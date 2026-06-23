@@ -112,6 +112,23 @@ int uocr_metal_context_get_rows_f16(uocr_metal_context *ctx,
                                     char *error,
                                     size_t error_size);
 
+/* Diagnostic prompt assembly helper for synthetic tests. image_span_start uses
+ * UINT32_MAX when there is no image span. Runtime inference should bind the
+ * mapped token-embedding tensor directly and write into the prompt arena.
+ */
+int uocr_metal_context_assemble_prompt_f16(uocr_metal_context *ctx,
+                                           const uint16_t *embedding_table_f16,
+                                           uint32_t table_rows,
+                                           uint32_t hidden_size,
+                                           const int32_t *input_ids,
+                                           uint32_t n_tokens,
+                                           uint32_t image_span_start,
+                                           uint32_t image_span_length,
+                                           const uint16_t *image_features_f16,
+                                           uint16_t *out_prompt_f16,
+                                           char *error,
+                                           size_t error_size);
+
 int uocr_metal_smoke_test(const char *resource_path, char *error, size_t error_size);
 
 #ifdef __cplusplus

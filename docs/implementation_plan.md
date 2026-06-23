@@ -595,11 +595,11 @@ First implementation slice, in order:
 
 - [x] Adapt DS4 `metal/get_rows.metal` for token embedding gather.
 - [x] Support fp16 embedding weights and fp16/fp32 output activations.
-- [ ] Implement direct prompt embedding assembly:
-  - [ ] write text token embeddings from token ids
-  - [ ] write image features into image spans when provided
-  - [ ] avoid emulating Python `masked_scatter_`
-- [ ] Add a text-only path where no image features are present.
+- [x] Implement direct prompt embedding assembly:
+  - [x] write text token embeddings from token ids
+  - [x] write image features into image spans when provided
+  - [x] avoid emulating Python `masked_scatter_`
+- [x] Add a text-only path where no image features are present.
 - [ ] Compare prompt embeddings against Python dumps.
 
 ### 14.2 Decoder layer primitives

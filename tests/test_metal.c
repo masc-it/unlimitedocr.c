@@ -193,6 +193,97 @@ static int test_metal_get_rows_f16(void) {
     return 0;
 }
 
+static int test_metal_prompt_assembly_f16(void) {
+    if (!uocr_metal_is_available()) {
+        return 0;
+    }
+
+    enum { TABLE_ROWS = 6, HIDDEN = 8, TEXT_TOKENS = 4, IMAGE_TOKENS = 2, PROMPT_TOKENS = 6 };
+    uint16_t table[TABLE_ROWS * HIDDEN];
+    for (uint32_t row = 0u; row < (uint32_t)TABLE_ROWS; ++row) {
+        for (uint32_t col = 0u; col < (uint32_t)HIDDEN; ++col) {
+            table[row * (uint32_t)HIDDEN + col] = (uint16_t)(0x3c00u + row * 0x40u + col);
+        }
+    }
+    uint16_t image_features[IMAGE_TOKENS * HIDDEN];
+    for (uint32_t i = 0u; i < (uint32_t)(IMAGE_TOKENS * HIDDEN); ++i) {
+        image_features[i] = (uint16_t)(0x5000u + i);
+    }
+
+    char error[1024];
+    memset(error, 0, sizeof(error));
+    uocr_metal_context *ctx = uocr_metal_context_create(UOCR_TEST_METAL_RESOURCE_PATH, error, sizeof(error));
+    CHECK(ctx != NULL);
+
+    const int32_t text_ids[TEXT_TOKENS] = {0, 3, 5, 1};
+    uint16_t text_out[TEXT_TOKENS * HIDDEN];
+    memset(text_out, 0, sizeof(text_out));
+    CHECK(uocr_metal_context_assemble_prompt_f16(ctx,
+                                                 table,
+                                                 TABLE_ROWS,
+                                                 HIDDEN,
+                                                 text_ids,
+                                                 TEXT_TOKENS,
+                                                 UINT32_MAX,
+                                                 0u,
+                                                 NULL,
+                                                 text_out,
+                                                 error,
+                                                 sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    for (uint32_t token = 0u; token < (uint32_t)TEXT_TOKENS; ++token) {
+        for (uint32_t col = 0u; col < (uint32_t)HIDDEN; ++col) {
+            CHECK(text_out[token * (uint32_t)HIDDEN + col] == table[(uint32_t)text_ids[token] * (uint32_t)HIDDEN + col]);
+        }
+    }
+
+    const int32_t prompt_ids[PROMPT_TOKENS] = {0, 2, 12345, 12346, 4, 1};
+    uint16_t prompt_out[PROMPT_TOKENS * HIDDEN];
+    memset(prompt_out, 0, sizeof(prompt_out));
+    CHECK(uocr_metal_context_assemble_prompt_f16(ctx,
+                                                 table,
+                                                 TABLE_ROWS,
+                                                 HIDDEN,
+                                                 prompt_ids,
+                                                 PROMPT_TOKENS,
+                                                 2u,
+                                                 IMAGE_TOKENS,
+                                                 image_features,
+                                                 prompt_out,
+                                                 error,
+                                                 sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    for (uint32_t token = 0u; token < (uint32_t)PROMPT_TOKENS; ++token) {
+        for (uint32_t col = 0u; col < (uint32_t)HIDDEN; ++col) {
+            uint16_t expected = 0u;
+            if (token >= 2u && token < 2u + (uint32_t)IMAGE_TOKENS) {
+                expected = image_features[(token - 2u) * (uint32_t)HIDDEN + col];
+            } else {
+                expected = table[(uint32_t)prompt_ids[token] * (uint32_t)HIDDEN + col];
+            }
+            CHECK(prompt_out[token * (uint32_t)HIDDEN + col] == expected);
+        }
+    }
+
+    const int32_t bad_text_ids[1] = {TABLE_ROWS};
+    CHECK(uocr_metal_context_assemble_prompt_f16(ctx,
+                                                 table,
+                                                 TABLE_ROWS,
+                                                 HIDDEN,
+                                                 bad_text_ids,
+                                                 1u,
+                                                 UINT32_MAX,
+                                                 0u,
+                                                 NULL,
+                                                 text_out,
+                                                 error,
+                                                 sizeof(error)) == 0);
+    CHECK(strstr(error, "outside embedding rows") != NULL);
+
+    uocr_metal_context_destroy(ctx);
+    return 0;
+}
+
 static int test_metal_runtime_arenas(void) {
     if (!uocr_metal_is_available()) {
         return 0;
@@ -345,6 +436,7 @@ int main(void) {
     if (test_metal_smoke() != 0) return 1;
     if (test_metal_named_scratch_buffers() != 0) return 1;
     if (test_metal_get_rows_f16() != 0) return 1;
+    if (test_metal_prompt_assembly_f16() != 0) return 1;
     if (test_metal_runtime_arenas() != 0) return 1;
     if (test_metal_model_mapping() != 0) return 1;
     if (test_public_engine_open_initializes_metal() != 0) return 1;

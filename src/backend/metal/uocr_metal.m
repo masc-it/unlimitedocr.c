@@ -254,6 +254,17 @@ typedef struct uocr_metal_get_rows_params {
     uint32_t reserved;
 } uocr_metal_get_rows_params;
 
+typedef struct uocr_metal_prompt_assembly_params {
+    uint32_t table_rows;
+    uint32_t hidden_size;
+    uint32_t n_tokens;
+    uint32_t image_span_start;
+    uint32_t image_span_length;
+    uint32_t reserved0;
+    uint32_t reserved1;
+    uint32_t reserved2;
+} uocr_metal_prompt_assembly_params;
+
 static int metal_retain_transient_until_completed(uocr_metal_context *ctx,
                                                   id<MTLCommandBuffer> command_buffer,
                                                   id object,
@@ -1434,6 +1445,228 @@ int uocr_metal_context_get_rows_f16(uocr_metal_context *ctx,
         memcpy(out, [dst contents], (size_t)out_bytes);
         [dst release];
         [ids release];
+        [table release];
+    }
+
+    metal_clear_error(error, error_size);
+    return 1;
+}
+
+static int validate_prompt_text_token_ids(const int32_t *input_ids,
+                                          uint32_t n_tokens,
+                                          uint32_t table_rows,
+                                          uint32_t image_span_start,
+                                          uint32_t image_span_length,
+                                          char *error,
+                                          size_t error_size) {
+    const int has_image_span = image_span_length != 0u;
+    const uint64_t image_span_end = has_image_span ? (uint64_t)image_span_start + (uint64_t)image_span_length : 0u;
+    for (uint32_t i = 0u; i < n_tokens; ++i) {
+        if (has_image_span && i >= image_span_start && (uint64_t)i < image_span_end) {
+            continue;
+        }
+        if (input_ids[i] < 0 || (uint32_t)input_ids[i] >= table_rows) {
+            return metal_fail(error,
+                              error_size,
+                              "Metal prompt token id %d at position %u is outside embedding rows %u",
+                              input_ids[i],
+                              i,
+                              table_rows);
+        }
+    }
+    return 1;
+}
+
+int uocr_metal_context_assemble_prompt_f16(uocr_metal_context *ctx,
+                                           const uint16_t *embedding_table_f16,
+                                           uint32_t table_rows,
+                                           uint32_t hidden_size,
+                                           const int32_t *input_ids,
+                                           uint32_t n_tokens,
+                                           uint32_t image_span_start,
+                                           uint32_t image_span_length,
+                                           const uint16_t *image_features_f16,
+                                           uint16_t *out_prompt_f16,
+                                           char *error,
+                                           size_t error_size) {
+    metal_clear_error(error, error_size);
+    if (ctx == NULL || embedding_table_f16 == NULL || input_ids == NULL || out_prompt_f16 == NULL ||
+        table_rows == 0u || hidden_size == 0u || n_tokens == 0u) {
+        return metal_fail(error, error_size, "invalid Metal prompt assembly request");
+    }
+
+    const int has_image_span = image_span_length != 0u;
+    if (has_image_span) {
+        uint64_t image_end = 0u;
+        if (image_span_start == UINT32_MAX ||
+            !checked_add_u64((uint64_t)image_span_start, (uint64_t)image_span_length, &image_end) ||
+            image_span_start >= n_tokens || image_end > (uint64_t)n_tokens) {
+            return metal_fail(error,
+                              error_size,
+                              "Metal prompt image span [%u,%llu) is outside %u tokens",
+                              image_span_start,
+                              (unsigned long long)image_end,
+                              n_tokens);
+        }
+        if (image_features_f16 == NULL) {
+            return metal_fail(error, error_size, "Metal prompt image span requires image features");
+        }
+    } else if (image_span_start != UINT32_MAX) {
+        return metal_fail(error, error_size, "Metal text-only prompt should use UINT32_MAX image span start");
+    }
+
+    if (!validate_prompt_text_token_ids(input_ids,
+                                        n_tokens,
+                                        table_rows,
+                                        image_span_start,
+                                        image_span_length,
+                                        error,
+                                        error_size)) {
+        return 0;
+    }
+
+    uint64_t table_values = 0u;
+    uint64_t table_bytes = 0u;
+    uint64_t token_bytes = 0u;
+    uint64_t output_values = 0u;
+    uint64_t output_bytes = 0u;
+    uint64_t image_values = 0u;
+    uint64_t image_bytes = 0u;
+    if (!checked_mul_u64((uint64_t)table_rows, (uint64_t)hidden_size, &table_values) ||
+        !checked_mul_u64(table_values, 2u, &table_bytes) ||
+        !checked_mul_u64((uint64_t)n_tokens, (uint64_t)sizeof(int32_t), &token_bytes) ||
+        !checked_mul_u64((uint64_t)n_tokens, (uint64_t)hidden_size, &output_values) ||
+        !checked_mul_u64(output_values, 2u, &output_bytes) ||
+        !checked_mul_u64((uint64_t)image_span_length, (uint64_t)hidden_size, &image_values) ||
+        !checked_mul_u64(image_values, 2u, &image_bytes)) {
+        return metal_fail(error, error_size, "Metal prompt assembly byte-size overflow");
+    }
+
+    const uint64_t max_buffer_length = metal_device_max_buffer_length(ctx->device);
+    if (table_bytes > max_buffer_length || token_bytes > max_buffer_length || output_bytes > max_buffer_length ||
+        image_bytes > max_buffer_length || table_bytes > (uint64_t)SIZE_MAX || token_bytes > (uint64_t)SIZE_MAX ||
+        output_bytes > (uint64_t)SIZE_MAX || image_bytes > (uint64_t)SIZE_MAX) {
+        return metal_fail(error,
+                          error_size,
+                          "Metal prompt assembly buffers exceed maxBufferLength %llu",
+                          (unsigned long long)max_buffer_length);
+    }
+
+    @autoreleasepool {
+        const char *function_name = has_image_span ? "uocr_assemble_prompt_with_image_f16" : "uocr_assemble_prompt_text_f16";
+        id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, function_name, error, error_size);
+        if (pipeline == nil) {
+            return 0;
+        }
+
+        id<MTLBuffer> table = [ctx->device newBufferWithBytes:embedding_table_f16
+                                                       length:(NSUInteger)table_bytes
+                                                      options:MTLResourceStorageModeShared];
+        if (table == nil) {
+            return metal_fail(error, error_size, "failed to allocate Metal prompt embedding table buffer");
+        }
+        table.label = @"uocr_prompt_embedding_table_f16";
+
+        id<MTLBuffer> tokens = [ctx->device newBufferWithBytes:input_ids
+                                                        length:(NSUInteger)token_bytes
+                                                       options:MTLResourceStorageModeShared];
+        if (tokens == nil) {
+            [table release];
+            return metal_fail(error, error_size, "failed to allocate Metal prompt token-id buffer");
+        }
+        tokens.label = @"uocr_prompt_input_ids";
+
+        id<MTLBuffer> image_features = nil;
+        if (has_image_span) {
+            image_features = [ctx->device newBufferWithBytes:image_features_f16
+                                                      length:(NSUInteger)image_bytes
+                                                     options:MTLResourceStorageModeShared];
+            if (image_features == nil) {
+                [tokens release];
+                [table release];
+                return metal_fail(error, error_size, "failed to allocate Metal prompt image-feature buffer");
+            }
+            image_features.label = @"uocr_prompt_image_features_f16";
+        }
+
+        id<MTLBuffer> dst = [ctx->device newBufferWithLength:(NSUInteger)output_bytes
+                                                     options:MTLResourceStorageModeShared];
+        if (dst == nil) {
+            [image_features release];
+            [tokens release];
+            [table release];
+            return metal_fail(error, error_size, "failed to allocate Metal prompt output buffer");
+        }
+        dst.label = @"uocr_prompt_embeddings_f16";
+        memset([dst contents], 0, (size_t)output_bytes);
+
+        id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
+        if (cb == nil) {
+            [dst release];
+            [image_features release];
+            [tokens release];
+            [table release];
+            return metal_fail(error, error_size, "failed to create Metal prompt assembly command buffer");
+        }
+        cb.label = @"uocr_prompt_assembly_command_buffer";
+
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        if (enc == nil) {
+            [dst release];
+            [image_features release];
+            [tokens release];
+            [table release];
+            return metal_fail(error, error_size, "failed to create Metal prompt assembly command encoder");
+        }
+
+        uocr_metal_prompt_assembly_params params;
+        params.table_rows = table_rows;
+        params.hidden_size = hidden_size;
+        params.n_tokens = n_tokens;
+        params.image_span_start = has_image_span ? image_span_start : UINT32_MAX;
+        params.image_span_length = image_span_length;
+        params.reserved0 = 0u;
+        params.reserved1 = 0u;
+        params.reserved2 = 0u;
+
+        [enc setComputePipelineState:pipeline];
+        [enc setBuffer:table offset:0u atIndex:0u];
+        [enc setBuffer:tokens offset:0u atIndex:1u];
+        if (has_image_span) {
+            [enc setBuffer:image_features offset:0u atIndex:2u];
+            [enc setBuffer:dst offset:0u atIndex:3u];
+            [enc setBytes:&params length:sizeof(params) atIndex:4u];
+        } else {
+            [enc setBuffer:dst offset:0u atIndex:2u];
+            [enc setBytes:&params length:sizeof(params) atIndex:3u];
+        }
+
+        NSUInteger threads_per_group = pipeline.threadExecutionWidth;
+        if (threads_per_group == 0u) {
+            threads_per_group = 1u;
+        }
+        if (threads_per_group > (NSUInteger)hidden_size) {
+            threads_per_group = (NSUInteger)hidden_size;
+        }
+        [enc dispatchThreads:MTLSizeMake((NSUInteger)hidden_size, (NSUInteger)n_tokens, 1u)
+       threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1u, 1u)];
+        [enc endEncoding];
+
+        [cb commit];
+        [cb waitUntilCompleted];
+        if (cb.status == MTLCommandBufferStatusError) {
+            NSString *description = cb.error != nil ? [cb.error localizedDescription] : @"unknown command-buffer error";
+            [dst release];
+            [image_features release];
+            [tokens release];
+            [table release];
+            return metal_fail(error, error_size, "Metal prompt assembly command failed: %s", [description UTF8String]);
+        }
+
+        memcpy(out_prompt_f16, [dst contents], (size_t)output_bytes);
+        [dst release];
+        [image_features release];
+        [tokens release];
         [table release];
     }
 
