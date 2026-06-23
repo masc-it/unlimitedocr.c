@@ -479,6 +479,135 @@ kernel void uocr_attention_output_residual_f16_to_f32(device const half *src [[b
     }
 }
 
+struct UocrDenseSwigluParams {
+    uint n_tokens;
+    uint hidden_size;
+    uint intermediate_size;
+    uint has_residual;
+};
+
+kernel void uocr_dense_swiglu_gate_up_f16(device const half *src [[buffer(0)]],
+                                          device const half *gate_weight [[buffer(1)]],
+                                          device const half *up_weight [[buffer(2)]],
+                                          device half *mid [[buffer(3)]],
+                                          constant UocrDenseSwigluParams &params [[buffer(4)]],
+                                          threadgroup float *partials [[threadgroup(0)]],
+                                          uint output_index [[threadgroup_position_in_grid]],
+                                          uint tid [[thread_index_in_threadgroup]],
+                                          uint ntg [[threads_per_threadgroup]]) {
+    const uint token = output_index / params.intermediate_size;
+    const uint out_col = output_index - token * params.intermediate_size;
+    if (token >= params.n_tokens || out_col >= params.intermediate_size) {
+        return;
+    }
+
+    threadgroup float *gate_partials = partials;
+    threadgroup float *up_partials = partials + ntg;
+    float gate_sum = 0.0f;
+    float up_sum = 0.0f;
+    const uint src_base = token * params.hidden_size;
+    const uint weight_base = out_col * params.hidden_size;
+    for (uint k = tid; k < params.hidden_size; k += ntg) {
+        const float x = float(src[src_base + k]);
+        gate_sum += x * float(gate_weight[weight_base + k]);
+        up_sum += x * float(up_weight[weight_base + k]);
+    }
+    gate_partials[tid] = gate_sum;
+    up_partials[tid] = up_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = ntg >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            gate_partials[tid] += gate_partials[tid + stride];
+            up_partials[tid] += up_partials[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tid == 0) {
+        const float gate = gate_partials[0];
+        const float up = up_partials[0];
+        const float silu = gate / (1.0f + exp(-gate));
+        mid[token * params.intermediate_size + out_col] = half(silu * up);
+    }
+}
+
+static inline float uocr_dense_swiglu_down_dot_f16(device const half *mid,
+                                                   device const half *down_weight,
+                                                   constant UocrDenseSwigluParams &params,
+                                                   uint token,
+                                                   uint out_col,
+                                                   uint tid,
+                                                   uint ntg,
+                                                   threadgroup float *partials) {
+    float sum = 0.0f;
+    const uint mid_base = token * params.intermediate_size;
+    const uint weight_base = out_col * params.intermediate_size;
+    for (uint k = tid; k < params.intermediate_size; k += ntg) {
+        sum += float(mid[mid_base + k]) * float(down_weight[weight_base + k]);
+    }
+    partials[tid] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = ntg >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            partials[tid] += partials[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    return partials[0];
+}
+
+kernel void uocr_dense_swiglu_down_f16_to_f16(device const half *mid [[buffer(0)]],
+                                              device const half *down_weight [[buffer(1)]],
+                                              device const half *residual [[buffer(2)]],
+                                              device half *dst [[buffer(3)]],
+                                              constant UocrDenseSwigluParams &params [[buffer(4)]],
+                                              threadgroup float *partials [[threadgroup(0)]],
+                                              uint output_index [[threadgroup_position_in_grid]],
+                                              uint tid [[thread_index_in_threadgroup]],
+                                              uint ntg [[threads_per_threadgroup]]) {
+    const uint token = output_index / params.hidden_size;
+    const uint out_col = output_index - token * params.hidden_size;
+    if (token >= params.n_tokens || out_col >= params.hidden_size) {
+        return;
+    }
+
+    float value = uocr_dense_swiglu_down_dot_f16(mid, down_weight, params, token, out_col, tid, ntg, partials);
+    if (tid == 0) {
+        const uint dst_index = token * params.hidden_size + out_col;
+        if (params.has_residual != 0u) {
+            value += float(residual[dst_index]);
+        }
+        dst[dst_index] = half(value);
+    }
+}
+
+kernel void uocr_dense_swiglu_down_f16_to_f32(device const half *mid [[buffer(0)]],
+                                              device const half *down_weight [[buffer(1)]],
+                                              device const half *residual [[buffer(2)]],
+                                              device float *dst [[buffer(3)]],
+                                              constant UocrDenseSwigluParams &params [[buffer(4)]],
+                                              threadgroup float *partials [[threadgroup(0)]],
+                                              uint output_index [[threadgroup_position_in_grid]],
+                                              uint tid [[thread_index_in_threadgroup]],
+                                              uint ntg [[threads_per_threadgroup]]) {
+    const uint token = output_index / params.hidden_size;
+    const uint out_col = output_index - token * params.hidden_size;
+    if (token >= params.n_tokens || out_col >= params.hidden_size) {
+        return;
+    }
+
+    float value = uocr_dense_swiglu_down_dot_f16(mid, down_weight, params, token, out_col, tid, ntg, partials);
+    if (tid == 0) {
+        const uint dst_index = token * params.hidden_size + out_col;
+        if (params.has_residual != 0u) {
+            value += float(residual[dst_index]);
+        }
+        dst[dst_index] = value;
+    }
+}
+
 struct UocrRopeQKParams {
     uint n_tokens;
     uint heads;

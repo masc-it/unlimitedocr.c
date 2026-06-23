@@ -110,6 +110,55 @@ static float f16_bits_to_f32(uint16_t h) {
     return out;
 }
 
+static uint16_t f32_to_f16_bits(float value) {
+    uint32_t bits = 0u;
+    memcpy(&bits, &value, sizeof(bits));
+    const uint32_t sign = (bits >> 16u) & 0x8000u;
+    const uint32_t exponent = (bits >> 23u) & 0xffu;
+    const uint32_t mantissa = bits & 0x007fffffu;
+
+    if (exponent == 0xffu) {
+        if (mantissa == 0u) {
+            return (uint16_t)(sign | 0x7c00u);
+        }
+        return (uint16_t)(sign | 0x7e00u);
+    }
+
+    int half_exponent = (int)exponent - 127 + 15;
+    if (half_exponent >= 31) {
+        return (uint16_t)(sign | 0x7c00u);
+    }
+    if (half_exponent <= 0) {
+        if (half_exponent < -10) {
+            return (uint16_t)sign;
+        }
+        uint32_t mant = mantissa | 0x00800000u;
+        const uint32_t shift = (uint32_t)(14 - half_exponent);
+        uint32_t rounded = mant >> shift;
+        const uint32_t round_bit = 1u << (shift - 1u);
+        const uint32_t remainder = mant & (round_bit - 1u);
+        if ((mant & round_bit) != 0u && (remainder != 0u || (rounded & 1u) != 0u)) {
+            ++rounded;
+        }
+        return (uint16_t)(sign | rounded);
+    }
+
+    uint32_t rounded_mantissa = mantissa >> 13u;
+    const uint32_t round_bit = 0x00001000u;
+    const uint32_t remainder = mantissa & (round_bit - 1u);
+    if ((mantissa & round_bit) != 0u && (remainder != 0u || (rounded_mantissa & 1u) != 0u)) {
+        ++rounded_mantissa;
+        if (rounded_mantissa == 0x400u) {
+            rounded_mantissa = 0u;
+            ++half_exponent;
+            if (half_exponent >= 31) {
+                return (uint16_t)(sign | 0x7c00u);
+            }
+        }
+    }
+    return (uint16_t)(sign | ((uint32_t)half_exponent << 10u) | rounded_mantissa);
+}
+
 static int test_metal_get_rows_f16(void) {
     if (!uocr_metal_is_available()) {
         return 0;
@@ -816,6 +865,192 @@ static int test_metal_attention_output_residual_f16(void) {
     free(residual);
     free(weight);
     free(context);
+    return 0;
+}
+
+static int test_metal_dense_swiglu_f16(void) {
+    if (!uocr_metal_is_available()) {
+        return 0;
+    }
+
+    enum { TOKENS = 2, HIDDEN = UOCR_HIDDEN_SIZE, INTERMEDIATE = UOCR_DENSE_LAYER0_INTERMEDIATE };
+    const uint16_t input_values[] = {
+        0xa800u, /* -0.03125 */
+        0x0000u, /* 0.0 */
+        0x2000u, /* 0.0078125 */
+        0x2400u, /* 0.015625 */
+        0x2800u  /* 0.03125 */
+    };
+    const uint16_t weight_values[] = {
+        0x0000u, /* 0.0 */
+        0x2000u, /* 0.0078125 */
+        0xa000u, /* -0.0078125 */
+        0x2400u, /* 0.015625 */
+        0xa400u  /* -0.015625 */
+    };
+    const uint16_t residual_values[] = {
+        0xa800u, /* -0.03125 */
+        0xa400u, /* -0.015625 */
+        0x0000u, /* 0.0 */
+        0x2400u, /* 0.015625 */
+        0x2800u  /* 0.03125 */
+    };
+    const uint32_t input_value_count = (uint32_t)(sizeof(input_values) / sizeof(input_values[0]));
+    const uint32_t weight_value_count = (uint32_t)(sizeof(weight_values) / sizeof(weight_values[0]));
+    const uint32_t residual_value_count = (uint32_t)(sizeof(residual_values) / sizeof(residual_values[0]));
+
+    uint16_t *input = (uint16_t *)malloc((size_t)TOKENS * HIDDEN * sizeof(uint16_t));
+    uint16_t *gate_weight = (uint16_t *)calloc((size_t)INTERMEDIATE * HIDDEN, sizeof(uint16_t));
+    uint16_t *up_weight = (uint16_t *)calloc((size_t)INTERMEDIATE * HIDDEN, sizeof(uint16_t));
+    uint16_t *down_weight = (uint16_t *)calloc((size_t)HIDDEN * INTERMEDIATE, sizeof(uint16_t));
+    uint16_t *residual = (uint16_t *)malloc((size_t)TOKENS * HIDDEN * sizeof(uint16_t));
+    float *mid = (float *)malloc((size_t)TOKENS * INTERMEDIATE * sizeof(float));
+    float *expected_residual = (float *)malloc((size_t)TOKENS * HIDDEN * sizeof(float));
+    float *expected_no_residual = (float *)malloc((size_t)HIDDEN * sizeof(float));
+    float *out_f32 = (float *)malloc((size_t)TOKENS * HIDDEN * sizeof(float));
+    uint16_t *out_f16 = (uint16_t *)malloc((size_t)HIDDEN * sizeof(uint16_t));
+    CHECK(input != NULL && gate_weight != NULL && up_weight != NULL && down_weight != NULL && residual != NULL &&
+          mid != NULL && expected_residual != NULL && expected_no_residual != NULL && out_f32 != NULL && out_f16 != NULL);
+
+    for (uint32_t i = 0u; i < (uint32_t)(TOKENS * HIDDEN); ++i) {
+        input[i] = input_values[(i * 11u + i / 29u + 2u) % input_value_count];
+        residual[i] = residual_values[(i * 7u + i / 17u + 1u) % residual_value_count];
+    }
+
+    for (uint32_t row = 0u; row < (uint32_t)INTERMEDIATE; ++row) {
+        const uint32_t k0 = (row * 37u) % (uint32_t)HIDDEN;
+        const uint32_t k1 = (row * 37u + 113u) % (uint32_t)HIDDEN;
+        const uint32_t u0 = (row * 53u + 7u) % (uint32_t)HIDDEN;
+        const uint32_t u1 = (row * 53u + 211u) % (uint32_t)HIDDEN;
+        gate_weight[row * (uint32_t)HIDDEN + k0] = weight_values[(row + 1u) % weight_value_count];
+        gate_weight[row * (uint32_t)HIDDEN + k1] = weight_values[(row * 3u + 2u) % weight_value_count];
+        up_weight[row * (uint32_t)HIDDEN + u0] = weight_values[(row * 5u + 3u) % weight_value_count];
+        up_weight[row * (uint32_t)HIDDEN + u1] = weight_values[(row * 7u + 4u) % weight_value_count];
+    }
+    for (uint32_t col = 0u; col < (uint32_t)HIDDEN; ++col) {
+        const uint32_t d0 = (col * 41u) % (uint32_t)INTERMEDIATE;
+        const uint32_t d1 = (col * 41u + 977u) % (uint32_t)INTERMEDIATE;
+        const uint32_t d2 = (col * 41u + 2222u) % (uint32_t)INTERMEDIATE;
+        down_weight[col * (uint32_t)INTERMEDIATE + d0] = weight_values[(col + 2u) % weight_value_count];
+        down_weight[col * (uint32_t)INTERMEDIATE + d1] = weight_values[(col * 3u + 1u) % weight_value_count];
+        down_weight[col * (uint32_t)INTERMEDIATE + d2] = weight_values[(col * 5u + 4u) % weight_value_count];
+    }
+
+    for (uint32_t token = 0u; token < (uint32_t)TOKENS; ++token) {
+        for (uint32_t row = 0u; row < (uint32_t)INTERMEDIATE; ++row) {
+            float gate = 0.0f;
+            float up = 0.0f;
+            const uint32_t k0 = (row * 37u) % (uint32_t)HIDDEN;
+            const uint32_t k1 = (row * 37u + 113u) % (uint32_t)HIDDEN;
+            const uint32_t u0 = (row * 53u + 7u) % (uint32_t)HIDDEN;
+            const uint32_t u1 = (row * 53u + 211u) % (uint32_t)HIDDEN;
+            gate += f16_bits_to_f32(input[token * (uint32_t)HIDDEN + k0]) *
+                    f16_bits_to_f32(gate_weight[row * (uint32_t)HIDDEN + k0]);
+            gate += f16_bits_to_f32(input[token * (uint32_t)HIDDEN + k1]) *
+                    f16_bits_to_f32(gate_weight[row * (uint32_t)HIDDEN + k1]);
+            up += f16_bits_to_f32(input[token * (uint32_t)HIDDEN + u0]) *
+                  f16_bits_to_f32(up_weight[row * (uint32_t)HIDDEN + u0]);
+            up += f16_bits_to_f32(input[token * (uint32_t)HIDDEN + u1]) *
+                  f16_bits_to_f32(up_weight[row * (uint32_t)HIDDEN + u1]);
+            const float silu = gate / (1.0f + expf(-gate));
+            mid[token * (uint32_t)INTERMEDIATE + row] = f16_bits_to_f32(f32_to_f16_bits(silu * up));
+        }
+    }
+    for (uint32_t token = 0u; token < (uint32_t)TOKENS; ++token) {
+        for (uint32_t col = 0u; col < (uint32_t)HIDDEN; ++col) {
+            const uint32_t d0 = (col * 41u) % (uint32_t)INTERMEDIATE;
+            const uint32_t d1 = (col * 41u + 977u) % (uint32_t)INTERMEDIATE;
+            const uint32_t d2 = (col * 41u + 2222u) % (uint32_t)INTERMEDIATE;
+            float sum = 0.0f;
+            sum += mid[token * (uint32_t)INTERMEDIATE + d0] *
+                   f16_bits_to_f32(down_weight[col * (uint32_t)INTERMEDIATE + d0]);
+            sum += mid[token * (uint32_t)INTERMEDIATE + d1] *
+                   f16_bits_to_f32(down_weight[col * (uint32_t)INTERMEDIATE + d1]);
+            sum += mid[token * (uint32_t)INTERMEDIATE + d2] *
+                   f16_bits_to_f32(down_weight[col * (uint32_t)INTERMEDIATE + d2]);
+            if (token == 0u) {
+                expected_no_residual[col] = sum;
+            }
+            expected_residual[token * (uint32_t)HIDDEN + col] =
+                sum + f16_bits_to_f32(residual[token * (uint32_t)HIDDEN + col]);
+        }
+    }
+
+    char error[1024];
+    memset(error, 0, sizeof(error));
+    uocr_metal_context *ctx = uocr_metal_context_create(UOCR_TEST_METAL_RESOURCE_PATH, error, sizeof(error));
+    CHECK(ctx != NULL);
+
+    memset(out_f32, 0, (size_t)TOKENS * HIDDEN * sizeof(float));
+    CHECK(uocr_metal_context_dense_swiglu_f16(ctx,
+                                              input,
+                                              gate_weight,
+                                              up_weight,
+                                              down_weight,
+                                              residual,
+                                              TOKENS,
+                                              UOCR_METAL_DENSE_OUTPUT_F32,
+                                              out_f32,
+                                              error,
+                                              sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    for (uint32_t i = 0u; i < (uint32_t)(TOKENS * HIDDEN); ++i) {
+        CHECK(fabsf(out_f32[i] - expected_residual[i]) < 2.0e-5f);
+    }
+
+    memset(out_f16, 0, (size_t)HIDDEN * sizeof(uint16_t));
+    CHECK(uocr_metal_context_dense_swiglu_f16(ctx,
+                                              input,
+                                              gate_weight,
+                                              up_weight,
+                                              down_weight,
+                                              NULL,
+                                              1u,
+                                              UOCR_METAL_DENSE_OUTPUT_F16,
+                                              out_f16,
+                                              error,
+                                              sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    for (uint32_t i = 0u; i < (uint32_t)HIDDEN; ++i) {
+        CHECK(fabsf(f16_bits_to_f32(out_f16[i]) - expected_no_residual[i]) < 2.0e-5f);
+    }
+
+    CHECK(uocr_metal_context_dense_swiglu_f16(ctx,
+                                              input,
+                                              gate_weight,
+                                              up_weight,
+                                              down_weight,
+                                              residual,
+                                              TOKENS,
+                                              (uocr_metal_dense_output_type)99,
+                                              out_f32,
+                                              error,
+                                              sizeof(error)) == 0);
+    CHECK(strstr(error, "unsupported Metal dense SwiGLU output type") != NULL);
+    CHECK(uocr_metal_context_dense_swiglu_f16(ctx,
+                                              input,
+                                              gate_weight,
+                                              up_weight,
+                                              down_weight,
+                                              residual,
+                                              0u,
+                                              UOCR_METAL_DENSE_OUTPUT_F32,
+                                              out_f32,
+                                              error,
+                                              sizeof(error)) == 0);
+    CHECK(strstr(error, "invalid Metal dense SwiGLU request") != NULL);
+
+    uocr_metal_context_destroy(ctx);
+    free(out_f16);
+    free(out_f32);
+    free(expected_no_residual);
+    free(expected_residual);
+    free(mid);
+    free(residual);
+    free(down_weight);
+    free(up_weight);
+    free(gate_weight);
+    free(input);
     return 0;
 }
 
@@ -2448,6 +2683,7 @@ int main(void) {
     if (test_metal_dense_f16() != 0) return 1;
     if (test_metal_attention_qkvo_f16() != 0) return 1;
     if (test_metal_attention_output_residual_f16() != 0) return 1;
+    if (test_metal_dense_swiglu_f16() != 0) return 1;
     if (test_metal_rope_qk_f16() != 0) return 1;
     if (test_metal_prefill_attention_f16() != 0) return 1;
     if (test_metal_prefill_attention_varlen_f16() != 0) return 1;

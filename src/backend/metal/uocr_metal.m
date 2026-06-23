@@ -297,6 +297,13 @@ typedef struct uocr_metal_attention_output_params {
     uint32_t reserved1;
 } uocr_metal_attention_output_params;
 
+typedef struct uocr_metal_dense_swiglu_params {
+    uint32_t n_tokens;
+    uint32_t hidden_size;
+    uint32_t intermediate_size;
+    uint32_t has_residual;
+} uocr_metal_dense_swiglu_params;
+
 typedef struct uocr_metal_rope_qk_params {
     uint32_t n_tokens;
     uint32_t heads;
@@ -2655,6 +2662,246 @@ int uocr_metal_context_attention_output_residual_f16(uocr_metal_context *ctx,
         [residual release];
         [weight release];
         [src release];
+    }
+
+    metal_clear_error(error, error_size);
+    return 1;
+}
+
+int uocr_metal_context_dense_swiglu_f16(uocr_metal_context *ctx,
+                                        const uint16_t *input_f16,
+                                        const uint16_t *gate_weight_f16,
+                                        const uint16_t *up_weight_f16,
+                                        const uint16_t *down_weight_f16,
+                                        const uint16_t *residual_f16_or_null,
+                                        uint32_t n_tokens,
+                                        uocr_metal_dense_output_type output_type,
+                                        void *out,
+                                        char *error,
+                                        size_t error_size) {
+    metal_clear_error(error, error_size);
+    if (ctx == NULL || input_f16 == NULL || gate_weight_f16 == NULL || up_weight_f16 == NULL ||
+        down_weight_f16 == NULL || out == NULL || n_tokens == 0u) {
+        return metal_fail(error, error_size, "invalid Metal dense SwiGLU request");
+    }
+    if (output_type != UOCR_METAL_DENSE_OUTPUT_F16 && output_type != UOCR_METAL_DENSE_OUTPUT_F32) {
+        return metal_fail(error, error_size, "unsupported Metal dense SwiGLU output type %d", (int)output_type);
+    }
+
+    uint64_t hidden_values = 0u;
+    uint64_t intermediate_values = 0u;
+    uint64_t input_bytes = 0u;
+    uint64_t intermediate_bytes = 0u;
+    uint64_t weight_values = 0u;
+    uint64_t weight_bytes = 0u;
+    uint64_t output_bytes = 0u;
+    const uint64_t output_element_bytes = output_type == UOCR_METAL_DENSE_OUTPUT_F16 ? 2u : (uint64_t)sizeof(float);
+    if (!checked_mul_u64((uint64_t)n_tokens, (uint64_t)UOCR_HIDDEN_SIZE, &hidden_values) ||
+        !checked_mul_u64((uint64_t)n_tokens, (uint64_t)UOCR_DENSE_LAYER0_INTERMEDIATE, &intermediate_values) ||
+        !checked_mul_u64(hidden_values, 2u, &input_bytes) ||
+        !checked_mul_u64(intermediate_values, 2u, &intermediate_bytes) ||
+        !checked_mul_u64((uint64_t)UOCR_DENSE_LAYER0_INTERMEDIATE, (uint64_t)UOCR_HIDDEN_SIZE, &weight_values) ||
+        !checked_mul_u64(weight_values, 2u, &weight_bytes) ||
+        !checked_mul_u64(hidden_values, output_element_bytes, &output_bytes)) {
+        return metal_fail(error, error_size, "Metal dense SwiGLU byte-size overflow");
+    }
+
+    const uint64_t max_buffer_length = metal_device_max_buffer_length(ctx->device);
+    if (input_bytes > max_buffer_length || intermediate_bytes > max_buffer_length ||
+        weight_bytes > max_buffer_length || output_bytes > max_buffer_length ||
+        input_bytes > (uint64_t)SIZE_MAX || intermediate_bytes > (uint64_t)SIZE_MAX ||
+        weight_bytes > (uint64_t)SIZE_MAX || output_bytes > (uint64_t)SIZE_MAX ||
+        hidden_values > (uint64_t)UINT32_MAX || intermediate_values > (uint64_t)UINT32_MAX) {
+        return metal_fail(error,
+                          error_size,
+                          "Metal dense SwiGLU buffers exceed maxBufferLength %llu",
+                          (unsigned long long)max_buffer_length);
+    }
+
+    @autoreleasepool {
+        id<MTLComputePipelineState> gate_up_pipeline = metal_get_pipeline(ctx,
+                                                                          "uocr_dense_swiglu_gate_up_f16",
+                                                                          error,
+                                                                          error_size);
+        if (gate_up_pipeline == nil) {
+            return 0;
+        }
+        const char *down_function_name = output_type == UOCR_METAL_DENSE_OUTPUT_F16 ?
+                                             "uocr_dense_swiglu_down_f16_to_f16" :
+                                             "uocr_dense_swiglu_down_f16_to_f32";
+        id<MTLComputePipelineState> down_pipeline = metal_get_pipeline(ctx, down_function_name, error, error_size);
+        if (down_pipeline == nil) {
+            return 0;
+        }
+
+        id<MTLBuffer> input = [ctx->device newBufferWithBytes:input_f16
+                                                       length:(NSUInteger)input_bytes
+                                                      options:MTLResourceStorageModeShared];
+        if (input == nil) {
+            return metal_fail(error, error_size, "failed to allocate Metal dense SwiGLU input buffer");
+        }
+        input.label = @"uocr_dense_swiglu_input_f16";
+
+        id<MTLBuffer> gate_weight = [ctx->device newBufferWithBytes:gate_weight_f16
+                                                             length:(NSUInteger)weight_bytes
+                                                            options:MTLResourceStorageModeShared];
+        if (gate_weight == nil) {
+            [input release];
+            return metal_fail(error, error_size, "failed to allocate Metal dense SwiGLU gate weight buffer");
+        }
+        gate_weight.label = @"uocr_dense_swiglu_gate_weight_f16";
+
+        id<MTLBuffer> up_weight = [ctx->device newBufferWithBytes:up_weight_f16
+                                                           length:(NSUInteger)weight_bytes
+                                                          options:MTLResourceStorageModeShared];
+        if (up_weight == nil) {
+            [gate_weight release];
+            [input release];
+            return metal_fail(error, error_size, "failed to allocate Metal dense SwiGLU up weight buffer");
+        }
+        up_weight.label = @"uocr_dense_swiglu_up_weight_f16";
+
+        id<MTLBuffer> down_weight = [ctx->device newBufferWithBytes:down_weight_f16
+                                                             length:(NSUInteger)weight_bytes
+                                                            options:MTLResourceStorageModeShared];
+        if (down_weight == nil) {
+            [up_weight release];
+            [gate_weight release];
+            [input release];
+            return metal_fail(error, error_size, "failed to allocate Metal dense SwiGLU down weight buffer");
+        }
+        down_weight.label = @"uocr_dense_swiglu_down_weight_f16";
+
+        id<MTLBuffer> residual = nil;
+        id<MTLBuffer> residual_arg = down_weight;
+        if (residual_f16_or_null != NULL) {
+            residual = [ctx->device newBufferWithBytes:residual_f16_or_null
+                                                length:(NSUInteger)input_bytes
+                                               options:MTLResourceStorageModeShared];
+            if (residual == nil) {
+                [down_weight release];
+                [up_weight release];
+                [gate_weight release];
+                [input release];
+                return metal_fail(error, error_size, "failed to allocate Metal dense SwiGLU residual buffer");
+            }
+            residual.label = @"uocr_dense_swiglu_residual_f16";
+            residual_arg = residual;
+        }
+
+        id<MTLBuffer> mid = [ctx->device newBufferWithLength:(NSUInteger)intermediate_bytes
+                                                     options:MTLResourceStorageModeShared];
+        if (mid == nil) {
+            [residual release];
+            [down_weight release];
+            [up_weight release];
+            [gate_weight release];
+            [input release];
+            return metal_fail(error, error_size, "failed to allocate Metal dense SwiGLU intermediate buffer");
+        }
+        mid.label = @"uocr_dense_swiglu_mid_f16";
+        memset([mid contents], 0, (size_t)intermediate_bytes);
+
+        id<MTLBuffer> dst = [ctx->device newBufferWithLength:(NSUInteger)output_bytes options:MTLResourceStorageModeShared];
+        if (dst == nil) {
+            [mid release];
+            [residual release];
+            [down_weight release];
+            [up_weight release];
+            [gate_weight release];
+            [input release];
+            return metal_fail(error, error_size, "failed to allocate Metal dense SwiGLU output buffer");
+        }
+        dst.label = @"uocr_dense_swiglu_output";
+        memset([dst contents], 0, (size_t)output_bytes);
+
+        id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
+        if (cb == nil) {
+            [dst release];
+            [mid release];
+            [residual release];
+            [down_weight release];
+            [up_weight release];
+            [gate_weight release];
+            [input release];
+            return metal_fail(error, error_size, "failed to create Metal dense SwiGLU command buffer");
+        }
+        cb.label = @"uocr_dense_swiglu_command_buffer";
+
+        uocr_metal_dense_swiglu_params params;
+        params.n_tokens = n_tokens;
+        params.hidden_size = UOCR_HIDDEN_SIZE;
+        params.intermediate_size = UOCR_DENSE_LAYER0_INTERMEDIATE;
+        params.has_residual = residual_f16_or_null != NULL ? 1u : 0u;
+
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        if (enc == nil) {
+            [dst release];
+            [mid release];
+            [residual release];
+            [down_weight release];
+            [up_weight release];
+            [gate_weight release];
+            [input release];
+            return metal_fail(error, error_size, "failed to create Metal dense SwiGLU gate/up command encoder");
+        }
+        const NSUInteger gate_threads = metal_power2_threadgroup_width(256u, gate_up_pipeline.maxTotalThreadsPerThreadgroup);
+        [enc setComputePipelineState:gate_up_pipeline];
+        [enc setBuffer:input offset:0u atIndex:0u];
+        [enc setBuffer:gate_weight offset:0u atIndex:1u];
+        [enc setBuffer:up_weight offset:0u atIndex:2u];
+        [enc setBuffer:mid offset:0u atIndex:3u];
+        [enc setBytes:&params length:sizeof(params) atIndex:4u];
+        [enc setThreadgroupMemoryLength:gate_threads * 2u * sizeof(float) atIndex:0u];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)intermediate_values, 1u, 1u)
+             threadsPerThreadgroup:MTLSizeMake(gate_threads, 1u, 1u)];
+        [enc endEncoding];
+
+        enc = [cb computeCommandEncoder];
+        if (enc == nil) {
+            [dst release];
+            [mid release];
+            [residual release];
+            [down_weight release];
+            [up_weight release];
+            [gate_weight release];
+            [input release];
+            return metal_fail(error, error_size, "failed to create Metal dense SwiGLU down command encoder");
+        }
+        const NSUInteger down_threads = metal_power2_threadgroup_width(256u, down_pipeline.maxTotalThreadsPerThreadgroup);
+        [enc setComputePipelineState:down_pipeline];
+        [enc setBuffer:mid offset:0u atIndex:0u];
+        [enc setBuffer:down_weight offset:0u atIndex:1u];
+        [enc setBuffer:residual_arg offset:0u atIndex:2u];
+        [enc setBuffer:dst offset:0u atIndex:3u];
+        [enc setBytes:&params length:sizeof(params) atIndex:4u];
+        [enc setThreadgroupMemoryLength:down_threads * sizeof(float) atIndex:0u];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)hidden_values, 1u, 1u)
+             threadsPerThreadgroup:MTLSizeMake(down_threads, 1u, 1u)];
+        [enc endEncoding];
+
+        [cb commit];
+        [cb waitUntilCompleted];
+        if (cb.status == MTLCommandBufferStatusError) {
+            NSString *description = cb.error != nil ? [cb.error localizedDescription] : @"unknown command-buffer error";
+            [dst release];
+            [mid release];
+            [residual release];
+            [down_weight release];
+            [up_weight release];
+            [gate_weight release];
+            [input release];
+            return metal_fail(error, error_size, "Metal dense SwiGLU command failed: %s", [description UTF8String]);
+        }
+
+        memcpy(out, [dst contents], (size_t)output_bytes);
+        [dst release];
+        [mid release];
+        [residual release];
+        [down_weight release];
+        [up_weight release];
+        [gate_weight release];
+        [input release];
     }
 
     metal_clear_error(error, error_size);

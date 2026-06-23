@@ -268,6 +268,24 @@ int uocr_metal_context_attention_output_residual_f16(uocr_metal_context *ctx,
                                                      char *error,
                                                      size_t error_size);
 
+/* Diagnostic dense layer-0 MLP helper for synthetic decoder tests. Computes
+ * down_proj(SiLU(input @ gate_proj.T) * (input @ up_proj.T)) with shapes
+ * input/residual [n_tokens,1280], gate/up [6848,1280], down [1280,6848].
+ * Gate/up/down dot products accumulate in fp32, the SwiGLU intermediate is
+ * stored as fp16, and residual_f16_or_null is added after down_proj when set.
+ */
+int uocr_metal_context_dense_swiglu_f16(uocr_metal_context *ctx,
+                                        const uint16_t *input_f16,
+                                        const uint16_t *gate_weight_f16,
+                                        const uint16_t *up_weight_f16,
+                                        const uint16_t *down_weight_f16,
+                                        const uint16_t *residual_f16_or_null,
+                                        uint32_t n_tokens,
+                                        uocr_metal_dense_output_type output_type,
+                                        void *out,
+                                        char *error,
+                                        size_t error_size);
+
 /* Diagnostic RoPE helper for synthetic decoder tests. Applies Unlimited-OCR's
  * Llama-style split-half RoPE to projected Q and K tensors shaped
  * [n_tokens, 10 heads, 128 dim], using monotonically increasing positions

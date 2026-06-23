@@ -628,12 +628,12 @@ First implementation slice, in order:
 
 ### 14.3 MLP and MoE
 
-- [ ] Implement layer-0 dense SwiGLU:
-  - [ ] `gate_proj`
-  - [ ] `up_proj`
-  - [ ] SiLU activation from DeepSeekV2Config default `hidden_act="silu"`; assert this at model load
-  - [ ] elementwise multiply
-  - [ ] `down_proj`
+- [x] Implement layer-0 dense SwiGLU:
+  - [x] `gate_proj`
+  - [x] `up_proj`
+  - [x] SiLU activation from DeepSeekV2Config default `hidden_act="silu"`; assert this at model load
+  - [x] elementwise multiply
+  - [x] `down_proj`
 - [ ] Implement MoE router for layers `1..11`:
   - [ ] fp16 router weight storage, fp32 matmul accumulation
   - [ ] softmax over `64` experts in fp32
