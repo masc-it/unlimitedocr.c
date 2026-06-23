@@ -637,6 +637,141 @@ kernel void uocr_prefill_attention_f16_to_f32(device const half *q_src [[buffer(
     }
 }
 
+struct UocrPrefillAttentionVarlenParams {
+    uint total_tokens;
+    uint batch;
+    uint heads;
+    uint head_dim;
+    float scale;
+    uint reserved0;
+    uint reserved1;
+    uint reserved2;
+};
+
+static inline void uocr_prefill_varlen_find_sequence(device const uint *cu,
+                                                     constant UocrPrefillAttentionVarlenParams &params,
+                                                     uint token,
+                                                     thread uint &seq_start,
+                                                     thread uint &seq_end) {
+    seq_start = 0u;
+    seq_end = 0u;
+    for (uint b = 0u; b < params.batch; ++b) {
+        const uint start = cu[b];
+        const uint end = cu[b + 1u];
+        if (token >= start && token < end) {
+            seq_start = start;
+            seq_end = end;
+            return;
+        }
+    }
+}
+
+kernel void uocr_prefill_attention_varlen_f16_to_f16(device const half *q_src [[buffer(0)]],
+                                                     device const half *k_src [[buffer(1)]],
+                                                     device const half *v_src [[buffer(2)]],
+                                                     device const uint *cu [[buffer(3)]],
+                                                     device half *dst [[buffer(4)]],
+                                                     constant UocrPrefillAttentionVarlenParams &params [[buffer(5)]],
+                                                     threadgroup float *partials [[threadgroup(0)]],
+                                                     uint group_index [[threadgroup_position_in_grid]],
+                                                     uint tid [[thread_index_in_threadgroup]],
+                                                     uint ntg [[threads_per_threadgroup]]) {
+    const uint token = group_index / params.heads;
+    const uint head = group_index - token * params.heads;
+    if (token >= params.total_tokens || head >= params.heads || tid >= params.head_dim || ntg < params.head_dim) {
+        return;
+    }
+
+    uint seq_start;
+    uint seq_end;
+    uocr_prefill_varlen_find_sequence(cu, params, token, seq_start, seq_end);
+    if (seq_end <= seq_start) {
+        return;
+    }
+
+    const ulong q_index = (ulong(token) * ulong(params.heads) + ulong(head)) * ulong(params.head_dim) + ulong(tid);
+    const float q = float(q_src[q_index]);
+    float acc = 0.0f;
+    float m = -3.4028234663852886e38f;
+    float l = 0.0f;
+    for (uint key_token = seq_start; key_token <= token; ++key_token) {
+        const ulong k_index = (ulong(key_token) * ulong(params.heads) + ulong(head)) * ulong(params.head_dim) + ulong(tid);
+        partials[tid] = q * float(k_src[k_index]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride = ntg >> 1u; stride > 0u; stride >>= 1u) {
+            if (tid < stride) {
+                partials[tid] += partials[tid + stride];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        const float score = partials[0] * params.scale;
+        const float mnew = max(m, score);
+        const float corr = exp(m - mnew);
+        const float e = exp(score - mnew);
+        const ulong v_index = (ulong(key_token) * ulong(params.heads) + ulong(head)) * ulong(params.head_dim) + ulong(tid);
+        acc = acc * corr + e * float(v_src[v_index]);
+        l = l * corr + e;
+        m = mnew;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    const ulong dst_index = (ulong(token) * ulong(params.heads) + ulong(head)) * ulong(params.head_dim) + ulong(tid);
+    dst[dst_index] = half(l > 0.0f ? acc / l : 0.0f);
+}
+
+kernel void uocr_prefill_attention_varlen_f16_to_f32(device const half *q_src [[buffer(0)]],
+                                                     device const half *k_src [[buffer(1)]],
+                                                     device const half *v_src [[buffer(2)]],
+                                                     device const uint *cu [[buffer(3)]],
+                                                     device float *dst [[buffer(4)]],
+                                                     constant UocrPrefillAttentionVarlenParams &params [[buffer(5)]],
+                                                     threadgroup float *partials [[threadgroup(0)]],
+                                                     uint group_index [[threadgroup_position_in_grid]],
+                                                     uint tid [[thread_index_in_threadgroup]],
+                                                     uint ntg [[threads_per_threadgroup]]) {
+    const uint token = group_index / params.heads;
+    const uint head = group_index - token * params.heads;
+    if (token >= params.total_tokens || head >= params.heads || tid >= params.head_dim || ntg < params.head_dim) {
+        return;
+    }
+
+    uint seq_start;
+    uint seq_end;
+    uocr_prefill_varlen_find_sequence(cu, params, token, seq_start, seq_end);
+    if (seq_end <= seq_start) {
+        return;
+    }
+
+    const ulong q_index = (ulong(token) * ulong(params.heads) + ulong(head)) * ulong(params.head_dim) + ulong(tid);
+    const float q = float(q_src[q_index]);
+    float acc = 0.0f;
+    float m = -3.4028234663852886e38f;
+    float l = 0.0f;
+    for (uint key_token = seq_start; key_token <= token; ++key_token) {
+        const ulong k_index = (ulong(key_token) * ulong(params.heads) + ulong(head)) * ulong(params.head_dim) + ulong(tid);
+        partials[tid] = q * float(k_src[k_index]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride = ntg >> 1u; stride > 0u; stride >>= 1u) {
+            if (tid < stride) {
+                partials[tid] += partials[tid + stride];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        const float score = partials[0] * params.scale;
+        const float mnew = max(m, score);
+        const float corr = exp(m - mnew);
+        const float e = exp(score - mnew);
+        const ulong v_index = (ulong(key_token) * ulong(params.heads) + ulong(head)) * ulong(params.head_dim) + ulong(tid);
+        acc = acc * corr + e * float(v_src[v_index]);
+        l = l * corr + e;
+        m = mnew;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    const ulong dst_index = (ulong(token) * ulong(params.heads) + ulong(head)) * ulong(params.head_dim) + ulong(tid);
+    dst[dst_index] = l > 0.0f ? acc / l : 0.0f;
+}
+
 struct UocrKVCacheWriteParams {
     uint n_tokens;
     uint batch_slots;

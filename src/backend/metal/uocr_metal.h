@@ -255,6 +255,24 @@ int uocr_metal_context_prefill_attention_f16(uocr_metal_context *ctx,
                                              char *error,
                                              size_t error_size);
 
+/* Diagnostic packed/variable-length prefill attention helper adapted from the
+ * gradients.c sdpa_varlen layout. Q/K/V are packed as
+ * [total_tokens, 10 heads, 128 dim], and cu_seqlens has batch + 1 entries.
+ * Causal masking is applied independently within each sequence.
+ */
+int uocr_metal_context_prefill_attention_varlen_f16(uocr_metal_context *ctx,
+                                                    const uint16_t *q_f16,
+                                                    const uint16_t *k_f16,
+                                                    const uint16_t *v_f16,
+                                                    const uint32_t *cu_seqlens,
+                                                    uint32_t batch,
+                                                    uint32_t total_tokens,
+                                                    uint32_t max_seqlen,
+                                                    uocr_metal_dense_output_type output_type,
+                                                    void *out,
+                                                    char *error,
+                                                    size_t error_size);
+
 /* Diagnostic KV-cache write helper for synthetic decoder tests. Writes K/V
  * tensors shaped [n_tokens, 10 heads, 128 dim] into separate caches laid out as
  * [12 layers, batch_slots, prompt_token_capacity + 128, 10 heads, 128 dim].

@@ -890,6 +890,57 @@ static int compute_prefill_attention_expected(const uint16_t *q,
     return 1;
 }
 
+static int compute_prefill_attention_varlen_expected(const uint16_t *q,
+                                                     const uint16_t *k,
+                                                     const uint16_t *v,
+                                                     const uint32_t *cu,
+                                                     uint32_t batch,
+                                                     uint32_t total_tokens,
+                                                     float *out) {
+    const float scale = 1.0f / sqrtf((float)UOCR_HEAD_DIM);
+    float scores[16];
+    for (uint32_t b = 0u; b < batch; ++b) {
+        const uint32_t start = cu[b];
+        const uint32_t end = cu[b + 1u];
+        if (end <= start || end > total_tokens || end - start > (uint32_t)(sizeof(scores) / sizeof(scores[0]))) {
+            return 0;
+        }
+        for (uint32_t query = start; query < end; ++query) {
+            for (uint32_t head = 0u; head < UOCR_ATTENTION_HEADS; ++head) {
+                float max_score = -3.4028234663852886e38f;
+                for (uint32_t key = start; key <= query; ++key) {
+                    float score = 0.0f;
+                    const uint32_t q_base = (query * UOCR_ATTENTION_HEADS + head) * UOCR_HEAD_DIM;
+                    const uint32_t k_base = (key * UOCR_ATTENTION_HEADS + head) * UOCR_HEAD_DIM;
+                    for (uint32_t dim = 0u; dim < UOCR_HEAD_DIM; ++dim) {
+                        score += f16_bits_to_f32(q[q_base + dim]) * f16_bits_to_f32(k[k_base + dim]);
+                    }
+                    score *= scale;
+                    scores[key - start] = score;
+                    if (score > max_score) {
+                        max_score = score;
+                    }
+                }
+
+                float denominator = 0.0f;
+                for (uint32_t key = start; key <= query; ++key) {
+                    scores[key - start] = expf(scores[key - start] - max_score);
+                    denominator += scores[key - start];
+                }
+                for (uint32_t dim = 0u; dim < UOCR_HEAD_DIM; ++dim) {
+                    float value = 0.0f;
+                    for (uint32_t key = start; key <= query; ++key) {
+                        const uint32_t v_index = (key * UOCR_ATTENTION_HEADS + head) * UOCR_HEAD_DIM + dim;
+                        value += (scores[key - start] / denominator) * f16_bits_to_f32(v[v_index]);
+                    }
+                    out[(query * UOCR_ATTENTION_HEADS + head) * UOCR_HEAD_DIM + dim] = value;
+                }
+            }
+        }
+    }
+    return 1;
+}
+
 static int test_metal_prefill_attention_f16(void) {
     if (!uocr_metal_is_available()) {
         return 0;
@@ -1002,6 +1053,143 @@ static int test_metal_prefill_attention_f16(void) {
                                                    error,
                                                    sizeof(error)) == 0);
     CHECK(strstr(error, "unsupported Metal prefill attention output type") != NULL);
+
+    uocr_metal_context_destroy(ctx);
+    free(out_f16);
+    free(out_f32);
+    free(expected);
+    free(v);
+    free(k);
+    free(q);
+    return 0;
+}
+
+static int test_metal_prefill_attention_varlen_f16(void) {
+    if (!uocr_metal_is_available()) {
+        return 0;
+    }
+
+    enum { BATCH = 2, TOTAL_TOKENS = 7, MAX_SEQLEN = 4, HIDDEN = UOCR_ATTENTION_HEADS * UOCR_HEAD_DIM };
+    const uint32_t cu[BATCH + 1] = {0u, 3u, 7u};
+    const uint16_t q_values[] = {
+        0x0000u, /* 0.0 */
+        0x2c00u, /* 0.0625 */
+        0x3000u, /* 0.125 */
+        0xb000u, /* -0.125 */
+        0x3400u  /* 0.25 */
+    };
+    const uint16_t k_values[] = {
+        0x0000u, /* 0.0 */
+        0x2800u, /* 0.03125 */
+        0x2c00u, /* 0.0625 */
+        0x3000u, /* 0.125 */
+        0xb000u  /* -0.125 */
+    };
+    const uint16_t v_values[] = {
+        0xbc00u, /* -1.0 */
+        0xb800u, /* -0.5 */
+        0x0000u, /* 0.0 */
+        0x3400u, /* 0.25 */
+        0x3800u, /* 0.5 */
+        0x3c00u  /* 1.0 */
+    };
+    const uint32_t q_count = (uint32_t)(sizeof(q_values) / sizeof(q_values[0]));
+    const uint32_t k_count = (uint32_t)(sizeof(k_values) / sizeof(k_values[0]));
+    const uint32_t v_count = (uint32_t)(sizeof(v_values) / sizeof(v_values[0]));
+
+    uint16_t *q = (uint16_t *)malloc((size_t)TOTAL_TOKENS * HIDDEN * sizeof(uint16_t));
+    uint16_t *k = (uint16_t *)malloc((size_t)TOTAL_TOKENS * HIDDEN * sizeof(uint16_t));
+    uint16_t *v = (uint16_t *)malloc((size_t)TOTAL_TOKENS * HIDDEN * sizeof(uint16_t));
+    float *expected = (float *)malloc((size_t)TOTAL_TOKENS * HIDDEN * sizeof(float));
+    float *out_f32 = (float *)malloc((size_t)TOTAL_TOKENS * HIDDEN * sizeof(float));
+    uint16_t *out_f16 = (uint16_t *)malloc((size_t)TOTAL_TOKENS * HIDDEN * sizeof(uint16_t));
+    CHECK(q != NULL && k != NULL && v != NULL && expected != NULL && out_f32 != NULL && out_f16 != NULL);
+
+    for (uint32_t i = 0u; i < (uint32_t)(TOTAL_TOKENS * HIDDEN); ++i) {
+        q[i] = q_values[(i * 7u + i / 19u + 2u) % q_count];
+        k[i] = k_values[(i * 11u + i / 23u + 4u) % k_count];
+        v[i] = v_values[(i * 13u + i / 29u + 1u) % v_count];
+    }
+    /* Make cross-sequence leakage obvious: first token of sequence 1 must only
+     * see itself, never the large values placed at the end of sequence 0.
+     */
+    v[2u * (uint32_t)HIDDEN] = 0x5000u; /* 32.0 */
+    v[3u * (uint32_t)HIDDEN] = 0xb800u; /* -0.5 */
+    CHECK(compute_prefill_attention_varlen_expected(q, k, v, cu, BATCH, TOTAL_TOKENS, expected) == 1);
+
+    char error[1024];
+    memset(error, 0, sizeof(error));
+    uocr_metal_context *ctx = uocr_metal_context_create(UOCR_TEST_METAL_RESOURCE_PATH, error, sizeof(error));
+    CHECK(ctx != NULL);
+
+    memset(out_f32, 0, (size_t)TOTAL_TOKENS * HIDDEN * sizeof(float));
+    CHECK(uocr_metal_context_prefill_attention_varlen_f16(ctx,
+                                                          q,
+                                                          k,
+                                                          v,
+                                                          cu,
+                                                          BATCH,
+                                                          TOTAL_TOKENS,
+                                                          MAX_SEQLEN,
+                                                          UOCR_METAL_DENSE_OUTPUT_F32,
+                                                          out_f32,
+                                                          error,
+                                                          sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    for (uint32_t i = 0u; i < (uint32_t)(TOTAL_TOKENS * HIDDEN); ++i) {
+        CHECK(fabsf(out_f32[i] - expected[i]) < 1.0e-3f);
+    }
+    for (uint32_t dim = 0u; dim < UOCR_HEAD_DIM; ++dim) {
+        CHECK(out_f32[dim] == f16_bits_to_f32(v[dim]));
+        CHECK(out_f32[3u * (uint32_t)HIDDEN + dim] == f16_bits_to_f32(v[3u * (uint32_t)HIDDEN + dim]));
+    }
+
+    memset(out_f16, 0, (size_t)TOTAL_TOKENS * HIDDEN * sizeof(uint16_t));
+    CHECK(uocr_metal_context_prefill_attention_varlen_f16(ctx,
+                                                          q,
+                                                          k,
+                                                          v,
+                                                          cu,
+                                                          BATCH,
+                                                          TOTAL_TOKENS,
+                                                          MAX_SEQLEN,
+                                                          UOCR_METAL_DENSE_OUTPUT_F16,
+                                                          out_f16,
+                                                          error,
+                                                          sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    for (uint32_t i = 0u; i < (uint32_t)(TOTAL_TOKENS * HIDDEN); ++i) {
+        CHECK(fabsf(f16_bits_to_f32(out_f16[i]) - expected[i]) < 1.0e-2f);
+    }
+
+    const uint32_t bad_cu_order[BATCH + 1] = {0u, 5u, 4u};
+    CHECK(uocr_metal_context_prefill_attention_varlen_f16(ctx,
+                                                          q,
+                                                          k,
+                                                          v,
+                                                          bad_cu_order,
+                                                          BATCH,
+                                                          TOTAL_TOKENS,
+                                                          MAX_SEQLEN,
+                                                          UOCR_METAL_DENSE_OUTPUT_F32,
+                                                          out_f32,
+                                                          error,
+                                                          sizeof(error)) == 0);
+    CHECK(strstr(error, "sequence metadata") != NULL || strstr(error, "cu_seqlens") != NULL);
+
+    CHECK(uocr_metal_context_prefill_attention_varlen_f16(ctx,
+                                                          q,
+                                                          k,
+                                                          v,
+                                                          cu,
+                                                          BATCH,
+                                                          TOTAL_TOKENS,
+                                                          2u,
+                                                          UOCR_METAL_DENSE_OUTPUT_F32,
+                                                          out_f32,
+                                                          error,
+                                                          sizeof(error)) == 0);
+    CHECK(strstr(error, "exceeds max_seqlen") != NULL);
 
     uocr_metal_context_destroy(ctx);
     free(out_f16);
@@ -1725,6 +1913,7 @@ int main(void) {
     if (test_metal_attention_qkvo_f16() != 0) return 1;
     if (test_metal_rope_qk_f16() != 0) return 1;
     if (test_metal_prefill_attention_f16() != 0) return 1;
+    if (test_metal_prefill_attention_varlen_f16() != 0) return 1;
     if (test_metal_kv_cache_layout_helpers() != 0) return 1;
     if (test_metal_kv_cache_write_f16() != 0) return 1;
     if (test_metal_recent_decoder_primitives_stress() != 0) return 1;
