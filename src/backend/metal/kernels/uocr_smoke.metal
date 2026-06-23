@@ -615,6 +615,12 @@ struct UocrMoeRouterParams {
     uint top_k;
 };
 
+static inline bool uocr_moe_router_topk_better(threadgroup const float *scores, uint a, uint b) {
+    const float va = scores[a];
+    const float vb = scores[b];
+    return va > vb || (va == vb && a < b);
+}
+
 static inline float uocr_moe_router_dot_f16(device const half *src,
                                             device const half *weight,
                                             constant UocrMoeRouterParams &params,
@@ -676,6 +682,7 @@ kernel void uocr_moe_router_softmax_topk_f32(device const float *logits [[buffer
 
     threadgroup float *scores = scratch;
     threadgroup float *partials = scratch + params.experts;
+    threadgroup uint *indices = (threadgroup uint *)(scratch + params.experts + ntg);
 
     float local_max = -INFINITY;
     const uint row_base = token * params.experts;
@@ -716,33 +723,40 @@ kernel void uocr_moe_router_softmax_topk_f32(device const float *logits [[buffer
         const float prob = scores[expert] * inv_sum;
         scores[expert] = prob;
         probs[row_base + expert] = prob;
+        indices[expert] = expert;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    if (tid == 0) {
-        for (uint rank = 0; rank < params.top_k; ++rank) {
-            float best_value = -INFINITY;
-            uint best_expert = 0u;
-            for (uint expert = 0; expert < params.experts; ++expert) {
-                bool already_selected = false;
-                for (uint prev = 0; prev < rank; ++prev) {
-                    if (top_expert_ids[token * params.top_k + prev] == expert) {
-                        already_selected = true;
-                        break;
-                    }
+    // OCR only needs top-6 from 64 experts, but use the same bitonic
+    // index-sort shape as DS4's router/argsort kernels instead of a serial
+    // thread-0 scan. This keeps selection deterministic for equal
+    // probabilities by preferring the lower expert id; the routed sum is
+    // commutative, so descending score order is only a diagnostic convention.
+    for (uint k = 2u; k <= params.experts; k <<= 1u) {
+        for (uint j = k >> 1u; j > 0u; j >>= 1u) {
+            const uint other = tid ^ j;
+            if (other > tid && other < params.experts) {
+                const uint a = indices[tid];
+                const uint b = indices[other];
+                bool swap = false;
+                if ((tid & k) == 0u) {
+                    swap = uocr_moe_router_topk_better(scores, b, a);
+                } else {
+                    swap = uocr_moe_router_topk_better(scores, a, b);
                 }
-                if (already_selected) {
-                    continue;
-                }
-                const float value = scores[expert];
-                if (value > best_value || (value == best_value && expert < best_expert)) {
-                    best_value = value;
-                    best_expert = expert;
+                if (swap) {
+                    indices[tid] = b;
+                    indices[other] = a;
                 }
             }
-            top_expert_ids[token * params.top_k + rank] = best_expert;
-            top_weights[token * params.top_k + rank] = best_value;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
         }
+    }
+
+    if (tid < params.top_k) {
+        const uint expert = indices[tid];
+        top_expert_ids[token * params.top_k + tid] = expert;
+        top_weights[token * params.top_k + tid] = scores[expert];
     }
 }
 

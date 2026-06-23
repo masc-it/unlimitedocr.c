@@ -1215,6 +1215,33 @@ static int test_metal_moe_router_f16(void) {
         CHECK(fabsf(top_weights_optional[i] - expected_top_weights[i]) < 2.0e-6f);
     }
 
+    memset(weight, 0, (size_t)EXPERTS * HIDDEN * sizeof(uint16_t));
+    memset(logits, 1, (size_t)TOKENS * EXPERTS * sizeof(float));
+    memset(probs, 1, (size_t)TOKENS * EXPERTS * sizeof(float));
+    memset(top_ids, 0xff, (size_t)TOKENS * TOP_K * sizeof(uint32_t));
+    memset(top_weights, 0, (size_t)TOKENS * TOP_K * sizeof(float));
+    CHECK(uocr_metal_context_moe_router_f16(ctx,
+                                            input,
+                                            weight,
+                                            TOKENS,
+                                            logits,
+                                            probs,
+                                            top_ids,
+                                            top_weights,
+                                            error,
+                                            sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    for (uint32_t i = 0u; i < (uint32_t)(TOKENS * EXPERTS); ++i) {
+        CHECK(fabsf(logits[i]) < 2.0e-7f);
+        CHECK(fabsf(probs[i] - (1.0f / (float)EXPERTS)) < 2.0e-7f);
+    }
+    for (uint32_t token = 0u; token < (uint32_t)TOKENS; ++token) {
+        for (uint32_t rank = 0u; rank < (uint32_t)TOP_K; ++rank) {
+            CHECK(top_ids[token * (uint32_t)TOP_K + rank] == rank);
+            CHECK(fabsf(top_weights[token * (uint32_t)TOP_K + rank] - (1.0f / (float)EXPERTS)) < 2.0e-7f);
+        }
+    }
+
     CHECK(uocr_metal_context_moe_router_f16(ctx,
                                             input,
                                             weight,

@@ -2979,6 +2979,13 @@ int uocr_metal_context_moe_router_f16(uocr_metal_context *ctx,
         if (topk_pipeline == nil) {
             return 0;
         }
+        if (topk_pipeline.maxTotalThreadsPerThreadgroup < (NSUInteger)UOCR_ROUTED_EXPERTS) {
+            return metal_fail(error,
+                              error_size,
+                              "Metal MoE router top-k pipeline supports only %llu threads; need %u",
+                              (unsigned long long)topk_pipeline.maxTotalThreadsPerThreadgroup,
+                              (unsigned)UOCR_ROUTED_EXPERTS);
+        }
 
         id<MTLBuffer> input = [ctx->device newBufferWithBytes:input_f16
                                                        length:(NSUInteger)input_bytes
@@ -3075,7 +3082,9 @@ int uocr_metal_context_moe_router_f16(uocr_metal_context *ctx,
         [enc setBuffer:top_ids offset:0u atIndex:2u];
         [enc setBuffer:top_weights offset:0u atIndex:3u];
         [enc setBytes:&params length:sizeof(params) atIndex:4u];
-        [enc setThreadgroupMemoryLength:((NSUInteger)UOCR_ROUTED_EXPERTS + topk_threads) * sizeof(float) atIndex:0u];
+        const NSUInteger topk_scratch_bytes = ((NSUInteger)UOCR_ROUTED_EXPERTS + topk_threads) * sizeof(float) +
+                                              (NSUInteger)UOCR_ROUTED_EXPERTS * sizeof(uint32_t);
+        [enc setThreadgroupMemoryLength:topk_scratch_bytes atIndex:0u];
         [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_tokens, 1u, 1u)
              threadsPerThreadgroup:MTLSizeMake(topk_threads, 1u, 1u)];
         [enc endEncoding];

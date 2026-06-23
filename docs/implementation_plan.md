@@ -641,7 +641,7 @@ First implementation slice, in order:
   - [x] multiply selected probabilities by `routed_scaling_factor=1.0`
   - [x] no probability renormalization (`norm_topk_prob=false`)
   - [x] no DS4 router-specific sqrt/softplus/bias behavior
-- [ ] Adapt DS4 `argsort.metal` / `dsv4_misc.metal` top-k patterns for OCR's simpler top-6.
+- [x] Adapt DS4 `argsort.metal` / `dsv4_misc.metal` top-k patterns for OCR's simpler top-6.
 - [ ] Implement selected-expert fp16 path for decode.
 - [ ] Implement grouped expert path for prefill later; simple token-by-token selected expert path is acceptable for first parity.
 - [ ] Implement shared experts for every MoE layer with intermediate `1792`.
