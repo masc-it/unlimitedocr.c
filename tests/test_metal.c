@@ -1281,6 +1281,183 @@ static int test_metal_moe_router_f16(void) {
     return 0;
 }
 
+static int test_metal_moe_selected_experts_decode_f16(void) {
+    if (!uocr_metal_is_available()) {
+        return 0;
+    }
+
+    enum { HIDDEN = UOCR_HIDDEN_SIZE, INTERMEDIATE = UOCR_MOE_EXPERT_INTERMEDIATE, TOP_K = UOCR_MOE_TOP_K };
+    const uint32_t top_ids[TOP_K] = {7u, 2u, 63u, 0u, 5u, 11u};
+    const float top_weights[TOP_K] = {0.375f, 0.25f, 0.125f, 0.0625f, 0.03125f, 0.015625f};
+    const uint16_t input_values[] = {
+        0xb000u, /* -0.125 */
+        0xa800u, /* -0.03125 */
+        0x0000u, /* 0.0 */
+        0x2800u, /* 0.03125 */
+        0x3000u  /* 0.125 */
+    };
+    const uint16_t weight_values[] = {
+        0x2000u, /* 0.0078125 */
+        0x2400u, /* 0.015625 */
+        0x2800u, /* 0.03125 */
+        0xa000u, /* -0.0078125 */
+        0xa400u, /* -0.015625 */
+        0xa800u  /* -0.03125 */
+    };
+    const uint32_t input_value_count = (uint32_t)(sizeof(input_values) / sizeof(input_values[0]));
+    const uint32_t weight_value_count = (uint32_t)(sizeof(weight_values) / sizeof(weight_values[0]));
+
+    uint16_t *input = (uint16_t *)malloc((size_t)HIDDEN * sizeof(uint16_t));
+    uint16_t *gate_weight = (uint16_t *)calloc((size_t)TOP_K * INTERMEDIATE * HIDDEN, sizeof(uint16_t));
+    uint16_t *up_weight = (uint16_t *)calloc((size_t)TOP_K * INTERMEDIATE * HIDDEN, sizeof(uint16_t));
+    uint16_t *down_weight = (uint16_t *)calloc((size_t)TOP_K * HIDDEN * INTERMEDIATE, sizeof(uint16_t));
+    float *mid = (float *)malloc((size_t)TOP_K * INTERMEDIATE * sizeof(float));
+    float *expected = (float *)malloc((size_t)HIDDEN * sizeof(float));
+    float *out_f32 = (float *)malloc((size_t)HIDDEN * sizeof(float));
+    uint16_t *out_f16 = (uint16_t *)malloc((size_t)HIDDEN * sizeof(uint16_t));
+    CHECK(input != NULL && gate_weight != NULL && up_weight != NULL && down_weight != NULL && mid != NULL &&
+          expected != NULL && out_f32 != NULL && out_f16 != NULL);
+
+    for (uint32_t col = 0u; col < (uint32_t)HIDDEN; ++col) {
+        input[col] = input_values[(col * 7u + col / 23u + 3u) % input_value_count];
+    }
+
+    for (uint32_t rank = 0u; rank < (uint32_t)TOP_K; ++rank) {
+        for (uint32_t row = 0u; row < (uint32_t)INTERMEDIATE; ++row) {
+            uint32_t g0 = (rank * 127u + row * 17u) % (uint32_t)HIDDEN;
+            uint32_t g1 = (rank * 197u + row * 31u + 23u) % (uint32_t)HIDDEN;
+            uint32_t u0 = (rank * 59u + row * 13u + 5u) % (uint32_t)HIDDEN;
+            uint32_t u1 = (rank * 89u + row * 19u + 17u) % (uint32_t)HIDDEN;
+            if (g1 == g0) g1 = (g1 + 1u) % (uint32_t)HIDDEN;
+            if (u1 == u0) u1 = (u1 + 1u) % (uint32_t)HIDDEN;
+            const size_t base = ((size_t)rank * INTERMEDIATE + row) * HIDDEN;
+            gate_weight[base + g0] = weight_values[(rank + row + 1u) % weight_value_count];
+            gate_weight[base + g1] = weight_values[(rank * 3u + row * 5u + 2u) % weight_value_count];
+            up_weight[base + u0] = weight_values[(rank * 5u + row * 7u + 3u) % weight_value_count];
+            up_weight[base + u1] = weight_values[(rank * 11u + row * 13u + 4u) % weight_value_count];
+        }
+    }
+
+    for (uint32_t rank = 0u; rank < (uint32_t)TOP_K; ++rank) {
+        for (uint32_t col = 0u; col < (uint32_t)HIDDEN; ++col) {
+            uint32_t d0 = (rank * 173u + col * 7u) % (uint32_t)INTERMEDIATE;
+            uint32_t d1 = (rank * 181u + col * 11u + 37u) % (uint32_t)INTERMEDIATE;
+            uint32_t d2 = (rank * 191u + col * 13u + 101u) % (uint32_t)INTERMEDIATE;
+            if (d1 == d0) d1 = (d1 + 1u) % (uint32_t)INTERMEDIATE;
+            if (d2 == d0 || d2 == d1) d2 = (d2 + 2u) % (uint32_t)INTERMEDIATE;
+            const size_t base = ((size_t)rank * HIDDEN + col) * INTERMEDIATE;
+            down_weight[base + d0] = weight_values[(rank + col + 2u) % weight_value_count];
+            down_weight[base + d1] = weight_values[(rank * 3u + col * 5u + 1u) % weight_value_count];
+            down_weight[base + d2] = weight_values[(rank * 7u + col * 11u + 5u) % weight_value_count];
+        }
+    }
+
+    for (uint32_t rank = 0u; rank < (uint32_t)TOP_K; ++rank) {
+        for (uint32_t row = 0u; row < (uint32_t)INTERMEDIATE; ++row) {
+            float gate = 0.0f;
+            float up = 0.0f;
+            const size_t base = ((size_t)rank * INTERMEDIATE + row) * HIDDEN;
+            for (uint32_t col = 0u; col < (uint32_t)HIDDEN; ++col) {
+                const float x = f16_bits_to_f32(input[col]);
+                gate += x * f16_bits_to_f32(gate_weight[base + col]);
+                up += x * f16_bits_to_f32(up_weight[base + col]);
+            }
+            const float silu = gate / (1.0f + expf(-gate));
+            mid[(size_t)rank * INTERMEDIATE + row] = f16_bits_to_f32(f32_to_f16_bits(silu * up));
+        }
+    }
+
+    for (uint32_t col = 0u; col < (uint32_t)HIDDEN; ++col) {
+        float routed_sum = 0.0f;
+        for (uint32_t rank = 0u; rank < (uint32_t)TOP_K; ++rank) {
+            float expert_sum = 0.0f;
+            const size_t base = ((size_t)rank * HIDDEN + col) * INTERMEDIATE;
+            for (uint32_t row = 0u; row < (uint32_t)INTERMEDIATE; ++row) {
+                expert_sum += mid[(size_t)rank * INTERMEDIATE + row] * f16_bits_to_f32(down_weight[base + row]);
+            }
+            routed_sum += expert_sum * top_weights[rank];
+        }
+        expected[col] = routed_sum;
+    }
+
+    char error[1024];
+    memset(error, 0, sizeof(error));
+    uocr_metal_context *ctx = uocr_metal_context_create(UOCR_TEST_METAL_RESOURCE_PATH, error, sizeof(error));
+    CHECK(ctx != NULL);
+
+    memset(out_f32, 0, (size_t)HIDDEN * sizeof(float));
+    CHECK(uocr_metal_context_moe_selected_experts_decode_f16(ctx,
+                                                             input,
+                                                             top_ids,
+                                                             top_weights,
+                                                             gate_weight,
+                                                             up_weight,
+                                                             down_weight,
+                                                             UOCR_METAL_DENSE_OUTPUT_F32,
+                                                             out_f32,
+                                                             error,
+                                                             sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    for (uint32_t col = 0u; col < (uint32_t)HIDDEN; ++col) {
+        CHECK(fabsf(out_f32[col] - expected[col]) < 3.0e-5f);
+    }
+
+    memset(out_f16, 0, (size_t)HIDDEN * sizeof(uint16_t));
+    CHECK(uocr_metal_context_moe_selected_experts_decode_f16(ctx,
+                                                             input,
+                                                             top_ids,
+                                                             top_weights,
+                                                             gate_weight,
+                                                             up_weight,
+                                                             down_weight,
+                                                             UOCR_METAL_DENSE_OUTPUT_F16,
+                                                             out_f16,
+                                                             error,
+                                                             sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    for (uint32_t col = 0u; col < (uint32_t)HIDDEN; ++col) {
+        CHECK(fabsf(f16_bits_to_f32(out_f16[col]) - expected[col]) < 3.0e-4f);
+    }
+
+    CHECK(uocr_metal_context_moe_selected_experts_decode_f16(ctx,
+                                                             input,
+                                                             top_ids,
+                                                             top_weights,
+                                                             gate_weight,
+                                                             up_weight,
+                                                             down_weight,
+                                                             (uocr_metal_dense_output_type)99,
+                                                             out_f32,
+                                                             error,
+                                                             sizeof(error)) == 0);
+    CHECK(strstr(error, "unsupported Metal MoE selected-expert output type") != NULL);
+
+    uint32_t bad_ids[TOP_K] = {7u, 2u, UOCR_ROUTED_EXPERTS, 0u, 5u, 11u};
+    CHECK(uocr_metal_context_moe_selected_experts_decode_f16(ctx,
+                                                             input,
+                                                             bad_ids,
+                                                             top_weights,
+                                                             gate_weight,
+                                                             up_weight,
+                                                             down_weight,
+                                                             UOCR_METAL_DENSE_OUTPUT_F32,
+                                                             out_f32,
+                                                             error,
+                                                             sizeof(error)) == 0);
+    CHECK(strstr(error, "invalid Metal MoE selected expert id") != NULL);
+
+    uocr_metal_context_destroy(ctx);
+    free(out_f16);
+    free(out_f32);
+    free(expected);
+    free(mid);
+    free(down_weight);
+    free(up_weight);
+    free(gate_weight);
+    free(input);
+    return 0;
+}
+
 static void compute_rope_expected(const uint16_t *src,
                                   uint32_t n_tokens,
                                   uint32_t position_start,
@@ -2912,6 +3089,7 @@ int main(void) {
     if (test_metal_attention_output_residual_f16() != 0) return 1;
     if (test_metal_dense_swiglu_f16() != 0) return 1;
     if (test_metal_moe_router_f16() != 0) return 1;
+    if (test_metal_moe_selected_experts_decode_f16() != 0) return 1;
     if (test_metal_rope_qk_f16() != 0) return 1;
     if (test_metal_prefill_attention_f16() != 0) return 1;
     if (test_metal_prefill_attention_varlen_f16() != 0) return 1;

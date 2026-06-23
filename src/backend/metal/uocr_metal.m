@@ -311,6 +311,13 @@ typedef struct uocr_metal_moe_router_params {
     uint32_t top_k;
 } uocr_metal_moe_router_params;
 
+typedef struct uocr_metal_moe_selected_params {
+    uint32_t hidden_size;
+    uint32_t intermediate_size;
+    uint32_t top_k;
+    uint32_t reserved;
+} uocr_metal_moe_selected_params;
+
 typedef struct uocr_metal_rope_qk_params {
     uint32_t n_tokens;
     uint32_t heads;
@@ -3117,6 +3124,242 @@ int uocr_metal_context_moe_router_f16(uocr_metal_context *ctx,
         [logits release];
         [weight release];
         [input release];
+    }
+
+    metal_clear_error(error, error_size);
+    return 1;
+}
+
+int uocr_metal_context_moe_selected_experts_decode_f16(uocr_metal_context *ctx,
+                                                       const uint16_t *input_f16,
+                                                       const uint32_t *top_expert_ids,
+                                                       const float *top_weights_f32,
+                                                       const uint16_t *selected_gate_weight_f16,
+                                                       const uint16_t *selected_up_weight_f16,
+                                                       const uint16_t *selected_down_weight_f16,
+                                                       uocr_metal_dense_output_type output_type,
+                                                       void *out,
+                                                       char *error,
+                                                       size_t error_size) {
+    metal_clear_error(error, error_size);
+    if (ctx == NULL || input_f16 == NULL || top_expert_ids == NULL || top_weights_f32 == NULL ||
+        selected_gate_weight_f16 == NULL || selected_up_weight_f16 == NULL || selected_down_weight_f16 == NULL ||
+        out == NULL) {
+        return metal_fail(error, error_size, "invalid Metal MoE selected-expert decode request");
+    }
+    if (output_type != UOCR_METAL_DENSE_OUTPUT_F16 && output_type != UOCR_METAL_DENSE_OUTPUT_F32) {
+        return metal_fail(error,
+                          error_size,
+                          "unsupported Metal MoE selected-expert output type %d",
+                          (int)output_type);
+    }
+    for (uint32_t rank = 0u; rank < UOCR_MOE_TOP_K; ++rank) {
+        if (top_expert_ids[rank] >= UOCR_ROUTED_EXPERTS) {
+            return metal_fail(error,
+                              error_size,
+                              "invalid Metal MoE selected expert id %u at rank %u",
+                              top_expert_ids[rank],
+                              rank);
+        }
+        for (uint32_t prev = 0u; prev < rank; ++prev) {
+            if (top_expert_ids[prev] == top_expert_ids[rank]) {
+                return metal_fail(error,
+                                  error_size,
+                                  "duplicate Metal MoE selected expert id %u",
+                                  top_expert_ids[rank]);
+            }
+        }
+        if (!isfinite(top_weights_f32[rank])) {
+            return metal_fail(error, error_size, "invalid Metal MoE selected expert weight at rank %u", rank);
+        }
+    }
+
+    uint64_t hidden_values = UOCR_HIDDEN_SIZE;
+    uint64_t input_bytes = 0u;
+    uint64_t selected_weight_values = 0u;
+    uint64_t selected_weight_bytes = 0u;
+    uint64_t intermediate_values = 0u;
+    uint64_t intermediate_bytes = 0u;
+    uint64_t top_weights_bytes = 0u;
+    uint64_t output_bytes = 0u;
+    const uint64_t output_element_bytes = output_type == UOCR_METAL_DENSE_OUTPUT_F16 ? 2u : (uint64_t)sizeof(float);
+    if (!checked_mul_u64(hidden_values, 2u, &input_bytes) ||
+        !checked_mul_u64((uint64_t)UOCR_MOE_TOP_K, (uint64_t)UOCR_MOE_EXPERT_INTERMEDIATE, &intermediate_values) ||
+        !checked_mul_u64(intermediate_values, (uint64_t)UOCR_HIDDEN_SIZE, &selected_weight_values) ||
+        !checked_mul_u64(selected_weight_values, 2u, &selected_weight_bytes) ||
+        !checked_mul_u64(intermediate_values, 2u, &intermediate_bytes) ||
+        !checked_mul_u64((uint64_t)UOCR_MOE_TOP_K, (uint64_t)sizeof(float), &top_weights_bytes) ||
+        !checked_mul_u64(hidden_values, output_element_bytes, &output_bytes)) {
+        return metal_fail(error, error_size, "Metal MoE selected-expert byte-size overflow");
+    }
+
+    const uint64_t max_buffer_length = metal_device_max_buffer_length(ctx->device);
+    if (input_bytes > max_buffer_length || selected_weight_bytes > max_buffer_length ||
+        intermediate_bytes > max_buffer_length || top_weights_bytes > max_buffer_length ||
+        output_bytes > max_buffer_length || input_bytes > (uint64_t)SIZE_MAX ||
+        selected_weight_bytes > (uint64_t)SIZE_MAX || intermediate_bytes > (uint64_t)SIZE_MAX ||
+        top_weights_bytes > (uint64_t)SIZE_MAX || output_bytes > (uint64_t)SIZE_MAX) {
+        return metal_fail(error,
+                          error_size,
+                          "Metal MoE selected-expert buffers exceed maxBufferLength %llu",
+                          (unsigned long long)max_buffer_length);
+    }
+
+    @autoreleasepool {
+        id<MTLComputePipelineState> gate_up_pipeline = metal_get_pipeline(ctx,
+                                                                          "uocr_moe_selected_gate_up_f16",
+                                                                          error,
+                                                                          error_size);
+        if (gate_up_pipeline == nil) {
+            return 0;
+        }
+        const char *down_function_name = output_type == UOCR_METAL_DENSE_OUTPUT_F16 ?
+                                             "uocr_moe_selected_down_sum_f16_to_f16" :
+                                             "uocr_moe_selected_down_sum_f16_to_f32";
+        id<MTLComputePipelineState> down_pipeline = metal_get_pipeline(ctx, down_function_name, error, error_size);
+        if (down_pipeline == nil) {
+            return 0;
+        }
+
+        int ok = 0;
+        id<MTLBuffer> input = nil;
+        id<MTLBuffer> gate_weight = nil;
+        id<MTLBuffer> up_weight = nil;
+        id<MTLBuffer> down_weight = nil;
+        id<MTLBuffer> top_weights = nil;
+        id<MTLBuffer> mid = nil;
+        id<MTLBuffer> dst = nil;
+
+        input = [ctx->device newBufferWithBytes:input_f16
+                                         length:(NSUInteger)input_bytes
+                                        options:MTLResourceStorageModeShared];
+        if (input == nil) {
+            (void)metal_fail(error, error_size, "failed to allocate Metal MoE selected input buffer");
+            goto cleanup;
+        }
+        input.label = @"uocr_moe_selected_input_f16";
+
+        gate_weight = [ctx->device newBufferWithBytes:selected_gate_weight_f16
+                                               length:(NSUInteger)selected_weight_bytes
+                                              options:MTLResourceStorageModeShared];
+        if (gate_weight == nil) {
+            (void)metal_fail(error, error_size, "failed to allocate Metal MoE selected gate-weight buffer");
+            goto cleanup;
+        }
+        gate_weight.label = @"uocr_moe_selected_gate_weight_f16";
+
+        up_weight = [ctx->device newBufferWithBytes:selected_up_weight_f16
+                                             length:(NSUInteger)selected_weight_bytes
+                                            options:MTLResourceStorageModeShared];
+        if (up_weight == nil) {
+            (void)metal_fail(error, error_size, "failed to allocate Metal MoE selected up-weight buffer");
+            goto cleanup;
+        }
+        up_weight.label = @"uocr_moe_selected_up_weight_f16";
+
+        down_weight = [ctx->device newBufferWithBytes:selected_down_weight_f16
+                                               length:(NSUInteger)selected_weight_bytes
+                                              options:MTLResourceStorageModeShared];
+        if (down_weight == nil) {
+            (void)metal_fail(error, error_size, "failed to allocate Metal MoE selected down-weight buffer");
+            goto cleanup;
+        }
+        down_weight.label = @"uocr_moe_selected_down_weight_f16";
+
+        top_weights = [ctx->device newBufferWithBytes:top_weights_f32
+                                               length:(NSUInteger)top_weights_bytes
+                                              options:MTLResourceStorageModeShared];
+        if (top_weights == nil) {
+            (void)metal_fail(error, error_size, "failed to allocate Metal MoE selected top-weight buffer");
+            goto cleanup;
+        }
+        top_weights.label = @"uocr_moe_selected_top_weights_f32";
+
+        mid = [ctx->device newBufferWithLength:(NSUInteger)intermediate_bytes options:MTLResourceStorageModeShared];
+        if (mid == nil) {
+            (void)metal_fail(error, error_size, "failed to allocate Metal MoE selected intermediate buffer");
+            goto cleanup;
+        }
+        mid.label = @"uocr_moe_selected_mid_f16";
+        memset([mid contents], 0, (size_t)intermediate_bytes);
+
+        dst = [ctx->device newBufferWithLength:(NSUInteger)output_bytes options:MTLResourceStorageModeShared];
+        if (dst == nil) {
+            (void)metal_fail(error, error_size, "failed to allocate Metal MoE selected output buffer");
+            goto cleanup;
+        }
+        dst.label = @"uocr_moe_selected_output";
+        memset([dst contents], 0, (size_t)output_bytes);
+
+        id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
+        if (cb == nil) {
+            (void)metal_fail(error, error_size, "failed to create Metal MoE selected command buffer");
+            goto cleanup;
+        }
+        cb.label = @"uocr_moe_selected_command_buffer";
+
+        uocr_metal_moe_selected_params params;
+        params.hidden_size = UOCR_HIDDEN_SIZE;
+        params.intermediate_size = UOCR_MOE_EXPERT_INTERMEDIATE;
+        params.top_k = UOCR_MOE_TOP_K;
+        params.reserved = 0u;
+
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        if (enc == nil) {
+            (void)metal_fail(error, error_size, "failed to create Metal MoE selected gate/up command encoder");
+            goto cleanup;
+        }
+        const NSUInteger gate_threads = metal_power2_threadgroup_width(256u, gate_up_pipeline.maxTotalThreadsPerThreadgroup);
+        [enc setComputePipelineState:gate_up_pipeline];
+        [enc setBuffer:input offset:0u atIndex:0u];
+        [enc setBuffer:gate_weight offset:0u atIndex:1u];
+        [enc setBuffer:up_weight offset:0u atIndex:2u];
+        [enc setBuffer:mid offset:0u atIndex:3u];
+        [enc setBytes:&params length:sizeof(params) atIndex:4u];
+        [enc setThreadgroupMemoryLength:gate_threads * 2u * sizeof(float) atIndex:0u];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)intermediate_values, 1u, 1u)
+             threadsPerThreadgroup:MTLSizeMake(gate_threads, 1u, 1u)];
+        [enc endEncoding];
+
+        enc = [cb computeCommandEncoder];
+        if (enc == nil) {
+            (void)metal_fail(error, error_size, "failed to create Metal MoE selected down command encoder");
+            goto cleanup;
+        }
+        const NSUInteger down_threads = metal_power2_threadgroup_width(256u, down_pipeline.maxTotalThreadsPerThreadgroup);
+        [enc setComputePipelineState:down_pipeline];
+        [enc setBuffer:mid offset:0u atIndex:0u];
+        [enc setBuffer:down_weight offset:0u atIndex:1u];
+        [enc setBuffer:top_weights offset:0u atIndex:2u];
+        [enc setBuffer:dst offset:0u atIndex:3u];
+        [enc setBytes:&params length:sizeof(params) atIndex:4u];
+        [enc setThreadgroupMemoryLength:down_threads * sizeof(float) atIndex:0u];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)UOCR_HIDDEN_SIZE, 1u, 1u)
+             threadsPerThreadgroup:MTLSizeMake(down_threads, 1u, 1u)];
+        [enc endEncoding];
+
+        [cb commit];
+        [cb waitUntilCompleted];
+        if (cb.status == MTLCommandBufferStatusError) {
+            NSString *description = cb.error != nil ? [cb.error localizedDescription] : @"unknown command-buffer error";
+            (void)metal_fail(error, error_size, "Metal MoE selected command failed: %s", [description UTF8String]);
+            goto cleanup;
+        }
+
+        memcpy(out, [dst contents], (size_t)output_bytes);
+        ok = 1;
+
+    cleanup:
+        [dst release];
+        [mid release];
+        [top_weights release];
+        [down_weight release];
+        [up_weight release];
+        [gate_weight release];
+        [input release];
+        if (!ok) {
+            return 0;
+        }
     }
 
     metal_clear_error(error, error_size);

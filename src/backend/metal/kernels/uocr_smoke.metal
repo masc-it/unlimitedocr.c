@@ -760,6 +760,126 @@ kernel void uocr_moe_router_softmax_topk_f32(device const float *logits [[buffer
     }
 }
 
+struct UocrMoeSelectedParams {
+    uint hidden_size;
+    uint intermediate_size;
+    uint top_k;
+    uint reserved;
+};
+
+kernel void uocr_moe_selected_gate_up_f16(device const half *src [[buffer(0)]],
+                                          device const half *gate_weight [[buffer(1)]],
+                                          device const half *up_weight [[buffer(2)]],
+                                          device half *mid [[buffer(3)]],
+                                          constant UocrMoeSelectedParams &params [[buffer(4)]],
+                                          threadgroup float *partials [[threadgroup(0)]],
+                                          uint output_index [[threadgroup_position_in_grid]],
+                                          uint tid [[thread_index_in_threadgroup]],
+                                          uint ntg [[threads_per_threadgroup]]) {
+    const uint rank = output_index / params.intermediate_size;
+    const uint out_col = output_index - rank * params.intermediate_size;
+    if (rank >= params.top_k || out_col >= params.intermediate_size) {
+        return;
+    }
+
+    threadgroup float *gate_partials = partials;
+    threadgroup float *up_partials = partials + ntg;
+    float gate_sum = 0.0f;
+    float up_sum = 0.0f;
+    const ulong weight_base = (ulong(rank) * ulong(params.intermediate_size) + ulong(out_col)) *
+                              ulong(params.hidden_size);
+    for (uint k = tid; k < params.hidden_size; k += ntg) {
+        const float x = float(src[k]);
+        gate_sum += x * float(gate_weight[weight_base + ulong(k)]);
+        up_sum += x * float(up_weight[weight_base + ulong(k)]);
+    }
+    gate_partials[tid] = gate_sum;
+    up_partials[tid] = up_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = ntg >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            gate_partials[tid] += gate_partials[tid + stride];
+            up_partials[tid] += up_partials[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tid == 0) {
+        const float gate = gate_partials[0];
+        const float up = up_partials[0];
+        const float silu = gate / (1.0f + exp(-gate));
+        mid[rank * params.intermediate_size + out_col] = half(silu * up);
+    }
+}
+
+static inline float uocr_moe_selected_down_sum_dot_f16(device const half *mid,
+                                                       device const half *down_weight,
+                                                       device const float *top_weights,
+                                                       constant UocrMoeSelectedParams &params,
+                                                       uint out_col,
+                                                       uint tid,
+                                                       uint ntg,
+                                                       threadgroup float *partials) {
+    float sum = 0.0f;
+    for (uint rank = 0; rank < params.top_k; ++rank) {
+        float expert_sum = 0.0f;
+        const ulong mid_base = ulong(rank) * ulong(params.intermediate_size);
+        const ulong weight_base = (ulong(rank) * ulong(params.hidden_size) + ulong(out_col)) *
+                                  ulong(params.intermediate_size);
+        for (uint k = tid; k < params.intermediate_size; k += ntg) {
+            expert_sum += float(mid[mid_base + ulong(k)]) * float(down_weight[weight_base + ulong(k)]);
+        }
+        sum += expert_sum * top_weights[rank];
+    }
+    partials[tid] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = ntg >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            partials[tid] += partials[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    return partials[0];
+}
+
+kernel void uocr_moe_selected_down_sum_f16_to_f16(device const half *mid [[buffer(0)]],
+                                                  device const half *down_weight [[buffer(1)]],
+                                                  device const float *top_weights [[buffer(2)]],
+                                                  device half *dst [[buffer(3)]],
+                                                  constant UocrMoeSelectedParams &params [[buffer(4)]],
+                                                  threadgroup float *partials [[threadgroup(0)]],
+                                                  uint out_col [[threadgroup_position_in_grid]],
+                                                  uint tid [[thread_index_in_threadgroup]],
+                                                  uint ntg [[threads_per_threadgroup]]) {
+    if (out_col >= params.hidden_size) {
+        return;
+    }
+    const float value = uocr_moe_selected_down_sum_dot_f16(mid, down_weight, top_weights, params, out_col, tid, ntg, partials);
+    if (tid == 0) {
+        dst[out_col] = half(value);
+    }
+}
+
+kernel void uocr_moe_selected_down_sum_f16_to_f32(device const half *mid [[buffer(0)]],
+                                                  device const half *down_weight [[buffer(1)]],
+                                                  device const float *top_weights [[buffer(2)]],
+                                                  device float *dst [[buffer(3)]],
+                                                  constant UocrMoeSelectedParams &params [[buffer(4)]],
+                                                  threadgroup float *partials [[threadgroup(0)]],
+                                                  uint out_col [[threadgroup_position_in_grid]],
+                                                  uint tid [[thread_index_in_threadgroup]],
+                                                  uint ntg [[threads_per_threadgroup]]) {
+    if (out_col >= params.hidden_size) {
+        return;
+    }
+    const float value = uocr_moe_selected_down_sum_dot_f16(mid, down_weight, top_weights, params, out_col, tid, ntg, partials);
+    if (tid == 0) {
+        dst[out_col] = value;
+    }
+}
+
 struct UocrRopeQKParams {
     uint n_tokens;
     uint heads;

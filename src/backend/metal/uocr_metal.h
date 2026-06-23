@@ -304,6 +304,26 @@ int uocr_metal_context_moe_router_f16(uocr_metal_context *ctx,
                                       char *error,
                                       size_t error_size);
 
+/* Diagnostic selected-routed-expert decode helper for synthetic decoder tests.
+ * input_f16 is one hidden row [1280]. selected_* weights are compacted in
+ * selected-rank-major order according to top_expert_ids: gate/up are
+ * [6,896,1280], down is [6,1280,896]. Computes the routed sum of the six
+ * fp16 experts with fp32 dot accumulation, fp16 SwiGLU intermediates, and
+ * fp32 router weights applied after each expert down projection. Shared
+ * experts and decoder residual are intentionally separate plan items.
+ */
+int uocr_metal_context_moe_selected_experts_decode_f16(uocr_metal_context *ctx,
+                                                       const uint16_t *input_f16,
+                                                       const uint32_t *top_expert_ids,
+                                                       const float *top_weights_f32,
+                                                       const uint16_t *selected_gate_weight_f16,
+                                                       const uint16_t *selected_up_weight_f16,
+                                                       const uint16_t *selected_down_weight_f16,
+                                                       uocr_metal_dense_output_type output_type,
+                                                       void *out,
+                                                       char *error,
+                                                       size_t error_size);
+
 /* Diagnostic RoPE helper for synthetic decoder tests. Applies Unlimited-OCR's
  * Llama-style split-half RoPE to projected Q and K tensors shaped
  * [n_tokens, 10 heads, 128 dim], using monotonically increasing positions
