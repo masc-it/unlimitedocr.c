@@ -388,6 +388,226 @@ static int test_metal_rmsnorm_f16(void) {
     return 0;
 }
 
+static int test_metal_recent_decoder_primitives_stress(void) {
+    if (!uocr_metal_is_available()) {
+        return 0;
+    }
+
+    char error[1024];
+    memset(error, 0, sizeof(error));
+    uocr_metal_context *ctx = uocr_metal_context_create(UOCR_TEST_METAL_RESOURCE_PATH, error, sizeof(error));
+    CHECK(ctx != NULL);
+
+    const uint16_t half_pool[] = {
+        0x0000u, /* 0.0 */
+        0x3400u, /* 0.25 */
+        0x3800u, /* 0.5 */
+        0x3c00u, /* 1.0 */
+        0xbc00u, /* -1.0 */
+        0x4000u, /* 2.0 */
+        0xc000u, /* -2.0 */
+        0x4200u, /* 3.0 */
+        0x5000u  /* 32.0; catches accidental fp16 RMS variance overflow */
+    };
+    const uint32_t half_pool_count = (uint32_t)(sizeof(half_pool) / sizeof(half_pool[0]));
+
+    {
+        enum { TABLE_ROWS = 257, HIDDEN = 1280, OUT_ROWS = 17 };
+        uint16_t table[TABLE_ROWS * HIDDEN];
+        uint16_t out[OUT_ROWS * HIDDEN];
+        const int32_t row_ids[OUT_ROWS] = {256, 0, 128, 7, 7, 255, 1, 64, 200, 31, 16, 127, 2, 254, 3, 129, 42};
+        for (uint32_t i = 0u; i < (uint32_t)(TABLE_ROWS * HIDDEN); ++i) {
+            table[i] = half_pool[(i * 13u + i / 17u + 5u) % half_pool_count];
+        }
+        memset(out, 0, sizeof(out));
+        CHECK(uocr_metal_context_get_rows_f16(ctx,
+                                              table,
+                                              TABLE_ROWS,
+                                              HIDDEN,
+                                              row_ids,
+                                              OUT_ROWS,
+                                              UOCR_METAL_GET_ROWS_OUTPUT_F16,
+                                              out,
+                                              error,
+                                              sizeof(error)) == 1);
+        CHECK(error[0] == '\0');
+        for (uint32_t row = 0u; row < (uint32_t)OUT_ROWS; ++row) {
+            for (uint32_t col = 0u; col < (uint32_t)HIDDEN; ++col) {
+                CHECK(out[row * (uint32_t)HIDDEN + col] == table[(uint32_t)row_ids[row] * (uint32_t)HIDDEN + col]);
+            }
+        }
+    }
+
+    {
+        enum { TABLE_ROWS = 64, HIDDEN = 1280, TOKENS = 9, IMAGE_TOKENS = 3 };
+        uint16_t table[TABLE_ROWS * HIDDEN];
+        uint16_t image_features[IMAGE_TOKENS * HIDDEN];
+        uint16_t out[TOKENS * HIDDEN];
+        const int32_t ids[TOKENS] = {0, 17, 999999, -7, 123456, 63, 4, 1, 2};
+        for (uint32_t i = 0u; i < (uint32_t)(TABLE_ROWS * HIDDEN); ++i) {
+            table[i] = half_pool[(i * 7u + 3u) % half_pool_count];
+        }
+        for (uint32_t i = 0u; i < (uint32_t)(IMAGE_TOKENS * HIDDEN); ++i) {
+            image_features[i] = (uint16_t)(0x6000u + (i % 1024u));
+        }
+        memset(out, 0, sizeof(out));
+        CHECK(uocr_metal_context_assemble_prompt_f16(ctx,
+                                                     table,
+                                                     TABLE_ROWS,
+                                                     HIDDEN,
+                                                     ids,
+                                                     TOKENS,
+                                                     2u,
+                                                     IMAGE_TOKENS,
+                                                     image_features,
+                                                     out,
+                                                     error,
+                                                     sizeof(error)) == 1);
+        CHECK(error[0] == '\0');
+        for (uint32_t token = 0u; token < (uint32_t)TOKENS; ++token) {
+            for (uint32_t col = 0u; col < (uint32_t)HIDDEN; ++col) {
+                uint16_t expected = 0u;
+                if (token >= 2u && token < 2u + (uint32_t)IMAGE_TOKENS) {
+                    expected = image_features[(token - 2u) * (uint32_t)HIDDEN + col];
+                } else {
+                    expected = table[(uint32_t)ids[token] * (uint32_t)HIDDEN + col];
+                }
+                CHECK(out[token * (uint32_t)HIDDEN + col] == expected);
+            }
+        }
+
+        const int32_t span_at_start_ids[TOKENS] = {-123, 999999, 3, 4, 5, 6, 7, 8, 9};
+        memset(out, 0, sizeof(out));
+        CHECK(uocr_metal_context_assemble_prompt_f16(ctx,
+                                                     table,
+                                                     TABLE_ROWS,
+                                                     HIDDEN,
+                                                     span_at_start_ids,
+                                                     TOKENS,
+                                                     0u,
+                                                     2u,
+                                                     image_features,
+                                                     out,
+                                                     error,
+                                                     sizeof(error)) == 1);
+        CHECK(error[0] == '\0');
+        for (uint32_t col = 0u; col < (uint32_t)HIDDEN; ++col) {
+            CHECK(out[col] == image_features[col]);
+            CHECK(out[(uint32_t)HIDDEN + col] == image_features[(uint32_t)HIDDEN + col]);
+        }
+
+        const int32_t span_at_end_ids[TOKENS] = {0, 1, 2, 3, 4, 5, 6, -123, 999999};
+        memset(out, 0, sizeof(out));
+        CHECK(uocr_metal_context_assemble_prompt_f16(ctx,
+                                                     table,
+                                                     TABLE_ROWS,
+                                                     HIDDEN,
+                                                     span_at_end_ids,
+                                                     TOKENS,
+                                                     7u,
+                                                     2u,
+                                                     image_features,
+                                                     out,
+                                                     error,
+                                                     sizeof(error)) == 1);
+        CHECK(error[0] == '\0');
+        for (uint32_t col = 0u; col < (uint32_t)HIDDEN; ++col) {
+            CHECK(out[7u * (uint32_t)HIDDEN + col] == image_features[col]);
+            CHECK(out[8u * (uint32_t)HIDDEN + col] == image_features[(uint32_t)HIDDEN + col]);
+        }
+
+        CHECK(uocr_metal_context_assemble_prompt_f16(ctx,
+                                                     table,
+                                                     TABLE_ROWS,
+                                                     HIDDEN,
+                                                     ids,
+                                                     TOKENS,
+                                                     0u,
+                                                     0u,
+                                                     NULL,
+                                                     out,
+                                                     error,
+                                                     sizeof(error)) == 0);
+        CHECK(strstr(error, "UINT32_MAX image span start") != NULL);
+
+        CHECK(uocr_metal_context_assemble_prompt_f16(ctx,
+                                                     table,
+                                                     TABLE_ROWS,
+                                                     HIDDEN,
+                                                     ids,
+                                                     TOKENS,
+                                                     2u,
+                                                     IMAGE_TOKENS,
+                                                     NULL,
+                                                     out,
+                                                     error,
+                                                     sizeof(error)) == 0);
+        CHECK(strstr(error, "requires image features") != NULL);
+
+        const int32_t invalid_outside_span[TOKENS] = {0, TABLE_ROWS, 999999, -7, 123456, 2, 3, 4, 5};
+        CHECK(uocr_metal_context_assemble_prompt_f16(ctx,
+                                                     table,
+                                                     TABLE_ROWS,
+                                                     HIDDEN,
+                                                     invalid_outside_span,
+                                                     TOKENS,
+                                                     2u,
+                                                     IMAGE_TOKENS,
+                                                     image_features,
+                                                     out,
+                                                     error,
+                                                     sizeof(error)) == 0);
+        CHECK(strstr(error, "outside embedding rows") != NULL);
+    }
+
+    {
+        enum { ROWS = 2, HIDDEN = 1280 };
+        uint16_t input[ROWS * HIDDEN];
+        uint16_t weight[HIDDEN];
+        float out[ROWS * HIDDEN];
+        float expected[ROWS * HIDDEN];
+        for (uint32_t col = 0u; col < (uint32_t)HIDDEN; ++col) {
+            input[col] = 0x5000u; /* 32.0: fp16 sum of squares would overflow. */
+            weight[col] = half_pool[(col * 5u + 3u) % half_pool_count];
+        }
+        for (uint32_t col = 0u; col < (uint32_t)HIDDEN; ++col) {
+            input[(uint32_t)HIDDEN + col] = half_pool[(col * 11u + 1u) % (half_pool_count - 1u)];
+        }
+        const float eps = 1.0e-6f;
+        for (uint32_t row = 0u; row < (uint32_t)ROWS; ++row) {
+            float sum = 0.0f;
+            for (uint32_t col = 0u; col < (uint32_t)HIDDEN; ++col) {
+                const float x = f16_bits_to_f32(input[row * (uint32_t)HIDDEN + col]);
+                sum += x * x;
+            }
+            const float scale = 1.0f / sqrtf(sum / (float)HIDDEN + eps);
+            for (uint32_t col = 0u; col < (uint32_t)HIDDEN; ++col) {
+                const float x = f16_bits_to_f32(input[row * (uint32_t)HIDDEN + col]);
+                const float w = f16_bits_to_f32(weight[col]);
+                expected[row * (uint32_t)HIDDEN + col] = x * scale * w;
+            }
+        }
+        memset(out, 0, sizeof(out));
+        CHECK(uocr_metal_context_rmsnorm_f16(ctx,
+                                             input,
+                                             weight,
+                                             ROWS,
+                                             HIDDEN,
+                                             eps,
+                                             UOCR_METAL_RMSNORM_OUTPUT_F32,
+                                             out,
+                                             error,
+                                             sizeof(error)) == 1);
+        CHECK(error[0] == '\0');
+        for (uint32_t i = 0u; i < (uint32_t)(ROWS * HIDDEN); ++i) {
+            CHECK(fabsf(out[i] - expected[i]) < 3.0e-4f);
+        }
+    }
+
+    uocr_metal_context_destroy(ctx);
+    return 0;
+}
+
 static int test_metal_runtime_arenas(void) {
     if (!uocr_metal_is_available()) {
         return 0;
@@ -542,6 +762,7 @@ int main(void) {
     if (test_metal_get_rows_f16() != 0) return 1;
     if (test_metal_prompt_assembly_f16() != 0) return 1;
     if (test_metal_rmsnorm_f16() != 0) return 1;
+    if (test_metal_recent_decoder_primitives_stress() != 0) return 1;
     if (test_metal_runtime_arenas() != 0) return 1;
     if (test_metal_model_mapping() != 0) return 1;
     if (test_public_engine_open_initializes_metal() != 0) return 1;
