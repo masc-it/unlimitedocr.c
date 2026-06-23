@@ -286,6 +286,24 @@ int uocr_metal_context_dense_swiglu_f16(uocr_metal_context *ctx,
                                         char *error,
                                         size_t error_size);
 
+/* Diagnostic shared-expert MLP helper for synthetic MoE decoder tests.
+ * Computes shared_experts(input) for layers 1..11 with shapes
+ * input [n_tokens,1280], gate/up [1792,1280], down [1280,1792]. Dot products
+ * accumulate in fp32 and the SwiGLU intermediate is stored as fp16, matching
+ * the dense/routed MLP diagnostic policy. The caller adds this output to the
+ * routed expert result in the following MoE-combine stage.
+ */
+int uocr_metal_context_moe_shared_experts_f16(uocr_metal_context *ctx,
+                                              const uint16_t *input_f16,
+                                              const uint16_t *shared_gate_weight_f16,
+                                              const uint16_t *shared_up_weight_f16,
+                                              const uint16_t *shared_down_weight_f16,
+                                              uint32_t n_tokens,
+                                              uocr_metal_dense_output_type output_type,
+                                              void *out,
+                                              char *error,
+                                              size_t error_size);
+
 /* Diagnostic MoE router helper for synthetic decoder tests. Computes router
  * logits = hidden @ router_weight.T for [n_tokens,1280] hidden states and
  * [64,1280] fp16 router weights, accumulates logits in fp32, softmaxes over

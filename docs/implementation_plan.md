@@ -644,7 +644,7 @@ First implementation slice, in order:
 - [x] Adapt DS4 `argsort.metal` / `dsv4_misc.metal` top-k patterns for OCR's simpler top-6.
 - [x] Implement selected-expert fp16 path for decode.
 - [ ] Implement grouped expert path for prefill later; simple token-by-token selected expert path is acceptable for first parity.
-- [ ] Implement shared experts for every MoE layer with intermediate `1792`.
+- [x] Implement shared experts for every MoE layer with intermediate `1792`.
 - [ ] Add routed expert result + shared expert result.
 
 ### 14.4 LM head and generation loop
