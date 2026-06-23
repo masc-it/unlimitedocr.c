@@ -860,6 +860,97 @@ static uint32_t kv_cache_token_for_position(uint32_t position, uint32_t prompt_l
     return prompt_length + ((position - prompt_length) % UOCR_GENERATED_RING_WINDOW);
 }
 
+static int test_metal_kv_cache_layout_helpers(void) {
+    uint32_t cache_token = UINT32_MAX;
+    uint32_t attention_length = 0u;
+    uint64_t offset = 0u;
+
+    CHECK(uocr_metal_kv_cache_token_for_position(7u, 16u, 0u, &cache_token) == 1);
+    CHECK(cache_token == 0u);
+    CHECK(uocr_metal_kv_cache_token_for_position(7u, 16u, 6u, &cache_token) == 1);
+    CHECK(cache_token == 6u);
+    CHECK(uocr_metal_kv_cache_token_for_position(7u, 16u, 7u, &cache_token) == 1);
+    CHECK(cache_token == 7u);
+    CHECK(uocr_metal_kv_cache_token_for_position(7u, 16u, 7u + UOCR_GENERATED_RING_WINDOW - 1u, &cache_token) == 1);
+    CHECK(cache_token == 7u + UOCR_GENERATED_RING_WINDOW - 1u);
+    CHECK(uocr_metal_kv_cache_token_for_position(7u, 16u, 7u + UOCR_GENERATED_RING_WINDOW, &cache_token) == 1);
+    CHECK(cache_token == 7u);
+    CHECK(uocr_metal_kv_cache_token_for_position(0u, 16u, 0u, &cache_token) == 0);
+    CHECK(uocr_metal_kv_cache_token_for_position(17u, 16u, 0u, &cache_token) == 0);
+    CHECK(uocr_metal_kv_cache_token_for_position(7u, 16u, UOCR_MAX_POSITIONS, &cache_token) == 0);
+
+    CHECK(uocr_metal_kv_cache_attention_length(7u, 0u, &attention_length) == 1);
+    CHECK(attention_length == 7u);
+    CHECK(uocr_metal_kv_cache_attention_length(7u, 5u, &attention_length) == 1);
+    CHECK(attention_length == 12u);
+    CHECK(uocr_metal_kv_cache_attention_length(7u, UOCR_GENERATED_RING_WINDOW, &attention_length) == 1);
+    CHECK(attention_length == 7u + UOCR_GENERATED_RING_WINDOW);
+    CHECK(uocr_metal_kv_cache_attention_length(7u, UOCR_GENERATED_RING_WINDOW + 9u, &attention_length) == 1);
+    CHECK(attention_length == 7u + UOCR_GENERATED_RING_WINDOW);
+    CHECK(uocr_metal_kv_cache_attention_length(0u, 1u, &attention_length) == 0);
+
+    uocr_metal_kv_cache_layout empty_layout;
+    memset(&empty_layout, 0, sizeof(empty_layout));
+    CHECK(uocr_metal_kv_cache_offset(&empty_layout, 0, 0u, 0u, 0u, 0u, 0u, &offset) == 0);
+
+    if (!uocr_metal_is_available()) {
+        return 0;
+    }
+
+    char error[1024];
+    memset(error, 0, sizeof(error));
+    uocr_metal_context *ctx = uocr_metal_context_create(UOCR_TEST_METAL_RESOURCE_PATH, error, sizeof(error));
+    CHECK(ctx != NULL);
+
+    uocr_metal_kv_cache_layout layout;
+    memset(&layout, 0, sizeof(layout));
+    CHECK(uocr_metal_context_get_kv_cache_layout(ctx, &layout) == 0);
+    CHECK(uocr_metal_context_allocate_runtime_arenas(ctx, 2u, 16u, error, sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    CHECK(uocr_metal_context_get_kv_cache_layout(ctx, &layout) == 1);
+    CHECK(layout.decoder_layers == UOCR_DECODER_LAYERS);
+    CHECK(layout.batch_slots == 2u);
+    CHECK(layout.prompt_token_capacity == 16u);
+    CHECK(layout.cache_token_capacity == 16u + UOCR_GENERATED_RING_WINDOW);
+    CHECK(layout.kv_heads == UOCR_KV_HEADS);
+    CHECK(layout.head_dim == UOCR_HEAD_DIM);
+    CHECK(layout.generated_ring_window == UOCR_GENERATED_RING_WINDOW);
+    CHECK(layout.token_stride_bytes == (uint64_t)UOCR_KV_HEADS * (uint64_t)UOCR_HEAD_DIM * 2u);
+    CHECK(layout.slot_stride_bytes == (uint64_t)layout.cache_token_capacity * layout.token_stride_bytes);
+    CHECK(layout.layer_stride_bytes == (uint64_t)layout.batch_slots * layout.slot_stride_bytes);
+    CHECK(layout.tensor_bytes == (uint64_t)UOCR_DECODER_LAYERS * layout.layer_stride_bytes);
+    CHECK(layout.k_offset_bytes == 0u);
+    CHECK(layout.v_offset_bytes == layout.tensor_bytes);
+    CHECK(layout.total_bytes == layout.tensor_bytes * 2u);
+    CHECK(layout.total_bytes == uocr_metal_context_runtime_arena_capacity(ctx, UOCR_METAL_ARENA_KV_CACHE));
+
+    const uint32_t layer = 2u;
+    const uint32_t slot = 1u;
+    const uint32_t token = 9u;
+    const uint32_t head = 4u;
+    const uint32_t dim = 5u;
+    const uint64_t expected_inner = (uint64_t)layer * layout.layer_stride_bytes +
+                                    (uint64_t)slot * layout.slot_stride_bytes +
+                                    (uint64_t)token * layout.token_stride_bytes +
+                                    (uint64_t)head * (uint64_t)UOCR_HEAD_DIM * 2u +
+                                    (uint64_t)dim * 2u;
+    CHECK(uocr_metal_kv_cache_offset(&layout, 0, layer, slot, token, head, dim, &offset) == 1);
+    CHECK(offset == layout.k_offset_bytes + expected_inner);
+    CHECK(uocr_metal_kv_cache_offset(&layout, 1, layer, slot, token, head, dim, &offset) == 1);
+    CHECK(offset == layout.v_offset_bytes + expected_inner);
+    CHECK(uocr_metal_kv_cache_offset(&layout, 2, layer, slot, token, head, dim, &offset) == 0);
+    CHECK(uocr_metal_kv_cache_offset(&layout, 0, UOCR_DECODER_LAYERS, slot, token, head, dim, &offset) == 0);
+    CHECK(uocr_metal_kv_cache_offset(&layout, 0, layer, 2u, token, head, dim, &offset) == 0);
+    CHECK(uocr_metal_kv_cache_offset(&layout, 0, layer, slot, layout.cache_token_capacity, head, dim, &offset) == 0);
+    CHECK(uocr_metal_kv_cache_offset(&layout, 0, layer, slot, token, UOCR_KV_HEADS, dim, &offset) == 0);
+    CHECK(uocr_metal_kv_cache_offset(&layout, 0, layer, slot, token, head, UOCR_HEAD_DIM, &offset) == 0);
+
+    uocr_metal_context_release_runtime_arenas(ctx);
+    CHECK(uocr_metal_context_get_kv_cache_layout(ctx, &layout) == 0);
+    uocr_metal_context_destroy(ctx);
+    return 0;
+}
+
 static int test_metal_kv_cache_write_f16(void) {
     if (!uocr_metal_is_available()) {
         return 0;
@@ -1449,6 +1540,7 @@ int main(void) {
     if (test_metal_dense_f16() != 0) return 1;
     if (test_metal_attention_qkvo_f16() != 0) return 1;
     if (test_metal_rope_qk_f16() != 0) return 1;
+    if (test_metal_kv_cache_layout_helpers() != 0) return 1;
     if (test_metal_kv_cache_write_f16() != 0) return 1;
     if (test_metal_recent_decoder_primitives_stress() != 0) return 1;
     if (test_metal_runtime_arenas() != 0) return 1;

@@ -76,6 +76,8 @@ struct uocr_metal_context {
     uint64_t last_model_warmup_bytes;
     uocr_metal_scratch_buffer scratch[UOCR_METAL_SCRATCH_COUNT];
     uocr_metal_runtime_arena runtime_arenas[UOCR_METAL_ARENA_COUNT];
+    uocr_metal_kv_cache_layout kv_cache_layout;
+    int has_kv_cache_layout;
 };
 
 static int metal_fail(char *error, size_t error_size, const char *fmt, ...) {
@@ -1220,6 +1222,50 @@ static int runtime_arena_is_cpu_visible(uocr_metal_runtime_arena_slot slot) {
     return slot == UOCR_METAL_ARENA_LOGITS_READBACK;
 }
 
+static int metal_init_kv_cache_layout(uint32_t batch_slots,
+                                      uint32_t prompt_token_capacity,
+                                      uocr_metal_kv_cache_layout *out_layout) {
+    if (out_layout == NULL || batch_slots == 0u || prompt_token_capacity == 0u) {
+        return 0;
+    }
+
+    uint64_t cache_token_capacity = 0u;
+    uint64_t token_stride = 0u;
+    uint64_t slot_stride = 0u;
+    uint64_t layer_stride = 0u;
+    uint64_t tensor_bytes = 0u;
+    uint64_t total_bytes = 0u;
+    if (!checked_add_u64((uint64_t)prompt_token_capacity,
+                         (uint64_t)UOCR_GENERATED_RING_WINDOW,
+                         &cache_token_capacity) ||
+        cache_token_capacity > (uint64_t)UINT32_MAX ||
+        !checked_mul_u64((uint64_t)UOCR_KV_HEADS, (uint64_t)UOCR_HEAD_DIM, &token_stride) ||
+        !checked_mul_u64(token_stride, 2u, &token_stride) ||
+        !checked_mul_u64(cache_token_capacity, token_stride, &slot_stride) ||
+        !checked_mul_u64((uint64_t)batch_slots, slot_stride, &layer_stride) ||
+        !checked_mul_u64((uint64_t)UOCR_DECODER_LAYERS, layer_stride, &tensor_bytes) ||
+        !checked_mul_u64(tensor_bytes, 2u, &total_bytes)) {
+        return 0;
+    }
+
+    memset(out_layout, 0, sizeof(*out_layout));
+    out_layout->decoder_layers = UOCR_DECODER_LAYERS;
+    out_layout->batch_slots = batch_slots;
+    out_layout->prompt_token_capacity = prompt_token_capacity;
+    out_layout->cache_token_capacity = (uint32_t)cache_token_capacity;
+    out_layout->kv_heads = UOCR_KV_HEADS;
+    out_layout->head_dim = UOCR_HEAD_DIM;
+    out_layout->generated_ring_window = UOCR_GENERATED_RING_WINDOW;
+    out_layout->token_stride_bytes = token_stride;
+    out_layout->slot_stride_bytes = slot_stride;
+    out_layout->layer_stride_bytes = layer_stride;
+    out_layout->tensor_bytes = tensor_bytes;
+    out_layout->k_offset_bytes = 0u;
+    out_layout->v_offset_bytes = tensor_bytes;
+    out_layout->total_bytes = total_bytes;
+    return 1;
+}
+
 static int runtime_arena_capacities(uint32_t batch_slots,
                                     uint32_t prompt_token_capacity,
                                     uint64_t capacities[UOCR_METAL_ARENA_COUNT]) {
@@ -1279,6 +1325,8 @@ void uocr_metal_context_release_runtime_arenas(uocr_metal_context *ctx) {
             arena->capacity = 0u;
             arena->cpu_visible = 0;
         }
+        memset(&ctx->kv_cache_layout, 0, sizeof(ctx->kv_cache_layout));
+        ctx->has_kv_cache_layout = 0;
     }
 }
 
@@ -1299,6 +1347,12 @@ int uocr_metal_context_allocate_runtime_arenas(uocr_metal_context *ctx,
                           error_size,
                           "failed to estimate Metal runtime arena sizes: %s",
                           uocr_status_string(estimate_status));
+    }
+
+    uocr_metal_kv_cache_layout kv_layout;
+    if (!metal_init_kv_cache_layout(batch_slots, prompt_token_capacity, &kv_layout) ||
+        kv_layout.total_bytes != capacities[UOCR_METAL_ARENA_KV_CACHE]) {
+        return metal_fail(error, error_size, "failed to build Metal KV cache layout");
     }
 
     const uint64_t max_buffer_length = metal_device_max_buffer_length(ctx->device);
@@ -1339,6 +1393,8 @@ int uocr_metal_context_allocate_runtime_arenas(uocr_metal_context *ctx,
             ctx->runtime_arenas[i].capacity = bytes;
             ctx->runtime_arenas[i].cpu_visible = cpu_visible;
         }
+        ctx->kv_cache_layout = kv_layout;
+        ctx->has_kv_cache_layout = 1;
     }
     return 1;
 }
@@ -1362,6 +1418,79 @@ uint64_t uocr_metal_context_total_runtime_arena_capacity(const uocr_metal_contex
         }
     }
     return total;
+}
+
+int uocr_metal_context_get_kv_cache_layout(const uocr_metal_context *ctx,
+                                           uocr_metal_kv_cache_layout *out_layout) {
+    if (ctx == NULL || out_layout == NULL || !ctx->has_kv_cache_layout) {
+        return 0;
+    }
+    *out_layout = ctx->kv_cache_layout;
+    return 1;
+}
+
+int uocr_metal_kv_cache_offset(const uocr_metal_kv_cache_layout *layout,
+                               int value_cache,
+                               uint32_t layer,
+                               uint32_t slot,
+                               uint32_t cache_token,
+                               uint32_t head,
+                               uint32_t dim,
+                               uint64_t *out_offset_bytes) {
+    if (layout == NULL || out_offset_bytes == NULL || (value_cache != 0 && value_cache != 1) ||
+        layout->total_bytes < 2u || layer >= layout->decoder_layers || slot >= layout->batch_slots ||
+        cache_token >= layout->cache_token_capacity || head >= layout->kv_heads || dim >= layout->head_dim) {
+        return 0;
+    }
+
+    uint64_t offset = value_cache ? layout->v_offset_bytes : layout->k_offset_bytes;
+    uint64_t term = 0u;
+    if (!checked_mul_u64((uint64_t)layer, layout->layer_stride_bytes, &term) ||
+        !checked_add_u64(offset, term, &offset) ||
+        !checked_mul_u64((uint64_t)slot, layout->slot_stride_bytes, &term) ||
+        !checked_add_u64(offset, term, &offset) ||
+        !checked_mul_u64((uint64_t)cache_token, layout->token_stride_bytes, &term) ||
+        !checked_add_u64(offset, term, &offset) ||
+        !checked_mul_u64((uint64_t)head, (uint64_t)layout->head_dim * 2u, &term) ||
+        !checked_add_u64(offset, term, &offset) ||
+        !checked_mul_u64((uint64_t)dim, 2u, &term) ||
+        !checked_add_u64(offset, term, &offset) ||
+        offset > layout->total_bytes - 2u) {
+        return 0;
+    }
+
+    *out_offset_bytes = offset;
+    return 1;
+}
+
+int uocr_metal_kv_cache_token_for_position(uint32_t prompt_length,
+                                           uint32_t prompt_token_capacity,
+                                           uint32_t position,
+                                           uint32_t *out_cache_token) {
+    if (out_cache_token == NULL || prompt_length == 0u || prompt_length > prompt_token_capacity ||
+        position >= UOCR_MAX_POSITIONS) {
+        return 0;
+    }
+    if (position < prompt_length) {
+        *out_cache_token = position;
+        return 1;
+    }
+    *out_cache_token = prompt_length + ((position - prompt_length) % UOCR_GENERATED_RING_WINDOW);
+    return 1;
+}
+
+int uocr_metal_kv_cache_attention_length(uint32_t prompt_length,
+                                         uint32_t generated_count,
+                                         uint32_t *out_attention_length) {
+    if (out_attention_length == NULL || prompt_length == 0u) {
+        return 0;
+    }
+    const uint32_t live_generated = generated_count < UOCR_GENERATED_RING_WINDOW ? generated_count : UOCR_GENERATED_RING_WINDOW;
+    if (prompt_length > UINT32_MAX - live_generated) {
+        return 0;
+    }
+    *out_attention_length = prompt_length + live_generated;
+    return 1;
 }
 
 int uocr_metal_context_get_rows_f16(uocr_metal_context *ctx,

@@ -15,7 +15,7 @@ Implemented first native scaffold:
 - `include/unlimitedocr.h` C ABI
 - `libunlimitedocr` shared library stub
 - CPU reference backend placeholder
-- macOS Metal backend skeleton with runtime source compilation, mmap/no-copy smoke test, `.uocr` no-copy model view mapping/warmup, transient retain tracking, reusable named scratch buffers, long-lived runtime arenas, fp16 get-rows gather, direct prompt assembly, fp16 RMSNorm, fp16 dense kernels, fp16 attention Q/K/V/O projections, split-half RoPE, and KV cache writes
+- macOS Metal backend skeleton with runtime source compilation, mmap/no-copy smoke test, `.uocr` no-copy model view mapping/warmup, transient retain tracking, reusable named scratch buffers, long-lived runtime arenas, fp16 get-rows gather, direct prompt assembly, fp16 RMSNorm, fp16 dense kernels, fp16 attention Q/K/V/O projections, split-half RoPE, and KV cache layout/writes
 - prepared-request validation foundation plus per-sequence prompt/image span state
 - upstream-compatible sliding-window no-repeat n-gram logits processor
 - DS4-style internal allocation wrappers with live/peak accounting and no-allocation guard primitive

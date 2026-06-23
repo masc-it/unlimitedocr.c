@@ -59,6 +59,24 @@ typedef enum uocr_metal_dense_output_type {
     UOCR_METAL_DENSE_OUTPUT_F32 = 1
 } uocr_metal_dense_output_type;
 
+typedef struct uocr_metal_kv_cache_layout {
+    uint32_t decoder_layers;
+    uint32_t batch_slots;
+    uint32_t prompt_token_capacity;
+    uint32_t cache_token_capacity;
+    uint32_t kv_heads;
+    uint32_t head_dim;
+    uint32_t generated_ring_window;
+    uint32_t reserved;
+    uint64_t token_stride_bytes;
+    uint64_t slot_stride_bytes;
+    uint64_t layer_stride_bytes;
+    uint64_t tensor_bytes;
+    uint64_t k_offset_bytes;
+    uint64_t v_offset_bytes;
+    uint64_t total_bytes;
+} uocr_metal_kv_cache_layout;
+
 int uocr_metal_is_available(void);
 const char *uocr_metal_backend_name(void);
 uint64_t uocr_metal_recommended_working_set_size(void);
@@ -106,6 +124,23 @@ void uocr_metal_context_release_runtime_arenas(uocr_metal_context *ctx);
 uint64_t uocr_metal_context_runtime_arena_capacity(const uocr_metal_context *ctx,
                                                    uocr_metal_runtime_arena_slot slot);
 uint64_t uocr_metal_context_total_runtime_arena_capacity(const uocr_metal_context *ctx);
+int uocr_metal_context_get_kv_cache_layout(const uocr_metal_context *ctx,
+                                           uocr_metal_kv_cache_layout *out_layout);
+int uocr_metal_kv_cache_offset(const uocr_metal_kv_cache_layout *layout,
+                               int value_cache,
+                               uint32_t layer,
+                               uint32_t slot,
+                               uint32_t cache_token,
+                               uint32_t head,
+                               uint32_t dim,
+                               uint64_t *out_offset_bytes);
+int uocr_metal_kv_cache_token_for_position(uint32_t prompt_length,
+                                           uint32_t prompt_token_capacity,
+                                           uint32_t position,
+                                           uint32_t *out_cache_token);
+int uocr_metal_kv_cache_attention_length(uint32_t prompt_length,
+                                         uint32_t generated_count,
+                                         uint32_t *out_attention_length);
 
 /* Diagnostic get-rows entry point used by synthetic tests. Runtime prompt
  * assembly should bind mmap-backed model buffers directly and reuse the same

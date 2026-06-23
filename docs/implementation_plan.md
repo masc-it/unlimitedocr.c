@@ -615,11 +615,11 @@ First implementation slice, in order:
   - [x] position ids monotonically increasing
   - [x] theta `10000`
 - [x] Implement KV cache write kernel.
-- [ ] Allocate KV cache layout:
-  - [ ] K: `[layer][slot][max_prompt_tokens + 128][10][128]` fp16
-  - [ ] V: `[layer][slot][max_prompt_tokens + 128][10][128]` fp16
-  - [ ] per sequence, ring slots start at actual `prefill_len`, not at `max_prompt_tokens`
-  - [ ] attention length uses actual prompt tokens plus live generated-ring tokens; unused prompt capacity is never attended
+- [x] Allocate KV cache layout:
+  - [x] K: `[layer][slot][max_prompt_tokens + 128][10][128]` fp16
+  - [x] V: `[layer][slot][max_prompt_tokens + 128][10][128]` fp16
+  - [x] per sequence, ring slots start at actual `prefill_len`, not at `max_prompt_tokens`
+  - [x] attention length uses actual prompt tokens plus live generated-ring tokens; unused prompt capacity is never attended
 - [ ] Implement prompt prefill attention over full prompt with causal mask.
 - [ ] Adapt gradients.c `sdpa_varlen` for prefill where useful.
 - [ ] Implement decode attention for one token attending to full prompt plus generated ring.
