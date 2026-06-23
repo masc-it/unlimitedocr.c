@@ -253,6 +253,21 @@ int uocr_metal_context_attention_qkvo_f16(uocr_metal_context *ctx,
                                           char *error,
                                           size_t error_size);
 
+/* Diagnostic attention output helper for synthetic decoder tests. Computes
+ * residual + (attention_context @ o_proj_weight.T), where tensors are shaped
+ * [n_tokens, 1280] and o_proj_weight is row-major [1280,1280]. Dot products
+ * are accumulated in fp32 before the residual add.
+ */
+int uocr_metal_context_attention_output_residual_f16(uocr_metal_context *ctx,
+                                                     const uint16_t *attention_context_f16,
+                                                     const uint16_t *o_weight_f16,
+                                                     const uint16_t *residual_f16,
+                                                     uint32_t n_tokens,
+                                                     uocr_metal_dense_output_type output_type,
+                                                     void *out,
+                                                     char *error,
+                                                     size_t error_size);
+
 /* Diagnostic RoPE helper for synthetic decoder tests. Applies Unlimited-OCR's
  * Llama-style split-half RoPE to projected Q and K tensors shaped
  * [n_tokens, 10 heads, 128 dim], using monotonically increasing positions

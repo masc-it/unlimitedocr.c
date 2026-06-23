@@ -694,6 +694,131 @@ static int test_metal_attention_qkvo_f16(void) {
     return 0;
 }
 
+static int test_metal_attention_output_residual_f16(void) {
+    if (!uocr_metal_is_available()) {
+        return 0;
+    }
+
+    enum { TOKENS = 2, HIDDEN = 1280 };
+    const uint16_t context_values[] = {
+        0x0000u, /* 0.0 */
+        0x2000u, /* 0.0078125 */
+        0x2400u, /* 0.015625 */
+        0xa400u, /* -0.015625 */
+        0x2800u  /* 0.03125 */
+    };
+    const uint16_t weight_values[] = {
+        0x0000u, /* 0.0 */
+        0x2400u, /* 0.015625 */
+        0xa400u, /* -0.015625 */
+        0x2800u, /* 0.03125 */
+        0xa800u  /* -0.03125 */
+    };
+    const uint16_t residual_values[] = {
+        0xb800u, /* -0.5 */
+        0xb000u, /* -0.125 */
+        0x0000u, /* 0.0 */
+        0x3000u, /* 0.125 */
+        0x3400u, /* 0.25 */
+        0x3800u  /* 0.5 */
+    };
+    const uint32_t context_value_count = (uint32_t)(sizeof(context_values) / sizeof(context_values[0]));
+    const uint32_t weight_value_count = (uint32_t)(sizeof(weight_values) / sizeof(weight_values[0]));
+    const uint32_t residual_value_count = (uint32_t)(sizeof(residual_values) / sizeof(residual_values[0]));
+
+    uint16_t *context = (uint16_t *)malloc((size_t)TOKENS * HIDDEN * sizeof(uint16_t));
+    uint16_t *weight = (uint16_t *)malloc((size_t)HIDDEN * HIDDEN * sizeof(uint16_t));
+    uint16_t *residual = (uint16_t *)malloc((size_t)TOKENS * HIDDEN * sizeof(uint16_t));
+    float *expected = (float *)malloc((size_t)TOKENS * HIDDEN * sizeof(float));
+    float *out_f32 = (float *)malloc((size_t)TOKENS * HIDDEN * sizeof(float));
+    uint16_t *out_f16 = (uint16_t *)malloc((size_t)HIDDEN * sizeof(uint16_t));
+    CHECK(context != NULL && weight != NULL && residual != NULL && expected != NULL && out_f32 != NULL && out_f16 != NULL);
+
+    for (uint32_t i = 0u; i < (uint32_t)(TOKENS * HIDDEN); ++i) {
+        context[i] = context_values[(i * 11u + i / 17u + 3u) % context_value_count];
+        residual[i] = residual_values[(i * 7u + i / 19u + 1u) % residual_value_count];
+    }
+    for (uint32_t i = 0u; i < (uint32_t)(HIDDEN * HIDDEN); ++i) {
+        weight[i] = weight_values[(i * 13u + i / 23u + 4u) % weight_value_count];
+    }
+
+    for (uint32_t token = 0u; token < (uint32_t)TOKENS; ++token) {
+        for (uint32_t col = 0u; col < (uint32_t)HIDDEN; ++col) {
+            float sum = f16_bits_to_f32(residual[token * (uint32_t)HIDDEN + col]);
+            for (uint32_t k = 0u; k < (uint32_t)HIDDEN; ++k) {
+                sum += f16_bits_to_f32(context[token * (uint32_t)HIDDEN + k]) *
+                       f16_bits_to_f32(weight[col * (uint32_t)HIDDEN + k]);
+            }
+            expected[token * (uint32_t)HIDDEN + col] = sum;
+        }
+    }
+
+    char error[1024];
+    memset(error, 0, sizeof(error));
+    uocr_metal_context *ctx = uocr_metal_context_create(UOCR_TEST_METAL_RESOURCE_PATH, error, sizeof(error));
+    CHECK(ctx != NULL);
+
+    memset(out_f32, 0, (size_t)TOKENS * HIDDEN * sizeof(float));
+    CHECK(uocr_metal_context_attention_output_residual_f16(ctx,
+                                                           context,
+                                                           weight,
+                                                           residual,
+                                                           TOKENS,
+                                                           UOCR_METAL_DENSE_OUTPUT_F32,
+                                                           out_f32,
+                                                           error,
+                                                           sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    for (uint32_t i = 0u; i < (uint32_t)(TOKENS * HIDDEN); ++i) {
+        CHECK(fabsf(out_f32[i] - expected[i]) < 2.0e-4f);
+    }
+
+    memset(out_f16, 0, (size_t)HIDDEN * sizeof(uint16_t));
+    CHECK(uocr_metal_context_attention_output_residual_f16(ctx,
+                                                           context,
+                                                           weight,
+                                                           residual,
+                                                           1u,
+                                                           UOCR_METAL_DENSE_OUTPUT_F16,
+                                                           out_f16,
+                                                           error,
+                                                           sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    for (uint32_t i = 0u; i < (uint32_t)HIDDEN; ++i) {
+        CHECK(fabsf(f16_bits_to_f32(out_f16[i]) - expected[i]) < 8.0e-3f);
+    }
+
+    CHECK(uocr_metal_context_attention_output_residual_f16(ctx,
+                                                           context,
+                                                           weight,
+                                                           residual,
+                                                           TOKENS,
+                                                           (uocr_metal_dense_output_type)99,
+                                                           out_f32,
+                                                           error,
+                                                           sizeof(error)) == 0);
+    CHECK(strstr(error, "unsupported Metal attention output type") != NULL);
+    CHECK(uocr_metal_context_attention_output_residual_f16(ctx,
+                                                           context,
+                                                           weight,
+                                                           residual,
+                                                           0u,
+                                                           UOCR_METAL_DENSE_OUTPUT_F32,
+                                                           out_f32,
+                                                           error,
+                                                           sizeof(error)) == 0);
+    CHECK(strstr(error, "invalid Metal attention output request") != NULL);
+
+    uocr_metal_context_destroy(ctx);
+    free(out_f16);
+    free(out_f32);
+    free(expected);
+    free(residual);
+    free(weight);
+    free(context);
+    return 0;
+}
+
 static void compute_rope_expected(const uint16_t *src,
                                   uint32_t n_tokens,
                                   uint32_t position_start,
@@ -2322,6 +2447,7 @@ int main(void) {
     if (test_metal_rmsnorm_f16() != 0) return 1;
     if (test_metal_dense_f16() != 0) return 1;
     if (test_metal_attention_qkvo_f16() != 0) return 1;
+    if (test_metal_attention_output_residual_f16() != 0) return 1;
     if (test_metal_rope_qk_f16() != 0) return 1;
     if (test_metal_prefill_attention_f16() != 0) return 1;
     if (test_metal_prefill_attention_varlen_f16() != 0) return 1;

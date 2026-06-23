@@ -402,6 +402,83 @@ kernel void uocr_attention_qkvo_f16_to_f32(device const half *src [[buffer(0)]],
     }
 }
 
+struct UocrAttentionOutputParams {
+    uint n_tokens;
+    uint hidden_size;
+    uint reserved0;
+    uint reserved1;
+};
+
+static inline float uocr_attention_output_dot_f16(device const half *src,
+                                                  device const half *weight,
+                                                  constant UocrAttentionOutputParams &params,
+                                                  uint token,
+                                                  uint out_col,
+                                                  uint tid,
+                                                  uint ntg,
+                                                  threadgroup float *partials) {
+    float sum = 0.0f;
+    const uint src_base = token * params.hidden_size;
+    const uint weight_base = out_col * params.hidden_size;
+    for (uint k = tid; k < params.hidden_size; k += ntg) {
+        sum += float(src[src_base + k]) * float(weight[weight_base + k]);
+    }
+    partials[tid] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = ntg >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            partials[tid] += partials[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    return partials[0];
+}
+
+kernel void uocr_attention_output_residual_f16_to_f16(device const half *src [[buffer(0)]],
+                                                      device const half *weight [[buffer(1)]],
+                                                      device const half *residual [[buffer(2)]],
+                                                      device half *dst [[buffer(3)]],
+                                                      constant UocrAttentionOutputParams &params [[buffer(4)]],
+                                                      threadgroup float *partials [[threadgroup(0)]],
+                                                      uint output_index [[threadgroup_position_in_grid]],
+                                                      uint tid [[thread_index_in_threadgroup]],
+                                                      uint ntg [[threads_per_threadgroup]]) {
+    const uint token = output_index / params.hidden_size;
+    const uint out_col = output_index - token * params.hidden_size;
+    if (token >= params.n_tokens || out_col >= params.hidden_size) {
+        return;
+    }
+
+    const float projected = uocr_attention_output_dot_f16(src, weight, params, token, out_col, tid, ntg, partials);
+    if (tid == 0) {
+        const uint dst_index = token * params.hidden_size + out_col;
+        dst[dst_index] = half(projected + float(residual[dst_index]));
+    }
+}
+
+kernel void uocr_attention_output_residual_f16_to_f32(device const half *src [[buffer(0)]],
+                                                      device const half *weight [[buffer(1)]],
+                                                      device const half *residual [[buffer(2)]],
+                                                      device float *dst [[buffer(3)]],
+                                                      constant UocrAttentionOutputParams &params [[buffer(4)]],
+                                                      threadgroup float *partials [[threadgroup(0)]],
+                                                      uint output_index [[threadgroup_position_in_grid]],
+                                                      uint tid [[thread_index_in_threadgroup]],
+                                                      uint ntg [[threads_per_threadgroup]]) {
+    const uint token = output_index / params.hidden_size;
+    const uint out_col = output_index - token * params.hidden_size;
+    if (token >= params.n_tokens || out_col >= params.hidden_size) {
+        return;
+    }
+
+    const float projected = uocr_attention_output_dot_f16(src, weight, params, token, out_col, tid, ntg, partials);
+    if (tid == 0) {
+        const uint dst_index = token * params.hidden_size + out_col;
+        dst[dst_index] = projected + float(residual[dst_index]);
+    }
+}
+
 struct UocrRopeQKParams {
     uint n_tokens;
     uint heads;

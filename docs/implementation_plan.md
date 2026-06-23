@@ -624,7 +624,7 @@ First implementation slice, in order:
 - [x] Adapt gradients.c `sdpa_varlen` for prefill where useful.
 - [x] Implement decode attention for one token attending to full prompt plus generated ring.
 - [x] Adapt gradients.c `sdpa_decode` window/prefix logic to OCR's rule: prompt always attendable, generated ring size `128`.
-- [ ] Implement attention output projection and residual add.
+- [x] Implement attention output projection and residual add.
 
 ### 14.3 MLP and MoE
 
