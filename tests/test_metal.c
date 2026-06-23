@@ -693,6 +693,157 @@ static int test_metal_attention_qkvo_f16(void) {
     return 0;
 }
 
+static void compute_rope_expected(const uint16_t *src,
+                                  uint32_t n_tokens,
+                                  uint32_t position_start,
+                                  float *out) {
+    enum { HEADS = 10, HEAD_DIM = 128, HALF_DIM = 64 };
+    const float freq_scale = -2.0f * log2f(10000.0f) / (float)HEAD_DIM;
+    for (uint32_t token = 0u; token < n_tokens; ++token) {
+        const float position = (float)(position_start + token);
+        for (uint32_t head = 0u; head < (uint32_t)HEADS; ++head) {
+            const uint32_t base = (token * (uint32_t)HEADS + head) * (uint32_t)HEAD_DIM;
+            for (uint32_t pair = 0u; pair < (uint32_t)HALF_DIM; ++pair) {
+                const uint32_t a = pair;
+                const uint32_t b = pair + (uint32_t)HALF_DIM;
+                const float angle = position * exp2f((float)pair * freq_scale);
+                const float c = cosf(angle);
+                const float s = sinf(angle);
+                const float x0 = f16_bits_to_f32(src[base + a]);
+                const float x1 = f16_bits_to_f32(src[base + b]);
+                out[base + a] = x0 * c - x1 * s;
+                out[base + b] = x0 * s + x1 * c;
+            }
+        }
+    }
+}
+
+static int test_metal_rope_qk_f16(void) {
+    if (!uocr_metal_is_available()) {
+        return 0;
+    }
+
+    enum { TOKENS = 4, HIDDEN = 1280 };
+    const uint16_t values[] = {
+        0xbc00u, /* -1.0 */
+        0xb800u, /* -0.5 */
+        0xb400u, /* -0.25 */
+        0x0000u, /* 0.0 */
+        0x3000u, /* 0.125 */
+        0x3400u, /* 0.25 */
+        0x3800u, /* 0.5 */
+        0x3c00u  /* 1.0 */
+    };
+    const uint32_t value_count = (uint32_t)(sizeof(values) / sizeof(values[0]));
+    uint16_t *q = (uint16_t *)malloc((size_t)TOKENS * HIDDEN * sizeof(uint16_t));
+    uint16_t *k = (uint16_t *)malloc((size_t)TOKENS * HIDDEN * sizeof(uint16_t));
+    float *expected_q = (float *)malloc((size_t)TOKENS * HIDDEN * sizeof(float));
+    float *expected_k = (float *)malloc((size_t)TOKENS * HIDDEN * sizeof(float));
+    float *q_out_f32 = (float *)malloc((size_t)TOKENS * HIDDEN * sizeof(float));
+    float *k_out_f32 = (float *)malloc((size_t)TOKENS * HIDDEN * sizeof(float));
+    uint16_t *q_out_f16 = (uint16_t *)malloc((size_t)TOKENS * HIDDEN * sizeof(uint16_t));
+    uint16_t *k_out_f16 = (uint16_t *)malloc((size_t)TOKENS * HIDDEN * sizeof(uint16_t));
+    CHECK(q != NULL && k != NULL && expected_q != NULL && expected_k != NULL &&
+          q_out_f32 != NULL && k_out_f32 != NULL && q_out_f16 != NULL && k_out_f16 != NULL);
+
+    for (uint32_t i = 0u; i < (uint32_t)(TOKENS * HIDDEN); ++i) {
+        q[i] = values[(i * 17u + i / 31u + 1u) % value_count];
+        k[i] = values[(i * 23u + i / 19u + 5u) % value_count];
+    }
+
+    const uint32_t position_start = 7u;
+    compute_rope_expected(q, TOKENS, position_start, expected_q);
+    compute_rope_expected(k, TOKENS, position_start, expected_k);
+
+    char error[1024];
+    memset(error, 0, sizeof(error));
+    uocr_metal_context *ctx = uocr_metal_context_create(UOCR_TEST_METAL_RESOURCE_PATH, error, sizeof(error));
+    CHECK(ctx != NULL);
+
+    memset(q_out_f32, 0, (size_t)TOKENS * HIDDEN * sizeof(float));
+    memset(k_out_f32, 0, (size_t)TOKENS * HIDDEN * sizeof(float));
+    CHECK(uocr_metal_context_rope_qk_f16(ctx,
+                                         q,
+                                         k,
+                                         TOKENS,
+                                         position_start,
+                                         UOCR_METAL_DENSE_OUTPUT_F32,
+                                         q_out_f32,
+                                         k_out_f32,
+                                         error,
+                                         sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    for (uint32_t i = 0u; i < (uint32_t)(TOKENS * HIDDEN); ++i) {
+        CHECK(fabsf(q_out_f32[i] - expected_q[i]) < 2.0e-4f);
+        CHECK(fabsf(k_out_f32[i] - expected_k[i]) < 2.0e-4f);
+    }
+
+    memset(q_out_f16, 0, (size_t)TOKENS * HIDDEN * sizeof(uint16_t));
+    memset(k_out_f16, 0, (size_t)TOKENS * HIDDEN * sizeof(uint16_t));
+    CHECK(uocr_metal_context_rope_qk_f16(ctx,
+                                         q,
+                                         k,
+                                         TOKENS,
+                                         position_start,
+                                         UOCR_METAL_DENSE_OUTPUT_F16,
+                                         q_out_f16,
+                                         k_out_f16,
+                                         error,
+                                         sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    for (uint32_t i = 0u; i < (uint32_t)(TOKENS * HIDDEN); ++i) {
+        CHECK(fabsf(f16_bits_to_f32(q_out_f16[i]) - expected_q[i]) < 4.0e-3f);
+        CHECK(fabsf(f16_bits_to_f32(k_out_f16[i]) - expected_k[i]) < 4.0e-3f);
+    }
+
+    CHECK(uocr_metal_context_rope_qk_f16(ctx,
+                                         q,
+                                         k,
+                                         0u,
+                                         position_start,
+                                         UOCR_METAL_DENSE_OUTPUT_F32,
+                                         q_out_f32,
+                                         k_out_f32,
+                                         error,
+                                         sizeof(error)) == 0);
+    CHECK(strstr(error, "invalid Metal RoPE request") != NULL);
+
+    CHECK(uocr_metal_context_rope_qk_f16(ctx,
+                                         q,
+                                         k,
+                                         2u,
+                                         32767u,
+                                         UOCR_METAL_DENSE_OUTPUT_F32,
+                                         q_out_f32,
+                                         k_out_f32,
+                                         error,
+                                         sizeof(error)) == 0);
+    CHECK(strstr(error, "exceeds max positions") != NULL);
+
+    CHECK(uocr_metal_context_rope_qk_f16(ctx,
+                                         q,
+                                         k,
+                                         TOKENS,
+                                         position_start,
+                                         (uocr_metal_dense_output_type)99,
+                                         q_out_f32,
+                                         k_out_f32,
+                                         error,
+                                         sizeof(error)) == 0);
+    CHECK(strstr(error, "unsupported Metal RoPE output type") != NULL);
+
+    uocr_metal_context_destroy(ctx);
+    free(k_out_f16);
+    free(q_out_f16);
+    free(k_out_f32);
+    free(q_out_f32);
+    free(expected_k);
+    free(expected_q);
+    free(k);
+    free(q);
+    return 0;
+}
+
 static int test_metal_recent_decoder_primitives_stress(void) {
     if (!uocr_metal_is_available()) {
         return 0;
@@ -1069,6 +1220,7 @@ int main(void) {
     if (test_metal_rmsnorm_f16() != 0) return 1;
     if (test_metal_dense_f16() != 0) return 1;
     if (test_metal_attention_qkvo_f16() != 0) return 1;
+    if (test_metal_rope_qk_f16() != 0) return 1;
     if (test_metal_recent_decoder_primitives_stress() != 0) return 1;
     if (test_metal_runtime_arenas() != 0) return 1;
     if (test_metal_model_mapping() != 0) return 1;

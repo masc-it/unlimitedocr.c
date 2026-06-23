@@ -608,12 +608,12 @@ First implementation slice, in order:
 - [x] Ensure RMSNorm variance accumulation is fp32.
 - [x] Implement fp16 dense matrix-vector and matrix-matrix kernels for `[out,in]` row-major weights.
 - [x] Implement attention Q/K/V/O projections for hidden `1280`.
-- [ ] Adapt gradients.c `qkv_split_rope` logic:
-  - [ ] split-half RoPE layout
-  - [ ] head dim `128`
-  - [ ] heads `10`
-  - [ ] position ids monotonically increasing
-  - [ ] theta `10000`
+- [x] Adapt gradients.c `qkv_split_rope` logic:
+  - [x] split-half RoPE layout
+  - [x] head dim `128`
+  - [x] heads `10`
+  - [x] position ids monotonically increasing
+  - [x] theta `10000`
 - [ ] Implement KV cache write kernel.
 - [ ] Allocate KV cache layout:
   - [ ] K: `[layer][slot][max_prompt_tokens + 128][10][128]` fp16

@@ -401,3 +401,94 @@ kernel void uocr_attention_qkvo_f16_to_f32(device const half *src [[buffer(0)]],
         dst[token * params.hidden_size + out_col] = value;
     }
 }
+
+struct UocrRopeQKParams {
+    uint n_tokens;
+    uint heads;
+    uint head_dim;
+    uint position_start;
+    float freq_scale;
+    uint reserved0;
+    uint reserved1;
+    uint reserved2;
+};
+
+static inline void uocr_rope_pair(uint gid,
+                                  constant UocrRopeQKParams &params,
+                                  thread uint &token,
+                                  thread uint &head,
+                                  thread uint &a,
+                                  thread uint &b,
+                                  thread float &c,
+                                  thread float &s) {
+    const uint half_dim = params.head_dim >> 1u;
+    const uint pair = gid % half_dim;
+    const uint token_head = gid / half_dim;
+    head = token_head % params.heads;
+    token = token_head / params.heads;
+    a = pair;
+    b = pair + half_dim;
+    const float angle = float(params.position_start + token) * exp2(float(pair) * params.freq_scale);
+    c = cos(angle);
+    s = sin(angle);
+}
+
+kernel void uocr_rope_qk_f16_to_f16(device const half *q_src [[buffer(0)]],
+                                    device const half *k_src [[buffer(1)]],
+                                    device half *q_dst [[buffer(2)]],
+                                    device half *k_dst [[buffer(3)]],
+                                    constant UocrRopeQKParams &params [[buffer(4)]],
+                                    uint gid [[thread_position_in_grid]]) {
+    const uint half_dim = params.head_dim >> 1u;
+    const uint total = params.n_tokens * params.heads * half_dim;
+    if (gid >= total) {
+        return;
+    }
+
+    uint token;
+    uint head;
+    uint a;
+    uint b;
+    float c;
+    float s;
+    uocr_rope_pair(gid, params, token, head, a, b, c, s);
+    const ulong base = (ulong(token) * ulong(params.heads) + ulong(head)) * ulong(params.head_dim);
+    const float q0 = float(q_src[base + ulong(a)]);
+    const float q1 = float(q_src[base + ulong(b)]);
+    const float k0 = float(k_src[base + ulong(a)]);
+    const float k1 = float(k_src[base + ulong(b)]);
+    q_dst[base + ulong(a)] = half(q0 * c - q1 * s);
+    q_dst[base + ulong(b)] = half(q0 * s + q1 * c);
+    k_dst[base + ulong(a)] = half(k0 * c - k1 * s);
+    k_dst[base + ulong(b)] = half(k0 * s + k1 * c);
+}
+
+kernel void uocr_rope_qk_f16_to_f32(device const half *q_src [[buffer(0)]],
+                                    device const half *k_src [[buffer(1)]],
+                                    device float *q_dst [[buffer(2)]],
+                                    device float *k_dst [[buffer(3)]],
+                                    constant UocrRopeQKParams &params [[buffer(4)]],
+                                    uint gid [[thread_position_in_grid]]) {
+    const uint half_dim = params.head_dim >> 1u;
+    const uint total = params.n_tokens * params.heads * half_dim;
+    if (gid >= total) {
+        return;
+    }
+
+    uint token;
+    uint head;
+    uint a;
+    uint b;
+    float c;
+    float s;
+    uocr_rope_pair(gid, params, token, head, a, b, c, s);
+    const ulong base = (ulong(token) * ulong(params.heads) + ulong(head)) * ulong(params.head_dim);
+    const float q0 = float(q_src[base + ulong(a)]);
+    const float q1 = float(q_src[base + ulong(b)]);
+    const float k0 = float(k_src[base + ulong(a)]);
+    const float k1 = float(k_src[base + ulong(b)]);
+    q_dst[base + ulong(a)] = q0 * c - q1 * s;
+    q_dst[base + ulong(b)] = q0 * s + q1 * c;
+    k_dst[base + ulong(a)] = k0 * c - k1 * s;
+    k_dst[base + ulong(b)] = k0 * s + k1 * c;
+}

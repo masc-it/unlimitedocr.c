@@ -189,6 +189,22 @@ int uocr_metal_context_attention_qkvo_f16(uocr_metal_context *ctx,
                                           char *error,
                                           size_t error_size);
 
+/* Diagnostic RoPE helper for synthetic decoder tests. Applies Unlimited-OCR's
+ * Llama-style split-half RoPE to projected Q and K tensors shaped
+ * [n_tokens, 10 heads, 128 dim], using monotonically increasing positions
+ * starting at position_start and theta=10000.
+ */
+int uocr_metal_context_rope_qk_f16(uocr_metal_context *ctx,
+                                   const uint16_t *q_f16,
+                                   const uint16_t *k_f16,
+                                   uint32_t n_tokens,
+                                   uint32_t position_start,
+                                   uocr_metal_dense_output_type output_type,
+                                   void *q_out,
+                                   void *k_out,
+                                   char *error,
+                                   size_t error_size);
+
 int uocr_metal_smoke_test(const char *resource_path, char *error, size_t error_size);
 
 #ifdef __cplusplus
