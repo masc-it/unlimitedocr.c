@@ -604,8 +604,8 @@ First implementation slice, in order:
 
 ### 14.2 Decoder layer primitives
 
-- [ ] Adapt DS4 `metal/norm.metal` or write OCR-specific RMSNorm for hidden `1280`.
-- [ ] Ensure RMSNorm variance accumulation is fp32.
+- [x] Adapt DS4 `metal/norm.metal` or write OCR-specific RMSNorm for hidden `1280`.
+- [x] Ensure RMSNorm variance accumulation is fp32.
 - [ ] Implement fp16 dense matrix-vector and matrix-matrix kernels for `[out,in]` row-major weights.
 - [ ] Implement attention Q/K/V/O projections for hidden `1280`.
 - [ ] Adapt gradients.c `qkv_split_rope` logic:
@@ -912,7 +912,7 @@ First implementation slice, in order:
   - [ ] CPU reference tiny ops
 - [ ] Add Metal tests that do not need full model weights:
   - [ ] compile all kernels
-  - [ ] run RMSNorm on synthetic tensor
+  - [x] run RMSNorm on synthetic tensor
   - [x] run get_rows on synthetic embedding table
   - [ ] run small RoPE kernel
   - [ ] run small SDPA prefill/decode kernel

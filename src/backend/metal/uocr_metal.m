@@ -265,6 +265,13 @@ typedef struct uocr_metal_prompt_assembly_params {
     uint32_t reserved2;
 } uocr_metal_prompt_assembly_params;
 
+typedef struct uocr_metal_rmsnorm_params {
+    uint32_t n_rows;
+    uint32_t hidden_size;
+    float eps;
+    uint32_t reserved;
+} uocr_metal_rmsnorm_params;
+
 static int metal_retain_transient_until_completed(uocr_metal_context *ctx,
                                                   id<MTLCommandBuffer> command_buffer,
                                                   id object,
@@ -327,6 +334,18 @@ static id<MTLComputePipelineState> metal_get_pipeline(uocr_metal_context *ctx,
     [ctx->pipeline_cache setObject:pipeline forKey:key];
     [pipeline release];
     return [ctx->pipeline_cache objectForKey:key];
+}
+
+static NSUInteger metal_power2_threadgroup_width(NSUInteger preferred, NSUInteger max_allowed) {
+    NSUInteger width = 1u;
+    if (preferred == 0u || max_allowed == 0u) {
+        return width;
+    }
+    NSUInteger limit = preferred < max_allowed ? preferred : max_allowed;
+    while (width <= limit / 2u) {
+        width *= 2u;
+    }
+    return width;
 }
 
 int uocr_metal_is_available(void) {
@@ -1668,6 +1687,137 @@ int uocr_metal_context_assemble_prompt_f16(uocr_metal_context *ctx,
         [image_features release];
         [tokens release];
         [table release];
+    }
+
+    metal_clear_error(error, error_size);
+    return 1;
+}
+
+int uocr_metal_context_rmsnorm_f16(uocr_metal_context *ctx,
+                                   const uint16_t *input_f16,
+                                   const uint16_t *weight_f16,
+                                   uint32_t n_rows,
+                                   uint32_t hidden_size,
+                                   float eps,
+                                   uocr_metal_rmsnorm_output_type output_type,
+                                   void *out,
+                                   char *error,
+                                   size_t error_size) {
+    metal_clear_error(error, error_size);
+    if (ctx == NULL || input_f16 == NULL || weight_f16 == NULL || out == NULL || n_rows == 0u || hidden_size == 0u) {
+        return metal_fail(error, error_size, "invalid Metal RMSNorm request");
+    }
+    if (!(eps > 0.0f)) {
+        return metal_fail(error, error_size, "Metal RMSNorm eps must be positive");
+    }
+    if (output_type != UOCR_METAL_RMSNORM_OUTPUT_F16 && output_type != UOCR_METAL_RMSNORM_OUTPUT_F32) {
+        return metal_fail(error, error_size, "unsupported Metal RMSNorm output type %d", (int)output_type);
+    }
+
+    uint64_t input_values = 0u;
+    uint64_t input_bytes = 0u;
+    uint64_t weight_bytes = 0u;
+    uint64_t output_bytes = 0u;
+    const uint64_t output_element_bytes = output_type == UOCR_METAL_RMSNORM_OUTPUT_F16 ? 2u : (uint64_t)sizeof(float);
+    if (!checked_mul_u64((uint64_t)n_rows, (uint64_t)hidden_size, &input_values) ||
+        !checked_mul_u64(input_values, 2u, &input_bytes) ||
+        !checked_mul_u64((uint64_t)hidden_size, 2u, &weight_bytes) ||
+        !checked_mul_u64(input_values, output_element_bytes, &output_bytes)) {
+        return metal_fail(error, error_size, "Metal RMSNorm byte-size overflow");
+    }
+
+    const uint64_t max_buffer_length = metal_device_max_buffer_length(ctx->device);
+    if (input_bytes > max_buffer_length || weight_bytes > max_buffer_length || output_bytes > max_buffer_length ||
+        input_bytes > (uint64_t)SIZE_MAX || weight_bytes > (uint64_t)SIZE_MAX || output_bytes > (uint64_t)SIZE_MAX) {
+        return metal_fail(error,
+                          error_size,
+                          "Metal RMSNorm buffers exceed maxBufferLength %llu",
+                          (unsigned long long)max_buffer_length);
+    }
+
+    @autoreleasepool {
+        const char *function_name = output_type == UOCR_METAL_RMSNORM_OUTPUT_F16 ?
+                                        "uocr_rmsnorm_f16_to_f16" :
+                                        "uocr_rmsnorm_f16_to_f32";
+        id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, function_name, error, error_size);
+        if (pipeline == nil) {
+            return 0;
+        }
+
+        id<MTLBuffer> src = [ctx->device newBufferWithBytes:input_f16
+                                                     length:(NSUInteger)input_bytes
+                                                    options:MTLResourceStorageModeShared];
+        if (src == nil) {
+            return metal_fail(error, error_size, "failed to allocate Metal RMSNorm input buffer");
+        }
+        src.label = @"uocr_rmsnorm_input_f16";
+
+        id<MTLBuffer> weight = [ctx->device newBufferWithBytes:weight_f16
+                                                        length:(NSUInteger)weight_bytes
+                                                       options:MTLResourceStorageModeShared];
+        if (weight == nil) {
+            [src release];
+            return metal_fail(error, error_size, "failed to allocate Metal RMSNorm weight buffer");
+        }
+        weight.label = @"uocr_rmsnorm_weight_f16";
+
+        id<MTLBuffer> dst = [ctx->device newBufferWithLength:(NSUInteger)output_bytes options:MTLResourceStorageModeShared];
+        if (dst == nil) {
+            [weight release];
+            [src release];
+            return metal_fail(error, error_size, "failed to allocate Metal RMSNorm output buffer");
+        }
+        dst.label = @"uocr_rmsnorm_output";
+        memset([dst contents], 0, (size_t)output_bytes);
+
+        id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
+        if (cb == nil) {
+            [dst release];
+            [weight release];
+            [src release];
+            return metal_fail(error, error_size, "failed to create Metal RMSNorm command buffer");
+        }
+        cb.label = @"uocr_rmsnorm_command_buffer";
+
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        if (enc == nil) {
+            [dst release];
+            [weight release];
+            [src release];
+            return metal_fail(error, error_size, "failed to create Metal RMSNorm command encoder");
+        }
+
+        uocr_metal_rmsnorm_params params;
+        params.n_rows = n_rows;
+        params.hidden_size = hidden_size;
+        params.eps = eps;
+        params.reserved = 0u;
+
+        const NSUInteger threads_per_group = metal_power2_threadgroup_width(256u, pipeline.maxTotalThreadsPerThreadgroup);
+        [enc setComputePipelineState:pipeline];
+        [enc setBuffer:src offset:0u atIndex:0u];
+        [enc setBuffer:weight offset:0u atIndex:1u];
+        [enc setBuffer:dst offset:0u atIndex:2u];
+        [enc setBytes:&params length:sizeof(params) atIndex:3u];
+        [enc setThreadgroupMemoryLength:threads_per_group * sizeof(float) atIndex:0u];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_rows, 1u, 1u)
+             threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1u, 1u)];
+        [enc endEncoding];
+
+        [cb commit];
+        [cb waitUntilCompleted];
+        if (cb.status == MTLCommandBufferStatusError) {
+            NSString *description = cb.error != nil ? [cb.error localizedDescription] : @"unknown command-buffer error";
+            [dst release];
+            [weight release];
+            [src release];
+            return metal_fail(error, error_size, "Metal RMSNorm command failed: %s", [description UTF8String]);
+        }
+
+        memcpy(out, [dst contents], (size_t)output_bytes);
+        [dst release];
+        [weight release];
+        [src release];
     }
 
     metal_clear_error(error, error_size);

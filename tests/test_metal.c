@@ -5,6 +5,7 @@
 
 #include "uocr_test_model_file.h"
 
+#include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -284,6 +285,109 @@ static int test_metal_prompt_assembly_f16(void) {
     return 0;
 }
 
+static int test_metal_rmsnorm_f16(void) {
+    if (!uocr_metal_is_available()) {
+        return 0;
+    }
+
+    enum { ROWS = 3, HIDDEN = 1280 };
+    const uint16_t input_values[] = {
+        0x3800u, /* 0.5 */
+        0xb800u, /* -0.5 */
+        0x3c00u, /* 1.0 */
+        0xbc00u, /* -1.0 */
+        0x4000u, /* 2.0 */
+        0xc000u, /* -2.0 */
+        0x3400u, /* 0.25 */
+        0xb400u  /* -0.25 */
+    };
+    const uint16_t weight_values[] = {
+        0x3c00u, /* 1.0 */
+        0x3800u, /* 0.5 */
+        0x4000u, /* 2.0 */
+        0x3e00u, /* 1.5 */
+        0x3a00u  /* 0.75 */
+    };
+    uint16_t input[ROWS * HIDDEN];
+    uint16_t weight[HIDDEN];
+    for (uint32_t i = 0u; i < (uint32_t)(ROWS * HIDDEN); ++i) {
+        input[i] = input_values[(i * 5u + 3u) % (sizeof(input_values) / sizeof(input_values[0]))];
+    }
+    for (uint32_t i = 0u; i < (uint32_t)HIDDEN; ++i) {
+        weight[i] = weight_values[(i * 7u + 1u) % (sizeof(weight_values) / sizeof(weight_values[0]))];
+    }
+
+    const float eps = 1.0e-6f;
+    float expected[ROWS * HIDDEN];
+    for (uint32_t row = 0u; row < (uint32_t)ROWS; ++row) {
+        float sum = 0.0f;
+        for (uint32_t col = 0u; col < (uint32_t)HIDDEN; ++col) {
+            const float x = f16_bits_to_f32(input[row * (uint32_t)HIDDEN + col]);
+            sum += x * x;
+        }
+        const float scale = 1.0f / sqrtf(sum / (float)HIDDEN + eps);
+        for (uint32_t col = 0u; col < (uint32_t)HIDDEN; ++col) {
+            const float x = f16_bits_to_f32(input[row * (uint32_t)HIDDEN + col]);
+            const float w = f16_bits_to_f32(weight[col]);
+            expected[row * (uint32_t)HIDDEN + col] = x * scale * w;
+        }
+    }
+
+    char error[1024];
+    memset(error, 0, sizeof(error));
+    uocr_metal_context *ctx = uocr_metal_context_create(UOCR_TEST_METAL_RESOURCE_PATH, error, sizeof(error));
+    CHECK(ctx != NULL);
+
+    float out_f32[ROWS * HIDDEN];
+    memset(out_f32, 0, sizeof(out_f32));
+    CHECK(uocr_metal_context_rmsnorm_f16(ctx,
+                                         input,
+                                         weight,
+                                         ROWS,
+                                         HIDDEN,
+                                         eps,
+                                         UOCR_METAL_RMSNORM_OUTPUT_F32,
+                                         out_f32,
+                                         error,
+                                         sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    for (uint32_t i = 0u; i < (uint32_t)(ROWS * HIDDEN); ++i) {
+        CHECK(fabsf(out_f32[i] - expected[i]) < 3.0e-4f);
+    }
+
+    uint16_t out_f16[ROWS * HIDDEN];
+    memset(out_f16, 0, sizeof(out_f16));
+    CHECK(uocr_metal_context_rmsnorm_f16(ctx,
+                                         input,
+                                         weight,
+                                         ROWS,
+                                         HIDDEN,
+                                         eps,
+                                         UOCR_METAL_RMSNORM_OUTPUT_F16,
+                                         out_f16,
+                                         error,
+                                         sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    for (uint32_t i = 0u; i < (uint32_t)(ROWS * HIDDEN); ++i) {
+        CHECK(fabsf(f16_bits_to_f32(out_f16[i]) - expected[i]) < 4.0e-3f);
+    }
+
+    CHECK(uocr_metal_context_rmsnorm_f16(ctx,
+                                         input,
+                                         weight,
+                                         ROWS,
+                                         HIDDEN,
+                                         0.0f,
+                                         UOCR_METAL_RMSNORM_OUTPUT_F32,
+                                         out_f32,
+                                         error,
+                                         sizeof(error)) == 0);
+    CHECK(strstr(error, "eps must be positive") != NULL);
+
+    uocr_metal_context_destroy(ctx);
+    return 0;
+}
+
 static int test_metal_runtime_arenas(void) {
     if (!uocr_metal_is_available()) {
         return 0;
@@ -437,6 +541,7 @@ int main(void) {
     if (test_metal_named_scratch_buffers() != 0) return 1;
     if (test_metal_get_rows_f16() != 0) return 1;
     if (test_metal_prompt_assembly_f16() != 0) return 1;
+    if (test_metal_rmsnorm_f16() != 0) return 1;
     if (test_metal_runtime_arenas() != 0) return 1;
     if (test_metal_model_mapping() != 0) return 1;
     if (test_public_engine_open_initializes_metal() != 0) return 1;

@@ -124,3 +124,82 @@ kernel void uocr_assemble_prompt_with_image_f16(device const half *embedding_tab
     }
     dst[token * params.hidden_size + col] = embedding_table[(uint)row * params.hidden_size + col];
 }
+
+struct UocrRmsNormParams {
+    uint n_rows;
+    uint hidden_size;
+    float eps;
+    uint reserved;
+};
+
+kernel void uocr_rmsnorm_f16_to_f16(device const half *src [[buffer(0)]],
+                                    device const half *weight [[buffer(1)]],
+                                    device half *dst [[buffer(2)]],
+                                    constant UocrRmsNormParams &params [[buffer(3)]],
+                                    threadgroup float *partials [[threadgroup(0)]],
+                                    uint row [[threadgroup_position_in_grid]],
+                                    uint tid [[thread_index_in_threadgroup]],
+                                    uint ntg [[threads_per_threadgroup]]) {
+    if (row >= params.n_rows) {
+        return;
+    }
+
+    float sum = 0.0f;
+    const uint row_base = row * params.hidden_size;
+    for (uint col = tid; col < params.hidden_size; col += ntg) {
+        const float x = float(src[row_base + col]);
+        sum += x * x;
+    }
+    partials[tid] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = ntg >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            partials[tid] += partials[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    const float scale = 1.0f / sqrt(partials[0] / float(params.hidden_size) + params.eps);
+    for (uint col = tid; col < params.hidden_size; col += ntg) {
+        const float x = float(src[row_base + col]);
+        const float w = float(weight[col]);
+        dst[row_base + col] = half(x * scale * w);
+    }
+}
+
+kernel void uocr_rmsnorm_f16_to_f32(device const half *src [[buffer(0)]],
+                                    device const half *weight [[buffer(1)]],
+                                    device float *dst [[buffer(2)]],
+                                    constant UocrRmsNormParams &params [[buffer(3)]],
+                                    threadgroup float *partials [[threadgroup(0)]],
+                                    uint row [[threadgroup_position_in_grid]],
+                                    uint tid [[thread_index_in_threadgroup]],
+                                    uint ntg [[threads_per_threadgroup]]) {
+    if (row >= params.n_rows) {
+        return;
+    }
+
+    float sum = 0.0f;
+    const uint row_base = row * params.hidden_size;
+    for (uint col = tid; col < params.hidden_size; col += ntg) {
+        const float x = float(src[row_base + col]);
+        sum += x * x;
+    }
+    partials[tid] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = ntg >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            partials[tid] += partials[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    const float scale = 1.0f / sqrt(partials[0] / float(params.hidden_size) + params.eps);
+    for (uint col = tid; col < params.hidden_size; col += ntg) {
+        const float x = float(src[row_base + col]);
+        const float w = float(weight[col]);
+        dst[row_base + col] = x * scale * w;
+    }
+}

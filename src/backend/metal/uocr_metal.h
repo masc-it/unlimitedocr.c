@@ -49,6 +49,11 @@ typedef enum uocr_metal_get_rows_output_type {
     UOCR_METAL_GET_ROWS_OUTPUT_F32 = 1
 } uocr_metal_get_rows_output_type;
 
+typedef enum uocr_metal_rmsnorm_output_type {
+    UOCR_METAL_RMSNORM_OUTPUT_F16 = 0,
+    UOCR_METAL_RMSNORM_OUTPUT_F32 = 1
+} uocr_metal_rmsnorm_output_type;
+
 int uocr_metal_is_available(void);
 const char *uocr_metal_backend_name(void);
 uint64_t uocr_metal_recommended_working_set_size(void);
@@ -128,6 +133,20 @@ int uocr_metal_context_assemble_prompt_f16(uocr_metal_context *ctx,
                                            uint16_t *out_prompt_f16,
                                            char *error,
                                            size_t error_size);
+
+/* Diagnostic RMSNorm helper for synthetic tests. The kernel accumulates the
+ * row variance in fp32 and applies fp16 learned weights.
+ */
+int uocr_metal_context_rmsnorm_f16(uocr_metal_context *ctx,
+                                   const uint16_t *input_f16,
+                                   const uint16_t *weight_f16,
+                                   uint32_t n_rows,
+                                   uint32_t hidden_size,
+                                   float eps,
+                                   uocr_metal_rmsnorm_output_type output_type,
+                                   void *out,
+                                   char *error,
+                                   size_t error_size);
 
 int uocr_metal_smoke_test(const char *resource_path, char *error, size_t error_size);
 
