@@ -620,7 +620,7 @@ First implementation slice, in order:
   - [x] V: `[layer][slot][max_prompt_tokens + 128][10][128]` fp16
   - [x] per sequence, ring slots start at actual `prefill_len`, not at `max_prompt_tokens`
   - [x] attention length uses actual prompt tokens plus live generated-ring tokens; unused prompt capacity is never attended
-- [ ] Implement prompt prefill attention over full prompt with causal mask.
+- [x] Implement prompt prefill attention over full prompt with causal mask.
 - [ ] Adapt gradients.c `sdpa_varlen` for prefill where useful.
 - [ ] Implement decode attention for one token attending to full prompt plus generated ring.
 - [ ] Adapt gradients.c `sdpa_decode` window/prefix logic to OCR's rule: prompt always attendable, generated ring size `128`.

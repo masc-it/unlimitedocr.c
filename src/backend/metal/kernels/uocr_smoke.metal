@@ -493,6 +493,150 @@ kernel void uocr_rope_qk_f16_to_f32(device const half *q_src [[buffer(0)]],
     k_dst[base + ulong(b)] = k0 * s + k1 * c;
 }
 
+struct UocrPrefillAttentionParams {
+    uint n_tokens;
+    uint heads;
+    uint head_dim;
+    float scale;
+};
+
+static inline float uocr_prefill_attention_score(device const half *q_src,
+                                                 device const half *k_src,
+                                                 constant UocrPrefillAttentionParams &params,
+                                                 uint query_token,
+                                                 uint key_token,
+                                                 uint head) {
+    const ulong q_base = (ulong(query_token) * ulong(params.heads) + ulong(head)) * ulong(params.head_dim);
+    const ulong k_base = (ulong(key_token) * ulong(params.heads) + ulong(head)) * ulong(params.head_dim);
+    float score = 0.0f;
+    for (uint dim = 0u; dim < params.head_dim; ++dim) {
+        score += float(q_src[q_base + ulong(dim)]) * float(k_src[k_base + ulong(dim)]);
+    }
+    return score * params.scale;
+}
+
+static inline void uocr_prefill_reduce_max(threadgroup float *partials,
+                                           uint tid,
+                                           uint ntg) {
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = ntg >> 1u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            partials[tid] = max(partials[tid], partials[tid + stride]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+static inline void uocr_prefill_reduce_sum(threadgroup float *partials,
+                                           uint tid,
+                                           uint ntg) {
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = ntg >> 1u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            partials[tid] += partials[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+kernel void uocr_prefill_attention_f16_to_f16(device const half *q_src [[buffer(0)]],
+                                              device const half *k_src [[buffer(1)]],
+                                              device const half *v_src [[buffer(2)]],
+                                              device half *dst [[buffer(3)]],
+                                              constant UocrPrefillAttentionParams &params [[buffer(4)]],
+                                              threadgroup float *scratch [[threadgroup(0)]],
+                                              uint group_index [[threadgroup_position_in_grid]],
+                                              uint tid [[thread_index_in_threadgroup]],
+                                              uint ntg [[threads_per_threadgroup]]) {
+    const uint query_token = group_index / params.heads;
+    const uint head = group_index - query_token * params.heads;
+    if (query_token >= params.n_tokens || head >= params.heads) {
+        return;
+    }
+
+    threadgroup float *scores = scratch;
+    threadgroup float *partials = scratch + params.n_tokens;
+    float local_max = -3.4028234663852886e38f;
+    for (uint key_token = tid; key_token <= query_token; key_token += ntg) {
+        const float score = uocr_prefill_attention_score(q_src, k_src, params, query_token, key_token, head);
+        scores[key_token] = score;
+        local_max = max(local_max, score);
+    }
+    partials[tid] = local_max;
+    uocr_prefill_reduce_max(partials, tid, ntg);
+    const float max_score = partials[0];
+
+    float local_denominator = 0.0f;
+    for (uint key_token = tid; key_token <= query_token; key_token += ntg) {
+        const float unnormalized = exp(scores[key_token] - max_score);
+        scores[key_token] = unnormalized;
+        local_denominator += unnormalized;
+    }
+    partials[tid] = local_denominator;
+    uocr_prefill_reduce_sum(partials, tid, ntg);
+    const float denominator = partials[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint dim = tid; dim < params.head_dim; dim += ntg) {
+        float value = 0.0f;
+        for (uint key_token = 0u; key_token <= query_token; ++key_token) {
+            const ulong v_index = (ulong(key_token) * ulong(params.heads) + ulong(head)) * ulong(params.head_dim) + ulong(dim);
+            value += (scores[key_token] / denominator) * float(v_src[v_index]);
+        }
+        const ulong dst_index = (ulong(query_token) * ulong(params.heads) + ulong(head)) * ulong(params.head_dim) + ulong(dim);
+        dst[dst_index] = half(value);
+    }
+}
+
+kernel void uocr_prefill_attention_f16_to_f32(device const half *q_src [[buffer(0)]],
+                                              device const half *k_src [[buffer(1)]],
+                                              device const half *v_src [[buffer(2)]],
+                                              device float *dst [[buffer(3)]],
+                                              constant UocrPrefillAttentionParams &params [[buffer(4)]],
+                                              threadgroup float *scratch [[threadgroup(0)]],
+                                              uint group_index [[threadgroup_position_in_grid]],
+                                              uint tid [[thread_index_in_threadgroup]],
+                                              uint ntg [[threads_per_threadgroup]]) {
+    const uint query_token = group_index / params.heads;
+    const uint head = group_index - query_token * params.heads;
+    if (query_token >= params.n_tokens || head >= params.heads) {
+        return;
+    }
+
+    threadgroup float *scores = scratch;
+    threadgroup float *partials = scratch + params.n_tokens;
+    float local_max = -3.4028234663852886e38f;
+    for (uint key_token = tid; key_token <= query_token; key_token += ntg) {
+        const float score = uocr_prefill_attention_score(q_src, k_src, params, query_token, key_token, head);
+        scores[key_token] = score;
+        local_max = max(local_max, score);
+    }
+    partials[tid] = local_max;
+    uocr_prefill_reduce_max(partials, tid, ntg);
+    const float max_score = partials[0];
+
+    float local_denominator = 0.0f;
+    for (uint key_token = tid; key_token <= query_token; key_token += ntg) {
+        const float unnormalized = exp(scores[key_token] - max_score);
+        scores[key_token] = unnormalized;
+        local_denominator += unnormalized;
+    }
+    partials[tid] = local_denominator;
+    uocr_prefill_reduce_sum(partials, tid, ntg);
+    const float denominator = partials[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint dim = tid; dim < params.head_dim; dim += ntg) {
+        float value = 0.0f;
+        for (uint key_token = 0u; key_token <= query_token; ++key_token) {
+            const ulong v_index = (ulong(key_token) * ulong(params.heads) + ulong(head)) * ulong(params.head_dim) + ulong(dim);
+            value += (scores[key_token] / denominator) * float(v_src[v_index]);
+        }
+        const ulong dst_index = (ulong(query_token) * ulong(params.heads) + ulong(head)) * ulong(params.head_dim) + ulong(dim);
+        dst[dst_index] = value;
+    }
+}
+
 struct UocrKVCacheWriteParams {
     uint n_tokens;
     uint batch_slots;

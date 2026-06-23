@@ -845,6 +845,174 @@ static int test_metal_rope_qk_f16(void) {
     return 0;
 }
 
+static int compute_prefill_attention_expected(const uint16_t *q,
+                                              const uint16_t *k,
+                                              const uint16_t *v,
+                                              uint32_t n_tokens,
+                                              float *out) {
+    const float scale = 1.0f / sqrtf((float)UOCR_HEAD_DIM);
+    float scores[16];
+    if (n_tokens > (uint32_t)(sizeof(scores) / sizeof(scores[0]))) {
+        return 0;
+    }
+    for (uint32_t query = 0u; query < n_tokens; ++query) {
+        for (uint32_t head = 0u; head < UOCR_ATTENTION_HEADS; ++head) {
+            float max_score = -3.4028234663852886e38f;
+            for (uint32_t key = 0u; key <= query; ++key) {
+                float score = 0.0f;
+                const uint32_t q_base = (query * UOCR_ATTENTION_HEADS + head) * UOCR_HEAD_DIM;
+                const uint32_t k_base = (key * UOCR_ATTENTION_HEADS + head) * UOCR_HEAD_DIM;
+                for (uint32_t dim = 0u; dim < UOCR_HEAD_DIM; ++dim) {
+                    score += f16_bits_to_f32(q[q_base + dim]) * f16_bits_to_f32(k[k_base + dim]);
+                }
+                score *= scale;
+                scores[key] = score;
+                if (score > max_score) {
+                    max_score = score;
+                }
+            }
+
+            float denominator = 0.0f;
+            for (uint32_t key = 0u; key <= query; ++key) {
+                scores[key] = expf(scores[key] - max_score);
+                denominator += scores[key];
+            }
+            for (uint32_t dim = 0u; dim < UOCR_HEAD_DIM; ++dim) {
+                float value = 0.0f;
+                for (uint32_t key = 0u; key <= query; ++key) {
+                    const uint32_t v_index = (key * UOCR_ATTENTION_HEADS + head) * UOCR_HEAD_DIM + dim;
+                    value += (scores[key] / denominator) * f16_bits_to_f32(v[v_index]);
+                }
+                out[(query * UOCR_ATTENTION_HEADS + head) * UOCR_HEAD_DIM + dim] = value;
+            }
+        }
+    }
+    return 1;
+}
+
+static int test_metal_prefill_attention_f16(void) {
+    if (!uocr_metal_is_available()) {
+        return 0;
+    }
+
+    enum { TOKENS = 5, HIDDEN = UOCR_ATTENTION_HEADS * UOCR_HEAD_DIM };
+    const uint16_t q_values[] = {
+        0x0000u, /* 0.0 */
+        0x2c00u, /* 0.0625 */
+        0x3000u, /* 0.125 */
+        0xb000u, /* -0.125 */
+        0x3400u  /* 0.25 */
+    };
+    const uint16_t k_values[] = {
+        0x0000u, /* 0.0 */
+        0x2800u, /* 0.03125 */
+        0x2c00u, /* 0.0625 */
+        0x3000u, /* 0.125 */
+        0xb000u  /* -0.125 */
+    };
+    const uint16_t v_values[] = {
+        0xbc00u, /* -1.0 */
+        0xb800u, /* -0.5 */
+        0x0000u, /* 0.0 */
+        0x3400u, /* 0.25 */
+        0x3800u, /* 0.5 */
+        0x3c00u  /* 1.0 */
+    };
+    const uint32_t q_count = (uint32_t)(sizeof(q_values) / sizeof(q_values[0]));
+    const uint32_t k_count = (uint32_t)(sizeof(k_values) / sizeof(k_values[0]));
+    const uint32_t v_count = (uint32_t)(sizeof(v_values) / sizeof(v_values[0]));
+
+    uint16_t *q = (uint16_t *)malloc((size_t)TOKENS * HIDDEN * sizeof(uint16_t));
+    uint16_t *k = (uint16_t *)malloc((size_t)TOKENS * HIDDEN * sizeof(uint16_t));
+    uint16_t *v = (uint16_t *)malloc((size_t)TOKENS * HIDDEN * sizeof(uint16_t));
+    float *expected = (float *)malloc((size_t)TOKENS * HIDDEN * sizeof(float));
+    float *out_f32 = (float *)malloc((size_t)TOKENS * HIDDEN * sizeof(float));
+    uint16_t *out_f16 = (uint16_t *)malloc((size_t)TOKENS * HIDDEN * sizeof(uint16_t));
+    CHECK(q != NULL && k != NULL && v != NULL && expected != NULL && out_f32 != NULL && out_f16 != NULL);
+
+    for (uint32_t i = 0u; i < (uint32_t)(TOKENS * HIDDEN); ++i) {
+        q[i] = q_values[(i * 7u + i / 19u + 1u) % q_count];
+        k[i] = k_values[(i * 11u + i / 23u + 3u) % k_count];
+        v[i] = v_values[(i * 13u + i / 29u + 5u) % v_count];
+    }
+    /* Make future tokens conspicuous so query-token zero verifies the causal
+     * mask cannot leak later values.
+     */
+    for (uint32_t token = 1u; token < (uint32_t)TOKENS; ++token) {
+        v[token * (uint32_t)HIDDEN] = 0x5000u; /* 32.0 */
+    }
+
+    CHECK(compute_prefill_attention_expected(q, k, v, TOKENS, expected) == 1);
+
+    char error[1024];
+    memset(error, 0, sizeof(error));
+    uocr_metal_context *ctx = uocr_metal_context_create(UOCR_TEST_METAL_RESOURCE_PATH, error, sizeof(error));
+    CHECK(ctx != NULL);
+
+    memset(out_f32, 0, (size_t)TOKENS * HIDDEN * sizeof(float));
+    CHECK(uocr_metal_context_prefill_attention_f16(ctx,
+                                                   q,
+                                                   k,
+                                                   v,
+                                                   TOKENS,
+                                                   UOCR_METAL_DENSE_OUTPUT_F32,
+                                                   out_f32,
+                                                   error,
+                                                   sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    for (uint32_t i = 0u; i < (uint32_t)(TOKENS * HIDDEN); ++i) {
+        CHECK(fabsf(out_f32[i] - expected[i]) < 8.0e-4f);
+    }
+    for (uint32_t dim = 0u; dim < UOCR_HEAD_DIM; ++dim) {
+        CHECK(out_f32[dim] == f16_bits_to_f32(v[dim]));
+    }
+
+    memset(out_f16, 0, (size_t)TOKENS * HIDDEN * sizeof(uint16_t));
+    CHECK(uocr_metal_context_prefill_attention_f16(ctx,
+                                                   q,
+                                                   k,
+                                                   v,
+                                                   TOKENS,
+                                                   UOCR_METAL_DENSE_OUTPUT_F16,
+                                                   out_f16,
+                                                   error,
+                                                   sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    for (uint32_t i = 0u; i < (uint32_t)(TOKENS * HIDDEN); ++i) {
+        CHECK(fabsf(f16_bits_to_f32(out_f16[i]) - expected[i]) < 1.0e-2f);
+    }
+
+    CHECK(uocr_metal_context_prefill_attention_f16(ctx,
+                                                   q,
+                                                   k,
+                                                   v,
+                                                   0u,
+                                                   UOCR_METAL_DENSE_OUTPUT_F32,
+                                                   out_f32,
+                                                   error,
+                                                   sizeof(error)) == 0);
+    CHECK(strstr(error, "invalid Metal prefill attention request") != NULL);
+    CHECK(uocr_metal_context_prefill_attention_f16(ctx,
+                                                   q,
+                                                   k,
+                                                   v,
+                                                   TOKENS,
+                                                   (uocr_metal_dense_output_type)99,
+                                                   out_f32,
+                                                   error,
+                                                   sizeof(error)) == 0);
+    CHECK(strstr(error, "unsupported Metal prefill attention output type") != NULL);
+
+    uocr_metal_context_destroy(ctx);
+    free(out_f16);
+    free(out_f32);
+    free(expected);
+    free(v);
+    free(k);
+    free(q);
+    return 0;
+}
+
 static uint16_t kv_cache_sentinel(uint64_t index, uint32_t stream) {
     return (uint16_t)(0x1800u + ((index * 17u + (uint64_t)stream * 97u) & 0x07ffu));
 }
@@ -887,6 +1055,13 @@ static int test_metal_kv_cache_layout_helpers(void) {
     CHECK(attention_length == 7u + UOCR_GENERATED_RING_WINDOW);
     CHECK(uocr_metal_kv_cache_attention_length(7u, UOCR_GENERATED_RING_WINDOW + 9u, &attention_length) == 1);
     CHECK(attention_length == 7u + UOCR_GENERATED_RING_WINDOW);
+    CHECK(uocr_metal_kv_cache_attention_length(UOCR_MAX_POSITIONS, 0u, &attention_length) == 1);
+    CHECK(attention_length == UOCR_MAX_POSITIONS);
+    CHECK(uocr_metal_kv_cache_attention_length(UOCR_MAX_POSITIONS, 1u, &attention_length) == 0);
+    CHECK(uocr_metal_kv_cache_attention_length(UOCR_MAX_POSITIONS - 3u, 3u, &attention_length) == 1);
+    CHECK(attention_length == UOCR_MAX_POSITIONS);
+    CHECK(uocr_metal_kv_cache_attention_length(UOCR_MAX_POSITIONS - 3u, 4u, &attention_length) == 0);
+    CHECK(uocr_metal_kv_cache_attention_length(UINT32_MAX, 0u, &attention_length) == 0);
     CHECK(uocr_metal_kv_cache_attention_length(0u, 1u, &attention_length) == 0);
 
     uocr_metal_kv_cache_layout empty_layout;
@@ -938,6 +1113,15 @@ static int test_metal_kv_cache_layout_helpers(void) {
     CHECK(offset == layout.k_offset_bytes + expected_inner);
     CHECK(uocr_metal_kv_cache_offset(&layout, 1, layer, slot, token, head, dim, &offset) == 1);
     CHECK(offset == layout.v_offset_bytes + expected_inner);
+    CHECK(uocr_metal_kv_cache_offset(&layout,
+                                     1,
+                                     layout.decoder_layers - 1u,
+                                     layout.batch_slots - 1u,
+                                     layout.cache_token_capacity - 1u,
+                                     layout.kv_heads - 1u,
+                                     layout.head_dim - 1u,
+                                     &offset) == 1);
+    CHECK(offset == layout.total_bytes - 2u);
     CHECK(uocr_metal_kv_cache_offset(&layout, 2, layer, slot, token, head, dim, &offset) == 0);
     CHECK(uocr_metal_kv_cache_offset(&layout, 0, UOCR_DECODER_LAYERS, slot, token, head, dim, &offset) == 0);
     CHECK(uocr_metal_kv_cache_offset(&layout, 0, layer, 2u, token, head, dim, &offset) == 0);
@@ -1540,6 +1724,7 @@ int main(void) {
     if (test_metal_dense_f16() != 0) return 1;
     if (test_metal_attention_qkvo_f16() != 0) return 1;
     if (test_metal_rope_qk_f16() != 0) return 1;
+    if (test_metal_prefill_attention_f16() != 0) return 1;
     if (test_metal_kv_cache_layout_helpers() != 0) return 1;
     if (test_metal_kv_cache_write_f16() != 0) return 1;
     if (test_metal_recent_decoder_primitives_stress() != 0) return 1;

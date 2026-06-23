@@ -301,6 +301,13 @@ typedef struct uocr_metal_rope_qk_params {
     uint32_t reserved2;
 } uocr_metal_rope_qk_params;
 
+typedef struct uocr_metal_prefill_attention_params {
+    uint32_t n_tokens;
+    uint32_t heads;
+    uint32_t head_dim;
+    float scale;
+} uocr_metal_prefill_attention_params;
+
 typedef struct uocr_metal_kv_cache_write_params {
     uint32_t n_tokens;
     uint32_t batch_slots;
@@ -1482,11 +1489,11 @@ int uocr_metal_kv_cache_token_for_position(uint32_t prompt_length,
 int uocr_metal_kv_cache_attention_length(uint32_t prompt_length,
                                          uint32_t generated_count,
                                          uint32_t *out_attention_length) {
-    if (out_attention_length == NULL || prompt_length == 0u) {
+    if (out_attention_length == NULL || prompt_length == 0u || prompt_length > UOCR_MAX_POSITIONS) {
         return 0;
     }
     const uint32_t live_generated = generated_count < UOCR_GENERATED_RING_WINDOW ? generated_count : UOCR_GENERATED_RING_WINDOW;
-    if (prompt_length > UINT32_MAX - live_generated) {
+    if (prompt_length > UOCR_MAX_POSITIONS - live_generated) {
         return 0;
     }
     *out_attention_length = prompt_length + live_generated;
@@ -2525,6 +2532,175 @@ int uocr_metal_context_rope_qk_f16(uocr_metal_context *ctx,
         memcpy(k_out, [k_dst contents], (size_t)output_bytes);
         [k_dst release];
         [q_dst release];
+        [k_src release];
+        [q_src release];
+    }
+
+    metal_clear_error(error, error_size);
+    return 1;
+}
+
+int uocr_metal_context_prefill_attention_f16(uocr_metal_context *ctx,
+                                             const uint16_t *q_f16,
+                                             const uint16_t *k_f16,
+                                             const uint16_t *v_f16,
+                                             uint32_t n_tokens,
+                                             uocr_metal_dense_output_type output_type,
+                                             void *out,
+                                             char *error,
+                                             size_t error_size) {
+    metal_clear_error(error, error_size);
+    if (ctx == NULL || q_f16 == NULL || k_f16 == NULL || v_f16 == NULL || out == NULL || n_tokens == 0u) {
+        return metal_fail(error, error_size, "invalid Metal prefill attention request");
+    }
+    if (output_type != UOCR_METAL_DENSE_OUTPUT_F16 && output_type != UOCR_METAL_DENSE_OUTPUT_F32) {
+        return metal_fail(error, error_size, "unsupported Metal prefill attention output type %d", (int)output_type);
+    }
+    if (n_tokens > UOCR_MAX_POSITIONS) {
+        return metal_fail(error,
+                          error_size,
+                          "Metal prefill attention prompt length %u exceeds max positions %u",
+                          n_tokens,
+                          UOCR_MAX_POSITIONS);
+    }
+
+    uint64_t tensor_values = 0u;
+    uint64_t attention_groups = 0u;
+    uint64_t input_bytes = 0u;
+    uint64_t output_bytes = 0u;
+    const uint64_t output_element_bytes = output_type == UOCR_METAL_DENSE_OUTPUT_F16 ? 2u : (uint64_t)sizeof(float);
+    if (!checked_mul_u64((uint64_t)n_tokens, (uint64_t)UOCR_ATTENTION_HEADS, &attention_groups) ||
+        !checked_mul_u64(attention_groups, (uint64_t)UOCR_HEAD_DIM, &tensor_values) ||
+        !checked_mul_u64(tensor_values, 2u, &input_bytes) ||
+        !checked_mul_u64(tensor_values, output_element_bytes, &output_bytes)) {
+        return metal_fail(error, error_size, "Metal prefill attention byte-size overflow");
+    }
+
+    const uint64_t max_buffer_length = metal_device_max_buffer_length(ctx->device);
+    if (input_bytes > max_buffer_length || output_bytes > max_buffer_length || input_bytes > (uint64_t)SIZE_MAX ||
+        output_bytes > (uint64_t)SIZE_MAX || tensor_values > (uint64_t)UINT32_MAX) {
+        return metal_fail(error,
+                          error_size,
+                          "Metal prefill attention buffers exceed maxBufferLength %llu",
+                          (unsigned long long)max_buffer_length);
+    }
+
+    @autoreleasepool {
+        const char *function_name = output_type == UOCR_METAL_DENSE_OUTPUT_F16 ?
+                                        "uocr_prefill_attention_f16_to_f16" :
+                                        "uocr_prefill_attention_f16_to_f32";
+        id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, function_name, error, error_size);
+        if (pipeline == nil) {
+            return 0;
+        }
+
+        NSUInteger threads_per_group = metal_power2_threadgroup_width(128u, pipeline.maxTotalThreadsPerThreadgroup);
+        if (threads_per_group == 0u) {
+            threads_per_group = 1u;
+        }
+        uint64_t threadgroup_float_count = 0u;
+        uint64_t threadgroup_bytes = 0u;
+        if (!checked_add_u64((uint64_t)n_tokens, (uint64_t)threads_per_group, &threadgroup_float_count) ||
+            !checked_mul_u64(threadgroup_float_count, (uint64_t)sizeof(float), &threadgroup_bytes) ||
+            threadgroup_bytes > (uint64_t)NSUIntegerMax) {
+            return metal_fail(error, error_size, "Metal prefill attention threadgroup memory overflow");
+        }
+        const NSUInteger max_threadgroup_memory = ctx->device.maxThreadgroupMemoryLength;
+        if (threadgroup_bytes > (uint64_t)max_threadgroup_memory) {
+            return metal_fail(error,
+                              error_size,
+                              "Metal prefill attention needs %llu bytes of threadgroup memory, exceeding limit %llu",
+                              (unsigned long long)threadgroup_bytes,
+                              (unsigned long long)max_threadgroup_memory);
+        }
+
+        id<MTLBuffer> q_src = [ctx->device newBufferWithBytes:q_f16
+                                                       length:(NSUInteger)input_bytes
+                                                      options:MTLResourceStorageModeShared];
+        if (q_src == nil) {
+            return metal_fail(error, error_size, "failed to allocate Metal prefill attention Q buffer");
+        }
+        q_src.label = @"uocr_prefill_attention_q_f16";
+
+        id<MTLBuffer> k_src = [ctx->device newBufferWithBytes:k_f16
+                                                       length:(NSUInteger)input_bytes
+                                                      options:MTLResourceStorageModeShared];
+        if (k_src == nil) {
+            [q_src release];
+            return metal_fail(error, error_size, "failed to allocate Metal prefill attention K buffer");
+        }
+        k_src.label = @"uocr_prefill_attention_k_f16";
+
+        id<MTLBuffer> v_src = [ctx->device newBufferWithBytes:v_f16
+                                                       length:(NSUInteger)input_bytes
+                                                      options:MTLResourceStorageModeShared];
+        if (v_src == nil) {
+            [k_src release];
+            [q_src release];
+            return metal_fail(error, error_size, "failed to allocate Metal prefill attention V buffer");
+        }
+        v_src.label = @"uocr_prefill_attention_v_f16";
+
+        id<MTLBuffer> dst = [ctx->device newBufferWithLength:(NSUInteger)output_bytes options:MTLResourceStorageModeShared];
+        if (dst == nil) {
+            [v_src release];
+            [k_src release];
+            [q_src release];
+            return metal_fail(error, error_size, "failed to allocate Metal prefill attention output buffer");
+        }
+        dst.label = @"uocr_prefill_attention_output";
+        memset([dst contents], 0, (size_t)output_bytes);
+
+        id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
+        if (cb == nil) {
+            [dst release];
+            [v_src release];
+            [k_src release];
+            [q_src release];
+            return metal_fail(error, error_size, "failed to create Metal prefill attention command buffer");
+        }
+        cb.label = @"uocr_prefill_attention_command_buffer";
+
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        if (enc == nil) {
+            [dst release];
+            [v_src release];
+            [k_src release];
+            [q_src release];
+            return metal_fail(error, error_size, "failed to create Metal prefill attention command encoder");
+        }
+
+        uocr_metal_prefill_attention_params params;
+        params.n_tokens = n_tokens;
+        params.heads = UOCR_ATTENTION_HEADS;
+        params.head_dim = UOCR_HEAD_DIM;
+        params.scale = 1.0f / sqrtf((float)UOCR_HEAD_DIM);
+
+        [enc setComputePipelineState:pipeline];
+        [enc setBuffer:q_src offset:0u atIndex:0u];
+        [enc setBuffer:k_src offset:0u atIndex:1u];
+        [enc setBuffer:v_src offset:0u atIndex:2u];
+        [enc setBuffer:dst offset:0u atIndex:3u];
+        [enc setBytes:&params length:sizeof(params) atIndex:4u];
+        [enc setThreadgroupMemoryLength:(NSUInteger)threadgroup_bytes atIndex:0u];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)attention_groups, 1u, 1u)
+             threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1u, 1u)];
+        [enc endEncoding];
+
+        [cb commit];
+        [cb waitUntilCompleted];
+        if (cb.status == MTLCommandBufferStatusError) {
+            NSString *description = cb.error != nil ? [cb.error localizedDescription] : @"unknown command-buffer error";
+            [dst release];
+            [v_src release];
+            [k_src release];
+            [q_src release];
+            return metal_fail(error, error_size, "Metal prefill attention command failed: %s", [description UTF8String]);
+        }
+
+        memcpy(out, [dst contents], (size_t)output_bytes);
+        [dst release];
+        [v_src release];
         [k_src release];
         [q_src release];
     }

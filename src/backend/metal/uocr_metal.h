@@ -240,6 +240,21 @@ int uocr_metal_context_rope_qk_f16(uocr_metal_context *ctx,
                                    char *error,
                                    size_t error_size);
 
+/* Diagnostic prompt-prefill SDPA helper for synthetic decoder tests. Computes
+ * causal full-prompt attention for Q/K/V tensors shaped
+ * [n_tokens, 10 heads, 128 dim]. The prompt remains fully attendable under a
+ * standard lower-triangular causal mask, and softmax/dot products are fp32.
+ */
+int uocr_metal_context_prefill_attention_f16(uocr_metal_context *ctx,
+                                             const uint16_t *q_f16,
+                                             const uint16_t *k_f16,
+                                             const uint16_t *v_f16,
+                                             uint32_t n_tokens,
+                                             uocr_metal_dense_output_type output_type,
+                                             void *out,
+                                             char *error,
+                                             size_t error_size);
+
 /* Diagnostic KV-cache write helper for synthetic decoder tests. Writes K/V
  * tensors shaped [n_tokens, 10 heads, 128 dim] into separate caches laid out as
  * [12 layers, batch_slots, prompt_token_capacity + 128, 10 heads, 128 dim].
