@@ -272,6 +272,13 @@ typedef struct uocr_metal_rmsnorm_params {
     uint32_t reserved;
 } uocr_metal_rmsnorm_params;
 
+typedef struct uocr_metal_dense_params {
+    uint32_t input_rows;
+    uint32_t in_features;
+    uint32_t out_features;
+    uint32_t has_bias;
+} uocr_metal_dense_params;
+
 static int metal_retain_transient_until_completed(uocr_metal_context *ctx,
                                                   id<MTLCommandBuffer> command_buffer,
                                                   id object,
@@ -1816,6 +1823,165 @@ int uocr_metal_context_rmsnorm_f16(uocr_metal_context *ctx,
 
         memcpy(out, [dst contents], (size_t)output_bytes);
         [dst release];
+        [weight release];
+        [src release];
+    }
+
+    metal_clear_error(error, error_size);
+    return 1;
+}
+
+int uocr_metal_context_dense_f16(uocr_metal_context *ctx,
+                                 const uint16_t *input_f16,
+                                 const uint16_t *weight_f16,
+                                 const uint16_t *bias_f16_or_null,
+                                 uint32_t input_rows,
+                                 uint32_t in_features,
+                                 uint32_t out_features,
+                                 uocr_metal_dense_output_type output_type,
+                                 void *out,
+                                 char *error,
+                                 size_t error_size) {
+    metal_clear_error(error, error_size);
+    if (ctx == NULL || input_f16 == NULL || weight_f16 == NULL || out == NULL ||
+        input_rows == 0u || in_features == 0u || out_features == 0u) {
+        return metal_fail(error, error_size, "invalid Metal dense request");
+    }
+    if (output_type != UOCR_METAL_DENSE_OUTPUT_F16 && output_type != UOCR_METAL_DENSE_OUTPUT_F32) {
+        return metal_fail(error, error_size, "unsupported Metal dense output type %d", (int)output_type);
+    }
+
+    uint64_t input_values = 0u;
+    uint64_t input_bytes = 0u;
+    uint64_t weight_values = 0u;
+    uint64_t weight_bytes = 0u;
+    uint64_t bias_bytes = 0u;
+    uint64_t output_values = 0u;
+    uint64_t output_bytes = 0u;
+    const uint64_t output_element_bytes = output_type == UOCR_METAL_DENSE_OUTPUT_F16 ? 2u : (uint64_t)sizeof(float);
+    if (!checked_mul_u64((uint64_t)input_rows, (uint64_t)in_features, &input_values) ||
+        !checked_mul_u64(input_values, 2u, &input_bytes) ||
+        !checked_mul_u64((uint64_t)out_features, (uint64_t)in_features, &weight_values) ||
+        !checked_mul_u64(weight_values, 2u, &weight_bytes) ||
+        !checked_mul_u64((uint64_t)out_features, 2u, &bias_bytes) ||
+        !checked_mul_u64((uint64_t)input_rows, (uint64_t)out_features, &output_values) ||
+        !checked_mul_u64(output_values, output_element_bytes, &output_bytes)) {
+        return metal_fail(error, error_size, "Metal dense byte-size overflow");
+    }
+
+    const uint64_t max_buffer_length = metal_device_max_buffer_length(ctx->device);
+    if (input_bytes > max_buffer_length || weight_bytes > max_buffer_length || bias_bytes > max_buffer_length ||
+        output_bytes > max_buffer_length || input_bytes > (uint64_t)SIZE_MAX || weight_bytes > (uint64_t)SIZE_MAX ||
+        bias_bytes > (uint64_t)SIZE_MAX || output_bytes > (uint64_t)SIZE_MAX ||
+        output_values > (uint64_t)NSUIntegerMax) {
+        return metal_fail(error,
+                          error_size,
+                          "Metal dense buffers exceed maxBufferLength %llu",
+                          (unsigned long long)max_buffer_length);
+    }
+
+    @autoreleasepool {
+        const char *function_name = output_type == UOCR_METAL_DENSE_OUTPUT_F16 ?
+                                        "uocr_dense_f16_to_f16" :
+                                        "uocr_dense_f16_to_f32";
+        id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, function_name, error, error_size);
+        if (pipeline == nil) {
+            return 0;
+        }
+
+        id<MTLBuffer> src = [ctx->device newBufferWithBytes:input_f16
+                                                     length:(NSUInteger)input_bytes
+                                                    options:MTLResourceStorageModeShared];
+        if (src == nil) {
+            return metal_fail(error, error_size, "failed to allocate Metal dense input buffer");
+        }
+        src.label = @"uocr_dense_input_f16";
+
+        id<MTLBuffer> weight = [ctx->device newBufferWithBytes:weight_f16
+                                                        length:(NSUInteger)weight_bytes
+                                                       options:MTLResourceStorageModeShared];
+        if (weight == nil) {
+            [src release];
+            return metal_fail(error, error_size, "failed to allocate Metal dense weight buffer");
+        }
+        weight.label = @"uocr_dense_weight_f16";
+
+        id<MTLBuffer> bias = nil;
+        id<MTLBuffer> bias_arg = weight;
+        if (bias_f16_or_null != NULL) {
+            bias = [ctx->device newBufferWithBytes:bias_f16_or_null
+                                            length:(NSUInteger)bias_bytes
+                                           options:MTLResourceStorageModeShared];
+            if (bias == nil) {
+                [weight release];
+                [src release];
+                return metal_fail(error, error_size, "failed to allocate Metal dense bias buffer");
+            }
+            bias.label = @"uocr_dense_bias_f16";
+            bias_arg = bias;
+        }
+
+        id<MTLBuffer> dst = [ctx->device newBufferWithLength:(NSUInteger)output_bytes options:MTLResourceStorageModeShared];
+        if (dst == nil) {
+            [bias release];
+            [weight release];
+            [src release];
+            return metal_fail(error, error_size, "failed to allocate Metal dense output buffer");
+        }
+        dst.label = @"uocr_dense_output";
+        memset([dst contents], 0, (size_t)output_bytes);
+
+        id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
+        if (cb == nil) {
+            [dst release];
+            [bias release];
+            [weight release];
+            [src release];
+            return metal_fail(error, error_size, "failed to create Metal dense command buffer");
+        }
+        cb.label = @"uocr_dense_command_buffer";
+
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        if (enc == nil) {
+            [dst release];
+            [bias release];
+            [weight release];
+            [src release];
+            return metal_fail(error, error_size, "failed to create Metal dense command encoder");
+        }
+
+        uocr_metal_dense_params params;
+        params.input_rows = input_rows;
+        params.in_features = in_features;
+        params.out_features = out_features;
+        params.has_bias = bias_f16_or_null != NULL ? 1u : 0u;
+
+        const NSUInteger threads_per_group = metal_power2_threadgroup_width(256u, pipeline.maxTotalThreadsPerThreadgroup);
+        [enc setComputePipelineState:pipeline];
+        [enc setBuffer:src offset:0u atIndex:0u];
+        [enc setBuffer:weight offset:0u atIndex:1u];
+        [enc setBuffer:bias_arg offset:0u atIndex:2u];
+        [enc setBuffer:dst offset:0u atIndex:3u];
+        [enc setBytes:&params length:sizeof(params) atIndex:4u];
+        [enc setThreadgroupMemoryLength:threads_per_group * sizeof(float) atIndex:0u];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)output_values, 1u, 1u)
+             threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1u, 1u)];
+        [enc endEncoding];
+
+        [cb commit];
+        [cb waitUntilCompleted];
+        if (cb.status == MTLCommandBufferStatusError) {
+            NSString *description = cb.error != nil ? [cb.error localizedDescription] : @"unknown command-buffer error";
+            [dst release];
+            [bias release];
+            [weight release];
+            [src release];
+            return metal_fail(error, error_size, "Metal dense command failed: %s", [description UTF8String]);
+        }
+
+        memcpy(out, [dst contents], (size_t)output_bytes);
+        [dst release];
+        [bias release];
         [weight release];
         [src release];
     }

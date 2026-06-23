@@ -8,6 +8,7 @@
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -388,6 +389,157 @@ static int test_metal_rmsnorm_f16(void) {
     return 0;
 }
 
+static int test_metal_dense_f16(void) {
+    if (!uocr_metal_is_available()) {
+        return 0;
+    }
+
+    enum { ROWS = 3, IN_FEATURES = 1280, OUT_FEATURES = 96 };
+    const uint16_t input_values[] = {
+        0xb800u, /* -0.5 */
+        0xb400u, /* -0.25 */
+        0x0000u, /* 0.0 */
+        0x3000u, /* 0.125 */
+        0x3400u, /* 0.25 */
+        0x3800u  /* 0.5 */
+    };
+    const uint16_t weight_values[] = {
+        0xb800u, /* -0.5 */
+        0x0000u, /* 0.0 */
+        0x3400u, /* 0.25 */
+        0x3800u, /* 0.5 */
+        0x3c00u  /* 1.0 */
+    };
+    const uint16_t bias_values[] = {
+        0x0000u, /* 0.0 */
+        0x3000u, /* 0.125 */
+        0xb000u, /* -0.125 */
+        0x3400u  /* 0.25 */
+    };
+    const uint32_t input_value_count = (uint32_t)(sizeof(input_values) / sizeof(input_values[0]));
+    const uint32_t weight_value_count = (uint32_t)(sizeof(weight_values) / sizeof(weight_values[0]));
+    const uint32_t bias_value_count = (uint32_t)(sizeof(bias_values) / sizeof(bias_values[0]));
+
+    uint16_t *input = (uint16_t *)malloc((size_t)ROWS * IN_FEATURES * sizeof(uint16_t));
+    uint16_t *weight = (uint16_t *)malloc((size_t)OUT_FEATURES * IN_FEATURES * sizeof(uint16_t));
+    uint16_t *bias = (uint16_t *)malloc((size_t)OUT_FEATURES * sizeof(uint16_t));
+    float *expected = (float *)malloc((size_t)ROWS * OUT_FEATURES * sizeof(float));
+    float *out_f32 = (float *)malloc((size_t)ROWS * OUT_FEATURES * sizeof(float));
+    uint16_t *out_f16 = (uint16_t *)malloc((size_t)ROWS * OUT_FEATURES * sizeof(uint16_t));
+    CHECK(input != NULL && weight != NULL && bias != NULL && expected != NULL && out_f32 != NULL && out_f16 != NULL);
+
+    for (uint32_t i = 0u; i < (uint32_t)(ROWS * IN_FEATURES); ++i) {
+        input[i] = input_values[(i * 17u + i / 29u + 1u) % input_value_count];
+    }
+    for (uint32_t i = 0u; i < (uint32_t)(OUT_FEATURES * IN_FEATURES); ++i) {
+        weight[i] = weight_values[(i * 11u + i / 37u + 3u) % weight_value_count];
+    }
+    for (uint32_t i = 0u; i < (uint32_t)OUT_FEATURES; ++i) {
+        bias[i] = bias_values[(i * 5u + 1u) % bias_value_count];
+    }
+
+    for (uint32_t row = 0u; row < (uint32_t)ROWS; ++row) {
+        for (uint32_t col = 0u; col < (uint32_t)OUT_FEATURES; ++col) {
+            float sum = f16_bits_to_f32(bias[col]);
+            for (uint32_t k = 0u; k < (uint32_t)IN_FEATURES; ++k) {
+                sum += f16_bits_to_f32(input[row * (uint32_t)IN_FEATURES + k]) *
+                       f16_bits_to_f32(weight[col * (uint32_t)IN_FEATURES + k]);
+            }
+            expected[row * (uint32_t)OUT_FEATURES + col] = sum;
+        }
+    }
+
+    char error[1024];
+    memset(error, 0, sizeof(error));
+    uocr_metal_context *ctx = uocr_metal_context_create(UOCR_TEST_METAL_RESOURCE_PATH, error, sizeof(error));
+    CHECK(ctx != NULL);
+
+    memset(out_f32, 0, (size_t)ROWS * OUT_FEATURES * sizeof(float));
+    CHECK(uocr_metal_context_dense_f16(ctx,
+                                       input,
+                                       weight,
+                                       bias,
+                                       ROWS,
+                                       IN_FEATURES,
+                                       OUT_FEATURES,
+                                       UOCR_METAL_DENSE_OUTPUT_F32,
+                                       out_f32,
+                                       error,
+                                       sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    for (uint32_t i = 0u; i < (uint32_t)(ROWS * OUT_FEATURES); ++i) {
+        CHECK(fabsf(out_f32[i] - expected[i]) < 2.5e-3f);
+    }
+
+    memset(out_f16, 0, (size_t)ROWS * OUT_FEATURES * sizeof(uint16_t));
+    CHECK(uocr_metal_context_dense_f16(ctx,
+                                       input,
+                                       weight,
+                                       bias,
+                                       1u,
+                                       IN_FEATURES,
+                                       OUT_FEATURES,
+                                       UOCR_METAL_DENSE_OUTPUT_F16,
+                                       out_f16,
+                                       error,
+                                       sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    for (uint32_t i = 0u; i < (uint32_t)OUT_FEATURES; ++i) {
+        CHECK(fabsf(f16_bits_to_f32(out_f16[i]) - expected[i]) < 5.0e-2f);
+    }
+
+    memset(out_f32, 0, (size_t)ROWS * OUT_FEATURES * sizeof(float));
+    CHECK(uocr_metal_context_dense_f16(ctx,
+                                       input,
+                                       weight,
+                                       NULL,
+                                       1u,
+                                       IN_FEATURES,
+                                       OUT_FEATURES,
+                                       UOCR_METAL_DENSE_OUTPUT_F32,
+                                       out_f32,
+                                       error,
+                                       sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    for (uint32_t col = 0u; col < (uint32_t)OUT_FEATURES; ++col) {
+        CHECK(fabsf(out_f32[col] - (expected[col] - f16_bits_to_f32(bias[col]))) < 2.5e-3f);
+    }
+
+    CHECK(uocr_metal_context_dense_f16(ctx,
+                                       input,
+                                       weight,
+                                       bias,
+                                       ROWS,
+                                       IN_FEATURES,
+                                       OUT_FEATURES,
+                                       (uocr_metal_dense_output_type)99,
+                                       out_f32,
+                                       error,
+                                       sizeof(error)) == 0);
+    CHECK(strstr(error, "unsupported Metal dense output type") != NULL);
+    CHECK(uocr_metal_context_dense_f16(ctx,
+                                       input,
+                                       weight,
+                                       bias,
+                                       0u,
+                                       IN_FEATURES,
+                                       OUT_FEATURES,
+                                       UOCR_METAL_DENSE_OUTPUT_F32,
+                                       out_f32,
+                                       error,
+                                       sizeof(error)) == 0);
+    CHECK(strstr(error, "invalid Metal dense request") != NULL);
+
+    uocr_metal_context_destroy(ctx);
+    free(out_f16);
+    free(out_f32);
+    free(expected);
+    free(bias);
+    free(weight);
+    free(input);
+    return 0;
+}
+
 static int test_metal_recent_decoder_primitives_stress(void) {
     if (!uocr_metal_is_available()) {
         return 0;
@@ -762,6 +914,7 @@ int main(void) {
     if (test_metal_get_rows_f16() != 0) return 1;
     if (test_metal_prompt_assembly_f16() != 0) return 1;
     if (test_metal_rmsnorm_f16() != 0) return 1;
+    if (test_metal_dense_f16() != 0) return 1;
     if (test_metal_recent_decoder_primitives_stress() != 0) return 1;
     if (test_metal_runtime_arenas() != 0) return 1;
     if (test_metal_model_mapping() != 0) return 1;

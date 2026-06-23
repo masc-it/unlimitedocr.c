@@ -54,6 +54,11 @@ typedef enum uocr_metal_rmsnorm_output_type {
     UOCR_METAL_RMSNORM_OUTPUT_F32 = 1
 } uocr_metal_rmsnorm_output_type;
 
+typedef enum uocr_metal_dense_output_type {
+    UOCR_METAL_DENSE_OUTPUT_F16 = 0,
+    UOCR_METAL_DENSE_OUTPUT_F32 = 1
+} uocr_metal_dense_output_type;
+
 int uocr_metal_is_available(void);
 const char *uocr_metal_backend_name(void);
 uint64_t uocr_metal_recommended_working_set_size(void);
@@ -147,6 +152,23 @@ int uocr_metal_context_rmsnorm_f16(uocr_metal_context *ctx,
                                    void *out,
                                    char *error,
                                    size_t error_size);
+
+/* Diagnostic fp16 dense helper for synthetic tests. Computes
+ * out[row, out_col] = dot(input[row, :], weight[out_col, :]) + optional bias,
+ * where weights are row-major [out_features, in_features]. Dot products are
+ * accumulated in fp32.
+ */
+int uocr_metal_context_dense_f16(uocr_metal_context *ctx,
+                                 const uint16_t *input_f16,
+                                 const uint16_t *weight_f16,
+                                 const uint16_t *bias_f16_or_null,
+                                 uint32_t input_rows,
+                                 uint32_t in_features,
+                                 uint32_t out_features,
+                                 uocr_metal_dense_output_type output_type,
+                                 void *out,
+                                 char *error,
+                                 size_t error_size);
 
 int uocr_metal_smoke_test(const char *resource_path, char *error, size_t error_size);
 
