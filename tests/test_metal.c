@@ -5,6 +5,7 @@
 
 #include "uocr_test_model_file.h"
 
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
@@ -74,6 +75,119 @@ static int test_metal_named_scratch_buffers(void) {
     uocr_metal_context_release_scratch(ctx, UOCR_METAL_SCRATCH_DECODER);
     CHECK(uocr_metal_context_scratch_capacity(ctx, UOCR_METAL_SCRATCH_DECODER) == 0u);
     CHECK(uocr_metal_context_scratch_high_watermark(ctx, UOCR_METAL_SCRATCH_DECODER) == first_capacity + 1u);
+
+    uocr_metal_context_destroy(ctx);
+    return 0;
+}
+
+static float f16_bits_to_f32(uint16_t h) {
+    const uint32_t sign = ((uint32_t)h & 0x8000u) << 16u;
+    uint32_t bits = 0u;
+    uint32_t mantissa = (uint32_t)h & 0x03ffu;
+    int exponent = (int)((h >> 10u) & 0x001fu);
+    if (exponent == 0) {
+        if (mantissa == 0u) {
+            bits = sign;
+        } else {
+            while ((mantissa & 0x0400u) == 0u) {
+                mantissa <<= 1u;
+                --exponent;
+            }
+            ++exponent;
+            mantissa &= ~0x0400u;
+            bits = sign | ((uint32_t)(exponent + 127 - 15) << 23u) | (mantissa << 13u);
+        }
+    } else if (exponent == 31) {
+        bits = sign | 0x7f800000u | (mantissa << 13u);
+    } else {
+        bits = sign | ((uint32_t)(exponent + 127 - 15) << 23u) | (mantissa << 13u);
+    }
+    float out = 0.0f;
+    memcpy(&out, &bits, sizeof(out));
+    return out;
+}
+
+static int test_metal_get_rows_f16(void) {
+    if (!uocr_metal_is_available()) {
+        return 0;
+    }
+
+    enum { TABLE_ROWS = 5, ROW_WIDTH = 8, OUT_ROWS = 4 };
+    const uint16_t values[] = {
+        0x0000u, /* 0.0 */
+        0x3c00u, /* 1.0 */
+        0xbc00u, /* -1.0 */
+        0x4000u, /* 2.0 */
+        0xc000u, /* -2.0 */
+        0x3800u, /* 0.5 */
+        0xb800u, /* -0.5 */
+        0x4200u, /* 3.0 */
+        0xc200u, /* -3.0 */
+        0x4400u  /* 4.0 */
+    };
+    uint16_t table[TABLE_ROWS * ROW_WIDTH];
+    for (uint32_t i = 0u; i < (uint32_t)(TABLE_ROWS * ROW_WIDTH); ++i) {
+        table[i] = values[(i * 3u + 1u) % (sizeof(values) / sizeof(values[0]))];
+    }
+    const int32_t row_ids[OUT_ROWS] = {3, 0, 4, 1};
+
+    char error[1024];
+    memset(error, 0, sizeof(error));
+    uocr_metal_context *ctx = uocr_metal_context_create(UOCR_TEST_METAL_RESOURCE_PATH, error, sizeof(error));
+    CHECK(ctx != NULL);
+
+    uint16_t out_f16[OUT_ROWS * ROW_WIDTH];
+    memset(out_f16, 0, sizeof(out_f16));
+    CHECK(uocr_metal_context_get_rows_f16(ctx,
+                                          table,
+                                          TABLE_ROWS,
+                                          ROW_WIDTH,
+                                          row_ids,
+                                          OUT_ROWS,
+                                          UOCR_METAL_GET_ROWS_OUTPUT_F16,
+                                          out_f16,
+                                          error,
+                                          sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    for (uint32_t row = 0u; row < (uint32_t)OUT_ROWS; ++row) {
+        for (uint32_t col = 0u; col < (uint32_t)ROW_WIDTH; ++col) {
+            const uint16_t expected = table[(uint32_t)row_ids[row] * (uint32_t)ROW_WIDTH + col];
+            CHECK(out_f16[row * (uint32_t)ROW_WIDTH + col] == expected);
+        }
+    }
+
+    float out_f32[OUT_ROWS * ROW_WIDTH];
+    memset(out_f32, 0, sizeof(out_f32));
+    CHECK(uocr_metal_context_get_rows_f16(ctx,
+                                          table,
+                                          TABLE_ROWS,
+                                          ROW_WIDTH,
+                                          row_ids,
+                                          OUT_ROWS,
+                                          UOCR_METAL_GET_ROWS_OUTPUT_F32,
+                                          out_f32,
+                                          error,
+                                          sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    for (uint32_t row = 0u; row < (uint32_t)OUT_ROWS; ++row) {
+        for (uint32_t col = 0u; col < (uint32_t)ROW_WIDTH; ++col) {
+            const uint16_t expected_bits = table[(uint32_t)row_ids[row] * (uint32_t)ROW_WIDTH + col];
+            CHECK(out_f32[row * (uint32_t)ROW_WIDTH + col] == f16_bits_to_f32(expected_bits));
+        }
+    }
+
+    const int32_t bad_row_ids[1] = {TABLE_ROWS};
+    CHECK(uocr_metal_context_get_rows_f16(ctx,
+                                          table,
+                                          TABLE_ROWS,
+                                          ROW_WIDTH,
+                                          bad_row_ids,
+                                          1u,
+                                          UOCR_METAL_GET_ROWS_OUTPUT_F16,
+                                          out_f16,
+                                          error,
+                                          sizeof(error)) == 0);
+    CHECK(strstr(error, "outside table rows") != NULL);
 
     uocr_metal_context_destroy(ctx);
     return 0;
@@ -230,6 +344,7 @@ int main(void) {
     CHECK(strcmp(uocr_metal_backend_name(), "metal") == 0);
     if (test_metal_smoke() != 0) return 1;
     if (test_metal_named_scratch_buffers() != 0) return 1;
+    if (test_metal_get_rows_f16() != 0) return 1;
     if (test_metal_runtime_arenas() != 0) return 1;
     if (test_metal_model_mapping() != 0) return 1;
     if (test_public_engine_open_initializes_metal() != 0) return 1;

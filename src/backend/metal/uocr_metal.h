@@ -44,6 +44,11 @@ typedef enum uocr_metal_runtime_arena_slot {
     UOCR_METAL_ARENA_COUNT = 7
 } uocr_metal_runtime_arena_slot;
 
+typedef enum uocr_metal_get_rows_output_type {
+    UOCR_METAL_GET_ROWS_OUTPUT_F16 = 0,
+    UOCR_METAL_GET_ROWS_OUTPUT_F32 = 1
+} uocr_metal_get_rows_output_type;
+
 int uocr_metal_is_available(void);
 const char *uocr_metal_backend_name(void);
 uint64_t uocr_metal_recommended_working_set_size(void);
@@ -91,6 +96,21 @@ void uocr_metal_context_release_runtime_arenas(uocr_metal_context *ctx);
 uint64_t uocr_metal_context_runtime_arena_capacity(const uocr_metal_context *ctx,
                                                    uocr_metal_runtime_arena_slot slot);
 uint64_t uocr_metal_context_total_runtime_arena_capacity(const uocr_metal_context *ctx);
+
+/* Diagnostic get-rows entry point used by synthetic tests. Runtime prompt
+ * assembly should bind mmap-backed model buffers directly and reuse the same
+ * kernels without uploading the embedding table through this helper.
+ */
+int uocr_metal_context_get_rows_f16(uocr_metal_context *ctx,
+                                    const uint16_t *table_f16,
+                                    uint32_t table_rows,
+                                    uint32_t row_width,
+                                    const int32_t *row_ids,
+                                    uint32_t n_row_ids,
+                                    uocr_metal_get_rows_output_type output_type,
+                                    void *out,
+                                    char *error,
+                                    size_t error_size);
 
 int uocr_metal_smoke_test(const char *resource_path, char *error, size_t error_size);
 

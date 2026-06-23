@@ -593,8 +593,8 @@ First implementation slice, in order:
 
 ### 14.1 Text embedding and prompt assembly
 
-- [ ] Adapt DS4 `metal/get_rows.metal` for token embedding gather.
-- [ ] Support fp16 embedding weights and fp16/fp32 output activations.
+- [x] Adapt DS4 `metal/get_rows.metal` for token embedding gather.
+- [x] Support fp16 embedding weights and fp16/fp32 output activations.
 - [ ] Implement direct prompt embedding assembly:
   - [ ] write text token embeddings from token ids
   - [ ] write image features into image spans when provided
@@ -913,7 +913,7 @@ First implementation slice, in order:
 - [ ] Add Metal tests that do not need full model weights:
   - [ ] compile all kernels
   - [ ] run RMSNorm on synthetic tensor
-  - [ ] run get_rows on synthetic embedding table
+  - [x] run get_rows on synthetic embedding table
   - [ ] run small RoPE kernel
   - [ ] run small SDPA prefill/decode kernel
   - [ ] run q8/q4 dot kernels once implemented

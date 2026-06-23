@@ -101,6 +101,14 @@ static int checked_add_u64(uint64_t a, uint64_t b, uint64_t *out) {
     return 1;
 }
 
+static int checked_mul_u64(uint64_t a, uint64_t b, uint64_t *out) {
+    if (out == NULL || (a != 0u && b > UINT64_MAX / a)) {
+        return 0;
+    }
+    *out = a * b;
+    return 1;
+}
+
 static uint64_t align_down_u64(uint64_t value, uint64_t align) {
     return align == 0u ? value : value - (value % align);
 }
@@ -238,6 +246,13 @@ typedef struct uocr_metal_touch_params {
     uint32_t dst_base;
     uint32_t reserved;
 } uocr_metal_touch_params;
+
+typedef struct uocr_metal_get_rows_params {
+    uint32_t table_rows;
+    uint32_t row_width;
+    uint32_t n_row_ids;
+    uint32_t reserved;
+} uocr_metal_get_rows_params;
 
 static int metal_retain_transient_until_completed(uocr_metal_context *ctx,
                                                   id<MTLCommandBuffer> command_buffer,
@@ -1275,6 +1290,155 @@ uint64_t uocr_metal_context_total_runtime_arena_capacity(const uocr_metal_contex
         }
     }
     return total;
+}
+
+int uocr_metal_context_get_rows_f16(uocr_metal_context *ctx,
+                                    const uint16_t *table_f16,
+                                    uint32_t table_rows,
+                                    uint32_t row_width,
+                                    const int32_t *row_ids,
+                                    uint32_t n_row_ids,
+                                    uocr_metal_get_rows_output_type output_type,
+                                    void *out,
+                                    char *error,
+                                    size_t error_size) {
+    metal_clear_error(error, error_size);
+    if (ctx == NULL || table_f16 == NULL || row_ids == NULL || out == NULL ||
+        table_rows == 0u || row_width == 0u || n_row_ids == 0u) {
+        return metal_fail(error, error_size, "invalid Metal get-rows request");
+    }
+    if (output_type != UOCR_METAL_GET_ROWS_OUTPUT_F16 && output_type != UOCR_METAL_GET_ROWS_OUTPUT_F32) {
+        return metal_fail(error, error_size, "unsupported Metal get-rows output type %d", (int)output_type);
+    }
+
+    for (uint32_t i = 0u; i < n_row_ids; ++i) {
+        if (row_ids[i] < 0 || (uint32_t)row_ids[i] >= table_rows) {
+            return metal_fail(error,
+                              error_size,
+                              "Metal get-rows id %d at position %u is outside table rows %u",
+                              row_ids[i],
+                              i,
+                              table_rows);
+        }
+    }
+
+    uint64_t table_values = 0u;
+    uint64_t table_bytes = 0u;
+    uint64_t out_values = 0u;
+    uint64_t out_bytes = 0u;
+    uint64_t ids_bytes = 0u;
+    const uint64_t out_element_bytes = output_type == UOCR_METAL_GET_ROWS_OUTPUT_F16 ? 2u : (uint64_t)sizeof(float);
+    if (!checked_mul_u64((uint64_t)table_rows, (uint64_t)row_width, &table_values) ||
+        !checked_mul_u64(table_values, 2u, &table_bytes) ||
+        !checked_mul_u64((uint64_t)n_row_ids, (uint64_t)row_width, &out_values) ||
+        !checked_mul_u64(out_values, out_element_bytes, &out_bytes) ||
+        !checked_mul_u64((uint64_t)n_row_ids, (uint64_t)sizeof(int32_t), &ids_bytes)) {
+        return metal_fail(error, error_size, "Metal get-rows byte-size overflow");
+    }
+
+    const uint64_t max_buffer_length = metal_device_max_buffer_length(ctx->device);
+    if (table_bytes > max_buffer_length || ids_bytes > max_buffer_length || out_bytes > max_buffer_length ||
+        table_bytes > (uint64_t)SIZE_MAX || ids_bytes > (uint64_t)SIZE_MAX || out_bytes > (uint64_t)SIZE_MAX) {
+        return metal_fail(error,
+                          error_size,
+                          "Metal get-rows buffers exceed maxBufferLength %llu",
+                          (unsigned long long)max_buffer_length);
+    }
+
+    @autoreleasepool {
+        const char *function_name = output_type == UOCR_METAL_GET_ROWS_OUTPUT_F16 ?
+                                        "uocr_get_rows_f16_to_f16" :
+                                        "uocr_get_rows_f16_to_f32";
+        id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, function_name, error, error_size);
+        if (pipeline == nil) {
+            return 0;
+        }
+
+        id<MTLBuffer> table = [ctx->device newBufferWithBytes:table_f16
+                                                       length:(NSUInteger)table_bytes
+                                                      options:MTLResourceStorageModeShared];
+        if (table == nil) {
+            return metal_fail(error, error_size, "failed to allocate Metal get-rows table buffer");
+        }
+        table.label = @"uocr_get_rows_table_f16";
+
+        id<MTLBuffer> ids = [ctx->device newBufferWithBytes:row_ids
+                                                     length:(NSUInteger)ids_bytes
+                                                    options:MTLResourceStorageModeShared];
+        if (ids == nil) {
+            [table release];
+            return metal_fail(error, error_size, "failed to allocate Metal get-rows id buffer");
+        }
+        ids.label = @"uocr_get_rows_ids";
+
+        id<MTLBuffer> dst = [ctx->device newBufferWithLength:(NSUInteger)out_bytes
+                                                     options:MTLResourceStorageModeShared];
+        if (dst == nil) {
+            [ids release];
+            [table release];
+            return metal_fail(error, error_size, "failed to allocate Metal get-rows output buffer");
+        }
+        dst.label = @"uocr_get_rows_output";
+        memset([dst contents], 0, (size_t)out_bytes);
+
+        id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
+        if (cb == nil) {
+            [dst release];
+            [ids release];
+            [table release];
+            return metal_fail(error, error_size, "failed to create Metal get-rows command buffer");
+        }
+        cb.label = @"uocr_get_rows_command_buffer";
+
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        if (enc == nil) {
+            [dst release];
+            [ids release];
+            [table release];
+            return metal_fail(error, error_size, "failed to create Metal get-rows command encoder");
+        }
+
+        uocr_metal_get_rows_params params;
+        params.table_rows = table_rows;
+        params.row_width = row_width;
+        params.n_row_ids = n_row_ids;
+        params.reserved = 0u;
+
+        [enc setComputePipelineState:pipeline];
+        [enc setBuffer:table offset:0u atIndex:0u];
+        [enc setBuffer:ids offset:0u atIndex:1u];
+        [enc setBuffer:dst offset:0u atIndex:2u];
+        [enc setBytes:&params length:sizeof(params) atIndex:3u];
+
+        NSUInteger threads_per_group = pipeline.threadExecutionWidth;
+        if (threads_per_group == 0u) {
+            threads_per_group = 1u;
+        }
+        if (threads_per_group > (NSUInteger)row_width) {
+            threads_per_group = (NSUInteger)row_width;
+        }
+        [enc dispatchThreads:MTLSizeMake((NSUInteger)row_width, (NSUInteger)n_row_ids, 1u)
+       threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1u, 1u)];
+        [enc endEncoding];
+
+        [cb commit];
+        [cb waitUntilCompleted];
+        if (cb.status == MTLCommandBufferStatusError) {
+            NSString *description = cb.error != nil ? [cb.error localizedDescription] : @"unknown command-buffer error";
+            [dst release];
+            [ids release];
+            [table release];
+            return metal_fail(error, error_size, "Metal get-rows command failed: %s", [description UTF8String]);
+        }
+
+        memcpy(out, [dst contents], (size_t)out_bytes);
+        [dst release];
+        [ids release];
+        [table release];
+    }
+
+    metal_clear_error(error, error_size);
+    return 1;
 }
 
 void uocr_metal_context_destroy(uocr_metal_context *ctx) {
