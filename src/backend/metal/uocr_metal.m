@@ -299,6 +299,21 @@ typedef struct uocr_metal_rope_qk_params {
     uint32_t reserved2;
 } uocr_metal_rope_qk_params;
 
+typedef struct uocr_metal_kv_cache_write_params {
+    uint32_t n_tokens;
+    uint32_t batch_slots;
+    uint32_t cache_token_capacity;
+    uint32_t layer;
+    uint32_t slot;
+    uint32_t prompt_length;
+    uint32_t position_start;
+    uint32_t heads;
+    uint32_t head_dim;
+    uint32_t ring_window;
+    uint32_t reserved0;
+    uint32_t reserved1;
+} uocr_metal_kv_cache_write_params;
+
 static int metal_retain_transient_until_completed(uocr_metal_context *ctx,
                                                   id<MTLCommandBuffer> command_buffer,
                                                   id object,
@@ -2383,6 +2398,220 @@ int uocr_metal_context_rope_qk_f16(uocr_metal_context *ctx,
         [q_dst release];
         [k_src release];
         [q_src release];
+    }
+
+    metal_clear_error(error, error_size);
+    return 1;
+}
+
+int uocr_metal_context_write_kv_cache_f16(uocr_metal_context *ctx,
+                                          const uint16_t *k_f16,
+                                          const uint16_t *v_f16,
+                                          const uint16_t *initial_k_cache_f16_or_null,
+                                          const uint16_t *initial_v_cache_f16_or_null,
+                                          uint32_t n_tokens,
+                                          uint32_t batch_slots,
+                                          uint32_t prompt_token_capacity,
+                                          uint32_t layer,
+                                          uint32_t slot,
+                                          uint32_t prompt_length,
+                                          uint32_t position_start,
+                                          uint16_t *k_cache_out_f16,
+                                          uint16_t *v_cache_out_f16,
+                                          char *error,
+                                          size_t error_size) {
+    metal_clear_error(error, error_size);
+    if (ctx == NULL || k_f16 == NULL || v_f16 == NULL || k_cache_out_f16 == NULL || v_cache_out_f16 == NULL ||
+        n_tokens == 0u || batch_slots == 0u || prompt_token_capacity == 0u) {
+        return metal_fail(error, error_size, "invalid Metal KV cache write request");
+    }
+    if (layer >= UOCR_DECODER_LAYERS || slot >= batch_slots) {
+        return metal_fail(error,
+                          error_size,
+                          "Metal KV cache layer/slot out of range: layer=%u slot=%u batch_slots=%u",
+                          layer,
+                          slot,
+                          batch_slots);
+    }
+    if (prompt_length == 0u || prompt_length > prompt_token_capacity) {
+        return metal_fail(error,
+                          error_size,
+                          "invalid Metal KV cache layout: prompt_length=%u prompt_token_capacity=%u",
+                          prompt_length,
+                          prompt_token_capacity);
+    }
+
+    uint64_t cache_token_capacity_u64 = 0u;
+    if (!checked_add_u64((uint64_t)prompt_token_capacity,
+                         (uint64_t)UOCR_GENERATED_RING_WINDOW,
+                         &cache_token_capacity_u64) ||
+        cache_token_capacity_u64 > (uint64_t)UINT32_MAX ||
+        (uint64_t)prompt_length + (uint64_t)UOCR_GENERATED_RING_WINDOW > cache_token_capacity_u64) {
+        return metal_fail(error, error_size, "Metal KV cache token capacity overflow");
+    }
+    const uint32_t cache_token_capacity = (uint32_t)cache_token_capacity_u64;
+
+    uint64_t position_end = 0u;
+    if (!checked_add_u64((uint64_t)position_start, (uint64_t)n_tokens, &position_end) ||
+        position_end > (uint64_t)UOCR_MAX_POSITIONS) {
+        return metal_fail(error,
+                          error_size,
+                          "Metal KV cache position range [%u,%llu) exceeds max positions %u",
+                          position_start,
+                          (unsigned long long)position_end,
+                          UOCR_MAX_POSITIONS);
+    }
+
+    uint64_t src_values = 0u;
+    uint64_t src_bytes = 0u;
+    uint64_t cache_values = 0u;
+    uint64_t cache_bytes = 0u;
+    uint64_t layer_slot_tokens = 0u;
+    if (!checked_mul_u64((uint64_t)n_tokens, (uint64_t)UOCR_KV_HEADS * (uint64_t)UOCR_HEAD_DIM, &src_values) ||
+        !checked_mul_u64(src_values, 2u, &src_bytes) ||
+        !checked_mul_u64((uint64_t)UOCR_DECODER_LAYERS, (uint64_t)batch_slots, &layer_slot_tokens) ||
+        !checked_mul_u64(layer_slot_tokens, cache_token_capacity_u64, &cache_values) ||
+        !checked_mul_u64(cache_values, (uint64_t)UOCR_KV_HEADS * (uint64_t)UOCR_HEAD_DIM, &cache_values) ||
+        !checked_mul_u64(cache_values, 2u, &cache_bytes)) {
+        return metal_fail(error, error_size, "Metal KV cache write byte-size overflow");
+    }
+
+    const uint64_t max_buffer_length = metal_device_max_buffer_length(ctx->device);
+    if (src_bytes > max_buffer_length || cache_bytes > max_buffer_length || src_bytes > (uint64_t)SIZE_MAX ||
+        cache_bytes > (uint64_t)SIZE_MAX || src_values > (uint64_t)UINT32_MAX) {
+        return metal_fail(error,
+                          error_size,
+                          "Metal KV cache write buffers exceed maxBufferLength %llu",
+                          (unsigned long long)max_buffer_length);
+    }
+
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, "uocr_kv_cache_write_f16", error, error_size);
+        if (pipeline == nil) {
+            return 0;
+        }
+
+        id<MTLBuffer> k_src = [ctx->device newBufferWithBytes:k_f16
+                                                       length:(NSUInteger)src_bytes
+                                                      options:MTLResourceStorageModeShared];
+        if (k_src == nil) {
+            return metal_fail(error, error_size, "failed to allocate Metal KV K input buffer");
+        }
+        k_src.label = @"uocr_kv_write_k_input_f16";
+
+        id<MTLBuffer> v_src = [ctx->device newBufferWithBytes:v_f16
+                                                       length:(NSUInteger)src_bytes
+                                                      options:MTLResourceStorageModeShared];
+        if (v_src == nil) {
+            [k_src release];
+            return metal_fail(error, error_size, "failed to allocate Metal KV V input buffer");
+        }
+        v_src.label = @"uocr_kv_write_v_input_f16";
+
+        id<MTLBuffer> k_cache = nil;
+        if (initial_k_cache_f16_or_null != NULL) {
+            k_cache = [ctx->device newBufferWithBytes:initial_k_cache_f16_or_null
+                                               length:(NSUInteger)cache_bytes
+                                              options:MTLResourceStorageModeShared];
+        } else {
+            k_cache = [ctx->device newBufferWithLength:(NSUInteger)cache_bytes options:MTLResourceStorageModeShared];
+            if (k_cache != nil) {
+                memset([k_cache contents], 0, (size_t)cache_bytes);
+            }
+        }
+        if (k_cache == nil) {
+            [v_src release];
+            [k_src release];
+            return metal_fail(error, error_size, "failed to allocate Metal KV K cache buffer");
+        }
+        k_cache.label = @"uocr_kv_write_k_cache_f16";
+
+        id<MTLBuffer> v_cache = nil;
+        if (initial_v_cache_f16_or_null != NULL) {
+            v_cache = [ctx->device newBufferWithBytes:initial_v_cache_f16_or_null
+                                               length:(NSUInteger)cache_bytes
+                                              options:MTLResourceStorageModeShared];
+        } else {
+            v_cache = [ctx->device newBufferWithLength:(NSUInteger)cache_bytes options:MTLResourceStorageModeShared];
+            if (v_cache != nil) {
+                memset([v_cache contents], 0, (size_t)cache_bytes);
+            }
+        }
+        if (v_cache == nil) {
+            [k_cache release];
+            [v_src release];
+            [k_src release];
+            return metal_fail(error, error_size, "failed to allocate Metal KV V cache buffer");
+        }
+        v_cache.label = @"uocr_kv_write_v_cache_f16";
+
+        id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
+        if (cb == nil) {
+            [v_cache release];
+            [k_cache release];
+            [v_src release];
+            [k_src release];
+            return metal_fail(error, error_size, "failed to create Metal KV cache write command buffer");
+        }
+        cb.label = @"uocr_kv_cache_write_command_buffer";
+
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        if (enc == nil) {
+            [v_cache release];
+            [k_cache release];
+            [v_src release];
+            [k_src release];
+            return metal_fail(error, error_size, "failed to create Metal KV cache write command encoder");
+        }
+
+        uocr_metal_kv_cache_write_params params;
+        params.n_tokens = n_tokens;
+        params.batch_slots = batch_slots;
+        params.cache_token_capacity = cache_token_capacity;
+        params.layer = layer;
+        params.slot = slot;
+        params.prompt_length = prompt_length;
+        params.position_start = position_start;
+        params.heads = UOCR_KV_HEADS;
+        params.head_dim = UOCR_HEAD_DIM;
+        params.ring_window = UOCR_GENERATED_RING_WINDOW;
+        params.reserved0 = 0u;
+        params.reserved1 = 0u;
+
+        NSUInteger threads_per_group = pipeline.threadExecutionWidth;
+        if (threads_per_group == 0u) {
+            threads_per_group = 1u;
+        }
+        if (threads_per_group > 256u) {
+            threads_per_group = 256u;
+        }
+        [enc setComputePipelineState:pipeline];
+        [enc setBuffer:k_src offset:0u atIndex:0u];
+        [enc setBuffer:v_src offset:0u atIndex:1u];
+        [enc setBuffer:k_cache offset:0u atIndex:2u];
+        [enc setBuffer:v_cache offset:0u atIndex:3u];
+        [enc setBytes:&params length:sizeof(params) atIndex:4u];
+        [enc dispatchThreads:MTLSizeMake((NSUInteger)src_values, 1u, 1u)
+       threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1u, 1u)];
+        [enc endEncoding];
+
+        [cb commit];
+        [cb waitUntilCompleted];
+        if (cb.status == MTLCommandBufferStatusError) {
+            NSString *description = cb.error != nil ? [cb.error localizedDescription] : @"unknown command-buffer error";
+            [v_cache release];
+            [k_cache release];
+            [v_src release];
+            [k_src release];
+            return metal_fail(error, error_size, "Metal KV cache write command failed: %s", [description UTF8String]);
+        }
+
+        memcpy(k_cache_out_f16, [k_cache contents], (size_t)cache_bytes);
+        memcpy(v_cache_out_f16, [v_cache contents], (size_t)cache_bytes);
+        [v_cache release];
+        [k_cache release];
+        [v_src release];
+        [k_src release];
     }
 
     metal_clear_error(error, error_size);

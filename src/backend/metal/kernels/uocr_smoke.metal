@@ -492,3 +492,50 @@ kernel void uocr_rope_qk_f16_to_f32(device const half *q_src [[buffer(0)]],
     k_dst[base + ulong(a)] = k0 * c - k1 * s;
     k_dst[base + ulong(b)] = k0 * s + k1 * c;
 }
+
+struct UocrKVCacheWriteParams {
+    uint n_tokens;
+    uint batch_slots;
+    uint cache_token_capacity;
+    uint layer;
+    uint slot;
+    uint prompt_length;
+    uint position_start;
+    uint heads;
+    uint head_dim;
+    uint ring_window;
+    uint reserved0;
+    uint reserved1;
+};
+
+kernel void uocr_kv_cache_write_f16(device const half *k_src [[buffer(0)]],
+                                    device const half *v_src [[buffer(1)]],
+                                    device half *k_cache [[buffer(2)]],
+                                    device half *v_cache [[buffer(3)]],
+                                    constant UocrKVCacheWriteParams &params [[buffer(4)]],
+                                    uint gid [[thread_position_in_grid]]) {
+    const uint head_area = params.heads * params.head_dim;
+    const uint total = params.n_tokens * head_area;
+    if (gid >= total) {
+        return;
+    }
+
+    const uint dim = gid % params.head_dim;
+    const uint head = (gid / params.head_dim) % params.heads;
+    const uint token = gid / head_area;
+    const uint position = params.position_start + token;
+    uint cache_token = position;
+    if (position >= params.prompt_length) {
+        cache_token = params.prompt_length + ((position - params.prompt_length) % params.ring_window);
+    }
+    if (cache_token >= params.cache_token_capacity) {
+        return;
+    }
+
+    const ulong src_index = (ulong(token) * ulong(params.heads) + ulong(head)) * ulong(params.head_dim) + ulong(dim);
+    const ulong dst_index = (((ulong(params.layer) * ulong(params.batch_slots) + ulong(params.slot)) *
+                              ulong(params.cache_token_capacity) + ulong(cache_token)) *
+                             ulong(params.heads) + ulong(head)) * ulong(params.head_dim) + ulong(dim);
+    k_cache[dst_index] = k_src[src_index];
+    v_cache[dst_index] = v_src[src_index];
+}

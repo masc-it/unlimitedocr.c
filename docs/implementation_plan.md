@@ -614,7 +614,7 @@ First implementation slice, in order:
   - [x] heads `10`
   - [x] position ids monotonically increasing
   - [x] theta `10000`
-- [ ] Implement KV cache write kernel.
+- [x] Implement KV cache write kernel.
 - [ ] Allocate KV cache layout:
   - [ ] K: `[layer][slot][max_prompt_tokens + 128][10][128]` fp16
   - [ ] V: `[layer][slot][max_prompt_tokens + 128][10][128]` fp16

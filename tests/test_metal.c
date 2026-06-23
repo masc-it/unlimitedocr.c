@@ -1,4 +1,5 @@
 #include "backend/metal/uocr_metal.h"
+#include "model/uocr_constants.h"
 #include "model/uocr_model_file.h"
 #include "runtime/uocr_memory.h"
 #include "unlimitedocr.h"
@@ -844,6 +845,233 @@ static int test_metal_rope_qk_f16(void) {
     return 0;
 }
 
+static uint16_t kv_cache_sentinel(uint64_t index, uint32_t stream) {
+    return (uint16_t)(0x1800u + ((index * 17u + (uint64_t)stream * 97u) & 0x07ffu));
+}
+
+static uint16_t kv_source_value(uint64_t index, uint32_t stream) {
+    return (uint16_t)(0x3000u + ((index * 23u + (uint64_t)stream * 211u) & 0x0fffu));
+}
+
+static uint32_t kv_cache_token_for_position(uint32_t position, uint32_t prompt_length) {
+    if (position < prompt_length) {
+        return position;
+    }
+    return prompt_length + ((position - prompt_length) % UOCR_GENERATED_RING_WINDOW);
+}
+
+static int test_metal_kv_cache_write_f16(void) {
+    if (!uocr_metal_is_available()) {
+        return 0;
+    }
+
+    enum {
+        BATCH_SLOTS = 2,
+        PROMPT_TOKEN_CAPACITY = 8,
+        PROMPT_LENGTH = 5,
+        CACHE_TOKEN_CAPACITY = PROMPT_TOKEN_CAPACITY + UOCR_GENERATED_RING_WINDOW,
+        LAYER = 3,
+        SLOT = 1,
+        N_TOKENS = PROMPT_LENGTH + UOCR_GENERATED_RING_WINDOW + 3,
+        HEADS = UOCR_KV_HEADS,
+        HEAD_DIM = UOCR_HEAD_DIM,
+        HEAD_AREA = HEADS * HEAD_DIM
+    };
+    const uint64_t cache_values = (uint64_t)UOCR_DECODER_LAYERS * (uint64_t)BATCH_SLOTS *
+                                  (uint64_t)CACHE_TOKEN_CAPACITY * (uint64_t)HEAD_AREA;
+    const uint64_t src_values = (uint64_t)N_TOKENS * (uint64_t)HEAD_AREA;
+
+    uint16_t *k_src = (uint16_t *)malloc((size_t)src_values * sizeof(uint16_t));
+    uint16_t *v_src = (uint16_t *)malloc((size_t)src_values * sizeof(uint16_t));
+    uint16_t *initial_k = (uint16_t *)malloc((size_t)cache_values * sizeof(uint16_t));
+    uint16_t *initial_v = (uint16_t *)malloc((size_t)cache_values * sizeof(uint16_t));
+    uint16_t *k_out = (uint16_t *)malloc((size_t)cache_values * sizeof(uint16_t));
+    uint16_t *v_out = (uint16_t *)malloc((size_t)cache_values * sizeof(uint16_t));
+    uint32_t *last_token_for_cache_token = (uint32_t *)malloc((size_t)CACHE_TOKEN_CAPACITY * sizeof(uint32_t));
+    CHECK(k_src != NULL && v_src != NULL && initial_k != NULL && initial_v != NULL &&
+          k_out != NULL && v_out != NULL && last_token_for_cache_token != NULL);
+
+    for (uint64_t i = 0u; i < src_values; ++i) {
+        k_src[i] = kv_source_value(i, 0u);
+        v_src[i] = kv_source_value(i, 1u);
+    }
+    for (uint64_t i = 0u; i < cache_values; ++i) {
+        initial_k[i] = kv_cache_sentinel(i, 0u);
+        initial_v[i] = kv_cache_sentinel(i, 1u);
+        k_out[i] = 0u;
+        v_out[i] = 0u;
+    }
+    for (uint32_t i = 0u; i < (uint32_t)CACHE_TOKEN_CAPACITY; ++i) {
+        last_token_for_cache_token[i] = UINT32_MAX;
+    }
+    for (uint32_t token = 0u; token < (uint32_t)N_TOKENS; ++token) {
+        const uint32_t cache_token = kv_cache_token_for_position(token, PROMPT_LENGTH);
+        CHECK(cache_token < (uint32_t)CACHE_TOKEN_CAPACITY);
+        last_token_for_cache_token[cache_token] = token;
+    }
+
+    char error[1024];
+    memset(error, 0, sizeof(error));
+    uocr_metal_context *ctx = uocr_metal_context_create(UOCR_TEST_METAL_RESOURCE_PATH, error, sizeof(error));
+    CHECK(ctx != NULL);
+
+    CHECK(uocr_metal_context_write_kv_cache_f16(ctx,
+                                                k_src,
+                                                v_src,
+                                                initial_k,
+                                                initial_v,
+                                                N_TOKENS,
+                                                BATCH_SLOTS,
+                                                PROMPT_TOKEN_CAPACITY,
+                                                LAYER,
+                                                SLOT,
+                                                PROMPT_LENGTH,
+                                                0u,
+                                                k_out,
+                                                v_out,
+                                                error,
+                                                sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+
+    for (uint64_t index = 0u; index < cache_values; ++index) {
+        uint64_t rem = index;
+        const uint32_t dim = (uint32_t)(rem % (uint64_t)HEAD_DIM);
+        rem /= (uint64_t)HEAD_DIM;
+        const uint32_t head = (uint32_t)(rem % (uint64_t)HEADS);
+        rem /= (uint64_t)HEADS;
+        const uint32_t cache_token = (uint32_t)(rem % (uint64_t)CACHE_TOKEN_CAPACITY);
+        rem /= (uint64_t)CACHE_TOKEN_CAPACITY;
+        const uint32_t slot = (uint32_t)(rem % (uint64_t)BATCH_SLOTS);
+        const uint32_t layer = (uint32_t)(rem / (uint64_t)BATCH_SLOTS);
+
+        uint16_t expected_k = initial_k[index];
+        uint16_t expected_v = initial_v[index];
+        if (layer == (uint32_t)LAYER && slot == (uint32_t)SLOT &&
+            last_token_for_cache_token[cache_token] != UINT32_MAX) {
+            const uint64_t src_index = ((uint64_t)last_token_for_cache_token[cache_token] * (uint64_t)HEADS +
+                                        (uint64_t)head) * (uint64_t)HEAD_DIM + (uint64_t)dim;
+            expected_k = k_src[src_index];
+            expected_v = v_src[src_index];
+        }
+        CHECK(k_out[index] == expected_k);
+        CHECK(v_out[index] == expected_v);
+    }
+
+    CHECK(uocr_metal_context_write_kv_cache_f16(ctx,
+                                                k_src,
+                                                v_src,
+                                                NULL,
+                                                NULL,
+                                                1u,
+                                                1u,
+                                                PROMPT_TOKEN_CAPACITY,
+                                                0u,
+                                                0u,
+                                                PROMPT_LENGTH,
+                                                2u,
+                                                k_out,
+                                                v_out,
+                                                error,
+                                                sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    for (uint64_t index = 0u; index < cache_values / (uint64_t)BATCH_SLOTS; ++index) {
+        uint64_t rem = index;
+        const uint32_t dim = (uint32_t)(rem % (uint64_t)HEAD_DIM);
+        rem /= (uint64_t)HEAD_DIM;
+        const uint32_t head = (uint32_t)(rem % (uint64_t)HEADS);
+        rem /= (uint64_t)HEADS;
+        const uint32_t cache_token = (uint32_t)(rem % (uint64_t)CACHE_TOKEN_CAPACITY);
+        rem /= (uint64_t)CACHE_TOKEN_CAPACITY;
+        const uint32_t layer = (uint32_t)rem;
+        const uint64_t src_index = ((uint64_t)head * (uint64_t)HEAD_DIM) + (uint64_t)dim;
+        const int should_have_value = layer == 0u && cache_token == 2u;
+        CHECK(k_out[index] == (should_have_value ? k_src[src_index] : 0u));
+        CHECK(v_out[index] == (should_have_value ? v_src[src_index] : 0u));
+    }
+
+    CHECK(uocr_metal_context_write_kv_cache_f16(ctx,
+                                                k_src,
+                                                v_src,
+                                                initial_k,
+                                                initial_v,
+                                                0u,
+                                                BATCH_SLOTS,
+                                                PROMPT_TOKEN_CAPACITY,
+                                                LAYER,
+                                                SLOT,
+                                                PROMPT_LENGTH,
+                                                0u,
+                                                k_out,
+                                                v_out,
+                                                error,
+                                                sizeof(error)) == 0);
+    CHECK(strstr(error, "invalid Metal KV cache write request") != NULL);
+
+    CHECK(uocr_metal_context_write_kv_cache_f16(ctx,
+                                                k_src,
+                                                v_src,
+                                                initial_k,
+                                                initial_v,
+                                                1u,
+                                                BATCH_SLOTS,
+                                                PROMPT_TOKEN_CAPACITY,
+                                                UOCR_DECODER_LAYERS,
+                                                SLOT,
+                                                PROMPT_LENGTH,
+                                                0u,
+                                                k_out,
+                                                v_out,
+                                                error,
+                                                sizeof(error)) == 0);
+    CHECK(strstr(error, "layer/slot out of range") != NULL);
+
+    CHECK(uocr_metal_context_write_kv_cache_f16(ctx,
+                                                k_src,
+                                                v_src,
+                                                initial_k,
+                                                initial_v,
+                                                1u,
+                                                BATCH_SLOTS,
+                                                PROMPT_TOKEN_CAPACITY,
+                                                LAYER,
+                                                SLOT,
+                                                PROMPT_TOKEN_CAPACITY + 1u,
+                                                0u,
+                                                k_out,
+                                                v_out,
+                                                error,
+                                                sizeof(error)) == 0);
+    CHECK(strstr(error, "invalid Metal KV cache layout") != NULL);
+
+    CHECK(uocr_metal_context_write_kv_cache_f16(ctx,
+                                                k_src,
+                                                v_src,
+                                                initial_k,
+                                                initial_v,
+                                                2u,
+                                                BATCH_SLOTS,
+                                                PROMPT_TOKEN_CAPACITY,
+                                                LAYER,
+                                                SLOT,
+                                                PROMPT_LENGTH,
+                                                UOCR_MAX_POSITIONS - 1u,
+                                                k_out,
+                                                v_out,
+                                                error,
+                                                sizeof(error)) == 0);
+    CHECK(strstr(error, "exceeds max positions") != NULL);
+
+    uocr_metal_context_destroy(ctx);
+    free(last_token_for_cache_token);
+    free(v_out);
+    free(k_out);
+    free(initial_v);
+    free(initial_k);
+    free(v_src);
+    free(k_src);
+    return 0;
+}
+
 static int test_metal_recent_decoder_primitives_stress(void) {
     if (!uocr_metal_is_available()) {
         return 0;
@@ -1221,6 +1449,7 @@ int main(void) {
     if (test_metal_dense_f16() != 0) return 1;
     if (test_metal_attention_qkvo_f16() != 0) return 1;
     if (test_metal_rope_qk_f16() != 0) return 1;
+    if (test_metal_kv_cache_write_f16() != 0) return 1;
     if (test_metal_recent_decoder_primitives_stress() != 0) return 1;
     if (test_metal_runtime_arenas() != 0) return 1;
     if (test_metal_model_mapping() != 0) return 1;

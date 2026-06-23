@@ -205,6 +205,29 @@ int uocr_metal_context_rope_qk_f16(uocr_metal_context *ctx,
                                    char *error,
                                    size_t error_size);
 
+/* Diagnostic KV-cache write helper for synthetic decoder tests. Writes K/V
+ * tensors shaped [n_tokens, 10 heads, 128 dim] into separate caches laid out as
+ * [12 layers, batch_slots, prompt_token_capacity + 128, 10 heads, 128 dim].
+ * Prompt positions map directly; generated positions use a 128-token ring that
+ * starts at the actual prompt_length, not at prompt_token_capacity.
+ */
+int uocr_metal_context_write_kv_cache_f16(uocr_metal_context *ctx,
+                                          const uint16_t *k_f16,
+                                          const uint16_t *v_f16,
+                                          const uint16_t *initial_k_cache_f16_or_null,
+                                          const uint16_t *initial_v_cache_f16_or_null,
+                                          uint32_t n_tokens,
+                                          uint32_t batch_slots,
+                                          uint32_t prompt_token_capacity,
+                                          uint32_t layer,
+                                          uint32_t slot,
+                                          uint32_t prompt_length,
+                                          uint32_t position_start,
+                                          uint16_t *k_cache_out_f16,
+                                          uint16_t *v_cache_out_f16,
+                                          char *error,
+                                          size_t error_size);
+
 int uocr_metal_smoke_test(const char *resource_path, char *error, size_t error_size);
 
 #ifdef __cplusplus
