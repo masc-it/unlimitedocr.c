@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import importlib.util
+import sys
+
 import numpy as np
 from PIL import Image
 
@@ -12,6 +15,8 @@ from unlimitedocr_c.frontend import (
     load_prepared_fixture,
     load_tokenizer,
     prepare_image,
+    project_root,
+    render_prompt,
     prepare_pages,
     prepare_text,
     save_prepared_request,
@@ -20,6 +25,28 @@ from unlimitedocr_c.frontend import (
 
 def solid_image(width: int, height: int, color: tuple[int, int, int] = (220, 20, 60)) -> Image.Image:
     return Image.new("RGB", (width, height), color)
+
+
+def upstream_plain_prompt(prompt: str) -> str:
+    conversation_path = project_root() / "data/context/conversation.py"
+    spec = importlib.util.spec_from_file_location("uocr_upstream_conversation", conversation_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    old_dont_write_bytecode = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.dont_write_bytecode = old_dont_write_bytecode
+
+    conv = module.get_conv_template("plain")
+    conv.set_system_message("")
+    for message in [
+        {"role": "<|User|>", "content": prompt},
+        {"role": "<|Assistant|>", "content": ""},
+    ]:
+        conv.append_message(message["role"], message["content"].strip())
+    return conv.get_prompt().strip()
 
 
 def test_tokenizer_metadata_loads() -> None:
@@ -33,6 +60,11 @@ def test_plain_prompt_rendering_strips_roles_and_content() -> None:
         {"role": "<|Assistant|>", "content": ""},
     ])
     assert prompt == "<image>document parsing."
+
+
+def test_plain_prompt_matches_cached_upstream_template() -> None:
+    prompt = "  <image>document parsing.  "
+    assert render_prompt(prompt) == upstream_plain_prompt(prompt)
 
 
 def test_prepare_text_has_bos_and_no_image_mask() -> None:

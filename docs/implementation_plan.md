@@ -35,7 +35,7 @@ First implementation slice, in order:
 
 - [ ] Assert model constants from `data/context/config.json` and `configuration_deepseek_v2.py` defaults:
   - [ ] vocab `129280`, hidden `1280`, layers `12`, heads `10`, KV heads `10`, head dim `128`
-  - [ ] max positions `32768`, generated ring window `128`, RoPE theta `10000`
+  - [x] max positions `32768`, generated ring window `128`, RoPE theta `10000`
   - [ ] dense layer-0 intermediate `6848`
   - [ ] MoE layers `1..11`, routed experts `64`, top-k `6`, routed intermediate `896`, shared experts `2`
   - [ ] `hidden_act="silu"`, `rms_norm_eps=1e-6`, `attention_bias=false`, `attention_dropout=0.0`
@@ -44,14 +44,14 @@ First implementation slice, in order:
   - [ ] BPE vocab `128000`, total vocab `129280`, added tokens `830`
   - [ ] BOS `0`, EOS `1`, PAD `2`, `<image>` `128815`
 - [ ] Assert current safetensors facts:
-  - [ ] total weight payload `6,672,212,480` bytes from `model.safetensors.index.json`
-  - [ ] `2710` tensor entries in the safetensors header / index
-  - [ ] all source tensors are BF16 in the current checkpoint header
-- [ ] Assert prompt-template facts:
-  - [ ] `plain` conversation template has empty roles and empty separators
-  - [ ] upstream strips each message content and strips the final prompt
-  - [ ] assistant empty message contributes no text
-  - [ ] BOS is manually prepended after text/image expansion
+  - [x] total weight payload `6,672,212,480` bytes from `model.safetensors.index.json`
+  - [x] `2710` tensor entries in the safetensors header / index
+  - [x] all source tensors are BF16 in the current checkpoint header
+- [x] Assert prompt-template facts:
+  - [x] `plain` conversation template has empty roles and empty separators
+  - [x] upstream strips each message content and strips the final prompt
+  - [x] assistant empty message contributes no text
+  - [x] BOS is manually prepended after text/image expansion
 - [ ] Assert generation/cache facts:
   - [ ] upstream `max_length` is total sequence length (`prompt + generated`), while the C API uses `max_new_tokens`
   - [ ] Python disables `config.sliding_window` for generation prefill and stores `_ring_window`
@@ -207,7 +207,7 @@ First implementation slice, in order:
 - [x] Add `tools/uocr-ref-dump` Python CLI to emit prepared-request fixtures without requiring C.
 - [ ] Add pytest frontend parity tests against the upstream remote code path in `data/context/modeling_unlimitedocr.py`:
   - [x] local frontend smoke tests for rendered prompt, token ids, image mask, crop grid, pixels, fixture roundtrip
-  - [ ] rendered prompt equality
+  - [x] rendered prompt equality
   - [ ] token ids equality
   - [ ] image mask equality
   - [ ] crop grid equality
@@ -254,7 +254,7 @@ First implementation slice, in order:
 
 - [x] Define `src/model/uocr_format.h` with a versioned binary file format.
 - [x] Use a mmap-friendly layout with a fixed header plus section directory.
-- [ ] Define header fields:
+- [x] Define header fields:
   - [x] magic, e.g. `UOCR`
   - [x] format version
   - [x] endian marker
@@ -262,14 +262,14 @@ First implementation slice, in order:
   - [x] model id/source hash
   - [x] qprofile id: `fp16`, `dyn-q8`, `dyn-q4`, custom
   - [x] section count and offsets
-- [ ] Define a config section with fixed Unlimited-OCR constants:
+- [x] Define a config section with fixed Unlimited-OCR constants:
   - [x] vocab `129280`
   - [x] hidden `1280`
   - [x] decoder layers `12`
   - [x] attention heads `10`
   - [x] KV heads `10`
   - [x] head dim `128`
-  - [ ] RoPE theta `10000`
+  - [x] RoPE theta `10000`
   - [x] max positions `32768`
   - [x] generated ring window `128`
   - [x] dense-first layers `1`
@@ -283,84 +283,84 @@ First implementation slice, in order:
   - [x] downsample ratio `4`
   - [x] supported global view `1024`
   - [x] supported local view `640`
-- [ ] Define tensor directory entries:
-  - [ ] stable tensor id
-  - [ ] family/layer/expert/projection fields
-  - [ ] logical shape
-  - [ ] physical packed shape
-  - [ ] dtype/qtype
-  - [ ] payload offset/size
-  - [ ] block size and row size for quantized tensors
-  - [ ] scale/min offsets if stored separately
-  - [ ] qtype reason and promotion reason
-  - [ ] runtime usage flag: used by inference, unused-but-preserved, or omitted-with-provenance
-- [ ] Define qtype enum:
-  - [ ] `UOCR_TENSOR_F16`
-  - [ ] `UOCR_TENSOR_F32`
-  - [ ] `UOCR_TENSOR_Q8_0`
-  - [ ] `UOCR_TENSOR_Q4_K`
-  - [ ] `UOCR_TENSOR_PADDED_Q4_K`
-  - [ ] later placeholders for `Q2_K` and `IQ2_XXS`
-- [ ] Define tokenizer metadata section:
-  - [ ] tokenizer file hash
-  - [ ] BOS/EOS/PAD/image token ids
-  - [ ] optional embedded tokenizer payload for future native frontend
-  - [ ] explicit flag that C v1 does not require tokenizer tables
-- [ ] Define provenance section:
-  - [ ] HF model id/commit if known
-  - [ ] safetensors file hashes
-  - [ ] converter version
-  - [ ] config/tokenizer hashes
-  - [ ] qprofile and calibration corpus id
-  - [ ] complete source tensor accounting: every one of the current `2710` safetensors tensors is mapped to a runtime tensor, marked unused-but-preserved, or marked omitted-with-reason
-- [ ] Keep tensor payloads page-aligned enough for Metal no-copy view wrapping.
-- [ ] Keep tensor payload separate from metadata/tokenizer so Metal only wraps tensor pages.
-- [ ] Write a standalone `uocr-dump` tool to print:
+- [x] Define tensor directory entries:
+  - [x] stable tensor id
+  - [x] family/layer/expert/projection fields
+  - [x] logical shape
+  - [x] physical packed shape
+  - [x] dtype/qtype
+  - [x] payload offset/size
+  - [x] block size and row size for quantized tensors
+  - [x] scale/min offsets if stored separately
+  - [x] qtype reason and promotion reason
+  - [x] runtime usage flag: used by inference, unused-but-preserved, or omitted-with-provenance
+- [x] Define qtype enum:
+  - [x] `UOCR_TENSOR_F16`
+  - [x] `UOCR_TENSOR_F32`
+  - [x] `UOCR_TENSOR_Q8_0`
+  - [x] `UOCR_TENSOR_Q4_K`
+  - [x] `UOCR_TENSOR_PADDED_Q4_K`
+  - [x] later placeholders for `Q2_K` and `IQ2_XXS`
+- [x] Define tokenizer metadata section:
+  - [x] tokenizer file hash
+  - [x] BOS/EOS/PAD/image token ids
+  - [x] optional embedded tokenizer payload for future native frontend
+  - [x] explicit flag that C v1 does not require tokenizer tables
+- [x] Define provenance section:
+  - [x] HF model id/commit if known
+  - [x] safetensors file hashes
+  - [x] converter version
+  - [x] config/tokenizer hashes
+  - [x] qprofile and calibration corpus id
+  - [x] complete source tensor accounting: every one of the current `2710` safetensors tensors is mapped to a runtime tensor, marked unused-but-preserved, or marked omitted-with-reason
+- [x] Keep tensor payloads page-aligned enough for Metal no-copy view wrapping.
+- [x] Keep tensor payload separate from metadata/tokenizer so Metal only wraps tensor pages.
+- [x] Write a standalone `uocr-dump` tool to print:
   - [x] header/config
-  - [ ] tensor count
-  - [ ] qtype histogram
-  - [ ] tensor offsets/sizes/alignment
-  - [ ] largest tensors
-  - [ ] expected memory footprint
-  - [ ] provenance
-  - [ ] source tensor accounting summary: runtime / preserved-unused / omitted
+  - [x] tensor count
+  - [x] qtype histogram
+  - [x] tensor offsets/sizes/alignment
+  - [x] largest tensors
+  - [x] expected memory footprint
+  - [x] provenance
+  - [x] source tensor accounting summary: runtime / preserved-unused / omitted
 
 ## 7. Tensor registry and shape validation
 
-- [ ] Implement enum-like tensor ids in `src/model/`, not string lookups in hot runtime paths.
-- [ ] Include tensor families:
-  - [ ] `TOK_EMBED`
-  - [ ] `LM_HEAD`
-  - [ ] `FINAL_NORM`
-  - [ ] `LAYER[i].ATTN.{Q,K,V,O}`
-  - [ ] `LAYER[i].NORM.{INPUT,POST_ATTN}`
-  - [ ] `LAYER[0].DENSE_MLP.{GATE,UP,DOWN}`
-  - [ ] `LAYER[1..11].MOE.ROUTER`
-  - [ ] `LAYER[1..11].MOE.EXPERTS.{GATE,UP,DOWN}`
-  - [ ] `LAYER[1..11].MOE.SHARED.{GATE,UP,DOWN}`
-  - [ ] `VISION.SAM.*`
-  - [ ] `VISION.CLIP.*`
-  - [ ] `PROJECTOR`
-  - [ ] `IMAGE_NEWLINE`
-  - [ ] `VIEW_SEPARATOR`
-- [ ] Generate or hardcode expected tensor shapes from `data/context/model.safetensors.header`.
-- [ ] Validate key known shapes:
-  - [ ] `lm_head.weight`: `[129280,1280]`
-  - [ ] `model.embed_tokens.weight`: `[129280,1280]`
-  - [ ] decoder attention projection weights: `[1280,1280]`
-  - [ ] layer-0 dense `down_proj`: `[1280,6848]`
-  - [ ] MoE router `mlp.gate.weight`: `[64,1280]`
-  - [ ] routed expert `down_proj`: `[1280,896]`
-  - [ ] routed expert `gate_proj/up_proj`: `[896,1280]`
-  - [ ] shared expert intermediate: `1792`
-  - [ ] projector weight: `[1280,2048]`
-  - [ ] projector bias: `[1280]`
-  - [ ] image newline/view separator: `[1280]`
-  - [ ] SAM patch embed: `[768,3,16,16]`
-  - [ ] CLIP qkv: `[3072,1024]`
-- [ ] Add a converter validation report that fails if expected tensor names are missing or unexpected shapes appear.
-- [ ] Identify tensors that are present but not used in the normal upstream OCR path, especially CLIP pixel patch embedding (`vision_model.embeddings.patch_embedding.*`) because CLIP receives SAM feature maps as `patch_embeds`; either preserve them as unused or omit them with explicit provenance.
-- [ ] Add a deterministic tensor-order table used by both converter and runtime.
+- [x] Implement enum-like tensor ids in `src/model/`, not string lookups in hot runtime paths.
+- [x] Include tensor families:
+  - [x] `TOK_EMBED`
+  - [x] `LM_HEAD`
+  - [x] `FINAL_NORM`
+  - [x] `LAYER[i].ATTN.{Q,K,V,O}`
+  - [x] `LAYER[i].NORM.{INPUT,POST_ATTN}`
+  - [x] `LAYER[0].DENSE_MLP.{GATE,UP,DOWN}`
+  - [x] `LAYER[1..11].MOE.ROUTER`
+  - [x] `LAYER[1..11].MOE.EXPERTS.{GATE,UP,DOWN}`
+  - [x] `LAYER[1..11].MOE.SHARED.{GATE,UP,DOWN}`
+  - [x] `VISION.SAM.*`
+  - [x] `VISION.CLIP.*`
+  - [x] `PROJECTOR`
+  - [x] `IMAGE_NEWLINE`
+  - [x] `VIEW_SEPARATOR`
+- [x] Generate or hardcode expected tensor shapes from `data/context/model.safetensors.header`.
+- [x] Validate key known shapes:
+  - [x] `lm_head.weight`: `[129280,1280]`
+  - [x] `model.embed_tokens.weight`: `[129280,1280]`
+  - [x] decoder attention projection weights: `[1280,1280]`
+  - [x] layer-0 dense `down_proj`: `[1280,6848]`
+  - [x] MoE router `mlp.gate.weight`: `[64,1280]`
+  - [x] routed expert `down_proj`: `[1280,896]`
+  - [x] routed expert `gate_proj/up_proj`: `[896,1280]`
+  - [x] shared expert intermediate: `1792`
+  - [x] projector weight: `[1280,2048]`
+  - [x] projector bias: `[1280]`
+  - [x] image newline/view separator: `[1280]`
+  - [x] SAM patch embed: `[768,3,16,16]`
+  - [x] CLIP qkv: `[3072,1024]`
+- [x] Add a converter validation report that fails if expected tensor names are missing or unexpected shapes appear.
+- [x] Identify tensors that are present but not used in the normal upstream OCR path, especially CLIP pixel patch embedding (`vision_model.embeddings.patch_embedding.*`) because CLIP receives SAM feature maps as `patch_embeds`; either preserve them as unused or omit them with explicit provenance.
+- [x] Add a deterministic tensor-order table used by both converter and runtime.
 - [ ] Pack routed experts expert-major:
   - [ ] `[layer][projection][expert][out_row][packed_input]`
 - [ ] Pack or colocate expert `gate_proj` and `up_proj` so Metal selected-expert kernels can read them together.
@@ -378,33 +378,35 @@ First implementation slice, in order:
   - [x] read header length
   - [x] parse JSON header
   - [x] validate that current source tensors are BF16 unless explicitly exempted by a future checkpoint
-  - [ ] map or stream individual tensor byte ranges
-  - [ ] convert BF16 rows to fp16 payload rows
-  - [ ] never allocate a second full-model-sized temporary buffer
-- [ ] Implement BF16 -> fp16 conversion using DS4-style scalar conversion as a starting point.
+  - [x] map or stream individual tensor byte ranges
+  - [x] convert BF16 rows to fp16 payload rows
+  - [x] never allocate a second full-model-sized temporary buffer
+- [x] Implement BF16 -> fp16 conversion using bounded NumPy chunk conversion for the Python converter writer.
 - [ ] Record conversion statistics per tensor: source dtype, output dtype/qtype, min/max if cheap, NaN/Inf count, and exact byte count.
 - [ ] Preserve row-major matrix layout where runtime kernels expect `[out, in]`.
 - [ ] Transpose only where an explicit runtime kernel requires it; record the decision in tensor metadata.
-- [ ] Emit pure fp16 `.uocr` first.
-- [ ] Add converter flags:
+- [x] Emit pure fp16 `.uocr` first when the safetensors payload is present; always-on tests use tiny synthetic safetensors payloads.
+- [x] Add converter flags:
   - [x] `--hf-dir PATH`
-  - [ ] `--out PATH`
+  - [x] `--out PATH`
   - [x] `--qprofile fp16|dyn-q8|dyn-q4`
   - [x] `--dry-run`
-  - [ ] `--tensor NAME_OR_ID` for single-tensor debugging
+  - [x] `--tensor NAME_OR_ID` for single-tensor debugging
   - [x] `--dump-plan`
-  - [ ] `--overwrite`
+  - [x] `--overwrite`
 - [ ] Add dry-run output similar to DS4 quantizer:
-  - [ ] tensor name -> tensor id mapping
+  - [x] tensor name -> tensor id mapping
   - [x] source shape/dtype
   - [x] output shape/qtype
   - [x] output bytes
   - [x] qtype/promotion reason
   - [x] source accounting status: runtime / preserved-unused / omitted
+  - [x] planned `.uocr` section layout and tensor payload offsets/alignment
 - [ ] Add single-tensor compare mode for converter development.
 - [x] Add strict loader tests using only a tiny synthetic `.uocr` file, so CI does not require full weights.
+- [x] Add writer tests using tiny synthetic safetensors payloads so `.uocr` serialization and BF16->fp16 streaming are covered without full weights.
 - [ ] Add an opt-in full-model converter smoke test for local machines with the full safetensors file.
-- [ ] Keep converter/loader unit tests runnable without full weights by using synthetic `.uocr` files and the cached safetensors header/index.
+- [x] Keep converter/loader unit tests runnable without full weights by using synthetic `.uocr` files, synthetic safetensors payloads, and the cached safetensors header/index.
 
 ## 9. C public API and Python FFI
 
@@ -474,55 +476,58 @@ First implementation slice, in order:
   - [x] reject mixed local/global orders that do not match this contract
 - [x] Validate prompt length plus `max_new_tokens` fits engine limits.
 - [ ] Validate KV budget before running vision/prefill.
-- [ ] Validate no-repeat config:
+- [x] Validate no-repeat config:
   - [x] allow zero disabled values
   - [x] support upstream defaults `35/128` and `35/1024`
-  - [ ] apply over the current full token sequence seen by generation (`prompt + generated`), then limit the scan by `window`, matching HF `LogitsProcessor` behavior
+  - [x] implement CPU no-repeat processor over the current full token sequence (`prompt + generated`) with the same sliding-window scan as upstream `LogitsProcessor`
 - [ ] Build per-sequence state:
-  - [ ] prompt token count
-  - [ ] text ranges
-  - [ ] image feature ranges
-  - [ ] max generation length
+  - [x] prompt token count
+  - [x] text ranges around the single visual span
+  - [x] image feature span range
+  - [x] max generation length
   - [ ] no-repeat state over prompt plus generated ids
   - [ ] generated token buffer
-  - [ ] position counter
-  - [ ] EOS status
+  - [x] position counter
+  - [x] EOS status
 
 ## 11. Model loader and memory management
 
 - [x] Implement `.uocr` mmap loader in `src/core/`/`src/model/`.
-- [ ] Parse header, section directory, config, tensor directory, tokenizer metadata, and provenance.
+- [x] Parse header, section directory, config, tensor directory, tokenizer metadata, and provenance.
 - [x] Validate `.uocr` config against compiled Unlimited-OCR constants.
 - [x] Validate tensor payload ranges do not exceed file size.
 - [x] Keep tensor data in mmap; do not copy tensors during load.
-- [ ] Build runtime tensor table mapping tensor id -> mmap offset/size/qtype/shape.
-- [ ] Implement DS4-style allocation wrappers:
-  - [ ] `uocr_malloc`
-  - [ ] `uocr_calloc`
-  - [ ] `uocr_realloc`
-  - [ ] `uocr_malloc_zeroed` using `malloc + memset`, not lazy `calloc`, for large hot-state buffers
+- [x] Build runtime tensor table mapping tensor id -> mmap offset/size/qtype/shape.
+- [x] Implement DS4-style allocation wrappers:
+  - [x] `uocr_malloc`
+  - [x] `uocr_calloc`
+  - [x] `uocr_realloc`
+  - [x] `uocr_malloc_zeroed` using `malloc + memset`, not lazy `calloc`, for large hot-state buffers
+  - [x] internal live/peak/total/failure allocation counters
+  - [x] no-allocation guard primitive for future hot-path checks
 - [ ] Add allocation guard around prefill/decode hot paths.
-- [ ] Implement runtime memory categories and live/peak counters:
-  - [ ] model views
-  - [ ] KV cache
-  - [ ] prompt embeddings
-  - [ ] vision scratch
-  - [ ] decoder scratch
-  - [ ] MoE scratch
-  - [ ] logits/readback
-  - [ ] transient buffers
-- [ ] Add `uocr_engine_memory_report()` or log output at open and after first run.
+- [x] Implement runtime memory categories and live/peak counters:
+  - [x] model views
+  - [x] KV cache
+  - [x] prompt embeddings
+  - [x] vision scratch
+  - [x] decoder scratch
+  - [x] MoE scratch
+  - [x] logits/readback
+  - [x] transient buffers
+- [x] Add `uocr_engine_memory_report()` or log output at open and after first run.
 - [ ] Implement admission control:
-  - [ ] resident weights estimate
-  - [ ] KV cache estimate
-  - [ ] prompt embedding estimate
-  - [ ] vision scratch estimate for configured view chunk
-  - [ ] decoder/MoE scratch estimate
-  - [ ] logits/readback estimate
-  - [ ] safety margin
-  - [ ] Metal `recommendedMaxWorkingSetSize` fraction if available
-- [ ] Implement KV size formula in code comments/tests:
-  - [ ] `2 * 12 * 10 * 128 * 2 = 61,440 bytes/token/sequence`
+  - [x] minimal request memory-budget enforcement before generation/ABI smoke path
+  - [x] resident weights estimate from `.uocr` tensor-data section and model-open budget rejection
+  - [x] KV cache estimate
+  - [x] prompt embedding estimate
+  - [x] vision scratch estimate for one-view chunk scheduling
+  - [x] decoder/MoE scratch estimate scaffold
+  - [x] logits/readback estimate
+  - [x] safety margin
+  - [x] Metal `recommendedMaxWorkingSetSize` fraction if available
+- [x] Implement KV size formula in code comments/tests:
+  - [x] `2 * 12 * 10 * 128 * 2 = 61,440 bytes/token/sequence`
 - [ ] Allocate long-lived runtime arenas at engine/session creation:
   - [ ] KV cache per batch slot
   - [ ] prompt embedding buffer sized by `max_prompt_tokens`
@@ -531,8 +536,6 @@ First implementation slice, in order:
   - [ ] MoE intermediate buffers
   - [ ] vision scratch buffers
   - [ ] logits and next-token buffers
-- [ ] Explicitly defer DS4's SSD expert streaming for v1.
-- [ ] Explicitly defer DS4's disk KV cache for v1.
 
 ## 12. Metal backend skeleton and DS4 memory policy
 
@@ -541,21 +544,21 @@ First implementation slice, in order:
 - [x] Compile `.metal` source files at runtime in development mode.
 - [x] Add pipeline cache keyed by function name; function-constant variants will extend the same key scheme when needed.
 - [x] Add backend resource lookup from `uocr_engine_opts.resource_path`.
-- [ ] Implement mmap-backed model view planning, following DS4:
-  - [ ] page-align view ranges
-  - [ ] account for device `maxBufferLength`
-  - [ ] create overlapping/coalesced views that cover all tensor payloads
-  - [ ] ensure every tensor lives wholly within one view
-  - [ ] wrap views with `newBufferWithBytesNoCopy`
-  - [ ] cache per-tensor `{id<MTLBuffer>, inner_offset}` after load
+- [x] Implement mmap-backed model view planning, following DS4:
+  - [x] page-align view ranges to host VM page size
+  - [x] account for device `maxBufferLength`
+  - [x] create coalesced views that cover all tensor payloads
+  - [x] ensure every tensor lives wholly within one view
+  - [x] wrap views with `newBufferWithBytesNoCopy`
+  - [x] cache per-tensor `{id<MTLBuffer>, inner_offset}` after load
 - [ ] Add optional exact-range wrapper cache only if needed; default kernels should use precomputed model views.
 - [ ] Add optional Metal residency set / warmup hooks for macOS 15+, treated as hints only.
-- [ ] Add DS4-style transient buffer tracking:
-  - [ ] retain CPU-filled shared buffers until command buffer completion
-  - [ ] release transients in completion handlers
-- [ ] Add named scratch buffers that grow to high-water mark and are reused.
-- [ ] Prefer `MTLResourceStorageModePrivate` for GPU-only scratch where possible.
-- [ ] Use shared storage only for CPU-filled/readback buffers.
+- [x] Add DS4-style transient buffer tracking:
+  - [x] retain CPU-filled shared buffers until command buffer completion
+  - [x] release transients in completion handlers
+- [x] Add named scratch buffers that grow to high-water mark and are reused.
+- [x] Prefer `MTLResourceStorageModePrivate` for GPU-only scratch where possible.
+- [x] Use shared storage only for CPU-filled/readback buffers.
 - [x] Add command-buffer ownership rules and a simple synchronous path first.
 - [x] Add Metal smoke tests:
   - [x] allocate/free scratch
@@ -582,7 +585,7 @@ First implementation slice, in order:
   - [ ] top-6 greedy
   - [ ] no top-k renormalization
   - [ ] shared expert added after routed sum
-- [ ] Implement no-repeat-ngram processor matching upstream `SlidingWindowNoRepeatNgramProcessor`.
+- [x] Implement no-repeat-ngram processor matching upstream `SlidingWindowNoRepeatNgramProcessor`.
 - [ ] Copy/adapt DS4 CPU quant dot helpers for `Q8_0` and `Q4_K` once quantization starts.
 - [ ] Add CPU reference tests against Python dumped tiny tensors.
 
@@ -903,7 +906,9 @@ First implementation slice, in order:
   - [ ] endian/alignment parsing
   - [ ] tensor directory range validation
   - [ ] qtype row-size math
-  - [ ] tensor id lookup
+  - [x] tensor id lookup
+  - [x] allocation wrapper accounting/overflow/guard tests
+  - [x] runtime memory accounting and KV formula tests
   - [ ] CPU reference tiny ops
 - [ ] Add Metal tests that do not need full model weights:
   - [ ] compile all kernels
@@ -950,8 +955,6 @@ First implementation slice, in order:
 - [ ] Document known unsupported v1 features:
   - [ ] native C tokenizer/image loader
   - [ ] CUDA backend
-  - [ ] SSD expert streaming
-  - [ ] disk KV cache
   - [ ] continuous batching
 - [ ] Add comments near inference code explaining non-obvious shape/order/cache choices, following DS4's quality rules.
 
@@ -963,7 +966,5 @@ First implementation slice, in order:
 - [ ] Add native C tokenizer by adapting DS4's JoyAI/DeepSeek byte-level BPE only if a standalone C CLI is required.
 - [ ] Add native image loading/preprocessing only if a standalone C CLI is required.
 - [ ] Add CUDA backend after Metal fp16 and quantized paths are stable.
-- [ ] Consider DS4-style SSD expert streaming only if a low-memory OCR target requires it.
-- [ ] Consider disk KV cache only if OCR workloads need reusable long prefixes or session persistence.
 - [ ] Consider experimental `Q2_K` / `IQ2_XXS` routed-expert quantization after dynamic q4 is robust.
 - [ ] Consider server/OpenAI-compatible API only after the Python API is stable.

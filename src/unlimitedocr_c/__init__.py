@@ -1,9 +1,18 @@
 """Python helpers for the Unlimited-OCR C inference core."""
 
-from .convert import DryRunPlan, TensorPlan, build_dry_run_plan
+from .convert import (
+    DryRunPlan,
+    SectionPlan,
+    TensorPlan,
+    build_dry_run_plan,
+    filter_plan_tensors,
+    write_uocr_model,
+)
+from .tensor_registry import TensorFamily, TensorProjection
 from .ffi import (
     Engine,
     EngineOptions,
+    MemoryReport,
     as_c_request,
     candidate_library_paths,
     find_library_path,
@@ -34,10 +43,16 @@ from .frontend import (
 
 __all__ = [
     "DryRunPlan",
+    "SectionPlan",
     "TensorPlan",
     "build_dry_run_plan",
+    "filter_plan_tensors",
+    "write_uocr_model",
+    "TensorFamily",
+    "TensorProjection",
     "Engine",
     "EngineOptions",
+    "MemoryReport",
     "as_c_request",
     "candidate_library_paths",
     "find_library_path",

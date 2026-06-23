@@ -26,6 +26,37 @@ UOCR_PIXEL_F32_NCHW = 1
 UOCR_VIEW_GLOBAL = 0
 UOCR_VIEW_LOCAL = 1
 
+UOCR_MEMORY_MODEL_VIEWS = 0
+UOCR_MEMORY_KV_CACHE = 1
+UOCR_MEMORY_PROMPT_EMBEDDINGS = 2
+UOCR_MEMORY_VISION_SCRATCH = 3
+UOCR_MEMORY_DECODER_SCRATCH = 4
+UOCR_MEMORY_MOE_SCRATCH = 5
+UOCR_MEMORY_LOGITS_READBACK = 6
+UOCR_MEMORY_TRANSIENT_BUFFERS = 7
+UOCR_MEMORY_CATEGORY_COUNT = 8
+
+
+class CMemoryReport(ct.Structure):
+    _fields_ = [
+        ("category_live_bytes", ct.c_uint64 * UOCR_MEMORY_CATEGORY_COUNT),
+        ("category_peak_bytes", ct.c_uint64 * UOCR_MEMORY_CATEGORY_COUNT),
+        ("total_live_bytes", ct.c_uint64),
+        ("total_peak_bytes", ct.c_uint64),
+        ("estimated_model_views_bytes", ct.c_uint64),
+        ("estimated_kv_cache_bytes", ct.c_uint64),
+        ("estimated_prompt_embeddings_bytes", ct.c_uint64),
+        ("estimated_vision_scratch_bytes", ct.c_uint64),
+        ("estimated_decoder_scratch_bytes", ct.c_uint64),
+        ("estimated_moe_scratch_bytes", ct.c_uint64),
+        ("estimated_logits_readback_bytes", ct.c_uint64),
+        ("estimated_transient_bytes", ct.c_uint64),
+        ("estimated_safety_margin_bytes", ct.c_uint64),
+        ("estimated_total_bytes", ct.c_uint64),
+        ("memory_budget_bytes", ct.c_uint64),
+        ("recommended_working_set_bytes", ct.c_uint64),
+    ]
+
 
 class CImageView(ct.Structure):
     _fields_ = [
@@ -62,6 +93,26 @@ class CEngineOpts(ct.Structure):
         ("max_gen_tokens", ct.c_uint32),
         ("memory_budget_bytes", ct.c_uint64),
     ]
+
+
+@dataclass(frozen=True)
+class MemoryReport:
+    category_live_bytes: tuple[int, ...]
+    category_peak_bytes: tuple[int, ...]
+    total_live_bytes: int
+    total_peak_bytes: int
+    estimated_model_views_bytes: int
+    estimated_kv_cache_bytes: int
+    estimated_prompt_embeddings_bytes: int
+    estimated_vision_scratch_bytes: int
+    estimated_decoder_scratch_bytes: int
+    estimated_moe_scratch_bytes: int
+    estimated_logits_readback_bytes: int
+    estimated_transient_bytes: int
+    estimated_safety_margin_bytes: int
+    estimated_total_bytes: int
+    memory_budget_bytes: int
+    recommended_working_set_bytes: int
 
 
 @dataclass(frozen=True)
@@ -129,6 +180,10 @@ def _bind_library(path: Path) -> ct.CDLL:
     lib.uocr_last_error.restype = ct.c_char_p
     lib.uocr_engine_backend.argtypes = [ct.c_void_p]
     lib.uocr_engine_backend.restype = ct.c_char_p
+    lib.uocr_memory_category_name.argtypes = [ct.c_int]
+    lib.uocr_memory_category_name.restype = ct.c_char_p
+    lib.uocr_engine_memory_report.argtypes = [ct.c_void_p, ct.POINTER(CMemoryReport)]
+    lib.uocr_engine_memory_report.restype = ct.c_int
     lib.uocr_generate_prepared.argtypes = [ct.c_void_p, ct.POINTER(CPreparedRequest), ct.c_uint32, ct.POINTER(ct.c_void_p)]
     lib.uocr_generate_prepared.restype = ct.c_int
     lib.uocr_result_count.argtypes = [ct.c_void_p]
@@ -229,6 +284,34 @@ class Engine:
     def backend(self) -> str:
         raw = self._lib.uocr_engine_backend(self._handle)
         return raw.decode("utf-8") if raw else ""
+
+    def memory_category_name(self, category: int) -> str:
+        raw = self._lib.uocr_memory_category_name(category)
+        return raw.decode("utf-8") if raw else ""
+
+    def memory_report(self) -> MemoryReport:
+        report = CMemoryReport()
+        status = self._lib.uocr_engine_memory_report(self._handle, ct.byref(report))
+        if status != UOCR_OK:
+            raise RuntimeError(f"uocr_engine_memory_report failed ({status}): {self.last_error()}")
+        return MemoryReport(
+            category_live_bytes=tuple(int(report.category_live_bytes[i]) for i in range(UOCR_MEMORY_CATEGORY_COUNT)),
+            category_peak_bytes=tuple(int(report.category_peak_bytes[i]) for i in range(UOCR_MEMORY_CATEGORY_COUNT)),
+            total_live_bytes=int(report.total_live_bytes),
+            total_peak_bytes=int(report.total_peak_bytes),
+            estimated_model_views_bytes=int(report.estimated_model_views_bytes),
+            estimated_kv_cache_bytes=int(report.estimated_kv_cache_bytes),
+            estimated_prompt_embeddings_bytes=int(report.estimated_prompt_embeddings_bytes),
+            estimated_vision_scratch_bytes=int(report.estimated_vision_scratch_bytes),
+            estimated_decoder_scratch_bytes=int(report.estimated_decoder_scratch_bytes),
+            estimated_moe_scratch_bytes=int(report.estimated_moe_scratch_bytes),
+            estimated_logits_readback_bytes=int(report.estimated_logits_readback_bytes),
+            estimated_transient_bytes=int(report.estimated_transient_bytes),
+            estimated_safety_margin_bytes=int(report.estimated_safety_margin_bytes),
+            estimated_total_bytes=int(report.estimated_total_bytes),
+            memory_budget_bytes=int(report.memory_budget_bytes),
+            recommended_working_set_bytes=int(report.recommended_working_set_bytes),
+        )
 
     def close(self) -> None:
         if self._handle:

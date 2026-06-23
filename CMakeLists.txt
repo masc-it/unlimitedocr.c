@@ -63,8 +63,12 @@ function(uocr_apply_sanitizers target)
 endfunction()
 
 add_library(uocr_core STATIC
+    src/core/uocr_alloc.c
     src/model/uocr_model_file.c
-    src/runtime/uocr_request_validation.c)
+    src/runtime/uocr_logits_processor.c
+    src/runtime/uocr_memory.c
+    src/runtime/uocr_request_validation.c
+    src/runtime/uocr_sequence.c)
 target_include_directories(uocr_core
     PUBLIC
         "${CMAKE_CURRENT_SOURCE_DIR}/include"
@@ -140,7 +144,9 @@ endif()
 if(UOCR_BUILD_TESTS)
     enable_testing()
     add_executable(test_api tests/test_api.c)
-    target_include_directories(test_api PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+    target_include_directories(test_api PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/include"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src")
     target_link_libraries(test_api PRIVATE unlimitedocr)
     uocr_apply_common_warnings(test_api)
     uocr_apply_sanitizers(test_api)
@@ -155,6 +161,42 @@ if(UOCR_BUILD_TESTS)
     uocr_apply_sanitizers(test_uocr_model_file)
     add_test(NAME uocr_model_file COMMAND test_uocr_model_file)
 
+    add_executable(test_alloc tests/test_alloc.c)
+    target_include_directories(test_alloc PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/include"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    target_link_libraries(test_alloc PRIVATE uocr_core)
+    uocr_apply_common_warnings(test_alloc)
+    uocr_apply_sanitizers(test_alloc)
+    add_test(NAME uocr_alloc COMMAND test_alloc)
+
+    add_executable(test_memory tests/test_memory.c)
+    target_include_directories(test_memory PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/include"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    target_link_libraries(test_memory PRIVATE uocr_core)
+    uocr_apply_common_warnings(test_memory)
+    uocr_apply_sanitizers(test_memory)
+    add_test(NAME uocr_memory COMMAND test_memory)
+
+    add_executable(test_logits_processor tests/test_logits_processor.c)
+    target_include_directories(test_logits_processor PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/include"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    target_link_libraries(test_logits_processor PRIVATE uocr_core)
+    uocr_apply_common_warnings(test_logits_processor)
+    uocr_apply_sanitizers(test_logits_processor)
+    add_test(NAME uocr_logits_processor COMMAND test_logits_processor)
+
+    add_executable(test_sequence tests/test_sequence.c)
+    target_include_directories(test_sequence PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/include"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    target_link_libraries(test_sequence PRIVATE uocr_core)
+    uocr_apply_common_warnings(test_sequence)
+    uocr_apply_sanitizers(test_sequence)
+    add_test(NAME uocr_sequence COMMAND test_sequence)
+
     if(UOCR_METAL_ENABLED AND UOCR_METAL_RUNTIME_COMPILE)
         add_executable(test_metal tests/test_metal.c)
         target_include_directories(test_metal PRIVATE
@@ -162,7 +204,7 @@ if(UOCR_BUILD_TESTS)
             "${CMAKE_CURRENT_SOURCE_DIR}/src")
         target_compile_definitions(test_metal PRIVATE
             UOCR_TEST_METAL_RESOURCE_PATH=\"${CMAKE_CURRENT_SOURCE_DIR}/src/backend/metal\")
-        target_link_libraries(test_metal PRIVATE unlimitedocr uocr_metal)
+        target_link_libraries(test_metal PRIVATE unlimitedocr uocr_metal uocr_core)
         uocr_apply_common_warnings(test_metal)
         uocr_apply_sanitizers(test_metal)
         add_test(NAME uocr_metal COMMAND test_metal)

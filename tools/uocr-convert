@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Dry-run converter entry point for development builds."""
+"""Converter entry point for development builds."""
 
 from unlimitedocr_c.convert import main
 

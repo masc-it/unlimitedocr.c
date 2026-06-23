@@ -227,6 +227,7 @@ typedef struct {
 
 uocr_engine *uocr_engine_open(const uocr_engine_opts *opts);
 void uocr_engine_close(uocr_engine *e);
+int uocr_engine_memory_report(const uocr_engine *e, uocr_memory_report *out);
 int uocr_generate_prepared(uocr_engine *e,
                            const uocr_prepared_request *reqs,
                            uint32_t n,
@@ -235,7 +236,7 @@ const int32_t *uocr_result_tokens(const uocr_result *r, uint32_t index, uint32_t
 void uocr_result_free(uocr_result *r);
 ```
 
-The Python package wraps this as `ocr.generate(image, prompt, preset=...)`, decodes output token ids with the HF tokenizer, and handles streaming text later by receiving generated token ids incrementally.
+The Python package wraps this as `ocr.generate(image, prompt, preset=...)`, decodes output token ids with the HF tokenizer, exposes memory estimates/reports for admission-control debugging, and handles streaming text later by receiving generated token ids incrementally.
 
 ## `.uocr` model file
 
@@ -329,6 +330,7 @@ Initial policy should keep unaligned down projections in `Q8_0`, unless the conv
 Useful DS4 converter features to copy:
 
 - dry-run tensor plan
+- bounded streaming writer that never allocates a full-model temporary buffer
 - per-prefix qtype overrides
 - single-tensor compare
 - imatrix/calibration metadata
@@ -506,12 +508,12 @@ Use DS4's memory discipline, scaled down for OCR: mmap model weights, preallocat
 
 ### Weight memory
 
-- `.uocr` should be opened once and kept mmap-backed for the engine lifetime.
-- On Metal, wrap page-aligned ranges of the mmap as no-copy `MTLBuffer`s. Do not eagerly copy the full model into private buffers.
+- `.uocr` should be opened once from `uocr_engine_opts.model_path` and kept mmap-backed for the engine lifetime.
+- Account resident tensor-data bytes in the engine memory report and reject configured model-open budgets that cannot cover the mapped tensor-data view.
+- On Metal, wrap host-VM-page-aligned ranges of the mmap as no-copy `MTLBuffer`s. Do not eagerly copy the full model into private buffers.
 - Store per-tensor `{view, inner_offset}` after load so hot kernels do not search views.
 - Keep the tensor payload separate from metadata/tokenizer so only tensor pages are exposed to Metal.
 - Request Metal residency / perform a coarse model-view warmup when useful, but treat this as a startup hint, not a full prefetch.
-- Unlike DS4, v1 does not need SSD expert streaming: even fp16 OCR weights are ~6.67 GB. Keep streaming as a later optional mode only if low-memory targets need it.
 
 ### Runtime arenas
 
@@ -534,6 +536,7 @@ Avoid allocation in the token loop. Add a debug allocation guard like DS4's CPU 
 - Use Metal private storage for GPU-only scratch when possible; use shared storage only for CPU-filled/readback buffers.
 - Keep CPU-filled transient buffers alive until the command buffer completes.
 - Track live/peak bytes by category and print a memory report.
+- Use the shared C `uocr_memory_tracker` categories (`model-views`, `kv-cache`, `prompt-embeddings`, `vision-scratch`, `decoder-scratch`, `moe-scratch`, `logits-readback`, `transient-buffers`) for backend-independent accounting before adding backend-specific details.
 
 ### KV cache budget
 
@@ -580,7 +583,7 @@ resident weights
 + safety margin
 ```
 
-Reject or downsize batches when the estimate exceeds a configured limit or a fraction of Metal `recommendedMaxWorkingSetSize`.
+Reject or downsize batches when the estimate exceeds a configured limit or the Metal backend default budget. When `uocr_engine_opts.memory_budget_bytes == 0`, Metal uses 95% of `recommendedMaxWorkingSetSize` if the device reports it; the runtime estimate already carries its own safety margin.
 
 ## What DS4 does for memory
 
@@ -593,10 +596,8 @@ Reject or downsize batches when the estimate exceeds a configured limit or a fra
 - **Preallocated scratch**: named global scratch buffers grow to the needed size and are reused; memory reports include scratch categories.
 - **Transient buffer lifetime**: CPU-filled Metal buffers are retained in an array until command completion, avoiding use-after-free with asynchronous command buffers.
 - **Runtime tensor accounting**: GPU tensor allocations/views are tracked with live and peak byte counters.
-- **SSD routed-expert streaming**: for models larger than RAM, DS4 keeps non-routed weights resident and uses an explicit routed-expert cache. Expert cache entries are loaded with `pread`, can be slab-allocated, mlocked when possible, protected while in-flight, evicted by policy, and instrumented with hit/miss/read timing stats.
-- **Disk KV cache**: server/agent sessions can persist KV checkpoints to disk; only one live KV session is kept in memory.
 
-For Unlimited-OCR, copy the mmap/no-copy views, scratch reuse, transient lifetime, accounting, and admission-control ideas first. Defer DS4's SSD expert streaming and disk KV cache unless a concrete OCR use case needs them.
+For Unlimited-OCR, copy the mmap/no-copy views, scratch reuse, transient lifetime, accounting, and admission-control ideas.
 
 ## Backend interface
 

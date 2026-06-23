@@ -47,6 +47,37 @@ typedef enum uocr_view_kind {
     UOCR_VIEW_LOCAL = 1
 } uocr_view_kind;
 
+typedef enum uocr_memory_category {
+    UOCR_MEMORY_MODEL_VIEWS = 0,
+    UOCR_MEMORY_KV_CACHE = 1,
+    UOCR_MEMORY_PROMPT_EMBEDDINGS = 2,
+    UOCR_MEMORY_VISION_SCRATCH = 3,
+    UOCR_MEMORY_DECODER_SCRATCH = 4,
+    UOCR_MEMORY_MOE_SCRATCH = 5,
+    UOCR_MEMORY_LOGITS_READBACK = 6,
+    UOCR_MEMORY_TRANSIENT_BUFFERS = 7,
+    UOCR_MEMORY_CATEGORY_COUNT = 8
+} uocr_memory_category;
+
+typedef struct uocr_memory_report {
+    uint64_t category_live_bytes[UOCR_MEMORY_CATEGORY_COUNT];
+    uint64_t category_peak_bytes[UOCR_MEMORY_CATEGORY_COUNT];
+    uint64_t total_live_bytes;
+    uint64_t total_peak_bytes;
+    uint64_t estimated_model_views_bytes;
+    uint64_t estimated_kv_cache_bytes;
+    uint64_t estimated_prompt_embeddings_bytes;
+    uint64_t estimated_vision_scratch_bytes;
+    uint64_t estimated_decoder_scratch_bytes;
+    uint64_t estimated_moe_scratch_bytes;
+    uint64_t estimated_logits_readback_bytes;
+    uint64_t estimated_transient_bytes;
+    uint64_t estimated_safety_margin_bytes;
+    uint64_t estimated_total_bytes;
+    uint64_t memory_budget_bytes;
+    uint64_t recommended_working_set_bytes;
+} uocr_memory_report;
+
 typedef struct uocr_image_view {
     const void *pixels;          /* contiguous [3,H,W], normalized to [-1,1] */
     uint32_t width;
@@ -88,6 +119,8 @@ UOCR_API uocr_engine *uocr_engine_open(const uocr_engine_opts *opts);
 UOCR_API void uocr_engine_close(uocr_engine *engine);
 UOCR_API const char *uocr_last_error(const uocr_engine *engine);
 UOCR_API const char *uocr_engine_backend(const uocr_engine *engine);
+UOCR_API const char *uocr_memory_category_name(uocr_memory_category category);
+UOCR_API int uocr_engine_memory_report(const uocr_engine *engine, uocr_memory_report *out_report);
 
 UOCR_API int uocr_generate_prepared(uocr_engine *engine,
                                     const uocr_prepared_request *requests,

@@ -1,6 +1,7 @@
 #include "backend/metal/uocr_metal.h"
 
 #include <errno.h>
+#include <limits.h>
 #include <stdint.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -22,11 +23,47 @@
 #define UOCR_DEFAULT_RESOURCE_PATH ""
 #endif
 
+typedef struct uocr_metal_model_view {
+    id<MTLBuffer> buffer;
+    uint64_t file_offset;
+    uint64_t length;
+} uocr_metal_model_view;
+
+typedef struct uocr_metal_tensor_binding_internal {
+    uint32_t tensor_id;
+    uint32_t view_index;
+    uint64_t inner_offset;
+    uint64_t payload_size;
+} uocr_metal_tensor_binding_internal;
+
+typedef struct uocr_metal_payload_span {
+    uint32_t tensor_index;
+    uint32_t tensor_id;
+    uint64_t payload_start;
+    uint64_t payload_end;
+    uint64_t page_start;
+    uint64_t page_end;
+} uocr_metal_payload_span;
+
+typedef struct uocr_metal_scratch_buffer {
+    id<MTLBuffer> buffer;
+    uint64_t capacity;
+    uint64_t high_watermark;
+    int cpu_visible;
+} uocr_metal_scratch_buffer;
+
 struct uocr_metal_context {
     id<MTLDevice> device;
     id<MTLCommandQueue> queue;
     id<MTLLibrary> library;
     NSMutableDictionary<NSString *, id<MTLComputePipelineState>> *pipeline_cache;
+    NSMutableArray *transient_retains;
+    uocr_metal_model_view *model_views;
+    uint32_t model_view_count;
+    uocr_metal_tensor_binding_internal *tensor_bindings;
+    uint32_t tensor_binding_count;
+    uint64_t model_view_bytes;
+    uocr_metal_scratch_buffer scratch[UOCR_METAL_SCRATCH_COUNT];
 };
 
 static int metal_fail(char *error, size_t error_size, const char *fmt, ...) {
@@ -44,6 +81,58 @@ static void metal_clear_error(char *error, size_t error_size) {
     if (error != NULL && error_size > 0u) {
         error[0] = '\0';
     }
+}
+
+static int checked_add_u64(uint64_t a, uint64_t b, uint64_t *out) {
+    if (out == NULL || a > UINT64_MAX - b) {
+        return 0;
+    }
+    *out = a + b;
+    return 1;
+}
+
+static uint64_t align_down_u64(uint64_t value, uint64_t align) {
+    return align == 0u ? value : value - (value % align);
+}
+
+static int align_up_u64_checked(uint64_t value, uint64_t align, uint64_t *out) {
+    if (out == NULL) {
+        return 0;
+    }
+    if (align == 0u) {
+        *out = value;
+        return 1;
+    }
+    const uint64_t rem = value % align;
+    if (rem == 0u) {
+        *out = value;
+        return 1;
+    }
+    return checked_add_u64(value, align - rem, out);
+}
+
+static int payload_span_compare(const void *a, const void *b) {
+    const uocr_metal_payload_span *pa = (const uocr_metal_payload_span *)a;
+    const uocr_metal_payload_span *pb = (const uocr_metal_payload_span *)b;
+    if (pa->page_start < pb->page_start) {
+        return -1;
+    }
+    if (pa->page_start > pb->page_start) {
+        return 1;
+    }
+    if (pa->page_end < pb->page_end) {
+        return -1;
+    }
+    if (pa->page_end > pb->page_end) {
+        return 1;
+    }
+    if (pa->tensor_id < pb->tensor_id) {
+        return -1;
+    }
+    if (pa->tensor_id > pb->tensor_id) {
+        return 1;
+    }
+    return 0;
 }
 
 #if UOCR_METAL_RUNTIME_COMPILE
@@ -124,6 +213,41 @@ static NSString *load_runtime_source(const char *resource_path, char *error, siz
 #endif
 }
 
+static uint32_t metal_inflight_transient_count(uocr_metal_context *ctx) {
+    if (ctx == NULL || ctx->transient_retains == nil) {
+        return 0u;
+    }
+    @synchronized(ctx->transient_retains) {
+        return (uint32_t)[ctx->transient_retains count];
+    }
+}
+
+static int metal_retain_transient_until_completed(uocr_metal_context *ctx,
+                                                  id<MTLCommandBuffer> command_buffer,
+                                                  id object,
+                                                  char *error,
+                                                  size_t error_size) {
+    if (ctx == NULL || ctx->transient_retains == nil || command_buffer == nil || object == nil) {
+        return metal_fail(error, error_size, "invalid Metal transient retain request");
+    }
+
+    NSMutableArray *retained_objects = [ctx->transient_retains retain];
+    @synchronized(retained_objects) {
+        [retained_objects addObject:object];
+    }
+    [command_buffer addCompletedHandler:^(id<MTLCommandBuffer> completed) {
+        (void)completed;
+        @synchronized(retained_objects) {
+            const NSUInteger index = [retained_objects indexOfObjectIdenticalTo:object];
+            if (index != NSNotFound) {
+                [retained_objects removeObjectAtIndex:index];
+            }
+        }
+        [retained_objects release];
+    }];
+    return 1;
+}
+
 static id<MTLComputePipelineState> metal_get_pipeline(uocr_metal_context *ctx,
                                                        const char *function_name,
                                                        char *error,
@@ -177,6 +301,28 @@ const char *uocr_metal_backend_name(void) {
     return "metal";
 }
 
+uint64_t uocr_metal_recommended_working_set_size(void) {
+    @autoreleasepool {
+        id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+        if (device == nil) {
+            return 0u;
+        }
+        const uint64_t size = (uint64_t)[device recommendedMaxWorkingSetSize];
+        [device release];
+        return size;
+    }
+}
+
+uint64_t uocr_metal_default_memory_budget_bytes(uint64_t recommended_working_set_bytes) {
+    if (recommended_working_set_bytes == 0u) {
+        return 0u;
+    }
+    /* The runtime estimate already includes its own safety margin; keep most
+     * of Metal's recommendation available while still leaving OS/driver room.
+     */
+    return (recommended_working_set_bytes / 100u) * 95u + ((recommended_working_set_bytes % 100u) * 95u) / 100u;
+}
+
 uocr_metal_context *uocr_metal_context_create(const char *resource_path, char *error, size_t error_size) {
     metal_clear_error(error, error_size);
 
@@ -208,6 +354,13 @@ uocr_metal_context *uocr_metal_context_create(const char *resource_path, char *e
             return NULL;
         }
 
+        ctx->transient_retains = [[NSMutableArray alloc] init];
+        if (ctx->transient_retains == nil) {
+            (void)metal_fail(error, error_size, "failed to allocate Metal transient-retain array");
+            uocr_metal_context_destroy(ctx);
+            return NULL;
+        }
+
         NSString *source = load_runtime_source(resource_path, error, error_size);
         if (source == nil) {
             uocr_metal_context_destroy(ctx);
@@ -231,11 +384,584 @@ uocr_metal_context *uocr_metal_context_create(const char *resource_path, char *e
     }
 }
 
-void uocr_metal_context_destroy(uocr_metal_context *ctx) {
+static uint64_t metal_device_max_buffer_length(id<MTLDevice> device) {
+    if (device == nil) {
+        return 0u;
+    }
+    const NSUInteger max_length = [device maxBufferLength];
+    return (uint64_t)max_length;
+}
+
+static int payload_tensor_count(const uocr_model_file *model, uint32_t *out_count) {
+    if (model == NULL || out_count == NULL) {
+        return 0;
+    }
+    uint32_t count = 0u;
+    for (uint32_t i = 0u; i < model->tensor_count; ++i) {
+        const uocr_tensor_entry *tensor = &model->tensors[i];
+        if (tensor->usage != UOCR_TENSOR_USAGE_OMITTED_WITH_REASON && tensor->payload_size != 0u) {
+            ++count;
+        }
+    }
+    *out_count = count;
+    return 1;
+}
+
+static uocr_metal_payload_span *build_payload_spans(const uocr_model_file *model,
+                                                     uint64_t page_size,
+                                                     uint32_t payload_count,
+                                                     char *error,
+                                                     size_t error_size) {
+    uocr_metal_payload_span *spans = (uocr_metal_payload_span *)calloc(payload_count, sizeof(spans[0]));
+    if (spans == NULL) {
+        (void)metal_fail(error, error_size, "failed to allocate Metal model payload span plan");
+        return NULL;
+    }
+
+    uint32_t out = 0u;
+    for (uint32_t i = 0u; i < model->tensor_count; ++i) {
+        const uocr_tensor_entry *tensor = &model->tensors[i];
+        if (tensor->usage == UOCR_TENSOR_USAGE_OMITTED_WITH_REASON || tensor->payload_size == 0u) {
+            continue;
+        }
+
+        uint64_t payload_end = 0u;
+        uint64_t page_end = 0u;
+        if (!checked_add_u64(tensor->payload_offset, tensor->payload_size, &payload_end) ||
+            !align_up_u64_checked(payload_end, page_size, &page_end)) {
+            free(spans);
+            (void)metal_fail(error,
+                             error_size,
+                             "tensor %u payload range overflows during Metal view planning",
+                             tensor->id);
+            return NULL;
+        }
+        if (page_end > (uint64_t)model->size) {
+            page_end = (uint64_t)model->size;
+        }
+        if (page_end < payload_end) {
+            free(spans);
+            (void)metal_fail(error,
+                             error_size,
+                             "tensor %u payload end exceeds mapped file during Metal view planning",
+                             tensor->id);
+            return NULL;
+        }
+
+        spans[out].tensor_index = i;
+        spans[out].tensor_id = tensor->id;
+        spans[out].payload_start = tensor->payload_offset;
+        spans[out].payload_end = payload_end;
+        spans[out].page_start = align_down_u64(tensor->payload_offset, page_size);
+        spans[out].page_end = page_end;
+        ++out;
+    }
+
+    qsort(spans, payload_count, sizeof(spans[0]), payload_span_compare);
+    return spans;
+}
+
+static int append_model_view_plan(uocr_metal_model_view **views,
+                                  uint32_t *count,
+                                  uint32_t *capacity,
+                                  uint64_t start,
+                                  uint64_t end,
+                                  char *error,
+                                  size_t error_size) {
+    if (views == NULL || count == NULL || capacity == NULL || end <= start) {
+        return metal_fail(error, error_size, "invalid Metal model view plan append");
+    }
+    if (*count == *capacity) {
+        const uint32_t new_capacity = *capacity == 0u ? 4u : *capacity * 2u;
+        if (new_capacity <= *capacity) {
+            return metal_fail(error, error_size, "too many Metal model views");
+        }
+        uocr_metal_model_view *new_views = (uocr_metal_model_view *)realloc(*views, (size_t)new_capacity * sizeof(new_views[0]));
+        if (new_views == NULL) {
+            return metal_fail(error, error_size, "failed to grow Metal model view plan");
+        }
+        memset(new_views + *capacity, 0, (size_t)(new_capacity - *capacity) * sizeof(new_views[0]));
+        *views = new_views;
+        *capacity = new_capacity;
+    }
+    (*views)[*count].file_offset = start;
+    (*views)[*count].length = end - start;
+    (*views)[*count].buffer = nil;
+    ++(*count);
+    return 1;
+}
+
+static uocr_metal_model_view *build_model_view_plan(const uocr_metal_payload_span *spans,
+                                                     uint32_t payload_count,
+                                                     uint64_t max_buffer_length,
+                                                     uint32_t *out_view_count,
+                                                     char *error,
+                                                     size_t error_size) {
+    *out_view_count = 0u;
+    if (payload_count == 0u) {
+        return NULL;
+    }
+
+    uocr_metal_model_view *views = NULL;
+    uint32_t view_count = 0u;
+    uint32_t view_capacity = 0u;
+    uint64_t current_start = 0u;
+    uint64_t current_end = 0u;
+    int have_current = 0;
+
+    for (uint32_t i = 0u; i < payload_count; ++i) {
+        const uocr_metal_payload_span *span = &spans[i];
+        if (span->page_end <= span->page_start) {
+            free(views);
+            (void)metal_fail(error, error_size, "tensor %u has empty page span", span->tensor_id);
+            return NULL;
+        }
+        if (span->page_end - span->page_start > max_buffer_length) {
+            free(views);
+            (void)metal_fail(error,
+                             error_size,
+                             "tensor %u requires %llu byte no-copy view, exceeding Metal maxBufferLength %llu",
+                             span->tensor_id,
+                             (unsigned long long)(span->page_end - span->page_start),
+                             (unsigned long long)max_buffer_length);
+            return NULL;
+        }
+
+        if (!have_current) {
+            current_start = span->page_start;
+            current_end = span->page_end;
+            have_current = 1;
+            continue;
+        }
+
+        uint64_t merged_end = current_end;
+        if (span->page_end > merged_end) {
+            merged_end = span->page_end;
+        }
+        if (merged_end - current_start <= max_buffer_length) {
+            current_end = merged_end;
+            continue;
+        }
+
+        if (!append_model_view_plan(&views, &view_count, &view_capacity, current_start, current_end, error, error_size)) {
+            free(views);
+            return NULL;
+        }
+        current_start = span->page_start;
+        current_end = span->page_end;
+    }
+
+    if (have_current && !append_model_view_plan(&views, &view_count, &view_capacity, current_start, current_end, error, error_size)) {
+        free(views);
+        return NULL;
+    }
+
+    *out_view_count = view_count;
+    return views;
+}
+
+static int find_view_for_payload(const uocr_metal_model_view *views,
+                                 uint32_t view_count,
+                                 uint64_t payload_start,
+                                 uint64_t payload_size,
+                                 uint32_t *out_view_index,
+                                 uint64_t *out_inner_offset) {
+    uint64_t payload_end = 0u;
+    if (!checked_add_u64(payload_start, payload_size, &payload_end)) {
+        return 0;
+    }
+    for (uint32_t i = 0u; i < view_count; ++i) {
+        const uint64_t view_start = views[i].file_offset;
+        const uint64_t view_end = view_start + views[i].length;
+        if (payload_start >= view_start && payload_end <= view_end) {
+            *out_view_index = i;
+            *out_inner_offset = payload_start - view_start;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static uocr_metal_tensor_binding_internal *build_tensor_bindings(const uocr_model_file *model,
+                                                                  const uocr_metal_model_view *views,
+                                                                  uint32_t view_count,
+                                                                  uint32_t binding_count,
+                                                                  char *error,
+                                                                  size_t error_size) {
+    if (binding_count == 0u) {
+        return NULL;
+    }
+    uocr_metal_tensor_binding_internal *bindings =
+        (uocr_metal_tensor_binding_internal *)calloc(binding_count, sizeof(bindings[0]));
+    if (bindings == NULL) {
+        (void)metal_fail(error, error_size, "failed to allocate Metal tensor binding table");
+        return NULL;
+    }
+
+    uint32_t out = 0u;
+    for (uint32_t i = 0u; i < model->tensor_count; ++i) {
+        const uocr_tensor_entry *tensor = &model->tensors[i];
+        if (tensor->usage == UOCR_TENSOR_USAGE_OMITTED_WITH_REASON || tensor->payload_size == 0u) {
+            continue;
+        }
+        uint32_t view_index = 0u;
+        uint64_t inner_offset = 0u;
+        if (!find_view_for_payload(views, view_count, tensor->payload_offset, tensor->payload_size, &view_index, &inner_offset)) {
+            free(bindings);
+            (void)metal_fail(error,
+                             error_size,
+                             "tensor %u was not covered by any Metal model view",
+                             tensor->id);
+            return NULL;
+        }
+        bindings[out].tensor_id = tensor->id;
+        bindings[out].view_index = view_index;
+        bindings[out].inner_offset = inner_offset;
+        bindings[out].payload_size = tensor->payload_size;
+        ++out;
+    }
+    return bindings;
+}
+
+void uocr_metal_context_unmap_model(uocr_metal_context *ctx) {
     if (ctx == NULL) {
         return;
     }
     @autoreleasepool {
+        if (ctx->model_views != NULL) {
+            for (uint32_t i = 0u; i < ctx->model_view_count; ++i) {
+                [ctx->model_views[i].buffer release];
+                ctx->model_views[i].buffer = nil;
+            }
+        }
+        free(ctx->model_views);
+        ctx->model_views = NULL;
+        ctx->model_view_count = 0u;
+        free(ctx->tensor_bindings);
+        ctx->tensor_bindings = NULL;
+        ctx->tensor_binding_count = 0u;
+        ctx->model_view_bytes = 0u;
+    }
+}
+
+int uocr_metal_context_map_model(uocr_metal_context *ctx, const uocr_model_file *model, char *error, size_t error_size) {
+    metal_clear_error(error, error_size);
+    if (ctx == NULL || model == NULL || model->data == NULL || model->tensors == NULL) {
+        return metal_fail(error, error_size, "Metal model mapping requires a context and loaded .uocr model");
+    }
+
+    const uocr_section_entry *tensor_data = uocr_model_file_find_section(model, UOCR_SECTION_TENSOR_DATA);
+    if (tensor_data == NULL || tensor_data->size == 0u) {
+        return metal_fail(error, error_size, ".uocr model has no tensor-data section to map");
+    }
+
+    uint32_t payload_count = 0u;
+    if (!payload_tensor_count(model, &payload_count) || payload_count == 0u) {
+        return metal_fail(error, error_size, ".uocr model has no tensor payloads to map");
+    }
+
+    long page_size_long = sysconf(_SC_PAGESIZE);
+    if (page_size_long <= 0) {
+        page_size_long = (long)UOCR_TENSOR_DATA_ALIGNMENT;
+    }
+    const uint64_t page_size = (uint64_t)page_size_long;
+    const uint64_t max_buffer_length = metal_device_max_buffer_length(ctx->device);
+    if (max_buffer_length < page_size) {
+        return metal_fail(error,
+                          error_size,
+                          "Metal maxBufferLength %llu is smaller than page size %llu",
+                          (unsigned long long)max_buffer_length,
+                          (unsigned long long)page_size);
+    }
+
+    uocr_metal_payload_span *spans = build_payload_spans(model, page_size, payload_count, error, error_size);
+    if (spans == NULL) {
+        return 0;
+    }
+
+    uint32_t view_count = 0u;
+    uocr_metal_model_view *views = build_model_view_plan(spans, payload_count, max_buffer_length, &view_count, error, error_size);
+    free(spans);
+    if (views == NULL || view_count == 0u) {
+        free(views);
+        return 0;
+    }
+
+    uocr_metal_tensor_binding_internal *bindings =
+        build_tensor_bindings(model, views, view_count, payload_count, error, error_size);
+    if (bindings == NULL) {
+        free(views);
+        return 0;
+    }
+
+    @autoreleasepool {
+        for (uint32_t i = 0u; i < view_count; ++i) {
+            if (views[i].length > (uint64_t)SIZE_MAX) {
+                free(bindings);
+                free(views);
+                return metal_fail(error, error_size, "Metal model view %u is too large for this platform", i);
+            }
+            void *view_ptr = (void *)(uintptr_t)(model->data + views[i].file_offset);
+            id<MTLBuffer> buffer = [ctx->device newBufferWithBytesNoCopy:view_ptr
+                                                                   length:(NSUInteger)views[i].length
+                                                                  options:MTLResourceStorageModeShared
+                                                              deallocator:nil];
+            if (buffer == nil) {
+                for (uint32_t j = 0u; j < i; ++j) {
+                    [views[j].buffer release];
+                    views[j].buffer = nil;
+                }
+                free(bindings);
+                free(views);
+                return metal_fail(error,
+                                  error_size,
+                                  "newBufferWithBytesNoCopy failed for model view %u at file offset %llu length %llu",
+                                  i,
+                                  (unsigned long long)views[i].file_offset,
+                                  (unsigned long long)views[i].length);
+            }
+            buffer.label = [NSString stringWithFormat:@"uocr_model_view_%u", i];
+            views[i].buffer = buffer;
+        }
+    }
+
+    uocr_metal_context_unmap_model(ctx);
+    ctx->model_views = views;
+    ctx->model_view_count = view_count;
+    ctx->tensor_bindings = bindings;
+    ctx->tensor_binding_count = payload_count;
+    ctx->model_view_bytes = tensor_data->size;
+    metal_clear_error(error, error_size);
+    return 1;
+}
+
+uint32_t uocr_metal_context_model_view_count(const uocr_metal_context *ctx) {
+    return ctx != NULL ? ctx->model_view_count : 0u;
+}
+
+uint32_t uocr_metal_context_tensor_binding_count(const uocr_metal_context *ctx) {
+    return ctx != NULL ? ctx->tensor_binding_count : 0u;
+}
+
+uint64_t uocr_metal_context_model_view_bytes(const uocr_metal_context *ctx) {
+    return ctx != NULL ? ctx->model_view_bytes : 0u;
+}
+
+int uocr_metal_context_get_model_view_info(const uocr_metal_context *ctx,
+                                           uint32_t view_index,
+                                           uocr_metal_model_view_info *out_info) {
+    if (ctx == NULL || out_info == NULL || view_index >= ctx->model_view_count) {
+        return 0;
+    }
+    out_info->file_offset = ctx->model_views[view_index].file_offset;
+    out_info->length = ctx->model_views[view_index].length;
+    return 1;
+}
+
+int uocr_metal_context_get_tensor_binding(const uocr_metal_context *ctx,
+                                          uint32_t tensor_id,
+                                          uocr_metal_tensor_binding *out_binding) {
+    if (ctx == NULL || out_binding == NULL || tensor_id == 0u) {
+        return 0;
+    }
+    uint32_t lo = 0u;
+    uint32_t hi = ctx->tensor_binding_count;
+    while (lo < hi) {
+        const uint32_t mid = lo + (hi - lo) / 2u;
+        const uint32_t mid_id = ctx->tensor_bindings[mid].tensor_id;
+        if (mid_id == tensor_id) {
+            out_binding->tensor_id = ctx->tensor_bindings[mid].tensor_id;
+            out_binding->view_index = ctx->tensor_bindings[mid].view_index;
+            out_binding->inner_offset = ctx->tensor_bindings[mid].inner_offset;
+            out_binding->payload_size = ctx->tensor_bindings[mid].payload_size;
+            return 1;
+        }
+        if (mid_id < tensor_id) {
+            lo = mid + 1u;
+        } else {
+            hi = mid;
+        }
+    }
+    return 0;
+}
+
+static int scratch_slot_valid(uocr_metal_scratch_slot slot) {
+    return slot >= UOCR_METAL_SCRATCH_VISION && slot < UOCR_METAL_SCRATCH_COUNT;
+}
+
+static const char *scratch_slot_name(uocr_metal_scratch_slot slot) {
+    switch (slot) {
+        case UOCR_METAL_SCRATCH_VISION:
+            return "vision";
+        case UOCR_METAL_SCRATCH_DECODER:
+            return "decoder";
+        case UOCR_METAL_SCRATCH_MOE:
+            return "moe";
+        case UOCR_METAL_SCRATCH_LOGITS:
+            return "logits";
+        case UOCR_METAL_SCRATCH_TRANSIENT:
+            return "transient";
+        default:
+            return "unknown";
+    }
+}
+
+static int scratch_capacity_for_request(uint64_t current_capacity, uint64_t min_length, uint64_t *out_capacity) {
+    const uint64_t min_allocation = 4096u;
+    uint64_t requested = 0u;
+    if (!align_up_u64_checked(min_length, 256u, &requested)) {
+        return 0;
+    }
+    if (requested < min_allocation) {
+        requested = min_allocation;
+    }
+
+    uint64_t capacity = current_capacity;
+    if (capacity < min_allocation) {
+        capacity = min_allocation;
+    }
+    while (capacity < requested) {
+        if (capacity > UINT64_MAX / 2u) {
+            capacity = requested;
+            break;
+        }
+        capacity *= 2u;
+    }
+    *out_capacity = capacity;
+    return 1;
+}
+
+int uocr_metal_context_ensure_scratch(uocr_metal_context *ctx,
+                                      uocr_metal_scratch_slot slot,
+                                      uint64_t min_length,
+                                      int cpu_visible,
+                                      char *error,
+                                      size_t error_size) {
+    metal_clear_error(error, error_size);
+    if (ctx == NULL || !scratch_slot_valid(slot)) {
+        return metal_fail(error, error_size, "invalid Metal scratch buffer request");
+    }
+    if (min_length == 0u) {
+        return 1;
+    }
+    if (min_length > (uint64_t)SIZE_MAX) {
+        return metal_fail(error,
+                          error_size,
+                          "Metal scratch request for %s is too large: %llu bytes",
+                          scratch_slot_name(slot),
+                          (unsigned long long)min_length);
+    }
+
+    uocr_metal_scratch_buffer *scratch = &ctx->scratch[slot];
+    const int wants_cpu_visible = cpu_visible ? 1 : 0;
+    if (scratch->buffer != nil && scratch->capacity >= min_length && scratch->cpu_visible == wants_cpu_visible) {
+        if (scratch->high_watermark < min_length) {
+            scratch->high_watermark = min_length;
+        }
+        return 1;
+    }
+
+    uint64_t new_capacity = 0u;
+    if (!scratch_capacity_for_request(scratch->capacity, min_length, &new_capacity) || new_capacity > (uint64_t)SIZE_MAX) {
+        return metal_fail(error,
+                          error_size,
+                          "Metal scratch capacity overflow for %s request of %llu bytes",
+                          scratch_slot_name(slot),
+                          (unsigned long long)min_length);
+    }
+
+    @autoreleasepool {
+        const MTLResourceOptions storage_mode = wants_cpu_visible ? MTLResourceStorageModeShared : MTLResourceStorageModePrivate;
+        id<MTLBuffer> buffer = [ctx->device newBufferWithLength:(NSUInteger)new_capacity options:storage_mode];
+        if (buffer == nil) {
+            return metal_fail(error,
+                              error_size,
+                              "failed to allocate %s Metal scratch buffer with %llu bytes",
+                              scratch_slot_name(slot),
+                              (unsigned long long)new_capacity);
+        }
+        buffer.label = [NSString stringWithFormat:@"uocr_scratch_%s", scratch_slot_name(slot)];
+        [scratch->buffer release];
+        scratch->buffer = buffer;
+        scratch->capacity = new_capacity;
+        scratch->cpu_visible = wants_cpu_visible;
+        if (scratch->high_watermark < min_length) {
+            scratch->high_watermark = min_length;
+        }
+    }
+    return 1;
+}
+
+void uocr_metal_context_release_scratch(uocr_metal_context *ctx, uocr_metal_scratch_slot slot) {
+    if (ctx == NULL || !scratch_slot_valid(slot)) {
+        return;
+    }
+    @autoreleasepool {
+        uocr_metal_scratch_buffer *scratch = &ctx->scratch[slot];
+        [scratch->buffer release];
+        scratch->buffer = nil;
+        scratch->capacity = 0u;
+        scratch->cpu_visible = 0;
+    }
+}
+
+uint64_t uocr_metal_context_scratch_capacity(const uocr_metal_context *ctx, uocr_metal_scratch_slot slot) {
+    if (ctx == NULL || !scratch_slot_valid(slot)) {
+        return 0u;
+    }
+    return ctx->scratch[slot].capacity;
+}
+
+uint64_t uocr_metal_context_scratch_high_watermark(const uocr_metal_context *ctx, uocr_metal_scratch_slot slot) {
+    if (ctx == NULL || !scratch_slot_valid(slot)) {
+        return 0u;
+    }
+    return ctx->scratch[slot].high_watermark;
+}
+
+uint64_t uocr_metal_context_total_scratch_capacity(const uocr_metal_context *ctx) {
+    uint64_t total = 0u;
+    if (ctx == NULL) {
+        return 0u;
+    }
+    for (uint32_t i = 0u; i < (uint32_t)UOCR_METAL_SCRATCH_COUNT; ++i) {
+        if (!checked_add_u64(total, ctx->scratch[i].capacity, &total)) {
+            return UINT64_MAX;
+        }
+    }
+    return total;
+}
+
+uint64_t uocr_metal_context_total_scratch_high_watermark(const uocr_metal_context *ctx) {
+    uint64_t total = 0u;
+    if (ctx == NULL) {
+        return 0u;
+    }
+    for (uint32_t i = 0u; i < (uint32_t)UOCR_METAL_SCRATCH_COUNT; ++i) {
+        if (!checked_add_u64(total, ctx->scratch[i].high_watermark, &total)) {
+            return UINT64_MAX;
+        }
+    }
+    return total;
+}
+
+static void release_all_scratch(uocr_metal_context *ctx) {
+    if (ctx == NULL) {
+        return;
+    }
+    for (uint32_t i = 0u; i < (uint32_t)UOCR_METAL_SCRATCH_COUNT; ++i) {
+        uocr_metal_context_release_scratch(ctx, (uocr_metal_scratch_slot)i);
+    }
+}
+
+void uocr_metal_context_destroy(uocr_metal_context *ctx) {
+    if (ctx == NULL) {
+        return;
+    }
+    uocr_metal_context_unmap_model(ctx);
+    release_all_scratch(ctx);
+    @autoreleasepool {
+        [ctx->transient_retains release];
         [ctx->pipeline_cache release];
         [ctx->library release];
         [ctx->queue release];
@@ -245,13 +971,12 @@ void uocr_metal_context_destroy(uocr_metal_context *ctx) {
 }
 
 static int run_scratch_smoke(uocr_metal_context *ctx, char *error, size_t error_size) {
-    id<MTLBuffer> scratch = [ctx->device newBufferWithLength:4096u options:MTLResourceStorageModeShared];
-    if (scratch == nil) {
-        return metal_fail(error, error_size, "failed to allocate Metal scratch buffer");
+    if (!uocr_metal_context_ensure_scratch(ctx, UOCR_METAL_SCRATCH_TRANSIENT, 4096u, 1, error, error_size)) {
+        return 0;
     }
-    scratch.label = @"uocr_scratch_smoke";
-    memset([scratch contents], 0, 4096u);
-    [scratch release];
+    if (uocr_metal_context_scratch_capacity(ctx, UOCR_METAL_SCRATCH_TRANSIENT) < 4096u) {
+        return metal_fail(error, error_size, "Metal scratch buffer capacity did not satisfy request");
+    }
     return 1;
 }
 
@@ -362,6 +1087,22 @@ static int run_no_copy_kernel_smoke(uocr_metal_context *ctx, char *error, size_t
    threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1u, 1u)];
     [enc endEncoding];
 
+    const uint32_t transient_count_before = metal_inflight_transient_count(ctx);
+    if (!metal_retain_transient_until_completed(ctx, cb, src, error, error_size)) {
+        [dst release];
+        [src release];
+        (void)munmap(mapping, map_size);
+        (void)close(fd);
+        return 0;
+    }
+    if (metal_inflight_transient_count(ctx) != transient_count_before + 1u) {
+        [dst release];
+        [src release];
+        (void)munmap(mapping, map_size);
+        (void)close(fd);
+        return metal_fail(error, error_size, "Metal transient retain tracking count did not increase");
+    }
+
     [cb commit];
     [cb waitUntilCompleted];
     if (cb.status == MTLCommandBufferStatusError) {
@@ -371,6 +1112,13 @@ static int run_no_copy_kernel_smoke(uocr_metal_context *ctx, char *error, size_t
         (void)munmap(mapping, map_size);
         (void)close(fd);
         return metal_fail(error, error_size, "Metal smoke command failed: %s", [description UTF8String]);
+    }
+    if (metal_inflight_transient_count(ctx) != transient_count_before) {
+        [dst release];
+        [src release];
+        (void)munmap(mapping, map_size);
+        (void)close(fd);
+        return metal_fail(error, error_size, "Metal transient retain tracking count did not drain after command completion");
     }
 
     const uint32_t *dst_words = (const uint32_t *)[dst contents];
