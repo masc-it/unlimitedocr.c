@@ -607,7 +607,7 @@ First implementation slice, in order:
 - [x] Adapt DS4 `metal/norm.metal` or write OCR-specific RMSNorm for hidden `1280`.
 - [x] Ensure RMSNorm variance accumulation is fp32.
 - [x] Implement fp16 dense matrix-vector and matrix-matrix kernels for `[out,in]` row-major weights.
-- [ ] Implement attention Q/K/V/O projections for hidden `1280`.
+- [x] Implement attention Q/K/V/O projections for hidden `1280`.
 - [ ] Adapt gradients.c `qkv_split_rope` logic:
   - [ ] split-half RoPE layout
   - [ ] head dim `128`

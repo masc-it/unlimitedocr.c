@@ -170,6 +170,25 @@ int uocr_metal_context_dense_f16(uocr_metal_context *ctx,
                                  char *error,
                                  size_t error_size);
 
+/* Diagnostic attention projection helper for synthetic tests. Computes the
+ * decoder Q/K/V/O fp16 projections for hidden size 1280 with row-major
+ * [1280,1280] weights and fp32 accumulation.
+ */
+int uocr_metal_context_attention_qkvo_f16(uocr_metal_context *ctx,
+                                          const uint16_t *input_f16,
+                                          const uint16_t *q_weight_f16,
+                                          const uint16_t *k_weight_f16,
+                                          const uint16_t *v_weight_f16,
+                                          const uint16_t *o_weight_f16,
+                                          uint32_t n_tokens,
+                                          uocr_metal_dense_output_type output_type,
+                                          void *q_out,
+                                          void *k_out,
+                                          void *v_out,
+                                          void *o_out,
+                                          char *error,
+                                          size_t error_size);
+
 int uocr_metal_smoke_test(const char *resource_path, char *error, size_t error_size);
 
 #ifdef __cplusplus
