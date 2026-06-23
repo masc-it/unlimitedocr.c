@@ -1529,36 +1529,100 @@ int uocr_metal_kv_cache_attention_length(uint32_t prompt_length,
     return 1;
 }
 
+int uocr_metal_kv_cache_decode_attention_plan(uint32_t prompt_length,
+                                             uint32_t prompt_token_capacity,
+                                             uint32_t generated_count,
+                                             uocr_metal_decode_attention_plan *out_plan) {
+    if (out_plan == NULL || prompt_length == 0u || prompt_length > prompt_token_capacity ||
+        prompt_length > UOCR_MAX_POSITIONS || generated_count > UOCR_MAX_POSITIONS - prompt_length) {
+        return 0;
+    }
+
+    uint64_t cache_token_capacity = 0u;
+    if (!checked_add_u64((uint64_t)prompt_token_capacity,
+                         (uint64_t)UOCR_GENERATED_RING_WINDOW,
+                         &cache_token_capacity) ||
+        cache_token_capacity > (uint64_t)UINT32_MAX) {
+        return 0;
+    }
+
+    uint32_t attention_length = 0u;
+    if (!uocr_metal_kv_cache_attention_length(prompt_length, generated_count, &attention_length)) {
+        return 0;
+    }
+
+    const uint32_t live_generated = generated_count < UOCR_GENERATED_RING_WINDOW ? generated_count : UOCR_GENERATED_RING_WINDOW;
+    const uint32_t first_generated_index = generated_count - live_generated;
+    const uint32_t first_generated_position = prompt_length + first_generated_index;
+    const uint32_t query_position = generated_count == 0u ? prompt_length : prompt_length + generated_count - 1u;
+
+    memset(out_plan, 0, sizeof(*out_plan));
+    out_plan->prompt_length = prompt_length;
+    out_plan->prompt_token_capacity = prompt_token_capacity;
+    out_plan->cache_token_capacity = (uint32_t)cache_token_capacity;
+    out_plan->generated_count = generated_count;
+    out_plan->live_generated = live_generated;
+    out_plan->first_generated_index = first_generated_index;
+    out_plan->first_generated_position = first_generated_position;
+    out_plan->query_position = query_position;
+    out_plan->attention_length = attention_length;
+    out_plan->generated_ring_window = UOCR_GENERATED_RING_WINDOW;
+    return 1;
+}
+
+int uocr_metal_kv_cache_decode_position_allowed(const uocr_metal_decode_attention_plan *plan,
+                                                uint32_t key_position) {
+    if (plan == NULL || plan->prompt_length == 0u || plan->generated_ring_window != UOCR_GENERATED_RING_WINDOW ||
+        key_position >= UOCR_MAX_POSITIONS) {
+        return 0;
+    }
+    if (key_position < plan->prompt_length) {
+        return 1;
+    }
+    if (plan->live_generated == 0u) {
+        return 0;
+    }
+    return key_position >= plan->first_generated_position && key_position <= plan->query_position;
+}
+
+int uocr_metal_kv_cache_decode_attention_index_to_token(const uocr_metal_decode_attention_plan *plan,
+                                                        uint32_t attention_index,
+                                                        uint32_t *out_cache_token) {
+    if (plan == NULL || out_cache_token == NULL || plan->prompt_length == 0u ||
+        plan->generated_ring_window != UOCR_GENERATED_RING_WINDOW || attention_index >= plan->attention_length) {
+        return 0;
+    }
+    if (attention_index < plan->prompt_length) {
+        *out_cache_token = attention_index;
+        return 1;
+    }
+
+    const uint32_t generated_offset = attention_index - plan->prompt_length;
+    if (generated_offset >= plan->live_generated) {
+        return 0;
+    }
+    const uint32_t logical_generated = plan->first_generated_index + generated_offset;
+    const uint32_t cache_token = plan->prompt_length + (logical_generated % plan->generated_ring_window);
+    if (cache_token >= plan->cache_token_capacity) {
+        return 0;
+    }
+    *out_cache_token = cache_token;
+    return 1;
+}
+
 int uocr_metal_kv_cache_token_for_attention_index(uint32_t prompt_length,
                                                   uint32_t prompt_token_capacity,
                                                   uint32_t generated_count,
                                                   uint32_t attention_index,
                                                   uint32_t *out_cache_token) {
-    if (out_cache_token == NULL || prompt_length == 0u || prompt_length > prompt_token_capacity ||
-        prompt_length > UOCR_MAX_POSITIONS || generated_count > UOCR_MAX_POSITIONS - prompt_length) {
+    uocr_metal_decode_attention_plan plan;
+    if (!uocr_metal_kv_cache_decode_attention_plan(prompt_length,
+                                                   prompt_token_capacity,
+                                                   generated_count,
+                                                   &plan)) {
         return 0;
     }
-    const uint32_t live_generated = generated_count < UOCR_GENERATED_RING_WINDOW ? generated_count : UOCR_GENERATED_RING_WINDOW;
-    uint32_t attention_length = 0u;
-    if (!uocr_metal_kv_cache_attention_length(prompt_length, generated_count, &attention_length) ||
-        attention_index >= attention_length) {
-        return 0;
-    }
-    if (attention_index < prompt_length) {
-        *out_cache_token = attention_index;
-        return 1;
-    }
-
-    const uint32_t generated_offset = attention_index - prompt_length;
-    const uint32_t first_generated = generated_count - live_generated;
-    const uint32_t logical_generated = first_generated + generated_offset;
-    const uint32_t cache_token = prompt_length + (logical_generated % UOCR_GENERATED_RING_WINDOW);
-    const uint64_t cache_token_capacity = (uint64_t)prompt_token_capacity + (uint64_t)UOCR_GENERATED_RING_WINDOW;
-    if ((uint64_t)cache_token >= cache_token_capacity) {
-        return 0;
-    }
-    *out_cache_token = cache_token;
-    return 1;
+    return uocr_metal_kv_cache_decode_attention_index_to_token(&plan, attention_index, out_cache_token);
 }
 
 int uocr_metal_context_get_rows_f16(uocr_metal_context *ctx,
@@ -3021,14 +3085,15 @@ int uocr_metal_context_decode_attention_f16(uocr_metal_context *ctx,
                           prompt_length);
     }
 
-    uint32_t attention_length = 0u;
-    if (!uocr_metal_kv_cache_attention_length(prompt_length, generated_count, &attention_length)) {
-        return metal_fail(error, error_size, "invalid Metal decode attention length metadata");
+    uocr_metal_decode_attention_plan plan;
+    if (!uocr_metal_kv_cache_decode_attention_plan(prompt_length,
+                                                   prompt_token_capacity,
+                                                   generated_count,
+                                                   &plan)) {
+        return metal_fail(error, error_size, "invalid Metal decode attention window/prefix metadata");
     }
-    const uint32_t live_generated = generated_count < UOCR_GENERATED_RING_WINDOW ? generated_count : UOCR_GENERATED_RING_WINDOW;
-    const uint32_t first_generated = generated_count - live_generated;
 
-    uint64_t cache_token_capacity_u64 = 0u;
+    const uint64_t cache_token_capacity_u64 = (uint64_t)plan.cache_token_capacity;
     uint64_t q_values = 0u;
     uint64_t q_bytes = 0u;
     uint64_t output_bytes = 0u;
@@ -3036,11 +3101,7 @@ int uocr_metal_context_decode_attention_f16(uocr_metal_context *ctx,
     uint64_t cache_values = 0u;
     uint64_t cache_bytes = 0u;
     const uint64_t output_element_bytes = output_type == UOCR_METAL_DENSE_OUTPUT_F16 ? 2u : (uint64_t)sizeof(float);
-    if (!checked_add_u64((uint64_t)prompt_token_capacity,
-                         (uint64_t)UOCR_GENERATED_RING_WINDOW,
-                         &cache_token_capacity_u64) ||
-        cache_token_capacity_u64 > (uint64_t)UINT32_MAX ||
-        (uint64_t)prompt_length + (uint64_t)UOCR_GENERATED_RING_WINDOW > cache_token_capacity_u64 ||
+    if ((uint64_t)prompt_length + (uint64_t)UOCR_GENERATED_RING_WINDOW > cache_token_capacity_u64 ||
         !checked_mul_u64((uint64_t)UOCR_ATTENTION_HEADS, (uint64_t)UOCR_HEAD_DIM, &q_values) ||
         !checked_mul_u64(q_values, 2u, &q_bytes) ||
         !checked_mul_u64(q_values, output_element_bytes, &output_bytes) ||
@@ -3144,8 +3205,8 @@ int uocr_metal_context_decode_attention_f16(uocr_metal_context *ctx,
         params.slot = slot;
         params.prompt_length = prompt_length;
         params.generated_count = generated_count;
-        params.attention_length = attention_length;
-        params.first_generated = first_generated;
+        params.attention_length = plan.attention_length;
+        params.first_generated = plan.first_generated_index;
         params.heads = UOCR_ATTENTION_HEADS;
         params.head_dim = UOCR_HEAD_DIM;
         params.ring_window = UOCR_GENERATED_RING_WINDOW;

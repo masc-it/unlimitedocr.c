@@ -787,6 +787,11 @@ struct UocrDecodeAttentionParams {
     float scale;
 };
 
+/* OCR adapts the gradients.c sdpa_decode prefix/window rule to a compact
+ * attention stream: [all prompt prefix tokens] followed by the live generated
+ * window. The generated window is a 128-token ring whose logical first token is
+ * supplied by the host as first_generated.
+ */
 static inline uint uocr_decode_attention_cache_token(constant UocrDecodeAttentionParams &params,
                                                      uint attention_index) {
     if (attention_index < params.prompt_length) {

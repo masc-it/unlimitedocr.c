@@ -1319,6 +1319,7 @@ static int test_metal_kv_cache_layout_helpers(void) {
     uint32_t cache_token = UINT32_MAX;
     uint32_t attention_length = 0u;
     uint64_t offset = 0u;
+    uocr_metal_decode_attention_plan decode_plan;
 
     CHECK(uocr_metal_kv_cache_token_for_position(7u, 16u, 0u, &cache_token) == 1);
     CHECK(cache_token == 0u);
@@ -1375,6 +1376,48 @@ static int test_metal_kv_cache_layout_helpers(void) {
                                                         UOCR_MAX_POSITIONS,
                                                         7u,
                                                         &cache_token) == 0);
+
+    memset(&decode_plan, 0, sizeof(decode_plan));
+    CHECK(uocr_metal_kv_cache_decode_attention_plan(7u,
+                                                    16u,
+                                                    UOCR_GENERATED_RING_WINDOW + 9u,
+                                                    &decode_plan) == 1);
+    CHECK(decode_plan.prompt_length == 7u);
+    CHECK(decode_plan.prompt_token_capacity == 16u);
+    CHECK(decode_plan.cache_token_capacity == 16u + UOCR_GENERATED_RING_WINDOW);
+    CHECK(decode_plan.generated_count == UOCR_GENERATED_RING_WINDOW + 9u);
+    CHECK(decode_plan.live_generated == UOCR_GENERATED_RING_WINDOW);
+    CHECK(decode_plan.first_generated_index == 9u);
+    CHECK(decode_plan.first_generated_position == 16u);
+    CHECK(decode_plan.query_position == 7u + UOCR_GENERATED_RING_WINDOW + 8u);
+    CHECK(decode_plan.attention_length == 7u + UOCR_GENERATED_RING_WINDOW);
+    CHECK(decode_plan.generated_ring_window == UOCR_GENERATED_RING_WINDOW);
+    CHECK(uocr_metal_kv_cache_decode_position_allowed(&decode_plan, 0u) == 1);
+    CHECK(uocr_metal_kv_cache_decode_position_allowed(&decode_plan, 6u) == 1);
+    CHECK(uocr_metal_kv_cache_decode_position_allowed(&decode_plan, 15u) == 0);
+    CHECK(uocr_metal_kv_cache_decode_position_allowed(&decode_plan, 16u) == 1);
+    CHECK(uocr_metal_kv_cache_decode_position_allowed(&decode_plan, 7u + UOCR_GENERATED_RING_WINDOW + 8u) == 1);
+    CHECK(uocr_metal_kv_cache_decode_position_allowed(&decode_plan, 7u + UOCR_GENERATED_RING_WINDOW + 9u) == 0);
+    CHECK(uocr_metal_kv_cache_decode_attention_index_to_token(&decode_plan, 0u, &cache_token) == 1);
+    CHECK(cache_token == 0u);
+    CHECK(uocr_metal_kv_cache_decode_attention_index_to_token(&decode_plan, 7u, &cache_token) == 1);
+    CHECK(cache_token == 16u);
+    CHECK(uocr_metal_kv_cache_decode_attention_index_to_token(&decode_plan,
+                                                              7u + UOCR_GENERATED_RING_WINDOW - 1u,
+                                                              &cache_token) == 1);
+    CHECK(cache_token == 15u);
+    CHECK(uocr_metal_kv_cache_decode_attention_index_to_token(&decode_plan,
+                                                              7u + UOCR_GENERATED_RING_WINDOW,
+                                                              &cache_token) == 0);
+    CHECK(uocr_metal_kv_cache_decode_attention_plan(7u, 6u, 0u, &decode_plan) == 0);
+    CHECK(uocr_metal_kv_cache_decode_attention_plan(0u, 16u, 0u, &decode_plan) == 0);
+
+    memset(&decode_plan, 0, sizeof(decode_plan));
+    CHECK(uocr_metal_kv_cache_decode_attention_plan(7u, 16u, 0u, &decode_plan) == 1);
+    CHECK(decode_plan.live_generated == 0u);
+    CHECK(decode_plan.attention_length == 7u);
+    CHECK(uocr_metal_kv_cache_decode_position_allowed(&decode_plan, 6u) == 1);
+    CHECK(uocr_metal_kv_cache_decode_position_allowed(&decode_plan, 7u) == 0);
 
     uocr_metal_kv_cache_layout empty_layout;
     memset(&empty_layout, 0, sizeof(empty_layout));

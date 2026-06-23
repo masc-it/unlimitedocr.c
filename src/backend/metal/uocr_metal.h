@@ -77,6 +77,21 @@ typedef struct uocr_metal_kv_cache_layout {
     uint64_t total_bytes;
 } uocr_metal_kv_cache_layout;
 
+typedef struct uocr_metal_decode_attention_plan {
+    uint32_t prompt_length;
+    uint32_t prompt_token_capacity;
+    uint32_t cache_token_capacity;
+    uint32_t generated_count;
+    uint32_t live_generated;
+    uint32_t first_generated_index;
+    uint32_t first_generated_position;
+    uint32_t query_position;
+    uint32_t attention_length;
+    uint32_t generated_ring_window;
+    uint32_t reserved0;
+    uint32_t reserved1;
+} uocr_metal_decode_attention_plan;
+
 int uocr_metal_is_available(void);
 const char *uocr_metal_backend_name(void);
 uint64_t uocr_metal_recommended_working_set_size(void);
@@ -141,6 +156,15 @@ int uocr_metal_kv_cache_token_for_position(uint32_t prompt_length,
 int uocr_metal_kv_cache_attention_length(uint32_t prompt_length,
                                          uint32_t generated_count,
                                          uint32_t *out_attention_length);
+int uocr_metal_kv_cache_decode_attention_plan(uint32_t prompt_length,
+                                             uint32_t prompt_token_capacity,
+                                             uint32_t generated_count,
+                                             uocr_metal_decode_attention_plan *out_plan);
+int uocr_metal_kv_cache_decode_position_allowed(const uocr_metal_decode_attention_plan *plan,
+                                                uint32_t key_position);
+int uocr_metal_kv_cache_decode_attention_index_to_token(const uocr_metal_decode_attention_plan *plan,
+                                                        uint32_t attention_index,
+                                                        uint32_t *out_cache_token);
 int uocr_metal_kv_cache_token_for_attention_index(uint32_t prompt_length,
                                                   uint32_t prompt_token_capacity,
                                                   uint32_t generated_count,
