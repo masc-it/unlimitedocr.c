@@ -1,5 +1,6 @@
 #include "backend/metal/uocr_metal.h"
 #include "model/uocr_model_file.h"
+#include "runtime/uocr_memory.h"
 #include "unlimitedocr.h"
 
 #include "uocr_test_model_file.h"
@@ -74,6 +75,52 @@ static int test_metal_named_scratch_buffers(void) {
     CHECK(uocr_metal_context_scratch_capacity(ctx, UOCR_METAL_SCRATCH_DECODER) == 0u);
     CHECK(uocr_metal_context_scratch_high_watermark(ctx, UOCR_METAL_SCRATCH_DECODER) == first_capacity + 1u);
 
+    uocr_metal_context_destroy(ctx);
+    return 0;
+}
+
+static int test_metal_runtime_arenas(void) {
+    if (!uocr_metal_is_available()) {
+        return 0;
+    }
+
+    char error[1024];
+    memset(error, 0, sizeof(error));
+    uocr_metal_context *ctx = uocr_metal_context_create(UOCR_TEST_METAL_RESOURCE_PATH, error, sizeof(error));
+    CHECK(ctx != NULL);
+    CHECK(uocr_metal_context_total_runtime_arena_capacity(ctx) == 0u);
+
+    CHECK(uocr_metal_context_allocate_runtime_arenas(ctx, 1u, 16u, error, sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+
+    uint64_t expected_kv = 0u;
+    uint64_t expected_prompt = 0u;
+    uint64_t expected_decoder = 0u;
+    uint64_t expected_router_topk = 0u;
+    uint64_t expected_moe_intermediate = 0u;
+    uint64_t expected_vision = 0u;
+    uint64_t expected_logits = 0u;
+    CHECK(uocr_estimate_kv_cache_bytes(1u, 16u, &expected_kv) == UOCR_OK);
+    CHECK(uocr_estimate_prompt_embedding_bytes(1u, 16u, &expected_prompt) == UOCR_OK);
+    CHECK(uocr_estimate_decoder_scratch_bytes(1u, 16u, &expected_decoder) == UOCR_OK);
+    CHECK(uocr_estimate_moe_router_topk_bytes(1u, 16u, &expected_router_topk) == UOCR_OK);
+    CHECK(uocr_estimate_moe_intermediate_bytes(1u, 16u, &expected_moe_intermediate) == UOCR_OK);
+    CHECK(uocr_estimate_vision_scratch_bytes(&expected_vision) == UOCR_OK);
+    CHECK(uocr_estimate_logits_readback_bytes(1u, &expected_logits) == UOCR_OK);
+
+    CHECK(uocr_metal_context_runtime_arena_capacity(ctx, UOCR_METAL_ARENA_KV_CACHE) == expected_kv);
+    CHECK(uocr_metal_context_runtime_arena_capacity(ctx, UOCR_METAL_ARENA_PROMPT_EMBEDDINGS) == expected_prompt);
+    CHECK(uocr_metal_context_runtime_arena_capacity(ctx, UOCR_METAL_ARENA_HIDDEN_PINGPONG) == expected_decoder);
+    CHECK(uocr_metal_context_runtime_arena_capacity(ctx, UOCR_METAL_ARENA_ROUTER_TOPK) == expected_router_topk);
+    CHECK(uocr_metal_context_runtime_arena_capacity(ctx, UOCR_METAL_ARENA_MOE_INTERMEDIATE) == expected_moe_intermediate);
+    CHECK(uocr_metal_context_runtime_arena_capacity(ctx, UOCR_METAL_ARENA_VISION_SCRATCH) == expected_vision);
+    CHECK(uocr_metal_context_runtime_arena_capacity(ctx, UOCR_METAL_ARENA_LOGITS_READBACK) == expected_logits);
+    CHECK(uocr_metal_context_total_runtime_arena_capacity(ctx) == expected_kv + expected_prompt + expected_decoder +
+                                                               expected_router_topk + expected_moe_intermediate +
+                                                               expected_vision + expected_logits);
+
+    uocr_metal_context_release_runtime_arenas(ctx);
+    CHECK(uocr_metal_context_total_runtime_arena_capacity(ctx) == 0u);
     uocr_metal_context_destroy(ctx);
     return 0;
 }
@@ -162,6 +209,18 @@ static int test_public_engine_open_initializes_metal(void) {
     CHECK(report.recommended_working_set_bytes == uocr_metal_recommended_working_set_size());
     CHECK(report.memory_budget_bytes == uocr_metal_default_memory_budget_bytes(report.recommended_working_set_bytes));
     CHECK(report.memory_budget_bytes > 0u);
+    CHECK(report.category_live_bytes[UOCR_MEMORY_KV_CACHE] == report.estimated_kv_cache_bytes);
+    CHECK(report.category_live_bytes[UOCR_MEMORY_PROMPT_EMBEDDINGS] == report.estimated_prompt_embeddings_bytes);
+    CHECK(report.category_live_bytes[UOCR_MEMORY_VISION_SCRATCH] == report.estimated_vision_scratch_bytes);
+    CHECK(report.category_live_bytes[UOCR_MEMORY_DECODER_SCRATCH] == report.estimated_decoder_scratch_bytes);
+    CHECK(report.category_live_bytes[UOCR_MEMORY_MOE_SCRATCH] == report.estimated_moe_scratch_bytes);
+    CHECK(report.category_live_bytes[UOCR_MEMORY_LOGITS_READBACK] == report.estimated_logits_readback_bytes);
+    CHECK(report.total_live_bytes == report.estimated_kv_cache_bytes +
+                                     report.estimated_prompt_embeddings_bytes +
+                                     report.estimated_vision_scratch_bytes +
+                                     report.estimated_decoder_scratch_bytes +
+                                     report.estimated_moe_scratch_bytes +
+                                     report.estimated_logits_readback_bytes);
 
     uocr_engine_close(engine);
     return 0;
@@ -171,6 +230,7 @@ int main(void) {
     CHECK(strcmp(uocr_metal_backend_name(), "metal") == 0);
     if (test_metal_smoke() != 0) return 1;
     if (test_metal_named_scratch_buffers() != 0) return 1;
+    if (test_metal_runtime_arenas() != 0) return 1;
     if (test_metal_model_mapping() != 0) return 1;
     if (test_public_engine_open_initializes_metal() != 0) return 1;
     return 0;

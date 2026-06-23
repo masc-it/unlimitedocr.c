@@ -208,7 +208,7 @@ int uocr_estimate_decoder_scratch_bytes(uint32_t batch_slots, uint32_t prompt_to
     return UOCR_OK;
 }
 
-int uocr_estimate_moe_scratch_bytes(uint32_t batch_slots, uint32_t prompt_token_capacity, uint64_t *out_bytes) {
+int uocr_estimate_moe_router_topk_bytes(uint32_t batch_slots, uint32_t prompt_token_capacity, uint64_t *out_bytes) {
     if (out_bytes == NULL || batch_slots == 0u || prompt_token_capacity == 0u) {
         return UOCR_ERROR_INVALID_ARGUMENT;
     }
@@ -216,30 +216,60 @@ int uocr_estimate_moe_scratch_bytes(uint32_t batch_slots, uint32_t prompt_token_
     uint64_t tokens = 0u;
     uint64_t router_values = 0u;
     uint64_t selected_values = 0u;
-    uint64_t routed_values = 0u;
-    uint64_t shared_values = 0u;
     uint64_t router_scores = 0u;
     uint64_t selected_ids_and_weights = 0u;
-    uint64_t routed_intermediate = 0u;
-    uint64_t shared_intermediate = 0u;
-    uint64_t total = 0u;
     if (!checked_mul_u64((uint64_t)batch_slots, (uint64_t)prompt_token_capacity, &tokens) ||
         !checked_mul_u64(tokens, (uint64_t)UOCR_ROUTED_EXPERTS, &router_values) ||
         !checked_mul_u64(tokens, (uint64_t)UOCR_MOE_TOP_K, &selected_values) ||
-        !checked_mul_u64(selected_values, (uint64_t)UOCR_MOE_EXPERT_INTERMEDIATE, &routed_values) ||
-        !checked_mul_u64(tokens, (uint64_t)UOCR_MOE_SHARED_INTERMEDIATE, &shared_values) ||
         !checked_mul_u64(router_values, (uint64_t)sizeof(float), &router_scores) ||
         !checked_mul_u64(selected_values, 2ull * (uint64_t)sizeof(uint32_t), &selected_ids_and_weights) ||
-        !checked_mul_u64(routed_values, 2u, &routed_intermediate) ||
-        !checked_mul_u64(shared_values, 2u, &shared_intermediate) ||
-        !checked_add_to_total(&total, router_scores) ||
-        !checked_add_to_total(&total, selected_ids_and_weights) ||
-        !checked_add_to_total(&total, routed_intermediate) ||
-        !checked_add_to_total(&total, shared_intermediate)) {
+        !checked_add_u64(router_scores, selected_ids_and_weights, out_bytes)) {
         return UOCR_ERROR_OUT_OF_MEMORY;
     }
+    return UOCR_OK;
+}
 
-    *out_bytes = total;
+int uocr_estimate_moe_intermediate_bytes(uint32_t batch_slots, uint32_t prompt_token_capacity, uint64_t *out_bytes) {
+    if (out_bytes == NULL || batch_slots == 0u || prompt_token_capacity == 0u) {
+        return UOCR_ERROR_INVALID_ARGUMENT;
+    }
+
+    uint64_t tokens = 0u;
+    uint64_t selected_values = 0u;
+    uint64_t routed_values = 0u;
+    uint64_t shared_values = 0u;
+    uint64_t routed_intermediate = 0u;
+    uint64_t shared_intermediate = 0u;
+    if (!checked_mul_u64((uint64_t)batch_slots, (uint64_t)prompt_token_capacity, &tokens) ||
+        !checked_mul_u64(tokens, (uint64_t)UOCR_MOE_TOP_K, &selected_values) ||
+        !checked_mul_u64(selected_values, (uint64_t)UOCR_MOE_EXPERT_INTERMEDIATE, &routed_values) ||
+        !checked_mul_u64(tokens, (uint64_t)UOCR_MOE_SHARED_INTERMEDIATE, &shared_values) ||
+        !checked_mul_u64(routed_values, 2u, &routed_intermediate) ||
+        !checked_mul_u64(shared_values, 2u, &shared_intermediate) ||
+        !checked_add_u64(routed_intermediate, shared_intermediate, out_bytes)) {
+        return UOCR_ERROR_OUT_OF_MEMORY;
+    }
+    return UOCR_OK;
+}
+
+int uocr_estimate_moe_scratch_bytes(uint32_t batch_slots, uint32_t prompt_token_capacity, uint64_t *out_bytes) {
+    if (out_bytes == NULL || batch_slots == 0u || prompt_token_capacity == 0u) {
+        return UOCR_ERROR_INVALID_ARGUMENT;
+    }
+
+    uint64_t router_topk = 0u;
+    uint64_t intermediate = 0u;
+    int status = uocr_estimate_moe_router_topk_bytes(batch_slots, prompt_token_capacity, &router_topk);
+    if (status != UOCR_OK) {
+        return status;
+    }
+    status = uocr_estimate_moe_intermediate_bytes(batch_slots, prompt_token_capacity, &intermediate);
+    if (status != UOCR_OK) {
+        return status;
+    }
+    if (!checked_add_u64(router_topk, intermediate, out_bytes)) {
+        return UOCR_ERROR_OUT_OF_MEMORY;
+    }
     return UOCR_OK;
 }
 

@@ -78,6 +78,11 @@ static int test_minimal_runtime_estimate(void) {
     CHECK(uocr_estimate_vision_scratch_bytes(&expected_vision) == UOCR_OK);
     CHECK(uocr_estimate_decoder_scratch_bytes(batch, prompt_tokens, &expected_decoder) == UOCR_OK);
     CHECK(uocr_estimate_moe_scratch_bytes(batch, prompt_tokens, &expected_moe) == UOCR_OK);
+    uint64_t expected_moe_router_topk = 0u;
+    uint64_t expected_moe_intermediate = 0u;
+    CHECK(uocr_estimate_moe_router_topk_bytes(batch, prompt_tokens, &expected_moe_router_topk) == UOCR_OK);
+    CHECK(uocr_estimate_moe_intermediate_bytes(batch, prompt_tokens, &expected_moe_intermediate) == UOCR_OK);
+    CHECK(expected_moe == expected_moe_router_topk + expected_moe_intermediate);
     CHECK(uocr_estimate_logits_readback_bytes(batch, &expected_logits) == UOCR_OK);
 
     const uint64_t subtotal = model_bytes + expected_kv + expected_prompt + expected_vision + expected_decoder + expected_moe + expected_logits;

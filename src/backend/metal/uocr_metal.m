@@ -1,5 +1,7 @@
 #include "backend/metal/uocr_metal.h"
 
+#include "runtime/uocr_memory.h"
+
 #include <errno.h>
 #include <limits.h>
 #include <stdint.h>
@@ -52,6 +54,12 @@ typedef struct uocr_metal_scratch_buffer {
     int cpu_visible;
 } uocr_metal_scratch_buffer;
 
+typedef struct uocr_metal_runtime_arena {
+    id<MTLBuffer> buffer;
+    uint64_t capacity;
+    int cpu_visible;
+} uocr_metal_runtime_arena;
+
 struct uocr_metal_context {
     id<MTLDevice> device;
     id<MTLCommandQueue> queue;
@@ -65,6 +73,7 @@ struct uocr_metal_context {
     uint64_t model_view_bytes;
     uint64_t last_model_warmup_bytes;
     uocr_metal_scratch_buffer scratch[UOCR_METAL_SCRATCH_COUNT];
+    uocr_metal_runtime_arena runtime_arenas[UOCR_METAL_ARENA_COUNT];
 };
 
 static int metal_fail(char *error, size_t error_size, const char *fmt, ...) {
@@ -1095,11 +1104,185 @@ uint64_t uocr_metal_context_last_warmup_bytes(const uocr_metal_context *ctx) {
     return ctx != NULL ? ctx->last_model_warmup_bytes : 0u;
 }
 
+static int runtime_arena_slot_valid(uocr_metal_runtime_arena_slot slot) {
+    return slot >= UOCR_METAL_ARENA_KV_CACHE && slot < UOCR_METAL_ARENA_COUNT;
+}
+
+static const char *runtime_arena_slot_name(uocr_metal_runtime_arena_slot slot) {
+    switch (slot) {
+        case UOCR_METAL_ARENA_KV_CACHE:
+            return "kv-cache";
+        case UOCR_METAL_ARENA_PROMPT_EMBEDDINGS:
+            return "prompt-embeddings";
+        case UOCR_METAL_ARENA_HIDDEN_PINGPONG:
+            return "hidden-pingpong";
+        case UOCR_METAL_ARENA_ROUTER_TOPK:
+            return "router-topk";
+        case UOCR_METAL_ARENA_MOE_INTERMEDIATE:
+            return "moe-intermediate";
+        case UOCR_METAL_ARENA_VISION_SCRATCH:
+            return "vision-scratch";
+        case UOCR_METAL_ARENA_LOGITS_READBACK:
+            return "logits-readback";
+        default:
+            return "unknown";
+    }
+}
+
+static int runtime_arena_is_cpu_visible(uocr_metal_runtime_arena_slot slot) {
+    return slot == UOCR_METAL_ARENA_LOGITS_READBACK;
+}
+
+static int runtime_arena_capacities(uint32_t batch_slots,
+                                    uint32_t prompt_token_capacity,
+                                    uint64_t capacities[UOCR_METAL_ARENA_COUNT]) {
+    if (capacities == NULL || batch_slots == 0u || prompt_token_capacity == 0u) {
+        return UOCR_ERROR_INVALID_ARGUMENT;
+    }
+    memset(capacities, 0, (size_t)UOCR_METAL_ARENA_COUNT * sizeof(capacities[0]));
+
+    int status = uocr_estimate_kv_cache_bytes(batch_slots, prompt_token_capacity, &capacities[UOCR_METAL_ARENA_KV_CACHE]);
+    if (status != UOCR_OK) {
+        return status;
+    }
+    status = uocr_estimate_prompt_embedding_bytes(batch_slots,
+                                                  prompt_token_capacity,
+                                                  &capacities[UOCR_METAL_ARENA_PROMPT_EMBEDDINGS]);
+    if (status != UOCR_OK) {
+        return status;
+    }
+    status = uocr_estimate_decoder_scratch_bytes(batch_slots,
+                                                 prompt_token_capacity,
+                                                 &capacities[UOCR_METAL_ARENA_HIDDEN_PINGPONG]);
+    if (status != UOCR_OK) {
+        return status;
+    }
+    status = uocr_estimate_moe_router_topk_bytes(batch_slots,
+                                                 prompt_token_capacity,
+                                                 &capacities[UOCR_METAL_ARENA_ROUTER_TOPK]);
+    if (status != UOCR_OK) {
+        return status;
+    }
+    status = uocr_estimate_moe_intermediate_bytes(batch_slots,
+                                                  prompt_token_capacity,
+                                                  &capacities[UOCR_METAL_ARENA_MOE_INTERMEDIATE]);
+    if (status != UOCR_OK) {
+        return status;
+    }
+    status = uocr_estimate_vision_scratch_bytes(&capacities[UOCR_METAL_ARENA_VISION_SCRATCH]);
+    if (status != UOCR_OK) {
+        return status;
+    }
+    status = uocr_estimate_logits_readback_bytes(batch_slots, &capacities[UOCR_METAL_ARENA_LOGITS_READBACK]);
+    if (status != UOCR_OK) {
+        return status;
+    }
+    return UOCR_OK;
+}
+
+void uocr_metal_context_release_runtime_arenas(uocr_metal_context *ctx) {
+    if (ctx == NULL) {
+        return;
+    }
+    @autoreleasepool {
+        for (uint32_t i = 0u; i < (uint32_t)UOCR_METAL_ARENA_COUNT; ++i) {
+            uocr_metal_runtime_arena *arena = &ctx->runtime_arenas[i];
+            [arena->buffer release];
+            arena->buffer = nil;
+            arena->capacity = 0u;
+            arena->cpu_visible = 0;
+        }
+    }
+}
+
+int uocr_metal_context_allocate_runtime_arenas(uocr_metal_context *ctx,
+                                               uint32_t batch_slots,
+                                               uint32_t prompt_token_capacity,
+                                               char *error,
+                                               size_t error_size) {
+    metal_clear_error(error, error_size);
+    if (ctx == NULL || batch_slots == 0u || prompt_token_capacity == 0u) {
+        return metal_fail(error, error_size, "invalid Metal runtime arena allocation request");
+    }
+
+    uint64_t capacities[UOCR_METAL_ARENA_COUNT];
+    const int estimate_status = runtime_arena_capacities(batch_slots, prompt_token_capacity, capacities);
+    if (estimate_status != UOCR_OK) {
+        return metal_fail(error,
+                          error_size,
+                          "failed to estimate Metal runtime arena sizes: %s",
+                          uocr_status_string(estimate_status));
+    }
+
+    const uint64_t max_buffer_length = metal_device_max_buffer_length(ctx->device);
+    if (max_buffer_length == 0u) {
+        return metal_fail(error, error_size, "Metal device reported maxBufferLength=0");
+    }
+
+    uocr_metal_context_release_runtime_arenas(ctx);
+    @autoreleasepool {
+        for (uint32_t i = 0u; i < (uint32_t)UOCR_METAL_ARENA_COUNT; ++i) {
+            const uocr_metal_runtime_arena_slot slot = (uocr_metal_runtime_arena_slot)i;
+            const uint64_t bytes = capacities[i];
+            if (bytes == 0u) {
+                continue;
+            }
+            if (bytes > max_buffer_length || bytes > (uint64_t)SIZE_MAX) {
+                uocr_metal_context_release_runtime_arenas(ctx);
+                return metal_fail(error,
+                                  error_size,
+                                  "Metal runtime arena %s needs %llu bytes, exceeding maxBufferLength %llu",
+                                  runtime_arena_slot_name(slot),
+                                  (unsigned long long)bytes,
+                                  (unsigned long long)max_buffer_length);
+            }
+            const int cpu_visible = runtime_arena_is_cpu_visible(slot);
+            const MTLResourceOptions storage_mode = cpu_visible ? MTLResourceStorageModeShared : MTLResourceStorageModePrivate;
+            id<MTLBuffer> buffer = [ctx->device newBufferWithLength:(NSUInteger)bytes options:storage_mode];
+            if (buffer == nil) {
+                uocr_metal_context_release_runtime_arenas(ctx);
+                return metal_fail(error,
+                                  error_size,
+                                  "failed to allocate Metal runtime arena %s with %llu bytes",
+                                  runtime_arena_slot_name(slot),
+                                  (unsigned long long)bytes);
+            }
+            buffer.label = [NSString stringWithFormat:@"uocr_arena_%s", runtime_arena_slot_name(slot)];
+            ctx->runtime_arenas[i].buffer = buffer;
+            ctx->runtime_arenas[i].capacity = bytes;
+            ctx->runtime_arenas[i].cpu_visible = cpu_visible;
+        }
+    }
+    return 1;
+}
+
+uint64_t uocr_metal_context_runtime_arena_capacity(const uocr_metal_context *ctx,
+                                                   uocr_metal_runtime_arena_slot slot) {
+    if (ctx == NULL || !runtime_arena_slot_valid(slot)) {
+        return 0u;
+    }
+    return ctx->runtime_arenas[slot].capacity;
+}
+
+uint64_t uocr_metal_context_total_runtime_arena_capacity(const uocr_metal_context *ctx) {
+    uint64_t total = 0u;
+    if (ctx == NULL) {
+        return 0u;
+    }
+    for (uint32_t i = 0u; i < (uint32_t)UOCR_METAL_ARENA_COUNT; ++i) {
+        if (!checked_add_u64(total, ctx->runtime_arenas[i].capacity, &total)) {
+            return UINT64_MAX;
+        }
+    }
+    return total;
+}
+
 void uocr_metal_context_destroy(uocr_metal_context *ctx) {
     if (ctx == NULL) {
         return;
     }
     uocr_metal_context_unmap_model(ctx);
+    uocr_metal_context_release_runtime_arenas(ctx);
     release_all_scratch(ctx);
     @autoreleasepool {
         [ctx->transient_retains release];

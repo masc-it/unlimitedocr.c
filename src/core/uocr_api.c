@@ -110,6 +110,32 @@ static uint64_t model_tensor_data_bytes(const uocr_model_file *model) {
     return section != NULL ? section->size : 0u;
 }
 
+#if UOCR_HAVE_METAL
+static int reserve_runtime_arena_accounting(uocr_engine *engine, const uocr_runtime_memory_estimate *estimate) {
+    int status = uocr_memory_reserve(&engine->memory_tracker, UOCR_MEMORY_KV_CACHE, estimate->kv_cache_bytes);
+    if (status != UOCR_OK) {
+        return status;
+    }
+    status = uocr_memory_reserve(&engine->memory_tracker, UOCR_MEMORY_PROMPT_EMBEDDINGS, estimate->prompt_embeddings_bytes);
+    if (status != UOCR_OK) {
+        return status;
+    }
+    status = uocr_memory_reserve(&engine->memory_tracker, UOCR_MEMORY_VISION_SCRATCH, estimate->vision_scratch_bytes);
+    if (status != UOCR_OK) {
+        return status;
+    }
+    status = uocr_memory_reserve(&engine->memory_tracker, UOCR_MEMORY_DECODER_SCRATCH, estimate->decoder_scratch_bytes);
+    if (status != UOCR_OK) {
+        return status;
+    }
+    status = uocr_memory_reserve(&engine->memory_tracker, UOCR_MEMORY_MOE_SCRATCH, estimate->moe_scratch_bytes);
+    if (status != UOCR_OK) {
+        return status;
+    }
+    return uocr_memory_reserve(&engine->memory_tracker, UOCR_MEMORY_LOGITS_READBACK, estimate->logits_readback_bytes);
+}
+#endif
+
 static void fill_memory_report(const uocr_engine *engine, uocr_memory_report *report) {
     memset(report, 0, sizeof(*report));
     for (uint32_t i = 0u; i < (uint32_t)UOCR_MEMORY_CATEGORY_COUNT; ++i) {
@@ -305,6 +331,16 @@ uocr_engine *uocr_engine_open(const uocr_engine_opts *opts) {
 
 #if UOCR_HAVE_METAL
     if (strcmp(engine->backend, "metal") == 0) {
+        if (engine->memory_budget_bytes != 0u && engine->capacity_estimate.total_bytes > engine->memory_budget_bytes) {
+            set_engine_errorf(engine,
+                              UOCR_ERROR_OUT_OF_MEMORY,
+                              "engine runtime memory estimate %llu bytes exceeds Metal budget %llu bytes",
+                              (unsigned long long)engine->capacity_estimate.total_bytes,
+                              (unsigned long long)engine->memory_budget_bytes);
+            uocr_engine_close(engine);
+            return NULL;
+        }
+
         char metal_error[512];
         engine->metal = uocr_metal_context_create(engine->resource_path, metal_error, sizeof(metal_error));
         if (engine->metal == NULL) {
@@ -314,6 +350,21 @@ uocr_engine *uocr_engine_open(const uocr_engine_opts *opts) {
         }
         if (engine->has_model_file && !uocr_metal_context_map_model(engine->metal, &engine->model_file, metal_error, sizeof(metal_error))) {
             set_engine_errorf(engine, UOCR_ERROR_INTERNAL, "failed to map model into Metal no-copy views: %s", metal_error);
+            uocr_engine_close(engine);
+            return NULL;
+        }
+        if (!uocr_metal_context_allocate_runtime_arenas(engine->metal,
+                                                        engine->max_batch,
+                                                        engine->max_prompt_tokens,
+                                                        metal_error,
+                                                        sizeof(metal_error))) {
+            set_engine_errorf(engine, UOCR_ERROR_OUT_OF_MEMORY, "failed to allocate Metal runtime arenas: %s", metal_error);
+            uocr_engine_close(engine);
+            return NULL;
+        }
+        const int arena_reserve_status = reserve_runtime_arena_accounting(engine, &engine->capacity_estimate);
+        if (arena_reserve_status != UOCR_OK) {
+            set_engine_errorf(engine, arena_reserve_status, "failed to account Metal runtime arena bytes");
             uocr_engine_close(engine);
             return NULL;
         }

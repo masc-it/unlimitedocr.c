@@ -43,6 +43,8 @@ int uocr_estimate_kv_cache_bytes(uint32_t batch_slots, uint32_t prompt_token_cap
 int uocr_estimate_prompt_embedding_bytes(uint32_t batch_slots, uint32_t prompt_token_capacity, uint64_t *out_bytes);
 int uocr_estimate_vision_scratch_bytes(uint64_t *out_bytes);
 int uocr_estimate_decoder_scratch_bytes(uint32_t batch_slots, uint32_t prompt_token_capacity, uint64_t *out_bytes);
+int uocr_estimate_moe_router_topk_bytes(uint32_t batch_slots, uint32_t prompt_token_capacity, uint64_t *out_bytes);
+int uocr_estimate_moe_intermediate_bytes(uint32_t batch_slots, uint32_t prompt_token_capacity, uint64_t *out_bytes);
 int uocr_estimate_moe_scratch_bytes(uint32_t batch_slots, uint32_t prompt_token_capacity, uint64_t *out_bytes);
 int uocr_estimate_logits_readback_bytes(uint32_t batch_slots, uint64_t *out_bytes);
 int uocr_estimate_safety_margin_bytes(uint64_t subtotal_bytes, uint64_t *out_bytes);

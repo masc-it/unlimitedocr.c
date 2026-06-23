@@ -528,14 +528,14 @@ First implementation slice, in order:
   - [x] Metal `recommendedMaxWorkingSetSize` fraction if available
 - [x] Implement KV size formula in code comments/tests:
   - [x] `2 * 12 * 10 * 128 * 2 = 61,440 bytes/token/sequence`
-- [ ] Allocate long-lived runtime arenas at engine/session creation:
-  - [ ] KV cache per batch slot
-  - [ ] prompt embedding buffer sized by `max_prompt_tokens`
-  - [ ] hidden-state ping-pong buffers
-  - [ ] router/top-k buffers
-  - [ ] MoE intermediate buffers
-  - [ ] vision scratch buffers
-  - [ ] logits and next-token buffers
+- [x] Allocate long-lived runtime arenas at engine/session creation:
+  - [x] KV cache per batch slot
+  - [x] prompt embedding buffer sized by `max_prompt_tokens`
+  - [x] hidden-state ping-pong buffers
+  - [x] router/top-k buffers
+  - [x] MoE intermediate buffers
+  - [x] vision scratch buffers
+  - [x] logits and next-token buffers
 
 ## 12. Metal backend skeleton and DS4 memory policy
 

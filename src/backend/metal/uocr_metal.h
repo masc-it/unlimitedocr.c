@@ -33,6 +33,17 @@ typedef enum uocr_metal_scratch_slot {
     UOCR_METAL_SCRATCH_COUNT = 5
 } uocr_metal_scratch_slot;
 
+typedef enum uocr_metal_runtime_arena_slot {
+    UOCR_METAL_ARENA_KV_CACHE = 0,
+    UOCR_METAL_ARENA_PROMPT_EMBEDDINGS = 1,
+    UOCR_METAL_ARENA_HIDDEN_PINGPONG = 2,
+    UOCR_METAL_ARENA_ROUTER_TOPK = 3,
+    UOCR_METAL_ARENA_MOE_INTERMEDIATE = 4,
+    UOCR_METAL_ARENA_VISION_SCRATCH = 5,
+    UOCR_METAL_ARENA_LOGITS_READBACK = 6,
+    UOCR_METAL_ARENA_COUNT = 7
+} uocr_metal_runtime_arena_slot;
+
 int uocr_metal_is_available(void);
 const char *uocr_metal_backend_name(void);
 uint64_t uocr_metal_recommended_working_set_size(void);
@@ -70,6 +81,16 @@ int uocr_metal_context_warmup_model_views(uocr_metal_context *ctx,
                                           char *error,
                                           size_t error_size);
 uint64_t uocr_metal_context_last_warmup_bytes(const uocr_metal_context *ctx);
+
+int uocr_metal_context_allocate_runtime_arenas(uocr_metal_context *ctx,
+                                               uint32_t batch_slots,
+                                               uint32_t prompt_token_capacity,
+                                               char *error,
+                                               size_t error_size);
+void uocr_metal_context_release_runtime_arenas(uocr_metal_context *ctx);
+uint64_t uocr_metal_context_runtime_arena_capacity(const uocr_metal_context *ctx,
+                                                   uocr_metal_runtime_arena_slot slot);
+uint64_t uocr_metal_context_total_runtime_arena_capacity(const uocr_metal_context *ctx);
 
 int uocr_metal_smoke_test(const char *resource_path, char *error, size_t error_size);
 
