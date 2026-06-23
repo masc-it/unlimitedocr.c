@@ -63,6 +63,7 @@ struct uocr_metal_context {
     uocr_metal_tensor_binding_internal *tensor_bindings;
     uint32_t tensor_binding_count;
     uint64_t model_view_bytes;
+    uint64_t last_model_warmup_bytes;
     uocr_metal_scratch_buffer scratch[UOCR_METAL_SCRATCH_COUNT];
 };
 
@@ -221,6 +222,13 @@ static uint32_t metal_inflight_transient_count(uocr_metal_context *ctx) {
         return (uint32_t)[ctx->transient_retains count];
     }
 }
+
+typedef struct uocr_metal_touch_params {
+    uint32_t n_words;
+    uint32_t stride_words;
+    uint32_t dst_base;
+    uint32_t reserved;
+} uocr_metal_touch_params;
 
 static int metal_retain_transient_until_completed(uocr_metal_context *ctx,
                                                   id<MTLCommandBuffer> command_buffer,
@@ -641,6 +649,7 @@ void uocr_metal_context_unmap_model(uocr_metal_context *ctx) {
         ctx->tensor_bindings = NULL;
         ctx->tensor_binding_count = 0u;
         ctx->model_view_bytes = 0u;
+        ctx->last_model_warmup_bytes = 0u;
     }
 }
 
@@ -952,6 +961,138 @@ static void release_all_scratch(uocr_metal_context *ctx) {
     for (uint32_t i = 0u; i < (uint32_t)UOCR_METAL_SCRATCH_COUNT; ++i) {
         uocr_metal_context_release_scratch(ctx, (uocr_metal_scratch_slot)i);
     }
+}
+
+int uocr_metal_context_warmup_model_views(uocr_metal_context *ctx,
+                                          uint64_t max_bytes_per_view,
+                                          char *error,
+                                          size_t error_size) {
+    metal_clear_error(error, error_size);
+    if (ctx == NULL) {
+        return metal_fail(error, error_size, "Metal model-view warmup requires a context");
+    }
+    if (ctx->model_views == NULL || ctx->model_view_count == 0u) {
+        return metal_fail(error, error_size, "Metal model-view warmup requires mapped model views");
+    }
+
+    long page_size_long = sysconf(_SC_PAGESIZE);
+    if (page_size_long <= 0) {
+        page_size_long = (long)UOCR_TENSOR_DATA_ALIGNMENT;
+    }
+    uint64_t stride_words_u64 = (uint64_t)page_size_long / sizeof(uint32_t);
+    if (stride_words_u64 == 0u) {
+        stride_words_u64 = 1u;
+    }
+    if (stride_words_u64 > UINT32_MAX) {
+        return metal_fail(error, error_size, "Metal warmup page stride is too large");
+    }
+    const uint32_t stride_words = (uint32_t)stride_words_u64;
+
+    uint64_t total_probe_count = 0u;
+    uint64_t total_warmup_bytes = 0u;
+    for (uint32_t i = 0u; i < ctx->model_view_count; ++i) {
+        uint64_t bytes = ctx->model_views[i].length;
+        if (max_bytes_per_view != 0u && bytes > max_bytes_per_view) {
+            bytes = max_bytes_per_view;
+        }
+        const uint64_t words = bytes / sizeof(uint32_t);
+        if (words == 0u) {
+            continue;
+        }
+        if (words > UINT32_MAX) {
+            return metal_fail(error, error_size, "Metal model-view warmup view %u is too large for u32 probe indexing", i);
+        }
+        const uint64_t probes = (words + (uint64_t)stride_words - 1u) / (uint64_t)stride_words;
+        if (probes > UINT32_MAX || total_probe_count > (uint64_t)UINT32_MAX - probes) {
+            return metal_fail(error, error_size, "Metal model-view warmup would need too many probe outputs");
+        }
+        if (!checked_add_u64(total_warmup_bytes, words * sizeof(uint32_t), &total_warmup_bytes)) {
+            return metal_fail(error, error_size, "Metal model-view warmup byte count overflow");
+        }
+        total_probe_count += probes;
+    }
+
+    if (total_probe_count == 0u) {
+        ctx->last_model_warmup_bytes = 0u;
+        return 1;
+    }
+    const uint64_t output_bytes = total_probe_count * sizeof(uint32_t);
+    if (!uocr_metal_context_ensure_scratch(ctx, UOCR_METAL_SCRATCH_TRANSIENT, output_bytes, 1, error, error_size)) {
+        return 0;
+    }
+
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, "uocr_touch_u32", error, error_size);
+        if (pipeline == nil) {
+            return 0;
+        }
+        id<MTLBuffer> dst = ctx->scratch[UOCR_METAL_SCRATCH_TRANSIENT].buffer;
+        if (dst == nil || [dst contents] == NULL) {
+            return metal_fail(error, error_size, "Metal model-view warmup has no CPU-visible scratch output");
+        }
+        memset([dst contents], 0, (size_t)output_bytes);
+
+        id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
+        if (cb == nil) {
+            return metal_fail(error, error_size, "failed to create Metal warmup command buffer");
+        }
+        cb.label = @"uocr_model_view_warmup_command_buffer";
+
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        if (enc == nil) {
+            return metal_fail(error, error_size, "failed to create Metal warmup command encoder");
+        }
+        [enc setComputePipelineState:pipeline];
+        [enc setBuffer:dst offset:0u atIndex:1u];
+
+        uint32_t dst_base = 0u;
+        for (uint32_t i = 0u; i < ctx->model_view_count; ++i) {
+            uint64_t bytes = ctx->model_views[i].length;
+            if (max_bytes_per_view != 0u && bytes > max_bytes_per_view) {
+                bytes = max_bytes_per_view;
+            }
+            const uint64_t words = bytes / sizeof(uint32_t);
+            if (words == 0u) {
+                continue;
+            }
+            const uint32_t probes = (uint32_t)((words + (uint64_t)stride_words - 1u) / (uint64_t)stride_words);
+            uocr_metal_touch_params params;
+            params.n_words = (uint32_t)words;
+            params.stride_words = stride_words;
+            params.dst_base = dst_base;
+            params.reserved = 0u;
+
+            [enc setBuffer:ctx->model_views[i].buffer offset:0u atIndex:0u];
+            [enc setBytes:&params length:sizeof(params) atIndex:2u];
+
+            NSUInteger threads_per_group = pipeline.threadExecutionWidth;
+            if (threads_per_group == 0u) {
+                threads_per_group = 1u;
+            }
+            if (threads_per_group > (NSUInteger)probes) {
+                threads_per_group = (NSUInteger)probes;
+            }
+            [enc dispatchThreads:MTLSizeMake((NSUInteger)probes, 1u, 1u)
+           threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1u, 1u)];
+            dst_base += probes;
+        }
+        [enc endEncoding];
+
+        [cb commit];
+        [cb waitUntilCompleted];
+        if (cb.status == MTLCommandBufferStatusError) {
+            NSString *description = cb.error != nil ? [cb.error localizedDescription] : @"unknown command-buffer error";
+            return metal_fail(error, error_size, "Metal model-view warmup failed: %s", [description UTF8String]);
+        }
+    }
+
+    ctx->last_model_warmup_bytes = total_warmup_bytes;
+    metal_clear_error(error, error_size);
+    return 1;
+}
+
+uint64_t uocr_metal_context_last_warmup_bytes(const uocr_metal_context *ctx) {
+    return ctx != NULL ? ctx->last_model_warmup_bytes : 0u;
 }
 
 void uocr_metal_context_destroy(uocr_metal_context *ctx) {

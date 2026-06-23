@@ -552,7 +552,7 @@ First implementation slice, in order:
   - [x] wrap views with `newBufferWithBytesNoCopy`
   - [x] cache per-tensor `{id<MTLBuffer>, inner_offset}` after load
 - [ ] Add optional exact-range wrapper cache only if needed; default kernels should use precomputed model views.
-- [ ] Add optional Metal residency set / warmup hooks for macOS 15+, treated as hints only.
+- [x] Add optional Metal model-view warmup hook; residency-set integration remains a future macOS 15+ hint if needed.
 - [x] Add DS4-style transient buffer tracking:
   - [x] retain CPU-filled shared buffers until command buffer completion
   - [x] release transients in completion handlers

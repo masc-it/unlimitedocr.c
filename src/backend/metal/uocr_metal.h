@@ -65,6 +65,12 @@ uint64_t uocr_metal_context_scratch_high_watermark(const uocr_metal_context *ctx
 uint64_t uocr_metal_context_total_scratch_capacity(const uocr_metal_context *ctx);
 uint64_t uocr_metal_context_total_scratch_high_watermark(const uocr_metal_context *ctx);
 
+int uocr_metal_context_warmup_model_views(uocr_metal_context *ctx,
+                                          uint64_t max_bytes_per_view,
+                                          char *error,
+                                          size_t error_size);
+uint64_t uocr_metal_context_last_warmup_bytes(const uocr_metal_context *ctx);
+
 int uocr_metal_smoke_test(const char *resource_path, char *error, size_t error_size);
 
 #ifdef __cplusplus

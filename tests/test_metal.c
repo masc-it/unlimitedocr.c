@@ -122,6 +122,11 @@ static int test_metal_model_mapping(void) {
     CHECK(binding.payload_size == 32u);
     CHECK(uocr_metal_context_get_tensor_binding(ctx, 999u, &binding) == 0);
 
+    CHECK(uocr_metal_context_warmup_model_views(ctx, 128u, error, sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    CHECK(uocr_metal_context_last_warmup_bytes(ctx) == 128u);
+    CHECK(uocr_metal_context_scratch_capacity(ctx, UOCR_METAL_SCRATCH_TRANSIENT) >= sizeof(uint32_t));
+
     uocr_metal_context_unmap_model(ctx);
     CHECK(uocr_metal_context_model_view_count(ctx) == 0u);
     CHECK(uocr_metal_context_tensor_binding_count(ctx) == 0u);
