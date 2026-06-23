@@ -286,6 +286,24 @@ int uocr_metal_context_dense_swiglu_f16(uocr_metal_context *ctx,
                                         char *error,
                                         size_t error_size);
 
+/* Diagnostic MoE router helper for synthetic decoder tests. Computes router
+ * logits = hidden @ router_weight.T for [n_tokens,1280] hidden states and
+ * [64,1280] fp16 router weights, accumulates logits in fp32, softmaxes over
+ * 64 experts in fp32, and returns greedy top-6 probabilities without
+ * renormalization or DS4-specific router transforms. logits_out_f32_or_null
+ * and probs_out_f32_or_null are optional; top ids/weights are required.
+ */
+int uocr_metal_context_moe_router_f16(uocr_metal_context *ctx,
+                                      const uint16_t *input_f16,
+                                      const uint16_t *router_weight_f16,
+                                      uint32_t n_tokens,
+                                      float *logits_out_f32_or_null,
+                                      float *probs_out_f32_or_null,
+                                      uint32_t *top_expert_ids_out,
+                                      float *top_weights_out,
+                                      char *error,
+                                      size_t error_size);
+
 /* Diagnostic RoPE helper for synthetic decoder tests. Applies Unlimited-OCR's
  * Llama-style split-half RoPE to projected Q and K tensors shaped
  * [n_tokens, 10 heads, 128 dim], using monotonically increasing positions

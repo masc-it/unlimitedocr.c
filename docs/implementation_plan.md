@@ -634,13 +634,13 @@ First implementation slice, in order:
   - [x] SiLU activation from DeepSeekV2Config default `hidden_act="silu"`; assert this at model load
   - [x] elementwise multiply
   - [x] `down_proj`
-- [ ] Implement MoE router for layers `1..11`:
-  - [ ] fp16 router weight storage, fp32 matmul accumulation
-  - [ ] softmax over `64` experts in fp32
-  - [ ] top-6 selection; order can differ because weighted sum is commutative
-  - [ ] multiply selected probabilities by `routed_scaling_factor=1.0`
-  - [ ] no probability renormalization (`norm_topk_prob=false`)
-  - [ ] no DS4 router-specific sqrt/softplus/bias behavior
+- [x] Implement MoE router for layers `1..11`:
+  - [x] fp16 router weight storage, fp32 matmul accumulation
+  - [x] softmax over `64` experts in fp32
+  - [x] top-6 selection; order can differ because weighted sum is commutative
+  - [x] multiply selected probabilities by `routed_scaling_factor=1.0`
+  - [x] no probability renormalization (`norm_topk_prob=false`)
+  - [x] no DS4 router-specific sqrt/softplus/bias behavior
 - [ ] Adapt DS4 `argsort.metal` / `dsv4_misc.metal` top-k patterns for OCR's simpler top-6.
 - [ ] Implement selected-expert fp16 path for decode.
 - [ ] Implement grouped expert path for prefill later; simple token-by-token selected expert path is acceptable for first parity.

@@ -1054,6 +1054,206 @@ static int test_metal_dense_swiglu_f16(void) {
     return 0;
 }
 
+static void compute_router_topk_expected(const float *probs,
+                                          uint32_t token,
+                                          uint32_t experts,
+                                          uint32_t top_k,
+                                          uint32_t *top_ids,
+                                          float *top_weights) {
+    for (uint32_t rank = 0u; rank < top_k; ++rank) {
+        float best = -INFINITY;
+        uint32_t best_expert = 0u;
+        for (uint32_t expert = 0u; expert < experts; ++expert) {
+            int already_selected = 0;
+            for (uint32_t prev = 0u; prev < rank; ++prev) {
+                if (top_ids[token * top_k + prev] == expert) {
+                    already_selected = 1;
+                    break;
+                }
+            }
+            if (already_selected) {
+                continue;
+            }
+            const float value = probs[token * experts + expert];
+            if (value > best || (value == best && expert < best_expert)) {
+                best = value;
+                best_expert = expert;
+            }
+        }
+        top_ids[token * top_k + rank] = best_expert;
+        top_weights[token * top_k + rank] = best;
+    }
+}
+
+static int test_metal_moe_router_f16(void) {
+    if (!uocr_metal_is_available()) {
+        return 0;
+    }
+
+    enum { TOKENS = 3, HIDDEN = UOCR_HIDDEN_SIZE, EXPERTS = UOCR_ROUTED_EXPERTS, TOP_K = UOCR_MOE_TOP_K };
+    uint16_t *input = (uint16_t *)calloc((size_t)TOKENS * HIDDEN, sizeof(uint16_t));
+    uint16_t *weight = (uint16_t *)calloc((size_t)EXPERTS * HIDDEN, sizeof(uint16_t));
+    float *expected_logits = (float *)malloc((size_t)TOKENS * EXPERTS * sizeof(float));
+    float *expected_probs = (float *)malloc((size_t)TOKENS * EXPERTS * sizeof(float));
+    uint32_t *expected_top_ids = (uint32_t *)calloc((size_t)TOKENS * TOP_K, sizeof(uint32_t));
+    float *expected_top_weights = (float *)calloc((size_t)TOKENS * TOP_K, sizeof(float));
+    float *logits = (float *)malloc((size_t)TOKENS * EXPERTS * sizeof(float));
+    float *probs = (float *)malloc((size_t)TOKENS * EXPERTS * sizeof(float));
+    uint32_t *top_ids = (uint32_t *)malloc((size_t)TOKENS * TOP_K * sizeof(uint32_t));
+    float *top_weights = (float *)malloc((size_t)TOKENS * TOP_K * sizeof(float));
+    uint32_t *top_ids_optional = (uint32_t *)malloc((size_t)TOP_K * sizeof(uint32_t));
+    float *top_weights_optional = (float *)malloc((size_t)TOP_K * sizeof(float));
+    CHECK(input != NULL && weight != NULL && expected_logits != NULL && expected_probs != NULL &&
+          expected_top_ids != NULL && expected_top_weights != NULL && logits != NULL && probs != NULL &&
+          top_ids != NULL && top_weights != NULL && top_ids_optional != NULL && top_weights_optional != NULL);
+
+    const float token_values[TOKENS][8] = {
+        {0.50f, -0.25f, 0.125f, 1.00f, -0.50f, 0.25f, 0.75f, -0.125f},
+        {-0.75f, 0.50f, -0.125f, 0.25f, 0.625f, -0.375f, 0.125f, 0.875f},
+        {0.25f, 0.75f, 0.50f, -0.50f, 0.375f, 0.125f, -0.625f, 0.25f},
+    };
+    const uint32_t feature_cols[8] = {0u, 1u, 2u, 3u, 17u, 113u, 509u, 1021u};
+    for (uint32_t token = 0u; token < (uint32_t)TOKENS; ++token) {
+        for (uint32_t i = 0u; i < 8u; ++i) {
+            input[token * (uint32_t)HIDDEN + feature_cols[i]] = f32_to_f16_bits(token_values[token][i]);
+        }
+    }
+
+    for (uint32_t expert = 0u; expert < (uint32_t)EXPERTS; ++expert) {
+        const float weights[8] = {
+            ((float)expert - 31.5f) / 16.0f,
+            ((float)((expert * 7u) % 17u) - 8.0f) / 32.0f,
+            ((float)((expert * 11u) % 23u) - 11.0f) / 48.0f,
+            ((float)((expert * 13u) % 29u) - 14.0f) / 64.0f,
+            ((float)((expert * 5u) % 19u) - 9.0f) / 40.0f,
+            ((float)((expert * 3u) % 31u) - 15.0f) / 80.0f,
+            ((float)((expert * 17u) % 37u) - 18.0f) / 96.0f,
+            ((float)((expert * 23u) % 41u) - 20.0f) / 112.0f,
+        };
+        for (uint32_t i = 0u; i < 8u; ++i) {
+            weight[expert * (uint32_t)HIDDEN + feature_cols[i]] = f32_to_f16_bits(weights[i]);
+        }
+    }
+
+    for (uint32_t token = 0u; token < (uint32_t)TOKENS; ++token) {
+        float max_logit = -INFINITY;
+        for (uint32_t expert = 0u; expert < (uint32_t)EXPERTS; ++expert) {
+            float sum = 0.0f;
+            for (uint32_t col = 0u; col < (uint32_t)HIDDEN; ++col) {
+                sum += f16_bits_to_f32(input[token * (uint32_t)HIDDEN + col]) *
+                       f16_bits_to_f32(weight[expert * (uint32_t)HIDDEN + col]);
+            }
+            expected_logits[token * (uint32_t)EXPERTS + expert] = sum;
+            if (sum > max_logit) {
+                max_logit = sum;
+            }
+        }
+        float denom = 0.0f;
+        for (uint32_t expert = 0u; expert < (uint32_t)EXPERTS; ++expert) {
+            const float value = expf(expected_logits[token * (uint32_t)EXPERTS + expert] - max_logit);
+            expected_probs[token * (uint32_t)EXPERTS + expert] = value;
+            denom += value;
+        }
+        float prob_sum = 0.0f;
+        for (uint32_t expert = 0u; expert < (uint32_t)EXPERTS; ++expert) {
+            expected_probs[token * (uint32_t)EXPERTS + expert] /= denom;
+            prob_sum += expected_probs[token * (uint32_t)EXPERTS + expert];
+        }
+        CHECK(fabsf(prob_sum - 1.0f) < 2.0e-6f);
+        compute_router_topk_expected(expected_probs,
+                                     token,
+                                     (uint32_t)EXPERTS,
+                                     (uint32_t)TOP_K,
+                                     expected_top_ids,
+                                     expected_top_weights);
+    }
+
+    char error[1024];
+    memset(error, 0, sizeof(error));
+    uocr_metal_context *ctx = uocr_metal_context_create(UOCR_TEST_METAL_RESOURCE_PATH, error, sizeof(error));
+    CHECK(ctx != NULL);
+
+    memset(logits, 0, (size_t)TOKENS * EXPERTS * sizeof(float));
+    memset(probs, 0, (size_t)TOKENS * EXPERTS * sizeof(float));
+    memset(top_ids, 0xff, (size_t)TOKENS * TOP_K * sizeof(uint32_t));
+    memset(top_weights, 0, (size_t)TOKENS * TOP_K * sizeof(float));
+    CHECK(uocr_metal_context_moe_router_f16(ctx,
+                                            input,
+                                            weight,
+                                            TOKENS,
+                                            logits,
+                                            probs,
+                                            top_ids,
+                                            top_weights,
+                                            error,
+                                            sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    for (uint32_t i = 0u; i < (uint32_t)(TOKENS * EXPERTS); ++i) {
+        CHECK(fabsf(logits[i] - expected_logits[i]) < 2.0e-6f);
+        CHECK(fabsf(probs[i] - expected_probs[i]) < 2.0e-6f);
+    }
+    for (uint32_t i = 0u; i < (uint32_t)(TOKENS * TOP_K); ++i) {
+        CHECK(top_ids[i] == expected_top_ids[i]);
+        CHECK(fabsf(top_weights[i] - expected_top_weights[i]) < 2.0e-6f);
+    }
+
+    memset(top_ids_optional, 0xff, (size_t)TOP_K * sizeof(uint32_t));
+    memset(top_weights_optional, 0, (size_t)TOP_K * sizeof(float));
+    CHECK(uocr_metal_context_moe_router_f16(ctx,
+                                            input,
+                                            weight,
+                                            1u,
+                                            NULL,
+                                            NULL,
+                                            top_ids_optional,
+                                            top_weights_optional,
+                                            error,
+                                            sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    for (uint32_t i = 0u; i < (uint32_t)TOP_K; ++i) {
+        CHECK(top_ids_optional[i] == expected_top_ids[i]);
+        CHECK(fabsf(top_weights_optional[i] - expected_top_weights[i]) < 2.0e-6f);
+    }
+
+    CHECK(uocr_metal_context_moe_router_f16(ctx,
+                                            input,
+                                            weight,
+                                            TOKENS,
+                                            logits,
+                                            probs,
+                                            NULL,
+                                            top_weights,
+                                            error,
+                                            sizeof(error)) == 0);
+    CHECK(strstr(error, "invalid Metal MoE router request") != NULL);
+    CHECK(uocr_metal_context_moe_router_f16(ctx,
+                                            input,
+                                            weight,
+                                            0u,
+                                            logits,
+                                            probs,
+                                            top_ids,
+                                            top_weights,
+                                            error,
+                                            sizeof(error)) == 0);
+    CHECK(strstr(error, "invalid Metal MoE router request") != NULL);
+
+    uocr_metal_context_destroy(ctx);
+    free(top_weights_optional);
+    free(top_ids_optional);
+    free(top_weights);
+    free(top_ids);
+    free(probs);
+    free(logits);
+    free(expected_top_weights);
+    free(expected_top_ids);
+    free(expected_probs);
+    free(expected_logits);
+    free(weight);
+    free(input);
+    return 0;
+}
+
 static void compute_rope_expected(const uint16_t *src,
                                   uint32_t n_tokens,
                                   uint32_t position_start,
@@ -2684,6 +2884,7 @@ int main(void) {
     if (test_metal_attention_qkvo_f16() != 0) return 1;
     if (test_metal_attention_output_residual_f16() != 0) return 1;
     if (test_metal_dense_swiglu_f16() != 0) return 1;
+    if (test_metal_moe_router_f16() != 0) return 1;
     if (test_metal_rope_qk_f16() != 0) return 1;
     if (test_metal_prefill_attention_f16() != 0) return 1;
     if (test_metal_prefill_attention_varlen_f16() != 0) return 1;

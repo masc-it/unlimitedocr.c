@@ -304,6 +304,13 @@ typedef struct uocr_metal_dense_swiglu_params {
     uint32_t has_residual;
 } uocr_metal_dense_swiglu_params;
 
+typedef struct uocr_metal_moe_router_params {
+    uint32_t n_tokens;
+    uint32_t hidden_size;
+    uint32_t experts;
+    uint32_t top_k;
+} uocr_metal_moe_router_params;
+
 typedef struct uocr_metal_rope_qk_params {
     uint32_t n_tokens;
     uint32_t heads;
@@ -2901,6 +2908,205 @@ int uocr_metal_context_dense_swiglu_f16(uocr_metal_context *ctx,
         [down_weight release];
         [up_weight release];
         [gate_weight release];
+        [input release];
+    }
+
+    metal_clear_error(error, error_size);
+    return 1;
+}
+
+int uocr_metal_context_moe_router_f16(uocr_metal_context *ctx,
+                                      const uint16_t *input_f16,
+                                      const uint16_t *router_weight_f16,
+                                      uint32_t n_tokens,
+                                      float *logits_out_f32_or_null,
+                                      float *probs_out_f32_or_null,
+                                      uint32_t *top_expert_ids_out,
+                                      float *top_weights_out,
+                                      char *error,
+                                      size_t error_size) {
+    metal_clear_error(error, error_size);
+    if (ctx == NULL || input_f16 == NULL || router_weight_f16 == NULL || top_expert_ids_out == NULL ||
+        top_weights_out == NULL || n_tokens == 0u) {
+        return metal_fail(error, error_size, "invalid Metal MoE router request");
+    }
+
+    uint64_t input_values = 0u;
+    uint64_t input_bytes = 0u;
+    uint64_t weight_values = 0u;
+    uint64_t weight_bytes = 0u;
+    uint64_t router_values = 0u;
+    uint64_t router_bytes = 0u;
+    uint64_t top_values = 0u;
+    uint64_t top_ids_bytes = 0u;
+    uint64_t top_weights_bytes = 0u;
+    if (!checked_mul_u64((uint64_t)n_tokens, (uint64_t)UOCR_HIDDEN_SIZE, &input_values) ||
+        !checked_mul_u64(input_values, 2u, &input_bytes) ||
+        !checked_mul_u64((uint64_t)UOCR_ROUTED_EXPERTS, (uint64_t)UOCR_HIDDEN_SIZE, &weight_values) ||
+        !checked_mul_u64(weight_values, 2u, &weight_bytes) ||
+        !checked_mul_u64((uint64_t)n_tokens, (uint64_t)UOCR_ROUTED_EXPERTS, &router_values) ||
+        !checked_mul_u64(router_values, (uint64_t)sizeof(float), &router_bytes) ||
+        !checked_mul_u64((uint64_t)n_tokens, (uint64_t)UOCR_MOE_TOP_K, &top_values) ||
+        !checked_mul_u64(top_values, (uint64_t)sizeof(uint32_t), &top_ids_bytes) ||
+        !checked_mul_u64(top_values, (uint64_t)sizeof(float), &top_weights_bytes)) {
+        return metal_fail(error, error_size, "Metal MoE router byte-size overflow");
+    }
+
+    const uint64_t max_buffer_length = metal_device_max_buffer_length(ctx->device);
+    if (input_bytes > max_buffer_length || weight_bytes > max_buffer_length || router_bytes > max_buffer_length ||
+        top_ids_bytes > max_buffer_length || top_weights_bytes > max_buffer_length ||
+        input_bytes > (uint64_t)SIZE_MAX || weight_bytes > (uint64_t)SIZE_MAX || router_bytes > (uint64_t)SIZE_MAX ||
+        top_ids_bytes > (uint64_t)SIZE_MAX || top_weights_bytes > (uint64_t)SIZE_MAX ||
+        router_values > (uint64_t)UINT32_MAX || top_values > (uint64_t)UINT32_MAX) {
+        return metal_fail(error,
+                          error_size,
+                          "Metal MoE router buffers exceed maxBufferLength %llu",
+                          (unsigned long long)max_buffer_length);
+    }
+
+    @autoreleasepool {
+        id<MTLComputePipelineState> logits_pipeline = metal_get_pipeline(ctx,
+                                                                         "uocr_moe_router_logits_f16_to_f32",
+                                                                         error,
+                                                                         error_size);
+        if (logits_pipeline == nil) {
+            return 0;
+        }
+        id<MTLComputePipelineState> topk_pipeline = metal_get_pipeline(ctx,
+                                                                       "uocr_moe_router_softmax_topk_f32",
+                                                                       error,
+                                                                       error_size);
+        if (topk_pipeline == nil) {
+            return 0;
+        }
+
+        id<MTLBuffer> input = [ctx->device newBufferWithBytes:input_f16
+                                                       length:(NSUInteger)input_bytes
+                                                      options:MTLResourceStorageModeShared];
+        if (input == nil) {
+            return metal_fail(error, error_size, "failed to allocate Metal MoE router input buffer");
+        }
+        input.label = @"uocr_moe_router_input_f16";
+
+        id<MTLBuffer> weight = [ctx->device newBufferWithBytes:router_weight_f16
+                                                        length:(NSUInteger)weight_bytes
+                                                       options:MTLResourceStorageModeShared];
+        if (weight == nil) {
+            [input release];
+            return metal_fail(error, error_size, "failed to allocate Metal MoE router weight buffer");
+        }
+        weight.label = @"uocr_moe_router_weight_f16";
+
+        id<MTLBuffer> logits = [ctx->device newBufferWithLength:(NSUInteger)router_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> probs = [ctx->device newBufferWithLength:(NSUInteger)router_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> top_ids = [ctx->device newBufferWithLength:(NSUInteger)top_ids_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> top_weights = [ctx->device newBufferWithLength:(NSUInteger)top_weights_bytes options:MTLResourceStorageModeShared];
+        if (logits == nil || probs == nil || top_ids == nil || top_weights == nil) {
+            [top_weights release];
+            [top_ids release];
+            [probs release];
+            [logits release];
+            [weight release];
+            [input release];
+            return metal_fail(error, error_size, "failed to allocate Metal MoE router output buffers");
+        }
+        logits.label = @"uocr_moe_router_logits_f32";
+        probs.label = @"uocr_moe_router_probs_f32";
+        top_ids.label = @"uocr_moe_router_top_ids_u32";
+        top_weights.label = @"uocr_moe_router_top_weights_f32";
+        memset([logits contents], 0, (size_t)router_bytes);
+        memset([probs contents], 0, (size_t)router_bytes);
+        memset([top_ids contents], 0, (size_t)top_ids_bytes);
+        memset([top_weights contents], 0, (size_t)top_weights_bytes);
+
+        id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
+        if (cb == nil) {
+            [top_weights release];
+            [top_ids release];
+            [probs release];
+            [logits release];
+            [weight release];
+            [input release];
+            return metal_fail(error, error_size, "failed to create Metal MoE router command buffer");
+        }
+        cb.label = @"uocr_moe_router_command_buffer";
+
+        uocr_metal_moe_router_params params;
+        params.n_tokens = n_tokens;
+        params.hidden_size = UOCR_HIDDEN_SIZE;
+        params.experts = UOCR_ROUTED_EXPERTS;
+        params.top_k = UOCR_MOE_TOP_K;
+
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        if (enc == nil) {
+            [top_weights release];
+            [top_ids release];
+            [probs release];
+            [logits release];
+            [weight release];
+            [input release];
+            return metal_fail(error, error_size, "failed to create Metal MoE router logits command encoder");
+        }
+        const NSUInteger logits_threads = metal_power2_threadgroup_width(256u, logits_pipeline.maxTotalThreadsPerThreadgroup);
+        [enc setComputePipelineState:logits_pipeline];
+        [enc setBuffer:input offset:0u atIndex:0u];
+        [enc setBuffer:weight offset:0u atIndex:1u];
+        [enc setBuffer:logits offset:0u atIndex:2u];
+        [enc setBytes:&params length:sizeof(params) atIndex:3u];
+        [enc setThreadgroupMemoryLength:logits_threads * sizeof(float) atIndex:0u];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)router_values, 1u, 1u)
+             threadsPerThreadgroup:MTLSizeMake(logits_threads, 1u, 1u)];
+        [enc endEncoding];
+
+        enc = [cb computeCommandEncoder];
+        if (enc == nil) {
+            [top_weights release];
+            [top_ids release];
+            [probs release];
+            [logits release];
+            [weight release];
+            [input release];
+            return metal_fail(error, error_size, "failed to create Metal MoE router top-k command encoder");
+        }
+        const NSUInteger topk_threads = metal_power2_threadgroup_width(64u, topk_pipeline.maxTotalThreadsPerThreadgroup);
+        [enc setComputePipelineState:topk_pipeline];
+        [enc setBuffer:logits offset:0u atIndex:0u];
+        [enc setBuffer:probs offset:0u atIndex:1u];
+        [enc setBuffer:top_ids offset:0u atIndex:2u];
+        [enc setBuffer:top_weights offset:0u atIndex:3u];
+        [enc setBytes:&params length:sizeof(params) atIndex:4u];
+        [enc setThreadgroupMemoryLength:((NSUInteger)UOCR_ROUTED_EXPERTS + topk_threads) * sizeof(float) atIndex:0u];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_tokens, 1u, 1u)
+             threadsPerThreadgroup:MTLSizeMake(topk_threads, 1u, 1u)];
+        [enc endEncoding];
+
+        [cb commit];
+        [cb waitUntilCompleted];
+        if (cb.status == MTLCommandBufferStatusError) {
+            NSString *description = cb.error != nil ? [cb.error localizedDescription] : @"unknown command-buffer error";
+            [top_weights release];
+            [top_ids release];
+            [probs release];
+            [logits release];
+            [weight release];
+            [input release];
+            return metal_fail(error, error_size, "Metal MoE router command failed: %s", [description UTF8String]);
+        }
+
+        if (logits_out_f32_or_null != NULL) {
+            memcpy(logits_out_f32_or_null, [logits contents], (size_t)router_bytes);
+        }
+        if (probs_out_f32_or_null != NULL) {
+            memcpy(probs_out_f32_or_null, [probs contents], (size_t)router_bytes);
+        }
+        memcpy(top_expert_ids_out, [top_ids contents], (size_t)top_ids_bytes);
+        memcpy(top_weights_out, [top_weights contents], (size_t)top_weights_bytes);
+
+        [top_weights release];
+        [top_ids release];
+        [probs release];
+        [logits release];
+        [weight release];
         [input release];
     }
 

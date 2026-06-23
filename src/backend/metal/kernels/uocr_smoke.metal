@@ -608,6 +608,144 @@ kernel void uocr_dense_swiglu_down_f16_to_f32(device const half *mid [[buffer(0)
     }
 }
 
+struct UocrMoeRouterParams {
+    uint n_tokens;
+    uint hidden_size;
+    uint experts;
+    uint top_k;
+};
+
+static inline float uocr_moe_router_dot_f16(device const half *src,
+                                            device const half *weight,
+                                            constant UocrMoeRouterParams &params,
+                                            uint token,
+                                            uint expert,
+                                            uint tid,
+                                            uint ntg,
+                                            threadgroup float *partials) {
+    float sum = 0.0f;
+    const uint src_base = token * params.hidden_size;
+    const uint weight_base = expert * params.hidden_size;
+    for (uint k = tid; k < params.hidden_size; k += ntg) {
+        sum += float(src[src_base + k]) * float(weight[weight_base + k]);
+    }
+    partials[tid] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = ntg >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            partials[tid] += partials[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    return partials[0];
+}
+
+kernel void uocr_moe_router_logits_f16_to_f32(device const half *src [[buffer(0)]],
+                                             device const half *weight [[buffer(1)]],
+                                             device float *logits [[buffer(2)]],
+                                             constant UocrMoeRouterParams &params [[buffer(3)]],
+                                             threadgroup float *partials [[threadgroup(0)]],
+                                             uint output_index [[threadgroup_position_in_grid]],
+                                             uint tid [[thread_index_in_threadgroup]],
+                                             uint ntg [[threads_per_threadgroup]]) {
+    const uint token = output_index / params.experts;
+    const uint expert = output_index - token * params.experts;
+    if (token >= params.n_tokens || expert >= params.experts) {
+        return;
+    }
+
+    const float value = uocr_moe_router_dot_f16(src, weight, params, token, expert, tid, ntg, partials);
+    if (tid == 0) {
+        logits[token * params.experts + expert] = value;
+    }
+}
+
+kernel void uocr_moe_router_softmax_topk_f32(device const float *logits [[buffer(0)]],
+                                             device float *probs [[buffer(1)]],
+                                             device uint *top_expert_ids [[buffer(2)]],
+                                             device float *top_weights [[buffer(3)]],
+                                             constant UocrMoeRouterParams &params [[buffer(4)]],
+                                             threadgroup float *scratch [[threadgroup(0)]],
+                                             uint token [[threadgroup_position_in_grid]],
+                                             uint tid [[thread_index_in_threadgroup]],
+                                             uint ntg [[threads_per_threadgroup]]) {
+    if (token >= params.n_tokens) {
+        return;
+    }
+
+    threadgroup float *scores = scratch;
+    threadgroup float *partials = scratch + params.experts;
+
+    float local_max = -INFINITY;
+    const uint row_base = token * params.experts;
+    for (uint expert = tid; expert < params.experts; expert += ntg) {
+        const float value = logits[row_base + expert];
+        scores[expert] = value;
+        local_max = max(local_max, value);
+    }
+    partials[tid] = local_max;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = ntg >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            partials[tid] = max(partials[tid], partials[tid + stride]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    const float max_logit = partials[0];
+    float local_sum = 0.0f;
+    for (uint expert = tid; expert < params.experts; expert += ntg) {
+        const float value = exp(scores[expert] - max_logit);
+        scores[expert] = value;
+        local_sum += value;
+    }
+    partials[tid] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = ntg >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            partials[tid] += partials[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    const float inv_sum = 1.0f / partials[0];
+    for (uint expert = tid; expert < params.experts; expert += ntg) {
+        const float prob = scores[expert] * inv_sum;
+        scores[expert] = prob;
+        probs[row_base + expert] = prob;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid == 0) {
+        for (uint rank = 0; rank < params.top_k; ++rank) {
+            float best_value = -INFINITY;
+            uint best_expert = 0u;
+            for (uint expert = 0; expert < params.experts; ++expert) {
+                bool already_selected = false;
+                for (uint prev = 0; prev < rank; ++prev) {
+                    if (top_expert_ids[token * params.top_k + prev] == expert) {
+                        already_selected = true;
+                        break;
+                    }
+                }
+                if (already_selected) {
+                    continue;
+                }
+                const float value = scores[expert];
+                if (value > best_value || (value == best_value && expert < best_expert)) {
+                    best_value = value;
+                    best_expert = expert;
+                }
+            }
+            top_expert_ids[token * params.top_k + rank] = best_expert;
+            top_weights[token * params.top_k + rank] = best_value;
+        }
+    }
+}
+
 struct UocrRopeQKParams {
     uint n_tokens;
     uint heads;
