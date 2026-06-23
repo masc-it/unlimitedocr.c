@@ -141,6 +141,11 @@ int uocr_metal_kv_cache_token_for_position(uint32_t prompt_length,
 int uocr_metal_kv_cache_attention_length(uint32_t prompt_length,
                                          uint32_t generated_count,
                                          uint32_t *out_attention_length);
+int uocr_metal_kv_cache_token_for_attention_index(uint32_t prompt_length,
+                                                  uint32_t prompt_token_capacity,
+                                                  uint32_t generated_count,
+                                                  uint32_t attention_index,
+                                                  uint32_t *out_cache_token);
 
 /* Diagnostic get-rows entry point used by synthetic tests. Runtime prompt
  * assembly should bind mmap-backed model buffers directly and reuse the same
@@ -272,6 +277,28 @@ int uocr_metal_context_prefill_attention_varlen_f16(uocr_metal_context *ctx,
                                                     void *out,
                                                     char *error,
                                                     size_t error_size);
+
+/* Diagnostic single-token decode SDPA helper for synthetic decoder tests. Q is
+ * shaped [10 heads, 128 dim]. K/V caches are shaped
+ * [12 layers, batch_slots, prompt_token_capacity + 128, 10 heads, 128 dim].
+ * The attention set is all prompt tokens plus the live generated-token ring;
+ * generated_count is the number of generated tokens already written to KV,
+ * including the current decode token when called after the KV write.
+ */
+int uocr_metal_context_decode_attention_f16(uocr_metal_context *ctx,
+                                            const uint16_t *q_f16,
+                                            const uint16_t *k_cache_f16,
+                                            const uint16_t *v_cache_f16,
+                                            uint32_t batch_slots,
+                                            uint32_t prompt_token_capacity,
+                                            uint32_t layer,
+                                            uint32_t slot,
+                                            uint32_t prompt_length,
+                                            uint32_t generated_count,
+                                            uocr_metal_dense_output_type output_type,
+                                            void *out,
+                                            char *error,
+                                            size_t error_size);
 
 /* Diagnostic KV-cache write helper for synthetic decoder tests. Writes K/V
  * tensors shaped [n_tokens, 10 heads, 128 dim] into separate caches laid out as

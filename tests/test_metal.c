@@ -1216,6 +1216,105 @@ static uint32_t kv_cache_token_for_position(uint32_t position, uint32_t prompt_l
     return prompt_length + ((position - prompt_length) % UOCR_GENERATED_RING_WINDOW);
 }
 
+static uint64_t kv_cache_flat_index(uint32_t batch_slots,
+                                    uint32_t cache_token_capacity,
+                                    uint32_t layer,
+                                    uint32_t slot,
+                                    uint32_t cache_token,
+                                    uint32_t head,
+                                    uint32_t dim) {
+    return (((uint64_t)layer * (uint64_t)batch_slots + (uint64_t)slot) *
+                (uint64_t)cache_token_capacity + (uint64_t)cache_token) *
+               (uint64_t)UOCR_KV_HEADS * (uint64_t)UOCR_HEAD_DIM +
+           (uint64_t)head * (uint64_t)UOCR_HEAD_DIM + (uint64_t)dim;
+}
+
+static int compute_decode_attention_expected(const uint16_t *q,
+                                             const uint16_t *k_cache,
+                                             const uint16_t *v_cache,
+                                             uint32_t batch_slots,
+                                             uint32_t prompt_token_capacity,
+                                             uint32_t layer,
+                                             uint32_t slot,
+                                             uint32_t prompt_length,
+                                             uint32_t generated_count,
+                                             float *out) {
+    uint32_t attention_length = 0u;
+    if (!uocr_metal_kv_cache_attention_length(prompt_length, generated_count, &attention_length)) {
+        return 0;
+    }
+    const uint32_t cache_token_capacity = prompt_token_capacity + UOCR_GENERATED_RING_WINDOW;
+    float *scores = (float *)malloc((size_t)attention_length * sizeof(float));
+    if (scores == NULL) {
+        return 0;
+    }
+
+    const float scale = 1.0f / sqrtf((float)UOCR_HEAD_DIM);
+    for (uint32_t head = 0u; head < UOCR_ATTENTION_HEADS; ++head) {
+        float max_score = -3.4028234663852886e38f;
+        for (uint32_t attention_index = 0u; attention_index < attention_length; ++attention_index) {
+            uint32_t cache_token = UINT32_MAX;
+            if (!uocr_metal_kv_cache_token_for_attention_index(prompt_length,
+                                                               prompt_token_capacity,
+                                                               generated_count,
+                                                               attention_index,
+                                                               &cache_token)) {
+                free(scores);
+                return 0;
+            }
+            float score = 0.0f;
+            for (uint32_t dim = 0u; dim < UOCR_HEAD_DIM; ++dim) {
+                const uint64_t q_index = (uint64_t)head * (uint64_t)UOCR_HEAD_DIM + (uint64_t)dim;
+                const uint64_t k_index = kv_cache_flat_index(batch_slots,
+                                                             cache_token_capacity,
+                                                             layer,
+                                                             slot,
+                                                             cache_token,
+                                                             head,
+                                                             dim);
+                score += f16_bits_to_f32(q[q_index]) * f16_bits_to_f32(k_cache[k_index]);
+            }
+            score *= scale;
+            scores[attention_index] = score;
+            if (score > max_score) {
+                max_score = score;
+            }
+        }
+
+        float denominator = 0.0f;
+        for (uint32_t attention_index = 0u; attention_index < attention_length; ++attention_index) {
+            scores[attention_index] = expf(scores[attention_index] - max_score);
+            denominator += scores[attention_index];
+        }
+        for (uint32_t dim = 0u; dim < UOCR_HEAD_DIM; ++dim) {
+            float value = 0.0f;
+            for (uint32_t attention_index = 0u; attention_index < attention_length; ++attention_index) {
+                uint32_t cache_token = UINT32_MAX;
+                if (!uocr_metal_kv_cache_token_for_attention_index(prompt_length,
+                                                                   prompt_token_capacity,
+                                                                   generated_count,
+                                                                   attention_index,
+                                                                   &cache_token)) {
+                    free(scores);
+                    return 0;
+                }
+                const uint64_t v_index = kv_cache_flat_index(batch_slots,
+                                                             cache_token_capacity,
+                                                             layer,
+                                                             slot,
+                                                             cache_token,
+                                                             head,
+                                                             dim);
+                value += (scores[attention_index] / denominator) * f16_bits_to_f32(v_cache[v_index]);
+            }
+            out[(uint64_t)head * (uint64_t)UOCR_HEAD_DIM + (uint64_t)dim] = value;
+        }
+    }
+
+    free(scores);
+    return 1;
+}
+
 static int test_metal_kv_cache_layout_helpers(void) {
     uint32_t cache_token = UINT32_MAX;
     uint32_t attention_length = 0u;
@@ -1251,6 +1350,31 @@ static int test_metal_kv_cache_layout_helpers(void) {
     CHECK(uocr_metal_kv_cache_attention_length(UOCR_MAX_POSITIONS - 3u, 4u, &attention_length) == 0);
     CHECK(uocr_metal_kv_cache_attention_length(UINT32_MAX, 0u, &attention_length) == 0);
     CHECK(uocr_metal_kv_cache_attention_length(0u, 1u, &attention_length) == 0);
+
+    CHECK(uocr_metal_kv_cache_token_for_attention_index(7u, 16u, 0u, 6u, &cache_token) == 1);
+    CHECK(cache_token == 6u);
+    CHECK(uocr_metal_kv_cache_token_for_attention_index(7u, 16u, 5u, 7u, &cache_token) == 1);
+    CHECK(cache_token == 7u);
+    CHECK(uocr_metal_kv_cache_token_for_attention_index(7u, 16u, 5u, 11u, &cache_token) == 1);
+    CHECK(cache_token == 11u);
+    CHECK(uocr_metal_kv_cache_token_for_attention_index(7u,
+                                                        16u,
+                                                        UOCR_GENERATED_RING_WINDOW + 9u,
+                                                        7u,
+                                                        &cache_token) == 1);
+    CHECK(cache_token == 16u);
+    CHECK(uocr_metal_kv_cache_token_for_attention_index(7u,
+                                                        16u,
+                                                        UOCR_GENERATED_RING_WINDOW + 9u,
+                                                        7u + UOCR_GENERATED_RING_WINDOW - 1u,
+                                                        &cache_token) == 1);
+    CHECK(cache_token == 15u);
+    CHECK(uocr_metal_kv_cache_token_for_attention_index(7u, 16u, 5u, 12u, &cache_token) == 0);
+    CHECK(uocr_metal_kv_cache_token_for_attention_index(7u,
+                                                        16u,
+                                                        UOCR_MAX_POSITIONS,
+                                                        7u,
+                                                        &cache_token) == 0);
 
     uocr_metal_kv_cache_layout empty_layout;
     memset(&empty_layout, 0, sizeof(empty_layout));
@@ -1532,6 +1656,250 @@ static int test_metal_kv_cache_write_f16(void) {
     free(initial_k);
     free(v_src);
     free(k_src);
+    return 0;
+}
+
+static int test_metal_decode_attention_f16(void) {
+    if (!uocr_metal_is_available()) {
+        return 0;
+    }
+
+    enum {
+        BATCH_SLOTS = 2,
+        PROMPT_TOKEN_CAPACITY = 8,
+        PROMPT_LENGTH = 5,
+        CACHE_TOKEN_CAPACITY = PROMPT_TOKEN_CAPACITY + UOCR_GENERATED_RING_WINDOW,
+        LAYER = 4,
+        SLOT = 1,
+        HEAD_AREA = UOCR_KV_HEADS * UOCR_HEAD_DIM
+    };
+    const uint64_t cache_values = (uint64_t)UOCR_DECODER_LAYERS * (uint64_t)BATCH_SLOTS *
+                                  (uint64_t)CACHE_TOKEN_CAPACITY * (uint64_t)HEAD_AREA;
+    const uint64_t out_values = (uint64_t)HEAD_AREA;
+    const uint16_t q_values[] = {
+        0x0000u, /* 0.0 */
+        0x2800u, /* 0.03125 */
+        0x2c00u, /* 0.0625 */
+        0x3000u, /* 0.125 */
+        0xb000u  /* -0.125 */
+    };
+    const uint16_t k_values[] = {
+        0x0000u, /* 0.0 */
+        0x2400u, /* 0.015625 */
+        0x2800u, /* 0.03125 */
+        0x2c00u, /* 0.0625 */
+        0xac00u  /* -0.0625 */
+    };
+    const uint16_t v_values[] = {
+        0xbc00u, /* -1.0 */
+        0xb800u, /* -0.5 */
+        0x0000u, /* 0.0 */
+        0x3400u, /* 0.25 */
+        0x3800u, /* 0.5 */
+        0x3c00u  /* 1.0 */
+    };
+    const uint32_t q_count = (uint32_t)(sizeof(q_values) / sizeof(q_values[0]));
+    const uint32_t k_count = (uint32_t)(sizeof(k_values) / sizeof(k_values[0]));
+    const uint32_t v_count = (uint32_t)(sizeof(v_values) / sizeof(v_values[0]));
+
+    uint16_t *q = (uint16_t *)malloc((size_t)out_values * sizeof(uint16_t));
+    uint16_t *k_cache = (uint16_t *)malloc((size_t)cache_values * sizeof(uint16_t));
+    uint16_t *v_cache = (uint16_t *)malloc((size_t)cache_values * sizeof(uint16_t));
+    float *expected = (float *)malloc((size_t)out_values * sizeof(float));
+    float *out_f32 = (float *)malloc((size_t)out_values * sizeof(float));
+    uint16_t *out_f16 = (uint16_t *)malloc((size_t)out_values * sizeof(uint16_t));
+    CHECK(q != NULL && k_cache != NULL && v_cache != NULL && expected != NULL && out_f32 != NULL && out_f16 != NULL);
+
+    char error[1024];
+    memset(error, 0, sizeof(error));
+    uocr_metal_context *ctx = uocr_metal_context_create(UOCR_TEST_METAL_RESOURCE_PATH, error, sizeof(error));
+    CHECK(ctx != NULL);
+
+    const uint32_t no_wrap_generated = 3u;
+    uint32_t attention_length = 0u;
+    CHECK(uocr_metal_kv_cache_attention_length(PROMPT_LENGTH, no_wrap_generated, &attention_length) == 1);
+    for (uint64_t i = 0u; i < out_values; ++i) {
+        q[i] = q_values[(i * 7u + i / 11u + 3u) % q_count];
+    }
+    for (uint64_t i = 0u; i < cache_values; ++i) {
+        k_cache[i] = 0x0000u;
+        v_cache[i] = 0x5000u; /* 32.0; catches accidental attention to unused ring slots. */
+    }
+    for (uint32_t attention_index = 0u; attention_index < attention_length; ++attention_index) {
+        uint32_t cache_token = UINT32_MAX;
+        CHECK(uocr_metal_kv_cache_token_for_attention_index(PROMPT_LENGTH,
+                                                            PROMPT_TOKEN_CAPACITY,
+                                                            no_wrap_generated,
+                                                            attention_index,
+                                                            &cache_token) == 1);
+        for (uint32_t head = 0u; head < UOCR_KV_HEADS; ++head) {
+            for (uint32_t dim = 0u; dim < UOCR_HEAD_DIM; ++dim) {
+                const uint64_t serial = ((uint64_t)attention_index * (uint64_t)HEAD_AREA +
+                                         (uint64_t)head * (uint64_t)UOCR_HEAD_DIM + (uint64_t)dim);
+                const uint64_t index = kv_cache_flat_index(BATCH_SLOTS,
+                                                           CACHE_TOKEN_CAPACITY,
+                                                           LAYER,
+                                                           SLOT,
+                                                           cache_token,
+                                                           head,
+                                                           dim);
+                k_cache[index] = k_values[(serial * 11u + serial / 17u + 1u) % k_count];
+                v_cache[index] = v_values[(serial * 13u + serial / 19u + 4u) % v_count];
+            }
+        }
+    }
+    CHECK(compute_decode_attention_expected(q,
+                                            k_cache,
+                                            v_cache,
+                                            BATCH_SLOTS,
+                                            PROMPT_TOKEN_CAPACITY,
+                                            LAYER,
+                                            SLOT,
+                                            PROMPT_LENGTH,
+                                            no_wrap_generated,
+                                            expected) == 1);
+
+    memset(out_f32, 0, (size_t)out_values * sizeof(float));
+    CHECK(uocr_metal_context_decode_attention_f16(ctx,
+                                                  q,
+                                                  k_cache,
+                                                  v_cache,
+                                                  BATCH_SLOTS,
+                                                  PROMPT_TOKEN_CAPACITY,
+                                                  LAYER,
+                                                  SLOT,
+                                                  PROMPT_LENGTH,
+                                                  no_wrap_generated,
+                                                  UOCR_METAL_DENSE_OUTPUT_F32,
+                                                  out_f32,
+                                                  error,
+                                                  sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    for (uint64_t i = 0u; i < out_values; ++i) {
+        CHECK(fabsf(out_f32[i] - expected[i]) < 1.0e-3f);
+    }
+
+    memset(out_f16, 0, (size_t)out_values * sizeof(uint16_t));
+    CHECK(uocr_metal_context_decode_attention_f16(ctx,
+                                                  q,
+                                                  k_cache,
+                                                  v_cache,
+                                                  BATCH_SLOTS,
+                                                  PROMPT_TOKEN_CAPACITY,
+                                                  LAYER,
+                                                  SLOT,
+                                                  PROMPT_LENGTH,
+                                                  no_wrap_generated,
+                                                  UOCR_METAL_DENSE_OUTPUT_F16,
+                                                  out_f16,
+                                                  error,
+                                                  sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    for (uint64_t i = 0u; i < out_values; ++i) {
+        CHECK(fabsf(f16_bits_to_f32(out_f16[i]) - expected[i]) < 1.0e-2f);
+    }
+
+    const uint32_t wrapped_generated = UOCR_GENERATED_RING_WINDOW + 3u;
+    CHECK(uocr_metal_kv_cache_attention_length(PROMPT_LENGTH, wrapped_generated, &attention_length) == 1);
+    for (uint64_t i = 0u; i < out_values; ++i) {
+        q[i] = 0x0000u;
+    }
+    for (uint64_t i = 0u; i < cache_values; ++i) {
+        k_cache[i] = 0x0000u;
+        v_cache[i] = 0x5000u; /* Must not be read from inactive layers/slots/tokens. */
+    }
+    for (uint32_t attention_index = 0u; attention_index < attention_length; ++attention_index) {
+        uint32_t cache_token = UINT32_MAX;
+        CHECK(uocr_metal_kv_cache_token_for_attention_index(PROMPT_LENGTH,
+                                                            PROMPT_TOKEN_CAPACITY,
+                                                            wrapped_generated,
+                                                            attention_index,
+                                                            &cache_token) == 1);
+        const uint16_t value = attention_index < PROMPT_LENGTH ? 0x3c00u : 0xbc00u; /* +1 prompt, -1 generated. */
+        for (uint32_t head = 0u; head < UOCR_KV_HEADS; ++head) {
+            for (uint32_t dim = 0u; dim < UOCR_HEAD_DIM; ++dim) {
+                const uint64_t index = kv_cache_flat_index(BATCH_SLOTS,
+                                                           CACHE_TOKEN_CAPACITY,
+                                                           LAYER,
+                                                           SLOT,
+                                                           cache_token,
+                                                           head,
+                                                           dim);
+                k_cache[index] = 0x0000u;
+                v_cache[index] = value;
+            }
+        }
+    }
+    CHECK(compute_decode_attention_expected(q,
+                                            k_cache,
+                                            v_cache,
+                                            BATCH_SLOTS,
+                                            PROMPT_TOKEN_CAPACITY,
+                                            LAYER,
+                                            SLOT,
+                                            PROMPT_LENGTH,
+                                            wrapped_generated,
+                                            expected) == 1);
+    memset(out_f32, 0, (size_t)out_values * sizeof(float));
+    CHECK(uocr_metal_context_decode_attention_f16(ctx,
+                                                  q,
+                                                  k_cache,
+                                                  v_cache,
+                                                  BATCH_SLOTS,
+                                                  PROMPT_TOKEN_CAPACITY,
+                                                  LAYER,
+                                                  SLOT,
+                                                  PROMPT_LENGTH,
+                                                  wrapped_generated,
+                                                  UOCR_METAL_DENSE_OUTPUT_F32,
+                                                  out_f32,
+                                                  error,
+                                                  sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    for (uint64_t i = 0u; i < out_values; ++i) {
+        CHECK(fabsf(out_f32[i] - expected[i]) < 1.0e-5f);
+    }
+    CHECK(out_f32[0] > -0.98f && out_f32[0] < -0.90f);
+
+    CHECK(uocr_metal_context_decode_attention_f16(ctx,
+                                                  q,
+                                                  k_cache,
+                                                  v_cache,
+                                                  BATCH_SLOTS,
+                                                  PROMPT_TOKEN_CAPACITY,
+                                                  LAYER,
+                                                  SLOT,
+                                                  PROMPT_LENGTH,
+                                                  UOCR_MAX_POSITIONS,
+                                                  UOCR_METAL_DENSE_OUTPUT_F32,
+                                                  out_f32,
+                                                  error,
+                                                  sizeof(error)) == 0);
+    CHECK(strstr(error, "generated count") != NULL);
+
+    CHECK(uocr_metal_context_decode_attention_f16(ctx,
+                                                  q,
+                                                  k_cache,
+                                                  v_cache,
+                                                  BATCH_SLOTS,
+                                                  PROMPT_TOKEN_CAPACITY,
+                                                  LAYER,
+                                                  SLOT,
+                                                  PROMPT_LENGTH,
+                                                  no_wrap_generated,
+                                                  (uocr_metal_dense_output_type)99,
+                                                  out_f32,
+                                                  error,
+                                                  sizeof(error)) == 0);
+    CHECK(strstr(error, "unsupported Metal decode attention output type") != NULL);
+
+    uocr_metal_context_destroy(ctx);
+    free(out_f16);
+    free(out_f32);
+    free(expected);
+    free(v_cache);
+    free(k_cache);
+    free(q);
     return 0;
 }
 
@@ -1916,6 +2284,7 @@ int main(void) {
     if (test_metal_prefill_attention_varlen_f16() != 0) return 1;
     if (test_metal_kv_cache_layout_helpers() != 0) return 1;
     if (test_metal_kv_cache_write_f16() != 0) return 1;
+    if (test_metal_decode_attention_f16() != 0) return 1;
     if (test_metal_recent_decoder_primitives_stress() != 0) return 1;
     if (test_metal_runtime_arenas() != 0) return 1;
     if (test_metal_model_mapping() != 0) return 1;

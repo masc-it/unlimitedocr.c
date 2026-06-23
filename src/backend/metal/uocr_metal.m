@@ -319,6 +319,24 @@ typedef struct uocr_metal_prefill_attention_varlen_params {
     uint32_t reserved2;
 } uocr_metal_prefill_attention_varlen_params;
 
+typedef struct uocr_metal_decode_attention_params {
+    uint32_t batch_slots;
+    uint32_t cache_token_capacity;
+    uint32_t layer;
+    uint32_t slot;
+    uint32_t prompt_length;
+    uint32_t generated_count;
+    uint32_t attention_length;
+    uint32_t first_generated;
+    uint32_t heads;
+    uint32_t head_dim;
+    uint32_t ring_window;
+    float scale;
+} uocr_metal_decode_attention_params;
+
+_Static_assert(sizeof(uocr_metal_decode_attention_params) == 48u,
+               "uocr_metal_decode_attention_params ABI mismatch");
+
 typedef struct uocr_metal_kv_cache_write_params {
     uint32_t n_tokens;
     uint32_t batch_slots;
@@ -1508,6 +1526,38 @@ int uocr_metal_kv_cache_attention_length(uint32_t prompt_length,
         return 0;
     }
     *out_attention_length = prompt_length + live_generated;
+    return 1;
+}
+
+int uocr_metal_kv_cache_token_for_attention_index(uint32_t prompt_length,
+                                                  uint32_t prompt_token_capacity,
+                                                  uint32_t generated_count,
+                                                  uint32_t attention_index,
+                                                  uint32_t *out_cache_token) {
+    if (out_cache_token == NULL || prompt_length == 0u || prompt_length > prompt_token_capacity ||
+        prompt_length > UOCR_MAX_POSITIONS || generated_count > UOCR_MAX_POSITIONS - prompt_length) {
+        return 0;
+    }
+    const uint32_t live_generated = generated_count < UOCR_GENERATED_RING_WINDOW ? generated_count : UOCR_GENERATED_RING_WINDOW;
+    uint32_t attention_length = 0u;
+    if (!uocr_metal_kv_cache_attention_length(prompt_length, generated_count, &attention_length) ||
+        attention_index >= attention_length) {
+        return 0;
+    }
+    if (attention_index < prompt_length) {
+        *out_cache_token = attention_index;
+        return 1;
+    }
+
+    const uint32_t generated_offset = attention_index - prompt_length;
+    const uint32_t first_generated = generated_count - live_generated;
+    const uint32_t logical_generated = first_generated + generated_offset;
+    const uint32_t cache_token = prompt_length + (logical_generated % UOCR_GENERATED_RING_WINDOW);
+    const uint64_t cache_token_capacity = (uint64_t)prompt_token_capacity + (uint64_t)UOCR_GENERATED_RING_WINDOW;
+    if ((uint64_t)cache_token >= cache_token_capacity) {
+        return 0;
+    }
+    *out_cache_token = cache_token;
     return 1;
 }
 
@@ -2919,6 +2969,214 @@ int uocr_metal_context_prefill_attention_varlen_f16(uocr_metal_context *ctx,
         [cu release];
         [v_src release];
         [k_src release];
+        [q_src release];
+    }
+
+    metal_clear_error(error, error_size);
+    return 1;
+}
+
+int uocr_metal_context_decode_attention_f16(uocr_metal_context *ctx,
+                                            const uint16_t *q_f16,
+                                            const uint16_t *k_cache_f16,
+                                            const uint16_t *v_cache_f16,
+                                            uint32_t batch_slots,
+                                            uint32_t prompt_token_capacity,
+                                            uint32_t layer,
+                                            uint32_t slot,
+                                            uint32_t prompt_length,
+                                            uint32_t generated_count,
+                                            uocr_metal_dense_output_type output_type,
+                                            void *out,
+                                            char *error,
+                                            size_t error_size) {
+    metal_clear_error(error, error_size);
+    if (ctx == NULL || q_f16 == NULL || k_cache_f16 == NULL || v_cache_f16 == NULL || out == NULL ||
+        batch_slots == 0u || prompt_token_capacity == 0u) {
+        return metal_fail(error, error_size, "invalid Metal decode attention request");
+    }
+    if (output_type != UOCR_METAL_DENSE_OUTPUT_F16 && output_type != UOCR_METAL_DENSE_OUTPUT_F32) {
+        return metal_fail(error, error_size, "unsupported Metal decode attention output type %d", (int)output_type);
+    }
+    if (layer >= UOCR_DECODER_LAYERS || slot >= batch_slots) {
+        return metal_fail(error,
+                          error_size,
+                          "Metal decode attention layer/slot out of range: layer=%u slot=%u batch_slots=%u",
+                          layer,
+                          slot,
+                          batch_slots);
+    }
+    if (prompt_length == 0u || prompt_length > prompt_token_capacity || prompt_length > UOCR_MAX_POSITIONS) {
+        return metal_fail(error,
+                          error_size,
+                          "invalid Metal decode attention prompt length: prompt_length=%u prompt_token_capacity=%u",
+                          prompt_length,
+                          prompt_token_capacity);
+    }
+    if (generated_count > UOCR_MAX_POSITIONS - prompt_length) {
+        return metal_fail(error,
+                          error_size,
+                          "Metal decode attention generated count %u exceeds remaining positions for prompt length %u",
+                          generated_count,
+                          prompt_length);
+    }
+
+    uint32_t attention_length = 0u;
+    if (!uocr_metal_kv_cache_attention_length(prompt_length, generated_count, &attention_length)) {
+        return metal_fail(error, error_size, "invalid Metal decode attention length metadata");
+    }
+    const uint32_t live_generated = generated_count < UOCR_GENERATED_RING_WINDOW ? generated_count : UOCR_GENERATED_RING_WINDOW;
+    const uint32_t first_generated = generated_count - live_generated;
+
+    uint64_t cache_token_capacity_u64 = 0u;
+    uint64_t q_values = 0u;
+    uint64_t q_bytes = 0u;
+    uint64_t output_bytes = 0u;
+    uint64_t layer_slot_tokens = 0u;
+    uint64_t cache_values = 0u;
+    uint64_t cache_bytes = 0u;
+    const uint64_t output_element_bytes = output_type == UOCR_METAL_DENSE_OUTPUT_F16 ? 2u : (uint64_t)sizeof(float);
+    if (!checked_add_u64((uint64_t)prompt_token_capacity,
+                         (uint64_t)UOCR_GENERATED_RING_WINDOW,
+                         &cache_token_capacity_u64) ||
+        cache_token_capacity_u64 > (uint64_t)UINT32_MAX ||
+        (uint64_t)prompt_length + (uint64_t)UOCR_GENERATED_RING_WINDOW > cache_token_capacity_u64 ||
+        !checked_mul_u64((uint64_t)UOCR_ATTENTION_HEADS, (uint64_t)UOCR_HEAD_DIM, &q_values) ||
+        !checked_mul_u64(q_values, 2u, &q_bytes) ||
+        !checked_mul_u64(q_values, output_element_bytes, &output_bytes) ||
+        !checked_mul_u64((uint64_t)UOCR_DECODER_LAYERS, (uint64_t)batch_slots, &layer_slot_tokens) ||
+        !checked_mul_u64(layer_slot_tokens, cache_token_capacity_u64, &cache_values) ||
+        !checked_mul_u64(cache_values, (uint64_t)UOCR_KV_HEADS * (uint64_t)UOCR_HEAD_DIM, &cache_values) ||
+        !checked_mul_u64(cache_values, 2u, &cache_bytes)) {
+        return metal_fail(error, error_size, "Metal decode attention byte-size overflow");
+    }
+
+    const uint64_t max_buffer_length = metal_device_max_buffer_length(ctx->device);
+    if (q_bytes > max_buffer_length || output_bytes > max_buffer_length || cache_bytes > max_buffer_length ||
+        q_bytes > (uint64_t)SIZE_MAX || output_bytes > (uint64_t)SIZE_MAX || cache_bytes > (uint64_t)SIZE_MAX) {
+        return metal_fail(error,
+                          error_size,
+                          "Metal decode attention buffers exceed maxBufferLength %llu",
+                          (unsigned long long)max_buffer_length);
+    }
+
+    @autoreleasepool {
+        const char *function_name = output_type == UOCR_METAL_DENSE_OUTPUT_F16 ?
+                                        "uocr_decode_attention_f16_to_f16" :
+                                        "uocr_decode_attention_f16_to_f32";
+        id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, function_name, error, error_size);
+        if (pipeline == nil) {
+            return 0;
+        }
+        if (pipeline.maxTotalThreadsPerThreadgroup < (NSUInteger)UOCR_HEAD_DIM) {
+            return metal_fail(error,
+                              error_size,
+                              "Metal decode attention pipeline supports only %llu threads per group",
+                              (unsigned long long)pipeline.maxTotalThreadsPerThreadgroup);
+        }
+        const NSUInteger threads_per_group = (NSUInteger)UOCR_HEAD_DIM;
+        const uint64_t threadgroup_bytes = (uint64_t)threads_per_group * (uint64_t)sizeof(float);
+        if (threadgroup_bytes > (uint64_t)ctx->device.maxThreadgroupMemoryLength) {
+            return metal_fail(error, error_size, "Metal decode attention threadgroup memory exceeds device limit");
+        }
+
+        id<MTLBuffer> q_src = [ctx->device newBufferWithBytes:q_f16
+                                                       length:(NSUInteger)q_bytes
+                                                      options:MTLResourceStorageModeShared];
+        if (q_src == nil) {
+            return metal_fail(error, error_size, "failed to allocate Metal decode attention Q buffer");
+        }
+        q_src.label = @"uocr_decode_attention_q_f16";
+
+        id<MTLBuffer> k_cache = [ctx->device newBufferWithBytes:k_cache_f16
+                                                         length:(NSUInteger)cache_bytes
+                                                        options:MTLResourceStorageModeShared];
+        if (k_cache == nil) {
+            [q_src release];
+            return metal_fail(error, error_size, "failed to allocate Metal decode attention K cache buffer");
+        }
+        k_cache.label = @"uocr_decode_attention_k_cache_f16";
+
+        id<MTLBuffer> v_cache = [ctx->device newBufferWithBytes:v_cache_f16
+                                                         length:(NSUInteger)cache_bytes
+                                                        options:MTLResourceStorageModeShared];
+        if (v_cache == nil) {
+            [k_cache release];
+            [q_src release];
+            return metal_fail(error, error_size, "failed to allocate Metal decode attention V cache buffer");
+        }
+        v_cache.label = @"uocr_decode_attention_v_cache_f16";
+
+        id<MTLBuffer> dst = [ctx->device newBufferWithLength:(NSUInteger)output_bytes options:MTLResourceStorageModeShared];
+        if (dst == nil) {
+            [v_cache release];
+            [k_cache release];
+            [q_src release];
+            return metal_fail(error, error_size, "failed to allocate Metal decode attention output buffer");
+        }
+        dst.label = @"uocr_decode_attention_output";
+        memset([dst contents], 0, (size_t)output_bytes);
+
+        id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
+        if (cb == nil) {
+            [dst release];
+            [v_cache release];
+            [k_cache release];
+            [q_src release];
+            return metal_fail(error, error_size, "failed to create Metal decode attention command buffer");
+        }
+        cb.label = @"uocr_decode_attention_command_buffer";
+
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        if (enc == nil) {
+            [dst release];
+            [v_cache release];
+            [k_cache release];
+            [q_src release];
+            return metal_fail(error, error_size, "failed to create Metal decode attention command encoder");
+        }
+
+        uocr_metal_decode_attention_params params;
+        memset(&params, 0, sizeof(params));
+        params.batch_slots = batch_slots;
+        params.cache_token_capacity = (uint32_t)cache_token_capacity_u64;
+        params.layer = layer;
+        params.slot = slot;
+        params.prompt_length = prompt_length;
+        params.generated_count = generated_count;
+        params.attention_length = attention_length;
+        params.first_generated = first_generated;
+        params.heads = UOCR_ATTENTION_HEADS;
+        params.head_dim = UOCR_HEAD_DIM;
+        params.ring_window = UOCR_GENERATED_RING_WINDOW;
+        params.scale = 1.0f / sqrtf((float)UOCR_HEAD_DIM);
+
+        [enc setComputePipelineState:pipeline];
+        [enc setBuffer:q_src offset:0u atIndex:0u];
+        [enc setBuffer:k_cache offset:0u atIndex:1u];
+        [enc setBuffer:v_cache offset:0u atIndex:2u];
+        [enc setBuffer:dst offset:0u atIndex:3u];
+        [enc setBytes:&params length:sizeof(params) atIndex:4u];
+        [enc setThreadgroupMemoryLength:(NSUInteger)threadgroup_bytes atIndex:0u];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)UOCR_ATTENTION_HEADS, 1u, 1u)
+             threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1u, 1u)];
+        [enc endEncoding];
+
+        [cb commit];
+        [cb waitUntilCompleted];
+        if (cb.status == MTLCommandBufferStatusError) {
+            NSString *description = cb.error != nil ? [cb.error localizedDescription] : @"unknown command-buffer error";
+            [dst release];
+            [v_cache release];
+            [k_cache release];
+            [q_src release];
+            return metal_fail(error, error_size, "Metal decode attention command failed: %s", [description UTF8String]);
+        }
+
+        memcpy(out, [dst contents], (size_t)output_bytes);
+        [dst release];
+        [v_cache release];
+        [k_cache release];
         [q_src release];
     }
 

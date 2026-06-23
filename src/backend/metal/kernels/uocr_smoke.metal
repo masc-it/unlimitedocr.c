@@ -772,6 +772,135 @@ kernel void uocr_prefill_attention_varlen_f16_to_f32(device const half *q_src [[
     dst[dst_index] = l > 0.0f ? acc / l : 0.0f;
 }
 
+struct UocrDecodeAttentionParams {
+    uint batch_slots;
+    uint cache_token_capacity;
+    uint layer;
+    uint slot;
+    uint prompt_length;
+    uint generated_count;
+    uint attention_length;
+    uint first_generated;
+    uint heads;
+    uint head_dim;
+    uint ring_window;
+    float scale;
+};
+
+static inline uint uocr_decode_attention_cache_token(constant UocrDecodeAttentionParams &params,
+                                                     uint attention_index) {
+    if (attention_index < params.prompt_length) {
+        return attention_index;
+    }
+    const uint generated_index = params.first_generated + (attention_index - params.prompt_length);
+    return params.prompt_length + (generated_index % params.ring_window);
+}
+
+static inline ulong uocr_decode_attention_cache_index(constant UocrDecodeAttentionParams &params,
+                                                      uint cache_token,
+                                                      uint head,
+                                                      uint dim) {
+    return (((ulong(params.layer) * ulong(params.batch_slots) + ulong(params.slot)) *
+             ulong(params.cache_token_capacity) + ulong(cache_token)) *
+            ulong(params.heads) + ulong(head)) * ulong(params.head_dim) + ulong(dim);
+}
+
+kernel void uocr_decode_attention_f16_to_f16(device const half *q_src [[buffer(0)]],
+                                             device const half *k_cache [[buffer(1)]],
+                                             device const half *v_cache [[buffer(2)]],
+                                             device half *dst [[buffer(3)]],
+                                             constant UocrDecodeAttentionParams &params [[buffer(4)]],
+                                             threadgroup float *partials [[threadgroup(0)]],
+                                             uint head [[threadgroup_position_in_grid]],
+                                             uint tid [[thread_index_in_threadgroup]],
+                                             uint ntg [[threads_per_threadgroup]]) {
+    if (head >= params.heads || tid >= params.head_dim || ntg < params.head_dim || params.attention_length == 0u) {
+        return;
+    }
+
+    const ulong q_index = ulong(head) * ulong(params.head_dim) + ulong(tid);
+    const float q = float(q_src[q_index]);
+    float acc = 0.0f;
+    float m = -3.4028234663852886e38f;
+    float l = 0.0f;
+    for (uint attention_index = 0u; attention_index < params.attention_length; ++attention_index) {
+        const uint cache_token = uocr_decode_attention_cache_token(params, attention_index);
+        if (cache_token >= params.cache_token_capacity) {
+            partials[tid] = 0.0f;
+        } else {
+            const ulong k_index = uocr_decode_attention_cache_index(params, cache_token, head, tid);
+            partials[tid] = q * float(k_cache[k_index]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride = ntg >> 1u; stride > 0u; stride >>= 1u) {
+            if (tid < stride) {
+                partials[tid] += partials[tid + stride];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        const float score = partials[0] * params.scale;
+        const float mnew = max(m, score);
+        const float corr = exp(m - mnew);
+        const float e = exp(score - mnew);
+        const ulong v_index = uocr_decode_attention_cache_index(params, cache_token, head, tid);
+        acc = acc * corr + e * float(v_cache[v_index]);
+        l = l * corr + e;
+        m = mnew;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    dst[q_index] = half(l > 0.0f ? acc / l : 0.0f);
+}
+
+kernel void uocr_decode_attention_f16_to_f32(device const half *q_src [[buffer(0)]],
+                                             device const half *k_cache [[buffer(1)]],
+                                             device const half *v_cache [[buffer(2)]],
+                                             device float *dst [[buffer(3)]],
+                                             constant UocrDecodeAttentionParams &params [[buffer(4)]],
+                                             threadgroup float *partials [[threadgroup(0)]],
+                                             uint head [[threadgroup_position_in_grid]],
+                                             uint tid [[thread_index_in_threadgroup]],
+                                             uint ntg [[threads_per_threadgroup]]) {
+    if (head >= params.heads || tid >= params.head_dim || ntg < params.head_dim || params.attention_length == 0u) {
+        return;
+    }
+
+    const ulong q_index = ulong(head) * ulong(params.head_dim) + ulong(tid);
+    const float q = float(q_src[q_index]);
+    float acc = 0.0f;
+    float m = -3.4028234663852886e38f;
+    float l = 0.0f;
+    for (uint attention_index = 0u; attention_index < params.attention_length; ++attention_index) {
+        const uint cache_token = uocr_decode_attention_cache_token(params, attention_index);
+        if (cache_token >= params.cache_token_capacity) {
+            partials[tid] = 0.0f;
+        } else {
+            const ulong k_index = uocr_decode_attention_cache_index(params, cache_token, head, tid);
+            partials[tid] = q * float(k_cache[k_index]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride = ntg >> 1u; stride > 0u; stride >>= 1u) {
+            if (tid < stride) {
+                partials[tid] += partials[tid + stride];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        const float score = partials[0] * params.scale;
+        const float mnew = max(m, score);
+        const float corr = exp(m - mnew);
+        const float e = exp(score - mnew);
+        const ulong v_index = uocr_decode_attention_cache_index(params, cache_token, head, tid);
+        acc = acc * corr + e * float(v_cache[v_index]);
+        l = l * corr + e;
+        m = mnew;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    dst[q_index] = l > 0.0f ? acc / l : 0.0f;
+}
+
 struct UocrKVCacheWriteParams {
     uint n_tokens;
     uint batch_slots;
