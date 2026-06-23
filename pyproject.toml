@@ -1,0 +1,24 @@
+[project]
+name = "unlimitedocr-c"
+version = "0.1.0"
+description = "Python frontend and C inference core scaffolding for baidu/Unlimited-OCR"
+readme = "README.md"
+authors = [
+    { name = "Mauro Sciancalepore", email = "maurosciancalepore98@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "numpy>=2",
+    "pillow>=10",
+    "safetensors>=0.4",
+    "tokenizers>=0.20",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+]
+
+[build-system]
+requires = ["uv_build>=0.10.0,<0.11.0"]
+build-backend = "uv_build"

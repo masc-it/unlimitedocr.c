@@ -1,0 +1,85 @@
+#!/usr/bin/env python3
+"""Emit Python prepared-request fixtures for Unlimited-OCR."""
+
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+import sys
+
+import numpy as np
+
+from unlimitedocr_c.frontend import (
+    MULTI_PROMPT,
+    PRESETS,
+    SINGLE_PROMPT,
+    prepare_image,
+    prepare_pages,
+    prepare_text,
+    save_prepared_request,
+)
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--image", type=Path, help="single image path")
+    source.add_argument("--page", dest="pages", action="append", type=Path, help="page image path; repeat for multi-page")
+    source.add_argument("--text-only", action="store_true", help="emit a text-only prepared request")
+    parser.add_argument("--out", type=Path, required=True, help="output fixture directory")
+    parser.add_argument("--prompt", default=None, help="prompt text; defaults match upstream wrappers")
+    parser.add_argument("--preset", choices=sorted(PRESETS), default="gundam", help="single-image preset")
+    parser.add_argument("--tokenizer", type=Path, default=None, help="path to tokenizer.json")
+    parser.add_argument("--max-length", type=int, default=32768, help="upstream-style total max length")
+    parser.add_argument("--max-new-tokens", type=int, default=None, help="override generated-token budget")
+    parser.add_argument("--no-repeat-ngram-size", type=int, default=35)
+    parser.add_argument("--ngram-window", type=int, default=None, help="default: 128 single image, 1024 multi-page, 0 text-only")
+    parser.add_argument("--dtype", choices=("float16", "float32"), default="float16")
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(sys.argv[1:] if argv is None else argv)
+    dtype = np.float16 if args.dtype == "float16" else np.float32
+
+    if args.text_only:
+        request = prepare_text(
+            args.prompt or "Hello",
+            tokenizer_path=args.tokenizer,
+            max_length=args.max_length,
+            max_new_tokens=args.max_new_tokens,
+            no_repeat_ngram_size=args.no_repeat_ngram_size if args.ngram_window else 0,
+            no_repeat_window=args.ngram_window or 0,
+        )
+    elif args.pages:
+        request = prepare_pages(
+            args.pages,
+            prompt=args.prompt or MULTI_PROMPT,
+            tokenizer_path=args.tokenizer,
+            max_length=args.max_length,
+            max_new_tokens=args.max_new_tokens,
+            no_repeat_ngram_size=args.no_repeat_ngram_size,
+            no_repeat_window=args.ngram_window or 1024,
+            dtype=dtype,
+        )
+    else:
+        request = prepare_image(
+            args.image,
+            prompt=args.prompt or SINGLE_PROMPT,
+            preset=args.preset,
+            tokenizer_path=args.tokenizer,
+            max_length=args.max_length,
+            max_new_tokens=args.max_new_tokens,
+            no_repeat_ngram_size=args.no_repeat_ngram_size,
+            no_repeat_window=args.ngram_window or 128,
+            dtype=dtype,
+        )
+
+    save_prepared_request(request, args.out)
+    print(f"wrote fixture: {args.out}")
+    print(f"tokens={request.n_tokens} image_tokens={request.expected_visual_tokens} views={len(request.views)}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

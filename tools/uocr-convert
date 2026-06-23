@@ -1,0 +1,7 @@
+#!/usr/bin/env python3
+"""Dry-run converter entry point for development builds."""
+
+from unlimitedocr_c.convert import main
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,44 @@
+#ifndef UOCR_MODEL_CONSTANTS_H
+#define UOCR_MODEL_CONSTANTS_H
+
+#include <stdint.h>
+
+#define UOCR_VOCAB_SIZE 129280u
+#define UOCR_BPE_VOCAB_SIZE 128000u
+#define UOCR_ADDED_TOKEN_COUNT 830u
+
+#define UOCR_TOKEN_BOS 0
+#define UOCR_TOKEN_EOS 1
+#define UOCR_TOKEN_PAD 2
+#define UOCR_TOKEN_IMAGE 128815
+
+#define UOCR_HIDDEN_SIZE 1280u
+#define UOCR_DECODER_LAYERS 12u
+#define UOCR_ATTENTION_HEADS 10u
+#define UOCR_KV_HEADS 10u
+#define UOCR_HEAD_DIM 128u
+#define UOCR_MAX_POSITIONS 32768u
+#define UOCR_GENERATED_RING_WINDOW 128u
+
+#define UOCR_GLOBAL_VIEW_SIZE 1024u
+#define UOCR_LOCAL_VIEW_SIZE 640u
+#define UOCR_VISION_PATCH_SIZE 16u
+#define UOCR_DOWNSAMPLE_RATIO 4u
+#define UOCR_GLOBAL_GRID_QUERIES 16u
+#define UOCR_LOCAL_GRID_QUERIES 10u
+#define UOCR_GLOBAL_VISUAL_TOKENS 273u
+#define UOCR_GLOBAL_ROW_NEWLINE_TOKENS 272u
+
+#define UOCR_DEFAULT_MAX_BATCH 1u
+#define UOCR_DEFAULT_MAX_PROMPT_TOKENS 4096u
+#define UOCR_DEFAULT_MAX_GEN_TOKENS 512u
+
+static inline uint32_t uocr_global_visual_token_count(void) {
+    return UOCR_GLOBAL_VISUAL_TOKENS;
+}
+
+static inline uint32_t uocr_local_visual_token_count(uint32_t grid_w, uint32_t grid_h) {
+    return (UOCR_LOCAL_GRID_QUERIES * grid_w + 1u) * (UOCR_LOCAL_GRID_QUERIES * grid_h);
+}
+
+#endif /* UOCR_MODEL_CONSTANTS_H */
