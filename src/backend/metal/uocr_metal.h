@@ -523,6 +523,20 @@ int uocr_metal_context_clip_attention_f16(uocr_metal_context *ctx,
                                           char *error,
                                           size_t error_size);
 
+/* Diagnostic CLIP attention output projection helper. Computes the biased
+ * [1024,1024] out_proj linear over [tokens,1024] attention results for either
+ * 257-token global or 101-token local CLIP sequences.
+ */
+int uocr_metal_context_clip_output_projection_f16(uocr_metal_context *ctx,
+                                                  const uint16_t *input_f16,
+                                                  const uint16_t *weight_f16,
+                                                  const uint16_t *bias_f16,
+                                                  uint32_t token_count,
+                                                  uocr_metal_dense_output_type output_type,
+                                                  void *out,
+                                                  char *error,
+                                                  size_t error_size);
+
 /* Diagnostic SAM window-attention helper for non-global transformer blocks.
  * Q/K/V are fp16 tensors laid out as [n_windows,14*14,12,64] (equivalent to
  * window-major rows with flattened [head,dim] channels). The helper computes

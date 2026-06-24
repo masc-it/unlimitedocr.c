@@ -778,7 +778,7 @@ Do not begin this section until sections 14.5 and 15.1 pass for fp16 single-requ
   - [x] LayerNorm eps `1e-5`
   - [x] QKV projection `[3072,1024]` with bias
   - [x] full attention, 16 heads, head dim `64`
-  - [ ] output projection
+  - [x] output projection
   - [ ] QuickGELU: `x * sigmoid(1.702*x)`
   - [ ] MLP `1024 -> 4096 -> 1024`
   - [ ] residual connections

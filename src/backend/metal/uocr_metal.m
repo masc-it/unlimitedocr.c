@@ -7745,6 +7745,55 @@ int uocr_metal_context_clip_attention_f16(uocr_metal_context *ctx,
     return result;
 }
 
+int uocr_metal_context_clip_output_projection_f16(uocr_metal_context *ctx,
+                                                  const uint16_t *input_f16,
+                                                  const uint16_t *weight_f16,
+                                                  const uint16_t *bias_f16,
+                                                  uint32_t token_count,
+                                                  uocr_metal_dense_output_type output_type,
+                                                  void *out,
+                                                  char *error,
+                                                  size_t error_size) {
+    metal_clear_error(error, error_size);
+    if (ctx == NULL || input_f16 == NULL || weight_f16 == NULL || bias_f16 == NULL || out == NULL) {
+        return metal_fail(error, error_size, "invalid Metal CLIP output projection request");
+    }
+    if (token_count != UOCR_CLIP_GLOBAL_TOKENS && token_count != UOCR_CLIP_LOCAL_TOKENS) {
+        return metal_fail(error, error_size, "invalid Metal CLIP output projection token count %u", token_count);
+    }
+    if (output_type != UOCR_METAL_DENSE_OUTPUT_F16 && output_type != UOCR_METAL_DENSE_OUTPUT_F32) {
+        return metal_fail(error,
+                          error_size,
+                          "unsupported Metal CLIP output projection output type %d",
+                          (int)output_type);
+    }
+    if (UOCR_CLIP_HIDDEN_SIZE != 1024u || UOCR_CLIP_GLOBAL_TOKENS != 257u || UOCR_CLIP_LOCAL_TOKENS != 101u) {
+        return metal_fail(error, error_size, "Metal CLIP output projection constants are inconsistent");
+    }
+
+    if (!uocr_metal_context_dense_f16(ctx,
+                                      input_f16,
+                                      weight_f16,
+                                      bias_f16,
+                                      token_count,
+                                      UOCR_CLIP_HIDDEN_SIZE,
+                                      UOCR_CLIP_HIDDEN_SIZE,
+                                      output_type,
+                                      out,
+                                      error,
+                                      error_size)) {
+        char detail[512];
+        (void)snprintf(detail,
+                       sizeof(detail),
+                       "%s",
+                       (error != NULL && error[0] != '\0') ? error : "unknown error");
+        return metal_fail(error, error_size, "failed to compute Metal CLIP output projection: %s", detail);
+    }
+
+    metal_clear_error(error, error_size);
+    return 1;
+}
+
 static int metal_context_sam_attention_f16(uocr_metal_context *ctx,
                                            const uint16_t *q_f16,
                                            const uint16_t *k_f16,
