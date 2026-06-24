@@ -1098,6 +1098,79 @@ kernel void uocr_sam_neck_conv1x1_f16_to_f32(device const half *src_bhwc [[buffe
     }
 }
 
+struct UocrSamLayerNorm2dParams {
+    uint grid_width;
+    uint grid_height;
+    uint channels;
+    float eps;
+};
+
+static inline float uocr_sam_layernorm2d_value(device const half *src_nchw,
+                                               device const half *weight,
+                                               device const half *bias,
+                                               constant UocrSamLayerNorm2dParams &params,
+                                               uint spatial,
+                                               uint channel,
+                                               threadgroup float *partials,
+                                               uint tid,
+                                               uint ntg) {
+    const uint spatial_size = params.grid_width * params.grid_height;
+    float value = 0.0f;
+    if (tid < params.channels) {
+        value = float(src_nchw[tid * spatial_size + spatial]);
+    }
+    partials[tid] = tid < params.channels ? value : 0.0f;
+    partials[ntg + tid] = tid < params.channels ? value * value : 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = ntg >> 1; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            partials[tid] += partials[tid + stride];
+            partials[ntg + tid] += partials[ntg + tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    const float inv_channels = 1.0f / float(params.channels);
+    const float mean = partials[0] * inv_channels;
+    const float variance = max(partials[ntg] * inv_channels - mean * mean, 0.0f);
+    return (value - mean) * rsqrt(variance + params.eps) * float(weight[channel]) + float(bias[channel]);
+}
+
+kernel void uocr_sam_layernorm2d_f16_to_f16(device const half *src_nchw [[buffer(0)]],
+                                            device const half *weight [[buffer(1)]],
+                                            device const half *bias [[buffer(2)]],
+                                            device half *dst_nchw [[buffer(3)]],
+                                            constant UocrSamLayerNorm2dParams &params [[buffer(4)]],
+                                            threadgroup float *partials [[threadgroup(0)]],
+                                            uint spatial [[threadgroup_position_in_grid]],
+                                            uint tid [[thread_index_in_threadgroup]],
+                                            uint ntg [[threads_per_threadgroup]]) {
+    const uint spatial_size = params.grid_width * params.grid_height;
+    if (spatial >= spatial_size || tid >= params.channels) {
+        return;
+    }
+    const float value = uocr_sam_layernorm2d_value(src_nchw, weight, bias, params, spatial, tid, partials, tid, ntg);
+    dst_nchw[tid * spatial_size + spatial] = half(value);
+}
+
+kernel void uocr_sam_layernorm2d_f16_to_f32(device const half *src_nchw [[buffer(0)]],
+                                            device const half *weight [[buffer(1)]],
+                                            device const half *bias [[buffer(2)]],
+                                            device float *dst_nchw [[buffer(3)]],
+                                            constant UocrSamLayerNorm2dParams &params [[buffer(4)]],
+                                            threadgroup float *partials [[threadgroup(0)]],
+                                            uint spatial [[threadgroup_position_in_grid]],
+                                            uint tid [[thread_index_in_threadgroup]],
+                                            uint ntg [[threads_per_threadgroup]]) {
+    const uint spatial_size = params.grid_width * params.grid_height;
+    if (spatial >= spatial_size || tid >= params.channels) {
+        return;
+    }
+    const float value = uocr_sam_layernorm2d_value(src_nchw, weight, bias, params, spatial, tid, partials, tid, ntg);
+    dst_nchw[tid * spatial_size + spatial] = value;
+}
+
 struct UocrSamResidualParams {
     uint n_rows;
     uint hidden_size;

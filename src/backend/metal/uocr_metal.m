@@ -355,6 +355,13 @@ typedef struct uocr_metal_sam_neck_conv1x1_params {
     uint32_t out_channels;
 } uocr_metal_sam_neck_conv1x1_params;
 
+typedef struct uocr_metal_sam_layernorm2d_params {
+    uint32_t grid_width;
+    uint32_t grid_height;
+    uint32_t channels;
+    float eps;
+} uocr_metal_sam_layernorm2d_params;
+
 typedef struct uocr_metal_sam_rel_pos_attention_params {
     uint32_t windows;
     uint32_t grid_width;
@@ -390,6 +397,8 @@ _Static_assert(sizeof(uocr_metal_sam_window_partition_params) == 32u,
                "uocr_metal_sam_window_partition_params ABI mismatch");
 _Static_assert(sizeof(uocr_metal_sam_neck_conv1x1_params) == 16u,
                "uocr_metal_sam_neck_conv1x1_params ABI mismatch");
+_Static_assert(sizeof(uocr_metal_sam_layernorm2d_params) == 16u,
+               "uocr_metal_sam_layernorm2d_params ABI mismatch");
 _Static_assert(sizeof(uocr_metal_sam_rel_pos_attention_params) == 48u,
                "uocr_metal_sam_rel_pos_attention_params ABI mismatch");
 _Static_assert(sizeof(uocr_metal_sam_residual_params) == 16u,
@@ -6366,6 +6375,175 @@ int uocr_metal_context_sam_neck_conv1x1_f16(uocr_metal_context *ctx,
 
     cleanup_sam_neck_conv1x1:
         [dst release];
+        [weight release];
+        [src release];
+    }
+
+    if (result) {
+        metal_clear_error(error, error_size);
+    }
+    return result;
+}
+
+int uocr_metal_context_sam_layernorm2d_f16(uocr_metal_context *ctx,
+                                           const uint16_t *input_nchw_f16,
+                                           const uint16_t *weight_f16,
+                                           const uint16_t *bias_f16,
+                                           uint32_t grid_w,
+                                           uint32_t grid_h,
+                                           uocr_metal_dense_output_type output_type,
+                                           void *out_nchw,
+                                           char *error,
+                                           size_t error_size) {
+    metal_clear_error(error, error_size);
+    if (ctx == NULL || input_nchw_f16 == NULL || weight_f16 == NULL || bias_f16 == NULL || out_nchw == NULL) {
+        return metal_fail(error, error_size, "invalid Metal SAM LayerNorm2d request");
+    }
+    if (output_type != UOCR_METAL_DENSE_OUTPUT_F16 && output_type != UOCR_METAL_DENSE_OUTPUT_F32) {
+        return metal_fail(error, error_size, "unsupported Metal SAM LayerNorm2d output type %d", (int)output_type);
+    }
+    if (grid_w == 0u || grid_h == 0u || grid_w > UOCR_SAM_MAX_GRID_SIZE || grid_h > UOCR_SAM_MAX_GRID_SIZE) {
+        return metal_fail(error, error_size, "invalid Metal SAM LayerNorm2d grid %ux%u", grid_w, grid_h);
+    }
+    if (UOCR_SAM_NECK_CHANNELS != 256u) {
+        return metal_fail(error, error_size, "Metal SAM LayerNorm2d constants are inconsistent");
+    }
+
+    uint64_t spatial = 0u;
+    uint64_t value_count = 0u;
+    uint64_t tensor_bytes = 0u;
+    uint64_t parameter_bytes = 0u;
+    uint64_t output_bytes = 0u;
+    const uint64_t output_element_bytes = output_type == UOCR_METAL_DENSE_OUTPUT_F16 ? 2u : (uint64_t)sizeof(float);
+    if (!checked_mul_u64((uint64_t)grid_w, (uint64_t)grid_h, &spatial) ||
+        !checked_mul_u64(spatial, (uint64_t)UOCR_SAM_NECK_CHANNELS, &value_count) ||
+        !checked_mul_u64(value_count, 2u, &tensor_bytes) ||
+        !checked_mul_u64((uint64_t)UOCR_SAM_NECK_CHANNELS, 2u, &parameter_bytes) ||
+        !checked_mul_u64(value_count, output_element_bytes, &output_bytes) || value_count > (uint64_t)UINT32_MAX ||
+        spatial > (uint64_t)UINT32_MAX || tensor_bytes > (uint64_t)SIZE_MAX ||
+        parameter_bytes > (uint64_t)SIZE_MAX || output_bytes > (uint64_t)SIZE_MAX) {
+        return metal_fail(error, error_size, "Metal SAM LayerNorm2d byte-size overflow");
+    }
+
+    const uint64_t max_buffer_length = metal_device_max_buffer_length(ctx->device);
+    if (tensor_bytes > max_buffer_length || parameter_bytes > max_buffer_length || output_bytes > max_buffer_length) {
+        return metal_fail(error,
+                          error_size,
+                          "Metal SAM LayerNorm2d buffers exceed maxBufferLength %llu",
+                          (unsigned long long)max_buffer_length);
+    }
+
+    int result = 0;
+    @autoreleasepool {
+        const char *function_name = output_type == UOCR_METAL_DENSE_OUTPUT_F16 ?
+                                        "uocr_sam_layernorm2d_f16_to_f16" :
+                                        "uocr_sam_layernorm2d_f16_to_f32";
+        id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, function_name, error, error_size);
+        if (pipeline == nil) {
+            return 0;
+        }
+
+        id<MTLBuffer> src = nil;
+        id<MTLBuffer> weight = nil;
+        id<MTLBuffer> bias = nil;
+        id<MTLBuffer> dst = nil;
+        id<MTLCommandBuffer> cb = nil;
+        id<MTLComputeCommandEncoder> enc = nil;
+
+        src = [ctx->device newBufferWithBytes:input_nchw_f16
+                                       length:(NSUInteger)tensor_bytes
+                                      options:MTLResourceStorageModeShared];
+        if (src == nil) {
+            result = metal_fail(error, error_size, "failed to allocate Metal SAM LayerNorm2d input buffer");
+            goto cleanup_sam_layernorm2d;
+        }
+        src.label = @"uocr_sam_layernorm2d_input_nchw_f16";
+
+        weight = [ctx->device newBufferWithBytes:weight_f16
+                                          length:(NSUInteger)parameter_bytes
+                                         options:MTLResourceStorageModeShared];
+        if (weight == nil) {
+            result = metal_fail(error, error_size, "failed to allocate Metal SAM LayerNorm2d weight buffer");
+            goto cleanup_sam_layernorm2d;
+        }
+        weight.label = @"uocr_sam_layernorm2d_weight_f16";
+
+        bias = [ctx->device newBufferWithBytes:bias_f16
+                                        length:(NSUInteger)parameter_bytes
+                                       options:MTLResourceStorageModeShared];
+        if (bias == nil) {
+            result = metal_fail(error, error_size, "failed to allocate Metal SAM LayerNorm2d bias buffer");
+            goto cleanup_sam_layernorm2d;
+        }
+        bias.label = @"uocr_sam_layernorm2d_bias_f16";
+
+        dst = [ctx->device newBufferWithLength:(NSUInteger)output_bytes options:MTLResourceStorageModeShared];
+        if (dst == nil) {
+            result = metal_fail(error, error_size, "failed to allocate Metal SAM LayerNorm2d output buffer");
+            goto cleanup_sam_layernorm2d;
+        }
+        dst.label = @"uocr_sam_layernorm2d_output_nchw";
+        memset([dst contents], 0, (size_t)output_bytes);
+
+        const NSUInteger threads_per_group = metal_power2_threadgroup_width((NSUInteger)UOCR_SAM_NECK_CHANNELS,
+                                                                            pipeline.maxTotalThreadsPerThreadgroup);
+        if (threads_per_group < (NSUInteger)UOCR_SAM_NECK_CHANNELS) {
+            result = metal_fail(error,
+                                error_size,
+                                "Metal SAM LayerNorm2d needs at least %u threads",
+                                UOCR_SAM_NECK_CHANNELS);
+            goto cleanup_sam_layernorm2d;
+        }
+        const uint64_t threadgroup_bytes = 2u * (uint64_t)threads_per_group * (uint64_t)sizeof(float);
+        if (threadgroup_bytes > (uint64_t)ctx->device.maxThreadgroupMemoryLength) {
+            result = metal_fail(error, error_size, "Metal SAM LayerNorm2d threadgroup memory exceeds device limit");
+            goto cleanup_sam_layernorm2d;
+        }
+
+        cb = [ctx->queue commandBuffer];
+        if (cb == nil) {
+            result = metal_fail(error, error_size, "failed to create Metal SAM LayerNorm2d command buffer");
+            goto cleanup_sam_layernorm2d;
+        }
+        cb.label = @"uocr_sam_layernorm2d_command_buffer";
+
+        enc = [cb computeCommandEncoder];
+        if (enc == nil) {
+            result = metal_fail(error, error_size, "failed to create Metal SAM LayerNorm2d command encoder");
+            goto cleanup_sam_layernorm2d;
+        }
+
+        uocr_metal_sam_layernorm2d_params params;
+        params.grid_width = grid_w;
+        params.grid_height = grid_h;
+        params.channels = UOCR_SAM_NECK_CHANNELS;
+        params.eps = 1.0e-6f;
+
+        [enc setComputePipelineState:pipeline];
+        [enc setBuffer:src offset:0u atIndex:0u];
+        [enc setBuffer:weight offset:0u atIndex:1u];
+        [enc setBuffer:bias offset:0u atIndex:2u];
+        [enc setBuffer:dst offset:0u atIndex:3u];
+        [enc setBytes:&params length:sizeof(params) atIndex:4u];
+        [enc setThreadgroupMemoryLength:(NSUInteger)threadgroup_bytes atIndex:0u];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)spatial, 1u, 1u)
+             threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1u, 1u)];
+        [enc endEncoding];
+
+        [cb commit];
+        [cb waitUntilCompleted];
+        if (cb.status == MTLCommandBufferStatusError) {
+            NSString *description = cb.error != nil ? [cb.error localizedDescription] : @"unknown command-buffer error";
+            result = metal_fail(error, error_size, "Metal SAM LayerNorm2d command failed: %s", [description UTF8String]);
+            goto cleanup_sam_layernorm2d;
+        }
+
+        memcpy(out_nchw, [dst contents], (size_t)output_bytes);
+        result = 1;
+
+    cleanup_sam_layernorm2d:
+        [dst release];
+        [bias release];
         [weight release];
         [src release];
     }

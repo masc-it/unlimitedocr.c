@@ -767,6 +767,161 @@ static int test_metal_sam_neck_conv1x1_f16(void) {
     return 0;
 }
 
+static float sam_layernorm2d_expected(const uint16_t *input,
+                                       const uint16_t *weight,
+                                       const uint16_t *bias,
+                                       uint32_t grid_w,
+                                       uint32_t grid_h,
+                                       uint32_t y,
+                                       uint32_t x,
+                                       uint32_t channel) {
+    const uint32_t spatial = y * grid_w + x;
+    const uint32_t spatial_size = grid_w * grid_h;
+    double sum = 0.0;
+    double sq_sum = 0.0;
+    for (uint32_t c = 0u; c < UOCR_SAM_NECK_CHANNELS; ++c) {
+        const float v = f16_bits_to_f32(input[(size_t)c * spatial_size + spatial]);
+        sum += (double)v;
+        sq_sum += (double)v * (double)v;
+    }
+    const float mean = (float)(sum / (double)UOCR_SAM_NECK_CHANNELS);
+    float variance = (float)(sq_sum / (double)UOCR_SAM_NECK_CHANNELS) - mean * mean;
+    if (variance < 0.0f) {
+        variance = 0.0f;
+    }
+    const float v = f16_bits_to_f32(input[sam_neck_nchw_index(grid_w, grid_h, channel, y, x)]);
+    return (v - mean) / sqrtf(variance + 1.0e-6f) * f16_bits_to_f32(weight[channel]) + f16_bits_to_f32(bias[channel]);
+}
+
+static int test_metal_sam_layernorm2d_f16(void) {
+    if (!uocr_metal_is_available()) {
+        return 0;
+    }
+
+    enum { GRID_W = 4u, GRID_H = 3u, CHANNELS = UOCR_SAM_NECK_CHANNELS };
+    const size_t value_count = (size_t)CHANNELS * GRID_H * GRID_W;
+    uint16_t *input = (uint16_t *)calloc(value_count, sizeof(uint16_t));
+    uint16_t *weight = (uint16_t *)calloc(CHANNELS, sizeof(uint16_t));
+    uint16_t *bias = (uint16_t *)calloc(CHANNELS, sizeof(uint16_t));
+    float *out_f32 = (float *)calloc(value_count, sizeof(float));
+    uint16_t *out_f16 = (uint16_t *)calloc(value_count, sizeof(uint16_t));
+    CHECK(input != NULL);
+    CHECK(weight != NULL);
+    CHECK(bias != NULL);
+    CHECK(out_f32 != NULL);
+    CHECK(out_f16 != NULL);
+    CHECK(UOCR_SAM_NECK_CHANNELS == 256u);
+
+    for (uint32_t c = 0u; c < CHANNELS; ++c) {
+        weight[c] = f32_to_f16_bits(0.75f + (float)(c % 11u) * 0.03125f);
+        bias[c] = f32_to_f16_bits(((int)(c % 13u) - 6) * 0.0125f);
+        for (uint32_t y = 0u; y < GRID_H; ++y) {
+            for (uint32_t x = 0u; x < GRID_W; ++x) {
+                const int mod = (int)((c * 17u + y * 23u + x * 5u) % 101u) - 50;
+                input[sam_neck_nchw_index(GRID_W, GRID_H, c, y, x)] = f32_to_f16_bits((float)mod * 0.006f);
+            }
+        }
+    }
+
+    char error[1024];
+    memset(error, 0, sizeof(error));
+    uocr_metal_context *ctx = uocr_metal_context_create(UOCR_TEST_METAL_RESOURCE_PATH, error, sizeof(error));
+    CHECK(ctx != NULL);
+
+    CHECK(uocr_metal_context_sam_layernorm2d_f16(ctx,
+                                                  input,
+                                                  weight,
+                                                  bias,
+                                                  GRID_W,
+                                                  GRID_H,
+                                                  UOCR_METAL_DENSE_OUTPUT_F32,
+                                                  out_f32,
+                                                  error,
+                                                  sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+
+    struct ln2d_sample {
+        uint32_t y;
+        uint32_t x;
+        uint32_t channel;
+    } samples[] = {
+        {0u, 0u, 0u},
+        {0u, 3u, 7u},
+        {1u, 2u, 111u},
+        {2u, 1u, 200u},
+        {2u, 3u, CHANNELS - 1u},
+    };
+    for (size_t i = 0u; i < sizeof(samples) / sizeof(samples[0]); ++i) {
+        const size_t idx = sam_neck_nchw_index(GRID_W, GRID_H, samples[i].channel, samples[i].y, samples[i].x);
+        const float expected = sam_layernorm2d_expected(input,
+                                                        weight,
+                                                        bias,
+                                                        GRID_W,
+                                                        GRID_H,
+                                                        samples[i].y,
+                                                        samples[i].x,
+                                                        samples[i].channel);
+        CHECK(isfinite(expected));
+        CHECK(fabsf(out_f32[idx] - expected) <= 8.0e-5f);
+    }
+
+    CHECK(uocr_metal_context_sam_layernorm2d_f16(ctx,
+                                                  input,
+                                                  weight,
+                                                  bias,
+                                                  GRID_W,
+                                                  GRID_H,
+                                                  UOCR_METAL_DENSE_OUTPUT_F16,
+                                                  out_f16,
+                                                  error,
+                                                  sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    for (size_t i = 0u; i < sizeof(samples) / sizeof(samples[0]); ++i) {
+        const size_t idx = sam_neck_nchw_index(GRID_W, GRID_H, samples[i].channel, samples[i].y, samples[i].x);
+        const float expected = sam_layernorm2d_expected(input,
+                                                        weight,
+                                                        bias,
+                                                        GRID_W,
+                                                        GRID_H,
+                                                        samples[i].y,
+                                                        samples[i].x,
+                                                        samples[i].channel);
+        CHECK(fabsf(f16_bits_to_f32(out_f16[idx]) - expected) <= 2.0e-3f);
+    }
+
+    CHECK(uocr_metal_context_sam_layernorm2d_f16(ctx,
+                                                  input,
+                                                  weight,
+                                                  NULL,
+                                                  GRID_W,
+                                                  GRID_H,
+                                                  UOCR_METAL_DENSE_OUTPUT_F32,
+                                                  out_f32,
+                                                  error,
+                                                  sizeof(error)) == 0);
+    CHECK(strstr(error, "invalid Metal SAM LayerNorm2d") != NULL);
+
+    CHECK(uocr_metal_context_sam_layernorm2d_f16(ctx,
+                                                  input,
+                                                  weight,
+                                                  bias,
+                                                  0u,
+                                                  GRID_H,
+                                                  UOCR_METAL_DENSE_OUTPUT_F32,
+                                                  out_f32,
+                                                  error,
+                                                  sizeof(error)) == 0);
+    CHECK(strstr(error, "invalid Metal SAM LayerNorm2d grid") != NULL);
+
+    uocr_metal_context_destroy(ctx);
+    free(out_f16);
+    free(out_f32);
+    free(bias);
+    free(weight);
+    free(input);
+    return 0;
+}
+
 static int test_metal_sam_window_partition_f16(void) {
     if (!uocr_metal_is_available()) {
         return 0;
@@ -10710,6 +10865,7 @@ int main(void) {
     if (test_metal_sam_layernorm_f16() != 0) return 1;
     if (test_metal_sam_qkv_f16() != 0) return 1;
     if (test_metal_sam_neck_conv1x1_f16() != 0) return 1;
+    if (test_metal_sam_layernorm2d_f16() != 0) return 1;
     if (test_metal_sam_window_partition_f16() != 0) return 1;
     if (test_metal_sam_window_attention_f16() != 0) return 1;
     if (test_metal_sam_global_attention_f16() != 0) return 1;
