@@ -218,6 +218,27 @@ int uocr_metal_context_assemble_prompt_from_model_f16(uocr_metal_context *ctx,
                                                       char *error,
                                                       size_t error_size);
 
+/* Runtime prompt assembly into the persistent Metal prompt-embedding arena.
+ * The arena must have been allocated with uocr_metal_context_allocate_runtime_arenas().
+ * slot selects the batch slot. Tests can inspect the private arena with the
+ * readback helper below; production decoder stages should consume it in-place.
+ */
+int uocr_metal_context_assemble_prompt_from_model_to_arena_f16(uocr_metal_context *ctx,
+                                                               const int32_t *input_ids,
+                                                               uint32_t n_tokens,
+                                                               uint32_t image_span_start,
+                                                               uint32_t image_span_length,
+                                                               const uint16_t *image_features_f16,
+                                                               uint32_t slot,
+                                                               char *error,
+                                                               size_t error_size);
+int uocr_metal_context_read_prompt_arena_f16(uocr_metal_context *ctx,
+                                             uint32_t slot,
+                                             uint32_t n_tokens,
+                                             uint16_t *out_prompt_f16,
+                                             char *error,
+                                             size_t error_size);
+
 /* Diagnostic RMSNorm helper for synthetic tests. The kernel accumulates the
  * row variance in fp32 and applies fp16 learned weights.
  */

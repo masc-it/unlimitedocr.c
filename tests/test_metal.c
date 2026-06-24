@@ -694,6 +694,50 @@ static int test_metal_prompt_assembly_from_mapped_model_f16(void) {
         }
     }
 
+    CHECK(uocr_metal_context_assemble_prompt_from_model_to_arena_f16(ctx,
+                                                                     text_ids,
+                                                                     TEXT_TOKENS,
+                                                                     UINT32_MAX,
+                                                                     0u,
+                                                                     NULL,
+                                                                     0u,
+                                                                     error,
+                                                                     sizeof(error)) == 0);
+    CHECK(strstr(error, "requires allocated arenas") != NULL);
+
+    CHECK(uocr_metal_context_allocate_runtime_arenas(ctx, 2u, PROMPT_TOKENS, error, sizeof(error)) == 1);
+    CHECK(uocr_metal_context_assemble_prompt_from_model_to_arena_f16(ctx,
+                                                                     text_ids,
+                                                                     TEXT_TOKENS,
+                                                                     UINT32_MAX,
+                                                                     0u,
+                                                                     NULL,
+                                                                     0u,
+                                                                     error,
+                                                                     sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    uint16_t arena_text_out[TEXT_TOKENS * HIDDEN];
+    memset(arena_text_out, 0, sizeof(arena_text_out));
+    CHECK(uocr_metal_context_read_prompt_arena_f16(ctx, 0u, TEXT_TOKENS, arena_text_out, error, sizeof(error)) == 1);
+    CHECK(memcmp(arena_text_out, text_out, sizeof(arena_text_out)) == 0);
+
+    CHECK(uocr_metal_context_assemble_prompt_from_model_to_arena_f16(ctx,
+                                                                     prompt_ids,
+                                                                     PROMPT_TOKENS,
+                                                                     2u,
+                                                                     IMAGE_TOKENS,
+                                                                     image_features,
+                                                                     1u,
+                                                                     error,
+                                                                     sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    uint16_t arena_prompt_out[PROMPT_TOKENS * HIDDEN];
+    memset(arena_prompt_out, 0, sizeof(arena_prompt_out));
+    CHECK(uocr_metal_context_read_prompt_arena_f16(ctx, 1u, PROMPT_TOKENS, arena_prompt_out, error, sizeof(error)) == 1);
+    CHECK(memcmp(arena_prompt_out, prompt_out, sizeof(arena_prompt_out)) == 0);
+    CHECK(uocr_metal_context_read_prompt_arena_f16(ctx, 2u, TEXT_TOKENS, arena_text_out, error, sizeof(error)) == 0);
+    CHECK(strstr(error, "requires allocated arenas") != NULL);
+
     uocr_metal_context_destroy(ctx);
     uocr_model_file_close(&model);
     unlink(path);

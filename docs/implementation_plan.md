@@ -601,6 +601,7 @@ First implementation slice, in order:
   - [x] avoid emulating Python `masked_scatter_`
 - [x] Add a text-only path where no image features are present.
 - [x] Bind mmap-backed token embeddings for production prompt assembly.
+- [x] Write mapped prompt embeddings into the persistent Metal prompt arena.
 - [ ] Compare prompt embeddings against Python dumps.
 
 ### 14.2 Decoder layer primitives
