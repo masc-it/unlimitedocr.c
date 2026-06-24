@@ -7794,6 +7794,125 @@ int uocr_metal_context_clip_output_projection_f16(uocr_metal_context *ctx,
     return 1;
 }
 
+int uocr_metal_context_clip_quickgelu_f16(uocr_metal_context *ctx,
+                                          const uint16_t *input_f16,
+                                          uint32_t token_count,
+                                          uocr_metal_dense_output_type output_type,
+                                          void *out,
+                                          char *error,
+                                          size_t error_size) {
+    metal_clear_error(error, error_size);
+    if (ctx == NULL || input_f16 == NULL || out == NULL) {
+        return metal_fail(error, error_size, "invalid Metal CLIP QuickGELU request");
+    }
+    if (token_count != UOCR_CLIP_GLOBAL_TOKENS && token_count != UOCR_CLIP_LOCAL_TOKENS) {
+        return metal_fail(error, error_size, "invalid Metal CLIP QuickGELU token count %u", token_count);
+    }
+    if (output_type != UOCR_METAL_DENSE_OUTPUT_F16 && output_type != UOCR_METAL_DENSE_OUTPUT_F32) {
+        return metal_fail(error, error_size, "unsupported Metal CLIP QuickGELU output type %d", (int)output_type);
+    }
+    if (UOCR_CLIP_MLP_INTERMEDIATE != 4096u || UOCR_CLIP_GLOBAL_TOKENS != 257u ||
+        UOCR_CLIP_LOCAL_TOKENS != 101u) {
+        return metal_fail(error, error_size, "Metal CLIP QuickGELU constants are inconsistent");
+    }
+
+    uint64_t value_count_u64 = 0u;
+    uint64_t input_bytes = 0u;
+    uint64_t output_bytes = 0u;
+    const uint64_t output_element_bytes = output_type == UOCR_METAL_DENSE_OUTPUT_F16 ? 2u : (uint64_t)sizeof(float);
+    if (!checked_mul_u64((uint64_t)token_count, (uint64_t)UOCR_CLIP_MLP_INTERMEDIATE, &value_count_u64) ||
+        !checked_mul_u64(value_count_u64, 2u, &input_bytes) ||
+        !checked_mul_u64(value_count_u64, output_element_bytes, &output_bytes) ||
+        value_count_u64 > (uint64_t)UINT32_MAX || input_bytes > (uint64_t)SIZE_MAX ||
+        output_bytes > (uint64_t)SIZE_MAX) {
+        return metal_fail(error, error_size, "Metal CLIP QuickGELU byte-size overflow");
+    }
+    const uint32_t value_count = (uint32_t)value_count_u64;
+
+    const uint64_t max_buffer_length = metal_device_max_buffer_length(ctx->device);
+    if (input_bytes > max_buffer_length || output_bytes > max_buffer_length) {
+        return metal_fail(error,
+                          error_size,
+                          "Metal CLIP QuickGELU buffers exceed maxBufferLength %llu",
+                          (unsigned long long)max_buffer_length);
+    }
+
+    int result = 0;
+    @autoreleasepool {
+        const char *function_name = output_type == UOCR_METAL_DENSE_OUTPUT_F16 ?
+                                        "uocr_clip_quickgelu_f16_to_f16" :
+                                        "uocr_clip_quickgelu_f16_to_f32";
+        id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, function_name, error, error_size);
+        if (pipeline == nil) {
+            return 0;
+        }
+
+        id<MTLBuffer> src = nil;
+        id<MTLBuffer> dst = nil;
+        id<MTLCommandBuffer> cb = nil;
+        id<MTLComputeCommandEncoder> enc = nil;
+
+        src = [ctx->device newBufferWithBytes:input_f16
+                                       length:(NSUInteger)input_bytes
+                                      options:MTLResourceStorageModeShared];
+        if (src == nil) {
+            result = metal_fail(error, error_size, "failed to allocate Metal CLIP QuickGELU input buffer");
+            goto cleanup_clip_quickgelu;
+        }
+        src.label = @"uocr_clip_quickgelu_input_f16";
+
+        dst = [ctx->device newBufferWithLength:(NSUInteger)output_bytes options:MTLResourceStorageModeShared];
+        if (dst == nil) {
+            result = metal_fail(error, error_size, "failed to allocate Metal CLIP QuickGELU output buffer");
+            goto cleanup_clip_quickgelu;
+        }
+        dst.label = @"uocr_clip_quickgelu_output";
+        memset([dst contents], 0, (size_t)output_bytes);
+
+        cb = [ctx->queue commandBuffer];
+        if (cb == nil) {
+            result = metal_fail(error, error_size, "failed to create Metal CLIP QuickGELU command buffer");
+            goto cleanup_clip_quickgelu;
+        }
+        cb.label = @"uocr_clip_quickgelu_command_buffer";
+
+        enc = [cb computeCommandEncoder];
+        if (enc == nil) {
+            result = metal_fail(error, error_size, "failed to create Metal CLIP QuickGELU command encoder");
+            goto cleanup_clip_quickgelu;
+        }
+
+        const NSUInteger threads_per_group = metal_power2_threadgroup_width(256u, pipeline.maxTotalThreadsPerThreadgroup);
+        [enc setComputePipelineState:pipeline];
+        [enc setBuffer:src offset:0u atIndex:0u];
+        [enc setBuffer:dst offset:0u atIndex:1u];
+        [enc setBytes:&value_count length:sizeof(value_count) atIndex:2u];
+        [enc dispatchThreads:MTLSizeMake((NSUInteger)value_count, 1u, 1u)
+       threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1u, 1u)];
+        [enc endEncoding];
+
+        [cb commit];
+        [cb waitUntilCompleted];
+        if (cb.status == MTLCommandBufferStatusError) {
+            NSString *description = cb.error != nil ? [cb.error localizedDescription] : @"unknown command-buffer error";
+            result = metal_fail(error, error_size, "Metal CLIP QuickGELU command failed: %s", [description UTF8String]);
+            goto cleanup_clip_quickgelu;
+        }
+
+        memcpy(out, [dst contents], (size_t)output_bytes);
+        result = 1;
+
+    cleanup_clip_quickgelu:
+        [dst release];
+        [src release];
+    }
+
+    if (result) {
+        metal_clear_error(error, error_size);
+    }
+    return result;
+}
+
 static int metal_context_sam_attention_f16(uocr_metal_context *ctx,
                                            const uint16_t *q_f16,
                                            const uint16_t *k_f16,

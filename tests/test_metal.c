@@ -2525,6 +2525,120 @@ static int test_metal_clip_output_projection_f16(void) {
     return 0;
 }
 
+static float quickgelu_expected_from_f16(uint16_t value) {
+    const float x = f16_bits_to_f32(value);
+    return x / (1.0f + expf(-1.702f * x));
+}
+
+static int test_metal_clip_quickgelu_f16(void) {
+    if (!uocr_metal_is_available()) {
+        return 0;
+    }
+
+    CHECK(UOCR_CLIP_MLP_INTERMEDIATE == 4096u);
+    CHECK(UOCR_CLIP_GLOBAL_TOKENS == 257u);
+    CHECK(UOCR_CLIP_LOCAL_TOKENS == 101u);
+
+    char error[1024];
+    memset(error, 0, sizeof(error));
+    uocr_metal_context *ctx = uocr_metal_context_create(UOCR_TEST_METAL_RESOURCE_PATH, error, sizeof(error));
+    CHECK(ctx != NULL);
+
+    const uint32_t token_counts[] = {UOCR_CLIP_GLOBAL_TOKENS, UOCR_CLIP_LOCAL_TOKENS};
+    for (size_t case_index = 0u; case_index < sizeof(token_counts) / sizeof(token_counts[0]); ++case_index) {
+        const uint32_t tokens = token_counts[case_index];
+        const size_t values = (size_t)tokens * UOCR_CLIP_MLP_INTERMEDIATE;
+        uint16_t *input = (uint16_t *)calloc(values, sizeof(uint16_t));
+        float *out_f32 = (float *)calloc(values, sizeof(float));
+        uint16_t *out_f16 = (uint16_t *)calloc(values, sizeof(uint16_t));
+        CHECK(input != NULL);
+        CHECK(out_f32 != NULL);
+        CHECK(out_f16 != NULL);
+
+        for (uint32_t token = 0u; token < tokens; ++token) {
+            for (uint32_t channel = 0u; channel < UOCR_CLIP_MLP_INTERMEDIATE; ++channel) {
+                const int mod = (int)((token * 17u + channel * 31u + tokens) % 161u) - 80;
+                input[(size_t)token * UOCR_CLIP_MLP_INTERMEDIATE + channel] = f32_to_f16_bits((float)mod * 0.05f);
+            }
+        }
+
+        CHECK(uocr_metal_context_clip_quickgelu_f16(ctx,
+                                                    input,
+                                                    tokens,
+                                                    UOCR_METAL_DENSE_OUTPUT_F32,
+                                                    out_f32,
+                                                    error,
+                                                    sizeof(error)) == 1);
+        CHECK(error[0] == '\0');
+
+        struct quickgelu_sample {
+            uint32_t token;
+            uint32_t channel;
+        } samples[] = {
+            {0u, 0u},
+            {tokens / 3u, 17u},
+            {tokens / 2u, 1023u},
+            {tokens - 1u, 2048u},
+            {tokens - 1u, UOCR_CLIP_MLP_INTERMEDIATE - 1u},
+        };
+        for (size_t i = 0u; i < sizeof(samples) / sizeof(samples[0]); ++i) {
+            const size_t idx = (size_t)samples[i].token * UOCR_CLIP_MLP_INTERMEDIATE + samples[i].channel;
+            const float expected = quickgelu_expected_from_f16(input[idx]);
+            CHECK(fabsf(out_f32[idx] - expected) <= 2.0e-5f);
+        }
+
+        CHECK(uocr_metal_context_clip_quickgelu_f16(ctx,
+                                                    input,
+                                                    tokens,
+                                                    UOCR_METAL_DENSE_OUTPUT_F16,
+                                                    out_f16,
+                                                    error,
+                                                    sizeof(error)) == 1);
+        CHECK(error[0] == '\0');
+        for (size_t i = 0u; i < sizeof(samples) / sizeof(samples[0]); ++i) {
+            const size_t idx = (size_t)samples[i].token * UOCR_CLIP_MLP_INTERMEDIATE + samples[i].channel;
+            const float expected = quickgelu_expected_from_f16(input[idx]);
+            CHECK(fabsf(f16_bits_to_f32(out_f16[idx]) - expected) <= 2.0e-3f);
+        }
+
+        free(out_f16);
+        free(out_f32);
+        free(input);
+    }
+
+    uint16_t one_value = f32_to_f16_bits(0.0f);
+    float one_out = 0.0f;
+    CHECK(uocr_metal_context_clip_quickgelu_f16(ctx,
+                                                NULL,
+                                                UOCR_CLIP_LOCAL_TOKENS,
+                                                UOCR_METAL_DENSE_OUTPUT_F32,
+                                                &one_out,
+                                                error,
+                                                sizeof(error)) == 0);
+    CHECK(strstr(error, "invalid Metal CLIP QuickGELU") != NULL);
+
+    CHECK(uocr_metal_context_clip_quickgelu_f16(ctx,
+                                                &one_value,
+                                                UOCR_CLIP_LOCAL_TOKENS - 1u,
+                                                UOCR_METAL_DENSE_OUTPUT_F32,
+                                                &one_out,
+                                                error,
+                                                sizeof(error)) == 0);
+    CHECK(strstr(error, "invalid Metal CLIP QuickGELU token count") != NULL);
+
+    CHECK(uocr_metal_context_clip_quickgelu_f16(ctx,
+                                                &one_value,
+                                                UOCR_CLIP_LOCAL_TOKENS,
+                                                (uocr_metal_dense_output_type)99,
+                                                &one_out,
+                                                error,
+                                                sizeof(error)) == 0);
+    CHECK(strstr(error, "unsupported Metal CLIP QuickGELU output type") != NULL);
+
+    uocr_metal_context_destroy(ctx);
+    return 0;
+}
+
 static int test_metal_sam_window_partition_f16(void) {
     if (!uocr_metal_is_available()) {
         return 0;
@@ -12608,6 +12722,7 @@ int main(void) {
     if (test_metal_clip_qkv_f16() != 0) return 1;
     if (test_metal_clip_attention_f16() != 0) return 1;
     if (test_metal_clip_output_projection_f16() != 0) return 1;
+    if (test_metal_clip_quickgelu_f16() != 0) return 1;
     if (test_metal_sam_window_partition_f16() != 0) return 1;
     if (test_metal_sam_window_attention_f16() != 0) return 1;
     if (test_metal_sam_global_attention_f16() != 0) return 1;

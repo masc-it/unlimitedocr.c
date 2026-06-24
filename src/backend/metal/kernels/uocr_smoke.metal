@@ -648,6 +648,30 @@ kernel void uocr_clip_qkv_f16_to_f32(device const half *src [[buffer(0)]],
     }
 }
 
+static inline float uocr_quickgelu(float x) {
+    return x / (1.0f + exp(-1.702f * x));
+}
+
+kernel void uocr_clip_quickgelu_f16_to_f16(device const half *src [[buffer(0)]],
+                                           device half *dst [[buffer(1)]],
+                                           constant uint &value_count [[buffer(2)]],
+                                           uint gid [[thread_position_in_grid]]) {
+    if (gid >= value_count) {
+        return;
+    }
+    dst[gid] = half(uocr_quickgelu(float(src[gid])));
+}
+
+kernel void uocr_clip_quickgelu_f16_to_f32(device const half *src [[buffer(0)]],
+                                           device float *dst [[buffer(1)]],
+                                           constant uint &value_count [[buffer(2)]],
+                                           uint gid [[thread_position_in_grid]]) {
+    if (gid >= value_count) {
+        return;
+    }
+    dst[gid] = uocr_quickgelu(float(src[gid]));
+}
+
 struct UocrSamWindowAttentionParams {
     uint windows;
     uint tokens_per_window;
