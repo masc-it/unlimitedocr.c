@@ -303,6 +303,23 @@ static int test_schedule_rejects_invalid_view_order(void) {
     return 0;
 }
 
+static int test_schedule_rejects_visual_placeholder_count_mismatch(void) {
+    owned_request owned;
+    CHECK(make_request(UOCR_GLOBAL_VISUAL_TOKENS - 1u, 1u, 1u, 1u, &owned));
+    fill_global_view(&owned.views[0]);
+
+    char error[256];
+    memset(error, 0, sizeof(error));
+    uocr_vision_schedule schedule;
+    memset(&schedule, 0, sizeof(schedule));
+    CHECK(uocr_plan_vision_schedule(&owned.request, 1u, NULL, 0u, &schedule, error, sizeof(error)) ==
+          UOCR_ERROR_INVALID_ARGUMENT);
+    CHECK(strstr(error, "image placeholder count mismatch") != NULL);
+
+    free_owned_request(&owned);
+    return 0;
+}
+
 static int test_text_only_processing_is_a_noop(void) {
     owned_request owned;
     CHECK(make_request(0u, 0u, 1u, 1u, &owned));
@@ -612,6 +629,7 @@ int main(void) {
     if (test_crop_local_views_are_chunked_before_global() != 0) return 1;
     if (test_schedule_query_and_capacity_failure() != 0) return 1;
     if (test_schedule_rejects_invalid_view_order() != 0) return 1;
+    if (test_schedule_rejects_visual_placeholder_count_mismatch() != 0) return 1;
     if (test_text_only_processing_is_a_noop() != 0) return 1;
     if (test_process_single_global_view_supports_zero_locals() != 0) return 1;
     if (test_process_global_views_formats_rows_and_reuses_scratch() != 0) return 1;

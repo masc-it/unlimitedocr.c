@@ -79,10 +79,10 @@ Current priority slice, in order. The coding agent should take the first uncheck
   - [x] Python disables `config.sliding_window` for generation prefill and stores `_ring_window`
   - [x] prefill tokens remain fully attendable
   - [x] only generated tokens use the 128-token ring overwrite behavior
-- [ ] Assert crop/view facts:
-  - [ ] crop-mode source feature order is local rows first, then global rows, then view separator
-  - [ ] placeholder id order is not semantically meaningful because all visual placeholders use the same id
-  - [ ] C must validate visual feature count, not trust placeholder construction blindly
+- [x] Assert crop/view facts:
+  - [x] crop-mode source feature order is local rows first, then global rows, then view separator
+  - [x] placeholder id order is not semantically meaningful because all visual placeholders use the same id
+  - [x] C must validate visual feature count, not trust placeholder construction blindly
 
 ## 2. Non-negotiable constraints
 

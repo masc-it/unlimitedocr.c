@@ -9,6 +9,7 @@ from PIL import Image
 from unlimitedocr_c.frontend import (
     GLOBAL_VISUAL_TOKENS,
     IMAGE_TOKEN_ID,
+    LOCAL_QUERIES,
     LOCAL_VIEW_SIZE,
     dynamic_preprocess,
     format_messages_plain,
@@ -25,6 +26,10 @@ from unlimitedocr_c.frontend import (
 
 def solid_image(width: int, height: int, color: tuple[int, int, int] = (220, 20, 60)) -> Image.Image:
     return Image.new("RGB", (width, height), color)
+
+
+def upstream_model_source() -> str:
+    return (project_root() / "data/context/modeling_unlimitedocr.py").read_text(encoding="utf-8")
 
 
 def upstream_plain_prompt(prompt: str) -> str:
@@ -96,10 +101,24 @@ def test_prepare_gundam_large_wide_image_uses_local_first_then_global() -> None:
 
     req = prepare_image(image, preset="gundam", max_new_tokens=0)
     assert (req.crop_grid_w, req.crop_grid_h) == (2, 1)
-    assert req.expected_visual_tokens == (10 * 2 + 1) * (10 * 1) + GLOBAL_VISUAL_TOKENS
+    local_visual_tokens = (LOCAL_QUERIES * 2 + 1) * (LOCAL_QUERIES * 1)
+    assert req.expected_visual_tokens == local_visual_tokens + GLOBAL_VISUAL_TOKENS
     assert [view.kind for view in req.views] == ["local", "local", "global"]
     assert req.views[0].pixels.shape == (3, LOCAL_VIEW_SIZE, LOCAL_VIEW_SIZE)
     assert req.views[-1].pixels.shape == (3, 1024, 1024)
+
+    visual_positions = np.flatnonzero(req.image_mask)
+    assert visual_positions.size == req.expected_visual_tokens
+    assert np.unique(req.input_ids[visual_positions]).tolist() == [IMAGE_TOKEN_ID]
+    assert req.input_ids[visual_positions[0]] == IMAGE_TOKEN_ID
+    assert req.input_ids[visual_positions[local_visual_tokens]] == IMAGE_TOKEN_ID
+    assert req.input_ids[visual_positions[-1]] == IMAGE_TOKEN_ID
+
+
+def test_cached_upstream_crop_features_are_local_global_separator_then_masked_scatter() -> None:
+    source = upstream_model_source()
+    assert "global_local_features = torch.cat([local_features, global_features, self.view_seperator[None, :]], dim=0)" in source
+    assert "inputs_embeds[idx].masked_scatter_(images_seq_mask[idx].unsqueeze(-1).cuda(), images_in_this_batch)" in source
 
 
 def test_prepare_pages_concatenates_global_visual_tokens() -> None:
