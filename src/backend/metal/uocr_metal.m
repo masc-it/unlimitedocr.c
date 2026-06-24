@@ -2400,6 +2400,110 @@ static int metal_router_arena_slices(const uocr_metal_context *ctx,
            metal_slice_valid(*top_weights, *top_weights_bytes);
 }
 
+static int metal_hidden_arena_token_slice(const uocr_metal_context *ctx,
+                                          uint32_t slot,
+                                          uint32_t segment,
+                                          uint32_t token_index,
+                                          uocr_metal_buffer_slice *out_slice) {
+    if (out_slice == NULL || token_index >= UOCR_MAX_POSITIONS) {
+        return 0;
+    }
+    uocr_metal_buffer_slice segment_slice;
+    uint64_t covered_bytes = 0u;
+    if (!metal_hidden_arena_segment_slice(ctx, slot, segment, token_index + 1u, &segment_slice, &covered_bytes)) {
+        return 0;
+    }
+    (void)covered_bytes;
+    const uint64_t row_bytes = (uint64_t)UOCR_HIDDEN_SIZE * 2u;
+    uint64_t row_offset = 0u;
+    uint64_t offset = 0u;
+    if (!checked_mul_u64((uint64_t)token_index, row_bytes, &row_offset) ||
+        !checked_add_u64((uint64_t)segment_slice.offset, row_offset, &offset) ||
+        offset > (uint64_t)NSUIntegerMax) {
+        return 0;
+    }
+    out_slice->buffer = segment_slice.buffer;
+    out_slice->offset = (NSUInteger)offset;
+    return metal_slice_valid(*out_slice, row_bytes);
+}
+
+static int metal_logits_arena_slices(const uocr_metal_context *ctx,
+                                     uint32_t slot,
+                                     uocr_metal_buffer_slice *logits,
+                                     uocr_metal_buffer_slice *next_token) {
+    if (ctx == NULL || logits == NULL || next_token == NULL || !ctx->has_kv_cache_layout ||
+        slot >= ctx->kv_cache_layout.batch_slots ||
+        ctx->runtime_arenas[UOCR_METAL_ARENA_LOGITS_READBACK].buffer == nil) {
+        return 0;
+    }
+    const uint64_t logits_bytes_per_slot = (uint64_t)UOCR_VOCAB_SIZE * (uint64_t)sizeof(float);
+    uint64_t logits_offset = 0u;
+    uint64_t next_base = 0u;
+    uint64_t next_offset = 0u;
+    if (!checked_mul_u64((uint64_t)slot, logits_bytes_per_slot, &logits_offset) ||
+        !checked_mul_u64((uint64_t)ctx->kv_cache_layout.batch_slots, logits_bytes_per_slot, &next_base) ||
+        !checked_add_u64(next_base, (uint64_t)slot * (uint64_t)sizeof(int32_t), &next_offset) ||
+        logits_offset > (uint64_t)NSUIntegerMax || next_offset > (uint64_t)NSUIntegerMax) {
+        return 0;
+    }
+    logits->buffer = ctx->runtime_arenas[UOCR_METAL_ARENA_LOGITS_READBACK].buffer;
+    logits->offset = (NSUInteger)logits_offset;
+    next_token->buffer = logits->buffer;
+    next_token->offset = (NSUInteger)next_offset;
+    return metal_slice_valid(*logits, logits_bytes_per_slot) &&
+           metal_slice_valid(*next_token, (uint64_t)sizeof(int32_t));
+}
+
+static float *metal_logits_slice_cpu_ptr(uocr_metal_buffer_slice logits) {
+    if (logits.buffer == nil) {
+        return NULL;
+    }
+    void *base = [logits.buffer contents];
+    if (base == NULL) {
+        return NULL;
+    }
+    return (float *)((uint8_t *)base + (size_t)logits.offset);
+}
+
+static int32_t *metal_token_slice_cpu_ptr(uocr_metal_buffer_slice token) {
+    if (token.buffer == nil) {
+        return NULL;
+    }
+    void *base = [token.buffer contents];
+    if (base == NULL) {
+        return NULL;
+    }
+    return (int32_t *)((uint8_t *)base + (size_t)token.offset);
+}
+
+static int metal_cpu_argmax_logits(const float *logits,
+                                   uint32_t vocab_size,
+                                   uint32_t *token_id_out,
+                                   float *score_out) {
+    if (logits == NULL || token_id_out == NULL || score_out == NULL || vocab_size == 0u) {
+        return 0;
+    }
+    uint32_t best_id = UINT32_MAX;
+    float best_score = -INFINITY;
+    for (uint32_t token = 0u; token < vocab_size; ++token) {
+        const float score = logits[token];
+        if (isnan(score)) {
+            continue;
+        }
+        if (best_id == UINT32_MAX || score > best_score || (score == best_score && token < best_id)) {
+            best_id = token;
+            best_score = score;
+        }
+    }
+    if (best_id == UINT32_MAX) {
+        best_id = 0u;
+        best_score = -INFINITY;
+    }
+    *token_id_out = best_id;
+    *score_out = best_score;
+    return 1;
+}
+
 static int metal_read_slice_to_host(uocr_metal_context *ctx,
                                     uocr_metal_buffer_slice src,
                                     uint64_t bytes,
@@ -2476,6 +2580,115 @@ static const uocr_metal_decoder_binding *metal_require_decoder_binding(const uoc
     return binding;
 }
 
+static int metal_run_token_embedding_from_token_slot_f16(uocr_metal_context *ctx,
+                                                         uocr_metal_buffer_slice token_id,
+                                                         uocr_metal_buffer_slice dst,
+                                                         char *error,
+                                                         size_t error_size) {
+    if (ctx == NULL || !metal_slice_valid(token_id, sizeof(int32_t)) ||
+        !metal_slice_valid(dst, (uint64_t)UOCR_HIDDEN_SIZE * 2u)) {
+        return metal_fail(error, error_size, "invalid integrated token-embedding request");
+    }
+    const uint64_t table_bytes = (uint64_t)UOCR_VOCAB_SIZE * (uint64_t)UOCR_HIDDEN_SIZE * 2u;
+    const uocr_metal_decoder_binding *embedding = metal_require_decoder_binding(ctx,
+                                                                                UOCR_TENSOR_ID_TOK_EMBED,
+                                                                                "token embedding",
+                                                                                error,
+                                                                                error_size);
+    if (embedding == NULL || !metal_buffer_range_valid(embedding->buffer, embedding->offset, table_bytes)) {
+        return 0;
+    }
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, "uocr_get_rows_f16_to_f16", error, error_size);
+        if (pipeline == nil) {
+            return 0;
+        }
+        id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
+        if (cb == nil) {
+            return metal_fail(error, error_size, "failed to create integrated token-embedding command buffer");
+        }
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        if (enc == nil) {
+            return metal_fail(error, error_size, "failed to create integrated token-embedding command encoder");
+        }
+        uocr_metal_get_rows_params params;
+        params.table_rows = UOCR_VOCAB_SIZE;
+        params.row_width = UOCR_HIDDEN_SIZE;
+        params.n_row_ids = 1u;
+        params.reserved = 0u;
+        NSUInteger threads = pipeline.threadExecutionWidth;
+        if (threads == 0u) threads = 1u;
+        if (threads > (NSUInteger)UOCR_HIDDEN_SIZE) threads = (NSUInteger)UOCR_HIDDEN_SIZE;
+        [enc setComputePipelineState:pipeline];
+        [enc setBuffer:embedding->buffer offset:embedding->offset atIndex:0u];
+        [enc setBuffer:token_id.buffer offset:token_id.offset atIndex:1u];
+        [enc setBuffer:dst.buffer offset:dst.offset atIndex:2u];
+        [enc setBytes:&params length:sizeof(params) atIndex:3u];
+        [enc dispatchThreads:MTLSizeMake((NSUInteger)UOCR_HIDDEN_SIZE, 1u, 1u)
+       threadsPerThreadgroup:MTLSizeMake(threads, 1u, 1u)];
+        [enc endEncoding];
+        return metal_wait_for_command_buffer(cb, "integrated token embedding", error, error_size);
+    }
+}
+
+static int metal_run_lm_head_buffer_f32(uocr_metal_context *ctx,
+                                        uocr_metal_buffer_slice input,
+                                        uint32_t n_rows,
+                                        uocr_metal_buffer_slice logits,
+                                        char *error,
+                                        size_t error_size) {
+    const uint64_t input_bytes = (uint64_t)n_rows * (uint64_t)UOCR_HIDDEN_SIZE * 2u;
+    const uint64_t weight_bytes = (uint64_t)UOCR_VOCAB_SIZE * (uint64_t)UOCR_HIDDEN_SIZE * 2u;
+    const uint64_t output_values = (uint64_t)n_rows * (uint64_t)UOCR_VOCAB_SIZE;
+    const uint64_t output_bytes = output_values * (uint64_t)sizeof(float);
+    if (ctx == NULL || n_rows == 0u || output_values > (uint64_t)UINT32_MAX ||
+        !metal_slice_valid(input, input_bytes) || !metal_slice_valid(logits, output_bytes)) {
+        return metal_fail(error, error_size, "invalid integrated LM-head request");
+    }
+    const uocr_metal_decoder_binding *lm_head = metal_require_decoder_binding(ctx,
+                                                                              UOCR_TENSOR_ID_LM_HEAD,
+                                                                              "LM head",
+                                                                              error,
+                                                                              error_size);
+    if (lm_head == NULL || !metal_buffer_range_valid(lm_head->buffer, lm_head->offset, weight_bytes)) {
+        return 0;
+    }
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, "uocr_dense_f16_to_f32", error, error_size);
+        if (pipeline == nil) {
+            return 0;
+        }
+        const NSUInteger threads = metal_power2_threadgroup_width(256u, pipeline.maxTotalThreadsPerThreadgroup);
+        if ((uint64_t)threads * sizeof(float) > (uint64_t)ctx->device.maxThreadgroupMemoryLength) {
+            return metal_fail(error, error_size, "integrated LM-head threadgroup memory exceeds device limit");
+        }
+        id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
+        if (cb == nil) {
+            return metal_fail(error, error_size, "failed to create integrated LM-head command buffer");
+        }
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        if (enc == nil) {
+            return metal_fail(error, error_size, "failed to create integrated LM-head command encoder");
+        }
+        uocr_metal_dense_params params;
+        params.input_rows = n_rows;
+        params.in_features = UOCR_HIDDEN_SIZE;
+        params.out_features = UOCR_VOCAB_SIZE;
+        params.has_bias = 0u;
+        [enc setComputePipelineState:pipeline];
+        [enc setBuffer:input.buffer offset:input.offset atIndex:0u];
+        [enc setBuffer:lm_head->buffer offset:lm_head->offset atIndex:1u];
+        [enc setBuffer:lm_head->buffer offset:lm_head->offset atIndex:2u];
+        [enc setBuffer:logits.buffer offset:logits.offset atIndex:3u];
+        [enc setBytes:&params length:sizeof(params) atIndex:4u];
+        [enc setThreadgroupMemoryLength:threads * sizeof(float) atIndex:0u];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)output_values, 1u, 1u)
+             threadsPerThreadgroup:MTLSizeMake(threads, 1u, 1u)];
+        [enc endEncoding];
+        return metal_wait_for_command_buffer(cb, "integrated LM-head", error, error_size);
+    }
+}
+
 static int metal_run_rmsnorm_buffer_f16(uocr_metal_context *ctx,
                                         uocr_metal_buffer_slice src,
                                         const uocr_metal_decoder_binding *weight,
@@ -2522,6 +2735,80 @@ static int metal_run_rmsnorm_buffer_f16(uocr_metal_context *ctx,
         [enc endEncoding];
         return metal_wait_for_command_buffer(cb, op_name, error, error_size);
     }
+}
+
+static int metal_select_next_token_from_hidden_slice_f16(uocr_metal_context *ctx,
+                                                        uocr_metal_buffer_slice hidden,
+                                                        uocr_metal_buffer_slice norm_scratch,
+                                                        uocr_metal_buffer_slice logits,
+                                                        uocr_metal_buffer_slice token_slot,
+                                                        const int32_t *sequence,
+                                                        uint32_t sequence_len,
+                                                        uint32_t no_repeat_ngram_size,
+                                                        uint32_t no_repeat_window,
+                                                        uint32_t *token_id_out,
+                                                        float *score_out,
+                                                        char *error,
+                                                        size_t error_size) {
+    if (ctx == NULL || sequence == NULL || token_id_out == NULL || score_out == NULL || sequence_len == 0u ||
+        !metal_slice_valid(hidden, (uint64_t)UOCR_HIDDEN_SIZE * 2u) ||
+        !metal_slice_valid(norm_scratch, (uint64_t)UOCR_HIDDEN_SIZE * 2u) ||
+        !metal_slice_valid(logits, (uint64_t)UOCR_VOCAB_SIZE * sizeof(float)) ||
+        !metal_slice_valid(token_slot, sizeof(int32_t))) {
+        return metal_fail(error, error_size, "invalid integrated next-token selection request");
+    }
+    const uocr_metal_decoder_binding *final_norm = metal_require_decoder_binding(ctx,
+                                                                                 UOCR_TENSOR_ID_FINAL_NORM,
+                                                                                 "final norm",
+                                                                                 error,
+                                                                                 error_size);
+    if (final_norm == NULL) {
+        return 0;
+    }
+    if (!metal_run_rmsnorm_buffer_f16(ctx,
+                                      hidden,
+                                      final_norm,
+                                      1u,
+                                      norm_scratch,
+                                      "integrated final RMSNorm",
+                                      error,
+                                      error_size) ||
+        !metal_run_lm_head_buffer_f32(ctx, norm_scratch, 1u, logits, error, error_size)) {
+        return 0;
+    }
+
+    float *logits_ptr = metal_logits_slice_cpu_ptr(logits);
+    int32_t *token_ptr = metal_token_slice_cpu_ptr(token_slot);
+    if (logits_ptr == NULL || token_ptr == NULL) {
+        return metal_fail(error, error_size, "integrated next-token selection requires CPU-visible logits arena");
+    }
+
+    if (no_repeat_ngram_size != 0u) {
+        const int status = uocr_no_repeat_ngram_apply(logits_ptr,
+                                                      UOCR_VOCAB_SIZE,
+                                                      sequence,
+                                                      sequence_len,
+                                                      no_repeat_ngram_size,
+                                                      no_repeat_window,
+                                                      NULL,
+                                                      0u);
+        if (status != UOCR_OK) {
+            return metal_fail(error,
+                              error_size,
+                              "integrated no-repeat-ngram processor failed: %s",
+                              uocr_status_string(status));
+        }
+    }
+
+    uint32_t token_id = UINT32_MAX;
+    float score = 0.0f;
+    if (!metal_cpu_argmax_logits(logits_ptr, UOCR_VOCAB_SIZE, &token_id, &score) || token_id >= UOCR_VOCAB_SIZE) {
+        return metal_fail(error, error_size, "integrated greedy argmax failed");
+    }
+    *token_ptr = (int32_t)token_id;
+    *token_id_out = token_id;
+    *score_out = score;
+    return 1;
 }
 
 static int metal_run_attention_qkv_buffer_f16(uocr_metal_context *ctx,
@@ -2712,6 +2999,83 @@ static int metal_run_kv_write_buffer_f16(uocr_metal_context *ctx,
        threadsPerThreadgroup:MTLSizeMake(threads, 1u, 1u)];
         [enc endEncoding];
         return metal_wait_for_command_buffer(cb, "integrated KV write", error, error_size);
+    }
+}
+
+static int metal_run_decode_attention_buffer_f16(uocr_metal_context *ctx,
+                                                 uocr_metal_buffer_slice q,
+                                                 uint32_t layer,
+                                                 uint32_t slot,
+                                                 uint32_t prompt_length,
+                                                 uint32_t generated_count,
+                                                 uocr_metal_buffer_slice dst,
+                                                 char *error,
+                                                 size_t error_size) {
+    const uint64_t hidden_bytes = (uint64_t)UOCR_HIDDEN_SIZE * 2u;
+    if (ctx == NULL || !ctx->has_kv_cache_layout || layer >= UOCR_DECODER_LAYERS ||
+        slot >= ctx->kv_cache_layout.batch_slots || prompt_length == 0u ||
+        prompt_length > ctx->kv_cache_layout.prompt_token_capacity ||
+        generated_count > UOCR_MAX_POSITIONS - prompt_length ||
+        !metal_slice_valid(q, hidden_bytes) || !metal_slice_valid(dst, hidden_bytes)) {
+        return metal_fail(error, error_size, "invalid integrated decode attention request");
+    }
+    uocr_metal_decode_attention_plan plan;
+    if (!uocr_metal_kv_cache_decode_attention_plan(prompt_length,
+                                                   ctx->kv_cache_layout.prompt_token_capacity,
+                                                   generated_count,
+                                                   &plan)) {
+        return metal_fail(error, error_size, "invalid integrated decode attention plan");
+    }
+    id<MTLBuffer> kv = ctx->runtime_arenas[UOCR_METAL_ARENA_KV_CACHE].buffer;
+    if (!metal_buffer_range_valid(kv, (NSUInteger)ctx->kv_cache_layout.k_offset_bytes, ctx->kv_cache_layout.tensor_bytes) ||
+        !metal_buffer_range_valid(kv, (NSUInteger)ctx->kv_cache_layout.v_offset_bytes, ctx->kv_cache_layout.tensor_bytes)) {
+        return metal_fail(error, error_size, "integrated decode attention KV arena is invalid");
+    }
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, "uocr_decode_attention_f16_to_f16", error, error_size);
+        if (pipeline == nil) {
+            return 0;
+        }
+        if (pipeline.maxTotalThreadsPerThreadgroup < (NSUInteger)UOCR_HEAD_DIM) {
+            return metal_fail(error, error_size, "integrated decode attention pipeline cannot run one head per group");
+        }
+        const NSUInteger threads = (NSUInteger)UOCR_HEAD_DIM;
+        if ((uint64_t)threads * sizeof(float) > (uint64_t)ctx->device.maxThreadgroupMemoryLength) {
+            return metal_fail(error, error_size, "integrated decode attention threadgroup memory exceeds device limit");
+        }
+        id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
+        if (cb == nil) {
+            return metal_fail(error, error_size, "failed to create integrated decode attention command buffer");
+        }
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        if (enc == nil) {
+            return metal_fail(error, error_size, "failed to create integrated decode attention command encoder");
+        }
+        uocr_metal_decode_attention_params params;
+        memset(&params, 0, sizeof(params));
+        params.batch_slots = ctx->kv_cache_layout.batch_slots;
+        params.cache_token_capacity = ctx->kv_cache_layout.cache_token_capacity;
+        params.layer = layer;
+        params.slot = slot;
+        params.prompt_length = prompt_length;
+        params.generated_count = generated_count;
+        params.attention_length = plan.attention_length;
+        params.first_generated = plan.first_generated_index;
+        params.heads = UOCR_ATTENTION_HEADS;
+        params.head_dim = UOCR_HEAD_DIM;
+        params.ring_window = UOCR_GENERATED_RING_WINDOW;
+        params.scale = 1.0f / sqrtf((float)UOCR_HEAD_DIM);
+        [enc setComputePipelineState:pipeline];
+        [enc setBuffer:q.buffer offset:q.offset atIndex:0u];
+        [enc setBuffer:kv offset:(NSUInteger)ctx->kv_cache_layout.k_offset_bytes atIndex:1u];
+        [enc setBuffer:kv offset:(NSUInteger)ctx->kv_cache_layout.v_offset_bytes atIndex:2u];
+        [enc setBuffer:dst.buffer offset:dst.offset atIndex:3u];
+        [enc setBytes:&params length:sizeof(params) atIndex:4u];
+        [enc setThreadgroupMemoryLength:threads * sizeof(float) atIndex:0u];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)UOCR_ATTENTION_HEADS, 1u, 1u)
+             threadsPerThreadgroup:MTLSizeMake(threads, 1u, 1u)];
+        [enc endEncoding];
+        return metal_wait_for_command_buffer(cb, "integrated decode attention", error, error_size);
     }
 }
 
@@ -3159,6 +3523,206 @@ static int metal_run_moe_combine_buffer_f16(uocr_metal_context *ctx,
     }
 }
 
+static int metal_run_decoder_decode_one_f16(uocr_metal_context *ctx,
+                                            uint32_t slot,
+                                            uint32_t prompt_length,
+                                            uint32_t generated_count_after_write,
+                                            char *error,
+                                            size_t error_size) {
+    if (ctx == NULL || !ctx->has_kv_cache_layout || slot >= ctx->kv_cache_layout.batch_slots ||
+        prompt_length == 0u || prompt_length > ctx->kv_cache_layout.prompt_token_capacity ||
+        generated_count_after_write == 0u || generated_count_after_write > UOCR_MAX_POSITIONS - prompt_length) {
+        return metal_fail(error, error_size, "invalid integrated decoder decode-step request");
+    }
+    const uint32_t position = prompt_length + generated_count_after_write - 1u;
+    const uint64_t hidden_bytes = (uint64_t)UOCR_HIDDEN_SIZE * 2u;
+
+    uocr_metal_buffer_slice scratch[UOCR_METAL_HIDDEN_SCRATCH_SEGMENTS];
+    for (uint32_t i = 0u; i < UOCR_METAL_HIDDEN_SCRATCH_SEGMENTS; ++i) {
+        uint64_t bytes = 0u;
+        if (!metal_hidden_arena_segment_slice(ctx, slot, i, 1u, &scratch[i], &bytes) || bytes != hidden_bytes) {
+            return metal_fail(error, error_size, "integrated decode requires hidden scratch segment %u", i);
+        }
+    }
+
+    uocr_metal_buffer_slice current = scratch[0];
+    uint32_t current_segment = 0u;
+    for (uint32_t layer = 0u; layer < UOCR_DECODER_LAYERS; ++layer) {
+        uint32_t available[UOCR_METAL_HIDDEN_SCRATCH_SEGMENTS];
+        uint32_t available_count = 0u;
+        for (uint32_t i = 0u; i < UOCR_METAL_HIDDEN_SCRATCH_SEGMENTS; ++i) {
+            if (i != current_segment) {
+                available[available_count++] = i;
+            }
+        }
+        if (available_count < 4u) {
+            return metal_fail(error, error_size, "integrated decode scratch assignment failed at layer %u", layer);
+        }
+        const uint32_t norm_segment = available[0];
+        const uint32_t q_segment = available[1];
+        const uint32_t k_segment = available[2];
+        const uint32_t v_segment = available[3];
+        uocr_metal_buffer_slice norm = scratch[norm_segment];
+        uocr_metal_buffer_slice q = scratch[q_segment];
+        uocr_metal_buffer_slice k = scratch[k_segment];
+        uocr_metal_buffer_slice v = scratch[v_segment];
+        uocr_metal_buffer_slice output = k;
+        const uint32_t output_segment = k_segment;
+
+        const uocr_metal_decoder_binding *input_norm = metal_require_decoder_binding(ctx,
+                                                                                     uocr_tensor_id_layer_input_norm(layer),
+                                                                                     "decode input RMSNorm",
+                                                                                     error,
+                                                                                     error_size);
+        const uocr_metal_decoder_binding *post_norm = metal_require_decoder_binding(ctx,
+                                                                                    uocr_tensor_id_layer_post_attn_norm(layer),
+                                                                                    "decode post-attention RMSNorm",
+                                                                                    error,
+                                                                                    error_size);
+        const uocr_metal_decoder_binding *q_weight = metal_require_decoder_binding(ctx,
+                                                                                   uocr_tensor_id_layer_attn(layer, UOCR_TENSOR_PROJ_Q),
+                                                                                   "decode attention q_proj",
+                                                                                   error,
+                                                                                   error_size);
+        const uocr_metal_decoder_binding *k_weight = metal_require_decoder_binding(ctx,
+                                                                                   uocr_tensor_id_layer_attn(layer, UOCR_TENSOR_PROJ_K),
+                                                                                   "decode attention k_proj",
+                                                                                   error,
+                                                                                   error_size);
+        const uocr_metal_decoder_binding *v_weight = metal_require_decoder_binding(ctx,
+                                                                                   uocr_tensor_id_layer_attn(layer, UOCR_TENSOR_PROJ_V),
+                                                                                   "decode attention v_proj",
+                                                                                   error,
+                                                                                   error_size);
+        const uocr_metal_decoder_binding *o_weight = metal_require_decoder_binding(ctx,
+                                                                                   uocr_tensor_id_layer_attn(layer, UOCR_TENSOR_PROJ_O),
+                                                                                   "decode attention o_proj",
+                                                                                   error,
+                                                                                   error_size);
+        if (input_norm == NULL || post_norm == NULL || q_weight == NULL || k_weight == NULL || v_weight == NULL || o_weight == NULL) {
+            return 0;
+        }
+
+        if (!metal_run_rmsnorm_buffer_f16(ctx, current, input_norm, 1u, norm, "integrated decode input RMSNorm", error, error_size) ||
+            !metal_run_attention_qkv_buffer_f16(ctx, norm, q_weight, k_weight, v_weight, 1u, q, k, v, error, error_size) ||
+            !metal_run_rope_qk_buffer_f16(ctx, q, k, 1u, position, error, error_size) ||
+            !metal_run_kv_write_buffer_f16(ctx, k, v, 1u, layer, slot, prompt_length, position, error, error_size) ||
+            !metal_run_decode_attention_buffer_f16(ctx, q, layer, slot, prompt_length, generated_count_after_write, norm, error, error_size) ||
+            !metal_run_attention_output_residual_buffer_f16(ctx, norm, o_weight, current, 1u, q, error, error_size) ||
+            !metal_run_rmsnorm_buffer_f16(ctx, q, post_norm, 1u, norm, "integrated decode post-attention RMSNorm", error, error_size)) {
+            return 0;
+        }
+
+        if (layer == 0u) {
+            const uocr_metal_decoder_binding *gate = metal_require_decoder_binding(ctx,
+                                                                                   uocr_tensor_id_layer_dense_mlp(UOCR_TENSOR_PROJ_GATE),
+                                                                                   "decode layer0 dense gate",
+                                                                                   error,
+                                                                                   error_size);
+            const uocr_metal_decoder_binding *up = metal_require_decoder_binding(ctx,
+                                                                                 uocr_tensor_id_layer_dense_mlp(UOCR_TENSOR_PROJ_UP),
+                                                                                 "decode layer0 dense up",
+                                                                                 error,
+                                                                                 error_size);
+            const uocr_metal_decoder_binding *down = metal_require_decoder_binding(ctx,
+                                                                                   uocr_tensor_id_layer_dense_mlp(UOCR_TENSOR_PROJ_DOWN),
+                                                                                   "decode layer0 dense down",
+                                                                                   error,
+                                                                                   error_size);
+            const uint64_t mid_bytes = (uint64_t)UOCR_DENSE_LAYER0_INTERMEDIATE * 2u;
+            uocr_metal_buffer_slice mid;
+            if (gate == NULL || up == NULL || down == NULL ||
+                !metal_moe_intermediate_slice(ctx, slot, mid_bytes, &mid) ||
+                !metal_run_dense_swiglu_buffer_f16(ctx,
+                                                   norm,
+                                                   gate,
+                                                   up,
+                                                   down,
+                                                   q,
+                                                   1,
+                                                   1u,
+                                                   UOCR_DENSE_LAYER0_INTERMEDIATE,
+                                                   mid,
+                                                   output,
+                                                   "integrated decode layer0 dense SwiGLU",
+                                                   error,
+                                                   error_size)) {
+                return 0;
+            }
+        } else {
+            const uocr_metal_decoder_binding *router = metal_require_decoder_binding(ctx,
+                                                                                     uocr_tensor_id_moe_router(layer),
+                                                                                     "decode MoE router",
+                                                                                     error,
+                                                                                     error_size);
+            const uocr_metal_decoder_binding *shared_gate = metal_require_decoder_binding(ctx,
+                                                                                          uocr_tensor_id_moe_shared(layer, UOCR_TENSOR_PROJ_GATE),
+                                                                                          "decode MoE shared gate",
+                                                                                          error,
+                                                                                          error_size);
+            const uocr_metal_decoder_binding *shared_up = metal_require_decoder_binding(ctx,
+                                                                                        uocr_tensor_id_moe_shared(layer, UOCR_TENSOR_PROJ_UP),
+                                                                                        "decode MoE shared up",
+                                                                                        error,
+                                                                                        error_size);
+            const uocr_metal_decoder_binding *shared_down = metal_require_decoder_binding(ctx,
+                                                                                          uocr_tensor_id_moe_shared(layer, UOCR_TENSOR_PROJ_DOWN),
+                                                                                          "decode MoE shared down",
+                                                                                          error,
+                                                                                          error_size);
+            uocr_metal_buffer_slice top_ids;
+            uocr_metal_buffer_slice top_weights;
+            uocr_metal_buffer_slice expert_slab;
+            const uint64_t shared_mid_bytes = (uint64_t)UOCR_MOE_SHARED_INTERMEDIATE * 2u;
+            const uint64_t routed_mid_bytes = (uint64_t)UOCR_MOE_TOP_K * (uint64_t)UOCR_MOE_EXPERT_INTERMEDIATE * 2u;
+            uocr_metal_buffer_slice mid;
+            if (router == NULL || shared_gate == NULL || shared_up == NULL || shared_down == NULL ||
+                !metal_run_moe_router_buffer_f16(ctx, norm, router, slot, 1u, &top_ids, &top_weights, error, error_size) ||
+                !metal_moe_intermediate_slice(ctx, slot, shared_mid_bytes, &mid) ||
+                !metal_run_dense_swiglu_buffer_f16(ctx,
+                                                   norm,
+                                                   shared_gate,
+                                                   shared_up,
+                                                   shared_down,
+                                                   q,
+                                                   0,
+                                                   1u,
+                                                   UOCR_MOE_SHARED_INTERMEDIATE,
+                                                   mid,
+                                                   v,
+                                                   "integrated decode MoE shared experts",
+                                                   error,
+                                                   error_size) ||
+                !metal_expert_interleaved_slab_for_layer(ctx, layer, &expert_slab, error, error_size) ||
+                !metal_moe_intermediate_slice(ctx, slot, routed_mid_bytes, &mid) ||
+                !metal_run_moe_interleaved_buffer_f16(ctx,
+                                                      norm,
+                                                      top_ids,
+                                                      top_weights,
+                                                      expert_slab,
+                                                      slot,
+                                                      1u,
+                                                      mid,
+                                                      current,
+                                                      error,
+                                                      error_size) ||
+                !metal_run_moe_combine_buffer_f16(ctx, current, v, q, 1u, output, error, error_size)) {
+                return 0;
+            }
+        }
+
+        current = output;
+        current_segment = output_segment;
+    }
+
+    if (current_segment != 0u) {
+        if (!metal_copy_slice(ctx, current, scratch[0], hidden_bytes, "integrated decode final-hidden copy", error, error_size)) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
 static int metal_run_decoder_prefill_text_f16(uocr_metal_context *ctx,
                                               uint32_t slot,
                                               uint32_t n_tokens,
@@ -3507,9 +4071,121 @@ int uocr_metal_context_generate_f16(uocr_metal_context *ctx,
         return 1;
     }
 
-    return metal_fail(error,
-                      error_size,
-                      "integrated Metal fp16 decoder decode loop is not implemented yet");
+    uint64_t sequence_len_u64 = 0u;
+    uint64_t sequence_bytes = 0u;
+    if (!checked_add_u64((uint64_t)request->n_tokens, (uint64_t)request->max_new_tokens, &sequence_len_u64) ||
+        sequence_len_u64 > (uint64_t)UINT32_MAX ||
+        !checked_mul_u64(sequence_len_u64, (uint64_t)sizeof(int32_t), &sequence_bytes) ||
+        sequence_bytes > (uint64_t)SIZE_MAX) {
+        return metal_fail(error, error_size, "integrated Metal fp16 decode sequence buffer size overflow");
+    }
+    int32_t *sequence = (int32_t *)malloc((size_t)sequence_bytes);
+    if (sequence == NULL) {
+        return metal_fail(error, error_size, "failed to allocate integrated Metal fp16 decode sequence buffer");
+    }
+    memcpy(sequence, request->input_ids, (size_t)request->n_tokens * sizeof(int32_t));
+    uint32_t sequence_len = request->n_tokens;
+
+    uocr_metal_buffer_slice logits;
+    uocr_metal_buffer_slice token_slot;
+    uocr_metal_buffer_slice norm_scratch;
+    uint64_t one_hidden_bytes = 0u;
+    if (!metal_logits_arena_slices(ctx, request->slot, &logits, &token_slot) ||
+        !metal_hidden_arena_segment_slice(ctx, request->slot, 1u, 1u, &norm_scratch, &one_hidden_bytes) ||
+        one_hidden_bytes != (uint64_t)UOCR_HIDDEN_SIZE * 2u) {
+        free(sequence);
+        return metal_fail(error, error_size, "integrated Metal fp16 decode arena slices are invalid");
+    }
+
+    uocr_metal_buffer_slice hidden_for_selection;
+    if (!metal_hidden_arena_token_slice(ctx,
+                                        request->slot,
+                                        ctx->integrated_prefill_final_segment,
+                                        request->n_tokens - 1u,
+                                        &hidden_for_selection)) {
+        free(sequence);
+        return metal_fail(error, error_size, "integrated Metal fp16 prefill final-token hidden slice is invalid");
+    }
+
+    while (result->generated_count < request->max_new_tokens) {
+        uint32_t token_id = UINT32_MAX;
+        float score = 0.0f;
+        if (!metal_select_next_token_from_hidden_slice_f16(ctx,
+                                                           hidden_for_selection,
+                                                           norm_scratch,
+                                                           logits,
+                                                           token_slot,
+                                                           sequence,
+                                                           sequence_len,
+                                                           request->no_repeat_ngram_size,
+                                                           request->no_repeat_window,
+                                                           &token_id,
+                                                           &score,
+                                                           error,
+                                                           error_size)) {
+            char detail[512];
+            (void)snprintf(detail, sizeof(detail), "%s", (error != NULL && error[0] != '\0') ? error : "unknown error");
+            free(sequence);
+            return metal_fail(error, error_size, "integrated Metal fp16 next-token selection failed: %s", detail);
+        }
+        if (token_id >= UOCR_VOCAB_SIZE) {
+            free(sequence);
+            return metal_fail(error, error_size, "integrated Metal fp16 selected invalid token id %u", token_id);
+        }
+
+        result->generated_ids[result->generated_count] = (int32_t)token_id;
+        if (result->generated_scores_f32_or_null != NULL) {
+            result->generated_scores_f32_or_null[result->generated_count] = score;
+        }
+        sequence[sequence_len++] = (int32_t)token_id;
+        ++result->generated_count;
+        result->last_token_id = token_id;
+        result->last_score_f32 = score;
+        if (token_id == (uint32_t)UOCR_TOKEN_EOS) {
+            result->stopped_on_eos = 1u;
+            break;
+        }
+        if (result->generated_count >= request->max_new_tokens) {
+            break;
+        }
+
+        int32_t *token_ptr = metal_token_slice_cpu_ptr(token_slot);
+        if (token_ptr == NULL) {
+            free(sequence);
+            return metal_fail(error, error_size, "integrated Metal fp16 token-id arena is not CPU-visible");
+        }
+        *token_ptr = (int32_t)token_id;
+        uocr_metal_buffer_slice decode_input;
+        uint64_t decode_input_bytes = 0u;
+        if (!metal_hidden_arena_segment_slice(ctx, request->slot, 0u, 1u, &decode_input, &decode_input_bytes) ||
+            decode_input_bytes != (uint64_t)UOCR_HIDDEN_SIZE * 2u ||
+            !metal_run_token_embedding_from_token_slot_f16(ctx, token_slot, decode_input, error, error_size)) {
+            char detail[512];
+            (void)snprintf(detail, sizeof(detail), "%s", (error != NULL && error[0] != '\0') ? error : "unknown error");
+            free(sequence);
+            return metal_fail(error, error_size, "integrated Metal fp16 generated-token embedding failed: %s", detail);
+        }
+        if (!metal_run_decoder_decode_one_f16(ctx,
+                                              request->slot,
+                                              request->n_tokens,
+                                              result->generated_count,
+                                              error,
+                                              error_size)) {
+            char detail[512];
+            (void)snprintf(detail, sizeof(detail), "%s", (error != NULL && error[0] != '\0') ? error : "unknown error");
+            free(sequence);
+            return metal_fail(error, error_size, "integrated Metal fp16 decode step failed: %s", detail);
+        }
+        if (!metal_hidden_arena_segment_slice(ctx, request->slot, 0u, 1u, &hidden_for_selection, &one_hidden_bytes) ||
+            one_hidden_bytes != (uint64_t)UOCR_HIDDEN_SIZE * 2u) {
+            free(sequence);
+            return metal_fail(error, error_size, "integrated Metal fp16 decode hidden slice is invalid");
+        }
+    }
+
+    free(sequence);
+    metal_clear_error(error, error_size);
+    return 1;
 }
 
 int uocr_metal_context_get_rows_f16(uocr_metal_context *ctx,

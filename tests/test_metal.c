@@ -7708,7 +7708,7 @@ static int test_metal_decoder_binding_cache_full_model(void) {
     };
     const int32_t input_ids[3] = {UOCR_TOKEN_BOS, 42, 77};
     const uint8_t image_mask[3] = {0u, 0u, 0u};
-    int32_t generated[1] = {0};
+    int32_t generated[2] = {0, 0};
     char error[1024];
     memset(error, 0, sizeof(error));
 
@@ -7754,13 +7754,19 @@ static int test_metal_decoder_binding_cache_full_model(void) {
     }
     CHECK(saw_nonzero_hidden == 1);
 
-    request.max_new_tokens = 1u;
+    request.max_new_tokens = 2u;
     result.generated_ids = generated;
-    result.generated_capacity = 1u;
+    result.generated_capacity = 2u;
     memset(error, 0, sizeof(error));
-    CHECK(uocr_metal_context_generate_f16(ctx, &request, &result, error, sizeof(error)) == 0);
-    CHECK(strstr(error, "decode loop is not implemented yet") != NULL);
-    CHECK(result.generated_count == 0u);
+    CHECK(uocr_metal_context_generate_f16(ctx, &request, &result, error, sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    CHECK(result.generated_count >= 1u);
+    CHECK(result.generated_count <= 2u);
+    for (uint32_t i = 0u; i < result.generated_count; ++i) {
+        CHECK(generated[i] >= 0);
+        CHECK((uint32_t)generated[i] < UOCR_VOCAB_SIZE);
+    }
+    CHECK(result.last_token_id == (uint32_t)generated[result.generated_count - 1u]);
 
     uocr_metal_context_destroy(ctx);
     uocr_model_file_close(&model);
