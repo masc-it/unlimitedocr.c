@@ -7736,13 +7736,30 @@ static int test_metal_decoder_binding_cache_full_model(void) {
     CHECK(uocr_metal_context_generate_f16(ctx, &request, &result, error, sizeof(error)) == 1);
     CHECK(error[0] == '\0');
     CHECK(result.generated_count == 0u);
+    uint16_t final_hidden[3u * UOCR_HIDDEN_SIZE];
+    memset(final_hidden, 0, sizeof(final_hidden));
+    CHECK(uocr_metal_context_read_decoder_final_hidden_f16(ctx,
+                                                           0u,
+                                                           3u,
+                                                           final_hidden,
+                                                           error,
+                                                           sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    int saw_nonzero_hidden = 0;
+    for (uint32_t i = 0u; i < 3u * UOCR_HIDDEN_SIZE; ++i) {
+        if (final_hidden[i] != 0u) {
+            saw_nonzero_hidden = 1;
+            break;
+        }
+    }
+    CHECK(saw_nonzero_hidden == 1);
 
     request.max_new_tokens = 1u;
     result.generated_ids = generated;
     result.generated_capacity = 1u;
     memset(error, 0, sizeof(error));
     CHECK(uocr_metal_context_generate_f16(ctx, &request, &result, error, sizeof(error)) == 0);
-    CHECK(strstr(error, "prefill/decode loop is not implemented yet") != NULL);
+    CHECK(strstr(error, "decode loop is not implemented yet") != NULL);
     CHECK(result.generated_count == 0u);
 
     uocr_metal_context_destroy(ctx);

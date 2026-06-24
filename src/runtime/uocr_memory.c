@@ -202,7 +202,11 @@ int uocr_estimate_decoder_scratch_bytes(uint32_t batch_slots, uint32_t prompt_to
     if (!checked_mul_u64((uint64_t)batch_slots, (uint64_t)prompt_token_capacity, &tokens) ||
         !checked_mul_u64(tokens, (uint64_t)UOCR_HIDDEN_SIZE, &hidden_values) ||
         !checked_mul_u64(hidden_values, 2u, &hidden_bytes) ||
-        !checked_mul_u64(hidden_bytes, 4u, out_bytes)) {
+        /* Integrated prefill keeps the prompt arena immutable and uses five
+         * hidden-sized scratch rows per slot: norm/context, q/attention
+         * residual, k/output, v/shared, and one spare/current ping-pong lane.
+         */
+        !checked_mul_u64(hidden_bytes, 5u, out_bytes)) {
         return UOCR_ERROR_OUT_OF_MEMORY;
     }
     return UOCR_OK;

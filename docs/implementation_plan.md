@@ -35,7 +35,7 @@ Current priority slice, in order. The coding agent should take the first uncheck
 
 - [x] Define internal integrated Metal decoder request/result structs and one orchestration entry point; keep existing per-op Metal functions as diagnostic/parity helpers.
 - [x] Validate and cache all decoder-required mapped tensor bindings (`TOK_EMBED`, `FINAL_NORM`, `LM_HEAD`, layer norms, attention, dense MLP, MoE router/shared/expert weights) before running the integrated decoder.
-- [ ] Implement single-request, slot-0, text-only prompt prefill orchestration over all 12 layers using persistent arenas and KV cache; no image features and no batching yet.
+- [x] Implement single-request, slot-0, text-only prompt prefill orchestration over all 12 layers using persistent arenas and KV cache; no image features and no batching yet.
 - [ ] Implement single-token decode-step orchestration using the existing KV ring helpers, prompt+generated-ring attention, final norm, LM head, no-repeat banning, greedy argmax, and EOS handling.
 - [ ] Wire the Metal backend path in `uocr_generate_prepared()` for `n_requests=1`, `views=0`, `fp16` model, and `max_new_tokens>0`; return generated ids with `uocr_result_create_from_generated()` instead of `UOCR_ERROR_NOT_IMPLEMENTED` for that narrow case.
 - [ ] Add an opt-in full-model public API parity test for text-only generated ids (`UOCR_RUN_LARGE_TESTS=1`, `UOCR_MODEL_PATH`, `UOCR_LAYER_DUMP_DIR` or equivalent fixture).
@@ -687,8 +687,8 @@ These tasks turn the fp16 decoder primitives/parity helpers into the first real 
 
 - [x] Define an internal decoder orchestration boundary, e.g. `uocr_metal_context_generate_text_f16()` or equivalent, that owns prefill/decode scheduling instead of exposing another per-op diagnostic helper.
 - [x] Build and validate a decoder tensor-binding table from stable tensor ids once per mapped model; fail early if any text decoder tensor is missing, not fp16, or has an unexpected shape.
-- [ ] Assemble text-only prompt embeddings into the persistent prompt arena for slot `0`.
-- [ ] Run full-prompt prefill through all 12 decoder layers, writing prompt K/V for every layer and carrying hidden-state ping-pong buffers in Metal arenas.
+- [x] Assemble text-only prompt embeddings into the persistent prompt arena for slot `0`.
+- [x] Run full-prompt prefill through all 12 decoder layers, writing prompt K/V for every layer and carrying hidden-state ping-pong buffers in Metal arenas.
 - [ ] Run decode steps from the last accepted token, writing generated K/V into the 128-token ring and attending to all prompt tokens plus live generated ring tokens.
 - [ ] Maintain a preallocated generated-token buffer and prompt+generated no-repeat state; no allocation is allowed inside the per-token loop after initial bring-up.
 - [ ] Stop on EOS id `1` or `max_new_tokens` and return generated ids through `uocr_result_create_from_generated()`.

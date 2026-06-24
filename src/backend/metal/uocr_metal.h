@@ -278,6 +278,12 @@ int uocr_metal_context_read_prompt_arena_f16(uocr_metal_context *ctx,
                                              uint16_t *out_prompt_f16,
                                              char *error,
                                              size_t error_size);
+int uocr_metal_context_read_decoder_final_hidden_f16(uocr_metal_context *ctx,
+                                                     uint32_t slot,
+                                                     uint32_t n_tokens,
+                                                     uint16_t *out_hidden_f16,
+                                                     char *error,
+                                                     size_t error_size);
 
 /* Diagnostic RMSNorm helper for synthetic tests. The kernel accumulates the
  * row variance in fp32 and applies fp16 learned weights.
