@@ -2513,6 +2513,176 @@ static int test_metal_image_router_topk_python_dump_parity(void) {
     return 0;
 }
 
+static int test_metal_image_logits_topk_python_dump_parity(void) {
+    if (!uocr_metal_is_available()) {
+        return 0;
+    }
+    if (!env_flag_enabled("UOCR_RUN_LARGE_TESTS")) {
+        return 0;
+    }
+
+    const char *model_path = getenv("UOCR_MODEL_PATH");
+    const char *dump_dir = getenv("UOCR_IMAGE_EMBED_DUMP_DIR");
+    if (model_path == NULL || model_path[0] == '\0' || dump_dir == NULL || dump_dir[0] == '\0') {
+        printf("UOCR_RUN_LARGE_TESTS=1 but UOCR_MODEL_PATH/UOCR_IMAGE_EMBED_DUMP_DIR are not both set; skipping image logits top-k parity\n");
+        return 0;
+    }
+    if (!fixture_binary_exists(dump_dir, "logits_topk_ids_i32.bin") ||
+        !fixture_binary_exists(dump_dir, "logits_topk_scores_f32.bin")) {
+        printf("UOCR_IMAGE_EMBED_DUMP_DIR has no logits_topk files; skipping image logits top-k parity\n");
+        return 0;
+    }
+    if (!fixture_binary_exists(dump_dir, "layer_11_hidden_f16.bin")) {
+        printf("UOCR_IMAGE_EMBED_DUMP_DIR has no layer_11_hidden_f16.bin; skipping image logits top-k parity\n");
+        return 0;
+    }
+
+    char error[1024];
+    memset(error, 0, sizeof(error));
+    int32_t *input_ids = NULL;
+    uint8_t *image_mask = NULL;
+    uint32_t n_tokens = 0u;
+    uint16_t *visual_features = NULL;
+    uint32_t image_span_start = UOCR_SEQUENCE_NO_IMAGE_SPAN;
+    uint32_t image_span_length = 0u;
+    uint16_t *prompt = NULL;
+    uint16_t *layer11 = NULL;
+    int32_t *expected_ids = NULL;
+    float *expected_scores = NULL;
+    uint32_t top_k = 0u;
+    CHECK(read_image_prompt_embedding_python_dump(dump_dir,
+                                                  &input_ids,
+                                                  &image_mask,
+                                                  &n_tokens,
+                                                  &visual_features,
+                                                  &image_span_start,
+                                                  &image_span_length,
+                                                  &prompt,
+                                                  error,
+                                                  sizeof(error)) == 1);
+    CHECK(n_tokens > 0u);
+    (void)image_span_start;
+    (void)image_span_length;
+
+    const uint32_t max_decoder_tokens = env_u32_or_default("UOCR_IMAGE_DECODER_MAX_TOKENS", 32u);
+    if (n_tokens > max_decoder_tokens) {
+        printf("UOCR_IMAGE_EMBED_DUMP_DIR has %u tokens; set UOCR_IMAGE_DECODER_MAX_TOKENS=%u or higher to run image logits top-k parity\n",
+               n_tokens,
+               n_tokens);
+        free(prompt);
+        free(visual_features);
+        free(image_mask);
+        free(input_ids);
+        return 0;
+    }
+
+    CHECK(read_layer_hidden_python_dump(dump_dir,
+                                        "layer_11_hidden_f16.bin",
+                                        n_tokens,
+                                        &layer11,
+                                        error,
+                                        sizeof(error)) == 1);
+    CHECK(read_text_logits_topk_python_dump(dump_dir,
+                                            &expected_ids,
+                                            &expected_scores,
+                                            &top_k,
+                                            error,
+                                            sizeof(error)) == 1);
+    CHECK(top_k > 0u && top_k <= 128u);
+
+    uocr_model_file model;
+    CHECK(uocr_model_file_open(model_path, &model, error, sizeof(error)) == 0);
+    uocr_metal_context *ctx = uocr_metal_context_create(UOCR_TEST_METAL_RESOURCE_PATH, error, sizeof(error));
+    CHECK(ctx != NULL);
+    CHECK(uocr_metal_context_map_model(ctx, &model, error, sizeof(error)) == 1);
+
+    uint16_t *normed = (uint16_t *)calloc((size_t)UOCR_HIDDEN_SIZE, sizeof(uint16_t));
+    float *logits = (float *)malloc((size_t)UOCR_VOCAB_SIZE * sizeof(float));
+    int32_t *actual_ids = (int32_t *)malloc((size_t)top_k * sizeof(int32_t));
+    float *actual_scores = (float *)malloc((size_t)top_k * sizeof(float));
+    CHECK(normed != NULL);
+    CHECK(logits != NULL);
+    CHECK(actual_ids != NULL);
+    CHECK(actual_scores != NULL);
+
+    const uint16_t *last_hidden = layer11 + (size_t)(n_tokens - 1u) * UOCR_HIDDEN_SIZE;
+    CHECK(uocr_metal_context_final_rmsnorm_f16(ctx,
+                                               last_hidden,
+                                               1u,
+                                               UOCR_METAL_RMSNORM_OUTPUT_F16,
+                                               normed,
+                                               error,
+                                               sizeof(error)) == 1);
+    CHECK(uocr_metal_context_lm_head_f16(ctx, normed, 1u, logits, error, sizeof(error)) == 1);
+    compute_logits_topk_f32(logits, UOCR_VOCAB_SIZE, top_k, actual_ids, actual_scores);
+    CHECK(error[0] == '\0');
+
+    for (uint32_t rank = 0u; rank < top_k; ++rank) {
+        if (actual_ids[rank] != expected_ids[rank]) {
+            fprintf(stderr,
+                    "image logits top-k id mismatch at rank %u: actual=%d expected=%d actual_score=%g expected_score=%g\n",
+                    rank,
+                    actual_ids[rank],
+                    expected_ids[rank],
+                    (double)actual_scores[rank],
+                    (double)expected_scores[rank]);
+            free(actual_scores);
+            free(actual_ids);
+            free(logits);
+            free(normed);
+            uocr_metal_context_destroy(ctx);
+            uocr_model_file_close(&model);
+            free(expected_scores);
+            free(expected_ids);
+            free(layer11);
+            free(prompt);
+            free(visual_features);
+            free(image_mask);
+            free(input_ids);
+            return 1;
+        }
+        const float diff = fabsf(actual_scores[rank] - expected_scores[rank]);
+        if (diff > 2.5e-2f) {
+            fprintf(stderr,
+                    "image logits top-k score mismatch at rank %u token %d: actual=%g expected=%g diff=%g\n",
+                    rank,
+                    actual_ids[rank],
+                    (double)actual_scores[rank],
+                    (double)expected_scores[rank],
+                    (double)diff);
+            free(actual_scores);
+            free(actual_ids);
+            free(logits);
+            free(normed);
+            uocr_metal_context_destroy(ctx);
+            uocr_model_file_close(&model);
+            free(expected_scores);
+            free(expected_ids);
+            free(layer11);
+            free(prompt);
+            free(visual_features);
+            free(image_mask);
+            free(input_ids);
+            return 1;
+        }
+    }
+
+    free(actual_scores);
+    free(actual_ids);
+    free(logits);
+    free(normed);
+    uocr_metal_context_destroy(ctx);
+    uocr_model_file_close(&model);
+    free(expected_scores);
+    free(expected_ids);
+    free(layer11);
+    free(prompt);
+    free(visual_features);
+    free(image_mask);
+    free(input_ids);
+    return 0;
+}
+
 static int test_metal_text_prompt_embedding_full_model_parity(void) {
     if (!uocr_metal_is_available()) {
         return 0;
@@ -7435,6 +7605,7 @@ int main(void) {
     if (test_metal_image_prompt_decoder_smoke_python_dump() != 0) return 1;
     if (test_metal_image_decoder_layers_python_dump_parity() != 0) return 1;
     if (test_metal_image_router_topk_python_dump_parity() != 0) return 1;
+    if (test_metal_image_logits_topk_python_dump_parity() != 0) return 1;
     if (test_metal_text_layer0_python_dump_parity() != 0) return 1;
     if (test_metal_text_layer1_python_dump_parity() != 0) return 1;
     if (test_metal_text_remaining_layers_python_dump_parity() != 0) return 1;

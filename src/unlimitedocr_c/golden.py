@@ -134,6 +134,12 @@ class ImageDecoderLayersDump(ImagePromptEmbeddingDump):
     router_top_weights_f32: dict[int, NDArray[np.float32]]
 
 
+@dataclass(frozen=True)
+class ImageLogitsTopKDump(ImageDecoderLayersDump):
+    logits_topk_ids: NDArray[np.int32]
+    logits_topk_scores_f32: NDArray[np.float32]
+
+
 def text_layer_hidden_filename(layer: int) -> str:
     if layer < 0 or layer >= TEXT_DECODER_LAYER_COUNT:
         raise ValueError(f"decoder layer out of range: {layer}")
@@ -1033,6 +1039,50 @@ def dump_image_decoder_layers_fixture(
     return out
 
 
+def dump_image_logits_topk_fixture(
+    request: PreparedRequest,
+    out_dir: str | Path,
+    hf_dir: str | Path,
+    visual_features_f16_bits: NDArray[np.uint16],
+    *,
+    top_k: int = DEFAULT_LOGITS_TOP_K,
+    tensor_name: str = TOK_EMBED_TENSOR_NAME,
+    expected_shape: tuple[int, int] = (MODEL_VOCAB_SIZE, HIDDEN_SIZE),
+) -> Path:
+    """Write image-embedding decoder layers plus next-token LM-head top-k logits."""
+
+    out = dump_image_decoder_layers_fixture(
+        request,
+        out_dir,
+        hf_dir,
+        visual_features_f16_bits,
+        layer_count=TEXT_DECODER_LAYER_COUNT,
+        tensor_name=tensor_name,
+        expected_shape=expected_shape,
+    )
+    layers = load_image_decoder_layers_dump(out)
+    ids, scores = compute_text_logits_topk_f32(layers.layer_hidden_f16_bits[-1], hf_dir, top_k=top_k)
+    np.asarray(ids, dtype=np.dtype("<i4")).tofile(out / LOGITS_TOPK_IDS_BIN)
+    np.asarray(scores, dtype=np.dtype("<f4")).tofile(out / LOGITS_TOPK_SCORES_BIN)
+
+    manifest_path = out / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest.setdefault("golden_tensors", {})["logits_topk"] = {
+        "ids_file": LOGITS_TOPK_IDS_BIN,
+        "scores_file": LOGITS_TOPK_SCORES_BIN,
+        "ids_dtype": "int32_le",
+        "scores_dtype": "float32_le",
+        "shape": [int(top_k)],
+        "source": f"image-embedding final RMSNorm {FINAL_NORM_TENSOR_NAME} and LM head {LM_HEAD_TENSOR_NAME}",
+        "reference_dtype_mode": "FP16 image decoder final norm activations/weights with FP32 LM-head reductions",
+        "rank_order": "score descending, token id ascending on ties",
+    }
+    manifest.setdefault("image_embedding_fixture", {})["logits_topk_ids_file"] = LOGITS_TOPK_IDS_BIN
+    manifest.setdefault("image_embedding_fixture", {})["logits_topk_scores_file"] = LOGITS_TOPK_SCORES_BIN
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return out
+
+
 def dump_text_layer0_fixture(request: PreparedRequest, out_dir: str | Path, hf_dir: str | Path) -> Path:
     """Write prompt embeddings plus the fp16 output of decoder layer 0.
 
@@ -1392,30 +1442,59 @@ def load_text_decoder_layers_dump(
     )
 
 
-def load_text_logits_topk_dump(fixture_dir: str | Path) -> TextLogitsTopKDump:
-    layers = load_text_decoder_layers_dump(fixture_dir)
-    root = Path(fixture_dir)
-    golden = layers.manifest.get("golden_tensors", {}).get("logits_topk", {})
+def _load_logits_topk_values(root: Path, manifest: dict[str, Any]) -> tuple[NDArray[np.int32], NDArray[np.float32]]:
+    golden = manifest.get("golden_tensors", {}).get("logits_topk", {})
     if not isinstance(golden, dict):
         raise ValueError(f"missing logits_topk metadata in {root}")
     shape = golden.get("shape")
     if not isinstance(shape, list) or len(shape) != 1:
         raise ValueError(f"invalid logits_topk shape metadata in {root}")
     top_k = int(shape[0])
-    ids = np.fromfile(root / LOGITS_TOPK_IDS_BIN, dtype=np.dtype("<i4"))
-    scores = np.fromfile(root / LOGITS_TOPK_SCORES_BIN, dtype=np.dtype("<f4"))
+    ids_file = golden.get("ids_file", LOGITS_TOPK_IDS_BIN)
+    scores_file = golden.get("scores_file", LOGITS_TOPK_SCORES_BIN)
+    if not isinstance(ids_file, str) or not isinstance(scores_file, str):
+        raise ValueError(f"invalid logits_topk filenames in {root}")
+    ids = np.fromfile(root / ids_file, dtype=np.dtype("<i4"))
+    scores = np.fromfile(root / scores_file, dtype=np.dtype("<f4"))
     if ids.shape != (top_k,) or scores.shape != (top_k,):
         raise ValueError(f"logits_topk shape mismatch in {root}: ids={ids.shape} scores={scores.shape}")
-    if top_k <= 0 or np.any(ids < 0) or np.any(ids >= MODEL_VOCAB_SIZE):
-        raise ValueError(f"invalid logits_topk ids in {root}")
+    if top_k <= 0 or np.any(ids < 0) or np.any(ids >= MODEL_VOCAB_SIZE) or not np.all(np.isfinite(scores)):
+        raise ValueError(f"invalid logits_topk values in {root}")
+    return ids.astype(np.int32, copy=False), scores.astype(np.float32, copy=False)
+
+
+def load_text_logits_topk_dump(fixture_dir: str | Path) -> TextLogitsTopKDump:
+    layers = load_text_decoder_layers_dump(fixture_dir)
+    root = Path(fixture_dir)
+    ids, scores = _load_logits_topk_values(root, layers.manifest)
     return TextLogitsTopKDump(
         manifest=layers.manifest,
         input_ids=layers.input_ids,
         image_mask=layers.image_mask,
         prompt_embeddings_f16_bits=layers.prompt_embeddings_f16_bits,
         layer_hidden_f16_bits=layers.layer_hidden_f16_bits,
-        logits_topk_ids=ids.astype(np.int32, copy=False),
-        logits_topk_scores_f32=scores.astype(np.float32, copy=False),
+        logits_topk_ids=ids,
+        logits_topk_scores_f32=scores,
+    )
+
+
+def load_image_logits_topk_dump(fixture_dir: str | Path) -> ImageLogitsTopKDump:
+    layers = load_image_decoder_layers_dump(fixture_dir)
+    root = Path(fixture_dir)
+    ids, scores = _load_logits_topk_values(root, layers.manifest)
+    return ImageLogitsTopKDump(
+        manifest=layers.manifest,
+        input_ids=layers.input_ids,
+        image_mask=layers.image_mask,
+        prompt_embeddings_f16_bits=layers.prompt_embeddings_f16_bits,
+        visual_features_f16_bits=layers.visual_features_f16_bits,
+        image_span_start=layers.image_span_start,
+        image_span_length=layers.image_span_length,
+        layer_hidden_f16_bits=layers.layer_hidden_f16_bits,
+        router_top_ids=layers.router_top_ids,
+        router_top_weights_f32=layers.router_top_weights_f32,
+        logits_topk_ids=ids,
+        logits_topk_scores_f32=scores,
     )
 
 

@@ -10,6 +10,7 @@ from unlimitedocr_c.golden import (
     dump_image_prompt_embedding_fixture,
     dump_prompt_embedding_fixture,
     load_image_decoder_layers_dump,
+    load_image_logits_topk_dump,
     load_image_prompt_embedding_dump,
     load_prompt_embedding_dump,
     load_text_decoder_layers_dump,
@@ -207,6 +208,10 @@ def test_load_image_decoder_layers_dump_reads_native_hidden_files(tmp_path) -> N
     layer1.tofile(out / "layer_1_hidden_f16.bin")
     router_ids.tofile(out / "layer_1_router_top_ids_u32.bin")
     router_weights.tofile(out / "layer_1_router_top_weights_f32.bin")
+    logits_ids = np.array([42, 7, 129279], dtype=np.dtype("<i4"))
+    logits_scores = np.array([5.0, 4.5, -0.25], dtype=np.dtype("<f4"))
+    logits_ids.tofile(out / "logits_topk_ids_i32.bin")
+    logits_scores.tofile(out / "logits_topk_scores_f32.bin")
     manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
     manifest["image_decoder_layer_count"] = 2
     manifest["image_embedding_fixture"] = {
@@ -220,6 +225,7 @@ def test_load_image_decoder_layers_dump_reads_native_hidden_files(tmp_path) -> N
         "prompt_embeddings": {"file": "prompt_embeddings_f16.bin", "shape": [3, 1280]},
         "layer_0_hidden": {"file": "layer_0_hidden_f16.bin", "shape": [3, 1280]},
         "layer_1_hidden": {"file": "layer_1_hidden_f16.bin", "shape": [3, 1280]},
+        "logits_topk": {"ids_file": "logits_topk_ids_i32.bin", "scores_file": "logits_topk_scores_f32.bin", "shape": [3]},
     }
     manifest["router_topk"] = {
         "layer_1": {
@@ -243,6 +249,10 @@ def test_load_image_decoder_layers_dump_reads_native_hidden_files(tmp_path) -> N
     np.testing.assert_array_equal(loaded.layer_hidden_f16_bits[1], layer1)
     np.testing.assert_array_equal(loaded.router_top_ids[1], router_ids)
     np.testing.assert_array_equal(loaded.router_top_weights_f32[1], router_weights)
+    loaded_logits = load_image_logits_topk_dump(out)
+    np.testing.assert_array_equal(loaded_logits.logits_topk_ids, logits_ids)
+    np.testing.assert_array_equal(loaded_logits.logits_topk_scores_f32, logits_scores)
+    assert loaded_logits.image_span_length == loaded.image_span_length
 
 
 def test_load_text_layer1_dump_reads_native_hidden_files(tmp_path) -> None:

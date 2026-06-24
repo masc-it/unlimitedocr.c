@@ -682,7 +682,7 @@ First implementation slice, in order:
   - [x] final prompt embeddings
   - [x] per-layer hidden states
   - [x] router top-6 agreement
-  - [ ] logits
+  - [x] logits
   - [ ] generated ids/text
 - [ ] Keep this mode available permanently as a parity/debug path even after Metal vision exists.
 
