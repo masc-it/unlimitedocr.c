@@ -8,7 +8,7 @@ from PIL import Image
 
 import unlimitedocr_c.ocr as ocr
 from unlimitedocr_c.ffi import find_library_path
-from unlimitedocr_c.frontend import GLOBAL_VISUAL_TOKENS, EOS_TOKEN_ID, MODEL_VOCAB_SIZE, SINGLE_PROMPT
+from unlimitedocr_c.frontend import GLOBAL_VISUAL_TOKENS, EOS_TOKEN_ID, MODEL_VOCAB_SIZE, MULTI_PROMPT, SINGLE_PROMPT
 
 
 def native_library_available() -> bool:
@@ -85,9 +85,44 @@ def test_ocr_image_rejects_negative_generation_cap() -> None:
         ocr.ocr_image(Image.new("RGB", (64, 64), (1, 2, 3)), engine=_FakeEngine(), max_gen_tokens=-1)
 
 
+def test_ocr_pages_uses_upstream_defaults_and_caps_generation() -> None:
+    fake = _FakeEngine()
+    pages = [Image.new("RGB", (96, 64), (1, 2, 3)), Image.new("RGB", (64, 96), (4, 5, 6))]
+    result = ocr.ocr_pages(pages, engine=fake, max_gen_tokens=9)
+    assert result.token_ids.tolist() == [EOS_TOKEN_ID]
+    assert result.text == ""
+    assert len(fake.requests) == 1
+
+    request = fake.requests[0]
+    assert request.prompt == MULTI_PROMPT
+    assert request.mode == "multi-page-base"
+    assert request.expected_visual_tokens == 2 * GLOBAL_VISUAL_TOKENS
+    assert request.max_length == 32768
+    assert request.max_new_tokens == 9
+    assert request.no_repeat_ngram_size == 35
+    assert request.no_repeat_window == 1024
+    assert request.crop_grid_w == 1
+    assert request.crop_grid_h == 1
+    assert [view.kind for view in request.views] == ["global", "global"]
+
+
+def test_ocr_pages_rejects_negative_generation_cap() -> None:
+    with pytest.raises(ValueError, match="max_gen_tokens must be non-negative"):
+        ocr.ocr_pages([Image.new("RGB", (64, 64), (1, 2, 3))], engine=_FakeEngine(), max_gen_tokens=-1)
+
+
 @pytest.mark.skipif(not native_library_available(), reason="libunlimitedocr is not built")
 def test_ocr_image_cpu_ref_validation_path() -> None:
     result = ocr.ocr_image(Image.new("RGB", (64, 64), (1, 2, 3)), backend="cpu-ref", max_gen_tokens=0)
+    assert result.token_ids.dtype == np.dtype(np.int32)
+    assert result.token_ids.shape == (0,)
+    assert result.text == ""
+
+
+@pytest.mark.skipif(not native_library_available(), reason="libunlimitedocr is not built")
+def test_ocr_pages_cpu_ref_validation_path() -> None:
+    pages = [Image.new("RGB", (64, 64), (1, 2, 3)), Image.new("RGB", (96, 64), (4, 5, 6))]
+    result = ocr.ocr_pages(pages, backend="cpu-ref", max_gen_tokens=0)
     assert result.token_ids.dtype == np.dtype(np.int32)
     assert result.token_ids.shape == (0,)
     assert result.text == ""
@@ -110,3 +145,21 @@ def test_generate_public_metal_image_smoke() -> None:
     assert 0 <= token_id < MODEL_VOCAB_SIZE
     assert isinstance(result.text, str)
     print(f"ocr.generate Metal image smoke generated token id={token_id} decoded={result.text!r}")
+
+
+@pytest.mark.skipif(
+    not _large_metal_test_enabled(),
+    reason="set UOCR_RUN_LARGE_TESTS=1 and UOCR_MODEL_PATH to run the full-model Metal ocr_pages smoke test",
+)
+def test_ocr_pages_public_metal_image_smoke() -> None:
+    result = ocr.ocr_pages(
+        [_gradient_image(128, 128), _gradient_image(96, 160)],
+        model_path=os.environ["UOCR_MODEL_PATH"],
+        max_gen_tokens=1,
+        memory_budget_bytes=(1 << 64) - 1,
+    )
+    assert result.token_ids.shape == (1,)
+    token_id = int(result.token_ids[0])
+    assert 0 <= token_id < MODEL_VOCAB_SIZE
+    assert isinstance(result.text, str)
+    print(f"ocr_pages Metal image smoke generated token id={token_id} decoded={result.text!r}")

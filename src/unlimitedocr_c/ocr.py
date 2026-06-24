@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 import numpy as np
 from numpy.typing import NDArray
@@ -19,6 +19,7 @@ from .ffi import Engine, EngineOptions
 from .frontend import (
     EOS_TOKEN_ID,
     MODEL_VOCAB_SIZE,
+    MULTI_PROMPT,
     SINGLE_PROMPT,
     ImageInput,
     PreparedRequest,
@@ -26,6 +27,7 @@ from .frontend import (
     default_tokenizer_path,
     load_tokenizer,
     prepare_image,
+    prepare_pages,
     project_root,
 )
 
@@ -212,6 +214,53 @@ def ocr_image(
         image,
         prompt=prompt,
         preset=preset,
+        tokenizer_path=tokenizer_path,
+        max_length=max_length,
+        max_new_tokens=None,
+        no_repeat_ngram_size=no_repeat_ngram_size,
+        no_repeat_window=ngram_window,
+        dtype=dtype,
+    )
+    request = _cap_max_new_tokens(request, max_gen_tokens)
+    return generate_prepared(
+        request,
+        engine=engine,
+        model_path=model_path,
+        backend=backend,
+        resource_path=resource_path,
+        memory_budget_bytes=memory_budget_bytes,
+        library_path=library_path,
+    )
+
+
+def ocr_pages(
+    pages: Sequence[ImageInput],
+    *,
+    model_path: str | Path | None = None,
+    prompt: str = MULTI_PROMPT,
+    tokenizer_path: str | Path | None = None,
+    max_length: int = 32768,
+    max_gen_tokens: int | None = 512,
+    no_repeat_ngram_size: int = 35,
+    ngram_window: int = 1024,
+    dtype: np.dtype[Any] | type[np.float16] | type[np.float32] = np.float16,
+    engine: Engine | None = None,
+    backend: str = "metal",
+    resource_path: str | Path | None = None,
+    memory_budget_bytes: int = 0,
+    library_path: str | Path | None = None,
+) -> GenerationResult:
+    """Run multi-page OCR with the upstream wrapper defaults.
+
+    Multi-page OCR always uses base/global 1024px views in the v1 frontend.  As
+    with ``ocr_image()``, upstream's total ``max_length`` is converted by
+    ``prepare_pages()`` to a prompt-relative generation budget, then capped to
+    ``max_gen_tokens`` for the owned-engine path.
+    """
+
+    request = prepare_pages(
+        pages,
+        prompt=prompt,
         tokenizer_path=tokenizer_path,
         max_length=max_length,
         max_new_tokens=None,

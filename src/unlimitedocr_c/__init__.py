@@ -106,6 +106,7 @@ from .ocr import (
     generate,
     generate_prepared,
     ocr_image,
+    ocr_pages,
 )
 
 __all__ = [
@@ -203,4 +204,5 @@ __all__ = [
     "generate",
     "generate_prepared",
     "ocr_image",
+    "ocr_pages",
 ]

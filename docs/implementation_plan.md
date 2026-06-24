@@ -952,11 +952,11 @@ Do not start the stable high-level OCR/PDF API until Gate E2E-0 passes: public f
   - [x] upstream-style `max_length=32768` converted to C `max_new_tokens = max_length - prompt_tokens`, capped by engine limit
   - [x] `no_repeat_ngram_size=35`
   - [x] `ngram_window=128`
-- [ ] Implement `ocr_pages()` matching upstream multi-page defaults:
-  - [ ] prompt `"<image>Multi page parsing."`
-  - [ ] base mode
-  - [ ] upstream-style `max_length=32768` converted to C `max_new_tokens = max_length - prompt_tokens`, capped by engine limit
-  - [ ] `ngram_window=1024`
+- [x] Implement `ocr_pages()` matching upstream multi-page defaults:
+  - [x] prompt `"<image>Multi page parsing."`
+  - [x] base mode
+  - [x] upstream-style `max_length=32768` converted to C `max_new_tokens = max_length - prompt_tokens`, capped by engine limit
+  - [x] `ngram_window=1024`
 - [ ] Implement `ocr_pdf()` using PyMuPDF in Python, not C.
 - [ ] Port useful postprocessing from `/Users/mascit/Downloads/ocrbaidu/src/ocrbaidu/postprocess.py`:
   - [ ] `parse_regions`
