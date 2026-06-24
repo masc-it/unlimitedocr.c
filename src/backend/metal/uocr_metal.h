@@ -634,6 +634,20 @@ int uocr_metal_context_clip_sam_concat_f16(uocr_metal_context *ctx,
                                            char *error,
                                            size_t error_size);
 
+/* Diagnostic visual projector helper. Applies model.projector.layers as a
+ * biased fp16 linear mapping from token-major [rows,2048] concat features to
+ * [rows,1280] decoder-hidden visual features.
+ */
+int uocr_metal_context_visual_projector_f16(uocr_metal_context *ctx,
+                                            const uint16_t *input_f16,
+                                            const uint16_t *weight_f16,
+                                            const uint16_t *bias_f16,
+                                            uint32_t n_rows,
+                                            uocr_metal_dense_output_type output_type,
+                                            void *out,
+                                            char *error,
+                                            size_t error_size);
+
 /* Diagnostic SAM window-attention helper for non-global transformer blocks.
  * Q/K/V are fp16 tensors laid out as [n_windows,14*14,12,64] (equivalent to
  * window-major rows with flattened [head,dim] channels). The helper computes

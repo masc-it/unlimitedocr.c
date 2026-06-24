@@ -102,6 +102,10 @@ static size_t clip_projection_weight_index(uint32_t out_channel, uint32_t in_cha
     return (size_t)out_channel * UOCR_CLIP_HIDDEN_SIZE + in_channel;
 }
 
+static size_t visual_projector_weight_index(uint32_t out_channel, uint32_t in_channel) {
+    return (size_t)out_channel * UOCR_PROJECTOR_IN_SIZE + in_channel;
+}
+
 static size_t clip_mlp_fc1_weight_index(uint32_t out_channel, uint32_t in_channel) {
     return (size_t)out_channel * UOCR_CLIP_HIDDEN_SIZE + in_channel;
 }
@@ -3294,6 +3298,164 @@ static int test_metal_clip_sam_concat_f16(void) {
                                                  sizeof(error)) == 0);
     CHECK(strstr(error, "unsupported Metal CLIP/SAM concat output type") != NULL);
 
+    uocr_metal_context_destroy(ctx);
+    return 0;
+}
+
+static float visual_projector_expected(const uint16_t *input,
+                                       const uint16_t *weight,
+                                       const uint16_t *bias,
+                                       uint32_t row,
+                                       uint32_t out_channel) {
+    float sum = f16_bits_to_f32(bias[out_channel]);
+    const size_t row_base = (size_t)row * UOCR_PROJECTOR_IN_SIZE;
+    for (uint32_t k = 0u; k < UOCR_PROJECTOR_IN_SIZE; ++k) {
+        const uint16_t weight_bits = weight[visual_projector_weight_index(out_channel, k)];
+        if (weight_bits != 0u) {
+            sum += f16_bits_to_f32(input[row_base + k]) * f16_bits_to_f32(weight_bits);
+        }
+    }
+    return sum;
+}
+
+static int test_metal_visual_projector_f16(void) {
+    if (!uocr_metal_is_available()) {
+        return 0;
+    }
+
+    CHECK(UOCR_PROJECTOR_IN_SIZE == 2048u);
+    CHECK(UOCR_HIDDEN_SIZE == 1280u);
+    CHECK(UOCR_GLOBAL_GRID_QUERIES * UOCR_GLOBAL_GRID_QUERIES == 256u);
+    CHECK(UOCR_LOCAL_GRID_QUERIES * UOCR_LOCAL_GRID_QUERIES == 100u);
+
+    char error[1024];
+    memset(error, 0, sizeof(error));
+    uocr_metal_context *ctx = uocr_metal_context_create(UOCR_TEST_METAL_RESOURCE_PATH, error, sizeof(error));
+    CHECK(ctx != NULL);
+
+    const size_t weight_values = (size_t)UOCR_HIDDEN_SIZE * UOCR_PROJECTOR_IN_SIZE;
+    uint16_t *weight = (uint16_t *)calloc(weight_values, sizeof(uint16_t));
+    uint16_t *bias = (uint16_t *)calloc(UOCR_HIDDEN_SIZE, sizeof(uint16_t));
+    CHECK(weight != NULL);
+    CHECK(bias != NULL);
+
+    for (uint32_t out_channel = 0u; out_channel < UOCR_HIDDEN_SIZE; ++out_channel) {
+        bias[out_channel] = f32_to_f16_bits(((int)(out_channel % 29u) - 14) * 0.0025f);
+        weight[visual_projector_weight_index(out_channel, out_channel % UOCR_PROJECTOR_IN_SIZE)] =
+            f32_to_f16_bits(((int)(out_channel % 9u) - 4) * 0.03125f);
+        weight[visual_projector_weight_index(out_channel, (out_channel + UOCR_CLIP_HIDDEN_SIZE) % UOCR_PROJECTOR_IN_SIZE)] =
+            f32_to_f16_bits(((int)(out_channel % 11u) - 5) * 0.015625f);
+        weight[visual_projector_weight_index(out_channel, (out_channel * 37u + 11u) % UOCR_PROJECTOR_IN_SIZE)] =
+            f32_to_f16_bits(((int)(out_channel % 13u) - 6) * 0.0078125f);
+    }
+
+    const uint32_t row_counts[] = {
+        UOCR_GLOBAL_GRID_QUERIES * UOCR_GLOBAL_GRID_QUERIES,
+        UOCR_LOCAL_GRID_QUERIES * UOCR_LOCAL_GRID_QUERIES,
+    };
+    for (size_t case_index = 0u; case_index < sizeof(row_counts) / sizeof(row_counts[0]); ++case_index) {
+        const uint32_t rows = row_counts[case_index];
+        const size_t input_values = (size_t)rows * UOCR_PROJECTOR_IN_SIZE;
+        const size_t output_values = (size_t)rows * UOCR_HIDDEN_SIZE;
+        uint16_t *input = (uint16_t *)calloc(input_values, sizeof(uint16_t));
+        float *out_f32 = (float *)calloc(output_values, sizeof(float));
+        uint16_t *out_f16 = (uint16_t *)calloc(output_values, sizeof(uint16_t));
+        CHECK(input != NULL);
+        CHECK(out_f32 != NULL);
+        CHECK(out_f16 != NULL);
+
+        for (uint32_t row = 0u; row < rows; ++row) {
+            for (uint32_t col = 0u; col < UOCR_PROJECTOR_IN_SIZE; ++col) {
+                const int mod = (int)((row * 17u + col * 19u + rows) % 149u) - 74;
+                input[(size_t)row * UOCR_PROJECTOR_IN_SIZE + col] = f32_to_f16_bits((float)mod * 0.002f);
+            }
+        }
+
+        CHECK(uocr_metal_context_visual_projector_f16(ctx,
+                                                      input,
+                                                      weight,
+                                                      bias,
+                                                      rows,
+                                                      UOCR_METAL_DENSE_OUTPUT_F32,
+                                                      out_f32,
+                                                      error,
+                                                      sizeof(error)) == 1);
+        CHECK(error[0] == '\0');
+
+        struct visual_projector_sample {
+            uint32_t row;
+            uint32_t channel;
+        } samples[] = {
+            {0u, 0u},
+            {rows / 4u, 17u},
+            {rows / 2u, 511u},
+            {rows - 1u, 777u},
+            {rows - 1u, UOCR_HIDDEN_SIZE - 1u},
+        };
+        for (size_t i = 0u; i < sizeof(samples) / sizeof(samples[0]); ++i) {
+            const size_t idx = (size_t)samples[i].row * UOCR_HIDDEN_SIZE + samples[i].channel;
+            const float expected = visual_projector_expected(input, weight, bias, samples[i].row, samples[i].channel);
+            CHECK(fabsf(out_f32[idx] - expected) <= 2.0e-5f);
+        }
+
+        CHECK(uocr_metal_context_visual_projector_f16(ctx,
+                                                      input,
+                                                      weight,
+                                                      bias,
+                                                      rows,
+                                                      UOCR_METAL_DENSE_OUTPUT_F16,
+                                                      out_f16,
+                                                      error,
+                                                      sizeof(error)) == 1);
+        CHECK(error[0] == '\0');
+        for (size_t i = 0u; i < sizeof(samples) / sizeof(samples[0]); ++i) {
+            const size_t idx = (size_t)samples[i].row * UOCR_HIDDEN_SIZE + samples[i].channel;
+            const float expected = visual_projector_expected(input, weight, bias, samples[i].row, samples[i].channel);
+            CHECK(fabsf(f16_bits_to_f32(out_f16[idx]) - expected) <= 1.0e-3f);
+        }
+
+        free(out_f16);
+        free(out_f32);
+        free(input);
+    }
+
+    uint16_t one_value = f32_to_f16_bits(0.0f);
+    float one_out = 0.0f;
+    CHECK(uocr_metal_context_visual_projector_f16(ctx,
+                                                  NULL,
+                                                  weight,
+                                                  bias,
+                                                  1u,
+                                                  UOCR_METAL_DENSE_OUTPUT_F32,
+                                                  &one_out,
+                                                  error,
+                                                  sizeof(error)) == 0);
+    CHECK(strstr(error, "invalid Metal visual projector") != NULL);
+
+    CHECK(uocr_metal_context_visual_projector_f16(ctx,
+                                                  &one_value,
+                                                  weight,
+                                                  bias,
+                                                  0u,
+                                                  UOCR_METAL_DENSE_OUTPUT_F32,
+                                                  &one_out,
+                                                  error,
+                                                  sizeof(error)) == 0);
+    CHECK(strstr(error, "invalid Metal visual projector") != NULL);
+
+    CHECK(uocr_metal_context_visual_projector_f16(ctx,
+                                                  &one_value,
+                                                  weight,
+                                                  bias,
+                                                  1u,
+                                                  (uocr_metal_dense_output_type)99,
+                                                  &one_out,
+                                                  error,
+                                                  sizeof(error)) == 0);
+    CHECK(strstr(error, "unsupported Metal visual projector output type") != NULL);
+
+    free(bias);
+    free(weight);
     uocr_metal_context_destroy(ctx);
     return 0;
 }
@@ -13386,6 +13548,7 @@ int main(void) {
     if (test_metal_clip_residual_add_f16() != 0) return 1;
     if (test_metal_clip_transformer_f16() != 0) return 1;
     if (test_metal_clip_sam_concat_f16() != 0) return 1;
+    if (test_metal_visual_projector_f16() != 0) return 1;
     if (test_metal_sam_window_partition_f16() != 0) return 1;
     if (test_metal_sam_window_attention_f16() != 0) return 1;
     if (test_metal_sam_global_attention_f16() != 0) return 1;

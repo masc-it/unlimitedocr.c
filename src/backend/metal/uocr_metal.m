@@ -8632,6 +8632,46 @@ int uocr_metal_context_clip_sam_concat_f16(uocr_metal_context *ctx,
     return result;
 }
 
+int uocr_metal_context_visual_projector_f16(uocr_metal_context *ctx,
+                                            const uint16_t *input_f16,
+                                            const uint16_t *weight_f16,
+                                            const uint16_t *bias_f16,
+                                            uint32_t n_rows,
+                                            uocr_metal_dense_output_type output_type,
+                                            void *out,
+                                            char *error,
+                                            size_t error_size) {
+    metal_clear_error(error, error_size);
+    if (ctx == NULL || input_f16 == NULL || weight_f16 == NULL || bias_f16 == NULL || out == NULL || n_rows == 0u) {
+        return metal_fail(error, error_size, "invalid Metal visual projector request");
+    }
+    if (output_type != UOCR_METAL_DENSE_OUTPUT_F16 && output_type != UOCR_METAL_DENSE_OUTPUT_F32) {
+        return metal_fail(error, error_size, "unsupported Metal visual projector output type %d", (int)output_type);
+    }
+    if (UOCR_PROJECTOR_IN_SIZE != 2048u || UOCR_HIDDEN_SIZE != 1280u) {
+        return metal_fail(error, error_size, "Metal visual projector constants are inconsistent");
+    }
+
+    if (!uocr_metal_context_dense_f16(ctx,
+                                      input_f16,
+                                      weight_f16,
+                                      bias_f16,
+                                      n_rows,
+                                      UOCR_PROJECTOR_IN_SIZE,
+                                      UOCR_HIDDEN_SIZE,
+                                      output_type,
+                                      out,
+                                      error,
+                                      error_size)) {
+        char detail[512];
+        metal_copy_error_detail(detail, sizeof(detail), error);
+        return metal_fail(error, error_size, "failed to compute Metal visual projector: %s", detail);
+    }
+
+    metal_clear_error(error, error_size);
+    return 1;
+}
+
 static int metal_context_sam_attention_f16(uocr_metal_context *ctx,
                                            const uint16_t *q_f16,
                                            const uint16_t *k_f16,

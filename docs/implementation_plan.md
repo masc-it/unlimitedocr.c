@@ -787,7 +787,7 @@ Do not begin this section until sections 14.5 and 15.1 pass for fp16 single-requ
 ### 16.4 Projector and visual feature formatting
 
 - [x] Concatenate CLIP token features without CLS and SAM feature-map tokens: `1024 + 1024 = 2048`.
-- [ ] Implement linear projector `2048 -> 1280` with bias.
+- [x] Implement linear projector `2048 -> 1280` with bias.
 - [ ] Validate projected features against Python dumps.
 - [ ] Format global view features:
   - [ ] reshape to grid `16x16` for `1024`
