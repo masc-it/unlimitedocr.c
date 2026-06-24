@@ -277,6 +277,20 @@ int uocr_metal_context_sam_patch_embed_f16(uocr_metal_context *ctx,
                                            char *error,
                                            size_t error_size);
 
+/* Diagnostic SAM absolute-position helper. Adds pos_embed [1,64,64,768]
+ * to patch embeddings shaped BHWC [grid_h,grid_w,768]. When the target grid is
+ * not 64x64, the position table is resized with get_abs_pos_sam-style bicubic
+ * interpolation, antialias=true, align_corners=false semantics.
+ */
+int uocr_metal_context_sam_add_abs_pos_f16(uocr_metal_context *ctx,
+                                           const uint16_t *patch_bhwc_f16,
+                                           const uint16_t *pos_embed_f16,
+                                           uint32_t grid_w,
+                                           uint32_t grid_h,
+                                           uint16_t *out_bhwc_f16,
+                                           char *error,
+                                           size_t error_size);
+
 /* Runtime prompt assembly into the persistent Metal prompt-embedding arena.
  * The arena must have been allocated with uocr_metal_context_allocate_runtime_arenas().
  * slot selects the batch slot. Tests can inspect the private arena with the

@@ -30,6 +30,8 @@
         }                                                                           \
     } while (0)
 
+static float f16_bits_to_f32(uint16_t h);
+
 static int test_metal_smoke(void) {
     if (!uocr_metal_is_available()) {
         printf("Metal device not available; skipping Metal smoke test\n");
@@ -51,6 +53,59 @@ static int test_metal_smoke(void) {
 
 static size_t sam_patch_weight_index(uint32_t out_channel, uint32_t in_channel, uint32_t ky, uint32_t kx) {
     return (size_t)((((out_channel * 3u + in_channel) * UOCR_VISION_PATCH_SIZE + ky) * UOCR_VISION_PATCH_SIZE + kx));
+}
+
+static size_t sam_abs_pos_index(uint32_t grid, uint32_t y, uint32_t x, uint32_t channel) {
+    return ((size_t)y * grid + x) * UOCR_SAM_HIDDEN_SIZE + channel;
+}
+
+static float sam_cubic_weight(float x) {
+    const float a = -0.75f;
+    const float ax = fabsf(x);
+    if (ax < 1.0f) {
+        return ((a + 2.0f) * ax - (a + 3.0f)) * ax * ax + 1.0f;
+    }
+    if (ax < 2.0f) {
+        return (((a * ax - 5.0f * a) * ax + 8.0f * a) * ax - 4.0f * a);
+    }
+    return 0.0f;
+}
+
+static float sam_abs_pos_reference(const uint16_t *pos,
+                                   uint32_t src_grid,
+                                   uint32_t target_grid,
+                                   uint32_t out_y,
+                                   uint32_t out_x,
+                                   uint32_t channel) {
+    if (src_grid == target_grid) {
+        return f16_bits_to_f32(pos[sam_abs_pos_index(src_grid, out_y, out_x, channel)]);
+    }
+    const float scale = (float)src_grid / (float)target_grid;
+    const float filter_scale = fmaxf(scale, 1.0f);
+    const float support = 2.0f * filter_scale;
+    const float center_y = ((float)out_y + 0.5f) * scale - 0.5f;
+    const float center_x = ((float)out_x + 0.5f) * scale - 0.5f;
+    int y0 = (int)floorf(center_y - support);
+    int y1 = (int)ceilf(center_y + support);
+    int x0 = (int)floorf(center_x - support);
+    int x1 = (int)ceilf(center_x + support);
+    if (y0 < 0) y0 = 0;
+    if (x0 < 0) x0 = 0;
+    if (y1 >= (int)src_grid) y1 = (int)src_grid - 1;
+    if (x1 >= (int)src_grid) x1 = (int)src_grid - 1;
+
+    float acc = 0.0f;
+    float weight_sum = 0.0f;
+    for (int iy = y0; iy <= y1; ++iy) {
+        const float wy = sam_cubic_weight(((float)iy - center_y) / filter_scale);
+        for (int ix = x0; ix <= x1; ++ix) {
+            const float wx = sam_cubic_weight(((float)ix - center_x) / filter_scale);
+            const float w = wy * wx;
+            acc += f16_bits_to_f32(pos[sam_abs_pos_index(src_grid, (uint32_t)iy, (uint32_t)ix, channel)]) * w;
+            weight_sum += w;
+        }
+    }
+    return weight_sum != 0.0f ? acc / weight_sum : 0.0f;
 }
 
 static int test_metal_named_scratch_buffers(void) {
@@ -284,6 +339,121 @@ static int test_metal_sam_patch_embed_f16(void) {
     free(weights);
     free(pixels_f32);
     uocr_metal_context_destroy(ctx);
+    return 0;
+}
+
+static int test_metal_sam_abs_pos_f16(void) {
+    if (!uocr_metal_is_available()) {
+        return 0;
+    }
+
+    enum {
+        SRC_GRID = UOCR_GLOBAL_VIEW_SIZE / UOCR_VISION_PATCH_SIZE,
+        LOCAL_GRID = UOCR_LOCAL_VIEW_SIZE / UOCR_VISION_PATCH_SIZE
+    };
+    const size_t pos_values = (size_t)SRC_GRID * SRC_GRID * UOCR_SAM_HIDDEN_SIZE;
+    const size_t global_values = pos_values;
+    const size_t local_values = (size_t)LOCAL_GRID * LOCAL_GRID * UOCR_SAM_HIDDEN_SIZE;
+
+    uint16_t *pos = (uint16_t *)calloc(pos_values, sizeof(uint16_t));
+    uint16_t *global_patch = (uint16_t *)calloc(global_values, sizeof(uint16_t));
+    uint16_t *global_out = (uint16_t *)calloc(global_values, sizeof(uint16_t));
+    uint16_t *local_patch = (uint16_t *)calloc(local_values, sizeof(uint16_t));
+    uint16_t *local_out = (uint16_t *)calloc(local_values, sizeof(uint16_t));
+    CHECK(pos != NULL);
+    CHECK(global_patch != NULL);
+    CHECK(global_out != NULL);
+    CHECK(local_patch != NULL);
+    CHECK(local_out != NULL);
+
+    for (uint32_t y = 0u; y < SRC_GRID; ++y) {
+        for (uint32_t x = 0u; x < SRC_GRID; ++x) {
+            for (uint32_t c = 0u; c < UOCR_SAM_HIDDEN_SIZE; ++c) {
+                const float value = 0.001f * (float)y + 0.002f * (float)x + 0.0001f * (float)(c % 17u);
+                pos[sam_abs_pos_index(SRC_GRID, y, x, c)] = f32_to_f16_bits(value);
+                global_patch[sam_abs_pos_index(SRC_GRID, y, x, c)] =
+                    f32_to_f16_bits(-0.25f + 0.00005f * (float)(c % 13u));
+            }
+        }
+    }
+    for (uint32_t y = 0u; y < LOCAL_GRID; ++y) {
+        for (uint32_t x = 0u; x < LOCAL_GRID; ++x) {
+            for (uint32_t c = 0u; c < UOCR_SAM_HIDDEN_SIZE; ++c) {
+                local_patch[sam_abs_pos_index(LOCAL_GRID, y, x, c)] =
+                    f32_to_f16_bits(0.125f + 0.00003f * (float)((x + y + c) % 19u));
+            }
+        }
+    }
+
+    char error[1024];
+    memset(error, 0, sizeof(error));
+    uocr_metal_context *ctx = uocr_metal_context_create(UOCR_TEST_METAL_RESOURCE_PATH, error, sizeof(error));
+    CHECK(ctx != NULL);
+
+    CHECK(uocr_metal_context_sam_add_abs_pos_f16(ctx,
+                                                 global_patch,
+                                                 pos,
+                                                 SRC_GRID,
+                                                 SRC_GRID,
+                                                 global_out,
+                                                 error,
+                                                 sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+
+    const uint32_t direct_y[] = {0u, 17u, 63u};
+    const uint32_t direct_x[] = {0u, 31u, 63u};
+    const uint32_t direct_c[] = {0u, 5u, UOCR_SAM_HIDDEN_SIZE - 1u};
+    for (size_t iy = 0u; iy < sizeof(direct_y) / sizeof(direct_y[0]); ++iy) {
+        for (size_t ix = 0u; ix < sizeof(direct_x) / sizeof(direct_x[0]); ++ix) {
+            for (size_t ic = 0u; ic < sizeof(direct_c) / sizeof(direct_c[0]); ++ic) {
+                const size_t idx = sam_abs_pos_index(SRC_GRID, direct_y[iy], direct_x[ix], direct_c[ic]);
+                const float expected = f16_bits_to_f32(global_patch[idx]) + f16_bits_to_f32(pos[idx]);
+                CHECK(global_out[idx] == f32_to_f16_bits(expected));
+            }
+        }
+    }
+
+    CHECK(uocr_metal_context_sam_add_abs_pos_f16(ctx,
+                                                 local_patch,
+                                                 pos,
+                                                 LOCAL_GRID,
+                                                 LOCAL_GRID,
+                                                 local_out,
+                                                 error,
+                                                 sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+
+    const uint32_t interp_y[] = {0u, 7u, LOCAL_GRID - 1u};
+    const uint32_t interp_x[] = {0u, 13u, LOCAL_GRID - 1u};
+    const uint32_t interp_c[] = {0u, 11u, UOCR_SAM_HIDDEN_SIZE - 1u};
+    for (size_t iy = 0u; iy < sizeof(interp_y) / sizeof(interp_y[0]); ++iy) {
+        for (size_t ix = 0u; ix < sizeof(interp_x) / sizeof(interp_x[0]); ++ix) {
+            for (size_t ic = 0u; ic < sizeof(interp_c) / sizeof(interp_c[0]); ++ic) {
+                const size_t idx = sam_abs_pos_index(LOCAL_GRID, interp_y[iy], interp_x[ix], interp_c[ic]);
+                const float expected = f16_bits_to_f32(local_patch[idx]) +
+                                       sam_abs_pos_reference(pos, SRC_GRID, LOCAL_GRID, interp_y[iy], interp_x[ix], interp_c[ic]);
+                const float actual = f16_bits_to_f32(local_out[idx]);
+                CHECK(fabsf(actual - expected) <= 1.5e-3f);
+            }
+        }
+    }
+
+    CHECK(uocr_metal_context_sam_add_abs_pos_f16(ctx,
+                                                 local_patch,
+                                                 pos,
+                                                 LOCAL_GRID,
+                                                 LOCAL_GRID + 1u,
+                                                 local_out,
+                                                 error,
+                                                 sizeof(error)) == 0);
+    CHECK(strstr(error, "square") != NULL);
+
+    uocr_metal_context_destroy(ctx);
+    free(local_out);
+    free(local_patch);
+    free(global_out);
+    free(global_patch);
+    free(pos);
     return 0;
 }
 
@@ -9026,6 +9196,7 @@ int main(void) {
     if (test_metal_smoke() != 0) return 1;
     if (test_metal_named_scratch_buffers() != 0) return 1;
     if (test_metal_sam_patch_embed_f16() != 0) return 1;
+    if (test_metal_sam_abs_pos_f16() != 0) return 1;
     if (test_metal_get_rows_f16() != 0) return 1;
     if (test_metal_prompt_assembly_f16() != 0) return 1;
     if (test_metal_prompt_assembly_from_mapped_model_f16() != 0) return 1;

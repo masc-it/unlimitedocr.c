@@ -319,6 +319,13 @@ typedef struct uocr_metal_sam_patch_embed_params {
     uint32_t reserved2;
 } uocr_metal_sam_patch_embed_params;
 
+typedef struct uocr_metal_sam_abs_pos_params {
+    uint32_t source_grid;
+    uint32_t target_width;
+    uint32_t target_height;
+    uint32_t channels;
+} uocr_metal_sam_abs_pos_params;
+
 typedef struct uocr_metal_argmax_params {
     uint32_t rows;
     uint32_t vocab_size;
@@ -4907,6 +4914,141 @@ int uocr_metal_context_sam_patch_embed_f16(uocr_metal_context *ctx,
         [bias_buffer release];
         [weight_buffer release];
         [pixel_buffer release];
+        return ok;
+    }
+}
+
+int uocr_metal_context_sam_add_abs_pos_f16(uocr_metal_context *ctx,
+                                           const uint16_t *patch_bhwc_f16,
+                                           const uint16_t *pos_embed_f16,
+                                           uint32_t grid_w,
+                                           uint32_t grid_h,
+                                           uint16_t *out_bhwc_f16,
+                                           char *error,
+                                           size_t error_size) {
+    metal_clear_error(error, error_size);
+    if (ctx == NULL || patch_bhwc_f16 == NULL || pos_embed_f16 == NULL || out_bhwc_f16 == NULL) {
+        return metal_fail(error, error_size, "invalid Metal SAM absolute-position request");
+    }
+
+    const uint32_t source_grid = UOCR_GLOBAL_VIEW_SIZE / UOCR_VISION_PATCH_SIZE;
+    if (grid_w == 0u || grid_h == 0u || grid_w != grid_h || grid_w > source_grid || grid_h > source_grid) {
+        return metal_fail(error,
+                          error_size,
+                          "Metal SAM absolute-position grid must be square and in [1,%u], got %ux%u",
+                          source_grid,
+                          grid_w,
+                          grid_h);
+    }
+
+    uint64_t target_patches = 0u;
+    uint64_t target_values = 0u;
+    uint64_t target_bytes = 0u;
+    uint64_t source_patches = 0u;
+    uint64_t source_values = 0u;
+    uint64_t source_bytes = 0u;
+    const uint64_t max_buffer_length = metal_device_max_buffer_length(ctx->device);
+    if (!checked_mul_u64((uint64_t)grid_w, (uint64_t)grid_h, &target_patches) ||
+        !checked_mul_u64(target_patches, (uint64_t)UOCR_SAM_HIDDEN_SIZE, &target_values) ||
+        !checked_mul_u64(target_values, 2u, &target_bytes) ||
+        !checked_mul_u64((uint64_t)source_grid, (uint64_t)source_grid, &source_patches) ||
+        !checked_mul_u64(source_patches, (uint64_t)UOCR_SAM_HIDDEN_SIZE, &source_values) ||
+        !checked_mul_u64(source_values, 2u, &source_bytes) || target_bytes > (uint64_t)SIZE_MAX ||
+        source_bytes > (uint64_t)SIZE_MAX || target_bytes > max_buffer_length || source_bytes > max_buffer_length) {
+        return metal_fail(error, error_size, "Metal SAM absolute-position byte-size overflow");
+    }
+
+    @autoreleasepool {
+        id<MTLBuffer> patch_buffer = [ctx->device newBufferWithBytes:patch_bhwc_f16
+                                                             length:(NSUInteger)target_bytes
+                                                            options:MTLResourceStorageModeShared];
+        if (patch_buffer == nil) {
+            return metal_fail(error, error_size, "failed to allocate Metal SAM absolute-position patch buffer");
+        }
+        patch_buffer.label = @"uocr_sam_abs_pos_patch_bhwc_f16";
+
+        id<MTLBuffer> pos_buffer = [ctx->device newBufferWithBytes:pos_embed_f16
+                                                           length:(NSUInteger)source_bytes
+                                                          options:MTLResourceStorageModeShared];
+        if (pos_buffer == nil) {
+            [patch_buffer release];
+            return metal_fail(error, error_size, "failed to allocate Metal SAM absolute-position table buffer");
+        }
+        pos_buffer.label = @"uocr_sam_abs_pos_table_f16";
+
+        id<MTLBuffer> output_buffer = [ctx->device newBufferWithLength:(NSUInteger)target_bytes
+                                                                options:MTLResourceStorageModeShared];
+        if (output_buffer == nil) {
+            [pos_buffer release];
+            [patch_buffer release];
+            return metal_fail(error, error_size, "failed to allocate Metal SAM absolute-position output buffer");
+        }
+        output_buffer.label = @"uocr_sam_abs_pos_output_bhwc_f16";
+
+        id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, "uocr_sam_add_abs_pos_f16", error, error_size);
+        if (pipeline == nil) {
+            [output_buffer release];
+            [pos_buffer release];
+            [patch_buffer release];
+            return 0;
+        }
+
+        id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
+        if (cb == nil) {
+            [output_buffer release];
+            [pos_buffer release];
+            [patch_buffer release];
+            return metal_fail(error, error_size, "failed to create Metal SAM absolute-position command buffer");
+        }
+        cb.label = @"uocr_sam_abs_pos_command_buffer";
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        if (enc == nil) {
+            [output_buffer release];
+            [pos_buffer release];
+            [patch_buffer release];
+            return metal_fail(error, error_size, "failed to create Metal SAM absolute-position encoder");
+        }
+
+        uocr_metal_sam_abs_pos_params params;
+        params.source_grid = source_grid;
+        params.target_width = grid_w;
+        params.target_height = grid_h;
+        params.channels = UOCR_SAM_HIDDEN_SIZE;
+
+        [enc setComputePipelineState:pipeline];
+        [enc setBuffer:patch_buffer offset:0u atIndex:0u];
+        [enc setBuffer:pos_buffer offset:0u atIndex:1u];
+        [enc setBuffer:output_buffer offset:0u atIndex:2u];
+        [enc setBytes:&params length:sizeof(params) atIndex:3u];
+
+        NSUInteger threads = pipeline.threadExecutionWidth;
+        if (threads == 0u) {
+            threads = 64u;
+        }
+        if (threads > pipeline.maxTotalThreadsPerThreadgroup) {
+            threads = pipeline.maxTotalThreadsPerThreadgroup;
+        }
+        if (threads == 0u) {
+            threads = 1u;
+        }
+        [enc dispatchThreads:MTLSizeMake((NSUInteger)target_values, 1u, 1u)
+       threadsPerThreadgroup:MTLSizeMake(threads, 1u, 1u)];
+        [enc endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+
+        int ok = 1;
+        if (cb.status == MTLCommandBufferStatusError) {
+            NSString *description = cb.error != nil ? [cb.error localizedDescription] : @"unknown command-buffer error";
+            ok = metal_fail(error, error_size, "Metal SAM absolute-position command failed: %s", [description UTF8String]);
+        } else {
+            memcpy(out_bhwc_f16, [output_buffer contents], (size_t)target_bytes);
+            metal_clear_error(error, error_size);
+        }
+
+        [output_buffer release];
+        [pos_buffer release];
+        [patch_buffer release];
         return ok;
     }
 }

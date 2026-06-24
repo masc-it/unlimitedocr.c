@@ -743,9 +743,9 @@ Do not begin this section until sections 14.5 and 15.1 pass for fp16 single-requ
   - [x] stride `16`
   - [x] output grid `64x64` for `1024`, `40x40` for `640`
   - [x] layout conversion to BHWC as upstream does
-- [ ] Add SAM absolute position embedding:
-  - [ ] use `get_abs_pos_sam` bicubic interpolation semantics
-  - [ ] precompute/store common `64x64` and `40x40` tables in converter if practical
+- [x] Add SAM absolute position embedding:
+  - [x] use `get_abs_pos_sam` bicubic interpolation semantics
+  - [x] precompute/store common `64x64` and `40x40` tables in converter if practical (not practical for the current v1 `.uocr` writer; runtime Metal interpolation is used until derived tensors are added)
 - [ ] Implement SAM transformer blocks `0..11`:
   - [ ] LayerNorm eps `1e-6`
   - [ ] QKV linear with bias
