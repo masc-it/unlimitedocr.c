@@ -666,7 +666,7 @@ First implementation slice, in order:
   - [x] layer-1 MoE decoder output
   - [x] remaining layers 2..11 MoE outputs
   - [x] logits top-k
-  - [ ] generated token ids
+  - [x] generated token ids
 
 ## 15. Decoder with Python-dumped image embeddings
 

@@ -10,6 +10,7 @@ from unlimitedocr_c.golden import (
     dump_prompt_embedding_fixture,
     load_prompt_embedding_dump,
     load_text_decoder_layers_dump,
+    load_text_generated_ids_dump,
     load_text_layer1_dump,
     load_text_logits_topk_dump,
     read_bf16_rows_as_f16_bits,
@@ -231,3 +232,42 @@ def test_load_text_logits_topk_dump_reads_native_logits_files(tmp_path) -> None:
     loaded = load_text_logits_topk_dump(out)
     np.testing.assert_array_equal(loaded.logits_topk_ids, top_ids)
     np.testing.assert_array_equal(loaded.logits_topk_scores_f32, top_scores)
+
+
+def test_load_text_generated_ids_dump_reads_native_generated_file(tmp_path) -> None:
+    request = _tiny_text_request(np.array([0, 1], dtype=np.int32))
+    out = tmp_path / "dump"
+    out.mkdir()
+    save_prepared_request(request, out)
+    request.input_ids.astype(np.dtype("<i4")).tofile(out / "input_ids_i32.bin")
+    request.image_mask.astype(np.uint8).tofile(out / "image_mask_u8.bin")
+    np.zeros((2, 1280), dtype=np.dtype("<u2")).tofile(out / "prompt_embeddings_f16.bin")
+    for layer in range(12):
+        np.full((2, 1280), 0x3C00 + layer, dtype=np.dtype("<u2")).tofile(
+            out / f"layer_{layer}_hidden_f16.bin"
+        )
+    top_ids = np.array([42, 7, 129279], dtype=np.dtype("<i4"))
+    top_scores = np.array([3.5, 2.25, -1.0], dtype=np.dtype("<f4"))
+    generated = np.array([42], dtype=np.dtype("<i4"))
+    top_ids.tofile(out / "logits_topk_ids_i32.bin")
+    top_scores.tofile(out / "logits_topk_scores_f32.bin")
+    generated.tofile(out / "generated_ids_i32.bin")
+    manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    manifest["text_decoder_layer_count"] = 12
+    manifest["golden_tensors"] = {
+        "prompt_embeddings": {"file": "prompt_embeddings_f16.bin", "shape": [2, 1280]},
+        **{
+            f"layer_{layer}_hidden": {"file": f"layer_{layer}_hidden_f16.bin", "shape": [2, 1280]}
+            for layer in range(12)
+        },
+        "logits_topk": {"ids_file": "logits_topk_ids_i32.bin", "scores_file": "logits_topk_scores_f32.bin", "shape": [3]},
+        "generated_ids": {"file": "generated_ids_i32.bin", "shape": [1]},
+    }
+    manifest["native_binary_arrays"] = {
+        "input_ids": {"file": "input_ids_i32.bin", "dtype": "int32_le", "shape": [2]},
+        "image_mask": {"file": "image_mask_u8.bin", "dtype": "uint8", "shape": [2]},
+    }
+    (out / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    loaded = load_text_generated_ids_dump(out)
+    np.testing.assert_array_equal(loaded.generated_ids, generated)

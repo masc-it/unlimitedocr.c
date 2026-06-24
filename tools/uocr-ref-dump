@@ -21,6 +21,7 @@ from unlimitedocr_c.frontend import (
 from unlimitedocr_c.golden import (
     dump_prompt_embedding_fixture,
     dump_text_decoder_layers_fixture,
+    dump_text_generated_ids_fixture,
     dump_text_layer0_fixture,
     dump_text_layer1_fixture,
     dump_text_logits_topk_fixture,
@@ -68,6 +69,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         action="store_true",
         help="also dump all text-only decoder layers plus next-token LM-head top-k logits for Metal parity",
     )
+    parser.add_argument(
+        "--dump-text-generated-ids",
+        action="store_true",
+        help="also dump all text-only decoder layers, logits top-k, and the first greedy generated token id",
+    )
     parser.add_argument("--logits-top-k", type=int, default=16, help="number of next-token logits to keep")
     return parser.parse_args(argv)
 
@@ -109,7 +115,11 @@ def main(argv: list[str] | None = None) -> int:
             dtype=dtype,
         )
 
-    if args.dump_text_logits_topk:
+    if args.dump_text_generated_ids:
+        if args.hf_dir is None:
+            raise SystemExit("--dump-text-generated-ids requires --hf-dir")
+        dump_text_generated_ids_fixture(request, args.out, args.hf_dir, top_k=args.logits_top_k)
+    elif args.dump_text_logits_topk:
         if args.hf_dir is None:
             raise SystemExit("--dump-text-logits-topk requires --hf-dir")
         dump_text_logits_topk_fixture(request, args.out, args.hf_dir, top_k=args.logits_top_k)

@@ -978,6 +978,58 @@ static int read_text_logits_topk_python_dump(const char *dump_dir,
     return 1;
 }
 
+static int read_text_generated_ids_python_dump(const char *dump_dir,
+                                               int32_t **ids_out,
+                                               uint32_t *n_ids_out,
+                                               char *error,
+                                               size_t error_size) {
+    if (ids_out == NULL || n_ids_out == NULL) {
+        snprintf(error, error_size, "invalid generated-id dump request");
+        return 0;
+    }
+    *ids_out = NULL;
+    *n_ids_out = 0u;
+
+    char path[4096];
+    if (!make_fixture_path(dump_dir, "generated_ids_i32.bin", path, sizeof(path))) {
+        snprintf(error, error_size, "generated-id dump path is too long");
+        return 0;
+    }
+    unsigned char *bytes = NULL;
+    size_t size = 0u;
+    if (!read_binary_file(path, &bytes, &size, error, error_size)) {
+        return 0;
+    }
+    if (size == 0u || size % sizeof(int32_t) != 0u) {
+        snprintf(error, error_size, "generated-id dump size mismatch: %zu bytes", size);
+        free(bytes);
+        return 0;
+    }
+    const uint32_t n_ids = (uint32_t)(size / sizeof(int32_t));
+    int32_t *ids = (int32_t *)malloc((size_t)n_ids * sizeof(int32_t));
+    if (ids == NULL) {
+        snprintf(error, error_size, "failed to allocate generated-id dump buffer");
+        free(bytes);
+        return 0;
+    }
+    for (uint32_t i = 0u; i < n_ids; ++i) {
+        const uint32_t id_bits = (uint32_t)bytes[4u * i] | ((uint32_t)bytes[4u * i + 1u] << 8u) |
+                                 ((uint32_t)bytes[4u * i + 2u] << 16u) |
+                                 ((uint32_t)bytes[4u * i + 3u] << 24u);
+        ids[i] = (int32_t)id_bits;
+        if (ids[i] < 0 || ids[i] >= (int32_t)UOCR_VOCAB_SIZE) {
+            snprintf(error, error_size, "invalid generated token id at index %u", i);
+            free(ids);
+            free(bytes);
+            return 0;
+        }
+    }
+    free(bytes);
+    *ids_out = ids;
+    *n_ids_out = n_ids;
+    return 1;
+}
+
 static void compute_logits_topk_f32(const float *logits,
                                     uint32_t vocab_size,
                                     uint32_t top_k,
@@ -2192,6 +2244,104 @@ static int test_metal_text_logits_topk_python_dump_parity(void) {
     uocr_metal_context_destroy(ctx);
     uocr_model_file_close(&model);
     free(expected_scores);
+    free(expected_ids);
+    free(layer11);
+    free(layer0);
+    free(prompt);
+    free(input_ids);
+    return 0;
+}
+
+static int test_metal_text_generated_ids_python_dump_parity(void) {
+    if (!uocr_metal_is_available()) {
+        return 0;
+    }
+    if (!env_flag_enabled("UOCR_RUN_LARGE_TESTS")) {
+        return 0;
+    }
+
+    const char *model_path = getenv("UOCR_MODEL_PATH");
+    const char *dump_dir = getenv("UOCR_LAYER_DUMP_DIR");
+    if (model_path == NULL || model_path[0] == '\0' || dump_dir == NULL || dump_dir[0] == '\0') {
+        printf("UOCR_RUN_LARGE_TESTS=1 but UOCR_MODEL_PATH/UOCR_LAYER_DUMP_DIR are not both set; skipping text generated-id parity\n");
+        return 0;
+    }
+    if (!fixture_binary_exists(dump_dir, "generated_ids_i32.bin")) {
+        printf("UOCR_LAYER_DUMP_DIR has no generated_ids_i32.bin; skipping text generated-id parity\n");
+        return 0;
+    }
+
+    char error[1024];
+    memset(error, 0, sizeof(error));
+    int32_t *input_ids = NULL;
+    uint32_t n_tokens = 0u;
+    uint16_t *prompt = NULL;
+    uint16_t *layer0 = NULL;
+    uint16_t *layer11 = NULL;
+    int32_t *expected_ids = NULL;
+    uint32_t n_generated = 0u;
+    CHECK(read_text_layer0_python_dump(dump_dir, &input_ids, &n_tokens, &prompt, &layer0, error, sizeof(error)) == 1);
+    CHECK(read_layer_hidden_python_dump(dump_dir,
+                                        "layer_11_hidden_f16.bin",
+                                        n_tokens,
+                                        &layer11,
+                                        error,
+                                        sizeof(error)) == 1);
+    CHECK(read_text_generated_ids_python_dump(dump_dir,
+                                              &expected_ids,
+                                              &n_generated,
+                                              error,
+                                              sizeof(error)) == 1);
+    CHECK(n_tokens > 0u);
+    CHECK(n_generated == 1u);
+
+    uocr_model_file model;
+    CHECK(uocr_model_file_open(model_path, &model, error, sizeof(error)) == 0);
+    uocr_metal_context *ctx = uocr_metal_context_create(UOCR_TEST_METAL_RESOURCE_PATH, error, sizeof(error));
+    CHECK(ctx != NULL);
+    CHECK(uocr_metal_context_map_model(ctx, &model, error, sizeof(error)) == 1);
+
+    uint16_t *normed = (uint16_t *)calloc((size_t)UOCR_HIDDEN_SIZE, sizeof(uint16_t));
+    float *logits = (float *)malloc((size_t)UOCR_VOCAB_SIZE * sizeof(float));
+    uint32_t actual_token = UINT32_MAX;
+    float actual_score = 0.0f;
+    CHECK(normed != NULL);
+    CHECK(logits != NULL);
+
+    const uint16_t *last_hidden = layer11 + (size_t)(n_tokens - 1u) * UOCR_HIDDEN_SIZE;
+    CHECK(uocr_metal_context_select_next_token_f16(ctx,
+                                                   last_hidden,
+                                                   1u,
+                                                   NULL,
+                                                   normed,
+                                                   logits,
+                                                   &actual_token,
+                                                   &actual_score,
+                                                   error,
+                                                   sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    if ((int32_t)actual_token != expected_ids[0]) {
+        fprintf(stderr,
+                "text generated-id mismatch: actual=%u expected=%d score=%g\n",
+                actual_token,
+                expected_ids[0],
+                (double)actual_score);
+        free(logits);
+        free(normed);
+        uocr_metal_context_destroy(ctx);
+        uocr_model_file_close(&model);
+        free(expected_ids);
+        free(layer11);
+        free(layer0);
+        free(prompt);
+        free(input_ids);
+        return 1;
+    }
+
+    free(logits);
+    free(normed);
+    uocr_metal_context_destroy(ctx);
+    uocr_model_file_close(&model);
     free(expected_ids);
     free(layer11);
     free(layer0);
@@ -6279,6 +6429,7 @@ int main(void) {
     if (test_metal_text_layer1_python_dump_parity() != 0) return 1;
     if (test_metal_text_remaining_layers_python_dump_parity() != 0) return 1;
     if (test_metal_text_logits_topk_python_dump_parity() != 0) return 1;
+    if (test_metal_text_generated_ids_python_dump_parity() != 0) return 1;
     if (test_metal_rmsnorm_f16() != 0) return 1;
     if (test_metal_final_rmsnorm_f16() != 0) return 1;
     if (test_metal_lm_head_f16() != 0) return 1;

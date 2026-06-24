@@ -32,6 +32,7 @@ TEXT_LAYER0_HIDDEN_BIN = "layer_0_hidden_f16.bin"
 TEXT_LAYER1_HIDDEN_BIN = "layer_1_hidden_f16.bin"
 LOGITS_TOPK_IDS_BIN = "logits_topk_ids_i32.bin"
 LOGITS_TOPK_SCORES_BIN = "logits_topk_scores_f32.bin"
+GENERATED_IDS_BIN = "generated_ids_i32.bin"
 TEXT_DECODER_LAYER_COUNT = 12
 DEFAULT_LOGITS_TOP_K = 16
 INPUT_IDS_BIN = "input_ids_i32.bin"
@@ -109,6 +110,11 @@ class TextDecoderLayersDump(PromptEmbeddingDump):
 class TextLogitsTopKDump(TextDecoderLayersDump):
     logits_topk_ids: NDArray[np.int32]
     logits_topk_scores_f32: NDArray[np.float32]
+
+
+@dataclass(frozen=True)
+class TextGeneratedIdsDump(TextLogitsTopKDump):
+    generated_ids: NDArray[np.int32]
 
 
 def text_layer_hidden_filename(layer: int) -> str:
@@ -693,6 +699,20 @@ def compute_text_logits_topk_f32(
     return _lm_head_topk_from_normed_f16_bits(normed, hf_dir, top_k=top_k)
 
 
+def compute_text_generated_ids(
+    final_hidden_f16_bits: NDArray[np.uint16],
+    hf_dir: str | Path,
+    *,
+    max_new_tokens: int = 1,
+) -> NDArray[np.int32]:
+    """Compute deterministic greedy generated ids supported by the current text-only parity path."""
+
+    if max_new_tokens != 1:
+        raise ValueError("text generated-id parity currently supports exactly one greedy token")
+    ids, _ = compute_text_logits_topk_f32(final_hidden_f16_bits, hf_dir, top_k=1)
+    return ids.astype(np.int32, copy=False)
+
+
 def dump_prompt_embedding_fixture(
     request: PreparedRequest,
     out_dir: str | Path,
@@ -877,6 +897,33 @@ def dump_text_logits_topk_fixture(
     return out
 
 
+def dump_text_generated_ids_fixture(
+    request: PreparedRequest,
+    out_dir: str | Path,
+    hf_dir: str | Path,
+    *,
+    top_k: int = DEFAULT_LOGITS_TOP_K,
+) -> Path:
+    """Write text-only decoder layers, logits top-k, and the first greedy generated token id."""
+
+    out = dump_text_logits_topk_fixture(request, out_dir, hf_dir, top_k=max(1, int(top_k)))
+    logits = load_text_logits_topk_dump(out)
+    generated = np.asarray(logits.logits_topk_ids[:1], dtype=np.dtype("<i4"))
+    generated.tofile(out / GENERATED_IDS_BIN)
+
+    manifest_path = out / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["golden_tensors"]["generated_ids"] = {
+        "file": GENERATED_IDS_BIN,
+        "dtype": "int32_le",
+        "shape": [1],
+        "source": "greedy argmax over next-token logits without sampling or no-repeat bans",
+        "reference_dtype_mode": "first deterministic text-only generated token from fp16 parity logits",
+    }
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return out
+
+
 def load_prompt_embedding_dump(fixture_dir: str | Path) -> PromptEmbeddingDump:
     root = Path(fixture_dir)
     manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
@@ -1024,4 +1071,31 @@ def load_text_logits_topk_dump(fixture_dir: str | Path) -> TextLogitsTopKDump:
         layer_hidden_f16_bits=layers.layer_hidden_f16_bits,
         logits_topk_ids=ids.astype(np.int32, copy=False),
         logits_topk_scores_f32=scores.astype(np.float32, copy=False),
+    )
+
+
+def load_text_generated_ids_dump(fixture_dir: str | Path) -> TextGeneratedIdsDump:
+    logits = load_text_logits_topk_dump(fixture_dir)
+    root = Path(fixture_dir)
+    golden = logits.manifest.get("golden_tensors", {}).get("generated_ids", {})
+    if not isinstance(golden, dict):
+        raise ValueError(f"missing generated_ids metadata in {root}")
+    shape = golden.get("shape")
+    if not isinstance(shape, list) or len(shape) != 1:
+        raise ValueError(f"invalid generated_ids shape metadata in {root}")
+    n_ids = int(shape[0])
+    ids = np.fromfile(root / GENERATED_IDS_BIN, dtype=np.dtype("<i4"))
+    if ids.shape != (n_ids,):
+        raise ValueError(f"generated_ids shape mismatch in {root}: ids={ids.shape}")
+    if n_ids <= 0 or np.any(ids < 0) or np.any(ids >= MODEL_VOCAB_SIZE):
+        raise ValueError(f"invalid generated_ids in {root}")
+    return TextGeneratedIdsDump(
+        manifest=logits.manifest,
+        input_ids=logits.input_ids,
+        image_mask=logits.image_mask,
+        prompt_embeddings_f16_bits=logits.prompt_embeddings_f16_bits,
+        layer_hidden_f16_bits=logits.layer_hidden_f16_bits,
+        logits_topk_ids=logits.logits_topk_ids,
+        logits_topk_scores_f32=logits.logits_topk_scores_f32,
+        generated_ids=ids.astype(np.int32, copy=False),
     )
