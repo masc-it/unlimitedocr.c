@@ -362,6 +362,17 @@ typedef struct uocr_metal_sam_neck_conv3x3_params {
     uint32_t kernel_size;
 } uocr_metal_sam_neck_conv3x3_params;
 
+typedef struct uocr_metal_sam_conv3x3_stride2_params {
+    uint32_t input_width;
+    uint32_t input_height;
+    uint32_t output_width;
+    uint32_t output_height;
+    uint32_t in_channels;
+    uint32_t out_channels;
+    uint32_t kernel_size;
+    uint32_t stride;
+} uocr_metal_sam_conv3x3_stride2_params;
+
 typedef struct uocr_metal_sam_layernorm2d_params {
     uint32_t grid_width;
     uint32_t grid_height;
@@ -406,6 +417,8 @@ _Static_assert(sizeof(uocr_metal_sam_neck_conv1x1_params) == 16u,
                "uocr_metal_sam_neck_conv1x1_params ABI mismatch");
 _Static_assert(sizeof(uocr_metal_sam_neck_conv3x3_params) == 16u,
                "uocr_metal_sam_neck_conv3x3_params ABI mismatch");
+_Static_assert(sizeof(uocr_metal_sam_conv3x3_stride2_params) == 32u,
+               "uocr_metal_sam_conv3x3_stride2_params ABI mismatch");
 _Static_assert(sizeof(uocr_metal_sam_layernorm2d_params) == 16u,
                "uocr_metal_sam_layernorm2d_params ABI mismatch");
 _Static_assert(sizeof(uocr_metal_sam_rel_pos_attention_params) == 48u,
@@ -6712,6 +6725,203 @@ int uocr_metal_context_sam_layernorm2d_f16(uocr_metal_context *ctx,
         metal_clear_error(error, error_size);
     }
     return result;
+}
+
+static int metal_context_sam_conv3x3_stride2_nchw_f16(uocr_metal_context *ctx,
+                                                       const uint16_t *input_nchw_f16,
+                                                       const uint16_t *weight_f16,
+                                                       uint32_t grid_w,
+                                                       uint32_t grid_h,
+                                                       uint32_t in_channels,
+                                                       uint32_t out_channels,
+                                                       uocr_metal_dense_output_type output_type,
+                                                       void *out_nchw,
+                                                       const char *diagnostic_name,
+                                                       char *error,
+                                                       size_t error_size) {
+    metal_clear_error(error, error_size);
+    if (diagnostic_name == NULL) {
+        return metal_fail(error, error_size, "invalid Metal SAM stride-2 conv request");
+    }
+    if (ctx == NULL || input_nchw_f16 == NULL || weight_f16 == NULL || out_nchw == NULL ||
+        in_channels == 0u || out_channels == 0u) {
+        return metal_fail(error, error_size, "invalid %s request", diagnostic_name);
+    }
+    if (output_type != UOCR_METAL_DENSE_OUTPUT_F16 && output_type != UOCR_METAL_DENSE_OUTPUT_F32) {
+        return metal_fail(error, error_size, "unsupported %s output type %d", diagnostic_name, (int)output_type);
+    }
+    if (grid_w == 0u || grid_h == 0u || grid_w > UOCR_SAM_MAX_GRID_SIZE || grid_h > UOCR_SAM_MAX_GRID_SIZE) {
+        return metal_fail(error, error_size, "invalid %s grid %ux%u", diagnostic_name, grid_w, grid_h);
+    }
+    if (UOCR_SAM_NECK_KERNEL_SIZE != 3u || UOCR_SAM_NET_STRIDE != 2u) {
+        return metal_fail(error, error_size, "%s constants are inconsistent", diagnostic_name);
+    }
+
+    const uint32_t out_w = (grid_w + UOCR_SAM_NET_STRIDE - 1u) / UOCR_SAM_NET_STRIDE;
+    const uint32_t out_h = (grid_h + UOCR_SAM_NET_STRIDE - 1u) / UOCR_SAM_NET_STRIDE;
+    uint64_t input_spatial = 0u;
+    uint64_t output_spatial = 0u;
+    uint64_t input_values = 0u;
+    uint64_t output_values = 0u;
+    uint64_t weight_values = 0u;
+    uint64_t kernel_area = 0u;
+    uint64_t input_bytes = 0u;
+    uint64_t weight_bytes = 0u;
+    uint64_t output_bytes = 0u;
+    const uint64_t output_element_bytes = output_type == UOCR_METAL_DENSE_OUTPUT_F16 ? 2u : (uint64_t)sizeof(float);
+    if (!checked_mul_u64((uint64_t)grid_w, (uint64_t)grid_h, &input_spatial) ||
+        !checked_mul_u64((uint64_t)out_w, (uint64_t)out_h, &output_spatial) ||
+        !checked_mul_u64(input_spatial, (uint64_t)in_channels, &input_values) ||
+        !checked_mul_u64(output_spatial, (uint64_t)out_channels, &output_values) ||
+        !checked_mul_u64((uint64_t)UOCR_SAM_NECK_KERNEL_SIZE, (uint64_t)UOCR_SAM_NECK_KERNEL_SIZE, &kernel_area) ||
+        !checked_mul_u64((uint64_t)out_channels, (uint64_t)in_channels, &weight_values) ||
+        !checked_mul_u64(weight_values, kernel_area, &weight_values) ||
+        !checked_mul_u64(input_values, 2u, &input_bytes) || !checked_mul_u64(weight_values, 2u, &weight_bytes) ||
+        !checked_mul_u64(output_values, output_element_bytes, &output_bytes) ||
+        output_values > (uint64_t)UINT32_MAX || input_bytes > (uint64_t)SIZE_MAX ||
+        weight_bytes > (uint64_t)SIZE_MAX || output_bytes > (uint64_t)SIZE_MAX) {
+        return metal_fail(error, error_size, "%s byte-size overflow", diagnostic_name);
+    }
+
+    const uint64_t max_buffer_length = metal_device_max_buffer_length(ctx->device);
+    if (input_bytes > max_buffer_length || weight_bytes > max_buffer_length || output_bytes > max_buffer_length) {
+        return metal_fail(error,
+                          error_size,
+                          "%s buffers exceed maxBufferLength %llu",
+                          diagnostic_name,
+                          (unsigned long long)max_buffer_length);
+    }
+
+    int result = 0;
+    @autoreleasepool {
+        const char *function_name = output_type == UOCR_METAL_DENSE_OUTPUT_F16 ?
+                                        "uocr_sam_conv3x3_stride2_f16_to_f16" :
+                                        "uocr_sam_conv3x3_stride2_f16_to_f32";
+        id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, function_name, error, error_size);
+        if (pipeline == nil) {
+            return 0;
+        }
+
+        id<MTLBuffer> src = nil;
+        id<MTLBuffer> weight = nil;
+        id<MTLBuffer> dst = nil;
+        id<MTLCommandBuffer> cb = nil;
+        id<MTLComputeCommandEncoder> enc = nil;
+
+        src = [ctx->device newBufferWithBytes:input_nchw_f16
+                                       length:(NSUInteger)input_bytes
+                                      options:MTLResourceStorageModeShared];
+        if (src == nil) {
+            result = metal_fail(error, error_size, "failed to allocate %s input buffer", diagnostic_name);
+            goto cleanup_sam_conv3x3_stride2;
+        }
+        src.label = @"uocr_sam_conv3x3_stride2_input_nchw_f16";
+
+        weight = [ctx->device newBufferWithBytes:weight_f16
+                                          length:(NSUInteger)weight_bytes
+                                         options:MTLResourceStorageModeShared];
+        if (weight == nil) {
+            result = metal_fail(error, error_size, "failed to allocate %s weight buffer", diagnostic_name);
+            goto cleanup_sam_conv3x3_stride2;
+        }
+        weight.label = @"uocr_sam_conv3x3_stride2_weight_f16";
+
+        dst = [ctx->device newBufferWithLength:(NSUInteger)output_bytes options:MTLResourceStorageModeShared];
+        if (dst == nil) {
+            result = metal_fail(error, error_size, "failed to allocate %s output buffer", diagnostic_name);
+            goto cleanup_sam_conv3x3_stride2;
+        }
+        dst.label = @"uocr_sam_conv3x3_stride2_output_nchw";
+        memset([dst contents], 0, (size_t)output_bytes);
+
+        const NSUInteger threads_per_group = metal_power2_threadgroup_width(256u, pipeline.maxTotalThreadsPerThreadgroup);
+        const uint64_t threadgroup_bytes = (uint64_t)threads_per_group * (uint64_t)sizeof(float);
+        if (threadgroup_bytes > (uint64_t)ctx->device.maxThreadgroupMemoryLength) {
+            result = metal_fail(error, error_size, "%s threadgroup memory exceeds device limit", diagnostic_name);
+            goto cleanup_sam_conv3x3_stride2;
+        }
+
+        cb = [ctx->queue commandBuffer];
+        if (cb == nil) {
+            result = metal_fail(error, error_size, "failed to create %s command buffer", diagnostic_name);
+            goto cleanup_sam_conv3x3_stride2;
+        }
+        cb.label = @"uocr_sam_conv3x3_stride2_command_buffer";
+
+        enc = [cb computeCommandEncoder];
+        if (enc == nil) {
+            result = metal_fail(error, error_size, "failed to create %s command encoder", diagnostic_name);
+            goto cleanup_sam_conv3x3_stride2;
+        }
+
+        uocr_metal_sam_conv3x3_stride2_params params;
+        params.input_width = grid_w;
+        params.input_height = grid_h;
+        params.output_width = out_w;
+        params.output_height = out_h;
+        params.in_channels = in_channels;
+        params.out_channels = out_channels;
+        params.kernel_size = UOCR_SAM_NECK_KERNEL_SIZE;
+        params.stride = UOCR_SAM_NET_STRIDE;
+
+        [enc setComputePipelineState:pipeline];
+        [enc setBuffer:src offset:0u atIndex:0u];
+        [enc setBuffer:weight offset:0u atIndex:1u];
+        [enc setBuffer:dst offset:0u atIndex:2u];
+        [enc setBytes:&params length:sizeof(params) atIndex:3u];
+        [enc setThreadgroupMemoryLength:threads_per_group * sizeof(float) atIndex:0u];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)output_values, 1u, 1u)
+             threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1u, 1u)];
+        [enc endEncoding];
+
+        [cb commit];
+        [cb waitUntilCompleted];
+        if (cb.status == MTLCommandBufferStatusError) {
+            NSString *description = cb.error != nil ? [cb.error localizedDescription] : @"unknown command-buffer error";
+            result = metal_fail(error, error_size, "%s command failed: %s", diagnostic_name, [description UTF8String]);
+            goto cleanup_sam_conv3x3_stride2;
+        }
+
+        memcpy(out_nchw, [dst contents], (size_t)output_bytes);
+        result = 1;
+
+    cleanup_sam_conv3x3_stride2:
+        [dst release];
+        [weight release];
+        [src release];
+    }
+
+    if (result) {
+        metal_clear_error(error, error_size);
+    }
+    return result;
+}
+
+int uocr_metal_context_sam_net2_conv3x3_stride2_f16(uocr_metal_context *ctx,
+                                                    const uint16_t *input_nchw_f16,
+                                                    const uint16_t *weight_f16,
+                                                    uint32_t grid_w,
+                                                    uint32_t grid_h,
+                                                    uocr_metal_dense_output_type output_type,
+                                                    void *out_nchw,
+                                                    char *error,
+                                                    size_t error_size) {
+    if (UOCR_SAM_NECK_CHANNELS != 256u || UOCR_SAM_NET2_CHANNELS != 512u ||
+        UOCR_SAM_NECK_KERNEL_SIZE != 3u || UOCR_SAM_NET_STRIDE != 2u) {
+        return metal_fail(error, error_size, "Metal SAM net_2 constants are inconsistent");
+    }
+    return metal_context_sam_conv3x3_stride2_nchw_f16(ctx,
+                                                      input_nchw_f16,
+                                                      weight_f16,
+                                                      grid_w,
+                                                      grid_h,
+                                                      UOCR_SAM_NECK_CHANNELS,
+                                                      UOCR_SAM_NET2_CHANNELS,
+                                                      output_type,
+                                                      out_nchw,
+                                                      "Metal SAM net_2",
+                                                      error,
+                                                      error_size);
 }
 
 static int metal_context_sam_attention_f16(uocr_metal_context *ctx,

@@ -1192,6 +1192,118 @@ kernel void uocr_sam_neck_conv3x3_f16_to_f32(device const half *src_nchw [[buffe
     }
 }
 
+struct UocrSamConv3x3Stride2Params {
+    uint input_width;
+    uint input_height;
+    uint output_width;
+    uint output_height;
+    uint in_channels;
+    uint out_channels;
+    uint kernel_size;
+    uint stride;
+};
+
+static inline float uocr_sam_conv3x3_stride2_dot_f16(device const half *src_nchw,
+                                                     device const half *weight,
+                                                     constant UocrSamConv3x3Stride2Params &params,
+                                                     uint output_spatial,
+                                                     uint out_channel,
+                                                     uint tid,
+                                                     uint ntg,
+                                                     threadgroup float *partials) {
+    const uint out_x = output_spatial % params.output_width;
+    const uint out_y = output_spatial / params.output_width;
+    const uint input_spatial_size = params.input_width * params.input_height;
+    const int kernel_radius = int(params.kernel_size >> 1u);
+    float sum = 0.0f;
+    for (uint in_channel = tid; in_channel < params.in_channels; in_channel += ntg) {
+        for (uint ky = 0u; ky < params.kernel_size; ++ky) {
+            const int sy = int(out_y * params.stride) + int(ky) - kernel_radius;
+            if (sy < 0 || sy >= int(params.input_height)) {
+                continue;
+            }
+            for (uint kx = 0u; kx < params.kernel_size; ++kx) {
+                const int sx = int(out_x * params.stride) + int(kx) - kernel_radius;
+                if (sx < 0 || sx >= int(params.input_width)) {
+                    continue;
+                }
+                const ulong src_index = ulong(in_channel) * ulong(input_spatial_size) +
+                                        ulong(uint(sy)) * ulong(params.input_width) + ulong(uint(sx));
+                const ulong weight_index = ((ulong(out_channel) * ulong(params.in_channels) + ulong(in_channel)) *
+                                                ulong(params.kernel_size) + ulong(ky)) *
+                                               ulong(params.kernel_size) + ulong(kx);
+                sum += float(src_nchw[src_index]) * float(weight[weight_index]);
+            }
+        }
+    }
+    partials[tid] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = ntg >> 1; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            partials[tid] += partials[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    return partials[0];
+}
+
+kernel void uocr_sam_conv3x3_stride2_f16_to_f16(device const half *src_nchw [[buffer(0)]],
+                                                device const half *weight [[buffer(1)]],
+                                                device half *dst_nchw [[buffer(2)]],
+                                                constant UocrSamConv3x3Stride2Params &params [[buffer(3)]],
+                                                threadgroup float *partials [[threadgroup(0)]],
+                                                uint output_index [[threadgroup_position_in_grid]],
+                                                uint tid [[thread_index_in_threadgroup]],
+                                                uint ntg [[threads_per_threadgroup]]) {
+    const uint output_spatial_size = params.output_width * params.output_height;
+    const uint out_channel = output_index / output_spatial_size;
+    const uint output_spatial = output_index - out_channel * output_spatial_size;
+    if (out_channel >= params.out_channels || output_spatial >= output_spatial_size) {
+        return;
+    }
+
+    const float value = uocr_sam_conv3x3_stride2_dot_f16(src_nchw,
+                                                        weight,
+                                                        params,
+                                                        output_spatial,
+                                                        out_channel,
+                                                        tid,
+                                                        ntg,
+                                                        partials);
+    if (tid == 0u) {
+        dst_nchw[output_index] = half(value);
+    }
+}
+
+kernel void uocr_sam_conv3x3_stride2_f16_to_f32(device const half *src_nchw [[buffer(0)]],
+                                                device const half *weight [[buffer(1)]],
+                                                device float *dst_nchw [[buffer(2)]],
+                                                constant UocrSamConv3x3Stride2Params &params [[buffer(3)]],
+                                                threadgroup float *partials [[threadgroup(0)]],
+                                                uint output_index [[threadgroup_position_in_grid]],
+                                                uint tid [[thread_index_in_threadgroup]],
+                                                uint ntg [[threads_per_threadgroup]]) {
+    const uint output_spatial_size = params.output_width * params.output_height;
+    const uint out_channel = output_index / output_spatial_size;
+    const uint output_spatial = output_index - out_channel * output_spatial_size;
+    if (out_channel >= params.out_channels || output_spatial >= output_spatial_size) {
+        return;
+    }
+
+    const float value = uocr_sam_conv3x3_stride2_dot_f16(src_nchw,
+                                                        weight,
+                                                        params,
+                                                        output_spatial,
+                                                        out_channel,
+                                                        tid,
+                                                        ntg,
+                                                        partials);
+    if (tid == 0u) {
+        dst_nchw[output_index] = value;
+    }
+}
+
 struct UocrSamLayerNorm2dParams {
     uint grid_width;
     uint grid_height;
