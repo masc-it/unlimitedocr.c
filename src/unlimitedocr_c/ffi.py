@@ -279,6 +279,7 @@ def as_c_request(request: PreparedRequest) -> _PreparedKeepalive:
 
 class Engine:
     def __init__(self, options: EngineOptions | None = None, *, library_path: str | Path | None = None) -> None:
+        self._handle: ct.c_void_p | None = None
         self._lib = load_library(library_path)
         opts = options or EngineOptions()
         c_opts = CEngineOpts(
@@ -328,8 +329,9 @@ class Engine:
         )
 
     def close(self) -> None:
-        if self._handle:
-            self._lib.uocr_engine_close(self._handle)
+        handle = getattr(self, "_handle", None)
+        if handle:
+            self._lib.uocr_engine_close(handle)
             self._handle = None
 
     def __enter__(self) -> "Engine":

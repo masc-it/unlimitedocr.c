@@ -31,6 +31,10 @@
 #define UOCR_DEFAULT_RESOURCE_PATH ""
 #endif
 
+#ifndef UOCR_DEFAULT_METALLIB_PATH
+#define UOCR_DEFAULT_METALLIB_PATH ""
+#endif
+
 typedef struct uocr_metal_model_view {
     id<MTLBuffer> buffer;
     uint64_t file_offset;
@@ -207,7 +211,6 @@ static int payload_span_compare(const void *a, const void *b) {
     return 0;
 }
 
-#if UOCR_METAL_RUNTIME_COMPILE
 static NSString *string_from_c_or_nil(const char *s) {
     if (s == NULL || s[0] == '\0') {
         return nil;
@@ -215,6 +218,16 @@ static NSString *string_from_c_or_nil(const char *s) {
     return [NSString stringWithUTF8String:s];
 }
 
+static void add_metallib_candidates(NSMutableArray<NSString *> *paths, NSString *root) {
+    if (root == nil || [root length] == 0u) {
+        return;
+    }
+    [paths addObject:[root stringByAppendingPathComponent:@"unlimitedocr.metallib"]];
+    [paths addObject:[root stringByAppendingPathComponent:@"metal/unlimitedocr.metallib"]];
+    [paths addObject:[root stringByAppendingPathComponent:@"share/unlimitedocr/metal/unlimitedocr.metallib"]];
+}
+
+#if UOCR_METAL_RUNTIME_COMPILE
 static void add_source_candidates(NSMutableArray<NSString *> *paths, NSString *root) {
     if (root == nil || [root length] == 0u) {
         return;
@@ -225,8 +238,76 @@ static void add_source_candidates(NSMutableArray<NSString *> *paths, NSString *r
 }
 #endif
 
-static NSString *load_runtime_source(const char *resource_path, char *error, size_t error_size) {
+static id<MTLLibrary> load_precompiled_library(id<MTLDevice> device,
+                                               const char *resource_path,
+                                               char *diagnostic,
+                                               size_t diagnostic_size) {
+    if (diagnostic != NULL && diagnostic_size > 0u) {
+        diagnostic[0] = '\0';
+    }
+    if (device == nil) {
+        if (diagnostic != NULL && diagnostic_size > 0u) {
+            (void)snprintf(diagnostic, diagnostic_size, "Metal device is nil");
+            diagnostic[diagnostic_size - 1u] = '\0';
+        }
+        return nil;
+    }
+
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSMutableArray<NSString *> *paths = [NSMutableArray array];
+
+    const char *override_path = getenv("UOCR_METAL_LIBRARY_PATH");
+    if (override_path != NULL && override_path[0] != '\0') {
+        [paths addObject:[NSString stringWithUTF8String:override_path]];
+    }
+
+    add_metallib_candidates(paths, string_from_c_or_nil(resource_path));
+
+    const char *env_resource_path = getenv("UOCR_METAL_RESOURCE_PATH");
+    add_metallib_candidates(paths, string_from_c_or_nil(env_resource_path));
+
+    NSString *default_metallib_path = string_from_c_or_nil(UOCR_DEFAULT_METALLIB_PATH);
+    if (default_metallib_path != nil) {
+        [paths addObject:default_metallib_path];
+    }
+    add_metallib_candidates(paths, string_from_c_or_nil(UOCR_DEFAULT_RESOURCE_PATH));
+    add_metallib_candidates(paths, @".");
+    add_metallib_candidates(paths, @"./build/debug");
+    add_metallib_candidates(paths, @"./build/release");
+
+    NSString *last_error_path = nil;
+    NSError *last_error = nil;
+    for (NSString *path in paths) {
+        if (![fm fileExistsAtPath:path]) {
+            continue;
+        }
+        NSError *load_error = nil;
+        NSURL *library_url = [NSURL fileURLWithPath:path];
+        id<MTLLibrary> library = [device newLibraryWithURL:library_url error:&load_error];
+        if (library != nil) {
+            return library;
+        }
+        last_error_path = path;
+        last_error = load_error;
+    }
+
+    if (diagnostic != NULL && diagnostic_size > 0u) {
+        if (last_error_path != nil) {
+            (void)snprintf(diagnostic,
+                           diagnostic_size,
+                           "failed to load precompiled Metal library %s: %s",
+                           [last_error_path UTF8String],
+                           last_error != nil ? [[last_error localizedDescription] UTF8String] : "unknown error");
+        } else {
+            (void)snprintf(diagnostic, diagnostic_size, "precompiled Metal library unlimitedocr.metallib not found");
+        }
+        diagnostic[diagnostic_size - 1u] = '\0';
+    }
+    return nil;
+}
+
 #if UOCR_METAL_RUNTIME_COMPILE
+static NSString *load_runtime_source(const char *resource_path, char *error, size_t error_size) {
     NSFileManager *fm = [NSFileManager defaultManager];
     NSMutableArray<NSString *> *paths = [NSMutableArray array];
 
@@ -276,14 +357,8 @@ static NSString *load_runtime_source(const char *resource_path, char *error, siz
     [source appendString:loaded];
     [source appendString:@"\n"];
     return source;
-#else
-    (void)resource_path;
-    (void)metal_fail(error,
-                     error_size,
-                     "Metal runtime source compilation is disabled and precompiled metallib loading is not implemented yet");
-    return nil;
-#endif
 }
+#endif
 
 static uint32_t metal_inflight_transient_count(uocr_metal_context *ctx) {
     if (ctx == NULL || ctx->transient_retains == nil) {
@@ -894,23 +969,39 @@ uocr_metal_context *uocr_metal_context_create(const char *resource_path, char *e
             return NULL;
         }
 
-        NSString *source = load_runtime_source(resource_path, error, error_size);
-        if (source == nil) {
-            uocr_metal_context_destroy(ctx);
-            return NULL;
-        }
+        char metallib_diagnostic[512];
+        memset(metallib_diagnostic, 0, sizeof(metallib_diagnostic));
+        ctx->library = load_precompiled_library(ctx->device, resource_path, metallib_diagnostic, sizeof(metallib_diagnostic));
 
-        MTLCompileOptions *options = [MTLCompileOptions new];
-        NSError *compile_error = nil;
-        ctx->library = [ctx->device newLibraryWithSource:source options:options error:&compile_error];
-        [options release];
         if (ctx->library == nil) {
+#if UOCR_METAL_RUNTIME_COMPILE
+            NSString *source = load_runtime_source(resource_path, error, error_size);
+            if (source == nil) {
+                uocr_metal_context_destroy(ctx);
+                return NULL;
+            }
+
+            MTLCompileOptions *options = [MTLCompileOptions new];
+            NSError *compile_error = nil;
+            ctx->library = [ctx->device newLibraryWithSource:source options:options error:&compile_error];
+            [options release];
+            if (ctx->library == nil) {
+                (void)metal_fail(error,
+                                 error_size,
+                                 "Metal shader compilation failed after %s: %s",
+                                 metallib_diagnostic[0] != '\0' ? metallib_diagnostic : "precompiled Metal library was unavailable",
+                                 [[compile_error localizedDescription] UTF8String]);
+                uocr_metal_context_destroy(ctx);
+                return NULL;
+            }
+#else
             (void)metal_fail(error,
                              error_size,
-                             "Metal shader compilation failed: %s",
-                             [[compile_error localizedDescription] UTF8String]);
+                             "Metal runtime source compilation is disabled and %s",
+                             metallib_diagnostic[0] != '\0' ? metallib_diagnostic : "precompiled Metal library was unavailable");
             uocr_metal_context_destroy(ctx);
             return NULL;
+#endif
         }
 
         return ctx;

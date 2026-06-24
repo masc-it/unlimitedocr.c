@@ -136,7 +136,7 @@ Current priority slice, in order. The coding agent should take the first uncheck
   - [x] `UOCR_SANITIZE=OFF`
 - [x] Configure Objective-C compilation for `src/backend/metal/*.m` and link Apple frameworks: `Metal`, `Foundation`, and required system frameworks.
 - [x] Use runtime Metal source compilation during development, DS4-style, so `.metal` edits do not require a full packaging flow.
-- [ ] Add an optional CMake path to precompile `unlimitedocr.metallib` with `xcrun metal`/`metallib` for future release builds.
+- [x] Add an optional CMake path to precompile `unlimitedocr.metallib` with `xcrun metal`/`metallib` for future release builds.
 - [x] Keep `pyproject.toml` uv-friendly for now; add Python deps for frontend/tests without switching the build backend yet.
 - [ ] Add Python extras:
   - [x] runtime/frontend: `numpy`, `pillow`, `tokenizers`, `safetensors`

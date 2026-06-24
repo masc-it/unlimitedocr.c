@@ -91,8 +91,29 @@ endif()
 
 if(UOCR_METAL_ENABLED)
     enable_language(OBJC)
+    set(UOCR_METAL_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/src/backend/metal/kernels/uocr_smoke.metal")
+    set(UOCR_METALLIB_OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/unlimitedocr.metallib")
+    if(UOCR_METAL_PRECOMPILE)
+        find_program(UOCR_XCRUN_EXECUTABLE xcrun)
+        if(NOT UOCR_XCRUN_EXECUTABLE)
+            message(FATAL_ERROR "UOCR_METAL_PRECOMPILE=ON requires xcrun")
+        endif()
+        set(UOCR_METAL_AIR_OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/unlimitedocr.air")
+        add_custom_command(
+            OUTPUT "${UOCR_METALLIB_OUTPUT}"
+            COMMAND "${UOCR_XCRUN_EXECUTABLE}" -sdk macosx metal -c "${UOCR_METAL_SOURCE}" -o "${UOCR_METAL_AIR_OUTPUT}"
+            COMMAND "${UOCR_XCRUN_EXECUTABLE}" -sdk macosx metallib "${UOCR_METAL_AIR_OUTPUT}" -o "${UOCR_METALLIB_OUTPUT}"
+            DEPENDS "${UOCR_METAL_SOURCE}"
+            COMMENT "Precompiling Metal shaders to ${UOCR_METALLIB_OUTPUT}"
+            VERBATIM)
+        add_custom_target(unlimitedocr_metallib ALL DEPENDS "${UOCR_METALLIB_OUTPUT}")
+    endif()
+
     add_library(uocr_metal STATIC
         src/backend/metal/uocr_metal.m)
+    if(UOCR_METAL_PRECOMPILE)
+        add_dependencies(uocr_metal unlimitedocr_metallib)
+    endif()
     target_include_directories(uocr_metal
         PUBLIC
             "${CMAKE_CURRENT_SOURCE_DIR}/include"
@@ -101,7 +122,8 @@ if(UOCR_METAL_ENABLED)
     target_compile_definitions(uocr_metal
         PRIVATE
             UOCR_METAL_RUNTIME_COMPILE=$<BOOL:${UOCR_METAL_RUNTIME_COMPILE}>
-            UOCR_DEFAULT_RESOURCE_PATH=\"${CMAKE_CURRENT_SOURCE_DIR}/src/backend/metal\")
+            UOCR_DEFAULT_RESOURCE_PATH=\"${CMAKE_CURRENT_SOURCE_DIR}/src/backend/metal\"
+            UOCR_DEFAULT_METALLIB_PATH=\"${UOCR_METALLIB_OUTPUT}\")
     target_link_libraries(uocr_metal
         PUBLIC
             "-framework Foundation"
@@ -256,3 +278,6 @@ install(TARGETS unlimitedocr
     ARCHIVE DESTINATION lib)
 install(FILES include/unlimitedocr.h DESTINATION include)
 install(DIRECTORY src/backend/metal/kernels DESTINATION share/unlimitedocr/metal FILES_MATCHING PATTERN "*.metal")
+if(UOCR_METAL_ENABLED AND UOCR_METAL_PRECOMPILE)
+    install(FILES "${UOCR_METALLIB_OUTPUT}" DESTINATION share/unlimitedocr/metal)
+endif()
