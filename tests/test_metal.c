@@ -5,6 +5,7 @@
 #include "runtime/uocr_memory.h"
 #include "runtime/uocr_request_validation.h"
 #include "runtime/uocr_sequence.h"
+#include "quant/uocr_quant.h"
 #include "unlimitedocr.h"
 
 #include "uocr_test_model_file.h"
@@ -9375,6 +9376,72 @@ static void set_q8_0_q(uint8_t *table, uint32_t row_size, uint32_t row, uint32_t
     packed[2u + in_block] = (uint8_t)q;
 }
 
+static void init_q4_k_rows(uint8_t *table, uint32_t rows, uint32_t row_size, uint32_t physical_cols, uint16_t d_bits) {
+    memset(table, 0, (size_t)rows * row_size);
+    for (uint32_t row = 0u; row < rows; ++row) {
+        for (uint32_t block = 0u; block < physical_cols / UOCR_Q4_K_BLOCK_SIZE; ++block) {
+            uint8_t *packed = table + (size_t)row * row_size + (size_t)block * UOCR_Q4_K_TYPE_SIZE;
+            write_q8_scale_le(packed, d_bits);
+            write_q8_scale_le(packed + 2u, 0u);
+            for (uint32_t i = 0u; i < 4u; ++i) {
+                packed[4u + i] = 1u;
+                packed[8u + i] = 0u;
+                packed[12u + i] = 1u;
+            }
+        }
+    }
+}
+
+static uint8_t q4_k_scale_value(const uint8_t *scales, uint32_t group) {
+    if (group < 4u) {
+        return (uint8_t)(scales[group] & 63u);
+    }
+    const uint32_t k = group - 4u;
+    return (uint8_t)((scales[8u + k] & 0x0fu) | ((scales[k] & 0xc0u) >> 2u));
+}
+
+static uint8_t q4_k_min_value(const uint8_t *scales, uint32_t group) {
+    if (group < 4u) {
+        return (uint8_t)(scales[group + 4u] & 63u);
+    }
+    const uint32_t k = group - 4u;
+    return (uint8_t)((scales[8u + k] >> 4u) | ((scales[4u + k] & 0xc0u) >> 2u));
+}
+
+static float q4_k_expected_value(const uint8_t *table, uint32_t row_size, uint32_t row, uint32_t col) {
+    const uint32_t block = col / UOCR_Q4_K_BLOCK_SIZE;
+    const uint32_t in_block = col % UOCR_Q4_K_BLOCK_SIZE;
+    const uint8_t *packed = table + (size_t)row * row_size + (size_t)block * UOCR_Q4_K_TYPE_SIZE;
+    const uint16_t d_bits = (uint16_t)((uint16_t)packed[0] | ((uint16_t)packed[1] << 8u));
+    const uint16_t dmin_bits = (uint16_t)((uint16_t)packed[2] | ((uint16_t)packed[3] << 8u));
+    const uint8_t *scales = packed + 4u;
+    const uint8_t *qs = packed + 16u;
+    const uint32_t il = in_block / 16u;
+    const uint32_t offset = in_block % 16u;
+    const uint32_t group = il / 2u;
+    const uint32_t q_base = (il / 4u) * 32u + 16u * (il & 1u);
+    const uint8_t q_byte = qs[q_base + offset];
+    const uint32_t q = (il & 2u) == 0u ? (uint32_t)(q_byte & 0x0fu) : (uint32_t)(q_byte >> 4u);
+    return f16_bits_to_f32(d_bits) * (float)q4_k_scale_value(scales, group) * (float)q -
+           f16_bits_to_f32(dmin_bits) * (float)q4_k_min_value(scales, group);
+}
+
+static void set_q4_k_q(uint8_t *table, uint32_t row_size, uint32_t row, uint32_t col, uint8_t q) {
+    const uint32_t block = col / UOCR_Q4_K_BLOCK_SIZE;
+    const uint32_t in_block = col % UOCR_Q4_K_BLOCK_SIZE;
+    const uint32_t il = in_block / 16u;
+    const uint32_t offset = in_block % 16u;
+    const uint32_t q_base = (il / 4u) * 32u + 16u * (il & 1u);
+    uint8_t *packed = table + (size_t)row * row_size + (size_t)block * UOCR_Q4_K_TYPE_SIZE;
+    uint8_t *dst = packed + 16u + q_base + offset;
+    q = (uint8_t)(q & 0x0fu);
+    if ((il & 2u) == 0u) {
+        *dst = (uint8_t)((*dst & 0xf0u) | q);
+    } else {
+        *dst = (uint8_t)((*dst & 0x0fu) | (uint8_t)(q << 4u));
+    }
+}
+
 static int test_metal_get_rows_f16(void) {
     if (!uocr_metal_is_available()) {
         return 0;
@@ -11968,6 +12035,205 @@ static int test_metal_moe_selected_experts_decode_f16(void) {
     return 0;
 }
 
+static int test_metal_moe_selected_experts_decode_q4_k(void) {
+    if (!uocr_metal_is_available()) {
+        return 0;
+    }
+
+    enum { HIDDEN = UOCR_HIDDEN_SIZE, PHYSICAL = UOCR_HIDDEN_SIZE, INTERMEDIATE = UOCR_MOE_EXPERT_INTERMEDIATE };
+    enum { TOP_K = UOCR_MOE_TOP_K, ROW_SIZE = (PHYSICAL / UOCR_Q4_K_BLOCK_SIZE) * UOCR_Q4_K_TYPE_SIZE };
+    const uint32_t top_ids[TOP_K] = {3u, 17u, 5u, 63u, 11u, 0u};
+    const float top_weights[TOP_K] = {0.3125f, 0.25f, 0.1875f, 0.125f, 0.0625f, 0.03125f};
+    const uint16_t input_values[] = {
+        0xb800u, /* -0.5 */
+        0xb400u, /* -0.25 */
+        0x0000u, /* 0.0 */
+        0x3000u, /* 0.125 */
+        0x3400u, /* 0.25 */
+        0x3800u  /* 0.5 */
+    };
+    const uint16_t down_values[] = {
+        0x2400u, /* 0.015625 */
+        0x2800u, /* 0.03125 */
+        0xa400u, /* -0.015625 */
+        0xa800u, /* -0.03125 */
+        0x2c00u, /* 0.0625 */
+        0xac00u  /* -0.0625 */
+    };
+    const uint32_t input_value_count = (uint32_t)(sizeof(input_values) / sizeof(input_values[0]));
+    const uint32_t down_value_count = (uint32_t)(sizeof(down_values) / sizeof(down_values[0]));
+
+    uint16_t *input = (uint16_t *)malloc((size_t)HIDDEN * sizeof(uint16_t));
+    uint8_t *gate_weight = (uint8_t *)malloc((size_t)TOP_K * INTERMEDIATE * ROW_SIZE);
+    uint8_t *up_weight = (uint8_t *)malloc((size_t)TOP_K * INTERMEDIATE * ROW_SIZE);
+    uint16_t *down_weight = (uint16_t *)calloc((size_t)TOP_K * HIDDEN * INTERMEDIATE, sizeof(uint16_t));
+    float *mid = (float *)malloc((size_t)TOP_K * INTERMEDIATE * sizeof(float));
+    float *expected = (float *)malloc((size_t)HIDDEN * sizeof(float));
+    float *out_f32 = (float *)malloc((size_t)HIDDEN * sizeof(float));
+    uint16_t *out_f16 = (uint16_t *)malloc((size_t)HIDDEN * sizeof(uint16_t));
+    CHECK(input != NULL && gate_weight != NULL && up_weight != NULL && down_weight != NULL && mid != NULL &&
+          expected != NULL && out_f32 != NULL && out_f16 != NULL);
+
+    init_q4_k_rows(gate_weight, (uint32_t)(TOP_K * INTERMEDIATE), (uint32_t)ROW_SIZE, (uint32_t)PHYSICAL, 0x2c00u);
+    init_q4_k_rows(up_weight, (uint32_t)(TOP_K * INTERMEDIATE), (uint32_t)ROW_SIZE, (uint32_t)PHYSICAL, 0x2c00u);
+    for (uint32_t col = 0u; col < (uint32_t)HIDDEN; ++col) {
+        input[col] = input_values[(col * 5u + col / 31u + 1u) % input_value_count];
+    }
+
+    for (uint32_t rank = 0u; rank < (uint32_t)TOP_K; ++rank) {
+        for (uint32_t row = 0u; row < (uint32_t)INTERMEDIATE; ++row) {
+            const uint32_t gate_row = rank * (uint32_t)INTERMEDIATE + row;
+            uint32_t g0 = (rank * 131u + row * 19u + 7u) % (uint32_t)HIDDEN;
+            uint32_t g1 = (rank * 193u + row * 29u + 41u) % (uint32_t)HIDDEN;
+            uint32_t u0 = (rank * 67u + row * 17u + 13u) % (uint32_t)HIDDEN;
+            uint32_t u1 = (rank * 101u + row * 23u + 59u) % (uint32_t)HIDDEN;
+            if (g1 == g0) g1 = (g1 + 1u) % (uint32_t)HIDDEN;
+            if (u1 == u0) u1 = (u1 + 1u) % (uint32_t)HIDDEN;
+            set_q4_k_q(gate_weight, (uint32_t)ROW_SIZE, gate_row, g0, (uint8_t)(1u + ((rank + row) % 7u)));
+            set_q4_k_q(gate_weight, (uint32_t)ROW_SIZE, gate_row, g1, (uint8_t)(2u + ((rank * 3u + row) % 6u)));
+            set_q4_k_q(up_weight, (uint32_t)ROW_SIZE, gate_row, u0, (uint8_t)(1u + ((rank * 5u + row) % 7u)));
+            set_q4_k_q(up_weight, (uint32_t)ROW_SIZE, gate_row, u1, (uint8_t)(2u + ((rank + row * 3u) % 6u)));
+        }
+    }
+
+    for (uint32_t rank = 0u; rank < (uint32_t)TOP_K; ++rank) {
+        for (uint32_t col = 0u; col < (uint32_t)HIDDEN; ++col) {
+            uint32_t d0 = (rank * 173u + col * 7u) % (uint32_t)INTERMEDIATE;
+            uint32_t d1 = (rank * 181u + col * 11u + 37u) % (uint32_t)INTERMEDIATE;
+            uint32_t d2 = (rank * 191u + col * 13u + 101u) % (uint32_t)INTERMEDIATE;
+            if (d1 == d0) d1 = (d1 + 1u) % (uint32_t)INTERMEDIATE;
+            if (d2 == d0 || d2 == d1) d2 = (d2 + 2u) % (uint32_t)INTERMEDIATE;
+            const size_t base = ((size_t)rank * HIDDEN + col) * INTERMEDIATE;
+            down_weight[base + d0] = down_values[(rank + col + 2u) % down_value_count];
+            down_weight[base + d1] = down_values[(rank * 3u + col * 5u + 1u) % down_value_count];
+            down_weight[base + d2] = down_values[(rank * 7u + col * 11u + 5u) % down_value_count];
+        }
+    }
+
+    for (uint32_t rank = 0u; rank < (uint32_t)TOP_K; ++rank) {
+        for (uint32_t row = 0u; row < (uint32_t)INTERMEDIATE; ++row) {
+            float gate = 0.0f;
+            float up = 0.0f;
+            const uint32_t weight_row = rank * (uint32_t)INTERMEDIATE + row;
+            for (uint32_t col = 0u; col < (uint32_t)HIDDEN; ++col) {
+                const float x = f16_bits_to_f32(input[col]);
+                gate += x * q4_k_expected_value(gate_weight, (uint32_t)ROW_SIZE, weight_row, col);
+                up += x * q4_k_expected_value(up_weight, (uint32_t)ROW_SIZE, weight_row, col);
+            }
+            const float silu = gate / (1.0f + expf(-gate));
+            mid[(size_t)rank * INTERMEDIATE + row] = f16_bits_to_f32(f32_to_f16_bits(silu * up));
+        }
+    }
+
+    for (uint32_t col = 0u; col < (uint32_t)HIDDEN; ++col) {
+        float routed_sum = 0.0f;
+        for (uint32_t rank = 0u; rank < (uint32_t)TOP_K; ++rank) {
+            float expert_sum = 0.0f;
+            const size_t base = ((size_t)rank * HIDDEN + col) * INTERMEDIATE;
+            for (uint32_t row = 0u; row < (uint32_t)INTERMEDIATE; ++row) {
+                expert_sum += mid[(size_t)rank * INTERMEDIATE + row] * f16_bits_to_f32(down_weight[base + row]);
+            }
+            routed_sum += expert_sum * top_weights[rank];
+        }
+        expected[col] = routed_sum;
+    }
+
+    char error[1024];
+    memset(error, 0, sizeof(error));
+    uocr_metal_context *ctx = uocr_metal_context_create(UOCR_TEST_METAL_RESOURCE_PATH, error, sizeof(error));
+    CHECK(ctx != NULL);
+
+    memset(out_f32, 0, (size_t)HIDDEN * sizeof(float));
+    CHECK(uocr_metal_context_moe_selected_experts_decode_q4_k(ctx,
+                                                              input,
+                                                              top_ids,
+                                                              top_weights,
+                                                              gate_weight,
+                                                              up_weight,
+                                                              down_weight,
+                                                              PHYSICAL,
+                                                              UOCR_METAL_DENSE_OUTPUT_F32,
+                                                              out_f32,
+                                                              error,
+                                                              sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    for (uint32_t col = 0u; col < (uint32_t)HIDDEN; ++col) {
+        CHECK(fabsf(out_f32[col] - expected[col]) < 5.0e-5f);
+    }
+
+    memset(out_f16, 0, (size_t)HIDDEN * sizeof(uint16_t));
+    CHECK(uocr_metal_context_moe_selected_experts_decode_q4_k(ctx,
+                                                              input,
+                                                              top_ids,
+                                                              top_weights,
+                                                              gate_weight,
+                                                              up_weight,
+                                                              down_weight,
+                                                              PHYSICAL,
+                                                              UOCR_METAL_DENSE_OUTPUT_F16,
+                                                              out_f16,
+                                                              error,
+                                                              sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    for (uint32_t col = 0u; col < (uint32_t)HIDDEN; ++col) {
+        CHECK(fabsf(f16_bits_to_f32(out_f16[col]) - expected[col]) < 7.0e-4f);
+    }
+
+    CHECK(uocr_metal_context_moe_selected_experts_decode_q4_k(ctx,
+                                                              input,
+                                                              top_ids,
+                                                              top_weights,
+                                                              gate_weight,
+                                                              up_weight,
+                                                              down_weight,
+                                                              1408u,
+                                                              UOCR_METAL_DENSE_OUTPUT_F32,
+                                                              out_f32,
+                                                              error,
+                                                              sizeof(error)) == 0);
+    CHECK(strstr(error, "invalid Metal MoE selected-expert Q4_K decode widths") != NULL);
+
+    CHECK(uocr_metal_context_moe_selected_experts_decode_q4_k(ctx,
+                                                              input,
+                                                              top_ids,
+                                                              top_weights,
+                                                              gate_weight,
+                                                              up_weight,
+                                                              down_weight,
+                                                              PHYSICAL,
+                                                              (uocr_metal_dense_output_type)99,
+                                                              out_f32,
+                                                              error,
+                                                              sizeof(error)) == 0);
+    CHECK(strstr(error, "unsupported Metal MoE selected-expert Q4_K output type") != NULL);
+
+    uint32_t bad_ids[TOP_K] = {3u, 17u, UOCR_ROUTED_EXPERTS, 63u, 11u, 0u};
+    CHECK(uocr_metal_context_moe_selected_experts_decode_q4_k(ctx,
+                                                              input,
+                                                              bad_ids,
+                                                              top_weights,
+                                                              gate_weight,
+                                                              up_weight,
+                                                              down_weight,
+                                                              PHYSICAL,
+                                                              UOCR_METAL_DENSE_OUTPUT_F32,
+                                                              out_f32,
+                                                              error,
+                                                              sizeof(error)) == 0);
+    CHECK(strstr(error, "invalid Metal MoE selected Q4_K expert id") != NULL);
+
+    uocr_metal_context_destroy(ctx);
+    free(out_f16);
+    free(out_f32);
+    free(expected);
+    free(mid);
+    free(down_weight);
+    free(up_weight);
+    free(gate_weight);
+    free(input);
+    return 0;
+}
+
 static int test_metal_moe_selected_experts_prefill_f16(void) {
     if (!uocr_metal_is_available()) {
         return 0;
@@ -12148,6 +12414,215 @@ static int test_metal_moe_selected_experts_prefill_f16(void) {
                                                               error,
                                                               sizeof(error)) == 0);
     CHECK(strstr(error, "unsupported Metal MoE selected-expert prefill output type") != NULL);
+
+    uocr_metal_context_destroy(ctx);
+    return 0;
+}
+
+static int test_metal_moe_selected_experts_prefill_q4_k(void) {
+    if (!uocr_metal_is_available()) {
+        return 0;
+    }
+
+    enum { TOKENS = 3, HIDDEN = 256, PHYSICAL = 256, INTERMEDIATE = 7, EXPERTS = 4, TOP_K = 2 };
+    enum { ROW_SIZE = (PHYSICAL / UOCR_Q4_K_BLOCK_SIZE) * UOCR_Q4_K_TYPE_SIZE };
+    uint16_t input[TOKENS * HIDDEN];
+    uint32_t top_ids[TOKENS * TOP_K] = {
+        0u, 2u,
+        1u, 3u,
+        2u, 0u,
+    };
+    float top_weights[TOKENS * TOP_K] = {
+        0.625f, 0.25f,
+        0.5f, 0.125f,
+        0.375f, 0.3125f,
+    };
+    uint8_t gate_weight[EXPERTS * INTERMEDIATE * ROW_SIZE];
+    uint8_t up_weight[EXPERTS * INTERMEDIATE * ROW_SIZE];
+    uint16_t down_weight[EXPERTS * HIDDEN * INTERMEDIATE];
+    float mid[TOKENS * TOP_K * INTERMEDIATE];
+    float expected[TOKENS * HIDDEN];
+    float out_f32[TOKENS * HIDDEN];
+    uint16_t out_f16[TOKENS * HIDDEN];
+
+    memset(down_weight, 0, sizeof(down_weight));
+    init_q4_k_rows(gate_weight, (uint32_t)(EXPERTS * INTERMEDIATE), (uint32_t)ROW_SIZE, (uint32_t)PHYSICAL, 0x2800u);
+    init_q4_k_rows(up_weight, (uint32_t)(EXPERTS * INTERMEDIATE), (uint32_t)ROW_SIZE, (uint32_t)PHYSICAL, 0x2800u);
+    const float input_values[] = {-0.5f, -0.25f, 0.0f, 0.125f, 0.25f, 0.5f, 0.75f};
+    const float down_values[] = {-0.375f, -0.125f, 0.0625f, 0.125f, 0.25f, 0.375f};
+    for (uint32_t i = 0u; i < (uint32_t)(TOKENS * HIDDEN); ++i) {
+        input[i] = f32_to_f16_bits(input_values[(i * 5u + 2u) % (sizeof(input_values) / sizeof(input_values[0]))]);
+    }
+
+    for (uint32_t expert = 0u; expert < (uint32_t)EXPERTS; ++expert) {
+        for (uint32_t row = 0u; row < (uint32_t)INTERMEDIATE; ++row) {
+            const uint32_t qrow = expert * (uint32_t)INTERMEDIATE + row;
+            const uint32_t g0 = (expert * 17u + row * 11u) % (uint32_t)HIDDEN;
+            const uint32_t g1 = (expert * 23u + row * 13u + 19u) % (uint32_t)HIDDEN;
+            const uint32_t u0 = (expert * 29u + row * 7u + 5u) % (uint32_t)HIDDEN;
+            const uint32_t u1 = (expert * 31u + row * 5u + 37u) % (uint32_t)HIDDEN;
+            set_q4_k_q(gate_weight, (uint32_t)ROW_SIZE, qrow, g0, (uint8_t)(1u + ((expert + row) % 8u)));
+            set_q4_k_q(gate_weight, (uint32_t)ROW_SIZE, qrow, g1, (uint8_t)(2u + ((expert * 3u + row) % 7u)));
+            set_q4_k_q(up_weight, (uint32_t)ROW_SIZE, qrow, u0, (uint8_t)(1u + ((expert * 5u + row) % 8u)));
+            set_q4_k_q(up_weight, (uint32_t)ROW_SIZE, qrow, u1, (uint8_t)(2u + ((expert + row * 3u) % 7u)));
+        }
+    }
+    for (uint32_t expert = 0u; expert < (uint32_t)EXPERTS; ++expert) {
+        for (uint32_t col = 0u; col < (uint32_t)HIDDEN; ++col) {
+            const size_t base = ((size_t)expert * HIDDEN + col) * INTERMEDIATE;
+            const uint32_t d0 = (expert + col) % (uint32_t)INTERMEDIATE;
+            const uint32_t d1 = (expert * 2u + col + 1u) % (uint32_t)INTERMEDIATE;
+            down_weight[base + d0] = f32_to_f16_bits(down_values[(expert + col + 2u) % 6u]);
+            down_weight[base + d1] = f32_to_f16_bits(down_values[(expert * 3u + col + 4u) % 6u]);
+        }
+    }
+
+    for (uint32_t token = 0u; token < (uint32_t)TOKENS; ++token) {
+        for (uint32_t rank = 0u; rank < (uint32_t)TOP_K; ++rank) {
+            const uint32_t expert = top_ids[token * (uint32_t)TOP_K + rank];
+            for (uint32_t row = 0u; row < (uint32_t)INTERMEDIATE; ++row) {
+                float gate = 0.0f;
+                float up = 0.0f;
+                const uint32_t weight_row = expert * (uint32_t)INTERMEDIATE + row;
+                const size_t input_base = (size_t)token * HIDDEN;
+                for (uint32_t col = 0u; col < (uint32_t)HIDDEN; ++col) {
+                    const float x = f16_bits_to_f32(input[input_base + col]);
+                    gate += x * q4_k_expected_value(gate_weight, (uint32_t)ROW_SIZE, weight_row, col);
+                    up += x * q4_k_expected_value(up_weight, (uint32_t)ROW_SIZE, weight_row, col);
+                }
+                const float silu = gate / (1.0f + expf(-gate));
+                mid[((size_t)token * TOP_K + rank) * INTERMEDIATE + row] = f16_bits_to_f32(f32_to_f16_bits(silu * up));
+            }
+        }
+    }
+
+    for (uint32_t token = 0u; token < (uint32_t)TOKENS; ++token) {
+        for (uint32_t col = 0u; col < (uint32_t)HIDDEN; ++col) {
+            float routed_sum = 0.0f;
+            for (uint32_t rank = 0u; rank < (uint32_t)TOP_K; ++rank) {
+                const uint32_t expert = top_ids[token * (uint32_t)TOP_K + rank];
+                float expert_sum = 0.0f;
+                const size_t mid_base = ((size_t)token * TOP_K + rank) * INTERMEDIATE;
+                const size_t weight_base = ((size_t)expert * HIDDEN + col) * INTERMEDIATE;
+                for (uint32_t row = 0u; row < (uint32_t)INTERMEDIATE; ++row) {
+                    expert_sum += mid[mid_base + row] * f16_bits_to_f32(down_weight[weight_base + row]);
+                }
+                routed_sum += expert_sum * top_weights[token * (uint32_t)TOP_K + rank];
+            }
+            expected[token * (uint32_t)HIDDEN + col] = routed_sum;
+        }
+    }
+
+    char error[1024];
+    memset(error, 0, sizeof(error));
+    uocr_metal_context *ctx = uocr_metal_context_create(UOCR_TEST_METAL_RESOURCE_PATH, error, sizeof(error));
+    CHECK(ctx != NULL);
+
+    memset(out_f32, 0, sizeof(out_f32));
+    CHECK(uocr_metal_context_moe_selected_experts_prefill_q4_k(ctx,
+                                                               input,
+                                                               top_ids,
+                                                               top_weights,
+                                                               gate_weight,
+                                                               up_weight,
+                                                               down_weight,
+                                                               TOKENS,
+                                                               HIDDEN,
+                                                               PHYSICAL,
+                                                               INTERMEDIATE,
+                                                               EXPERTS,
+                                                               TOP_K,
+                                                               UOCR_METAL_DENSE_OUTPUT_F32,
+                                                               out_f32,
+                                                               error,
+                                                               sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    for (uint32_t i = 0u; i < (uint32_t)(TOKENS * HIDDEN); ++i) {
+        CHECK(fabsf(out_f32[i] - expected[i]) < 5.0e-5f);
+    }
+
+    memset(out_f16, 0, sizeof(out_f16));
+    CHECK(uocr_metal_context_moe_selected_experts_prefill_q4_k(ctx,
+                                                               input,
+                                                               top_ids,
+                                                               top_weights,
+                                                               gate_weight,
+                                                               up_weight,
+                                                               down_weight,
+                                                               TOKENS,
+                                                               HIDDEN,
+                                                               PHYSICAL,
+                                                               INTERMEDIATE,
+                                                               EXPERTS,
+                                                               TOP_K,
+                                                               UOCR_METAL_DENSE_OUTPUT_F16,
+                                                               out_f16,
+                                                               error,
+                                                               sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    for (uint32_t i = 0u; i < (uint32_t)(TOKENS * HIDDEN); ++i) {
+        CHECK(fabsf(f16_bits_to_f32(out_f16[i]) - expected[i]) < 6.0e-4f);
+    }
+
+    uint32_t bad_ids[TOKENS * TOP_K];
+    memcpy(bad_ids, top_ids, sizeof(bad_ids));
+    bad_ids[3] = EXPERTS;
+    CHECK(uocr_metal_context_moe_selected_experts_prefill_q4_k(ctx,
+                                                               input,
+                                                               bad_ids,
+                                                               top_weights,
+                                                               gate_weight,
+                                                               up_weight,
+                                                               down_weight,
+                                                               TOKENS,
+                                                               HIDDEN,
+                                                               PHYSICAL,
+                                                               INTERMEDIATE,
+                                                               EXPERTS,
+                                                               TOP_K,
+                                                               UOCR_METAL_DENSE_OUTPUT_F32,
+                                                               out_f32,
+                                                               error,
+                                                               sizeof(error)) == 0);
+    CHECK(strstr(error, "invalid Metal MoE Q4_K prefill expert id") != NULL);
+
+    CHECK(uocr_metal_context_moe_selected_experts_prefill_q4_k(ctx,
+                                                               input,
+                                                               top_ids,
+                                                               top_weights,
+                                                               gate_weight,
+                                                               up_weight,
+                                                               down_weight,
+                                                               TOKENS,
+                                                               HIDDEN,
+                                                               384u,
+                                                               INTERMEDIATE,
+                                                               EXPERTS,
+                                                               TOP_K,
+                                                               UOCR_METAL_DENSE_OUTPUT_F32,
+                                                               out_f32,
+                                                               error,
+                                                               sizeof(error)) == 0);
+    CHECK(strstr(error, "invalid Metal MoE selected-expert Q4_K prefill widths") != NULL);
+
+    CHECK(uocr_metal_context_moe_selected_experts_prefill_q4_k(ctx,
+                                                               input,
+                                                               top_ids,
+                                                               top_weights,
+                                                               gate_weight,
+                                                               up_weight,
+                                                               down_weight,
+                                                               TOKENS,
+                                                               HIDDEN,
+                                                               PHYSICAL,
+                                                               INTERMEDIATE,
+                                                               EXPERTS,
+                                                               TOP_K,
+                                                               (uocr_metal_dense_output_type)99,
+                                                               out_f32,
+                                                               error,
+                                                               sizeof(error)) == 0);
+    CHECK(strstr(error, "unsupported Metal MoE selected-expert Q4_K prefill output type") != NULL);
 
     uocr_metal_context_destroy(ctx);
     return 0;
@@ -14273,7 +14748,9 @@ int main(void) {
     if (test_metal_moe_shared_experts_q8_0() != 0) return 1;
     if (test_metal_moe_router_f16() != 0) return 1;
     if (test_metal_moe_selected_experts_decode_f16() != 0) return 1;
+    if (test_metal_moe_selected_experts_decode_q4_k() != 0) return 1;
     if (test_metal_moe_selected_experts_prefill_f16() != 0) return 1;
+    if (test_metal_moe_selected_experts_prefill_q4_k() != 0) return 1;
     if (test_metal_moe_combine_f16() != 0) return 1;
     if (test_metal_rope_qk_f16() != 0) return 1;
     if (test_metal_prefill_attention_f16() != 0) return 1;

@@ -62,6 +62,38 @@ static inline float uocr_q8_0_load_value(device const uchar *table, uint row_siz
     return float(scale) * float(q);
 }
 
+static inline uchar2 uocr_q4_k_get_scale_min(device const uchar *scales, uint group) {
+    if (group < 4u) {
+        return uchar2(uchar(scales[group] & 63u), uchar(scales[group + 4u] & 63u));
+    }
+    const uint k = group - 4u;
+    return uchar2(uchar((scales[8u + k] & 0x0fu) | ((scales[k] & 0xc0u) >> 2u)),
+                  uchar((scales[8u + k] >> 4u) | ((scales[4u + k] & 0xc0u) >> 2u)));
+}
+
+static inline float uocr_q4_k_load_value(device const uchar *table, uint row_size, uint row, uint col) {
+    constexpr uint qk = 256u;
+    constexpr uint block_bytes = 144u;
+    const uint block = col / qk;
+    const uint in_block = col - block * qk;
+    device const uchar *packed = table + row * row_size + block * block_bytes;
+    const ushort d_bits = ushort(packed[0]) | (ushort(packed[1]) << 8u);
+    const ushort dmin_bits = ushort(packed[2]) | (ushort(packed[3]) << 8u);
+    const float d = float(as_type<half>(d_bits));
+    const float dmin = float(as_type<half>(dmin_bits));
+    device const uchar *scales = packed + 4u;
+    device const uchar *qs = packed + 16u;
+
+    const uint il = in_block / 16u;
+    const uint offset = in_block - il * 16u;
+    const uint group = il / 2u;
+    const uchar2 scale_min = uocr_q4_k_get_scale_min(scales, group);
+    const uint q_base = (il / 4u) * 32u + 16u * (il & 1u);
+    const uchar q_byte = qs[q_base + offset];
+    const uint q = (il & 2u) == 0u ? uint(q_byte & 0x0fu) : uint(q_byte >> 4u);
+    return d * float(scale_min.x) * float(q) - dmin * float(scale_min.y);
+}
+
 kernel void uocr_get_rows_f16_to_f16(device const half *table [[buffer(0)]],
                                      device const int *row_ids [[buffer(1)]],
                                      device half *dst [[buffer(2)]],
@@ -2688,6 +2720,17 @@ struct UocrMoeSelectedParams {
     uint reserved;
 };
 
+struct UocrMoeSelectedQ4Params {
+    uint hidden_size;
+    uint physical_hidden_size;
+    uint intermediate_size;
+    uint top_k;
+    uint gate_row_size;
+    uint reserved0;
+    uint reserved1;
+    uint reserved2;
+};
+
 kernel void uocr_moe_selected_gate_up_f16(device const half *src [[buffer(0)]],
                                           device const half *gate_weight [[buffer(1)]],
                                           device const half *up_weight [[buffer(2)]],
@@ -2713,6 +2756,51 @@ kernel void uocr_moe_selected_gate_up_f16(device const half *src [[buffer(0)]],
         const float x = float(src[k]);
         gate_sum += x * float(gate_weight[weight_base + ulong(k)]);
         up_sum += x * float(up_weight[weight_base + ulong(k)]);
+    }
+    gate_partials[tid] = gate_sum;
+    up_partials[tid] = up_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = ntg >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            gate_partials[tid] += gate_partials[tid + stride];
+            up_partials[tid] += up_partials[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tid == 0) {
+        const float gate = gate_partials[0];
+        const float up = up_partials[0];
+        const float silu = gate / (1.0f + exp(-gate));
+        mid[rank * params.intermediate_size + out_col] = half(silu * up);
+    }
+}
+
+kernel void uocr_moe_selected_gate_up_q4_k(device const half *src [[buffer(0)]],
+                                           device const uchar *gate_weight [[buffer(1)]],
+                                           device const uchar *up_weight [[buffer(2)]],
+                                           device half *mid [[buffer(3)]],
+                                           constant UocrMoeSelectedQ4Params &params [[buffer(4)]],
+                                           threadgroup float *partials [[threadgroup(0)]],
+                                           uint output_index [[threadgroup_position_in_grid]],
+                                           uint tid [[thread_index_in_threadgroup]],
+                                           uint ntg [[threads_per_threadgroup]]) {
+    const uint rank = output_index / params.intermediate_size;
+    const uint out_col = output_index - rank * params.intermediate_size;
+    if (rank >= params.top_k || out_col >= params.intermediate_size) {
+        return;
+    }
+
+    threadgroup float *gate_partials = partials;
+    threadgroup float *up_partials = partials + ntg;
+    float gate_sum = 0.0f;
+    float up_sum = 0.0f;
+    const uint weight_row = rank * params.intermediate_size + out_col;
+    for (uint k = tid; k < params.hidden_size; k += ntg) {
+        const float x = float(src[k]);
+        gate_sum += x * uocr_q4_k_load_value(gate_weight, params.gate_row_size, weight_row, k);
+        up_sum += x * uocr_q4_k_load_value(up_weight, params.gate_row_size, weight_row, k);
     }
     gate_partials[tid] = gate_sum;
     up_partials[tid] = up_sum;
@@ -2812,6 +2900,17 @@ struct UocrMoePrefillSelectedParams {
     uint reserved2;
 };
 
+struct UocrMoePrefillSelectedQ4Params {
+    uint n_tokens;
+    uint hidden_size;
+    uint physical_hidden_size;
+    uint intermediate_size;
+    uint expert_count;
+    uint top_k;
+    uint gate_row_size;
+    uint reserved0;
+};
+
 struct UocrMoePrefillInterleavedParams {
     uint n_tokens;
     uint hidden_size;
@@ -2861,6 +2960,67 @@ kernel void uocr_moe_prefill_selected_gate_up_f16(device const half *src [[buffe
         const float x = float(src[src_base + ulong(k)]);
         gate_sum += x * float(gate_weight[weight_base + ulong(k)]);
         up_sum += x * float(up_weight[weight_base + ulong(k)]);
+    }
+    gate_partials[tid] = gate_sum;
+    up_partials[tid] = up_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = ntg >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            gate_partials[tid] += gate_partials[tid + stride];
+            up_partials[tid] += up_partials[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tid == 0) {
+        const float gate = gate_partials[0];
+        const float up = up_partials[0];
+        const float silu = gate / (1.0f + exp(-gate));
+        const ulong mid_index = (ulong(token) * ulong(params.top_k) + ulong(rank)) *
+                                    ulong(params.intermediate_size) +
+                                ulong(out_col);
+        mid[mid_index] = half(silu * up);
+    }
+}
+
+kernel void uocr_moe_prefill_selected_gate_up_q4_k(device const half *src [[buffer(0)]],
+                                                   device const uint *top_expert_ids [[buffer(1)]],
+                                                   device const uchar *gate_weight [[buffer(2)]],
+                                                   device const uchar *up_weight [[buffer(3)]],
+                                                   device half *mid [[buffer(4)]],
+                                                   constant UocrMoePrefillSelectedQ4Params &params [[buffer(5)]],
+                                                   threadgroup float *partials [[threadgroup(0)]],
+                                                   uint output_index [[threadgroup_position_in_grid]],
+                                                   uint tid [[thread_index_in_threadgroup]],
+                                                   uint ntg [[threads_per_threadgroup]]) {
+    const uint per_token = params.top_k * params.intermediate_size;
+    const uint token = output_index / per_token;
+    const uint token_rem = output_index - token * per_token;
+    const uint rank = token_rem / params.intermediate_size;
+    const uint out_col = token_rem - rank * params.intermediate_size;
+    if (token >= params.n_tokens || rank >= params.top_k || out_col >= params.intermediate_size) {
+        return;
+    }
+
+    const uint expert = top_expert_ids[token * params.top_k + rank];
+    if (expert >= params.expert_count) {
+        if (tid == 0) {
+            mid[(token * params.top_k + rank) * params.intermediate_size + out_col] = half(0.0f);
+        }
+        return;
+    }
+
+    threadgroup float *gate_partials = partials;
+    threadgroup float *up_partials = partials + ntg;
+    float gate_sum = 0.0f;
+    float up_sum = 0.0f;
+    const uint weight_row = expert * params.intermediate_size + out_col;
+    const ulong src_base = ulong(token) * ulong(params.hidden_size);
+    for (uint k = tid; k < params.hidden_size; k += ntg) {
+        const float x = float(src[src_base + ulong(k)]);
+        gate_sum += x * uocr_q4_k_load_value(gate_weight, params.gate_row_size, weight_row, k);
+        up_sum += x * uocr_q4_k_load_value(up_weight, params.gate_row_size, weight_row, k);
     }
     gate_partials[tid] = gate_sum;
     up_partials[tid] = up_sum;
