@@ -169,6 +169,20 @@ static int env_flag_enabled(const char *name) {
                              strcmp(value, "yes") == 0 || strcmp(value, "YES") == 0);
 }
 
+static uint32_t env_u32_or_default(const char *name, uint32_t default_value) {
+    const char *value = getenv(name);
+    if (value == NULL || value[0] == '\0') {
+        return default_value;
+    }
+    errno = 0;
+    char *end = NULL;
+    const unsigned long parsed = strtoul(value, &end, 10);
+    if (errno != 0 || end == value || *end != '\0' || parsed > (unsigned long)UINT32_MAX) {
+        return default_value;
+    }
+    return (uint32_t)parsed;
+}
+
 static uint16_t bf16_bits_to_f16_bits(uint16_t bf16) {
     uint32_t bits = ((uint32_t)bf16) << 16u;
     float value = 0.0f;
@@ -1002,6 +1016,85 @@ static int run_metal_attention_block_from_model_f16(uocr_metal_context *ctx,
     return ok;
 }
 
+static int run_metal_dense_decoder_layer0_from_model_f16(uocr_metal_context *ctx,
+                                                           const uocr_model_file *model,
+                                                           const uint16_t *hidden_in,
+                                                           uint32_t n_tokens,
+                                                           uint16_t *hidden_out,
+                                                           char *error,
+                                                           size_t error_size) {
+    if (ctx == NULL || model == NULL || hidden_in == NULL || hidden_out == NULL || n_tokens == 0u) {
+        snprintf(error, error_size, "invalid Metal dense decoder-layer0 request");
+        return 0;
+    }
+    const uint64_t hidden_values = (uint64_t)n_tokens * (uint64_t)UOCR_HIDDEN_SIZE;
+    if (hidden_values > (uint64_t)SIZE_MAX / sizeof(uint16_t)) {
+        snprintf(error, error_size, "Metal dense decoder-layer0 size overflow");
+        return 0;
+    }
+
+    const uint16_t *gate_weight = model_tensor_f16_payload(model,
+                                                           uocr_tensor_id_layer_dense_mlp(UOCR_TENSOR_PROJ_GATE),
+                                                           (uint64_t)UOCR_DENSE_LAYER0_INTERMEDIATE *
+                                                               (uint64_t)UOCR_HIDDEN_SIZE,
+                                                           error,
+                                                           error_size);
+    const uint16_t *up_weight = model_tensor_f16_payload(model,
+                                                         uocr_tensor_id_layer_dense_mlp(UOCR_TENSOR_PROJ_UP),
+                                                         (uint64_t)UOCR_DENSE_LAYER0_INTERMEDIATE *
+                                                             (uint64_t)UOCR_HIDDEN_SIZE,
+                                                         error,
+                                                         error_size);
+    const uint16_t *down_weight = model_tensor_f16_payload(model,
+                                                           uocr_tensor_id_layer_dense_mlp(UOCR_TENSOR_PROJ_DOWN),
+                                                           (uint64_t)UOCR_HIDDEN_SIZE *
+                                                               (uint64_t)UOCR_DENSE_LAYER0_INTERMEDIATE,
+                                                           error,
+                                                           error_size);
+    if (gate_weight == NULL || up_weight == NULL || down_weight == NULL) {
+        return 0;
+    }
+
+    uint16_t *attn_hidden = (uint16_t *)calloc((size_t)hidden_values, sizeof(uint16_t));
+    uint16_t *mlp_input = (uint16_t *)calloc((size_t)hidden_values, sizeof(uint16_t));
+    if (attn_hidden == NULL || mlp_input == NULL) {
+        snprintf(error, error_size, "failed to allocate Metal dense decoder-layer0 buffers");
+        free(mlp_input);
+        free(attn_hidden);
+        return 0;
+    }
+
+    int ok = 0;
+    if (run_metal_attention_block_from_model_f16(ctx,
+                                                model,
+                                                0u,
+                                                hidden_in,
+                                                n_tokens,
+                                                attn_hidden,
+                                                mlp_input,
+                                                error,
+                                                error_size) != 1 ||
+        uocr_metal_context_dense_swiglu_f16(ctx,
+                                            mlp_input,
+                                            gate_weight,
+                                            up_weight,
+                                            down_weight,
+                                            attn_hidden,
+                                            n_tokens,
+                                            UOCR_METAL_DENSE_OUTPUT_F16,
+                                            hidden_out,
+                                            error,
+                                            error_size) != 1) {
+        ok = 0;
+    } else {
+        ok = 1;
+    }
+
+    free(mlp_input);
+    free(attn_hidden);
+    return ok;
+}
+
 static int copy_selected_moe_expert_weights(const uocr_model_file *model,
                                             uint32_t layer,
                                             const uint32_t *top_expert_ids,
@@ -1589,6 +1682,69 @@ cleanup:
     return ok;
 }
 
+static int run_metal_decoder_prefill_from_model_f16(uocr_metal_context *ctx,
+                                                     const uocr_model_file *model,
+                                                     const uint16_t *prompt_embeddings_f16,
+                                                     uint32_t n_tokens,
+                                                     uint16_t *final_hidden_out,
+                                                     char *error,
+                                                     size_t error_size) {
+    if (ctx == NULL || model == NULL || prompt_embeddings_f16 == NULL || final_hidden_out == NULL || n_tokens == 0u) {
+        snprintf(error, error_size, "invalid Metal decoder prefill request");
+        return 0;
+    }
+    const uint64_t hidden_values = (uint64_t)n_tokens * (uint64_t)UOCR_HIDDEN_SIZE;
+    if (hidden_values > (uint64_t)SIZE_MAX / sizeof(uint16_t)) {
+        snprintf(error, error_size, "Metal decoder prefill size overflow");
+        return 0;
+    }
+    const size_t hidden_bytes = (size_t)hidden_values * sizeof(uint16_t);
+    uint16_t *ping = (uint16_t *)calloc((size_t)hidden_values, sizeof(uint16_t));
+    uint16_t *pong = (uint16_t *)calloc((size_t)hidden_values, sizeof(uint16_t));
+    if (ping == NULL || pong == NULL) {
+        snprintf(error, error_size, "failed to allocate Metal decoder prefill ping-pong buffers");
+        free(pong);
+        free(ping);
+        return 0;
+    }
+
+    int ok = 0;
+    if (run_metal_dense_decoder_layer0_from_model_f16(ctx,
+                                                      model,
+                                                      prompt_embeddings_f16,
+                                                      n_tokens,
+                                                      ping,
+                                                      error,
+                                                      error_size) != 1) {
+        goto cleanup;
+    }
+
+    uint16_t *current = ping;
+    uint16_t *next = pong;
+    for (uint32_t layer = 1u; layer < UOCR_DECODER_LAYERS; ++layer) {
+        if (run_metal_moe_decoder_layer_from_model_f16(ctx,
+                                                       model,
+                                                       layer,
+                                                       current,
+                                                       n_tokens,
+                                                       next,
+                                                       error,
+                                                       error_size) != 1) {
+            goto cleanup;
+        }
+        uint16_t *tmp = current;
+        current = next;
+        next = tmp;
+    }
+    memcpy(final_hidden_out, current, hidden_bytes);
+    ok = 1;
+
+cleanup:
+    free(pong);
+    free(ping);
+    return ok;
+}
+
 static int test_metal_text_prompt_embedding_python_dump_parity(void) {
     if (!uocr_metal_is_available()) {
         return 0;
@@ -1750,6 +1906,144 @@ static int test_metal_image_prompt_embedding_python_dump_parity(void) {
     uocr_metal_context_destroy(ctx);
     uocr_model_file_close(&model);
     free(expected);
+    free(visual_features);
+    free(image_mask);
+    free(input_ids);
+    return 0;
+}
+
+static int test_metal_image_prompt_decoder_smoke_python_dump(void) {
+    if (!uocr_metal_is_available()) {
+        return 0;
+    }
+    if (!env_flag_enabled("UOCR_RUN_LARGE_TESTS")) {
+        return 0;
+    }
+
+    const char *model_path = getenv("UOCR_MODEL_PATH");
+    const char *dump_dir = getenv("UOCR_IMAGE_EMBED_DUMP_DIR");
+    if (model_path == NULL || model_path[0] == '\0' || dump_dir == NULL || dump_dir[0] == '\0') {
+        printf("UOCR_RUN_LARGE_TESTS=1 but UOCR_MODEL_PATH/UOCR_IMAGE_EMBED_DUMP_DIR are not both set; skipping image prompt decoder smoke\n");
+        return 0;
+    }
+    if (!fixture_binary_exists(dump_dir, "visual_features_f16.bin")) {
+        printf("UOCR_IMAGE_EMBED_DUMP_DIR has no visual_features_f16.bin; skipping image prompt decoder smoke\n");
+        return 0;
+    }
+
+    char error[1024];
+    memset(error, 0, sizeof(error));
+    int32_t *input_ids = NULL;
+    uint8_t *image_mask = NULL;
+    uint32_t n_tokens = 0u;
+    uint16_t *visual_features = NULL;
+    uint32_t image_span_start = UOCR_SEQUENCE_NO_IMAGE_SPAN;
+    uint32_t image_span_length = 0u;
+    uint16_t *expected_prompt = NULL;
+    CHECK(read_image_prompt_embedding_python_dump(dump_dir,
+                                                  &input_ids,
+                                                  &image_mask,
+                                                  &n_tokens,
+                                                  &visual_features,
+                                                  &image_span_start,
+                                                  &image_span_length,
+                                                  &expected_prompt,
+                                                  error,
+                                                  sizeof(error)) == 1);
+    CHECK(n_tokens > 0u);
+    CHECK(image_span_start != UOCR_SEQUENCE_NO_IMAGE_SPAN);
+    CHECK(image_span_length > 0u);
+
+    const uint32_t max_decoder_tokens = env_u32_or_default("UOCR_IMAGE_DECODER_MAX_TOKENS", 32u);
+    if (n_tokens > max_decoder_tokens) {
+        printf("UOCR_IMAGE_EMBED_DUMP_DIR has %u tokens; set UOCR_IMAGE_DECODER_MAX_TOKENS=%u or higher to run image decoder smoke\n",
+               n_tokens,
+               n_tokens);
+        free(expected_prompt);
+        free(visual_features);
+        free(image_mask);
+        free(input_ids);
+        return 0;
+    }
+
+    uocr_model_file model;
+    CHECK(uocr_model_file_open(model_path, &model, error, sizeof(error)) == 0);
+
+    uocr_metal_context *ctx = uocr_metal_context_create(UOCR_TEST_METAL_RESOURCE_PATH, error, sizeof(error));
+    CHECK(ctx != NULL);
+    CHECK(uocr_metal_context_map_model(ctx, &model, error, sizeof(error)) == 1);
+
+    const uint64_t hidden_values = (uint64_t)n_tokens * (uint64_t)UOCR_HIDDEN_SIZE;
+    CHECK(hidden_values <= (uint64_t)SIZE_MAX / sizeof(uint16_t));
+    uint16_t *prompt = (uint16_t *)calloc((size_t)hidden_values, sizeof(uint16_t));
+    uint16_t *final_hidden = (uint16_t *)calloc((size_t)hidden_values, sizeof(uint16_t));
+    uint16_t *normed = (uint16_t *)calloc((size_t)UOCR_HIDDEN_SIZE, sizeof(uint16_t));
+    float *logits = (float *)malloc((size_t)UOCR_VOCAB_SIZE * sizeof(float));
+    CHECK(prompt != NULL);
+    CHECK(final_hidden != NULL);
+    CHECK(normed != NULL);
+    CHECK(logits != NULL);
+
+    CHECK(uocr_metal_context_assemble_prompt_from_model_f16(ctx,
+                                                            input_ids,
+                                                            n_tokens,
+                                                            image_span_start,
+                                                            image_span_length,
+                                                            visual_features,
+                                                            prompt,
+                                                            error,
+                                                            sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    CHECK(memcmp(prompt, expected_prompt, (size_t)hidden_values * sizeof(uint16_t)) == 0);
+
+    CHECK(run_metal_decoder_prefill_from_model_f16(ctx,
+                                                   &model,
+                                                   prompt,
+                                                   n_tokens,
+                                                   final_hidden,
+                                                   error,
+                                                   sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+
+    uint32_t token_id = UINT32_MAX;
+    float score = 0.0f;
+    const uint16_t *last_hidden = final_hidden + (size_t)(n_tokens - 1u) * UOCR_HIDDEN_SIZE;
+    CHECK(uocr_metal_context_select_next_token_f16(ctx,
+                                                   last_hidden,
+                                                   1u,
+                                                   NULL,
+                                                   normed,
+                                                   logits,
+                                                   &token_id,
+                                                   &score,
+                                                   error,
+                                                   sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    CHECK(token_id < (uint32_t)UOCR_VOCAB_SIZE);
+    CHECK(isfinite(score));
+
+    uocr_prepared_request request;
+    memset(&request, 0, sizeof(request));
+    request.input_ids = input_ids;
+    request.image_mask = image_mask;
+    request.n_tokens = n_tokens;
+    request.max_new_tokens = 1u;
+    uocr_sequence_state state;
+    memset(&state, 0, sizeof(state));
+    CHECK(uocr_build_sequence_state(&request, &state, error, sizeof(error)) == UOCR_OK);
+    int32_t generated[1] = {0};
+    CHECK(uocr_sequence_accept_generated_token(&state, (int32_t)token_id, generated, 1u) == UOCR_OK);
+    CHECK(generated[0] == (int32_t)token_id);
+    CHECK(state.generated_count == 1u);
+    CHECK(uocr_sequence_generation_done(&state) == 1);
+
+    free(logits);
+    free(normed);
+    free(final_hidden);
+    free(prompt);
+    uocr_metal_context_destroy(ctx);
+    uocr_model_file_close(&model);
+    free(expected_prompt);
     free(visual_features);
     free(image_mask);
     free(input_ids);
@@ -6675,6 +6969,7 @@ int main(void) {
     if (test_metal_text_prompt_embedding_full_model_parity() != 0) return 1;
     if (test_metal_text_prompt_embedding_python_dump_parity() != 0) return 1;
     if (test_metal_image_prompt_embedding_python_dump_parity() != 0) return 1;
+    if (test_metal_image_prompt_decoder_smoke_python_dump() != 0) return 1;
     if (test_metal_text_layer0_python_dump_parity() != 0) return 1;
     if (test_metal_text_layer1_python_dump_parity() != 0) return 1;
     if (test_metal_text_remaining_layers_python_dump_parity() != 0) return 1;

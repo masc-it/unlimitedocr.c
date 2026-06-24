@@ -677,7 +677,7 @@ First implementation slice, in order:
   - [x] dumped visual embeddings
   - [x] text embeddings after image
 - [x] Validate image placeholder count against dumped visual feature length.
-- [ ] Run full decoder prefill/decode with dumped image embeddings.
+- [x] Run full decoder prefill/decode with dumped image embeddings.
 - [ ] Compare against Python:
   - [ ] final prompt embeddings
   - [ ] per-layer hidden states
