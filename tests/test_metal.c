@@ -2050,6 +2050,185 @@ static int test_metal_image_prompt_decoder_smoke_python_dump(void) {
     return 0;
 }
 
+static int test_metal_image_decoder_layers_python_dump_parity(void) {
+    if (!uocr_metal_is_available()) {
+        return 0;
+    }
+    if (!env_flag_enabled("UOCR_RUN_LARGE_TESTS")) {
+        return 0;
+    }
+
+    const char *model_path = getenv("UOCR_MODEL_PATH");
+    const char *dump_dir = getenv("UOCR_IMAGE_EMBED_DUMP_DIR");
+    if (model_path == NULL || model_path[0] == '\0' || dump_dir == NULL || dump_dir[0] == '\0') {
+        printf("UOCR_RUN_LARGE_TESTS=1 but UOCR_MODEL_PATH/UOCR_IMAGE_EMBED_DUMP_DIR are not both set; skipping image decoder layer parity\n");
+        return 0;
+    }
+    if (!fixture_binary_exists(dump_dir, "visual_features_f16.bin")) {
+        printf("UOCR_IMAGE_EMBED_DUMP_DIR has no visual_features_f16.bin; skipping image decoder layer parity\n");
+        return 0;
+    }
+    if (!fixture_binary_exists(dump_dir, "layer_11_hidden_f16.bin")) {
+        printf("UOCR_IMAGE_EMBED_DUMP_DIR has no layer_11_hidden_f16.bin; skipping image decoder layer parity\n");
+        return 0;
+    }
+
+    char error[1024];
+    memset(error, 0, sizeof(error));
+    int32_t *input_ids = NULL;
+    uint8_t *image_mask = NULL;
+    uint32_t n_tokens = 0u;
+    uint16_t *visual_features = NULL;
+    uint32_t image_span_start = UOCR_SEQUENCE_NO_IMAGE_SPAN;
+    uint32_t image_span_length = 0u;
+    uint16_t *expected_prompt = NULL;
+    CHECK(read_image_prompt_embedding_python_dump(dump_dir,
+                                                  &input_ids,
+                                                  &image_mask,
+                                                  &n_tokens,
+                                                  &visual_features,
+                                                  &image_span_start,
+                                                  &image_span_length,
+                                                  &expected_prompt,
+                                                  error,
+                                                  sizeof(error)) == 1);
+    CHECK(n_tokens > 0u);
+    CHECK(image_span_start != UOCR_SEQUENCE_NO_IMAGE_SPAN);
+    CHECK(image_span_length > 0u);
+
+    const uint32_t max_decoder_tokens = env_u32_or_default("UOCR_IMAGE_DECODER_MAX_TOKENS", 32u);
+    if (n_tokens > max_decoder_tokens) {
+        printf("UOCR_IMAGE_EMBED_DUMP_DIR has %u tokens; set UOCR_IMAGE_DECODER_MAX_TOKENS=%u or higher to run image decoder layer parity\n",
+               n_tokens,
+               n_tokens);
+        free(expected_prompt);
+        free(visual_features);
+        free(image_mask);
+        free(input_ids);
+        return 0;
+    }
+
+    const uint64_t hidden_values = (uint64_t)n_tokens * (uint64_t)UOCR_HIDDEN_SIZE;
+    CHECK(hidden_values <= (uint64_t)SIZE_MAX / sizeof(uint16_t));
+    const size_t hidden_bytes = (size_t)hidden_values * sizeof(uint16_t);
+
+    uocr_model_file model;
+    CHECK(uocr_model_file_open(model_path, &model, error, sizeof(error)) == 0);
+    uocr_metal_context *ctx = uocr_metal_context_create(UOCR_TEST_METAL_RESOURCE_PATH, error, sizeof(error));
+    CHECK(ctx != NULL);
+    CHECK(uocr_metal_context_map_model(ctx, &model, error, sizeof(error)) == 1);
+
+    uint16_t *actual_prompt = (uint16_t *)calloc((size_t)hidden_values, sizeof(uint16_t));
+    uint16_t *actual = (uint16_t *)calloc((size_t)hidden_values, sizeof(uint16_t));
+    CHECK(actual_prompt != NULL);
+    CHECK(actual != NULL);
+
+    CHECK(uocr_metal_context_assemble_prompt_from_model_f16(ctx,
+                                                            input_ids,
+                                                            n_tokens,
+                                                            image_span_start,
+                                                            image_span_length,
+                                                            visual_features,
+                                                            actual_prompt,
+                                                            error,
+                                                            sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    for (uint64_t i = 0u; i < hidden_values; ++i) {
+        if (actual_prompt[i] != expected_prompt[i]) {
+            fprintf(stderr,
+                    "image decoder prompt mismatch at token %llu col %llu: actual=0x%04x expected=0x%04x\n",
+                    (unsigned long long)(i / (uint64_t)UOCR_HIDDEN_SIZE),
+                    (unsigned long long)(i % (uint64_t)UOCR_HIDDEN_SIZE),
+                    actual_prompt[i],
+                    expected_prompt[i]);
+            free(actual);
+            free(actual_prompt);
+            uocr_metal_context_destroy(ctx);
+            uocr_model_file_close(&model);
+            free(expected_prompt);
+            free(visual_features);
+            free(image_mask);
+            free(input_ids);
+            return 1;
+        }
+    }
+
+    uint16_t *expected = NULL;
+    CHECK(read_layer_hidden_python_dump(dump_dir,
+                                        "layer_0_hidden_f16.bin",
+                                        n_tokens,
+                                        &expected,
+                                        error,
+                                        sizeof(error)) == 1);
+    CHECK(run_metal_dense_decoder_layer0_from_model_f16(ctx,
+                                                        &model,
+                                                        actual_prompt,
+                                                        n_tokens,
+                                                        actual,
+                                                        error,
+                                                        sizeof(error)) == 1);
+    if (!compare_hidden_f16("image layer0", actual, expected, n_tokens, 7.5e-3f, 7.5e-4)) {
+        free(expected);
+        free(actual);
+        free(actual_prompt);
+        uocr_metal_context_destroy(ctx);
+        uocr_model_file_close(&model);
+        free(expected_prompt);
+        free(visual_features);
+        free(image_mask);
+        free(input_ids);
+        return 1;
+    }
+    free(expected);
+
+    for (uint32_t layer = 1u; layer < UOCR_DECODER_LAYERS; ++layer) {
+        char prev_filename[64];
+        char expected_filename[64];
+        char label[64];
+        snprintf(prev_filename, sizeof(prev_filename), "layer_%u_hidden_f16.bin", layer - 1u);
+        snprintf(expected_filename, sizeof(expected_filename), "layer_%u_hidden_f16.bin", layer);
+        snprintf(label, sizeof(label), "image layer%u", layer);
+        uint16_t *prev_expected = NULL;
+        expected = NULL;
+        CHECK(read_layer_hidden_python_dump(dump_dir, prev_filename, n_tokens, &prev_expected, error, sizeof(error)) == 1);
+        CHECK(read_layer_hidden_python_dump(dump_dir, expected_filename, n_tokens, &expected, error, sizeof(error)) == 1);
+        memset(actual, 0, hidden_bytes);
+        CHECK(run_metal_moe_decoder_layer_from_model_f16(ctx,
+                                                         &model,
+                                                         layer,
+                                                         prev_expected,
+                                                         n_tokens,
+                                                         actual,
+                                                         error,
+                                                         sizeof(error)) == 1);
+        const int close = compare_hidden_f16(label, actual, expected, n_tokens, 1.25e-2f, 1.25e-3);
+        free(expected);
+        free(prev_expected);
+        if (!close) {
+            free(actual);
+            free(actual_prompt);
+            uocr_metal_context_destroy(ctx);
+            uocr_model_file_close(&model);
+            free(expected_prompt);
+            free(visual_features);
+            free(image_mask);
+            free(input_ids);
+            return 1;
+        }
+    }
+    CHECK(error[0] == '\0');
+
+    free(actual);
+    free(actual_prompt);
+    uocr_metal_context_destroy(ctx);
+    uocr_model_file_close(&model);
+    free(expected_prompt);
+    free(visual_features);
+    free(image_mask);
+    free(input_ids);
+    return 0;
+}
+
 static int test_metal_text_prompt_embedding_full_model_parity(void) {
     if (!uocr_metal_is_available()) {
         return 0;
@@ -6970,6 +7149,7 @@ int main(void) {
     if (test_metal_text_prompt_embedding_python_dump_parity() != 0) return 1;
     if (test_metal_image_prompt_embedding_python_dump_parity() != 0) return 1;
     if (test_metal_image_prompt_decoder_smoke_python_dump() != 0) return 1;
+    if (test_metal_image_decoder_layers_python_dump_parity() != 0) return 1;
     if (test_metal_text_layer0_python_dump_parity() != 0) return 1;
     if (test_metal_text_layer1_python_dump_parity() != 0) return 1;
     if (test_metal_text_remaining_layers_python_dump_parity() != 0) return 1;

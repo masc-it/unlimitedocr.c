@@ -679,8 +679,8 @@ First implementation slice, in order:
 - [x] Validate image placeholder count against dumped visual feature length.
 - [x] Run full decoder prefill/decode with dumped image embeddings.
 - [ ] Compare against Python:
-  - [ ] final prompt embeddings
-  - [ ] per-layer hidden states
+  - [x] final prompt embeddings
+  - [x] per-layer hidden states
   - [ ] router top-6 agreement
   - [ ] logits
   - [ ] generated ids/text

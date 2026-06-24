@@ -9,6 +9,7 @@ from unlimitedocr_c.frontend import PreparedRequest, save_prepared_request
 from unlimitedocr_c.golden import (
     dump_image_prompt_embedding_fixture,
     dump_prompt_embedding_fixture,
+    load_image_decoder_layers_dump,
     load_image_prompt_embedding_dump,
     load_prompt_embedding_dump,
     load_text_decoder_layers_dump,
@@ -178,6 +179,54 @@ def test_dump_image_prompt_embedding_fixture_splices_visual_features(tmp_path) -
     assert loaded.image_span_start == 1
     assert loaded.image_span_length == 2
     assert loaded.manifest["image_embedding_fixture"]["bypasses_c_vision_encoder"] is True
+
+
+def test_load_image_decoder_layers_dump_reads_native_hidden_files(tmp_path) -> None:
+    request = _tiny_image_request(
+        np.array([0, 5, 2], dtype=np.int32),
+        np.array([0, 1, 0], dtype=np.uint8),
+    )
+    out = tmp_path / "dump"
+    out.mkdir()
+    save_prepared_request(request, out)
+    request.input_ids.astype(np.dtype("<i4")).tofile(out / "input_ids_i32.bin")
+    request.image_mask.astype(np.uint8).tofile(out / "image_mask_u8.bin")
+    visual = np.full((1, 1280), 0x3800, dtype=np.dtype("<u2"))
+    prompt = np.zeros((3, 1280), dtype=np.dtype("<u2"))
+    prompt[1:2] = visual
+    layer0 = np.full((3, 1280), 0x3C00, dtype=np.dtype("<u2"))
+    layer1 = np.full((3, 1280), 0x4000, dtype=np.dtype("<u2"))
+    visual.tofile(out / "visual_features_f16.bin")
+    prompt.tofile(out / "prompt_embeddings_f16.bin")
+    layer0.tofile(out / "layer_0_hidden_f16.bin")
+    layer1.tofile(out / "layer_1_hidden_f16.bin")
+    manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    manifest["image_decoder_layer_count"] = 2
+    manifest["image_embedding_fixture"] = {
+        "bypasses_c_vision_encoder": True,
+        "image_span_start": 1,
+        "image_span_length": 1,
+        "visual_features_file": "visual_features_f16.bin",
+    }
+    manifest["golden_tensors"] = {
+        "visual_features": {"file": "visual_features_f16.bin", "shape": [1, 1280]},
+        "prompt_embeddings": {"file": "prompt_embeddings_f16.bin", "shape": [3, 1280]},
+        "layer_0_hidden": {"file": "layer_0_hidden_f16.bin", "shape": [3, 1280]},
+        "layer_1_hidden": {"file": "layer_1_hidden_f16.bin", "shape": [3, 1280]},
+    }
+    manifest["native_binary_arrays"] = {
+        "input_ids": {"file": "input_ids_i32.bin", "dtype": "int32_le", "shape": [3]},
+        "image_mask": {"file": "image_mask_u8.bin", "dtype": "uint8", "shape": [3]},
+    }
+    (out / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    loaded = load_image_decoder_layers_dump(out)
+    assert loaded.image_span_start == 1
+    assert loaded.image_span_length == 1
+    np.testing.assert_array_equal(loaded.visual_features_f16_bits, visual)
+    assert len(loaded.layer_hidden_f16_bits) == 2
+    np.testing.assert_array_equal(loaded.layer_hidden_f16_bits[0], layer0)
+    np.testing.assert_array_equal(loaded.layer_hidden_f16_bits[1], layer1)
 
 
 def test_load_text_layer1_dump_reads_native_hidden_files(tmp_path) -> None:

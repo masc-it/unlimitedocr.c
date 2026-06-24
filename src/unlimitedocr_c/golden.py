@@ -125,6 +125,11 @@ class ImagePromptEmbeddingDump(PromptEmbeddingDump):
     image_span_length: int
 
 
+@dataclass(frozen=True)
+class ImageDecoderLayersDump(ImagePromptEmbeddingDump):
+    layer_hidden_f16_bits: tuple[NDArray[np.uint16], ...]
+
+
 def text_layer_hidden_filename(layer: int) -> str:
     if layer < 0 or layer >= TEXT_DECODER_LAYER_COUNT:
         raise ValueError(f"decoder layer out of range: {layer}")
@@ -929,6 +934,59 @@ def _add_hidden_tensor_manifest(
     }
 
 
+def dump_image_decoder_layers_fixture(
+    request: PreparedRequest,
+    out_dir: str | Path,
+    hf_dir: str | Path,
+    visual_features_f16_bits: NDArray[np.uint16],
+    *,
+    layer_count: int = TEXT_DECODER_LAYER_COUNT,
+    tensor_name: str = TOK_EMBED_TENSOR_NAME,
+    expected_shape: tuple[int, int] = (MODEL_VOCAB_SIZE, HIDDEN_SIZE),
+) -> Path:
+    """Write image prompt embeddings plus fp16 decoder layer outputs.
+
+    This is the image-embedding counterpart to
+    :func:`dump_text_decoder_layers_fixture`: visual features are supplied as
+    already formatted fp16 rows and spliced into the prompt before running the
+    same fp16 decoder reference.  It keeps the C/Metal parity path independent
+    of the unfinished native vision encoder.
+    """
+
+    out = dump_image_prompt_embedding_fixture(
+        request,
+        out_dir,
+        hf_dir,
+        visual_features_f16_bits,
+        tensor_name=tensor_name,
+        expected_shape=expected_shape,
+    )
+    prompt_dump = load_image_prompt_embedding_dump(out)
+    layer_outputs = compute_text_decoder_layer_hidden_f16_bits(
+        prompt_dump.prompt_embeddings_f16_bits,
+        hf_dir,
+        layer_count=layer_count,
+    )
+
+    manifest_path = out / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    for layer, hidden in enumerate(layer_outputs):
+        filename = text_layer_hidden_filename(layer)
+        (out / filename).write_bytes(np.asarray(hidden, dtype=np.dtype("<u2")).tobytes())
+        _add_hidden_tensor_manifest(
+            manifest,
+            f"layer_{layer}_hidden",
+            filename,
+            int(prompt_dump.input_ids.size),
+            hidden,
+            f"FP16 weights/activations with FP32 reductions; layer {layer} image-embedding decoder prefill",
+        )
+    manifest["image_decoder_layer_count"] = int(layer_count)
+    manifest["image_embedding_fixture"]["decoder_layers_file_pattern"] = "layer_{layer}_hidden_f16.bin"
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return out
+
+
 def dump_text_layer0_fixture(request: PreparedRequest, out_dir: str | Path, hf_dir: str | Path) -> Path:
     """Write prompt embeddings plus the fp16 output of decoder layer 0.
 
@@ -1151,6 +1209,34 @@ def _load_hidden_tensor_bits(
     if bits.size != expected_values:
         raise ValueError(f"{key} size mismatch: expected {expected_values} f16 values, got {bits.size}")
     return bits.reshape((n_tokens, hidden_size))
+
+
+def load_image_decoder_layers_dump(fixture_dir: str | Path) -> ImageDecoderLayersDump:
+    prompt = load_image_prompt_embedding_dump(fixture_dir)
+    root = Path(fixture_dir)
+    layer_count = int(prompt.manifest.get("image_decoder_layer_count", TEXT_DECODER_LAYER_COUNT))
+    if layer_count < 1 or layer_count > TEXT_DECODER_LAYER_COUNT:
+        raise ValueError(f"invalid image decoder layer count {layer_count} in {root}")
+    layers = tuple(
+        _load_hidden_tensor_bits(
+            root,
+            prompt.manifest,
+            f"layer_{layer}_hidden",
+            text_layer_hidden_filename(layer),
+            int(prompt.input_ids.size),
+        )
+        for layer in range(layer_count)
+    )
+    return ImageDecoderLayersDump(
+        manifest=prompt.manifest,
+        input_ids=prompt.input_ids,
+        image_mask=prompt.image_mask,
+        prompt_embeddings_f16_bits=prompt.prompt_embeddings_f16_bits,
+        visual_features_f16_bits=prompt.visual_features_f16_bits,
+        image_span_start=prompt.image_span_start,
+        image_span_length=prompt.image_span_length,
+        layer_hidden_f16_bits=layers,
+    )
 
 
 def load_text_layer0_dump(fixture_dir: str | Path) -> TextLayer0Dump:
