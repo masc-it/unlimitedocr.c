@@ -12000,6 +12000,253 @@ int uocr_metal_context_moe_shared_experts_f16(uocr_metal_context *ctx,
                                     error_size);
 }
 
+int uocr_metal_context_moe_shared_experts_q8_0(uocr_metal_context *ctx,
+                                               const uint16_t *input_f16,
+                                               const void *shared_gate_weight_q8_0,
+                                               const void *shared_up_weight_q8_0,
+                                               const void *shared_down_weight_q8_0,
+                                               uint32_t physical_hidden_features,
+                                               uint32_t physical_intermediate_features,
+                                               uint32_t n_tokens,
+                                               uocr_metal_dense_output_type output_type,
+                                               void *out,
+                                               char *error,
+                                               size_t error_size) {
+    metal_clear_error(error, error_size);
+    if (ctx == NULL || input_f16 == NULL || shared_gate_weight_q8_0 == NULL || shared_up_weight_q8_0 == NULL ||
+        shared_down_weight_q8_0 == NULL || out == NULL || n_tokens == 0u) {
+        return metal_fail(error, error_size, "invalid Metal MoE shared Q8_0 experts request");
+    }
+    if (physical_hidden_features < UOCR_HIDDEN_SIZE || physical_intermediate_features < UOCR_MOE_SHARED_INTERMEDIATE ||
+        (physical_hidden_features % 32u) != 0u || (physical_intermediate_features % 32u) != 0u) {
+        return metal_fail(error,
+                          error_size,
+                          "invalid Metal MoE shared Q8_0 widths hidden=%u intermediate=%u",
+                          physical_hidden_features,
+                          physical_intermediate_features);
+    }
+    if (output_type != UOCR_METAL_DENSE_OUTPUT_F16 && output_type != UOCR_METAL_DENSE_OUTPUT_F32) {
+        return metal_fail(error, error_size, "unsupported Metal MoE shared Q8_0 output type %d", (int)output_type);
+    }
+
+    uint64_t hidden_values = 0u;
+    uint64_t intermediate_values = 0u;
+    uint64_t input_bytes = 0u;
+    uint64_t intermediate_bytes = 0u;
+    uint64_t gate_row_size = 0u;
+    uint64_t gate_weight_bytes = 0u;
+    uint64_t down_row_size = 0u;
+    uint64_t down_weight_bytes = 0u;
+    uint64_t output_bytes = 0u;
+    const uint64_t output_element_bytes = output_type == UOCR_METAL_DENSE_OUTPUT_F16 ? 2u : (uint64_t)sizeof(float);
+    if (!checked_mul_u64((uint64_t)n_tokens, (uint64_t)UOCR_HIDDEN_SIZE, &hidden_values) ||
+        !checked_mul_u64((uint64_t)n_tokens, (uint64_t)UOCR_MOE_SHARED_INTERMEDIATE, &intermediate_values) ||
+        !checked_mul_u64(hidden_values, 2u, &input_bytes) ||
+        !checked_mul_u64(intermediate_values, 2u, &intermediate_bytes) ||
+        !checked_mul_u64((uint64_t)(physical_hidden_features / 32u), 34u, &gate_row_size) ||
+        !checked_mul_u64((uint64_t)UOCR_MOE_SHARED_INTERMEDIATE, gate_row_size, &gate_weight_bytes) ||
+        !checked_mul_u64((uint64_t)(physical_intermediate_features / 32u), 34u, &down_row_size) ||
+        !checked_mul_u64((uint64_t)UOCR_HIDDEN_SIZE, down_row_size, &down_weight_bytes) ||
+        !checked_mul_u64(hidden_values, output_element_bytes, &output_bytes)) {
+        return metal_fail(error, error_size, "Metal MoE shared Q8_0 byte-size overflow");
+    }
+    if (gate_row_size == 0u || down_row_size == 0u || gate_row_size > UINT32_MAX || down_row_size > UINT32_MAX) {
+        return metal_fail(error, error_size, "Metal MoE shared Q8_0 row size is invalid");
+    }
+
+    const uint64_t max_buffer_length = metal_device_max_buffer_length(ctx->device);
+    if (input_bytes > max_buffer_length || intermediate_bytes > max_buffer_length ||
+        gate_weight_bytes > max_buffer_length || down_weight_bytes > max_buffer_length ||
+        output_bytes > max_buffer_length || input_bytes > (uint64_t)SIZE_MAX || intermediate_bytes > (uint64_t)SIZE_MAX ||
+        gate_weight_bytes > (uint64_t)SIZE_MAX || down_weight_bytes > (uint64_t)SIZE_MAX ||
+        output_bytes > (uint64_t)SIZE_MAX || hidden_values > (uint64_t)UINT32_MAX ||
+        intermediate_values > (uint64_t)UINT32_MAX) {
+        return metal_fail(error,
+                          error_size,
+                          "Metal MoE shared Q8_0 buffers exceed maxBufferLength %llu",
+                          (unsigned long long)max_buffer_length);
+    }
+
+    @autoreleasepool {
+        id<MTLComputePipelineState> gate_up_pipeline = metal_get_pipeline(ctx,
+                                                                          "uocr_dense_swiglu_gate_up_q8_0",
+                                                                          error,
+                                                                          error_size);
+        if (gate_up_pipeline == nil) {
+            return 0;
+        }
+        const char *down_function_name = output_type == UOCR_METAL_DENSE_OUTPUT_F16 ?
+                                             "uocr_dense_q8_0_to_f16" :
+                                             "uocr_dense_q8_0_to_f32";
+        id<MTLComputePipelineState> down_pipeline = metal_get_pipeline(ctx, down_function_name, error, error_size);
+        if (down_pipeline == nil) {
+            return 0;
+        }
+
+        id<MTLBuffer> input = [ctx->device newBufferWithBytes:input_f16
+                                                       length:(NSUInteger)input_bytes
+                                                      options:MTLResourceStorageModeShared];
+        if (input == nil) {
+            return metal_fail(error, error_size, "failed to allocate Metal MoE shared Q8_0 input buffer");
+        }
+        input.label = @"uocr_moe_shared_q8_input_f16";
+
+        id<MTLBuffer> gate_weight = [ctx->device newBufferWithBytes:shared_gate_weight_q8_0
+                                                             length:(NSUInteger)gate_weight_bytes
+                                                            options:MTLResourceStorageModeShared];
+        if (gate_weight == nil) {
+            [input release];
+            return metal_fail(error, error_size, "failed to allocate Metal MoE shared Q8_0 gate weight buffer");
+        }
+        gate_weight.label = @"uocr_moe_shared_gate_weight_q8_0";
+
+        id<MTLBuffer> up_weight = [ctx->device newBufferWithBytes:shared_up_weight_q8_0
+                                                           length:(NSUInteger)gate_weight_bytes
+                                                          options:MTLResourceStorageModeShared];
+        if (up_weight == nil) {
+            [gate_weight release];
+            [input release];
+            return metal_fail(error, error_size, "failed to allocate Metal MoE shared Q8_0 up weight buffer");
+        }
+        up_weight.label = @"uocr_moe_shared_up_weight_q8_0";
+
+        id<MTLBuffer> down_weight = [ctx->device newBufferWithBytes:shared_down_weight_q8_0
+                                                             length:(NSUInteger)down_weight_bytes
+                                                            options:MTLResourceStorageModeShared];
+        if (down_weight == nil) {
+            [up_weight release];
+            [gate_weight release];
+            [input release];
+            return metal_fail(error, error_size, "failed to allocate Metal MoE shared Q8_0 down weight buffer");
+        }
+        down_weight.label = @"uocr_moe_shared_down_weight_q8_0";
+
+        id<MTLBuffer> mid = [ctx->device newBufferWithLength:(NSUInteger)intermediate_bytes
+                                                     options:MTLResourceStorageModeShared];
+        if (mid == nil) {
+            [down_weight release];
+            [up_weight release];
+            [gate_weight release];
+            [input release];
+            return metal_fail(error, error_size, "failed to allocate Metal MoE shared Q8_0 intermediate buffer");
+        }
+        mid.label = @"uocr_moe_shared_q8_mid_f16";
+        memset([mid contents], 0, (size_t)intermediate_bytes);
+
+        id<MTLBuffer> dst = [ctx->device newBufferWithLength:(NSUInteger)output_bytes options:MTLResourceStorageModeShared];
+        if (dst == nil) {
+            [mid release];
+            [down_weight release];
+            [up_weight release];
+            [gate_weight release];
+            [input release];
+            return metal_fail(error, error_size, "failed to allocate Metal MoE shared Q8_0 output buffer");
+        }
+        dst.label = @"uocr_moe_shared_q8_output";
+        memset([dst contents], 0, (size_t)output_bytes);
+
+        id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
+        if (cb == nil) {
+            [dst release];
+            [mid release];
+            [down_weight release];
+            [up_weight release];
+            [gate_weight release];
+            [input release];
+            return metal_fail(error, error_size, "failed to create Metal MoE shared Q8_0 command buffer");
+        }
+        cb.label = @"uocr_moe_shared_q8_command_buffer";
+
+        uocr_metal_dense_q8_params gate_params;
+        gate_params.input_rows = n_tokens;
+        gate_params.logical_in_features = UOCR_HIDDEN_SIZE;
+        gate_params.physical_in_features = physical_hidden_features;
+        gate_params.out_features = UOCR_MOE_SHARED_INTERMEDIATE;
+        gate_params.weight_row_size = (uint32_t)gate_row_size;
+        gate_params.has_bias = 0u;
+        gate_params.reserved0 = 0u;
+        gate_params.reserved1 = 0u;
+
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        if (enc == nil) {
+            [dst release];
+            [mid release];
+            [down_weight release];
+            [up_weight release];
+            [gate_weight release];
+            [input release];
+            return metal_fail(error, error_size, "failed to create Metal MoE shared Q8_0 gate/up command encoder");
+        }
+        const NSUInteger gate_threads = metal_power2_threadgroup_width(256u, gate_up_pipeline.maxTotalThreadsPerThreadgroup);
+        [enc setComputePipelineState:gate_up_pipeline];
+        [enc setBuffer:input offset:0u atIndex:0u];
+        [enc setBuffer:gate_weight offset:0u atIndex:1u];
+        [enc setBuffer:up_weight offset:0u atIndex:2u];
+        [enc setBuffer:mid offset:0u atIndex:3u];
+        [enc setBytes:&gate_params length:sizeof(gate_params) atIndex:4u];
+        [enc setThreadgroupMemoryLength:gate_threads * 2u * sizeof(float) atIndex:0u];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)intermediate_values, 1u, 1u)
+             threadsPerThreadgroup:MTLSizeMake(gate_threads, 1u, 1u)];
+        [enc endEncoding];
+
+        uocr_metal_dense_q8_params down_params;
+        down_params.input_rows = n_tokens;
+        down_params.logical_in_features = UOCR_MOE_SHARED_INTERMEDIATE;
+        down_params.physical_in_features = physical_intermediate_features;
+        down_params.out_features = UOCR_HIDDEN_SIZE;
+        down_params.weight_row_size = (uint32_t)down_row_size;
+        down_params.has_bias = 0u;
+        down_params.reserved0 = 0u;
+        down_params.reserved1 = 0u;
+
+        enc = [cb computeCommandEncoder];
+        if (enc == nil) {
+            [dst release];
+            [mid release];
+            [down_weight release];
+            [up_weight release];
+            [gate_weight release];
+            [input release];
+            return metal_fail(error, error_size, "failed to create Metal MoE shared Q8_0 down command encoder");
+        }
+        const NSUInteger down_threads = metal_power2_threadgroup_width(256u, down_pipeline.maxTotalThreadsPerThreadgroup);
+        [enc setComputePipelineState:down_pipeline];
+        [enc setBuffer:mid offset:0u atIndex:0u];
+        [enc setBuffer:down_weight offset:0u atIndex:1u];
+        [enc setBuffer:down_weight offset:0u atIndex:2u];
+        [enc setBuffer:dst offset:0u atIndex:3u];
+        [enc setBytes:&down_params length:sizeof(down_params) atIndex:4u];
+        [enc setThreadgroupMemoryLength:down_threads * sizeof(float) atIndex:0u];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)hidden_values, 1u, 1u)
+             threadsPerThreadgroup:MTLSizeMake(down_threads, 1u, 1u)];
+        [enc endEncoding];
+
+        [cb commit];
+        [cb waitUntilCompleted];
+        if (cb.status == MTLCommandBufferStatusError) {
+            NSString *description = cb.error != nil ? [cb.error localizedDescription] : @"unknown command-buffer error";
+            [dst release];
+            [mid release];
+            [down_weight release];
+            [up_weight release];
+            [gate_weight release];
+            [input release];
+            return metal_fail(error, error_size, "Metal MoE shared Q8_0 command failed: %s", [description UTF8String]);
+        }
+
+        memcpy(out, [dst contents], (size_t)output_bytes);
+        [dst release];
+        [mid release];
+        [down_weight release];
+        [up_weight release];
+        [gate_weight release];
+        [input release];
+    }
+
+    metal_clear_error(error, error_size);
+    return 1;
+}
+
 int uocr_metal_context_moe_router_f16(uocr_metal_context *ctx,
                                       const uint16_t *input_f16,
                                       const uint16_t *router_weight_f16,

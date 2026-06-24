@@ -2408,6 +2408,51 @@ kernel void uocr_dense_swiglu_gate_up_f16(device const half *src [[buffer(0)]],
     }
 }
 
+kernel void uocr_dense_swiglu_gate_up_q8_0(device const half *src [[buffer(0)]],
+                                           device const uchar *gate_weight [[buffer(1)]],
+                                           device const uchar *up_weight [[buffer(2)]],
+                                           device half *mid [[buffer(3)]],
+                                           constant UocrDenseQ8Params &params [[buffer(4)]],
+                                           threadgroup float *partials [[threadgroup(0)]],
+                                           uint output_index [[threadgroup_position_in_grid]],
+                                           uint tid [[thread_index_in_threadgroup]],
+                                           uint ntg [[threads_per_threadgroup]]) {
+    const uint token = output_index / params.out_features;
+    const uint out_col = output_index - token * params.out_features;
+    if (token >= params.input_rows || out_col >= params.out_features) {
+        return;
+    }
+
+    threadgroup float *gate_partials = partials;
+    threadgroup float *up_partials = partials + ntg;
+    float gate_sum = 0.0f;
+    float up_sum = 0.0f;
+    const uint src_base = token * params.logical_in_features;
+    for (uint k = tid; k < params.logical_in_features; k += ntg) {
+        const float x = float(src[src_base + k]);
+        gate_sum += x * uocr_q8_0_load_value(gate_weight, params.weight_row_size, out_col, k);
+        up_sum += x * uocr_q8_0_load_value(up_weight, params.weight_row_size, out_col, k);
+    }
+    gate_partials[tid] = gate_sum;
+    up_partials[tid] = up_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = ntg >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            gate_partials[tid] += gate_partials[tid + stride];
+            up_partials[tid] += up_partials[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tid == 0) {
+        const float gate = gate_partials[0];
+        const float up = up_partials[0];
+        const float silu = gate / (1.0f + exp(-gate));
+        mid[token * params.out_features + out_col] = half(silu * up);
+    }
+}
+
 static inline float uocr_dense_swiglu_down_dot_f16(device const half *mid,
                                                    device const half *down_weight,
                                                    constant UocrDenseSwigluParams &params,

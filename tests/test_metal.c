@@ -9368,6 +9368,13 @@ static float q8_0_expected_value(const uint8_t *table, uint32_t row_size, uint32
     return f16_bits_to_f32(scale_bits) * (float)q;
 }
 
+static void set_q8_0_q(uint8_t *table, uint32_t row_size, uint32_t row, uint32_t col, int8_t q) {
+    const uint32_t block = col / 32u;
+    const uint32_t in_block = col % 32u;
+    uint8_t *packed = table + (size_t)row * row_size + (size_t)block * 34u;
+    packed[2u + in_block] = (uint8_t)q;
+}
+
 static int test_metal_get_rows_f16(void) {
     if (!uocr_metal_is_available()) {
         return 0;
@@ -11365,6 +11372,185 @@ static int test_metal_moe_shared_experts_f16(void) {
                                                     error,
                                                     sizeof(error)) == 0);
     CHECK(strstr(error, "invalid Metal MoE shared experts request") != NULL);
+
+    uocr_metal_context_destroy(ctx);
+    free(out_f16);
+    free(out_f32);
+    free(expected);
+    free(mid);
+    free(down_weight);
+    free(up_weight);
+    free(gate_weight);
+    free(input);
+    return 0;
+}
+
+static int test_metal_moe_shared_experts_q8_0(void) {
+    if (!uocr_metal_is_available()) {
+        return 0;
+    }
+
+    enum { TOKENS = 2, HIDDEN = UOCR_HIDDEN_SIZE, INTERMEDIATE = UOCR_MOE_SHARED_INTERMEDIATE };
+    enum { PHYSICAL_HIDDEN = HIDDEN + 32, PHYSICAL_INTERMEDIATE = INTERMEDIATE + 32 };
+    enum { GATE_ROW_SIZE = (PHYSICAL_HIDDEN / 32) * 34, DOWN_ROW_SIZE = (PHYSICAL_INTERMEDIATE / 32) * 34 };
+    const uint16_t input_values[] = {
+        0xb400u, /* -0.25 */
+        0xb000u, /* -0.125 */
+        0x0000u, /* 0.0 */
+        0x2c00u, /* 0.0625 */
+        0x3000u, /* 0.125 */
+        0x3400u  /* 0.25 */
+    };
+    const uint32_t input_value_count = (uint32_t)(sizeof(input_values) / sizeof(input_values[0]));
+
+    uint16_t *input = (uint16_t *)malloc((size_t)TOKENS * HIDDEN * sizeof(uint16_t));
+    uint8_t *gate_weight = (uint8_t *)calloc((size_t)INTERMEDIATE, (size_t)GATE_ROW_SIZE);
+    uint8_t *up_weight = (uint8_t *)calloc((size_t)INTERMEDIATE, (size_t)GATE_ROW_SIZE);
+    uint8_t *down_weight = (uint8_t *)calloc((size_t)HIDDEN, (size_t)DOWN_ROW_SIZE);
+    float *mid = (float *)malloc((size_t)TOKENS * INTERMEDIATE * sizeof(float));
+    float *expected = (float *)malloc((size_t)TOKENS * HIDDEN * sizeof(float));
+    float *out_f32 = (float *)malloc((size_t)TOKENS * HIDDEN * sizeof(float));
+    uint16_t *out_f16 = (uint16_t *)malloc((size_t)HIDDEN * sizeof(uint16_t));
+    CHECK(input != NULL && gate_weight != NULL && up_weight != NULL && down_weight != NULL && mid != NULL &&
+          expected != NULL && out_f32 != NULL && out_f16 != NULL);
+
+    for (uint32_t i = 0u; i < (uint32_t)(TOKENS * HIDDEN); ++i) {
+        input[i] = input_values[(i * 17u + i / 23u + 3u) % input_value_count];
+    }
+
+    for (uint32_t row = 0u; row < (uint32_t)INTERMEDIATE; ++row) {
+        for (uint32_t block = 0u; block < (uint32_t)(PHYSICAL_HIDDEN / 32); ++block) {
+            const uint16_t gate_scale = f32_to_f16_bits(0.03125f * (float)(1u + ((row + block) & 1u)));
+            const uint16_t up_scale = f32_to_f16_bits(0.015625f * (float)(1u + ((row + block + 1u) % 3u)));
+            write_q8_scale_le(gate_weight + (size_t)row * GATE_ROW_SIZE + (size_t)block * 34u, gate_scale);
+            write_q8_scale_le(up_weight + (size_t)row * GATE_ROW_SIZE + (size_t)block * 34u, up_scale);
+        }
+        const uint32_t g0 = (row * 29u) % (uint32_t)HIDDEN;
+        const uint32_t g1 = (row * 29u + 101u) % (uint32_t)HIDDEN;
+        const uint32_t u0 = (row * 43u + 11u) % (uint32_t)HIDDEN;
+        const uint32_t u1 = (row * 43u + 307u) % (uint32_t)HIDDEN;
+        set_q8_0_q(gate_weight, GATE_ROW_SIZE, row, g0, (int8_t)((int)(row % 13u) - 6));
+        set_q8_0_q(gate_weight, GATE_ROW_SIZE, row, g1, (int8_t)(5 - (int)(row % 11u)));
+        set_q8_0_q(up_weight, GATE_ROW_SIZE, row, u0, (int8_t)((int)(row % 9u) - 4));
+        set_q8_0_q(up_weight, GATE_ROW_SIZE, row, u1, (int8_t)(4 - (int)(row % 7u)));
+        set_q8_0_q(gate_weight, GATE_ROW_SIZE, row, HIDDEN + 5u, 99); /* physical padding */
+        set_q8_0_q(up_weight, GATE_ROW_SIZE, row, HIDDEN + 11u, -99); /* physical padding */
+    }
+
+    for (uint32_t col = 0u; col < (uint32_t)HIDDEN; ++col) {
+        for (uint32_t block = 0u; block < (uint32_t)(PHYSICAL_INTERMEDIATE / 32); ++block) {
+            const uint16_t scale = f32_to_f16_bits(0.015625f * (float)(1u + ((col + block) % 4u)));
+            write_q8_scale_le(down_weight + (size_t)col * DOWN_ROW_SIZE + (size_t)block * 34u, scale);
+        }
+        const uint32_t d0 = (col * 31u) % (uint32_t)INTERMEDIATE;
+        const uint32_t d1 = (col * 31u + 271u) % (uint32_t)INTERMEDIATE;
+        const uint32_t d2 = (col * 31u + 1009u) % (uint32_t)INTERMEDIATE;
+        set_q8_0_q(down_weight, DOWN_ROW_SIZE, col, d0, (int8_t)((int)(col % 15u) - 7));
+        set_q8_0_q(down_weight, DOWN_ROW_SIZE, col, d1, (int8_t)(6 - (int)(col % 13u)));
+        set_q8_0_q(down_weight, DOWN_ROW_SIZE, col, d2, (int8_t)((int)(col % 11u) - 5));
+        set_q8_0_q(down_weight, DOWN_ROW_SIZE, col, INTERMEDIATE + 3u, 88); /* physical padding */
+    }
+
+    for (uint32_t token = 0u; token < (uint32_t)TOKENS; ++token) {
+        for (uint32_t row = 0u; row < (uint32_t)INTERMEDIATE; ++row) {
+            const uint32_t g0 = (row * 29u) % (uint32_t)HIDDEN;
+            const uint32_t g1 = (row * 29u + 101u) % (uint32_t)HIDDEN;
+            const uint32_t u0 = (row * 43u + 11u) % (uint32_t)HIDDEN;
+            const uint32_t u1 = (row * 43u + 307u) % (uint32_t)HIDDEN;
+            float gate = 0.0f;
+            float up = 0.0f;
+            gate += f16_bits_to_f32(input[token * (uint32_t)HIDDEN + g0]) *
+                    q8_0_expected_value(gate_weight, GATE_ROW_SIZE, row, g0);
+            gate += f16_bits_to_f32(input[token * (uint32_t)HIDDEN + g1]) *
+                    q8_0_expected_value(gate_weight, GATE_ROW_SIZE, row, g1);
+            up += f16_bits_to_f32(input[token * (uint32_t)HIDDEN + u0]) *
+                  q8_0_expected_value(up_weight, GATE_ROW_SIZE, row, u0);
+            up += f16_bits_to_f32(input[token * (uint32_t)HIDDEN + u1]) *
+                  q8_0_expected_value(up_weight, GATE_ROW_SIZE, row, u1);
+            const float silu = gate / (1.0f + expf(-gate));
+            mid[token * (uint32_t)INTERMEDIATE + row] = f16_bits_to_f32(f32_to_f16_bits(silu * up));
+        }
+    }
+    for (uint32_t token = 0u; token < (uint32_t)TOKENS; ++token) {
+        for (uint32_t col = 0u; col < (uint32_t)HIDDEN; ++col) {
+            const uint32_t d0 = (col * 31u) % (uint32_t)INTERMEDIATE;
+            const uint32_t d1 = (col * 31u + 271u) % (uint32_t)INTERMEDIATE;
+            const uint32_t d2 = (col * 31u + 1009u) % (uint32_t)INTERMEDIATE;
+            float sum = 0.0f;
+            sum += mid[token * (uint32_t)INTERMEDIATE + d0] * q8_0_expected_value(down_weight, DOWN_ROW_SIZE, col, d0);
+            sum += mid[token * (uint32_t)INTERMEDIATE + d1] * q8_0_expected_value(down_weight, DOWN_ROW_SIZE, col, d1);
+            sum += mid[token * (uint32_t)INTERMEDIATE + d2] * q8_0_expected_value(down_weight, DOWN_ROW_SIZE, col, d2);
+            expected[token * (uint32_t)HIDDEN + col] = sum;
+        }
+    }
+
+    char error[1024];
+    memset(error, 0, sizeof(error));
+    uocr_metal_context *ctx = uocr_metal_context_create(UOCR_TEST_METAL_RESOURCE_PATH, error, sizeof(error));
+    CHECK(ctx != NULL);
+
+    memset(out_f32, 0, (size_t)TOKENS * HIDDEN * sizeof(float));
+    CHECK(uocr_metal_context_moe_shared_experts_q8_0(ctx,
+                                                     input,
+                                                     gate_weight,
+                                                     up_weight,
+                                                     down_weight,
+                                                     PHYSICAL_HIDDEN,
+                                                     PHYSICAL_INTERMEDIATE,
+                                                     TOKENS,
+                                                     UOCR_METAL_DENSE_OUTPUT_F32,
+                                                     out_f32,
+                                                     error,
+                                                     sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    for (uint32_t i = 0u; i < (uint32_t)(TOKENS * HIDDEN); ++i) {
+        CHECK(fabsf(out_f32[i] - expected[i]) < 1.0e-4f);
+    }
+
+    memset(out_f16, 0, (size_t)HIDDEN * sizeof(uint16_t));
+    CHECK(uocr_metal_context_moe_shared_experts_q8_0(ctx,
+                                                     input,
+                                                     gate_weight,
+                                                     up_weight,
+                                                     down_weight,
+                                                     PHYSICAL_HIDDEN,
+                                                     PHYSICAL_INTERMEDIATE,
+                                                     1u,
+                                                     UOCR_METAL_DENSE_OUTPUT_F16,
+                                                     out_f16,
+                                                     error,
+                                                     sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    for (uint32_t i = 0u; i < (uint32_t)HIDDEN; ++i) {
+        CHECK(fabsf(f16_bits_to_f32(out_f16[i]) - expected[i]) < 3.0e-4f);
+    }
+
+    CHECK(uocr_metal_context_moe_shared_experts_q8_0(ctx,
+                                                     input,
+                                                     gate_weight,
+                                                     up_weight,
+                                                     down_weight,
+                                                     PHYSICAL_HIDDEN,
+                                                     PHYSICAL_INTERMEDIATE,
+                                                     TOKENS,
+                                                     (uocr_metal_dense_output_type)99,
+                                                     out_f32,
+                                                     error,
+                                                     sizeof(error)) == 0);
+    CHECK(strstr(error, "unsupported Metal MoE shared Q8_0 output type") != NULL);
+    CHECK(uocr_metal_context_moe_shared_experts_q8_0(ctx,
+                                                     input,
+                                                     gate_weight,
+                                                     up_weight,
+                                                     down_weight,
+                                                     1279u,
+                                                     PHYSICAL_INTERMEDIATE,
+                                                     TOKENS,
+                                                     UOCR_METAL_DENSE_OUTPUT_F32,
+                                                     out_f32,
+                                                     error,
+                                                     sizeof(error)) == 0);
+    CHECK(strstr(error, "widths") != NULL);
 
     uocr_metal_context_destroy(ctx);
     free(out_f16);
@@ -14084,6 +14270,7 @@ int main(void) {
     if (test_metal_attention_output_residual_f16() != 0) return 1;
     if (test_metal_dense_swiglu_f16() != 0) return 1;
     if (test_metal_moe_shared_experts_f16() != 0) return 1;
+    if (test_metal_moe_shared_experts_q8_0() != 0) return 1;
     if (test_metal_moe_router_f16() != 0) return 1;
     if (test_metal_moe_selected_experts_decode_f16() != 0) return 1;
     if (test_metal_moe_selected_experts_prefill_f16() != 0) return 1;

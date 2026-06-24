@@ -1056,6 +1056,24 @@ int uocr_metal_context_moe_shared_experts_f16(uocr_metal_context *ctx,
                                               char *error,
                                               size_t error_size);
 
+/* Diagnostic Q8_0 shared-expert MLP helper. Gate/up/down weights are packed
+ * as row-major GGML Q8_0 blocks with logical shapes [1792,1280], [1792,1280],
+ * and [1280,1792]. The physical widths may be padded independently and are
+ * ignored beyond the logical OCR dimensions.
+ */
+int uocr_metal_context_moe_shared_experts_q8_0(uocr_metal_context *ctx,
+                                               const uint16_t *input_f16,
+                                               const void *shared_gate_weight_q8_0,
+                                               const void *shared_up_weight_q8_0,
+                                               const void *shared_down_weight_q8_0,
+                                               uint32_t physical_hidden_features,
+                                               uint32_t physical_intermediate_features,
+                                               uint32_t n_tokens,
+                                               uocr_metal_dense_output_type output_type,
+                                               void *out,
+                                               char *error,
+                                               size_t error_size);
+
 /* Diagnostic MoE router helper for synthetic decoder tests. Computes router
  * logits = hidden @ router_weight.T for [n_tokens,1280] hidden states and
  * [64,1280] fp16 router weights, accumulates logits in fp32, softmaxes over
