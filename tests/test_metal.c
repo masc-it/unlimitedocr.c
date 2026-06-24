@@ -14263,6 +14263,31 @@ static int test_metal_kv_cache_layout_helpers(void) {
     CHECK(uocr_metal_kv_cache_decode_position_allowed(&decode_plan, 6u) == 1);
     CHECK(uocr_metal_kv_cache_decode_position_allowed(&decode_plan, 7u) == 0);
 
+    memset(&decode_plan, 0, sizeof(decode_plan));
+    CHECK(uocr_metal_kv_cache_decode_attention_plan(7u,
+                                                    16u,
+                                                    UOCR_GENERATED_RING_WINDOW + 1u,
+                                                    &decode_plan) == 1);
+    CHECK(decode_plan.attention_length == 7u + UOCR_GENERATED_RING_WINDOW);
+    CHECK(decode_plan.first_generated_index == 1u);
+    CHECK(decode_plan.first_generated_position == 8u);
+    CHECK(uocr_metal_kv_cache_decode_position_allowed(&decode_plan, 0u) == 1);
+    CHECK(uocr_metal_kv_cache_decode_position_allowed(&decode_plan, 6u) == 1);
+    CHECK(uocr_metal_kv_cache_decode_position_allowed(&decode_plan, 7u) == 0);
+    CHECK(uocr_metal_kv_cache_decode_position_allowed(&decode_plan, 8u) == 1);
+    CHECK(uocr_metal_kv_cache_decode_position_allowed(&decode_plan,
+                                                      7u + UOCR_GENERATED_RING_WINDOW) == 1);
+    CHECK(uocr_metal_kv_cache_decode_attention_index_to_token(&decode_plan, 0u, &cache_token) == 1);
+    CHECK(cache_token == 0u);
+    CHECK(uocr_metal_kv_cache_decode_attention_index_to_token(&decode_plan, 6u, &cache_token) == 1);
+    CHECK(cache_token == 6u);
+    CHECK(uocr_metal_kv_cache_decode_attention_index_to_token(&decode_plan, 7u, &cache_token) == 1);
+    CHECK(cache_token == 8u);
+    CHECK(uocr_metal_kv_cache_decode_attention_index_to_token(&decode_plan,
+                                                              7u + UOCR_GENERATED_RING_WINDOW - 1u,
+                                                              &cache_token) == 1);
+    CHECK(cache_token == 7u);
+
     uocr_metal_kv_cache_layout empty_layout;
     memset(&empty_layout, 0, sizeof(empty_layout));
     CHECK(uocr_metal_kv_cache_offset(&empty_layout, 0, 0u, 0u, 0u, 0u, 0u, &offset) == 0);

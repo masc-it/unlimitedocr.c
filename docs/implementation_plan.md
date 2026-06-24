@@ -74,11 +74,11 @@ Current priority slice, in order. The coding agent should take the first uncheck
   - [x] upstream strips each message content and strips the final prompt
   - [x] assistant empty message contributes no text
   - [x] BOS is manually prepended after text/image expansion
-- [ ] Assert generation/cache facts:
-  - [ ] upstream `max_length` is total sequence length (`prompt + generated`), while the C API uses `max_new_tokens`
-  - [ ] Python disables `config.sliding_window` for generation prefill and stores `_ring_window`
-  - [ ] prefill tokens remain fully attendable
-  - [ ] only generated tokens use the 128-token ring overwrite behavior
+- [x] Assert generation/cache facts:
+  - [x] upstream `max_length` is total sequence length (`prompt + generated`), while the C API uses `max_new_tokens`
+  - [x] Python disables `config.sliding_window` for generation prefill and stores `_ring_window`
+  - [x] prefill tokens remain fully attendable
+  - [x] only generated tokens use the 128-token ring overwrite behavior
 - [ ] Assert crop/view facts:
   - [ ] crop-mode source feature order is local rows first, then global rows, then view separator
   - [ ] placeholder id order is not semantically meaningful because all visual placeholders use the same id
