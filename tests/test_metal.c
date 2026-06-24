@@ -342,6 +342,30 @@ static int test_metal_sam_patch_embed_f16(void) {
     return 0;
 }
 
+static void sam_layernorm_expected(const uint16_t *input,
+                                   const uint16_t *weight,
+                                   const uint16_t *bias,
+                                   uint32_t row,
+                                   float eps,
+                                   float *out) {
+    double sum = 0.0;
+    const size_t row_base = (size_t)row * UOCR_SAM_HIDDEN_SIZE;
+    for (uint32_t col = 0u; col < UOCR_SAM_HIDDEN_SIZE; ++col) {
+        sum += (double)f16_bits_to_f32(input[row_base + col]);
+    }
+    const float mean = (float)(sum / (double)UOCR_SAM_HIDDEN_SIZE);
+    double sq_sum = 0.0;
+    for (uint32_t col = 0u; col < UOCR_SAM_HIDDEN_SIZE; ++col) {
+        const float centered = f16_bits_to_f32(input[row_base + col]) - mean;
+        sq_sum += (double)(centered * centered);
+    }
+    const float inv_std = 1.0f / sqrtf((float)(sq_sum / (double)UOCR_SAM_HIDDEN_SIZE) + eps);
+    for (uint32_t col = 0u; col < UOCR_SAM_HIDDEN_SIZE; ++col) {
+        const float normalized = (f16_bits_to_f32(input[row_base + col]) - mean) * inv_std;
+        out[col] = normalized * f16_bits_to_f32(weight[col]) + f16_bits_to_f32(bias[col]);
+    }
+}
+
 static int test_metal_sam_abs_pos_f16(void) {
     if (!uocr_metal_is_available()) {
         return 0;
@@ -454,6 +478,102 @@ static int test_metal_sam_abs_pos_f16(void) {
     free(global_out);
     free(global_patch);
     free(pos);
+    return 0;
+}
+
+static int test_metal_sam_layernorm_f16(void) {
+    if (!uocr_metal_is_available()) {
+        return 0;
+    }
+
+    enum { ROWS = 4u, HIDDEN = UOCR_SAM_HIDDEN_SIZE };
+    uint16_t *input = (uint16_t *)calloc((size_t)ROWS * HIDDEN, sizeof(uint16_t));
+    uint16_t *weight = (uint16_t *)calloc(HIDDEN, sizeof(uint16_t));
+    uint16_t *bias = (uint16_t *)calloc(HIDDEN, sizeof(uint16_t));
+    float *out_f32 = (float *)calloc((size_t)ROWS * HIDDEN, sizeof(float));
+    uint16_t *out_f16 = (uint16_t *)calloc((size_t)ROWS * HIDDEN, sizeof(uint16_t));
+    float *expected = (float *)calloc(HIDDEN, sizeof(float));
+    CHECK(input != NULL);
+    CHECK(weight != NULL);
+    CHECK(bias != NULL);
+    CHECK(out_f32 != NULL);
+    CHECK(out_f16 != NULL);
+    CHECK(expected != NULL);
+
+    for (uint32_t col = 0u; col < HIDDEN; ++col) {
+        weight[col] = f32_to_f16_bits(0.75f + 0.0125f * (float)(col % 17u));
+        bias[col] = f32_to_f16_bits(-0.2f + 0.01f * (float)(col % 23u));
+    }
+    for (uint32_t col = 0u; col < HIDDEN; ++col) {
+        input[col] = f32_to_f16_bits(-1.0f + 0.003f * (float)col);
+        input[HIDDEN + col] = f32_to_f16_bits(((col & 1u) ? 0.5f : -0.5f) + 0.0007f * (float)(col % 31u));
+        input[2u * HIDDEN + col] = f32_to_f16_bits(0.125f);
+        input[3u * HIDDEN + col] = f32_to_f16_bits(sinf((float)col * 0.05f) * 0.25f + (float)(col % 5u) * 0.02f);
+    }
+
+    char error[1024];
+    memset(error, 0, sizeof(error));
+    uocr_metal_context *ctx = uocr_metal_context_create(UOCR_TEST_METAL_RESOURCE_PATH, error, sizeof(error));
+    CHECK(ctx != NULL);
+
+    CHECK(uocr_metal_context_sam_layernorm_f16(ctx,
+                                               input,
+                                               weight,
+                                               bias,
+                                               ROWS,
+                                               UOCR_METAL_LAYERNORM_OUTPUT_F32,
+                                               out_f32,
+                                               error,
+                                               sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+
+    const uint32_t cols[] = {0u, 1u, 17u, 255u, 511u, HIDDEN - 1u};
+    for (uint32_t row = 0u; row < ROWS; ++row) {
+        sam_layernorm_expected(input, weight, bias, row, 1.0e-6f, expected);
+        for (size_t i = 0u; i < sizeof(cols) / sizeof(cols[0]); ++i) {
+            const uint32_t col = cols[i];
+            const float actual = out_f32[(size_t)row * HIDDEN + col];
+            CHECK(fabsf(actual - expected[col]) <= 5.0e-4f);
+        }
+    }
+
+    CHECK(uocr_metal_context_sam_layernorm_f16(ctx,
+                                               input,
+                                               weight,
+                                               bias,
+                                               ROWS,
+                                               UOCR_METAL_LAYERNORM_OUTPUT_F16,
+                                               out_f16,
+                                               error,
+                                               sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    for (uint32_t row = 0u; row < ROWS; ++row) {
+        sam_layernorm_expected(input, weight, bias, row, 1.0e-6f, expected);
+        for (size_t i = 0u; i < sizeof(cols) / sizeof(cols[0]); ++i) {
+            const uint32_t col = cols[i];
+            const float actual = f16_bits_to_f32(out_f16[(size_t)row * HIDDEN + col]);
+            CHECK(fabsf(actual - expected[col]) <= 2.0e-3f);
+        }
+    }
+
+    CHECK(uocr_metal_context_sam_layernorm_f16(ctx,
+                                               input,
+                                               weight,
+                                               bias,
+                                               0u,
+                                               UOCR_METAL_LAYERNORM_OUTPUT_F32,
+                                               out_f32,
+                                               error,
+                                               sizeof(error)) == 0);
+    CHECK(strstr(error, "invalid Metal SAM LayerNorm") != NULL);
+
+    uocr_metal_context_destroy(ctx);
+    free(expected);
+    free(out_f16);
+    free(out_f32);
+    free(bias);
+    free(weight);
+    free(input);
     return 0;
 }
 
@@ -9197,6 +9317,7 @@ int main(void) {
     if (test_metal_named_scratch_buffers() != 0) return 1;
     if (test_metal_sam_patch_embed_f16() != 0) return 1;
     if (test_metal_sam_abs_pos_f16() != 0) return 1;
+    if (test_metal_sam_layernorm_f16() != 0) return 1;
     if (test_metal_get_rows_f16() != 0) return 1;
     if (test_metal_prompt_assembly_f16() != 0) return 1;
     if (test_metal_prompt_assembly_from_mapped_model_f16() != 0) return 1;

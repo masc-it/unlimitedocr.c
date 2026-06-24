@@ -361,6 +361,96 @@ kernel void uocr_rmsnorm_f16_to_f32(device const half *src [[buffer(0)]],
     }
 }
 
+static inline float uocr_layernorm_reduce_sum(device const half *src,
+                                              constant UocrRmsNormParams &params,
+                                              uint row_base,
+                                              uint tid,
+                                              uint ntg,
+                                              threadgroup float *partials) {
+    float sum = 0.0f;
+    for (uint col = tid; col < params.hidden_size; col += ntg) {
+        sum += float(src[row_base + col]);
+    }
+    partials[tid] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = ntg >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            partials[tid] += partials[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    return partials[0];
+}
+
+static inline float uocr_layernorm_reduce_var(device const half *src,
+                                              constant UocrRmsNormParams &params,
+                                              uint row_base,
+                                              float mean,
+                                              uint tid,
+                                              uint ntg,
+                                              threadgroup float *partials) {
+    float sum = 0.0f;
+    for (uint col = tid; col < params.hidden_size; col += ntg) {
+        const float centered = float(src[row_base + col]) - mean;
+        sum += centered * centered;
+    }
+    partials[tid] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = ntg >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            partials[tid] += partials[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    return partials[0] / float(params.hidden_size);
+}
+
+kernel void uocr_layernorm_f16_to_f16(device const half *src [[buffer(0)]],
+                                      device const half *weight [[buffer(1)]],
+                                      device const half *bias [[buffer(2)]],
+                                      device half *dst [[buffer(3)]],
+                                      constant UocrRmsNormParams &params [[buffer(4)]],
+                                      threadgroup float *partials [[threadgroup(0)]],
+                                      uint row [[threadgroup_position_in_grid]],
+                                      uint tid [[thread_index_in_threadgroup]],
+                                      uint ntg [[threads_per_threadgroup]]) {
+    if (row >= params.n_rows) {
+        return;
+    }
+
+    const uint row_base = row * params.hidden_size;
+    const float mean = uocr_layernorm_reduce_sum(src, params, row_base, tid, ntg, partials) / float(params.hidden_size);
+    const float variance = uocr_layernorm_reduce_var(src, params, row_base, mean, tid, ntg, partials);
+    const float scale = 1.0f / sqrt(variance + params.eps);
+    for (uint col = tid; col < params.hidden_size; col += ntg) {
+        const float normalized = (float(src[row_base + col]) - mean) * scale;
+        dst[row_base + col] = half(normalized * float(weight[col]) + float(bias[col]));
+    }
+}
+
+kernel void uocr_layernorm_f16_to_f32(device const half *src [[buffer(0)]],
+                                      device const half *weight [[buffer(1)]],
+                                      device const half *bias [[buffer(2)]],
+                                      device float *dst [[buffer(3)]],
+                                      constant UocrRmsNormParams &params [[buffer(4)]],
+                                      threadgroup float *partials [[threadgroup(0)]],
+                                      uint row [[threadgroup_position_in_grid]],
+                                      uint tid [[thread_index_in_threadgroup]],
+                                      uint ntg [[threads_per_threadgroup]]) {
+    if (row >= params.n_rows) {
+        return;
+    }
+
+    const uint row_base = row * params.hidden_size;
+    const float mean = uocr_layernorm_reduce_sum(src, params, row_base, tid, ntg, partials) / float(params.hidden_size);
+    const float variance = uocr_layernorm_reduce_var(src, params, row_base, mean, tid, ntg, partials);
+    const float scale = 1.0f / sqrt(variance + params.eps);
+    for (uint col = tid; col < params.hidden_size; col += ntg) {
+        const float normalized = (float(src[row_base + col]) - mean) * scale;
+        dst[row_base + col] = normalized * float(weight[col]) + float(bias[col]);
+    }
+}
+
 struct UocrDenseParams {
     uint input_rows;
     uint in_features;

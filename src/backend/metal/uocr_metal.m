@@ -5422,6 +5422,218 @@ int uocr_metal_context_rmsnorm_f16(uocr_metal_context *ctx,
     }
 }
 
+static int metal_context_layernorm_f16_with_parameter_buffers(uocr_metal_context *ctx,
+                                                               const uint16_t *input_f16,
+                                                               id<MTLBuffer> weight_buffer,
+                                                               NSUInteger weight_offset,
+                                                               id<MTLBuffer> bias_buffer,
+                                                               NSUInteger bias_offset,
+                                                               uint32_t n_rows,
+                                                               uint32_t hidden_size,
+                                                               float eps,
+                                                               uocr_metal_layernorm_output_type output_type,
+                                                               void *out,
+                                                               const char *op_name,
+                                                               char *error,
+                                                               size_t error_size) {
+    const char *op = op_name != NULL ? op_name : "Metal LayerNorm";
+    if (ctx == NULL || input_f16 == NULL || weight_buffer == nil || bias_buffer == nil || out == NULL ||
+        n_rows == 0u || hidden_size == 0u) {
+        return metal_fail(error, error_size, "invalid %s request", op);
+    }
+    if (!(eps > 0.0f)) {
+        return metal_fail(error, error_size, "%s eps must be positive", op);
+    }
+    if (output_type != UOCR_METAL_LAYERNORM_OUTPUT_F16 && output_type != UOCR_METAL_LAYERNORM_OUTPUT_F32) {
+        return metal_fail(error, error_size, "unsupported %s output type %d", op, (int)output_type);
+    }
+
+    uint64_t input_values = 0u;
+    uint64_t input_bytes = 0u;
+    uint64_t parameter_bytes = 0u;
+    uint64_t output_bytes = 0u;
+    const uint64_t output_element_bytes = output_type == UOCR_METAL_LAYERNORM_OUTPUT_F16 ? 2u : (uint64_t)sizeof(float);
+    if (!checked_mul_u64((uint64_t)n_rows, (uint64_t)hidden_size, &input_values) ||
+        !checked_mul_u64(input_values, 2u, &input_bytes) ||
+        !checked_mul_u64((uint64_t)hidden_size, 2u, &parameter_bytes) ||
+        !checked_mul_u64(input_values, output_element_bytes, &output_bytes)) {
+        return metal_fail(error, error_size, "%s byte-size overflow", op);
+    }
+
+    const uint64_t max_buffer_length = metal_device_max_buffer_length(ctx->device);
+    if (input_bytes > max_buffer_length || output_bytes > max_buffer_length ||
+        input_bytes > (uint64_t)SIZE_MAX || output_bytes > (uint64_t)SIZE_MAX) {
+        return metal_fail(error,
+                          error_size,
+                          "%s buffers exceed maxBufferLength %llu",
+                          op,
+                          (unsigned long long)max_buffer_length);
+    }
+    const uint64_t weight_length = (uint64_t)[weight_buffer length];
+    const uint64_t bias_length = (uint64_t)[bias_buffer length];
+    if ((uint64_t)weight_offset > weight_length || parameter_bytes > weight_length - (uint64_t)weight_offset) {
+        return metal_fail(error,
+                          error_size,
+                          "%s weight buffer is too small: offset=%llu need=%llu length=%llu",
+                          op,
+                          (unsigned long long)weight_offset,
+                          (unsigned long long)parameter_bytes,
+                          (unsigned long long)weight_length);
+    }
+    if ((uint64_t)bias_offset > bias_length || parameter_bytes > bias_length - (uint64_t)bias_offset) {
+        return metal_fail(error,
+                          error_size,
+                          "%s bias buffer is too small: offset=%llu need=%llu length=%llu",
+                          op,
+                          (unsigned long long)bias_offset,
+                          (unsigned long long)parameter_bytes,
+                          (unsigned long long)bias_length);
+    }
+
+    @autoreleasepool {
+        const char *function_name = output_type == UOCR_METAL_LAYERNORM_OUTPUT_F16 ?
+                                        "uocr_layernorm_f16_to_f16" :
+                                        "uocr_layernorm_f16_to_f32";
+        id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, function_name, error, error_size);
+        if (pipeline == nil) {
+            return 0;
+        }
+
+        id<MTLBuffer> src = [ctx->device newBufferWithBytes:input_f16
+                                                     length:(NSUInteger)input_bytes
+                                                    options:MTLResourceStorageModeShared];
+        if (src == nil) {
+            return metal_fail(error, error_size, "failed to allocate %s input buffer", op);
+        }
+        src.label = @"uocr_layernorm_input_f16";
+
+        id<MTLBuffer> dst = [ctx->device newBufferWithLength:(NSUInteger)output_bytes options:MTLResourceStorageModeShared];
+        if (dst == nil) {
+            [src release];
+            return metal_fail(error, error_size, "failed to allocate %s output buffer", op);
+        }
+        dst.label = @"uocr_layernorm_output";
+        memset([dst contents], 0, (size_t)output_bytes);
+
+        id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
+        if (cb == nil) {
+            [dst release];
+            [src release];
+            return metal_fail(error, error_size, "failed to create %s command buffer", op);
+        }
+        cb.label = @"uocr_layernorm_command_buffer";
+
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        if (enc == nil) {
+            [dst release];
+            [src release];
+            return metal_fail(error, error_size, "failed to create %s command encoder", op);
+        }
+
+        uocr_metal_rmsnorm_params params;
+        params.n_rows = n_rows;
+        params.hidden_size = hidden_size;
+        params.eps = eps;
+        params.reserved = 0u;
+
+        const NSUInteger threads_per_group = metal_power2_threadgroup_width(256u, pipeline.maxTotalThreadsPerThreadgroup);
+        const uint64_t threadgroup_bytes = (uint64_t)threads_per_group * (uint64_t)sizeof(float);
+        if (threadgroup_bytes > (uint64_t)ctx->device.maxThreadgroupMemoryLength) {
+            [dst release];
+            [src release];
+            return metal_fail(error, error_size, "%s threadgroup memory exceeds device limit", op);
+        }
+
+        [enc setComputePipelineState:pipeline];
+        [enc setBuffer:src offset:0u atIndex:0u];
+        [enc setBuffer:weight_buffer offset:weight_offset atIndex:1u];
+        [enc setBuffer:bias_buffer offset:bias_offset atIndex:2u];
+        [enc setBuffer:dst offset:0u atIndex:3u];
+        [enc setBytes:&params length:sizeof(params) atIndex:4u];
+        [enc setThreadgroupMemoryLength:threads_per_group * sizeof(float) atIndex:0u];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_rows, 1u, 1u)
+             threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1u, 1u)];
+        [enc endEncoding];
+
+        [cb commit];
+        [cb waitUntilCompleted];
+        if (cb.status == MTLCommandBufferStatusError) {
+            NSString *description = cb.error != nil ? [cb.error localizedDescription] : @"unknown command-buffer error";
+            [dst release];
+            [src release];
+            return metal_fail(error, error_size, "%s command failed: %s", op, [description UTF8String]);
+        }
+
+        memcpy(out, [dst contents], (size_t)output_bytes);
+        [dst release];
+        [src release];
+    }
+
+    metal_clear_error(error, error_size);
+    return 1;
+}
+
+int uocr_metal_context_sam_layernorm_f16(uocr_metal_context *ctx,
+                                         const uint16_t *input_f16,
+                                         const uint16_t *weight_f16,
+                                         const uint16_t *bias_f16,
+                                         uint32_t n_rows,
+                                         uocr_metal_layernorm_output_type output_type,
+                                         void *out,
+                                         char *error,
+                                         size_t error_size) {
+    metal_clear_error(error, error_size);
+    if (ctx == NULL || input_f16 == NULL || weight_f16 == NULL || bias_f16 == NULL || out == NULL || n_rows == 0u) {
+        return metal_fail(error, error_size, "invalid Metal SAM LayerNorm request");
+    }
+
+    const uint64_t parameter_bytes = (uint64_t)UOCR_SAM_HIDDEN_SIZE * 2u;
+    const uint64_t max_buffer_length = metal_device_max_buffer_length(ctx->device);
+    if (parameter_bytes > (uint64_t)SIZE_MAX || parameter_bytes > max_buffer_length) {
+        return metal_fail(error,
+                          error_size,
+                          "Metal SAM LayerNorm buffers exceed maxBufferLength %llu",
+                          (unsigned long long)max_buffer_length);
+    }
+
+    @autoreleasepool {
+        id<MTLBuffer> weight = [ctx->device newBufferWithBytes:weight_f16
+                                                        length:(NSUInteger)parameter_bytes
+                                                       options:MTLResourceStorageModeShared];
+        if (weight == nil) {
+            return metal_fail(error, error_size, "failed to allocate Metal SAM LayerNorm weight buffer");
+        }
+        weight.label = @"uocr_sam_layernorm_weight_f16";
+
+        id<MTLBuffer> bias = [ctx->device newBufferWithBytes:bias_f16
+                                                      length:(NSUInteger)parameter_bytes
+                                                     options:MTLResourceStorageModeShared];
+        if (bias == nil) {
+            [weight release];
+            return metal_fail(error, error_size, "failed to allocate Metal SAM LayerNorm bias buffer");
+        }
+        bias.label = @"uocr_sam_layernorm_bias_f16";
+
+        const int ok = metal_context_layernorm_f16_with_parameter_buffers(ctx,
+                                                                         input_f16,
+                                                                         weight,
+                                                                         0u,
+                                                                         bias,
+                                                                         0u,
+                                                                         n_rows,
+                                                                         UOCR_SAM_HIDDEN_SIZE,
+                                                                         1.0e-6f,
+                                                                         output_type,
+                                                                         out,
+                                                                         "Metal SAM LayerNorm",
+                                                                         error,
+                                                                         error_size);
+        [bias release];
+        [weight release];
+        return ok;
+    }
+}
+
 int uocr_metal_context_final_rmsnorm_f16(uocr_metal_context *ctx,
                                          const uint16_t *input_f16,
                                          uint32_t n_rows,

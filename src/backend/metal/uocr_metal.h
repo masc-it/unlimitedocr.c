@@ -56,6 +56,11 @@ typedef enum uocr_metal_rmsnorm_output_type {
     UOCR_METAL_RMSNORM_OUTPUT_F32 = 1
 } uocr_metal_rmsnorm_output_type;
 
+typedef enum uocr_metal_layernorm_output_type {
+    UOCR_METAL_LAYERNORM_OUTPUT_F16 = 0,
+    UOCR_METAL_LAYERNORM_OUTPUT_F32 = 1
+} uocr_metal_layernorm_output_type;
+
 typedef enum uocr_metal_dense_output_type {
     UOCR_METAL_DENSE_OUTPUT_F16 = 0,
     UOCR_METAL_DENSE_OUTPUT_F32 = 1
@@ -290,6 +295,20 @@ int uocr_metal_context_sam_add_abs_pos_f16(uocr_metal_context *ctx,
                                            uint16_t *out_bhwc_f16,
                                            char *error,
                                            size_t error_size);
+
+/* Diagnostic SAM transformer LayerNorm helper. Normalizes rows over the last
+ * dimension using fp32 mean/variance, applies fp16 weight+bias, and uses the
+ * upstream SAM transformer epsilon 1e-6 for hidden size 768.
+ */
+int uocr_metal_context_sam_layernorm_f16(uocr_metal_context *ctx,
+                                         const uint16_t *input_f16,
+                                         const uint16_t *weight_f16,
+                                         const uint16_t *bias_f16,
+                                         uint32_t n_rows,
+                                         uocr_metal_layernorm_output_type output_type,
+                                         void *out,
+                                         char *error,
+                                         size_t error_size);
 
 /* Runtime prompt assembly into the persistent Metal prompt-embedding arena.
  * The arena must have been allocated with uocr_metal_context_allocate_runtime_arenas().
