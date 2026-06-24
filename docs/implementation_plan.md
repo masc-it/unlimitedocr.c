@@ -864,7 +864,7 @@ Do not begin this section until sections 14.5 and 15.1 pass for fp16 single-requ
   - [ ] flyer/graphic-heavy image
   - [ ] multi-page PDF subset
   - [ ] crop-mode high aspect-ratio image
-- [ ] Add `tools/uocr-calibrate` to run fp16 and candidate quantized models over fixtures.
+- [x] Add `tools/uocr-calibrate` to run fp16 and candidate quantized models over fixtures.
 - [ ] Add optional DS4-style activation-importance collection for routed experts:
   - [ ] for routed `gate_proj`/`up_proj`, accumulate squared FFN-normalized input columns per expert
   - [ ] for routed `down_proj`, accumulate squared routed SwiGLU/down-input columns after route weighting
@@ -873,11 +873,11 @@ Do not begin this section until sections 14.5 and 15.1 pass for fp16 single-requ
 - [ ] Record metrics:
   - [ ] tensor/module RMSE
   - [ ] tensor/module cosine similarity
-  - [ ] per-layer hidden-state drift
-  - [ ] router top-6 agreement
-  - [ ] selected expert frequency
-  - [ ] logits KL/top-k agreement
-  - [ ] generated token id agreement or longest common prefix
+  - [x] per-layer hidden-state drift
+  - [x] router top-6 agreement
+  - [x] selected expert frequency
+  - [x] logits KL/top-k agreement
+  - [x] generated token id agreement or longest common prefix
   - [ ] decoded markdown/layout agreement
 - [ ] Add per-expert/per-projection error and traffic stats.
 - [ ] Implement monotonic promotion:

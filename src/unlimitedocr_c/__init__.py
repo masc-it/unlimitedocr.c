@@ -1,5 +1,20 @@
 """Python helpers for the Unlimited-OCR C inference core."""
 
+from .calibrate import (
+    CalibrationCandidateReport,
+    CalibrationCaseReport,
+    CalibrationFixtureCase,
+    CalibrationReport,
+    ExpertTrafficMetrics,
+    GeneratedIdsMetrics,
+    LogitsTopKMetrics,
+    calibrate_case,
+    expert_traffic_metrics,
+    generated_ids_metrics,
+    load_calibration_corpus,
+    logits_topk_metrics,
+    run_calibration,
+)
 from .convert import (
     DryRunPlan,
     SectionPlan,
@@ -86,6 +101,19 @@ from .frontend import (
 )
 
 __all__ = [
+    "CalibrationCandidateReport",
+    "CalibrationCaseReport",
+    "CalibrationFixtureCase",
+    "CalibrationReport",
+    "ExpertTrafficMetrics",
+    "GeneratedIdsMetrics",
+    "LogitsTopKMetrics",
+    "calibrate_case",
+    "expert_traffic_metrics",
+    "generated_ids_metrics",
+    "load_calibration_corpus",
+    "logits_topk_metrics",
+    "run_calibration",
     "DryRunPlan",
     "SectionPlan",
     "TensorPlan",
