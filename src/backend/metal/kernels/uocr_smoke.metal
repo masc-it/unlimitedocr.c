@@ -36,6 +36,32 @@ struct UocrGetRowsParams {
     uint reserved;
 };
 
+struct UocrGetRowsQ8Params {
+    uint table_rows;
+    uint logical_width;
+    uint physical_width;
+    uint n_row_ids;
+    uint row_size;
+    uint reserved0;
+    uint reserved1;
+    uint reserved2;
+};
+
+static inline float uocr_q8_0_load_value(device const uchar *table, uint row_size, uint row, uint col) {
+    constexpr uint qk = 32u;
+    constexpr uint block_bytes = 34u;
+    const uint block = col / qk;
+    const uint in_block = col - block * qk;
+    device const uchar *packed = table + row * row_size + block * block_bytes;
+    const ushort scale_bits = ushort(packed[0]) | (ushort(packed[1]) << 8u);
+    const half scale = as_type<half>(scale_bits);
+    int q = int(packed[2u + in_block]);
+    if (q >= 128) {
+        q -= 256;
+    }
+    return float(scale) * float(q);
+}
+
 kernel void uocr_get_rows_f16_to_f16(device const half *table [[buffer(0)]],
                                      device const int *row_ids [[buffer(1)]],
                                      device half *dst [[buffer(2)]],
@@ -70,6 +96,42 @@ kernel void uocr_get_rows_f16_to_f32(device const half *table [[buffer(0)]],
         return;
     }
     dst[out_row * params.row_width + col] = float(table[(uint)row * params.row_width + col]);
+}
+
+kernel void uocr_get_rows_q8_0_to_f16(device const uchar *table [[buffer(0)]],
+                                      device const int *row_ids [[buffer(1)]],
+                                      device half *dst [[buffer(2)]],
+                                      constant UocrGetRowsQ8Params &params [[buffer(3)]],
+                                      uint2 gid [[thread_position_in_grid]]) {
+    const uint col = gid.x;
+    const uint out_row = gid.y;
+    if (col >= params.logical_width || out_row >= params.n_row_ids) {
+        return;
+    }
+    const int row = row_ids[out_row];
+    if (row < 0 || (uint)row >= params.table_rows) {
+        dst[out_row * params.logical_width + col] = half(0.0);
+        return;
+    }
+    dst[out_row * params.logical_width + col] = half(uocr_q8_0_load_value(table, params.row_size, uint(row), col));
+}
+
+kernel void uocr_get_rows_q8_0_to_f32(device const uchar *table [[buffer(0)]],
+                                      device const int *row_ids [[buffer(1)]],
+                                      device float *dst [[buffer(2)]],
+                                      constant UocrGetRowsQ8Params &params [[buffer(3)]],
+                                      uint2 gid [[thread_position_in_grid]]) {
+    const uint col = gid.x;
+    const uint out_row = gid.y;
+    if (col >= params.logical_width || out_row >= params.n_row_ids) {
+        return;
+    }
+    const int row = row_ids[out_row];
+    if (row < 0 || (uint)row >= params.table_rows) {
+        dst[out_row * params.logical_width + col] = 0.0f;
+        return;
+    }
+    dst[out_row * params.logical_width + col] = uocr_q8_0_load_value(table, params.row_size, uint(row), col);
 }
 
 struct UocrPromptAssemblyParams {

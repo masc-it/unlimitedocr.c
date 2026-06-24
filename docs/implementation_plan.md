@@ -825,7 +825,7 @@ Do not begin this section until sections 14.5 and 15.1 pass for fp16 single-requ
 - [x] Add converter dry-run qtype histogram and memory estimate.
 - [x] Emit q8 `.uocr`.
 - [x] Add CPU dequant/dot tests for q8 tensors.
-- [ ] Add Metal tests for Q8_0 get-rows/dequant because token embeddings and possibly LM-head-adjacent paths need it.
+- [x] Add Metal tests for Q8_0 get-rows/dequant because token embeddings and possibly LM-head-adjacent paths need it.
 
 ### 17.3 `dyn-q4` profile
 

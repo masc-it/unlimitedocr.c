@@ -9354,6 +9354,20 @@ static int test_metal_text_generated_ids_python_dump_parity(void) {
     return 0;
 }
 
+static void write_q8_scale_le(uint8_t *dst, uint16_t scale_bits) {
+    dst[0] = (uint8_t)(scale_bits & 0xffu);
+    dst[1] = (uint8_t)(scale_bits >> 8u);
+}
+
+static float q8_0_expected_value(const uint8_t *table, uint32_t row_size, uint32_t row, uint32_t col) {
+    const uint32_t block = col / 32u;
+    const uint32_t in_block = col % 32u;
+    const uint8_t *packed = table + (size_t)row * row_size + (size_t)block * 34u;
+    const uint16_t scale_bits = (uint16_t)((uint16_t)packed[0] | ((uint16_t)packed[1] << 8u));
+    const int8_t q = (int8_t)packed[2u + in_block];
+    return f16_bits_to_f32(scale_bits) * (float)q;
+}
+
 static int test_metal_get_rows_f16(void) {
     if (!uocr_metal_is_available()) {
         return 0;
@@ -9435,6 +9449,110 @@ static int test_metal_get_rows_f16(void) {
                                           error,
                                           sizeof(error)) == 0);
     CHECK(strstr(error, "outside table rows") != NULL);
+
+    uocr_metal_context_destroy(ctx);
+    return 0;
+}
+
+static int test_metal_get_rows_q8_0(void) {
+    if (!uocr_metal_is_available()) {
+        return 0;
+    }
+
+    enum { TABLE_ROWS = 4, LOGICAL_WIDTH = 33, PHYSICAL_WIDTH = 64, OUT_ROWS = 3 };
+    enum { ROW_SIZE = (PHYSICAL_WIDTH / 32) * 34 };
+    uint8_t table[TABLE_ROWS * ROW_SIZE];
+    memset(table, 0, sizeof(table));
+
+    for (uint32_t row = 0u; row < (uint32_t)TABLE_ROWS; ++row) {
+        uint8_t *row_base = table + row * (uint32_t)ROW_SIZE;
+        write_q8_scale_le(row_base, row == 0u ? f32_to_f16_bits(0.0f) : f32_to_f16_bits(0.25f * (float)row));
+        int8_t *q0 = (int8_t *)(void *)(row_base + 2u);
+        for (uint32_t col = 0u; col < 32u; ++col) {
+            q0[col] = (int8_t)(((int)(row * 17u + col * 3u) % 41) - 20);
+        }
+        uint8_t *block1 = row_base + 34u;
+        write_q8_scale_le(block1, f32_to_f16_bits(0.125f * (float)(row + 1u)));
+        int8_t *q1 = (int8_t *)(void *)(block1 + 2u);
+        q1[0] = (int8_t)(12 - (int)row);
+        q1[1] = -99; /* physical padding; must not appear in logical output */
+    }
+
+    const int32_t row_ids[OUT_ROWS] = {2, 1, 3};
+    char error[1024];
+    memset(error, 0, sizeof(error));
+    uocr_metal_context *ctx = uocr_metal_context_create(UOCR_TEST_METAL_RESOURCE_PATH, error, sizeof(error));
+    CHECK(ctx != NULL);
+
+    float out_f32[OUT_ROWS * LOGICAL_WIDTH];
+    memset(out_f32, 0, sizeof(out_f32));
+    CHECK(uocr_metal_context_get_rows_q8_0(ctx,
+                                           table,
+                                           TABLE_ROWS,
+                                           LOGICAL_WIDTH,
+                                           PHYSICAL_WIDTH,
+                                           row_ids,
+                                           OUT_ROWS,
+                                           UOCR_METAL_GET_ROWS_OUTPUT_F32,
+                                           out_f32,
+                                           error,
+                                           sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    for (uint32_t out_row = 0u; out_row < (uint32_t)OUT_ROWS; ++out_row) {
+        for (uint32_t col = 0u; col < (uint32_t)LOGICAL_WIDTH; ++col) {
+            const float expected = q8_0_expected_value(table, ROW_SIZE, (uint32_t)row_ids[out_row], col);
+            const float actual = out_f32[out_row * (uint32_t)LOGICAL_WIDTH + col];
+            CHECK(fabsf(actual - expected) <= 1.0e-6f);
+        }
+    }
+
+    uint16_t out_f16[OUT_ROWS * LOGICAL_WIDTH];
+    memset(out_f16, 0, sizeof(out_f16));
+    CHECK(uocr_metal_context_get_rows_q8_0(ctx,
+                                           table,
+                                           TABLE_ROWS,
+                                           LOGICAL_WIDTH,
+                                           PHYSICAL_WIDTH,
+                                           row_ids,
+                                           OUT_ROWS,
+                                           UOCR_METAL_GET_ROWS_OUTPUT_F16,
+                                           out_f16,
+                                           error,
+                                           sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    for (uint32_t out_row = 0u; out_row < (uint32_t)OUT_ROWS; ++out_row) {
+        for (uint32_t col = 0u; col < (uint32_t)LOGICAL_WIDTH; ++col) {
+            const float expected = q8_0_expected_value(table, ROW_SIZE, (uint32_t)row_ids[out_row], col);
+            CHECK(out_f16[out_row * (uint32_t)LOGICAL_WIDTH + col] == f32_to_f16_bits(expected));
+        }
+    }
+
+    const int32_t bad_row_ids[1] = {TABLE_ROWS};
+    CHECK(uocr_metal_context_get_rows_q8_0(ctx,
+                                           table,
+                                           TABLE_ROWS,
+                                           LOGICAL_WIDTH,
+                                           PHYSICAL_WIDTH,
+                                           bad_row_ids,
+                                           1u,
+                                           UOCR_METAL_GET_ROWS_OUTPUT_F32,
+                                           out_f32,
+                                           error,
+                                           sizeof(error)) == 0);
+    CHECK(strstr(error, "outside table rows") != NULL);
+
+    CHECK(uocr_metal_context_get_rows_q8_0(ctx,
+                                           table,
+                                           TABLE_ROWS,
+                                           LOGICAL_WIDTH,
+                                           33u,
+                                           row_ids,
+                                           OUT_ROWS,
+                                           UOCR_METAL_GET_ROWS_OUTPUT_F32,
+                                           out_f32,
+                                           error,
+                                           sizeof(error)) == 0);
+    CHECK(strstr(error, "widths") != NULL);
 
     uocr_metal_context_destroy(ctx);
     return 0;
@@ -13772,6 +13890,7 @@ int main(void) {
     if (test_metal_sam_residuals_f16() != 0) return 1;
     if (test_metal_sam_transformer_block_f16() != 0) return 1;
     if (test_metal_get_rows_f16() != 0) return 1;
+    if (test_metal_get_rows_q8_0() != 0) return 1;
     if (test_metal_prompt_assembly_f16() != 0) return 1;
     if (test_metal_prompt_assembly_from_mapped_model_f16() != 0) return 1;
     if (test_metal_text_prompt_embedding_full_model_parity() != 0) return 1;

@@ -233,6 +233,23 @@ int uocr_metal_context_get_rows_f16(uocr_metal_context *ctx,
                                     char *error,
                                     size_t error_size);
 
+/* Diagnostic Q8_0 get-rows/dequant entry point. The packed table is row-major
+ * `[table_rows][physical_width / 32 blocks]`, with each block using the GGML
+ * Q8_0 layout: f16 scale followed by 32 signed int8 values. Only
+ * logical_width values are returned, so physical_width may be padded.
+ */
+int uocr_metal_context_get_rows_q8_0(uocr_metal_context *ctx,
+                                     const void *table_q8_0,
+                                     uint32_t table_rows,
+                                     uint32_t logical_width,
+                                     uint32_t physical_width,
+                                     const int32_t *row_ids,
+                                     uint32_t n_row_ids,
+                                     uocr_metal_get_rows_output_type output_type,
+                                     void *out,
+                                     char *error,
+                                     size_t error_size);
+
 /* Diagnostic prompt assembly helper for synthetic tests. image_span_start uses
  * UINT32_MAX when there is no image span. Runtime inference should bind the
  * mapped token-embedding tensor directly and write into the prompt arena.
