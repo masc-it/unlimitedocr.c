@@ -752,7 +752,7 @@ Do not begin this section until sections 14.5 and 15.1 pass for fp16 single-requ
   - [x] window attention size `14` for non-global blocks
   - [x] global attention for blocks `[2,5,8,11]`
   - [x] decomposed relative position bias from `rel_pos_h` and `rel_pos_w`
-  - [ ] GELU MLP with `mlp_ratio=4`
+  - [x] GELU MLP with `mlp_ratio=4`
   - [ ] residual connections
 - [ ] Implement window partition/unpartition with padding exactly like upstream.
 - [ ] Implement SAM neck/net:

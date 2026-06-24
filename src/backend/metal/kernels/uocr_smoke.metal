@@ -961,6 +961,132 @@ kernel void uocr_sam_rel_pos_attention_f16_to_f32(device const half *q_src [[buf
     }
 }
 
+struct UocrSamMlpParams {
+    uint n_rows;
+    uint hidden_size;
+    uint intermediate_size;
+    uint reserved;
+};
+
+static inline float uocr_erf_approx(float x) {
+    const float sign = x < 0.0f ? -1.0f : 1.0f;
+    const float ax = fabs(x);
+    const float t = 1.0f / (1.0f + 0.3275911f * ax);
+    const float y = 1.0f - (((((1.061405429f * t - 1.453152027f) * t) + 1.421413741f) * t - 0.284496736f) * t +
+                            0.254829592f) *
+                               t * exp(-(ax * ax));
+    return sign * y;
+}
+
+static inline float uocr_gelu_erf(float x) {
+    return 0.5f * x * (1.0f + uocr_erf_approx(x * 0.70710678118654752440f));
+}
+
+kernel void uocr_sam_mlp_lin1_gelu_f16(device const half *src [[buffer(0)]],
+                                       device const half *weight [[buffer(1)]],
+                                       device const half *bias [[buffer(2)]],
+                                       device half *mid [[buffer(3)]],
+                                       constant UocrSamMlpParams &params [[buffer(4)]],
+                                       threadgroup float *partials [[threadgroup(0)]],
+                                       uint output_index [[threadgroup_position_in_grid]],
+                                       uint tid [[thread_index_in_threadgroup]],
+                                       uint ntg [[threads_per_threadgroup]]) {
+    const uint row = output_index / params.intermediate_size;
+    const uint out_col = output_index - row * params.intermediate_size;
+    if (row >= params.n_rows || out_col >= params.intermediate_size) {
+        return;
+    }
+
+    float sum = 0.0f;
+    const uint src_base = row * params.hidden_size;
+    const uint weight_base = out_col * params.hidden_size;
+    for (uint k = tid; k < params.hidden_size; k += ntg) {
+        sum += float(src[src_base + k]) * float(weight[weight_base + k]);
+    }
+    partials[tid] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = ntg >> 1; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            partials[tid] += partials[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tid == 0u) {
+        const float projected = partials[0] + float(bias[out_col]);
+        mid[row * params.intermediate_size + out_col] = half(uocr_gelu_erf(projected));
+    }
+}
+
+static inline float uocr_sam_mlp_lin2_dot_f16(device const half *mid,
+                                              device const half *weight,
+                                              constant UocrSamMlpParams &params,
+                                              uint row,
+                                              uint out_col,
+                                              uint tid,
+                                              uint ntg,
+                                              threadgroup float *partials) {
+    float sum = 0.0f;
+    const uint mid_base = row * params.intermediate_size;
+    const uint weight_base = out_col * params.intermediate_size;
+    for (uint k = tid; k < params.intermediate_size; k += ntg) {
+        sum += float(mid[mid_base + k]) * float(weight[weight_base + k]);
+    }
+    partials[tid] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = ntg >> 1; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            partials[tid] += partials[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    return partials[0];
+}
+
+kernel void uocr_sam_mlp_lin2_f16_to_f16(device const half *mid [[buffer(0)]],
+                                         device const half *weight [[buffer(1)]],
+                                         device const half *bias [[buffer(2)]],
+                                         device half *dst [[buffer(3)]],
+                                         constant UocrSamMlpParams &params [[buffer(4)]],
+                                         threadgroup float *partials [[threadgroup(0)]],
+                                         uint output_index [[threadgroup_position_in_grid]],
+                                         uint tid [[thread_index_in_threadgroup]],
+                                         uint ntg [[threads_per_threadgroup]]) {
+    const uint row = output_index / params.hidden_size;
+    const uint out_col = output_index - row * params.hidden_size;
+    if (row >= params.n_rows || out_col >= params.hidden_size) {
+        return;
+    }
+
+    float value = uocr_sam_mlp_lin2_dot_f16(mid, weight, params, row, out_col, tid, ntg, partials);
+    if (tid == 0u) {
+        dst[row * params.hidden_size + out_col] = half(value + float(bias[out_col]));
+    }
+}
+
+kernel void uocr_sam_mlp_lin2_f16_to_f32(device const half *mid [[buffer(0)]],
+                                         device const half *weight [[buffer(1)]],
+                                         device const half *bias [[buffer(2)]],
+                                         device float *dst [[buffer(3)]],
+                                         constant UocrSamMlpParams &params [[buffer(4)]],
+                                         threadgroup float *partials [[threadgroup(0)]],
+                                         uint output_index [[threadgroup_position_in_grid]],
+                                         uint tid [[thread_index_in_threadgroup]],
+                                         uint ntg [[threads_per_threadgroup]]) {
+    const uint row = output_index / params.hidden_size;
+    const uint out_col = output_index - row * params.hidden_size;
+    if (row >= params.n_rows || out_col >= params.hidden_size) {
+        return;
+    }
+
+    float value = uocr_sam_mlp_lin2_dot_f16(mid, weight, params, row, out_col, tid, ntg, partials);
+    if (tid == 0u) {
+        dst[row * params.hidden_size + out_col] = value + float(bias[out_col]);
+    }
+}
+
 struct UocrArgmaxParams {
     uint rows;
     uint vocab_size;

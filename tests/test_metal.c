@@ -85,6 +85,14 @@ static size_t sam_rel_pos_attention_index(uint32_t window, uint32_t token, uint3
     return (((size_t)window * tokens + token) * UOCR_SAM_ATTENTION_HEADS + head) * UOCR_SAM_HEAD_DIM + dim;
 }
 
+static size_t sam_mlp_lin1_weight_index(uint32_t out_col, uint32_t in_col) {
+    return (size_t)out_col * UOCR_SAM_HIDDEN_SIZE + in_col;
+}
+
+static size_t sam_mlp_lin2_weight_index(uint32_t out_col, uint32_t in_col) {
+    return (size_t)out_col * UOCR_SAM_MLP_INTERMEDIATE + in_col;
+}
+
 static float sam_cubic_weight(float x) {
     const float a = -0.75f;
     const float ax = fabsf(x);
@@ -750,6 +758,30 @@ static float sam_rel_pos_attention_expected(const uint16_t *q,
     return denominator > 0.0f ? value / denominator : 0.0f;
 }
 
+static float sam_mlp_gelu_expected(float x) {
+    return 0.5f * x * (1.0f + erff(x * 0.70710678118654752440f));
+}
+
+static float sam_mlp_expected(const uint16_t *input,
+                              const uint16_t *lin1_weight,
+                              const uint16_t *lin1_bias,
+                              const uint16_t *lin2_weight,
+                              const uint16_t *lin2_bias,
+                              uint32_t row,
+                              uint32_t out_col) {
+    float value = f16_bits_to_f32(lin2_bias[out_col]);
+    for (uint32_t hidden = 0u; hidden < UOCR_SAM_MLP_INTERMEDIATE; ++hidden) {
+        float projected = f16_bits_to_f32(lin1_bias[hidden]);
+        for (uint32_t col = 0u; col < UOCR_SAM_HIDDEN_SIZE; ++col) {
+            projected += f16_bits_to_f32(input[(size_t)row * UOCR_SAM_HIDDEN_SIZE + col]) *
+                         f16_bits_to_f32(lin1_weight[sam_mlp_lin1_weight_index(hidden, col)]);
+        }
+        const float gelu_f16 = f16_bits_to_f32(f32_to_f16_bits(sam_mlp_gelu_expected(projected)));
+        value += gelu_f16 * f16_bits_to_f32(lin2_weight[sam_mlp_lin2_weight_index(out_col, hidden)]);
+    }
+    return value;
+}
+
 static int test_metal_sam_qkv_f16(void) {
     if (!uocr_metal_is_available()) {
         return 0;
@@ -1325,6 +1357,146 @@ static int test_metal_sam_rel_pos_attention_f16(void) {
     free(v);
     free(k);
     free(q);
+    return 0;
+}
+
+static int test_metal_sam_mlp_f16(void) {
+    if (!uocr_metal_is_available()) {
+        return 0;
+    }
+
+    enum { ROWS = 3u, HIDDEN = UOCR_SAM_HIDDEN_SIZE, INTERMEDIATE = UOCR_SAM_MLP_INTERMEDIATE };
+    uint16_t *input = (uint16_t *)calloc((size_t)ROWS * HIDDEN, sizeof(uint16_t));
+    uint16_t *lin1_weight = (uint16_t *)calloc((size_t)INTERMEDIATE * HIDDEN, sizeof(uint16_t));
+    uint16_t *lin1_bias = (uint16_t *)calloc(INTERMEDIATE, sizeof(uint16_t));
+    uint16_t *lin2_weight = (uint16_t *)calloc((size_t)HIDDEN * INTERMEDIATE, sizeof(uint16_t));
+    uint16_t *lin2_bias = (uint16_t *)calloc(HIDDEN, sizeof(uint16_t));
+    float *out_f32 = (float *)calloc((size_t)ROWS * HIDDEN, sizeof(float));
+    uint16_t *out_f16 = (uint16_t *)calloc((size_t)ROWS * HIDDEN, sizeof(uint16_t));
+    CHECK(input != NULL);
+    CHECK(lin1_weight != NULL);
+    CHECK(lin1_bias != NULL);
+    CHECK(lin2_weight != NULL);
+    CHECK(lin2_bias != NULL);
+    CHECK(out_f32 != NULL);
+    CHECK(out_f16 != NULL);
+    CHECK(UOCR_SAM_MLP_RATIO == 4u);
+    CHECK(UOCR_SAM_MLP_INTERMEDIATE == 3072u);
+
+    for (uint32_t row = 0u; row < ROWS; ++row) {
+        for (uint32_t col = 0u; col < HIDDEN; ++col) {
+            const int mod = (int)((7u * row + 3u * col) % 23u) - 11;
+            input[(size_t)row * HIDDEN + col] = f32_to_f16_bits((float)mod * 0.0125f);
+        }
+    }
+
+    const uint32_t active_hidden[] = {0u, 5u, 17u, 1024u, INTERMEDIATE - 1u};
+    for (size_t i = 0u; i < sizeof(active_hidden) / sizeof(active_hidden[0]); ++i) {
+        const uint32_t hidden = active_hidden[i];
+        lin1_bias[hidden] = f32_to_f16_bits(((int)i - 2) * 0.035f);
+        lin1_weight[sam_mlp_lin1_weight_index(hidden, (uint32_t)(1u + i))] = f32_to_f16_bits(0.18f - (float)i * 0.015f);
+        lin1_weight[sam_mlp_lin1_weight_index(hidden, (uint32_t)(31u + 3u * i))] = f32_to_f16_bits(-0.11f + (float)i * 0.02f);
+        lin1_weight[sam_mlp_lin1_weight_index(hidden, HIDDEN - 1u - (uint32_t)i)] = f32_to_f16_bits(0.045f * (float)(i + 1u));
+    }
+
+    const uint32_t active_out[] = {0u, 3u, 77u, HIDDEN - 1u};
+    for (size_t o = 0u; o < sizeof(active_out) / sizeof(active_out[0]); ++o) {
+        const uint32_t out_col = active_out[o];
+        lin2_bias[out_col] = f32_to_f16_bits(((int)o - 1) * 0.02f);
+        for (size_t i = 0u; i < sizeof(active_hidden) / sizeof(active_hidden[0]); ++i) {
+            const float sign = ((o + i) & 1u) ? -1.0f : 1.0f;
+            lin2_weight[sam_mlp_lin2_weight_index(out_col, active_hidden[i])] =
+                f32_to_f16_bits(sign * (0.09f + 0.01f * (float)o + 0.006f * (float)i));
+        }
+    }
+
+    char error[1024];
+    memset(error, 0, sizeof(error));
+    uocr_metal_context *ctx = uocr_metal_context_create(UOCR_TEST_METAL_RESOURCE_PATH, error, sizeof(error));
+    CHECK(ctx != NULL);
+
+    CHECK(uocr_metal_context_sam_mlp_f16(ctx,
+                                          input,
+                                          lin1_weight,
+                                          lin1_bias,
+                                          lin2_weight,
+                                          lin2_bias,
+                                          ROWS,
+                                          UOCR_METAL_DENSE_OUTPUT_F32,
+                                          out_f32,
+                                          error,
+                                          sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+
+    struct mlp_sample {
+        uint32_t row;
+        uint32_t out_col;
+    } samples[] = {
+        {0u, 0u},
+        {1u, 3u},
+        {2u, 77u},
+        {2u, HIDDEN - 1u},
+        {1u, 11u},
+    };
+    for (size_t i = 0u; i < sizeof(samples) / sizeof(samples[0]); ++i) {
+        const float expected = sam_mlp_expected(input,
+                                                lin1_weight,
+                                                lin1_bias,
+                                                lin2_weight,
+                                                lin2_bias,
+                                                samples[i].row,
+                                                samples[i].out_col);
+        const size_t idx = (size_t)samples[i].row * HIDDEN + samples[i].out_col;
+        CHECK(isfinite(expected));
+        CHECK(fabsf(out_f32[idx] - expected) <= 3.0e-4f);
+    }
+
+    CHECK(uocr_metal_context_sam_mlp_f16(ctx,
+                                          input,
+                                          lin1_weight,
+                                          lin1_bias,
+                                          lin2_weight,
+                                          lin2_bias,
+                                          ROWS,
+                                          UOCR_METAL_DENSE_OUTPUT_F16,
+                                          out_f16,
+                                          error,
+                                          sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    for (size_t i = 0u; i < sizeof(samples) / sizeof(samples[0]); ++i) {
+        const float expected = sam_mlp_expected(input,
+                                                lin1_weight,
+                                                lin1_bias,
+                                                lin2_weight,
+                                                lin2_bias,
+                                                samples[i].row,
+                                                samples[i].out_col);
+        const size_t idx = (size_t)samples[i].row * HIDDEN + samples[i].out_col;
+        CHECK(isfinite(expected));
+        CHECK(fabsf(f16_bits_to_f32(out_f16[idx]) - expected) <= 2.0e-3f);
+    }
+
+    CHECK(uocr_metal_context_sam_mlp_f16(ctx,
+                                          input,
+                                          lin1_weight,
+                                          NULL,
+                                          lin2_weight,
+                                          lin2_bias,
+                                          ROWS,
+                                          UOCR_METAL_DENSE_OUTPUT_F32,
+                                          out_f32,
+                                          error,
+                                          sizeof(error)) == 0);
+    CHECK(strstr(error, "invalid Metal SAM MLP") != NULL);
+
+    uocr_metal_context_destroy(ctx);
+    free(out_f16);
+    free(out_f32);
+    free(lin2_bias);
+    free(lin2_weight);
+    free(lin1_bias);
+    free(lin1_weight);
+    free(input);
     return 0;
 }
 
@@ -10073,6 +10245,7 @@ int main(void) {
     if (test_metal_sam_window_attention_f16() != 0) return 1;
     if (test_metal_sam_global_attention_f16() != 0) return 1;
     if (test_metal_sam_rel_pos_attention_f16() != 0) return 1;
+    if (test_metal_sam_mlp_f16() != 0) return 1;
     if (test_metal_get_rows_f16() != 0) return 1;
     if (test_metal_prompt_assembly_f16() != 0) return 1;
     if (test_metal_prompt_assembly_from_mapped_model_f16() != 0) return 1;

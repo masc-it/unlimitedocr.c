@@ -388,6 +388,25 @@ int uocr_metal_context_sam_rel_pos_attention_f16(uocr_metal_context *ctx,
                                                  char *error,
                                                  size_t error_size);
 
+/* Diagnostic SAM transformer MLP helper. Computes
+ * lin2(GELU(lin1(input))) with input [n_rows,768], lin1 weight/bias
+ * [3072,768]/[3072], lin2 weight/bias [768,3072]/[768]. GELU uses PyTorch's
+ * default erf formulation with a small Metal-side erf approximation. Dot
+ * products accumulate in fp32 and the post-GELU intermediate is stored as fp16
+ * before lin2, matching the current fp16 activation policy for vision bring-up.
+ */
+int uocr_metal_context_sam_mlp_f16(uocr_metal_context *ctx,
+                                   const uint16_t *input_f16,
+                                   const uint16_t *lin1_weight_f16,
+                                   const uint16_t *lin1_bias_f16,
+                                   const uint16_t *lin2_weight_f16,
+                                   const uint16_t *lin2_bias_f16,
+                                   uint32_t n_rows,
+                                   uocr_metal_dense_output_type output_type,
+                                   void *out,
+                                   char *error,
+                                   size_t error_size);
+
 /* Runtime prompt assembly into the persistent Metal prompt-embedding arena.
  * The arena must have been allocated with uocr_metal_context_allocate_runtime_arenas().
  * slot selects the batch slot. Tests can inspect the private arena with the
