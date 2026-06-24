@@ -129,6 +129,85 @@ static int reserve_runtime_arena_accounting(uocr_engine *engine, const uocr_runt
     }
     return uocr_memory_reserve(&engine->memory_tracker, UOCR_MEMORY_LOGITS_READBACK, estimate->logits_readback_bytes);
 }
+
+static int generate_metal_text_fp16(uocr_engine *engine,
+                                    const uocr_prepared_request *request,
+                                    uocr_result **out_result) {
+    if (engine == NULL || request == NULL || out_result == NULL) {
+        return set_engine_errorf(engine, UOCR_ERROR_INVALID_ARGUMENT, "invalid Metal text generation request");
+    }
+    if (engine->metal == NULL) {
+        return set_engine_errorf(engine, UOCR_ERROR_INTERNAL, "Metal backend context is not initialized");
+    }
+    if (!engine->has_model_file || engine->model_file.header == NULL) {
+        return set_engine_errorf(engine,
+                                 UOCR_ERROR_NOT_IMPLEMENTED,
+                                 "Metal fp16 text generation requires a mapped fp16 .uocr model");
+    }
+    if (engine->model_file.header->qprofile != UOCR_QPROFILE_FP16) {
+        return set_engine_errorf(engine,
+                                 UOCR_ERROR_NOT_IMPLEMENTED,
+                                 "Metal text generation currently supports only fp16 .uocr models, got %s",
+                                 uocr_qprofile_name(engine->model_file.header->qprofile));
+    }
+    if (!uocr_metal_context_decoder_bindings_ready(engine->metal)) {
+        return set_engine_errorf(engine,
+                                 UOCR_ERROR_NOT_IMPLEMENTED,
+                                 "Metal fp16 text generation requires complete validated decoder tensor bindings");
+    }
+
+    uint64_t generated_bytes = 0u;
+    if ((uint64_t)request->max_new_tokens > (uint64_t)SIZE_MAX / sizeof(int32_t)) {
+        return set_engine_errorf(engine, UOCR_ERROR_OUT_OF_MEMORY, "generated-token buffer size overflow");
+    }
+    generated_bytes = (uint64_t)request->max_new_tokens * (uint64_t)sizeof(int32_t);
+    int32_t *generated = (int32_t *)uocr_malloc((size_t)generated_bytes);
+    if (generated == NULL) {
+        return set_engine_errorf(engine, UOCR_ERROR_OUT_OF_MEMORY, "failed to allocate generated-token buffer");
+    }
+
+    uocr_metal_decoder_request_f16 metal_request;
+    memset(&metal_request, 0, sizeof(metal_request));
+    metal_request.input_ids = request->input_ids;
+    metal_request.image_mask = request->image_mask;
+    metal_request.n_tokens = request->n_tokens;
+    metal_request.max_new_tokens = request->max_new_tokens;
+    metal_request.slot = 0u;
+    metal_request.image_span_start = UINT32_MAX;
+    metal_request.image_span_length = 0u;
+    metal_request.no_repeat_ngram_size = request->no_repeat_ngram_size;
+    metal_request.no_repeat_window = request->no_repeat_window;
+
+    uocr_metal_decoder_result_f16 metal_result;
+    memset(&metal_result, 0, sizeof(metal_result));
+    metal_result.generated_ids = generated;
+    metal_result.generated_capacity = request->max_new_tokens;
+
+    char metal_error[1024];
+    memset(metal_error, 0, sizeof(metal_error));
+    if (!uocr_metal_context_generate_f16(engine->metal,
+                                         &metal_request,
+                                         &metal_result,
+                                         metal_error,
+                                         sizeof(metal_error))) {
+        uocr_free(generated);
+        return set_engine_errorf(engine,
+                                 UOCR_ERROR_INTERNAL,
+                                 "Metal fp16 text generation failed: %s",
+                                 metal_error[0] != '\0' ? metal_error : "unknown error");
+    }
+
+    const int32_t *generated_lists[1] = {generated};
+    const uint32_t generated_counts[1] = {metal_result.generated_count};
+    const int status = uocr_result_create_from_generated(1u, generated_lists, generated_counts, out_result);
+    uocr_free(generated);
+    if (status != UOCR_OK) {
+        return set_engine_errorf(engine, status, "failed to allocate generated-token result");
+    }
+
+    clear_engine_error(engine);
+    return UOCR_OK;
+}
 #endif
 
 static void fill_memory_report(const uocr_engine *engine, uocr_memory_report *report) {
@@ -477,6 +556,27 @@ int uocr_generate_prepared(uocr_engine *engine,
     }
 
     if (any_generation_requested) {
+#if UOCR_HAVE_METAL
+        if (strcmp(engine->backend, "metal") == 0) {
+            if (n_requests != 1u) {
+                return set_engine_errorf(engine,
+                                         UOCR_ERROR_NOT_IMPLEMENTED,
+                                         "Metal generation currently supports exactly one request");
+            }
+            const uocr_prepared_request *request = &requests[0];
+            if (request->max_new_tokens == 0u) {
+                return set_engine_errorf(engine,
+                                         UOCR_ERROR_INTERNAL,
+                                         "internal generation dispatch error: no generated tokens requested");
+            }
+            if (request->n_views != 0u || uocr_count_image_placeholders(request) != 0u) {
+                return set_engine_errorf(engine,
+                                         UOCR_ERROR_NOT_IMPLEMENTED,
+                                         "Metal generation currently supports only text-only requests with n_views=0");
+            }
+            return generate_metal_text_fp16(engine, request, out_result);
+        }
+#endif
         return set_engine_errorf(engine,
                                  UOCR_ERROR_NOT_IMPLEMENTED,
                                  "inference kernels are not implemented yet; use max_new_tokens=0 for ABI smoke tests");

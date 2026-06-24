@@ -7878,6 +7878,64 @@ static int test_public_engine_open_initializes_metal(void) {
     return 0;
 }
 
+static int test_public_metal_text_generation_full_model(void) {
+    if (!uocr_metal_is_available()) {
+        return 0;
+    }
+    if (!env_flag_enabled("UOCR_RUN_LARGE_TESTS")) {
+        return 0;
+    }
+    const char *model_path = getenv("UOCR_MODEL_PATH");
+    if (model_path == NULL || model_path[0] == '\0') {
+        printf("UOCR_RUN_LARGE_TESTS=1 but UOCR_MODEL_PATH is not set; skipping public Metal text generation\n");
+        return 0;
+    }
+
+    uocr_engine_opts opts;
+    memset(&opts, 0, sizeof(opts));
+    opts.model_path = model_path;
+    opts.backend = "metal";
+    opts.resource_path = UOCR_TEST_METAL_RESOURCE_PATH;
+    opts.max_batch = 1u;
+    opts.max_prompt_tokens = 8u;
+    opts.max_gen_tokens = 2u;
+    opts.memory_budget_bytes = UINT64_MAX;
+
+    uocr_engine *engine = uocr_engine_open(&opts);
+    CHECK(engine != NULL);
+    CHECK(strcmp(uocr_engine_backend(engine), "metal") == 0);
+
+    const int32_t input_ids[3] = {UOCR_TOKEN_BOS, 42, 77};
+    const uint8_t image_mask[3] = {0u, 0u, 0u};
+    uocr_prepared_request request;
+    memset(&request, 0, sizeof(request));
+    request.input_ids = input_ids;
+    request.image_mask = image_mask;
+    request.n_tokens = 3u;
+    request.crop_grid_w = 1u;
+    request.crop_grid_h = 1u;
+    request.max_new_tokens = 2u;
+
+    uocr_result *result = NULL;
+    CHECK(uocr_generate_prepared(engine, &request, 1u, &result) == UOCR_OK);
+    CHECK(result != NULL);
+    CHECK(strcmp(uocr_last_error(engine), "OK") == 0);
+    CHECK(uocr_result_count(result) == 1u);
+    uint32_t generated_count = 0u;
+    const int32_t *generated = uocr_result_tokens(result, 0u, &generated_count);
+    CHECK(generated != NULL);
+    CHECK(generated_count >= 1u);
+    CHECK(generated_count <= 2u);
+    for (uint32_t i = 0u; i < generated_count; ++i) {
+        CHECK(generated[i] >= 0);
+        CHECK((uint32_t)generated[i] < UOCR_VOCAB_SIZE);
+    }
+
+    uocr_result_free(result);
+    uocr_engine_close(engine);
+    return 0;
+}
+
 int main(void) {
     CHECK(strcmp(uocr_metal_backend_name(), "metal") == 0);
     if (test_metal_smoke() != 0) return 1;
@@ -7927,5 +7985,6 @@ int main(void) {
     if (test_metal_decoder_binding_cache_full_model() != 0) return 1;
     if (test_metal_model_mapping() != 0) return 1;
     if (test_public_engine_open_initializes_metal() != 0) return 1;
+    if (test_public_metal_text_generation_full_model() != 0) return 1;
     return 0;
 }
