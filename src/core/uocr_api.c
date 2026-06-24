@@ -428,6 +428,15 @@ uocr_engine *uocr_engine_open(const uocr_engine_opts *opts) {
             uocr_engine_close(engine);
             return NULL;
         }
+        if (engine->has_model_file && engine->model_file.header->qprofile == UOCR_QPROFILE_FP16 &&
+            !uocr_metal_context_vision_bindings_ready(engine->metal)) {
+            set_engine_errorf(engine,
+                              UOCR_ERROR_NOT_IMPLEMENTED,
+                              "Metal fp16 image generation requires complete validated vision tensor bindings: %s",
+                              uocr_metal_context_vision_binding_error(engine->metal));
+            uocr_engine_close(engine);
+            return NULL;
+        }
         if (!uocr_metal_context_allocate_runtime_arenas(engine->metal,
                                                         engine->max_batch,
                                                         engine->max_prompt_tokens,
@@ -592,10 +601,33 @@ int uocr_generate_prepared(uocr_engine *engine,
                                          UOCR_ERROR_INTERNAL,
                                          "internal generation dispatch error: no generated tokens requested");
             }
-            if (request->n_views != 0u || uocr_count_image_placeholders(request) != 0u) {
+            const uint32_t image_placeholders = uocr_count_image_placeholders(request);
+            if (request->n_views != 0u || image_placeholders != 0u) {
+                if (!engine->has_model_file || engine->model_file.header == NULL) {
+                    return set_engine_errorf(engine,
+                                             UOCR_ERROR_NOT_IMPLEMENTED,
+                                             "Metal fp16 image generation requires a mapped fp16 .uocr model");
+                }
+                if (engine->model_file.header->qprofile != UOCR_QPROFILE_FP16) {
+                    return set_engine_errorf(engine,
+                                             UOCR_ERROR_NOT_IMPLEMENTED,
+                                             "Metal image generation currently supports only fp16 .uocr models, got %s",
+                                             uocr_qprofile_name(engine->model_file.header->qprofile));
+                }
+                if (!uocr_metal_context_decoder_bindings_ready(engine->metal)) {
+                    return set_engine_errorf(engine,
+                                             UOCR_ERROR_NOT_IMPLEMENTED,
+                                             "Metal fp16 image generation requires complete validated decoder tensor bindings");
+                }
+                if (!uocr_metal_context_vision_bindings_ready(engine->metal)) {
+                    return set_engine_errorf(engine,
+                                             UOCR_ERROR_NOT_IMPLEMENTED,
+                                             "Metal fp16 image generation requires complete validated vision tensor bindings: %s",
+                                             uocr_metal_context_vision_binding_error(engine->metal));
+                }
                 return set_engine_errorf(engine,
                                          UOCR_ERROR_NOT_IMPLEMENTED,
-                                         "Metal generation currently supports only text-only requests with n_views=0");
+                                         "Metal fp16 image generation has validated tensor bindings but the production vision runner is not wired yet");
             }
             return generate_metal_text_fp16(engine, request, out_result);
         }

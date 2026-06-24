@@ -14915,7 +14915,9 @@ static int test_metal_decoder_binding_cache_full_model(void) {
     enum {
         EXPECTED_DECODER_BINDINGS = 3u + (UOCR_DECODER_LAYERS * 6u) + 3u +
                                     ((UOCR_DECODER_LAYERS - 1u) *
-                                     (1u + 3u + UOCR_ROUTED_EXPERTS * 3u))
+                                     (1u + 3u + UOCR_ROUTED_EXPERTS * 3u)),
+        EXPECTED_VISION_BINDINGS = 2u + 2u + (UOCR_SAM_BLOCKS * 14u + 11u) +
+                                   (4u + UOCR_CLIP_BLOCKS * 12u)
     };
     const int32_t input_ids[3] = {UOCR_TOKEN_BOS, 42, 77};
     const uint8_t image_mask[3] = {0u, 0u, 0u};
@@ -14931,6 +14933,8 @@ static int test_metal_decoder_binding_cache_full_model(void) {
     CHECK(error[0] == '\0');
     CHECK(uocr_metal_context_decoder_bindings_ready(ctx) == 1);
     CHECK(uocr_metal_context_decoder_binding_count(ctx) == EXPECTED_DECODER_BINDINGS);
+    CHECK(uocr_metal_context_vision_bindings_ready(ctx) == 1);
+    CHECK(uocr_metal_context_vision_binding_count(ctx) == EXPECTED_VISION_BINDINGS);
     CHECK(uocr_metal_context_allocate_runtime_arenas(ctx, 1u, 8u, error, sizeof(error)) == 1);
 
     uocr_metal_decoder_request_f16 request;
@@ -15006,6 +15010,9 @@ static int test_metal_model_mapping(void) {
     CHECK(uocr_metal_context_tensor_binding_count(ctx) == 2u);
     CHECK(uocr_metal_context_decoder_binding_count(ctx) == 0u);
     CHECK(uocr_metal_context_decoder_bindings_ready(ctx) == 0);
+    CHECK(uocr_metal_context_vision_binding_count(ctx) == 0u);
+    CHECK(uocr_metal_context_vision_bindings_ready(ctx) == 0);
+    CHECK(strstr(uocr_metal_context_vision_binding_error(ctx), "missing") != NULL);
     CHECK(uocr_metal_context_model_view_bytes(ctx) == UOCR_TENSOR_DATA_ALIGNMENT);
 
     uocr_metal_model_view_info view_info;
@@ -15040,6 +15047,9 @@ static int test_metal_model_mapping(void) {
     CHECK(uocr_metal_context_tensor_binding_count(ctx) == 0u);
     CHECK(uocr_metal_context_decoder_binding_count(ctx) == 0u);
     CHECK(uocr_metal_context_decoder_bindings_ready(ctx) == 0);
+    CHECK(uocr_metal_context_vision_binding_count(ctx) == 0u);
+    CHECK(uocr_metal_context_vision_bindings_ready(ctx) == 0);
+    CHECK(strstr(uocr_metal_context_vision_binding_error(ctx), "no mapped model") != NULL);
     CHECK(uocr_metal_context_model_view_bytes(ctx) == 0u);
 
     uocr_metal_context_destroy(ctx);

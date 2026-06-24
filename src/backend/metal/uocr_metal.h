@@ -138,6 +138,9 @@ uint32_t uocr_metal_context_model_view_count(const uocr_metal_context *ctx);
 uint32_t uocr_metal_context_tensor_binding_count(const uocr_metal_context *ctx);
 uint32_t uocr_metal_context_decoder_binding_count(const uocr_metal_context *ctx);
 int uocr_metal_context_decoder_bindings_ready(const uocr_metal_context *ctx);
+uint32_t uocr_metal_context_vision_binding_count(const uocr_metal_context *ctx);
+int uocr_metal_context_vision_bindings_ready(const uocr_metal_context *ctx);
+const char *uocr_metal_context_vision_binding_error(const uocr_metal_context *ctx);
 uint64_t uocr_metal_context_model_view_bytes(const uocr_metal_context *ctx);
 int uocr_metal_context_get_model_view_info(const uocr_metal_context *ctx,
                                            uint32_t view_index,

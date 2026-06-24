@@ -44,7 +44,13 @@ typedef struct uocr_metal_tensor_binding_internal {
 
 #define UOCR_METAL_DECODER_REQUIRED_TENSOR_COUNT \
     (3u + (UOCR_DECODER_LAYERS * 6u) + 3u + ((UOCR_DECODER_LAYERS - 1u) * (1u + 3u + UOCR_ROUTED_EXPERTS * 3u)))
+#define UOCR_METAL_SAM_REQUIRED_TENSOR_COUNT (UOCR_SAM_BLOCKS * 14u + 11u)
+#define UOCR_METAL_CLIP_REQUIRED_TENSOR_COUNT (4u + UOCR_CLIP_BLOCKS * 12u)
+#define UOCR_METAL_VISION_REQUIRED_TENSOR_COUNT \
+    (2u + 2u + UOCR_METAL_SAM_REQUIRED_TENSOR_COUNT + UOCR_METAL_CLIP_REQUIRED_TENSOR_COUNT)
 #define UOCR_METAL_HIDDEN_SCRATCH_SEGMENTS 5u
+
+_Static_assert(UOCR_METAL_VISION_REQUIRED_TENSOR_COUNT == 475u, "unexpected Metal vision binding count");
 
 typedef struct uocr_metal_decoder_binding {
     uint32_t tensor_id;
@@ -59,6 +65,20 @@ typedef struct uocr_metal_decoder_binding_cache {
     uint32_t count;
     uocr_metal_decoder_binding tensors[UOCR_METAL_DECODER_REQUIRED_TENSOR_COUNT];
 } uocr_metal_decoder_binding_cache;
+
+typedef struct uocr_metal_vision_binding {
+    uint32_t tensor_id;
+    uint32_t reserved;
+    id<MTLBuffer> buffer;
+    NSUInteger offset;
+    uint64_t payload_size;
+} uocr_metal_vision_binding;
+
+typedef struct uocr_metal_vision_binding_cache {
+    int valid;
+    uint32_t count;
+    uocr_metal_vision_binding tensors[UOCR_METAL_VISION_REQUIRED_TENSOR_COUNT];
+} uocr_metal_vision_binding_cache;
 
 typedef struct uocr_metal_payload_span {
     uint32_t tensor_index;
@@ -98,6 +118,8 @@ struct uocr_metal_context {
     uocr_metal_runtime_arena runtime_arenas[UOCR_METAL_ARENA_COUNT];
     uocr_metal_decoder_binding_cache decoder_bindings;
     char decoder_binding_error[256];
+    uocr_metal_vision_binding_cache vision_bindings;
+    char vision_binding_error[256];
     uocr_metal_kv_cache_layout kv_cache_layout;
     int has_kv_cache_layout;
     int has_integrated_prefill;
@@ -1096,6 +1118,11 @@ static int metal_refresh_decoder_binding_cache(uocr_metal_context *ctx,
                                                const uocr_model_file *model,
                                                char *error,
                                                size_t error_size);
+static void metal_invalidate_vision_binding_cache(uocr_metal_context *ctx, const char *reason);
+static int metal_refresh_vision_binding_cache(uocr_metal_context *ctx,
+                                              const uocr_model_file *model,
+                                              char *error,
+                                              size_t error_size);
 
 static uocr_metal_tensor_binding_internal *build_tensor_bindings(const uocr_model_file *model,
                                                                   const uocr_metal_model_view *views,
@@ -1156,6 +1183,7 @@ void uocr_metal_context_unmap_model(uocr_metal_context *ctx) {
         ctx->tensor_bindings = NULL;
         ctx->tensor_binding_count = 0u;
         metal_invalidate_decoder_binding_cache(ctx, "no mapped model");
+        metal_invalidate_vision_binding_cache(ctx, "no mapped model");
         ctx->model_view_bytes = 0u;
         ctx->last_model_warmup_bytes = 0u;
     }
@@ -1254,6 +1282,12 @@ int uocr_metal_context_map_model(uocr_metal_context *ctx, const uocr_model_file 
     if (!metal_refresh_decoder_binding_cache(ctx, model, decoder_error, sizeof(decoder_error))) {
         metal_invalidate_decoder_binding_cache(ctx,
                                                decoder_error[0] != '\0' ? decoder_error : "decoder tensor bindings are not available");
+    }
+    char vision_error[256];
+    memset(vision_error, 0, sizeof(vision_error));
+    if (!metal_refresh_vision_binding_cache(ctx, model, vision_error, sizeof(vision_error))) {
+        metal_invalidate_vision_binding_cache(ctx,
+                                              vision_error[0] != '\0' ? vision_error : "vision tensor bindings are not available");
     }
 
     metal_clear_error(error, error_size);
@@ -1750,6 +1784,379 @@ uint32_t uocr_metal_context_decoder_binding_count(const uocr_metal_context *ctx)
 int uocr_metal_context_decoder_bindings_ready(const uocr_metal_context *ctx) {
     return ctx != NULL && ctx->decoder_bindings.valid &&
            ctx->decoder_bindings.count == UOCR_METAL_DECODER_REQUIRED_TENSOR_COUNT;
+}
+
+static void metal_invalidate_vision_binding_cache(uocr_metal_context *ctx, const char *reason) {
+    if (ctx == NULL) {
+        return;
+    }
+    memset(&ctx->vision_bindings, 0, sizeof(ctx->vision_bindings));
+    if (reason == NULL || reason[0] == '\0') {
+        reason = "vision tensor bindings are not validated";
+    }
+    (void)snprintf(ctx->vision_binding_error, sizeof(ctx->vision_binding_error), "%s", reason);
+}
+
+static int metal_validate_vision_tensor_metadata(const uocr_tensor_entry *tensor,
+                                                 uint32_t tensor_id,
+                                                 const char *role,
+                                                 uint32_t family,
+                                                 int32_t layer,
+                                                 int32_t expert,
+                                                 uint32_t projection,
+                                                 uint32_t rank,
+                                                 const uint32_t dims[UOCR_TENSOR_MAX_DIMS],
+                                                 uint64_t expected_payload_size,
+                                                 char *error,
+                                                 size_t error_size) {
+    if (role == NULL || role[0] == '\0') {
+        role = "vision tensor";
+    }
+    if (tensor == NULL) {
+        return metal_fail(error, error_size, "missing %s %u", role, tensor_id);
+    }
+    if (tensor->id != tensor_id) {
+        return metal_fail(error, error_size, "%s id mismatch: got %u expected %u", role, tensor->id, tensor_id);
+    }
+    if (tensor->usage != UOCR_TENSOR_USAGE_RUNTIME) {
+        return metal_fail(error,
+                          error_size,
+                          "%s %u has unsupported usage %s",
+                          role,
+                          tensor_id,
+                          uocr_tensor_usage_name(tensor->usage));
+    }
+    if (tensor->qtype != UOCR_TENSOR_F16) {
+        return metal_fail(error,
+                          error_size,
+                          "%s %u has unsupported qtype %s; production Metal vision requires f16",
+                          role,
+                          tensor_id,
+                          uocr_tensor_qtype_name(tensor->qtype));
+    }
+    if (tensor->family != family || tensor->layer != layer || tensor->expert != expert || tensor->projection != projection) {
+        return metal_fail(error,
+                          error_size,
+                          "%s %u registry metadata mismatch: family=%s layer=%d expert=%d projection=%u",
+                          role,
+                          tensor_id,
+                          uocr_tensor_family_name(tensor->family),
+                          tensor->layer,
+                          tensor->expert,
+                          tensor->projection);
+    }
+    if (tensor->rank != rank) {
+        return metal_fail(error,
+                          error_size,
+                          "%s %u rank mismatch: got %u expected %u",
+                          role,
+                          tensor_id,
+                          tensor->rank,
+                          rank);
+    }
+    for (uint32_t i = 0u; i < rank; ++i) {
+        if (tensor->logical_shape[i] != dims[i] || tensor->physical_shape[i] != dims[i]) {
+            return metal_fail(error,
+                              error_size,
+                              "%s %u shape[%u] mismatch: logical=%u physical=%u expected=%u",
+                              role,
+                              tensor_id,
+                              i,
+                              tensor->logical_shape[i],
+                              tensor->physical_shape[i],
+                              dims[i]);
+        }
+    }
+    for (uint32_t i = rank; i < UOCR_TENSOR_MAX_DIMS; ++i) {
+        if (tensor->logical_shape[i] != 0u || tensor->physical_shape[i] != 0u) {
+            return metal_fail(error,
+                              error_size,
+                              "%s %u has non-zero trailing shape[%u]: logical=%u physical=%u",
+                              role,
+                              tensor_id,
+                              i,
+                              tensor->logical_shape[i],
+                              tensor->physical_shape[i]);
+        }
+    }
+    if (tensor->payload_size != expected_payload_size) {
+        return metal_fail(error,
+                          error_size,
+                          "%s %u payload size mismatch: got %llu expected %llu",
+                          role,
+                          tensor_id,
+                          (unsigned long long)tensor->payload_size,
+                          (unsigned long long)expected_payload_size);
+    }
+    return 1;
+}
+
+static int metal_append_vision_binding(uocr_metal_context *ctx,
+                                       const uocr_model_file *model,
+                                       uocr_metal_vision_binding_cache *cache,
+                                       uint32_t tensor_id,
+                                       const char *role,
+                                       uint32_t family,
+                                       int32_t layer,
+                                       int32_t expert,
+                                       uint32_t projection,
+                                       uint32_t rank,
+                                       const uint32_t dims[UOCR_TENSOR_MAX_DIMS],
+                                       char *error,
+                                       size_t error_size) {
+    if (ctx == NULL || model == NULL || cache == NULL || cache->count >= UOCR_METAL_VISION_REQUIRED_TENSOR_COUNT) {
+        return metal_fail(error, error_size, "vision tensor binding cache overflow");
+    }
+    uint64_t expected_payload_size = 0u;
+    if (!metal_tensor_expected_payload_bytes(rank, dims, &expected_payload_size)) {
+        return metal_fail(error, error_size, "vision tensor %u expected byte-size overflow", tensor_id);
+    }
+    const uocr_tensor_entry *tensor = uocr_model_file_find_tensor(model, tensor_id);
+    if (!metal_validate_vision_tensor_metadata(tensor,
+                                               tensor_id,
+                                               role,
+                                               family,
+                                               layer,
+                                               expert,
+                                               projection,
+                                               rank,
+                                               dims,
+                                               expected_payload_size,
+                                               error,
+                                               error_size)) {
+        return 0;
+    }
+
+    id<MTLBuffer> buffer = nil;
+    NSUInteger offset = 0u;
+    if (!metal_get_mapped_tensor_buffer(ctx, tensor_id, expected_payload_size, &buffer, &offset, error, error_size)) {
+        return 0;
+    }
+
+    uocr_metal_vision_binding *binding = &cache->tensors[cache->count++];
+    binding->tensor_id = tensor_id;
+    binding->reserved = 0u;
+    binding->buffer = buffer;
+    binding->offset = offset;
+    binding->payload_size = expected_payload_size;
+    return 1;
+}
+
+static int metal_append_vision_binding1(uocr_metal_context *ctx,
+                                        const uocr_model_file *model,
+                                        uocr_metal_vision_binding_cache *cache,
+                                        uint32_t tensor_id,
+                                        const char *role,
+                                        uint32_t family,
+                                        int32_t layer,
+                                        int32_t expert,
+                                        uint32_t projection,
+                                        uint32_t d0,
+                                        char *error,
+                                        size_t error_size) {
+    const uint32_t dims[UOCR_TENSOR_MAX_DIMS] = {d0, 0u, 0u, 0u};
+    return metal_append_vision_binding(ctx, model, cache, tensor_id, role, family, layer, expert, projection, 1u, dims, error, error_size);
+}
+
+static int metal_append_vision_binding2(uocr_metal_context *ctx,
+                                        const uocr_model_file *model,
+                                        uocr_metal_vision_binding_cache *cache,
+                                        uint32_t tensor_id,
+                                        const char *role,
+                                        uint32_t family,
+                                        int32_t layer,
+                                        int32_t expert,
+                                        uint32_t projection,
+                                        uint32_t d0,
+                                        uint32_t d1,
+                                        char *error,
+                                        size_t error_size) {
+    const uint32_t dims[UOCR_TENSOR_MAX_DIMS] = {d0, d1, 0u, 0u};
+    return metal_append_vision_binding(ctx, model, cache, tensor_id, role, family, layer, expert, projection, 2u, dims, error, error_size);
+}
+
+static int metal_append_vision_binding4(uocr_metal_context *ctx,
+                                        const uocr_model_file *model,
+                                        uocr_metal_vision_binding_cache *cache,
+                                        uint32_t tensor_id,
+                                        const char *role,
+                                        uint32_t family,
+                                        int32_t layer,
+                                        int32_t expert,
+                                        uint32_t projection,
+                                        uint32_t d0,
+                                        uint32_t d1,
+                                        uint32_t d2,
+                                        uint32_t d3,
+                                        char *error,
+                                        size_t error_size) {
+    const uint32_t dims[UOCR_TENSOR_MAX_DIMS] = {d0, d1, d2, d3};
+    return metal_append_vision_binding(ctx, model, cache, tensor_id, role, family, layer, expert, projection, 4u, dims, error, error_size);
+}
+
+static int metal_refresh_vision_binding_cache(uocr_metal_context *ctx,
+                                              const uocr_model_file *model,
+                                              char *error,
+                                              size_t error_size) {
+    metal_clear_error(error, error_size);
+    if (ctx == NULL || model == NULL || ctx->model_views == NULL || ctx->tensor_bindings == NULL) {
+        return metal_fail(error, error_size, "vision tensor binding validation requires a mapped model");
+    }
+
+    uocr_metal_vision_binding_cache cache;
+    memset(&cache, 0, sizeof(cache));
+
+#define VAPPEND1(tensor_id, role, family, layer, expert, projection, d0) \
+    do { \
+        if (!metal_append_vision_binding1(ctx, model, &cache, (tensor_id), (role), (family), (layer), (expert), (projection), (d0), error, error_size)) { \
+            return 0; \
+        } \
+    } while (0)
+#define VAPPEND2(tensor_id, role, family, layer, expert, projection, d0, d1) \
+    do { \
+        if (!metal_append_vision_binding2(ctx, model, &cache, (tensor_id), (role), (family), (layer), (expert), (projection), (d0), (d1), error, error_size)) { \
+            return 0; \
+        } \
+    } while (0)
+#define VAPPEND4(tensor_id, role, family, layer, expert, projection, d0, d1, d2, d3) \
+    do { \
+        if (!metal_append_vision_binding4(ctx, model, &cache, (tensor_id), (role), (family), (layer), (expert), (projection), (d0), (d1), (d2), (d3), error, error_size)) { \
+            return 0; \
+        } \
+    } while (0)
+
+    VAPPEND1(UOCR_TENSOR_ID_IMAGE_NEWLINE,
+             "image newline tensor",
+             UOCR_TENSOR_FAMILY_IMAGE_NEWLINE,
+             -1,
+             -1,
+             UOCR_TENSOR_PROJ_NONE,
+             UOCR_HIDDEN_SIZE);
+    VAPPEND1(UOCR_TENSOR_ID_VIEW_SEPARATOR,
+             "view separator tensor",
+             UOCR_TENSOR_FAMILY_VIEW_SEPARATOR,
+             -1,
+             -1,
+             UOCR_TENSOR_PROJ_NONE,
+             UOCR_HIDDEN_SIZE);
+    VAPPEND2(UOCR_TENSOR_ID_PROJECTOR_WEIGHT,
+             "visual projector weight",
+             UOCR_TENSOR_FAMILY_PROJECTOR,
+             -1,
+             -1,
+             UOCR_TENSOR_PROJ_WEIGHT,
+             UOCR_HIDDEN_SIZE,
+             UOCR_PROJECTOR_IN_SIZE);
+    VAPPEND1(UOCR_TENSOR_ID_PROJECTOR_BIAS,
+             "visual projector bias",
+             UOCR_TENSOR_FAMILY_PROJECTOR,
+             -1,
+             -1,
+             UOCR_TENSOR_PROJ_BIAS,
+             UOCR_HIDDEN_SIZE);
+
+    static const uint32_t sam_block_name_order[UOCR_SAM_BLOCKS] = {0u, 1u, 10u, 11u, 2u, 3u, 4u, 5u, 6u, 7u, 8u, 9u};
+    for (uint32_t sorted_block = 0u; sorted_block < UOCR_SAM_BLOCKS; ++sorted_block) {
+        const uint32_t source_block = sam_block_name_order[sorted_block];
+        const uint32_t base = UOCR_TENSOR_ID_VISION_SAM_BASE + sorted_block * 14u;
+        const uint32_t rel_pos_length = uocr_sam_block_uses_global_attention(source_block) ? UOCR_SAM_MAX_REL_POS_SIZE : UOCR_SAM_WINDOW_REL_POS_SIZE;
+        VAPPEND1(base + 0u, "SAM attention projection bias", UOCR_TENSOR_FAMILY_VISION_SAM, -1, -1, UOCR_TENSOR_PROJ_NONE, UOCR_SAM_HIDDEN_SIZE);
+        VAPPEND2(base + 1u, "SAM attention projection weight", UOCR_TENSOR_FAMILY_VISION_SAM, -1, -1, UOCR_TENSOR_PROJ_NONE, UOCR_SAM_HIDDEN_SIZE, UOCR_SAM_HIDDEN_SIZE);
+        VAPPEND1(base + 2u, "SAM attention qkv bias", UOCR_TENSOR_FAMILY_VISION_SAM, -1, -1, UOCR_TENSOR_PROJ_NONE, UOCR_SAM_QKV_SIZE);
+        VAPPEND2(base + 3u, "SAM attention qkv weight", UOCR_TENSOR_FAMILY_VISION_SAM, -1, -1, UOCR_TENSOR_PROJ_NONE, UOCR_SAM_QKV_SIZE, UOCR_SAM_HIDDEN_SIZE);
+        VAPPEND2(base + 4u, "SAM relative position H", UOCR_TENSOR_FAMILY_VISION_SAM, -1, -1, UOCR_TENSOR_PROJ_NONE, rel_pos_length, UOCR_SAM_HEAD_DIM);
+        VAPPEND2(base + 5u, "SAM relative position W", UOCR_TENSOR_FAMILY_VISION_SAM, -1, -1, UOCR_TENSOR_PROJ_NONE, rel_pos_length, UOCR_SAM_HEAD_DIM);
+        VAPPEND1(base + 6u, "SAM MLP lin1 bias", UOCR_TENSOR_FAMILY_VISION_SAM, -1, -1, UOCR_TENSOR_PROJ_NONE, UOCR_SAM_MLP_INTERMEDIATE);
+        VAPPEND2(base + 7u, "SAM MLP lin1 weight", UOCR_TENSOR_FAMILY_VISION_SAM, -1, -1, UOCR_TENSOR_PROJ_NONE, UOCR_SAM_MLP_INTERMEDIATE, UOCR_SAM_HIDDEN_SIZE);
+        VAPPEND1(base + 8u, "SAM MLP lin2 bias", UOCR_TENSOR_FAMILY_VISION_SAM, -1, -1, UOCR_TENSOR_PROJ_NONE, UOCR_SAM_HIDDEN_SIZE);
+        VAPPEND2(base + 9u, "SAM MLP lin2 weight", UOCR_TENSOR_FAMILY_VISION_SAM, -1, -1, UOCR_TENSOR_PROJ_NONE, UOCR_SAM_HIDDEN_SIZE, UOCR_SAM_MLP_INTERMEDIATE);
+        VAPPEND1(base + 10u, "SAM norm1 bias", UOCR_TENSOR_FAMILY_VISION_SAM, -1, -1, UOCR_TENSOR_PROJ_NONE, UOCR_SAM_HIDDEN_SIZE);
+        VAPPEND1(base + 11u, "SAM norm1 weight", UOCR_TENSOR_FAMILY_VISION_SAM, -1, -1, UOCR_TENSOR_PROJ_NONE, UOCR_SAM_HIDDEN_SIZE);
+        VAPPEND1(base + 12u, "SAM norm2 bias", UOCR_TENSOR_FAMILY_VISION_SAM, -1, -1, UOCR_TENSOR_PROJ_NONE, UOCR_SAM_HIDDEN_SIZE);
+        VAPPEND1(base + 13u, "SAM norm2 weight", UOCR_TENSOR_FAMILY_VISION_SAM, -1, -1, UOCR_TENSOR_PROJ_NONE, UOCR_SAM_HIDDEN_SIZE);
+    }
+
+    const uint32_t sam_extra = UOCR_TENSOR_ID_VISION_SAM_BASE + UOCR_SAM_BLOCKS * 14u;
+    VAPPEND4(sam_extra + 0u, "SAM neck 1x1 conv weight", UOCR_TENSOR_FAMILY_VISION_SAM, -1, -1, UOCR_TENSOR_PROJ_NONE, UOCR_SAM_NECK_CHANNELS, UOCR_SAM_HIDDEN_SIZE, 1u, 1u);
+    VAPPEND1(sam_extra + 1u, "SAM neck norm1 bias", UOCR_TENSOR_FAMILY_VISION_SAM, -1, -1, UOCR_TENSOR_PROJ_NONE, UOCR_SAM_NECK_CHANNELS);
+    VAPPEND1(sam_extra + 2u, "SAM neck norm1 weight", UOCR_TENSOR_FAMILY_VISION_SAM, -1, -1, UOCR_TENSOR_PROJ_NONE, UOCR_SAM_NECK_CHANNELS);
+    VAPPEND4(sam_extra + 3u, "SAM neck 3x3 conv weight", UOCR_TENSOR_FAMILY_VISION_SAM, -1, -1, UOCR_TENSOR_PROJ_NONE, UOCR_SAM_NECK_CHANNELS, UOCR_SAM_NECK_CHANNELS, UOCR_SAM_NECK_KERNEL_SIZE, UOCR_SAM_NECK_KERNEL_SIZE);
+    VAPPEND1(sam_extra + 4u, "SAM neck norm2 bias", UOCR_TENSOR_FAMILY_VISION_SAM, -1, -1, UOCR_TENSOR_PROJ_NONE, UOCR_SAM_NECK_CHANNELS);
+    VAPPEND1(sam_extra + 5u, "SAM neck norm2 weight", UOCR_TENSOR_FAMILY_VISION_SAM, -1, -1, UOCR_TENSOR_PROJ_NONE, UOCR_SAM_NECK_CHANNELS);
+    VAPPEND4(sam_extra + 6u, "SAM net_2 conv weight", UOCR_TENSOR_FAMILY_VISION_SAM, -1, -1, UOCR_TENSOR_PROJ_NONE, UOCR_SAM_NET2_CHANNELS, UOCR_SAM_NECK_CHANNELS, UOCR_SAM_NECK_KERNEL_SIZE, UOCR_SAM_NECK_KERNEL_SIZE);
+    VAPPEND4(sam_extra + 7u, "SAM net_3 conv weight", UOCR_TENSOR_FAMILY_VISION_SAM, -1, -1, UOCR_TENSOR_PROJ_NONE, UOCR_SAM_NET3_CHANNELS, UOCR_SAM_NET2_CHANNELS, UOCR_SAM_NECK_KERNEL_SIZE, UOCR_SAM_NECK_KERNEL_SIZE);
+    VAPPEND1(sam_extra + 8u, "SAM patch-embed bias", UOCR_TENSOR_FAMILY_VISION_SAM, -1, -1, UOCR_TENSOR_PROJ_NONE, UOCR_SAM_HIDDEN_SIZE);
+    VAPPEND4(sam_extra + 9u, "SAM patch-embed weight", UOCR_TENSOR_FAMILY_VISION_SAM, -1, -1, UOCR_TENSOR_PROJ_NONE, UOCR_SAM_HIDDEN_SIZE, 3u, UOCR_VISION_PATCH_SIZE, UOCR_VISION_PATCH_SIZE);
+    VAPPEND4(sam_extra + 10u, "SAM absolute position embedding", UOCR_TENSOR_FAMILY_VISION_SAM, -1, -1, UOCR_TENSOR_PROJ_NONE, 1u, UOCR_SAM_MAX_GRID_SIZE, UOCR_SAM_MAX_GRID_SIZE, UOCR_SAM_HIDDEN_SIZE);
+
+    VAPPEND1(UOCR_TENSOR_ID_VISION_CLIP_BASE + 0u,
+             "CLIP class embedding",
+             UOCR_TENSOR_FAMILY_VISION_CLIP,
+             -1,
+             -1,
+             UOCR_TENSOR_PROJ_NONE,
+             UOCR_CLIP_HIDDEN_SIZE);
+    /* model.vision_model.embeddings.patch_embedding.weight is deliberately not
+     * required for normal OCR inference: CLIP consumes SAM patch embeddings.
+     */
+    VAPPEND2(UOCR_TENSOR_ID_VISION_CLIP_BASE + 2u,
+             "CLIP position embedding",
+             UOCR_TENSOR_FAMILY_VISION_CLIP,
+             -1,
+             -1,
+             UOCR_TENSOR_PROJ_NONE,
+             UOCR_CLIP_GLOBAL_TOKENS,
+             UOCR_CLIP_HIDDEN_SIZE);
+    VAPPEND1(UOCR_TENSOR_ID_VISION_CLIP_BASE + 3u, "CLIP pre-LayerNorm bias", UOCR_TENSOR_FAMILY_VISION_CLIP, -1, -1, UOCR_TENSOR_PROJ_NONE, UOCR_CLIP_HIDDEN_SIZE);
+    VAPPEND1(UOCR_TENSOR_ID_VISION_CLIP_BASE + 4u, "CLIP pre-LayerNorm weight", UOCR_TENSOR_FAMILY_VISION_CLIP, -1, -1, UOCR_TENSOR_PROJ_NONE, UOCR_CLIP_HIDDEN_SIZE);
+
+    for (uint32_t sorted_layer = 0u; sorted_layer < UOCR_CLIP_BLOCKS; ++sorted_layer) {
+        const uint32_t base = UOCR_TENSOR_ID_VISION_CLIP_BASE + 5u + sorted_layer * 12u;
+        VAPPEND1(base + 0u, "CLIP layer_norm1 bias", UOCR_TENSOR_FAMILY_VISION_CLIP, -1, -1, UOCR_TENSOR_PROJ_NONE, UOCR_CLIP_HIDDEN_SIZE);
+        VAPPEND1(base + 1u, "CLIP layer_norm1 weight", UOCR_TENSOR_FAMILY_VISION_CLIP, -1, -1, UOCR_TENSOR_PROJ_NONE, UOCR_CLIP_HIDDEN_SIZE);
+        VAPPEND1(base + 2u, "CLIP layer_norm2 bias", UOCR_TENSOR_FAMILY_VISION_CLIP, -1, -1, UOCR_TENSOR_PROJ_NONE, UOCR_CLIP_HIDDEN_SIZE);
+        VAPPEND1(base + 3u, "CLIP layer_norm2 weight", UOCR_TENSOR_FAMILY_VISION_CLIP, -1, -1, UOCR_TENSOR_PROJ_NONE, UOCR_CLIP_HIDDEN_SIZE);
+        VAPPEND1(base + 4u, "CLIP MLP fc1 bias", UOCR_TENSOR_FAMILY_VISION_CLIP, -1, -1, UOCR_TENSOR_PROJ_NONE, UOCR_CLIP_MLP_INTERMEDIATE);
+        VAPPEND2(base + 5u, "CLIP MLP fc1 weight", UOCR_TENSOR_FAMILY_VISION_CLIP, -1, -1, UOCR_TENSOR_PROJ_NONE, UOCR_CLIP_MLP_INTERMEDIATE, UOCR_CLIP_HIDDEN_SIZE);
+        VAPPEND1(base + 6u, "CLIP MLP fc2 bias", UOCR_TENSOR_FAMILY_VISION_CLIP, -1, -1, UOCR_TENSOR_PROJ_NONE, UOCR_CLIP_HIDDEN_SIZE);
+        VAPPEND2(base + 7u, "CLIP MLP fc2 weight", UOCR_TENSOR_FAMILY_VISION_CLIP, -1, -1, UOCR_TENSOR_PROJ_NONE, UOCR_CLIP_HIDDEN_SIZE, UOCR_CLIP_MLP_INTERMEDIATE);
+        VAPPEND1(base + 8u, "CLIP attention output bias", UOCR_TENSOR_FAMILY_VISION_CLIP, -1, -1, UOCR_TENSOR_PROJ_NONE, UOCR_CLIP_HIDDEN_SIZE);
+        VAPPEND2(base + 9u, "CLIP attention output weight", UOCR_TENSOR_FAMILY_VISION_CLIP, -1, -1, UOCR_TENSOR_PROJ_NONE, UOCR_CLIP_HIDDEN_SIZE, UOCR_CLIP_HIDDEN_SIZE);
+        VAPPEND1(base + 10u, "CLIP attention qkv bias", UOCR_TENSOR_FAMILY_VISION_CLIP, -1, -1, UOCR_TENSOR_PROJ_NONE, UOCR_CLIP_QKV_SIZE);
+        VAPPEND2(base + 11u, "CLIP attention qkv weight", UOCR_TENSOR_FAMILY_VISION_CLIP, -1, -1, UOCR_TENSOR_PROJ_NONE, UOCR_CLIP_QKV_SIZE, UOCR_CLIP_HIDDEN_SIZE);
+    }
+
+#undef VAPPEND1
+#undef VAPPEND2
+#undef VAPPEND4
+
+    if (cache.count != UOCR_METAL_VISION_REQUIRED_TENSOR_COUNT) {
+        return metal_fail(error,
+                          error_size,
+                          "vision tensor binding count mismatch: got %u expected %u",
+                          cache.count,
+                          (uint32_t)UOCR_METAL_VISION_REQUIRED_TENSOR_COUNT);
+    }
+    cache.valid = 1;
+    ctx->vision_bindings = cache;
+    ctx->vision_binding_error[0] = '\0';
+    return 1;
+}
+
+uint32_t uocr_metal_context_vision_binding_count(const uocr_metal_context *ctx) {
+    return ctx != NULL && ctx->vision_bindings.valid ? ctx->vision_bindings.count : 0u;
+}
+
+int uocr_metal_context_vision_bindings_ready(const uocr_metal_context *ctx) {
+    return ctx != NULL && ctx->vision_bindings.valid &&
+           ctx->vision_bindings.count == UOCR_METAL_VISION_REQUIRED_TENSOR_COUNT;
+}
+
+const char *uocr_metal_context_vision_binding_error(const uocr_metal_context *ctx) {
+    if (ctx == NULL || ctx->vision_binding_error[0] == '\0') {
+        return "vision tensor bindings are not validated";
+    }
+    return ctx->vision_binding_error;
 }
 
 static int scratch_slot_valid(uocr_metal_scratch_slot slot) {
