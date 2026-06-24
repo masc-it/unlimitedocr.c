@@ -65,7 +65,7 @@ Current priority slice, in order. The coding agent should take the first uncheck
 - [x] Assert tokenizer facts:
   - [x] BPE vocab `128000`, total vocab `129280`, added tokens `830`
   - [x] BOS `0`, EOS `1`, PAD `2`, `<image>` `128815`
-- [ ] Assert current safetensors facts:
+- [x] Assert current safetensors facts:
   - [x] total weight payload `6,672,212,480` bytes from `model.safetensors.index.json`
   - [x] `2710` tensor entries in the safetensors header / index
   - [x] all source tensors are BF16 in the current checkpoint header

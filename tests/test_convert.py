@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import struct
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -89,6 +90,21 @@ def _q8_0_from_bf16_payload(payload: bytes, shape: tuple[int, ...], physical_sha
     return packed.tobytes()
 
 
+def _read_length_prefixed_safetensors_header(path: Path) -> dict[str, object]:
+    data = path.read_bytes()
+    if len(data) < 8:
+        raise ValueError(f"{path} is too small to contain a safetensors header length")
+    (header_len,) = struct.unpack_from("<Q", data, 0)
+    start = 8
+    end = start + header_len
+    if end > len(data):
+        raise ValueError(f"{path} declares {header_len} header bytes but only has {len(data) - start}")
+    header = json.loads(data[start:end].decode("utf-8"))
+    if not isinstance(header, dict):
+        raise ValueError(f"{path} header is not a JSON object")
+    return header
+
+
 def _write_tiny_safetensors(hf_dir) -> tuple[dict[str, bytes], dict[str, tuple[int, ...]]]:
     tensors = {
         "model.sam_model.tiny_a.weight": (np.array([[1.0, -2.0], [3.5, 0.25]], dtype=np.float32), (2, 2)),
@@ -120,6 +136,35 @@ def _write_tiny_safetensors(hf_dir) -> tuple[dict[str, bytes], dict[str, tuple[i
     (hf_dir / "model.safetensors.index.json").write_text(json.dumps(index), encoding="utf-8")
     (hf_dir / "tokenizer.json").write_text("{}\n", encoding="utf-8")
     return payloads, {name: shape for name, (_values, shape) in tensors.items()}
+
+
+def test_cached_safetensors_header_current_checkpoint_facts() -> None:
+    context_dir = project_root() / "data/context"
+    header = _read_length_prefixed_safetensors_header(context_dir / "model.safetensors.header")
+    index = json.loads((context_dir / "model.safetensors.index.json").read_text(encoding="utf-8"))
+
+    entries = {name: meta for name, meta in header.items() if name != "__metadata__"}
+    assert len(entries) == EXPECTED_TENSOR_COUNT
+    assert len(index["weight_map"]) == EXPECTED_TENSOR_COUNT
+    assert set(index["weight_map"]) == set(entries)
+    assert set(index["weight_map"].values()) == {"model-00001-of-000001.safetensors"}
+    assert index["metadata"]["total_size"] == EXPECTED_TOTAL_BYTES
+
+    total_payload_bytes = 0
+    max_payload_end = 0
+    for name, meta in entries.items():
+        assert isinstance(meta, dict), name
+        assert meta.get("dtype") == "BF16", name
+        offsets = meta.get("data_offsets")
+        assert isinstance(offsets, list) and len(offsets) == 2, name
+        start, end = offsets
+        assert isinstance(start, int) and isinstance(end, int), name
+        assert 0 <= start < end <= EXPECTED_TOTAL_BYTES, name
+        total_payload_bytes += end - start
+        max_payload_end = max(max_payload_end, end)
+
+    assert total_payload_bytes == EXPECTED_TOTAL_BYTES
+    assert max_payload_end == EXPECTED_TOTAL_BYTES
 
 
 def test_fp16_converter_dry_run_against_cached_header() -> None:
