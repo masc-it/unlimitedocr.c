@@ -446,6 +446,58 @@ typedef struct uocr_metal_clip_transformer_block_f16 {
     const uint16_t *mlp_fc2_bias_f16;
 } uocr_metal_clip_transformer_block_f16;
 
+typedef struct uocr_metal_sam_transformer_block_f16 {
+    const uint16_t *norm1_weight_f16;
+    const uint16_t *norm1_bias_f16;
+    const uint16_t *qkv_weight_f16;
+    const uint16_t *qkv_bias_f16;
+    const uint16_t *proj_weight_f16;
+    const uint16_t *proj_bias_f16;
+    const uint16_t *rel_pos_h_f16;
+    const uint16_t *rel_pos_w_f16;
+    uint32_t rel_pos_h_length;
+    uint32_t rel_pos_w_length;
+    const uint16_t *norm2_weight_f16;
+    const uint16_t *norm2_bias_f16;
+    const uint16_t *mlp_lin1_weight_f16;
+    const uint16_t *mlp_lin1_bias_f16;
+    const uint16_t *mlp_lin2_weight_f16;
+    const uint16_t *mlp_lin2_bias_f16;
+} uocr_metal_sam_transformer_block_f16;
+
+/* Diagnostic SAM transformer block helper. Runs the upstream pre-norm block
+ * over BHWC-flattened rows [grid_h*grid_w,768]. Non-global blocks partition
+ * LayerNorm1 output into 14x14 windows with bottom/right padding, run rel-pos
+ * attention per window, unpartition, then apply the two residuals. Global
+ * blocks run rel-pos attention over the full grid. Internal activations are
+ * kept fp16 for the current Metal vision bring-up path.
+ */
+int uocr_metal_context_sam_transformer_block_f16(uocr_metal_context *ctx,
+                                                 const uint16_t *input_bhwc_f16,
+                                                 const uocr_metal_sam_transformer_block_f16 *block,
+                                                 uint32_t grid_w,
+                                                 uint32_t grid_h,
+                                                 int use_global_attention,
+                                                 uocr_metal_dense_output_type output_type,
+                                                 void *out_bhwc,
+                                                 char *error,
+                                                 size_t error_size);
+
+/* Diagnostic 12-block SAM transformer helper. The blocks array must contain
+ * UOCR_SAM_BLOCKS entries in layer order; global attention is selected for
+ * blocks 2, 5, 8, and 11.
+ */
+int uocr_metal_context_sam_transformer_f16(uocr_metal_context *ctx,
+                                           const uint16_t *input_bhwc_f16,
+                                           const uocr_metal_sam_transformer_block_f16 *blocks,
+                                           uint32_t block_count,
+                                           uint32_t grid_w,
+                                           uint32_t grid_h,
+                                           uocr_metal_dense_output_type output_type,
+                                           void *out_bhwc,
+                                           char *error,
+                                           size_t error_size);
+
 /* Diagnostic CLIP embedding helper for the SAM-output path. Consumes SAM net
  * output in NCHW fp16 layout [1024,grid_h,grid_w], flattens spatial features
  * in row-major order, prepends the fp16 CLIP class embedding [1024], and emits

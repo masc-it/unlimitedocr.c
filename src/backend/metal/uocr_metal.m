@@ -8672,6 +8672,403 @@ int uocr_metal_context_visual_projector_f16(uocr_metal_context *ctx,
     return 1;
 }
 
+static int metal_sam_transformer_block_has_weights(const uocr_metal_sam_transformer_block_f16 *block) {
+    return block != NULL && block->norm1_weight_f16 != NULL && block->norm1_bias_f16 != NULL &&
+           block->qkv_weight_f16 != NULL && block->qkv_bias_f16 != NULL &&
+           block->proj_weight_f16 != NULL && block->proj_bias_f16 != NULL &&
+           block->rel_pos_h_f16 != NULL && block->rel_pos_w_f16 != NULL &&
+           block->rel_pos_h_length != 0u && block->rel_pos_w_length != 0u &&
+           block->norm2_weight_f16 != NULL && block->norm2_bias_f16 != NULL &&
+           block->mlp_lin1_weight_f16 != NULL && block->mlp_lin1_bias_f16 != NULL &&
+           block->mlp_lin2_weight_f16 != NULL && block->mlp_lin2_bias_f16 != NULL;
+}
+
+static int metal_sam_transformer_activation_bytes(uint32_t grid_w,
+                                                  uint32_t grid_h,
+                                                  uint64_t *row_count,
+                                                  uint64_t *hidden_bytes,
+                                                  char *error,
+                                                  size_t error_size) {
+    if (grid_w == 0u || grid_h == 0u || grid_w > UOCR_SAM_MAX_GRID_SIZE || grid_h > UOCR_SAM_MAX_GRID_SIZE) {
+        return metal_fail(error, error_size, "invalid Metal SAM transformer grid %ux%u", grid_w, grid_h);
+    }
+    uint64_t rows = 0u;
+    uint64_t values = 0u;
+    uint64_t bytes = 0u;
+    if (!checked_mul_u64((uint64_t)grid_w, (uint64_t)grid_h, &rows) || rows == 0u ||
+        rows > (uint64_t)UINT32_MAX || !checked_mul_u64(rows, (uint64_t)UOCR_SAM_HIDDEN_SIZE, &values) ||
+        !checked_mul_u64(values, 2u, &bytes) || values > (uint64_t)UINT32_MAX || bytes > (uint64_t)SIZE_MAX) {
+        return metal_fail(error, error_size, "Metal SAM transformer byte-size overflow");
+    }
+    if (row_count != NULL) {
+        *row_count = rows;
+    }
+    if (hidden_bytes != NULL) {
+        *hidden_bytes = bytes;
+    }
+    return 1;
+}
+
+int uocr_metal_context_sam_transformer_block_f16(uocr_metal_context *ctx,
+                                                 const uint16_t *input_bhwc_f16,
+                                                 const uocr_metal_sam_transformer_block_f16 *block,
+                                                 uint32_t grid_w,
+                                                 uint32_t grid_h,
+                                                 int use_global_attention,
+                                                 uocr_metal_dense_output_type output_type,
+                                                 void *out_bhwc,
+                                                 char *error,
+                                                 size_t error_size) {
+    metal_clear_error(error, error_size);
+    if (ctx == NULL || input_bhwc_f16 == NULL || !metal_sam_transformer_block_has_weights(block) || out_bhwc == NULL) {
+        return metal_fail(error, error_size, "invalid Metal SAM transformer block request");
+    }
+    if (output_type != UOCR_METAL_DENSE_OUTPUT_F16 && output_type != UOCR_METAL_DENSE_OUTPUT_F32) {
+        return metal_fail(error, error_size, "unsupported Metal SAM transformer block output type %d", (int)output_type);
+    }
+    if (UOCR_SAM_HIDDEN_SIZE != 768u || UOCR_SAM_QKV_SIZE != 2304u || UOCR_SAM_ATTENTION_HEADS != 12u ||
+        UOCR_SAM_HEAD_DIM != 64u || UOCR_SAM_ATTENTION_HEADS * UOCR_SAM_HEAD_DIM != UOCR_SAM_HIDDEN_SIZE ||
+        UOCR_SAM_WINDOW_SIZE != 14u || UOCR_SAM_WINDOW_TOKENS != 196u || UOCR_SAM_MLP_INTERMEDIATE != 3072u) {
+        return metal_fail(error, error_size, "Metal SAM transformer block constants are inconsistent");
+    }
+
+    uint64_t row_count_u64 = 0u;
+    uint64_t hidden_bytes = 0u;
+    if (!metal_sam_transformer_activation_bytes(grid_w, grid_h, &row_count_u64, &hidden_bytes, error, error_size)) {
+        return 0;
+    }
+    const uint32_t row_count = (uint32_t)row_count_u64;
+
+    uint32_t n_windows = 1u;
+    uint32_t padded_w = grid_w;
+    uint32_t padded_h = grid_h;
+    uint64_t attention_rows_u64 = row_count_u64;
+    uint64_t attention_values = 0u;
+    uint64_t attention_bytes = 0u;
+    if (!use_global_attention) {
+        uint32_t windows_per_row = 0u;
+        uint32_t windows_per_col = 0u;
+        if (!sam_window_partition_geometry(grid_w,
+                                           grid_h,
+                                           &padded_w,
+                                           &padded_h,
+                                           &windows_per_row,
+                                           &windows_per_col,
+                                           &n_windows)) {
+            return metal_fail(error, error_size, "invalid Metal SAM transformer window grid %ux%u", grid_w, grid_h);
+        }
+        if (!checked_mul_u64((uint64_t)n_windows, (uint64_t)UOCR_SAM_WINDOW_TOKENS, &attention_rows_u64)) {
+            return metal_fail(error, error_size, "Metal SAM transformer window row-count overflow");
+        }
+    }
+    if (!checked_mul_u64(attention_rows_u64, (uint64_t)UOCR_SAM_HIDDEN_SIZE, &attention_values) ||
+        !checked_mul_u64(attention_values, 2u, &attention_bytes) || attention_rows_u64 > (uint64_t)UINT32_MAX ||
+        attention_values > (uint64_t)UINT32_MAX || attention_bytes > (uint64_t)SIZE_MAX) {
+        return metal_fail(error, error_size, "Metal SAM transformer attention byte-size overflow");
+    }
+    const uint32_t attention_rows = (uint32_t)attention_rows_u64;
+
+    const uint64_t max_buffer_length = metal_device_max_buffer_length(ctx->device);
+    if (hidden_bytes > max_buffer_length || attention_bytes > max_buffer_length) {
+        return metal_fail(error,
+                          error_size,
+                          "Metal SAM transformer block buffers exceed maxBufferLength %llu",
+                          (unsigned long long)max_buffer_length);
+    }
+
+    int result = 0;
+    uint16_t *norm1_f16 = (uint16_t *)malloc((size_t)hidden_bytes);
+    uint16_t *window_tokens_f16 = (uint16_t *)malloc((size_t)attention_bytes);
+    uint16_t *q_f16 = (uint16_t *)malloc((size_t)attention_bytes);
+    uint16_t *k_f16 = (uint16_t *)malloc((size_t)attention_bytes);
+    uint16_t *v_f16 = (uint16_t *)malloc((size_t)attention_bytes);
+    uint16_t *attention_f16 = (uint16_t *)malloc((size_t)attention_bytes);
+    uint16_t *projected_windows_f16 = (uint16_t *)malloc((size_t)attention_bytes);
+    uint16_t *attention_bhwc_f16 = (uint16_t *)malloc((size_t)hidden_bytes);
+    uint16_t *residual1_f16 = (uint16_t *)malloc((size_t)hidden_bytes);
+    uint16_t *norm2_f16 = (uint16_t *)malloc((size_t)hidden_bytes);
+    uint16_t *mlp_f16 = (uint16_t *)malloc((size_t)hidden_bytes);
+    if (norm1_f16 == NULL || window_tokens_f16 == NULL || q_f16 == NULL || k_f16 == NULL || v_f16 == NULL ||
+        attention_f16 == NULL || projected_windows_f16 == NULL || attention_bhwc_f16 == NULL || residual1_f16 == NULL ||
+        norm2_f16 == NULL || mlp_f16 == NULL) {
+        result = metal_fail(error, error_size, "failed to allocate Metal SAM transformer block scratch buffers");
+        goto cleanup_sam_transformer_block;
+    }
+
+#define RUN_SAM_BLOCK_STEP(step_name, call_expr)                                                       \
+    do {                                                                                                \
+        if (!(call_expr)) {                                                                             \
+            char detail[512];                                                                           \
+            metal_copy_error_detail(detail, sizeof(detail), error);                                      \
+            result = metal_fail(error, error_size, "failed to compute Metal SAM transformer block %s: %s", step_name, detail); \
+            goto cleanup_sam_transformer_block;                                                         \
+        }                                                                                               \
+    } while (0)
+
+    RUN_SAM_BLOCK_STEP("LayerNorm1",
+                       uocr_metal_context_sam_layernorm_f16(ctx,
+                                                             input_bhwc_f16,
+                                                             block->norm1_weight_f16,
+                                                             block->norm1_bias_f16,
+                                                             row_count,
+                                                             UOCR_METAL_LAYERNORM_OUTPUT_F16,
+                                                             norm1_f16,
+                                                             error,
+                                                             error_size));
+
+    if (use_global_attention) {
+        RUN_SAM_BLOCK_STEP("QKV",
+                           uocr_metal_context_sam_qkv_f16(ctx,
+                                                           norm1_f16,
+                                                           block->qkv_weight_f16,
+                                                           block->qkv_bias_f16,
+                                                           row_count,
+                                                           UOCR_METAL_DENSE_OUTPUT_F16,
+                                                           q_f16,
+                                                           k_f16,
+                                                           v_f16,
+                                                           error,
+                                                           error_size));
+        RUN_SAM_BLOCK_STEP("relative-position attention",
+                           uocr_metal_context_sam_rel_pos_attention_f16(ctx,
+                                                                        q_f16,
+                                                                        k_f16,
+                                                                        v_f16,
+                                                                        block->rel_pos_h_f16,
+                                                                        block->rel_pos_w_f16,
+                                                                        1u,
+                                                                        grid_w,
+                                                                        grid_h,
+                                                                        block->rel_pos_h_length,
+                                                                        block->rel_pos_w_length,
+                                                                        UOCR_METAL_DENSE_OUTPUT_F16,
+                                                                        attention_f16,
+                                                                        error,
+                                                                        error_size));
+        RUN_SAM_BLOCK_STEP("attention projection residual",
+                           uocr_metal_context_sam_attention_project_residual_f16(ctx,
+                                                                                 attention_f16,
+                                                                                 block->proj_weight_f16,
+                                                                                 block->proj_bias_f16,
+                                                                                 input_bhwc_f16,
+                                                                                 row_count,
+                                                                                 UOCR_METAL_DENSE_OUTPUT_F16,
+                                                                                 residual1_f16,
+                                                                                 error,
+                                                                                 error_size));
+    } else {
+        uint32_t actual_windows = 0u;
+        uint32_t actual_padded_w = 0u;
+        uint32_t actual_padded_h = 0u;
+        RUN_SAM_BLOCK_STEP("window partition",
+                           uocr_metal_context_sam_window_partition_f16(ctx,
+                                                                       norm1_f16,
+                                                                       grid_w,
+                                                                       grid_h,
+                                                                       window_tokens_f16,
+                                                                       &actual_windows,
+                                                                       &actual_padded_w,
+                                                                       &actual_padded_h,
+                                                                       error,
+                                                                       error_size));
+        if (actual_windows != n_windows || actual_padded_w != padded_w || actual_padded_h != padded_h) {
+            result = metal_fail(error, error_size, "Metal SAM transformer window geometry changed during partition");
+            goto cleanup_sam_transformer_block;
+        }
+        RUN_SAM_BLOCK_STEP("window QKV",
+                           uocr_metal_context_sam_qkv_f16(ctx,
+                                                           window_tokens_f16,
+                                                           block->qkv_weight_f16,
+                                                           block->qkv_bias_f16,
+                                                           attention_rows,
+                                                           UOCR_METAL_DENSE_OUTPUT_F16,
+                                                           q_f16,
+                                                           k_f16,
+                                                           v_f16,
+                                                           error,
+                                                           error_size));
+        RUN_SAM_BLOCK_STEP("window relative-position attention",
+                           uocr_metal_context_sam_rel_pos_attention_f16(ctx,
+                                                                        q_f16,
+                                                                        k_f16,
+                                                                        v_f16,
+                                                                        block->rel_pos_h_f16,
+                                                                        block->rel_pos_w_f16,
+                                                                        n_windows,
+                                                                        UOCR_SAM_WINDOW_SIZE,
+                                                                        UOCR_SAM_WINDOW_SIZE,
+                                                                        block->rel_pos_h_length,
+                                                                        block->rel_pos_w_length,
+                                                                        UOCR_METAL_DENSE_OUTPUT_F16,
+                                                                        attention_f16,
+                                                                        error,
+                                                                        error_size));
+        RUN_SAM_BLOCK_STEP("window output projection",
+                           uocr_metal_context_dense_f16(ctx,
+                                                        attention_f16,
+                                                        block->proj_weight_f16,
+                                                        block->proj_bias_f16,
+                                                        attention_rows,
+                                                        UOCR_SAM_HIDDEN_SIZE,
+                                                        UOCR_SAM_HIDDEN_SIZE,
+                                                        UOCR_METAL_DENSE_OUTPUT_F16,
+                                                        projected_windows_f16,
+                                                        error,
+                                                        error_size));
+        RUN_SAM_BLOCK_STEP("window unpartition",
+                           uocr_metal_context_sam_window_unpartition_f16(ctx,
+                                                                         projected_windows_f16,
+                                                                         grid_w,
+                                                                         grid_h,
+                                                                         attention_bhwc_f16,
+                                                                         error,
+                                                                         error_size));
+        RUN_SAM_BLOCK_STEP("attention residual",
+                           uocr_metal_context_sam_residual_add_f16(ctx,
+                                                                    input_bhwc_f16,
+                                                                    attention_bhwc_f16,
+                                                                    row_count,
+                                                                    UOCR_METAL_DENSE_OUTPUT_F16,
+                                                                    residual1_f16,
+                                                                    error,
+                                                                    error_size));
+    }
+
+    RUN_SAM_BLOCK_STEP("LayerNorm2",
+                       uocr_metal_context_sam_layernorm_f16(ctx,
+                                                             residual1_f16,
+                                                             block->norm2_weight_f16,
+                                                             block->norm2_bias_f16,
+                                                             row_count,
+                                                             UOCR_METAL_LAYERNORM_OUTPUT_F16,
+                                                             norm2_f16,
+                                                             error,
+                                                             error_size));
+    RUN_SAM_BLOCK_STEP("MLP",
+                       uocr_metal_context_sam_mlp_f16(ctx,
+                                                       norm2_f16,
+                                                       block->mlp_lin1_weight_f16,
+                                                       block->mlp_lin1_bias_f16,
+                                                       block->mlp_lin2_weight_f16,
+                                                       block->mlp_lin2_bias_f16,
+                                                       row_count,
+                                                       UOCR_METAL_DENSE_OUTPUT_F16,
+                                                       mlp_f16,
+                                                       error,
+                                                       error_size));
+    RUN_SAM_BLOCK_STEP("MLP residual",
+                       uocr_metal_context_sam_residual_add_f16(ctx,
+                                                                residual1_f16,
+                                                                mlp_f16,
+                                                                row_count,
+                                                                output_type,
+                                                                out_bhwc,
+                                                                error,
+                                                                error_size));
+
+#undef RUN_SAM_BLOCK_STEP
+
+    result = 1;
+
+cleanup_sam_transformer_block:
+    free(mlp_f16);
+    free(norm2_f16);
+    free(residual1_f16);
+    free(attention_bhwc_f16);
+    free(projected_windows_f16);
+    free(attention_f16);
+    free(v_f16);
+    free(k_f16);
+    free(q_f16);
+    free(window_tokens_f16);
+    free(norm1_f16);
+    if (result) {
+        metal_clear_error(error, error_size);
+    }
+    return result;
+}
+
+int uocr_metal_context_sam_transformer_f16(uocr_metal_context *ctx,
+                                           const uint16_t *input_bhwc_f16,
+                                           const uocr_metal_sam_transformer_block_f16 *blocks,
+                                           uint32_t block_count,
+                                           uint32_t grid_w,
+                                           uint32_t grid_h,
+                                           uocr_metal_dense_output_type output_type,
+                                           void *out_bhwc,
+                                           char *error,
+                                           size_t error_size) {
+    metal_clear_error(error, error_size);
+    if (ctx == NULL || input_bhwc_f16 == NULL || blocks == NULL || out_bhwc == NULL) {
+        return metal_fail(error, error_size, "invalid Metal SAM transformer request");
+    }
+    if (block_count != UOCR_SAM_BLOCKS) {
+        return metal_fail(error, error_size, "invalid Metal SAM transformer block count %u", block_count);
+    }
+    if (output_type != UOCR_METAL_DENSE_OUTPUT_F16 && output_type != UOCR_METAL_DENSE_OUTPUT_F32) {
+        return metal_fail(error, error_size, "unsupported Metal SAM transformer output type %d", (int)output_type);
+    }
+    for (uint32_t block_index = 0u; block_index < block_count; ++block_index) {
+        if (!metal_sam_transformer_block_has_weights(&blocks[block_index])) {
+            return metal_fail(error, error_size, "invalid Metal SAM transformer block %u weights", block_index);
+        }
+    }
+
+    uint64_t hidden_bytes = 0u;
+    if (!metal_sam_transformer_activation_bytes(grid_w, grid_h, NULL, &hidden_bytes, error, error_size)) {
+        return 0;
+    }
+
+    int result = 0;
+    uint16_t *state_a_f16 = (uint16_t *)malloc((size_t)hidden_bytes);
+    uint16_t *state_b_f16 = (uint16_t *)malloc((size_t)hidden_bytes);
+    if (state_a_f16 == NULL || state_b_f16 == NULL) {
+        result = metal_fail(error, error_size, "failed to allocate Metal SAM transformer state buffers");
+        goto cleanup_sam_transformer;
+    }
+
+    const uint16_t *current_f16 = input_bhwc_f16;
+    uint16_t *next_f16 = state_a_f16;
+    for (uint32_t block_index = 0u; block_index < block_count; ++block_index) {
+        const int is_last = block_index + 1u == block_count;
+        const uocr_metal_dense_output_type block_output_type = is_last ? output_type : UOCR_METAL_DENSE_OUTPUT_F16;
+        void *block_out = is_last ? out_bhwc : (void *)next_f16;
+        if (!uocr_metal_context_sam_transformer_block_f16(ctx,
+                                                          current_f16,
+                                                          &blocks[block_index],
+                                                          grid_w,
+                                                          grid_h,
+                                                          uocr_sam_block_uses_global_attention(block_index),
+                                                          block_output_type,
+                                                          block_out,
+                                                          error,
+                                                          error_size)) {
+            char detail[512];
+            metal_copy_error_detail(detail, sizeof(detail), error);
+            result = metal_fail(error,
+                                error_size,
+                                "failed to compute Metal SAM transformer block %u: %s",
+                                block_index,
+                                detail);
+            goto cleanup_sam_transformer;
+        }
+        if (!is_last) {
+            current_f16 = next_f16;
+            next_f16 = next_f16 == state_a_f16 ? state_b_f16 : state_a_f16;
+        }
+    }
+
+    result = 1;
+
+cleanup_sam_transformer:
+    free(state_b_f16);
+    free(state_a_f16);
+    if (result) {
+        metal_clear_error(error, error_size);
+    }
+    return result;
+}
+
 static int metal_context_sam_attention_f16(uocr_metal_context *ctx,
                                            const uint16_t *q_f16,
                                            const uint16_t *k_f16,

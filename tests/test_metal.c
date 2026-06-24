@@ -4789,6 +4789,221 @@ static int test_metal_sam_residuals_f16(void) {
     return 0;
 }
 
+static int test_metal_sam_transformer_block_f16(void) {
+    if (!uocr_metal_is_available()) {
+        return 0;
+    }
+
+    enum {
+        GRID_W = 3u,
+        GRID_H = 2u,
+        ROWS = GRID_W * GRID_H,
+        HIDDEN = UOCR_SAM_HIDDEN_SIZE,
+        QKV = UOCR_SAM_QKV_SIZE,
+        MLP = UOCR_SAM_MLP_INTERMEDIATE,
+    };
+    CHECK(UOCR_SAM_BLOCKS == 12u);
+    CHECK(UOCR_SAM_WINDOW_SIZE == 14u);
+    CHECK(UOCR_SAM_WINDOW_REL_POS_SIZE == 27u);
+    CHECK(UOCR_SAM_MAX_REL_POS_SIZE == 127u);
+
+    uint16_t *input = (uint16_t *)calloc((size_t)ROWS * HIDDEN, sizeof(uint16_t));
+    uint16_t *norm1_weight = (uint16_t *)calloc(HIDDEN, sizeof(uint16_t));
+    uint16_t *norm1_bias = (uint16_t *)calloc(HIDDEN, sizeof(uint16_t));
+    uint16_t *qkv_weight = (uint16_t *)calloc((size_t)QKV * HIDDEN, sizeof(uint16_t));
+    uint16_t *qkv_bias = (uint16_t *)calloc(QKV, sizeof(uint16_t));
+    uint16_t *proj_weight = (uint16_t *)calloc((size_t)HIDDEN * HIDDEN, sizeof(uint16_t));
+    uint16_t *proj_bias = (uint16_t *)calloc(HIDDEN, sizeof(uint16_t));
+    uint16_t *rel_h = (uint16_t *)calloc((size_t)UOCR_SAM_MAX_REL_POS_SIZE * UOCR_SAM_HEAD_DIM, sizeof(uint16_t));
+    uint16_t *rel_w = (uint16_t *)calloc((size_t)UOCR_SAM_MAX_REL_POS_SIZE * UOCR_SAM_HEAD_DIM, sizeof(uint16_t));
+    uint16_t *norm2_weight = (uint16_t *)calloc(HIDDEN, sizeof(uint16_t));
+    uint16_t *norm2_bias = (uint16_t *)calloc(HIDDEN, sizeof(uint16_t));
+    uint16_t *lin1_weight = (uint16_t *)calloc((size_t)MLP * HIDDEN, sizeof(uint16_t));
+    uint16_t *lin1_bias = (uint16_t *)calloc(MLP, sizeof(uint16_t));
+    uint16_t *lin2_weight = (uint16_t *)calloc((size_t)HIDDEN * MLP, sizeof(uint16_t));
+    uint16_t *lin2_bias = (uint16_t *)calloc(HIDDEN, sizeof(uint16_t));
+    float *out_f32 = (float *)calloc((size_t)ROWS * HIDDEN, sizeof(float));
+    uint16_t *out_f16 = (uint16_t *)calloc((size_t)ROWS * HIDDEN, sizeof(uint16_t));
+    uint16_t *stack_out_f16 = (uint16_t *)calloc((size_t)ROWS * HIDDEN, sizeof(uint16_t));
+    CHECK(input != NULL);
+    CHECK(norm1_weight != NULL);
+    CHECK(norm1_bias != NULL);
+    CHECK(qkv_weight != NULL);
+    CHECK(qkv_bias != NULL);
+    CHECK(proj_weight != NULL);
+    CHECK(proj_bias != NULL);
+    CHECK(rel_h != NULL);
+    CHECK(rel_w != NULL);
+    CHECK(norm2_weight != NULL);
+    CHECK(norm2_bias != NULL);
+    CHECK(lin1_weight != NULL);
+    CHECK(lin1_bias != NULL);
+    CHECK(lin2_weight != NULL);
+    CHECK(lin2_bias != NULL);
+    CHECK(out_f32 != NULL);
+    CHECK(out_f16 != NULL);
+    CHECK(stack_out_f16 != NULL);
+
+    for (uint32_t channel = 0u; channel < HIDDEN; ++channel) {
+        norm1_weight[channel] = f32_to_f16_bits(1.0f);
+        norm2_weight[channel] = f32_to_f16_bits(1.0f);
+        proj_bias[channel] = f32_to_f16_bits(((int)(channel % 17u) - 8) * 0.0025f);
+        lin2_bias[channel] = f32_to_f16_bits(((int)(channel % 23u) - 11) * 0.00175f);
+    }
+    for (uint32_t y = 0u; y < GRID_H; ++y) {
+        for (uint32_t x = 0u; x < GRID_W; ++x) {
+            for (uint32_t channel = 0u; channel < HIDDEN; ++channel) {
+                const int mod = (int)((y * 31u + x * 17u + channel * 7u) % 97u) - 48;
+                input[sam_bhwc_index(GRID_W, y, x, channel)] = f32_to_f16_bits((float)mod * 0.0025f);
+            }
+        }
+    }
+
+    uocr_metal_sam_transformer_block_f16 block = {
+        norm1_weight,
+        norm1_bias,
+        qkv_weight,
+        qkv_bias,
+        proj_weight,
+        proj_bias,
+        rel_h,
+        rel_w,
+        UOCR_SAM_MAX_REL_POS_SIZE,
+        UOCR_SAM_MAX_REL_POS_SIZE,
+        norm2_weight,
+        norm2_bias,
+        lin1_weight,
+        lin1_bias,
+        lin2_weight,
+        lin2_bias,
+    };
+
+    char error[1024];
+    memset(error, 0, sizeof(error));
+    uocr_metal_context *ctx = uocr_metal_context_create(UOCR_TEST_METAL_RESOURCE_PATH, error, sizeof(error));
+    CHECK(ctx != NULL);
+
+    CHECK(uocr_metal_context_sam_transformer_block_f16(ctx,
+                                                       input,
+                                                       &block,
+                                                       GRID_W,
+                                                       GRID_H,
+                                                       1,
+                                                       UOCR_METAL_DENSE_OUTPUT_F32,
+                                                       out_f32,
+                                                       error,
+                                                       sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+
+    struct sam_transformer_sample {
+        uint32_t y;
+        uint32_t x;
+        uint32_t channel;
+    } samples[] = {
+        {0u, 0u, 0u},
+        {0u, 2u, 17u},
+        {1u, 0u, 101u},
+        {1u, 2u, HIDDEN - 1u},
+    };
+    for (size_t i = 0u; i < sizeof(samples) / sizeof(samples[0]); ++i) {
+        const size_t idx = sam_bhwc_index(GRID_W, samples[i].y, samples[i].x, samples[i].channel);
+        const float residual1 = f16_bits_to_f32(f32_to_f16_bits(f16_bits_to_f32(input[idx]) +
+                                                                f16_bits_to_f32(proj_bias[samples[i].channel])));
+        const float expected = residual1 + f16_bits_to_f32(lin2_bias[samples[i].channel]);
+        CHECK(fabsf(out_f32[idx] - expected) <= 1.0e-7f);
+    }
+
+    block.rel_pos_h_length = UOCR_SAM_WINDOW_REL_POS_SIZE;
+    block.rel_pos_w_length = UOCR_SAM_WINDOW_REL_POS_SIZE;
+    CHECK(uocr_metal_context_sam_transformer_block_f16(ctx,
+                                                       input,
+                                                       &block,
+                                                       GRID_W,
+                                                       GRID_H,
+                                                       0,
+                                                       UOCR_METAL_DENSE_OUTPUT_F16,
+                                                       out_f16,
+                                                       error,
+                                                       sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    for (size_t i = 0u; i < sizeof(samples) / sizeof(samples[0]); ++i) {
+        const size_t idx = sam_bhwc_index(GRID_W, samples[i].y, samples[i].x, samples[i].channel);
+        const float residual1 = f16_bits_to_f32(f32_to_f16_bits(f16_bits_to_f32(input[idx]) +
+                                                                f16_bits_to_f32(proj_bias[samples[i].channel])));
+        const float expected = residual1 + f16_bits_to_f32(lin2_bias[samples[i].channel]);
+        CHECK(fabsf(f16_bits_to_f32(out_f16[idx]) - expected) <= 6.5e-4f);
+    }
+
+    memset(proj_bias, 0, HIDDEN * sizeof(uint16_t));
+    memset(lin2_bias, 0, HIDDEN * sizeof(uint16_t));
+    block.rel_pos_h_length = UOCR_SAM_MAX_REL_POS_SIZE;
+    block.rel_pos_w_length = UOCR_SAM_MAX_REL_POS_SIZE;
+    uocr_metal_sam_transformer_block_f16 blocks[UOCR_SAM_BLOCKS];
+    for (uint32_t i = 0u; i < UOCR_SAM_BLOCKS; ++i) {
+        blocks[i] = block;
+    }
+    CHECK(uocr_metal_context_sam_transformer_f16(ctx,
+                                                 input,
+                                                 blocks,
+                                                 UOCR_SAM_BLOCKS,
+                                                 GRID_W,
+                                                 GRID_H,
+                                                 UOCR_METAL_DENSE_OUTPUT_F16,
+                                                 stack_out_f16,
+                                                 error,
+                                                 sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    for (size_t i = 0u; i < sizeof(samples) / sizeof(samples[0]); ++i) {
+        const size_t idx = sam_bhwc_index(GRID_W, samples[i].y, samples[i].x, samples[i].channel);
+        CHECK(stack_out_f16[idx] == input[idx]);
+    }
+
+    CHECK(uocr_metal_context_sam_transformer_block_f16(ctx,
+                                                       input,
+                                                       NULL,
+                                                       GRID_W,
+                                                       GRID_H,
+                                                       1,
+                                                       UOCR_METAL_DENSE_OUTPUT_F16,
+                                                       out_f16,
+                                                       error,
+                                                       sizeof(error)) == 0);
+    CHECK(strstr(error, "invalid Metal SAM transformer block") != NULL);
+
+    CHECK(uocr_metal_context_sam_transformer_f16(ctx,
+                                                 input,
+                                                 blocks,
+                                                 UOCR_SAM_BLOCKS - 1u,
+                                                 GRID_W,
+                                                 GRID_H,
+                                                 UOCR_METAL_DENSE_OUTPUT_F16,
+                                                 stack_out_f16,
+                                                 error,
+                                                 sizeof(error)) == 0);
+    CHECK(strstr(error, "invalid Metal SAM transformer block count") != NULL);
+
+    uocr_metal_context_destroy(ctx);
+    free(stack_out_f16);
+    free(out_f16);
+    free(out_f32);
+    free(lin2_bias);
+    free(lin2_weight);
+    free(lin1_bias);
+    free(lin1_weight);
+    free(norm2_bias);
+    free(norm2_weight);
+    free(rel_w);
+    free(rel_h);
+    free(proj_bias);
+    free(proj_weight);
+    free(qkv_bias);
+    free(qkv_weight);
+    free(norm1_bias);
+    free(norm1_weight);
+    free(input);
+    return 0;
+}
+
 static int env_flag_enabled(const char *name) {
     const char *value = getenv(name);
     return value != NULL && (strcmp(value, "1") == 0 || strcmp(value, "true") == 0 || strcmp(value, "TRUE") == 0 ||
@@ -13555,6 +13770,7 @@ int main(void) {
     if (test_metal_sam_rel_pos_attention_f16() != 0) return 1;
     if (test_metal_sam_mlp_f16() != 0) return 1;
     if (test_metal_sam_residuals_f16() != 0) return 1;
+    if (test_metal_sam_transformer_block_f16() != 0) return 1;
     if (test_metal_get_rows_f16() != 0) return 1;
     if (test_metal_prompt_assembly_f16() != 0) return 1;
     if (test_metal_prompt_assembly_from_mapped_model_f16() != 0) return 1;
