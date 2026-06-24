@@ -337,6 +337,111 @@ static int test_metal_prompt_assembly_f16(void) {
     return 0;
 }
 
+static int test_metal_prompt_assembly_from_mapped_model_f16(void) {
+    if (!uocr_metal_is_available()) {
+        return 0;
+    }
+
+    enum { ROW_COUNT = 4, HIDDEN = UOCR_HIDDEN_SIZE, TEXT_TOKENS = 3, IMAGE_TOKENS = 2, PROMPT_TOKENS = 6 };
+    const uint32_t rows[ROW_COUNT] = {0u, 1u, 42u, 99u};
+    uint16_t row_weights[ROW_COUNT * HIDDEN];
+    for (uint32_t row = 0u; row < (uint32_t)ROW_COUNT; ++row) {
+        for (uint32_t col = 0u; col < (uint32_t)HIDDEN; ++col) {
+            const int centered = (int)(((row + 5u) * 13u + col * 7u) % 31u) - 15;
+            row_weights[row * (uint32_t)HIDDEN + col] = f32_to_f16_bits((float)centered * 0.015625f);
+        }
+    }
+    uint16_t image_features[IMAGE_TOKENS * HIDDEN];
+    for (uint32_t i = 0u; i < (uint32_t)(IMAGE_TOKENS * HIDDEN); ++i) {
+        image_features[i] = f32_to_f16_bits((float)((int)(i % 23u) - 11) * 0.03125f);
+    }
+
+    char path[128];
+    CHECK(uocr_test_make_temp_path(path, sizeof(path)) == 0);
+    CHECK(uocr_test_write_sparse_tok_embed_uocr_model(path, rows, row_weights, ROW_COUNT) == 0);
+
+    char error[1024];
+    memset(error, 0, sizeof(error));
+    uocr_model_file model;
+    CHECK(uocr_model_file_open(path, &model, error, sizeof(error)) == 0);
+
+    uocr_metal_context *ctx = uocr_metal_context_create(UOCR_TEST_METAL_RESOURCE_PATH, error, sizeof(error));
+    CHECK(ctx != NULL);
+
+    const int32_t text_ids[TEXT_TOKENS] = {0, 42, 1};
+    uint16_t text_out[TEXT_TOKENS * HIDDEN];
+    CHECK(uocr_metal_context_assemble_prompt_from_model_f16(ctx,
+                                                            text_ids,
+                                                            TEXT_TOKENS,
+                                                            UINT32_MAX,
+                                                            0u,
+                                                            NULL,
+                                                            text_out,
+                                                            error,
+                                                            sizeof(error)) == 0);
+    CHECK(strstr(error, "requires mapped model views") != NULL);
+
+    CHECK(uocr_metal_context_map_model(ctx, &model, error, sizeof(error)) == 1);
+    CHECK(uocr_metal_context_assemble_prompt_from_model_f16(ctx,
+                                                            text_ids,
+                                                            TEXT_TOKENS,
+                                                            UINT32_MAX,
+                                                            0u,
+                                                            NULL,
+                                                            text_out,
+                                                            error,
+                                                            sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    for (uint32_t token = 0u; token < (uint32_t)TEXT_TOKENS; ++token) {
+        uint32_t row_index = UINT32_MAX;
+        for (uint32_t r = 0u; r < (uint32_t)ROW_COUNT; ++r) {
+            if (rows[r] == (uint32_t)text_ids[token]) {
+                row_index = r;
+            }
+        }
+        CHECK(row_index != UINT32_MAX);
+        for (uint32_t col = 0u; col < (uint32_t)HIDDEN; ++col) {
+            CHECK(text_out[token * (uint32_t)HIDDEN + col] == row_weights[row_index * (uint32_t)HIDDEN + col]);
+        }
+    }
+
+    const int32_t prompt_ids[PROMPT_TOKENS] = {0, 99, UOCR_TOKEN_IMAGE, UOCR_TOKEN_IMAGE, 42, 1};
+    uint16_t prompt_out[PROMPT_TOKENS * HIDDEN];
+    CHECK(uocr_metal_context_assemble_prompt_from_model_f16(ctx,
+                                                            prompt_ids,
+                                                            PROMPT_TOKENS,
+                                                            2u,
+                                                            IMAGE_TOKENS,
+                                                            image_features,
+                                                            prompt_out,
+                                                            error,
+                                                            sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    for (uint32_t token = 0u; token < (uint32_t)PROMPT_TOKENS; ++token) {
+        for (uint32_t col = 0u; col < (uint32_t)HIDDEN; ++col) {
+            uint16_t expected = 0u;
+            if (token >= 2u && token < 2u + (uint32_t)IMAGE_TOKENS) {
+                expected = image_features[(token - 2u) * (uint32_t)HIDDEN + col];
+            } else {
+                uint32_t row_index = UINT32_MAX;
+                for (uint32_t r = 0u; r < (uint32_t)ROW_COUNT; ++r) {
+                    if (rows[r] == (uint32_t)prompt_ids[token]) {
+                        row_index = r;
+                    }
+                }
+                CHECK(row_index != UINT32_MAX);
+                expected = row_weights[row_index * (uint32_t)HIDDEN + col];
+            }
+            CHECK(prompt_out[token * (uint32_t)HIDDEN + col] == expected);
+        }
+    }
+
+    uocr_metal_context_destroy(ctx);
+    uocr_model_file_close(&model);
+    unlink(path);
+    return 0;
+}
+
 static int test_metal_rmsnorm_f16(void) {
     if (!uocr_metal_is_available()) {
         return 0;
@@ -3791,6 +3896,7 @@ int main(void) {
     if (test_metal_named_scratch_buffers() != 0) return 1;
     if (test_metal_get_rows_f16() != 0) return 1;
     if (test_metal_prompt_assembly_f16() != 0) return 1;
+    if (test_metal_prompt_assembly_from_mapped_model_f16() != 0) return 1;
     if (test_metal_rmsnorm_f16() != 0) return 1;
     if (test_metal_final_rmsnorm_f16() != 0) return 1;
     if (test_metal_lm_head_f16() != 0) return 1;

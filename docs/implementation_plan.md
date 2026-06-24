@@ -600,6 +600,7 @@ First implementation slice, in order:
   - [x] write image features into image spans when provided
   - [x] avoid emulating Python `masked_scatter_`
 - [x] Add a text-only path where no image features are present.
+- [x] Bind mmap-backed token embeddings for production prompt assembly.
 - [ ] Compare prompt embeddings against Python dumps.
 
 ### 14.2 Decoder layer primitives

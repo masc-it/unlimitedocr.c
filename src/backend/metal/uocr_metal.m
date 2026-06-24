@@ -1910,22 +1910,24 @@ static int validate_prompt_text_token_ids(const int32_t *input_ids,
     return 1;
 }
 
-int uocr_metal_context_assemble_prompt_f16(uocr_metal_context *ctx,
-                                           const uint16_t *embedding_table_f16,
-                                           uint32_t table_rows,
-                                           uint32_t hidden_size,
-                                           const int32_t *input_ids,
-                                           uint32_t n_tokens,
-                                           uint32_t image_span_start,
-                                           uint32_t image_span_length,
-                                           const uint16_t *image_features_f16,
-                                           uint16_t *out_prompt_f16,
-                                           char *error,
-                                           size_t error_size) {
-    metal_clear_error(error, error_size);
-    if (ctx == NULL || embedding_table_f16 == NULL || input_ids == NULL || out_prompt_f16 == NULL ||
+static int metal_context_assemble_prompt_f16_with_table_buffer(uocr_metal_context *ctx,
+                                                                id<MTLBuffer> table_buffer,
+                                                                NSUInteger table_offset,
+                                                                uint32_t table_rows,
+                                                                uint32_t hidden_size,
+                                                                const int32_t *input_ids,
+                                                                uint32_t n_tokens,
+                                                                uint32_t image_span_start,
+                                                                uint32_t image_span_length,
+                                                                const uint16_t *image_features_f16,
+                                                                uint16_t *out_prompt_f16,
+                                                                const char *op_name,
+                                                                char *error,
+                                                                size_t error_size) {
+    const char *op = op_name != NULL ? op_name : "Metal prompt assembly";
+    if (ctx == NULL || table_buffer == nil || input_ids == NULL || out_prompt_f16 == NULL ||
         table_rows == 0u || hidden_size == 0u || n_tokens == 0u) {
-        return metal_fail(error, error_size, "invalid Metal prompt assembly request");
+        return metal_fail(error, error_size, "invalid %s request", op);
     }
 
     const int has_image_span = image_span_length != 0u;
@@ -1936,16 +1938,17 @@ int uocr_metal_context_assemble_prompt_f16(uocr_metal_context *ctx,
             image_span_start >= n_tokens || image_end > (uint64_t)n_tokens) {
             return metal_fail(error,
                               error_size,
-                              "Metal prompt image span [%u,%llu) is outside %u tokens",
+                              "%s image span [%u,%llu) is outside %u tokens",
+                              op,
                               image_span_start,
                               (unsigned long long)image_end,
                               n_tokens);
         }
         if (image_features_f16 == NULL) {
-            return metal_fail(error, error_size, "Metal prompt image span requires image features");
+            return metal_fail(error, error_size, "%s image span requires image features", op);
         }
     } else if (image_span_start != UINT32_MAX) {
-        return metal_fail(error, error_size, "Metal text-only prompt should use UINT32_MAX image span start");
+        return metal_fail(error, error_size, "%s text-only path should use UINT32_MAX image span start", op);
     }
 
     if (!validate_prompt_text_token_ids(input_ids,
@@ -1972,17 +1975,29 @@ int uocr_metal_context_assemble_prompt_f16(uocr_metal_context *ctx,
         !checked_mul_u64(output_values, 2u, &output_bytes) ||
         !checked_mul_u64((uint64_t)image_span_length, (uint64_t)hidden_size, &image_values) ||
         !checked_mul_u64(image_values, 2u, &image_bytes)) {
-        return metal_fail(error, error_size, "Metal prompt assembly byte-size overflow");
+        return metal_fail(error, error_size, "%s byte-size overflow", op);
     }
 
     const uint64_t max_buffer_length = metal_device_max_buffer_length(ctx->device);
-    if (table_bytes > max_buffer_length || token_bytes > max_buffer_length || output_bytes > max_buffer_length ||
-        image_bytes > max_buffer_length || table_bytes > (uint64_t)SIZE_MAX || token_bytes > (uint64_t)SIZE_MAX ||
-        output_bytes > (uint64_t)SIZE_MAX || image_bytes > (uint64_t)SIZE_MAX) {
+    if (token_bytes > max_buffer_length || output_bytes > max_buffer_length || image_bytes > max_buffer_length ||
+        token_bytes > (uint64_t)SIZE_MAX || output_bytes > (uint64_t)SIZE_MAX || image_bytes > (uint64_t)SIZE_MAX) {
         return metal_fail(error,
                           error_size,
-                          "Metal prompt assembly buffers exceed maxBufferLength %llu",
+                          "%s transient buffers exceed maxBufferLength %llu",
+                          op,
                           (unsigned long long)max_buffer_length);
+    }
+    const uint64_t table_offset_u64 = (uint64_t)table_offset;
+    const uint64_t table_length = (uint64_t)[table_buffer length];
+    uint64_t table_end = 0u;
+    if (!checked_add_u64(table_offset_u64, table_bytes, &table_end) || table_end > table_length) {
+        return metal_fail(error,
+                          error_size,
+                          "%s embedding table range [%llu,%llu) exceeds Metal buffer length %llu",
+                          op,
+                          (unsigned long long)table_offset_u64,
+                          (unsigned long long)table_end,
+                          (unsigned long long)table_length);
     }
 
     @autoreleasepool {
@@ -1992,20 +2007,11 @@ int uocr_metal_context_assemble_prompt_f16(uocr_metal_context *ctx,
             return 0;
         }
 
-        id<MTLBuffer> table = [ctx->device newBufferWithBytes:embedding_table_f16
-                                                       length:(NSUInteger)table_bytes
-                                                      options:MTLResourceStorageModeShared];
-        if (table == nil) {
-            return metal_fail(error, error_size, "failed to allocate Metal prompt embedding table buffer");
-        }
-        table.label = @"uocr_prompt_embedding_table_f16";
-
         id<MTLBuffer> tokens = [ctx->device newBufferWithBytes:input_ids
                                                         length:(NSUInteger)token_bytes
                                                        options:MTLResourceStorageModeShared];
         if (tokens == nil) {
-            [table release];
-            return metal_fail(error, error_size, "failed to allocate Metal prompt token-id buffer");
+            return metal_fail(error, error_size, "failed to allocate %s token-id buffer", op);
         }
         tokens.label = @"uocr_prompt_input_ids";
 
@@ -2016,8 +2022,7 @@ int uocr_metal_context_assemble_prompt_f16(uocr_metal_context *ctx,
                                                      options:MTLResourceStorageModeShared];
             if (image_features == nil) {
                 [tokens release];
-                [table release];
-                return metal_fail(error, error_size, "failed to allocate Metal prompt image-feature buffer");
+                return metal_fail(error, error_size, "failed to allocate %s image-feature buffer", op);
             }
             image_features.label = @"uocr_prompt_image_features_f16";
         }
@@ -2027,8 +2032,7 @@ int uocr_metal_context_assemble_prompt_f16(uocr_metal_context *ctx,
         if (dst == nil) {
             [image_features release];
             [tokens release];
-            [table release];
-            return metal_fail(error, error_size, "failed to allocate Metal prompt output buffer");
+            return metal_fail(error, error_size, "failed to allocate %s output buffer", op);
         }
         dst.label = @"uocr_prompt_embeddings_f16";
         memset([dst contents], 0, (size_t)output_bytes);
@@ -2038,8 +2042,7 @@ int uocr_metal_context_assemble_prompt_f16(uocr_metal_context *ctx,
             [dst release];
             [image_features release];
             [tokens release];
-            [table release];
-            return metal_fail(error, error_size, "failed to create Metal prompt assembly command buffer");
+            return metal_fail(error, error_size, "failed to create %s command buffer", op);
         }
         cb.label = @"uocr_prompt_assembly_command_buffer";
 
@@ -2048,8 +2051,7 @@ int uocr_metal_context_assemble_prompt_f16(uocr_metal_context *ctx,
             [dst release];
             [image_features release];
             [tokens release];
-            [table release];
-            return metal_fail(error, error_size, "failed to create Metal prompt assembly command encoder");
+            return metal_fail(error, error_size, "failed to create %s command encoder", op);
         }
 
         uocr_metal_prompt_assembly_params params;
@@ -2063,7 +2065,7 @@ int uocr_metal_context_assemble_prompt_f16(uocr_metal_context *ctx,
         params.reserved2 = 0u;
 
         [enc setComputePipelineState:pipeline];
-        [enc setBuffer:table offset:0u atIndex:0u];
+        [enc setBuffer:table_buffer offset:table_offset atIndex:0u];
         [enc setBuffer:tokens offset:0u atIndex:1u];
         if (has_image_span) {
             [enc setBuffer:image_features offset:0u atIndex:2u];
@@ -2092,19 +2094,119 @@ int uocr_metal_context_assemble_prompt_f16(uocr_metal_context *ctx,
             [dst release];
             [image_features release];
             [tokens release];
-            [table release];
-            return metal_fail(error, error_size, "Metal prompt assembly command failed: %s", [description UTF8String]);
+            return metal_fail(error, error_size, "%s command failed: %s", op, [description UTF8String]);
         }
 
         memcpy(out_prompt_f16, [dst contents], (size_t)output_bytes);
         [dst release];
         [image_features release];
         [tokens release];
-        [table release];
     }
 
     metal_clear_error(error, error_size);
     return 1;
+}
+
+int uocr_metal_context_assemble_prompt_f16(uocr_metal_context *ctx,
+                                           const uint16_t *embedding_table_f16,
+                                           uint32_t table_rows,
+                                           uint32_t hidden_size,
+                                           const int32_t *input_ids,
+                                           uint32_t n_tokens,
+                                           uint32_t image_span_start,
+                                           uint32_t image_span_length,
+                                           const uint16_t *image_features_f16,
+                                           uint16_t *out_prompt_f16,
+                                           char *error,
+                                           size_t error_size) {
+    metal_clear_error(error, error_size);
+    if (ctx == NULL || embedding_table_f16 == NULL || input_ids == NULL || out_prompt_f16 == NULL ||
+        table_rows == 0u || hidden_size == 0u || n_tokens == 0u) {
+        return metal_fail(error, error_size, "invalid Metal prompt assembly request");
+    }
+
+    uint64_t table_values = 0u;
+    uint64_t table_bytes = 0u;
+    if (!checked_mul_u64((uint64_t)table_rows, (uint64_t)hidden_size, &table_values) ||
+        !checked_mul_u64(table_values, 2u, &table_bytes) || table_bytes > (uint64_t)SIZE_MAX ||
+        table_bytes > metal_device_max_buffer_length(ctx->device)) {
+        return metal_fail(error, error_size, "Metal prompt assembly table byte-size overflow");
+    }
+
+    @autoreleasepool {
+        id<MTLBuffer> table = [ctx->device newBufferWithBytes:embedding_table_f16
+                                                       length:(NSUInteger)table_bytes
+                                                      options:MTLResourceStorageModeShared];
+        if (table == nil) {
+            return metal_fail(error, error_size, "failed to allocate Metal prompt embedding table buffer");
+        }
+        table.label = @"uocr_prompt_embedding_table_f16";
+        const int status = metal_context_assemble_prompt_f16_with_table_buffer(ctx,
+                                                                               table,
+                                                                               0u,
+                                                                               table_rows,
+                                                                               hidden_size,
+                                                                               input_ids,
+                                                                               n_tokens,
+                                                                               image_span_start,
+                                                                               image_span_length,
+                                                                               image_features_f16,
+                                                                               out_prompt_f16,
+                                                                               "Metal prompt assembly",
+                                                                               error,
+                                                                               error_size);
+        [table release];
+        return status;
+    }
+}
+
+int uocr_metal_context_assemble_prompt_from_model_f16(uocr_metal_context *ctx,
+                                                      const int32_t *input_ids,
+                                                      uint32_t n_tokens,
+                                                      uint32_t image_span_start,
+                                                      uint32_t image_span_length,
+                                                      const uint16_t *image_features_f16,
+                                                      uint16_t *out_prompt_f16,
+                                                      char *error,
+                                                      size_t error_size) {
+    metal_clear_error(error, error_size);
+    if (ctx == NULL || input_ids == NULL || out_prompt_f16 == NULL || n_tokens == 0u) {
+        return metal_fail(error, error_size, "invalid Metal mapped prompt assembly request");
+    }
+
+    uint64_t table_values = 0u;
+    uint64_t table_bytes = 0u;
+    if (!checked_mul_u64((uint64_t)UOCR_VOCAB_SIZE, (uint64_t)UOCR_HIDDEN_SIZE, &table_values) ||
+        !checked_mul_u64(table_values, 2u, &table_bytes)) {
+        return metal_fail(error, error_size, "Metal mapped prompt assembly table byte-size overflow");
+    }
+
+    id<MTLBuffer> table = nil;
+    NSUInteger table_offset = 0u;
+    if (!metal_get_mapped_tensor_buffer(ctx,
+                                        UOCR_TENSOR_ID_TOK_EMBED,
+                                        table_bytes,
+                                        &table,
+                                        &table_offset,
+                                        error,
+                                        error_size)) {
+        return 0;
+    }
+
+    return metal_context_assemble_prompt_f16_with_table_buffer(ctx,
+                                                               table,
+                                                               table_offset,
+                                                               UOCR_VOCAB_SIZE,
+                                                               UOCR_HIDDEN_SIZE,
+                                                               input_ids,
+                                                               n_tokens,
+                                                               image_span_start,
+                                                               image_span_length,
+                                                               image_features_f16,
+                                                               out_prompt_f16,
+                                                               "Metal mapped prompt assembly",
+                                                               error,
+                                                               error_size);
 }
 
 static int metal_context_rmsnorm_f16_with_weight_buffer(uocr_metal_context *ctx,

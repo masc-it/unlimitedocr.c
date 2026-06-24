@@ -204,6 +204,20 @@ int uocr_metal_context_assemble_prompt_f16(uocr_metal_context *ctx,
                                            char *error,
                                            size_t error_size);
 
+/* Runtime prompt assembly helper. Binds the mmap-backed TOK_EMBED tensor from
+ * mapped .uocr model views, uses fixed Unlimited-OCR vocab/hidden sizes, and
+ * supports the same direct image-feature span used by the diagnostic helper.
+ */
+int uocr_metal_context_assemble_prompt_from_model_f16(uocr_metal_context *ctx,
+                                                      const int32_t *input_ids,
+                                                      uint32_t n_tokens,
+                                                      uint32_t image_span_start,
+                                                      uint32_t image_span_length,
+                                                      const uint16_t *image_features_f16,
+                                                      uint16_t *out_prompt_f16,
+                                                      char *error,
+                                                      size_t error_size);
+
 /* Diagnostic RMSNorm helper for synthetic tests. The kernel accumulates the
  * row variance in fp32 and applies fp16 learned weights.
  */

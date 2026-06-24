@@ -304,6 +304,46 @@ static inline int uocr_test_write_sparse_lm_head_uocr_model(const char *path,
     return failed ? 1 : 0;
 }
 
+static inline int uocr_test_write_sparse_tok_embed_uocr_model(const char *path,
+                                                              const uint32_t *rows,
+                                                              const uint16_t *row_weights_f16,
+                                                              uint32_t row_count) {
+    if (uocr_test_write_sparse_lm_head_uocr_model(path, rows, row_weights_f16, row_count) != 0) {
+        return 1;
+    }
+
+    const uint64_t section_dir_offset = sizeof(uocr_file_header);
+    const uint32_t section_count = 5u;
+    const uint64_t config_offset = section_dir_offset + section_count * sizeof(uocr_section_entry);
+    const uint64_t tokenizer_offset = uocr_test_align_up_u64(config_offset + sizeof(uocr_config_record), 8u);
+    const uint64_t provenance_offset = uocr_test_align_up_u64(tokenizer_offset + sizeof(uocr_tokenizer_metadata_record), 8u);
+    const uint64_t tensor_dir_offset = uocr_test_align_up_u64(provenance_offset + sizeof(uocr_provenance_record), 8u);
+    const uint64_t tensor_entry_offset = tensor_dir_offset + sizeof(uocr_tensor_directory_header);
+    if (tensor_entry_offset > (uint64_t)LONG_MAX) {
+        return 1;
+    }
+
+    FILE *f = fopen(path, "r+b");
+    if (f == NULL) {
+        perror("fopen");
+        return 1;
+    }
+    uocr_tensor_entry tensor;
+    int failed = 0;
+    if (fseek(f, (long)tensor_entry_offset, SEEK_SET) != 0 ||
+        fread(&tensor, 1u, sizeof(tensor), f) != sizeof(tensor)) {
+        failed = 1;
+    }
+    tensor.id = UOCR_TENSOR_ID_TOK_EMBED;
+    tensor.family = UOCR_TENSOR_FAMILY_TOK_EMBED;
+    if (!failed &&
+        (fseek(f, (long)tensor_entry_offset, SEEK_SET) != 0 || fwrite(&tensor, 1u, sizeof(tensor), f) != sizeof(tensor))) {
+        failed = 1;
+    }
+    failed |= fclose(f) != 0;
+    return failed ? 1 : 0;
+}
+
 static inline int uocr_test_write_two_tensor_uocr_model(const char *path) {
     const uint64_t section_dir_offset = sizeof(uocr_file_header);
     const uint32_t section_count = 5u;
