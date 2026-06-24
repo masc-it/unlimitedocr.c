@@ -49,7 +49,7 @@ Current priority slice, in order. The coding agent should take the first uncheck
 - [x] Add a production Metal vision runner that consumes validated public `uocr_prepared_request` views and writes one formatted fp16 visual-feature buffer `[image_tokens,1280]` using the existing view scheduler, SAM/CLIP/projector kernels, and newline/separator formatter.
 - [x] Wire the public Metal path in `uocr_generate_prepared()` for `n_requests=1`, fp16 model, `max_new_tokens>0`, and image requests; find/validate the contiguous image span, run vision, then call the existing integrated decoder with `image_features_f16` instead of returning `UOCR_ERROR_NOT_IMPLEMENTED`.
 - [x] Add an opt-in full-model public image smoke test: Python `prepare_image(..., max_new_tokens=1)` -> C `uocr_generate_prepared()` -> at least one valid generated id; decode the id in Python for developer visibility.
-- [ ] Add image e2e parity fixtures/tests for formatted visual features and first generated ids/text against the Python/HF path, starting with one base/global `1024` image, then gundam `[1,1]`, then real multi-crop.
+- [x] Add image e2e parity fixtures/tests for formatted visual features and first generated ids/text against the Python/HF path, starting with one base/global `1024` image, then gundam `[1,1]`, then real multi-crop.
 - [ ] Add only the thinnest Python convenience wrapper/decoder needed to call the working public path; defer stable `ocr_image`/PDF/postprocess ergonomics until after the native fp16 image path works.
 - [ ] Resume q8/q4 runtime kernels, batching, CUDA, and performance optimization only after Gate E2E-0 passes.
 
@@ -750,7 +750,7 @@ Do not resume quantization, batching, CUDA, or high-level OCR/PDF/postprocess AP
 - [x] Compute the contiguous image span from `image_mask`; validate span length equals formatted visual-feature rows before decoder prefill.
 - [x] Wire public `uocr_generate_prepared()` Metal fp16 image case for `n_requests=1`, `max_new_tokens>0`, and fp16 `.uocr`; pass `image_span_start`, `image_span_length`, and `image_features_f16` into the existing integrated decoder.
 - [x] Add opt-in full-model public image smoke test that returns valid generated ids from real image pixels.
-- [ ] Add parity tests for final visual features and first generated ids/text against Python/HF dumps.
+- [x] Add parity tests for final visual features and first generated ids/text against Python/HF dumps.
 - [ ] Extend the public image smoke from one base/global image to gundam `[1,1]`, gundam real multi-crop, and multi-page base mode.
 
 ### 16.1 Vision scheduling and memory
