@@ -67,6 +67,9 @@ UOCR_TENSOR_USAGE_OMITTED_WITH_REASON = 3
 
 CONVERTER_VERSION = (0, 1, 0)
 
+CLIP_PIXEL_PATCH_EMBEDDING_PREFIX = "model.vision_model.embeddings.patch_embedding."
+PRESERVED_UNUSED_NORMAL_OCR_PREFIXES: tuple[str, ...] = (CLIP_PIXEL_PATCH_EMBEDDING_PREFIX,)
+
 QPROFILE_IDS: Mapping[str, int] = {
     "fp16": UOCR_QPROFILE_FP16,
     "dyn-q8": UOCR_QPROFILE_DYN_Q8,
@@ -472,12 +475,17 @@ def _validate_key_shapes(entries: Mapping[str, Mapping[str, Any]]) -> None:
             raise ValueError(f"tensor {name} shape mismatch: got {actual_shape}, expected {expected_shape}")
 
 
+def is_preserved_unused_in_normal_ocr(name: str) -> bool:
+    """Return true for source tensors intentionally not consumed by v1 OCR inference."""
+    return any(name.startswith(prefix) for prefix in PRESERVED_UNUSED_NORMAL_OCR_PREFIXES)
+
+
 def _usage_for_name(name: str) -> tuple[str, int, str]:
-    if name.startswith("model.vision_model.embeddings.patch_embedding."):
+    if is_preserved_unused_in_normal_ocr(name):
         return (
             "preserved-unused",
             2,
-            "CLIP receives SAM feature maps as patch_embeds in the normal OCR path",
+            "CLIP receives SAM feature maps as patch_embeds in the normal OCR path; raw-pixel patch_embedding is preserved only for provenance",
         )
     if name.endswith(".mlp.gate.weight"):
         return "runtime", 1, "MoE router: mandatory fp16 keep-list"

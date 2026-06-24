@@ -9,12 +9,14 @@ import pytest
 from unlimitedocr_c.convert import (
     EXPECTED_TENSOR_COUNT,
     EXPECTED_TOTAL_BYTES,
+    PRESERVED_UNUSED_NORMAL_OCR_PREFIXES,
     UOCR_FILE_HEADER_SIZE,
     UOCR_SECTION_TENSOR_DATA,
     UOCR_TENSOR_DATA_ALIGNMENT,
     UOCR_TENSOR_PAYLOAD_ALIGNMENT,
     build_dry_run_plan,
     filter_plan_tensors,
+    is_preserved_unused_in_normal_ocr,
     write_uocr_model,
 )
 from unlimitedocr_c.tensor_registry import (
@@ -79,7 +81,12 @@ def test_fp16_converter_dry_run_against_cached_header() -> None:
     assert plan.total_source_bytes == EXPECTED_TOTAL_BYTES
     assert plan.total_output_bytes == EXPECTED_TOTAL_BYTES
     assert plan.qtype_histogram == {"UOCR_TENSOR_F16": EXPECTED_TENSOR_COUNT}
-    assert plan.usage_histogram["runtime"] + plan.usage_histogram["preserved-unused"] == EXPECTED_TENSOR_COUNT
+    assert plan.usage_histogram == {"runtime": EXPECTED_TENSOR_COUNT - 1, "preserved-unused": 1}
+
+    preserved_unused = [tensor for tensor in plan.tensors if tensor.usage == "preserved-unused"]
+    assert [tensor.name for tensor in preserved_unused] == ["model.vision_model.embeddings.patch_embedding.weight"]
+    assert all(is_preserved_unused_in_normal_ocr(tensor.name) for tensor in preserved_unused)
+    assert PRESERVED_UNUSED_NORMAL_OCR_PREFIXES == ("model.vision_model.embeddings.patch_embedding.",)
 
     tensor_data = next(section for section in plan.sections if section.section_type == UOCR_SECTION_TENSOR_DATA)
     assert tensor_data.offset % UOCR_TENSOR_DATA_ALIGNMENT == 0
@@ -125,6 +132,7 @@ def test_fp16_converter_dry_run_against_cached_header() -> None:
     assert clip_patch.family == "VISION_CLIP"
     assert clip_patch.usage == "preserved-unused"
     assert "patch_embeds" in clip_patch.reason
+    assert "provenance" in clip_patch.reason
 
 
 def test_filter_plan_tensors_relayouts_single_tensor(tmp_path) -> None:

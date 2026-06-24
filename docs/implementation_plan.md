@@ -767,7 +767,7 @@ Do not begin this section until sections 14.5 and 15.1 pass for fp16 single-requ
 ### 16.3 CLIP-like encoder
 
 - [x] Implement CLIP embeddings using SAM output as `patch_embeds`; do not use raw-pixel patch embedding in the normal path.
-- [ ] Treat `vision_model.embeddings.patch_embedding.*` as unused in normal OCR inference unless a later parity test proves an alternate path needs it.
+- [x] Treat `vision_model.embeddings.patch_embedding.*` as unused in normal OCR inference unless a later parity test proves an alternate path needs it.
 - [x] Flatten SAM features to token sequence and prepend class embedding.
 - [ ] Add CLIP absolute position embedding using upstream bicubic interpolation with antialias and `align_corners=False`.
 - [ ] Support token lengths:
