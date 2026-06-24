@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import ctypes as ct
+import os
 
 import numpy as np
 import pytest
 
 from unlimitedocr_c.ffi import Engine, EngineOptions, UOCR_MEMORY_KV_CACHE, _copy_result_tokens, find_library_path
-from unlimitedocr_c.frontend import prepare_image, prepare_text
+from unlimitedocr_c.frontend import MODEL_VOCAB_SIZE, load_tokenizer, prepare_image, prepare_text, project_root
 from PIL import Image
 
 
@@ -19,6 +20,10 @@ def native_library_available() -> bool:
 
 
 pytestmark = pytest.mark.skipif(not native_library_available(), reason="libunlimitedocr is not built")
+
+
+def _large_metal_test_enabled() -> bool:
+    return os.environ.get("UOCR_RUN_LARGE_TESTS") == "1" and bool(os.environ.get("UOCR_MODEL_PATH"))
 
 
 class _FakeResultLib:
@@ -83,3 +88,49 @@ def test_ctypes_image_validation_smoke() -> None:
         outputs = engine.generate_prepared(req)
     assert len(outputs) == 1
     assert outputs[0].shape == (0,)
+
+
+@pytest.mark.skipif(
+    not _large_metal_test_enabled(),
+    reason="set UOCR_RUN_LARGE_TESTS=1 and UOCR_MODEL_PATH to run the full-model Metal public image smoke test",
+)
+def test_public_metal_image_generation_smoke() -> None:
+    width, height = 160, 96
+    x = np.linspace(0, 255, width, dtype=np.uint8)
+    y = np.linspace(0, 255, height, dtype=np.uint8)[:, None]
+    pixels = np.empty((height, width, 3), dtype=np.uint8)
+    pixels[..., 0] = x[None, :]
+    pixels[..., 1] = y
+    pixels[..., 2] = ((pixels[..., 0].astype(np.uint16) + pixels[..., 1].astype(np.uint16)) // 2).astype(np.uint8)
+    image = Image.fromarray(pixels, mode="RGB")
+
+    req = prepare_image(image, preset="base", max_new_tokens=1)
+    assert req.expected_visual_tokens == 273
+    assert len(req.views) == 1
+    assert req.views[0].kind == "global"
+
+    model_path = os.environ["UOCR_MODEL_PATH"]
+    resource_path = project_root() / "src" / "backend" / "metal"
+    with Engine(
+        EngineOptions(
+            model_path=model_path,
+            backend="metal",
+            resource_path=str(resource_path),
+            max_batch=1,
+            max_prompt_tokens=req.n_tokens,
+            max_gen_tokens=1,
+            memory_budget_bytes=(1 << 64) - 1,
+        )
+    ) as engine:
+        outputs = engine.generate_prepared(req)
+
+    assert len(outputs) == 1
+    generated = outputs[0]
+    assert generated.shape == (1,)
+    token_id = int(generated[0])
+    assert 0 <= token_id < MODEL_VOCAB_SIZE
+
+    tokenizer = load_tokenizer(req.tokenizer_path)
+    decoded = tokenizer.decode([token_id], skip_special_tokens=False)
+    print(f"public Metal image smoke generated token id={token_id} decoded={decoded!r}")
+    assert isinstance(decoded, str)
