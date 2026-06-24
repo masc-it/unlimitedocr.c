@@ -43,6 +43,15 @@ int uocr_quant_tensor_payload_size(uint32_t qtype,
                                    const uint32_t *physical_shape,
                                    uint32_t rank,
                                    uint64_t *out_payload_size);
+int uocr_quant_q8_0_dequantize_row_f32(const void *row,
+                                       uint32_t logical_cols,
+                                       uint32_t physical_cols,
+                                       float *out_values);
+int uocr_quant_q8_0_dot_row_f32(const void *row,
+                                const float *values,
+                                uint32_t logical_cols,
+                                uint32_t physical_cols,
+                                float *out_dot);
 int uocr_quant_validate_tensor_entry(const uocr_tensor_entry *tensor, char *error, size_t error_size);
 
 #ifdef __cplusplus

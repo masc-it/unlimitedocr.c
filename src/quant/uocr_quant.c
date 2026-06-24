@@ -159,6 +159,95 @@ int uocr_quant_tensor_payload_size(uint32_t qtype,
     return checked_mul_u64(rows, row_size, out_payload_size);
 }
 
+static float f16_bits_to_f32(uint16_t h) {
+    const uint32_t sign = ((uint32_t)h & 0x8000u) << 16u;
+    uint32_t exp = ((uint32_t)h >> 10u) & 0x1fu;
+    uint32_t mant = (uint32_t)h & 0x03ffu;
+    uint32_t bits;
+
+    if (exp == 0u) {
+        if (mant == 0u) {
+            bits = sign;
+        } else {
+            int e = -14;
+            while ((mant & 0x0400u) == 0u) {
+                mant <<= 1u;
+                --e;
+            }
+            mant &= 0x03ffu;
+            bits = sign | ((uint32_t)(e + 127) << 23u) | (mant << 13u);
+        }
+    } else if (exp == 0x1fu) {
+        bits = sign | 0x7f800000u | (mant << 13u);
+    } else {
+        exp = exp + (127u - 15u);
+        bits = sign | (exp << 23u) | (mant << 13u);
+    }
+
+    float out;
+    memcpy(&out, &bits, sizeof(out));
+    return out;
+}
+
+static int validate_q8_0_row_request(const void *row,
+                                     uint32_t logical_cols,
+                                     uint32_t physical_cols,
+                                     const void *out_or_values) {
+    if (row == NULL || out_or_values == NULL || logical_cols == 0u || physical_cols == 0u) {
+        return 0;
+    }
+    if (logical_cols > physical_cols) {
+        return 0;
+    }
+    if ((physical_cols % UOCR_Q8_0_BLOCK_SIZE) != 0u) {
+        return 0;
+    }
+    return 1;
+}
+
+int uocr_quant_q8_0_dequantize_row_f32(const void *row,
+                                       uint32_t logical_cols,
+                                       uint32_t physical_cols,
+                                       float *out_values) {
+    if (!validate_q8_0_row_request(row, logical_cols, physical_cols, out_values)) {
+        return 0;
+    }
+    const uint8_t *bytes = (const uint8_t *)row;
+    for (uint32_t col = 0u; col < logical_cols; ++col) {
+        const uint32_t block = col / UOCR_Q8_0_BLOCK_SIZE;
+        const uint32_t in_block = col % UOCR_Q8_0_BLOCK_SIZE;
+        const uint8_t *packed = bytes + (uint64_t)block * UOCR_Q8_0_TYPE_SIZE;
+        const uint16_t scale_bits = (uint16_t)((uint16_t)packed[0] | ((uint16_t)packed[1] << 8u));
+        const float scale = f16_bits_to_f32(scale_bits);
+        const int8_t q = (int8_t)packed[2u + in_block];
+        out_values[col] = scale * (float)q;
+    }
+    return 1;
+}
+
+int uocr_quant_q8_0_dot_row_f32(const void *row,
+                                const float *values,
+                                uint32_t logical_cols,
+                                uint32_t physical_cols,
+                                float *out_dot) {
+    if (!validate_q8_0_row_request(row, logical_cols, physical_cols, values) || out_dot == NULL) {
+        return 0;
+    }
+    const uint8_t *bytes = (const uint8_t *)row;
+    float sum = 0.0f;
+    for (uint32_t col = 0u; col < logical_cols; ++col) {
+        const uint32_t block = col / UOCR_Q8_0_BLOCK_SIZE;
+        const uint32_t in_block = col % UOCR_Q8_0_BLOCK_SIZE;
+        const uint8_t *packed = bytes + (uint64_t)block * UOCR_Q8_0_TYPE_SIZE;
+        const uint16_t scale_bits = (uint16_t)((uint16_t)packed[0] | ((uint16_t)packed[1] << 8u));
+        const float scale = f16_bits_to_f32(scale_bits);
+        const int8_t q = (int8_t)packed[2u + in_block];
+        sum += scale * (float)q * values[col];
+    }
+    *out_dot = sum;
+    return 1;
+}
+
 static int tensor_shape_elements(const uint32_t *shape, uint32_t rank, uint64_t *out_elements) {
     if (shape == NULL || out_elements == NULL || rank == 0u || rank > UOCR_TENSOR_MAX_DIMS) {
         return 0;

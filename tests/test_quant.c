@@ -87,6 +87,52 @@ static int test_quant_row_sizes(void) {
     return 0;
 }
 
+static int nearly_equal(float a, float b, float tolerance) {
+    const float diff = a >= b ? a - b : b - a;
+    return diff <= tolerance;
+}
+
+static void write_f16_le(uint8_t *dst, uint16_t bits) {
+    dst[0] = (uint8_t)(bits & 0xffu);
+    dst[1] = (uint8_t)(bits >> 8u);
+}
+
+static int test_q8_cpu_dequant_and_dot(void) {
+    uint8_t row[UOCR_Q8_0_TYPE_SIZE * 2u];
+    memset(row, 0, sizeof(row));
+    write_f16_le(row, 0x3800u); /* 0.5 */
+    int8_t *q0 = (int8_t *)(void *)(row + 2u);
+    for (uint32_t i = 0u; i < UOCR_Q8_0_BLOCK_SIZE; ++i) {
+        q0[i] = (int8_t)((int)i - 16);
+    }
+    write_f16_le(row + UOCR_Q8_0_TYPE_SIZE, 0x3400u); /* 0.25 */
+    int8_t *q1 = (int8_t *)(void *)(row + UOCR_Q8_0_TYPE_SIZE + 2u);
+    q1[0] = 12;
+    q1[1] = -8; /* padded/logically ignored in this test */
+
+    float dequant[33];
+    CHECK(uocr_quant_q8_0_dequantize_row_f32(row, 33u, 64u, dequant) == 1);
+    for (uint32_t i = 0u; i < 32u; ++i) {
+        CHECK(nearly_equal(dequant[i], 0.5f * (float)((int)i - 16), 1.0e-6f));
+    }
+    CHECK(nearly_equal(dequant[32], 3.0f, 1.0e-6f));
+
+    float values[33];
+    float expected = 0.0f;
+    for (uint32_t i = 0u; i < 33u; ++i) {
+        values[i] = (float)((int)(i % 7u) - 3) * 0.125f;
+        expected += dequant[i] * values[i];
+    }
+    float actual = 0.0f;
+    CHECK(uocr_quant_q8_0_dot_row_f32(row, values, 33u, 64u, &actual) == 1);
+    CHECK(nearly_equal(actual, expected, 1.0e-5f));
+
+    CHECK(uocr_quant_q8_0_dequantize_row_f32(row, 65u, 64u, dequant) == 0);
+    CHECK(uocr_quant_q8_0_dot_row_f32(row, values, 33u, 33u, &actual) == 0);
+    CHECK(uocr_quant_q8_0_dot_row_f32(NULL, values, 33u, 64u, &actual) == 0);
+    return 0;
+}
+
 static int test_quant_tensor_validation(void) {
     char error[256];
     uocr_tensor_entry tensor;
@@ -137,6 +183,7 @@ static int test_quant_tensor_validation(void) {
 int main(void) {
     if (test_quant_type_traits() != 0) return 1;
     if (test_quant_row_sizes() != 0) return 1;
+    if (test_q8_cpu_dequant_and_dot() != 0) return 1;
     if (test_quant_tensor_validation() != 0) return 1;
     return 0;
 }
