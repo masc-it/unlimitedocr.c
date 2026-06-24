@@ -371,6 +371,20 @@ int uocr_metal_context_sam_neck_conv1x1_f16(uocr_metal_context *ctx,
                                             char *error,
                                             size_t error_size);
 
+/* Diagnostic SAM neck 3x3 convolution helper. Consumes NCHW fp16 tensors
+ * [256,grid_h,grid_w], applies Conv2d weight [256,256,3,3] with padding=1,
+ * stride=1, no bias, accumulates in fp32, and emits NCHW output.
+ */
+int uocr_metal_context_sam_neck_conv3x3_f16(uocr_metal_context *ctx,
+                                            const uint16_t *input_nchw_f16,
+                                            const uint16_t *weight_f16,
+                                            uint32_t grid_w,
+                                            uint32_t grid_h,
+                                            uocr_metal_dense_output_type output_type,
+                                            void *out_nchw,
+                                            char *error,
+                                            size_t error_size);
+
 /* Diagnostic SAM neck LayerNorm2d helper. Normalizes NCHW fp16 tensors
  * [256,grid_h,grid_w] across the channel dimension for each spatial location,
  * applies fp16 weight+bias [256], uses eps=1e-6, and emits NCHW output.

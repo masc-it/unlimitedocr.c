@@ -1098,6 +1098,100 @@ kernel void uocr_sam_neck_conv1x1_f16_to_f32(device const half *src_bhwc [[buffe
     }
 }
 
+struct UocrSamNeckConv3x3Params {
+    uint grid_width;
+    uint grid_height;
+    uint channels;
+    uint kernel_size;
+};
+
+static inline float uocr_sam_neck_conv3x3_dot_f16(device const half *src_nchw,
+                                                  device const half *weight,
+                                                  constant UocrSamNeckConv3x3Params &params,
+                                                  uint spatial,
+                                                  uint out_channel,
+                                                  uint tid,
+                                                  uint ntg,
+                                                  threadgroup float *partials) {
+    const uint x = spatial % params.grid_width;
+    const uint y = spatial / params.grid_width;
+    const uint spatial_size = params.grid_width * params.grid_height;
+    const int kernel_radius = int(params.kernel_size >> 1u);
+    float sum = 0.0f;
+    for (uint in_channel = tid; in_channel < params.channels; in_channel += ntg) {
+        for (uint ky = 0u; ky < params.kernel_size; ++ky) {
+            const int sy = int(y) + int(ky) - kernel_radius;
+            if (sy < 0 || sy >= int(params.grid_height)) {
+                continue;
+            }
+            for (uint kx = 0u; kx < params.kernel_size; ++kx) {
+                const int sx = int(x) + int(kx) - kernel_radius;
+                if (sx < 0 || sx >= int(params.grid_width)) {
+                    continue;
+                }
+                const ulong src_index = ulong(in_channel) * ulong(spatial_size) +
+                                        ulong(uint(sy)) * ulong(params.grid_width) + ulong(uint(sx));
+                const ulong weight_index = ((ulong(out_channel) * ulong(params.channels) + ulong(in_channel)) *
+                                                ulong(params.kernel_size) + ulong(ky)) *
+                                               ulong(params.kernel_size) + ulong(kx);
+                sum += float(src_nchw[src_index]) * float(weight[weight_index]);
+            }
+        }
+    }
+    partials[tid] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = ntg >> 1; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            partials[tid] += partials[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    return partials[0];
+}
+
+kernel void uocr_sam_neck_conv3x3_f16_to_f16(device const half *src_nchw [[buffer(0)]],
+                                             device const half *weight [[buffer(1)]],
+                                             device half *dst_nchw [[buffer(2)]],
+                                             constant UocrSamNeckConv3x3Params &params [[buffer(3)]],
+                                             threadgroup float *partials [[threadgroup(0)]],
+                                             uint output_index [[threadgroup_position_in_grid]],
+                                             uint tid [[thread_index_in_threadgroup]],
+                                             uint ntg [[threads_per_threadgroup]]) {
+    const uint spatial_size = params.grid_width * params.grid_height;
+    const uint out_channel = output_index / spatial_size;
+    const uint spatial = output_index - out_channel * spatial_size;
+    if (out_channel >= params.channels || spatial >= spatial_size) {
+        return;
+    }
+
+    const float value = uocr_sam_neck_conv3x3_dot_f16(src_nchw, weight, params, spatial, out_channel, tid, ntg, partials);
+    if (tid == 0u) {
+        dst_nchw[output_index] = half(value);
+    }
+}
+
+kernel void uocr_sam_neck_conv3x3_f16_to_f32(device const half *src_nchw [[buffer(0)]],
+                                             device const half *weight [[buffer(1)]],
+                                             device float *dst_nchw [[buffer(2)]],
+                                             constant UocrSamNeckConv3x3Params &params [[buffer(3)]],
+                                             threadgroup float *partials [[threadgroup(0)]],
+                                             uint output_index [[threadgroup_position_in_grid]],
+                                             uint tid [[thread_index_in_threadgroup]],
+                                             uint ntg [[threads_per_threadgroup]]) {
+    const uint spatial_size = params.grid_width * params.grid_height;
+    const uint out_channel = output_index / spatial_size;
+    const uint spatial = output_index - out_channel * spatial_size;
+    if (out_channel >= params.channels || spatial >= spatial_size) {
+        return;
+    }
+
+    const float value = uocr_sam_neck_conv3x3_dot_f16(src_nchw, weight, params, spatial, out_channel, tid, ntg, partials);
+    if (tid == 0u) {
+        dst_nchw[output_index] = value;
+    }
+}
+
 struct UocrSamLayerNorm2dParams {
     uint grid_width;
     uint grid_height;

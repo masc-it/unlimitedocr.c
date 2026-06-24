@@ -89,6 +89,12 @@ static size_t sam_neck_conv1x1_weight_index(uint32_t out_channel, uint32_t in_ch
     return (size_t)out_channel * UOCR_SAM_HIDDEN_SIZE + in_channel;
 }
 
+static size_t sam_neck_conv3x3_weight_index(uint32_t out_channel, uint32_t in_channel, uint32_t ky, uint32_t kx) {
+    return (((size_t)out_channel * UOCR_SAM_NECK_CHANNELS + in_channel) * UOCR_SAM_NECK_KERNEL_SIZE + ky) *
+               UOCR_SAM_NECK_KERNEL_SIZE +
+           kx;
+}
+
 static size_t sam_neck_nchw_index(uint32_t grid_w, uint32_t grid_h, uint32_t out_channel, uint32_t y, uint32_t x) {
     return ((size_t)out_channel * grid_h + y) * grid_w + x;
 }
@@ -96,6 +102,13 @@ static size_t sam_neck_nchw_index(uint32_t grid_w, uint32_t grid_h, uint32_t out
 static float sam_neck_conv1x1_expected(const uint16_t *input,
                                        const uint16_t *weight,
                                        uint32_t grid_w,
+                                       uint32_t y,
+                                       uint32_t x,
+                                       uint32_t out_channel);
+static float sam_neck_conv3x3_expected(const uint16_t *input,
+                                       const uint16_t *weight,
+                                       uint32_t grid_w,
+                                       uint32_t grid_h,
                                        uint32_t y,
                                        uint32_t x,
                                        uint32_t out_channel);
@@ -767,6 +780,138 @@ static int test_metal_sam_neck_conv1x1_f16(void) {
     return 0;
 }
 
+static int test_metal_sam_neck_conv3x3_f16(void) {
+    if (!uocr_metal_is_available()) {
+        return 0;
+    }
+
+    enum { GRID_W = 4u, GRID_H = 3u, CHANNELS = UOCR_SAM_NECK_CHANNELS };
+    const size_t input_values = (size_t)CHANNELS * GRID_H * GRID_W;
+    const size_t weight_values = (size_t)CHANNELS * CHANNELS * UOCR_SAM_NECK_KERNEL_SIZE * UOCR_SAM_NECK_KERNEL_SIZE;
+    const size_t output_values = input_values;
+    uint16_t *input = (uint16_t *)calloc(input_values, sizeof(uint16_t));
+    uint16_t *weight = (uint16_t *)calloc(weight_values, sizeof(uint16_t));
+    float *out_f32 = (float *)calloc(output_values, sizeof(float));
+    uint16_t *out_f16 = (uint16_t *)calloc(output_values, sizeof(uint16_t));
+    CHECK(input != NULL);
+    CHECK(weight != NULL);
+    CHECK(out_f32 != NULL);
+    CHECK(out_f16 != NULL);
+    CHECK(UOCR_SAM_NECK_CHANNELS == 256u);
+    CHECK(UOCR_SAM_NECK_KERNEL_SIZE == 3u);
+
+    for (uint32_t c = 0u; c < CHANNELS; ++c) {
+        for (uint32_t y = 0u; y < GRID_H; ++y) {
+            for (uint32_t x = 0u; x < GRID_W; ++x) {
+                const int mod = (int)((c * 13u + y * 17u + x * 19u) % 79u) - 39;
+                input[sam_neck_nchw_index(GRID_W, GRID_H, c, y, x)] = f32_to_f16_bits((float)mod * 0.0035f);
+            }
+        }
+    }
+    for (uint32_t out_channel = 0u; out_channel < CHANNELS; ++out_channel) {
+        for (uint32_t in_channel = 0u; in_channel < CHANNELS; ++in_channel) {
+            for (uint32_t ky = 0u; ky < UOCR_SAM_NECK_KERNEL_SIZE; ++ky) {
+                for (uint32_t kx = 0u; kx < UOCR_SAM_NECK_KERNEL_SIZE; ++kx) {
+                    const int mod = (int)((out_channel * 7u + in_channel * 11u + ky * 13u + kx * 5u) % 53u) - 26;
+                    weight[sam_neck_conv3x3_weight_index(out_channel, in_channel, ky, kx)] =
+                        f32_to_f16_bits((float)mod * 0.00016f);
+                }
+            }
+        }
+    }
+
+    char error[1024];
+    memset(error, 0, sizeof(error));
+    uocr_metal_context *ctx = uocr_metal_context_create(UOCR_TEST_METAL_RESOURCE_PATH, error, sizeof(error));
+    CHECK(ctx != NULL);
+
+    CHECK(uocr_metal_context_sam_neck_conv3x3_f16(ctx,
+                                                   input,
+                                                   weight,
+                                                   GRID_W,
+                                                   GRID_H,
+                                                   UOCR_METAL_DENSE_OUTPUT_F32,
+                                                   out_f32,
+                                                   error,
+                                                   sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+
+    struct conv3_sample {
+        uint32_t y;
+        uint32_t x;
+        uint32_t out_channel;
+    } samples[] = {
+        {0u, 0u, 0u},
+        {0u, GRID_W - 1u, 7u},
+        {1u, 2u, 111u},
+        {GRID_H - 1u, 1u, 200u},
+        {GRID_H - 1u, GRID_W - 1u, CHANNELS - 1u},
+    };
+    for (size_t i = 0u; i < sizeof(samples) / sizeof(samples[0]); ++i) {
+        const size_t idx = sam_neck_nchw_index(GRID_W, GRID_H, samples[i].out_channel, samples[i].y, samples[i].x);
+        const float expected = sam_neck_conv3x3_expected(input,
+                                                         weight,
+                                                         GRID_W,
+                                                         GRID_H,
+                                                         samples[i].y,
+                                                         samples[i].x,
+                                                         samples[i].out_channel);
+        CHECK(isfinite(expected));
+        CHECK(fabsf(out_f32[idx] - expected) <= 5.0e-4f);
+    }
+
+    CHECK(uocr_metal_context_sam_neck_conv3x3_f16(ctx,
+                                                   input,
+                                                   weight,
+                                                   GRID_W,
+                                                   GRID_H,
+                                                   UOCR_METAL_DENSE_OUTPUT_F16,
+                                                   out_f16,
+                                                   error,
+                                                   sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    for (size_t i = 0u; i < sizeof(samples) / sizeof(samples[0]); ++i) {
+        const size_t idx = sam_neck_nchw_index(GRID_W, GRID_H, samples[i].out_channel, samples[i].y, samples[i].x);
+        const float expected = sam_neck_conv3x3_expected(input,
+                                                         weight,
+                                                         GRID_W,
+                                                         GRID_H,
+                                                         samples[i].y,
+                                                         samples[i].x,
+                                                         samples[i].out_channel);
+        CHECK(fabsf(f16_bits_to_f32(out_f16[idx]) - expected) <= 2.0e-3f);
+    }
+
+    CHECK(uocr_metal_context_sam_neck_conv3x3_f16(ctx,
+                                                   input,
+                                                   NULL,
+                                                   GRID_W,
+                                                   GRID_H,
+                                                   UOCR_METAL_DENSE_OUTPUT_F32,
+                                                   out_f32,
+                                                   error,
+                                                   sizeof(error)) == 0);
+    CHECK(strstr(error, "invalid Metal SAM neck 3x3") != NULL);
+
+    CHECK(uocr_metal_context_sam_neck_conv3x3_f16(ctx,
+                                                   input,
+                                                   weight,
+                                                   UOCR_SAM_MAX_GRID_SIZE + 1u,
+                                                   GRID_H,
+                                                   UOCR_METAL_DENSE_OUTPUT_F32,
+                                                   out_f32,
+                                                   error,
+                                                   sizeof(error)) == 0);
+    CHECK(strstr(error, "invalid Metal SAM neck 3x3 grid") != NULL);
+
+    uocr_metal_context_destroy(ctx);
+    free(out_f16);
+    free(out_f32);
+    free(weight);
+    free(input);
+    return 0;
+}
+
 static float sam_layernorm2d_expected(const uint16_t *input,
                                        const uint16_t *weight,
                                        const uint16_t *bias,
@@ -1234,6 +1379,37 @@ static float sam_neck_conv1x1_expected(const uint16_t *input,
     for (uint32_t in_channel = 0u; in_channel < UOCR_SAM_HIDDEN_SIZE; ++in_channel) {
         value += f16_bits_to_f32(input[sam_bhwc_index(grid_w, y, x, in_channel)]) *
                  f16_bits_to_f32(weight[sam_neck_conv1x1_weight_index(out_channel, in_channel)]);
+    }
+    return value;
+}
+
+static float sam_neck_conv3x3_expected(const uint16_t *input,
+                                       const uint16_t *weight,
+                                       uint32_t grid_w,
+                                       uint32_t grid_h,
+                                       uint32_t y,
+                                       uint32_t x,
+                                       uint32_t out_channel) {
+    float value = 0.0f;
+    for (uint32_t in_channel = 0u; in_channel < UOCR_SAM_NECK_CHANNELS; ++in_channel) {
+        for (uint32_t ky = 0u; ky < UOCR_SAM_NECK_KERNEL_SIZE; ++ky) {
+            const int32_t sy = (int32_t)y + (int32_t)ky - 1;
+            if (sy < 0 || sy >= (int32_t)grid_h) {
+                continue;
+            }
+            for (uint32_t kx = 0u; kx < UOCR_SAM_NECK_KERNEL_SIZE; ++kx) {
+                const int32_t sx = (int32_t)x + (int32_t)kx - 1;
+                if (sx < 0 || sx >= (int32_t)grid_w) {
+                    continue;
+                }
+                value += f16_bits_to_f32(input[sam_neck_nchw_index(grid_w,
+                                                                   grid_h,
+                                                                   in_channel,
+                                                                   (uint32_t)sy,
+                                                                   (uint32_t)sx)]) *
+                         f16_bits_to_f32(weight[sam_neck_conv3x3_weight_index(out_channel, in_channel, ky, kx)]);
+            }
+        }
     }
     return value;
 }
@@ -10865,6 +11041,7 @@ int main(void) {
     if (test_metal_sam_layernorm_f16() != 0) return 1;
     if (test_metal_sam_qkv_f16() != 0) return 1;
     if (test_metal_sam_neck_conv1x1_f16() != 0) return 1;
+    if (test_metal_sam_neck_conv3x3_f16() != 0) return 1;
     if (test_metal_sam_layernorm2d_f16() != 0) return 1;
     if (test_metal_sam_window_partition_f16() != 0) return 1;
     if (test_metal_sam_window_attention_f16() != 0) return 1;

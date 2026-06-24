@@ -355,6 +355,13 @@ typedef struct uocr_metal_sam_neck_conv1x1_params {
     uint32_t out_channels;
 } uocr_metal_sam_neck_conv1x1_params;
 
+typedef struct uocr_metal_sam_neck_conv3x3_params {
+    uint32_t grid_width;
+    uint32_t grid_height;
+    uint32_t channels;
+    uint32_t kernel_size;
+} uocr_metal_sam_neck_conv3x3_params;
+
 typedef struct uocr_metal_sam_layernorm2d_params {
     uint32_t grid_width;
     uint32_t grid_height;
@@ -397,6 +404,8 @@ _Static_assert(sizeof(uocr_metal_sam_window_partition_params) == 32u,
                "uocr_metal_sam_window_partition_params ABI mismatch");
 _Static_assert(sizeof(uocr_metal_sam_neck_conv1x1_params) == 16u,
                "uocr_metal_sam_neck_conv1x1_params ABI mismatch");
+_Static_assert(sizeof(uocr_metal_sam_neck_conv3x3_params) == 16u,
+               "uocr_metal_sam_neck_conv3x3_params ABI mismatch");
 _Static_assert(sizeof(uocr_metal_sam_layernorm2d_params) == 16u,
                "uocr_metal_sam_layernorm2d_params ABI mismatch");
 _Static_assert(sizeof(uocr_metal_sam_rel_pos_attention_params) == 48u,
@@ -6374,6 +6383,157 @@ int uocr_metal_context_sam_neck_conv1x1_f16(uocr_metal_context *ctx,
         result = 1;
 
     cleanup_sam_neck_conv1x1:
+        [dst release];
+        [weight release];
+        [src release];
+    }
+
+    if (result) {
+        metal_clear_error(error, error_size);
+    }
+    return result;
+}
+
+int uocr_metal_context_sam_neck_conv3x3_f16(uocr_metal_context *ctx,
+                                            const uint16_t *input_nchw_f16,
+                                            const uint16_t *weight_f16,
+                                            uint32_t grid_w,
+                                            uint32_t grid_h,
+                                            uocr_metal_dense_output_type output_type,
+                                            void *out_nchw,
+                                            char *error,
+                                            size_t error_size) {
+    metal_clear_error(error, error_size);
+    if (ctx == NULL || input_nchw_f16 == NULL || weight_f16 == NULL || out_nchw == NULL) {
+        return metal_fail(error, error_size, "invalid Metal SAM neck 3x3 request");
+    }
+    if (output_type != UOCR_METAL_DENSE_OUTPUT_F16 && output_type != UOCR_METAL_DENSE_OUTPUT_F32) {
+        return metal_fail(error, error_size, "unsupported Metal SAM neck 3x3 output type %d", (int)output_type);
+    }
+    if (grid_w == 0u || grid_h == 0u || grid_w > UOCR_SAM_MAX_GRID_SIZE || grid_h > UOCR_SAM_MAX_GRID_SIZE) {
+        return metal_fail(error, error_size, "invalid Metal SAM neck 3x3 grid %ux%u", grid_w, grid_h);
+    }
+    if (UOCR_SAM_NECK_CHANNELS != 256u || UOCR_SAM_NECK_KERNEL_SIZE != 3u) {
+        return metal_fail(error, error_size, "Metal SAM neck 3x3 constants are inconsistent");
+    }
+
+    uint64_t spatial = 0u;
+    uint64_t value_count = 0u;
+    uint64_t kernel_area = 0u;
+    uint64_t weight_values = 0u;
+    uint64_t tensor_bytes = 0u;
+    uint64_t weight_bytes = 0u;
+    uint64_t output_bytes = 0u;
+    const uint64_t output_element_bytes = output_type == UOCR_METAL_DENSE_OUTPUT_F16 ? 2u : (uint64_t)sizeof(float);
+    if (!checked_mul_u64((uint64_t)grid_w, (uint64_t)grid_h, &spatial) ||
+        !checked_mul_u64(spatial, (uint64_t)UOCR_SAM_NECK_CHANNELS, &value_count) ||
+        !checked_mul_u64((uint64_t)UOCR_SAM_NECK_KERNEL_SIZE, (uint64_t)UOCR_SAM_NECK_KERNEL_SIZE, &kernel_area) ||
+        !checked_mul_u64((uint64_t)UOCR_SAM_NECK_CHANNELS, (uint64_t)UOCR_SAM_NECK_CHANNELS, &weight_values) ||
+        !checked_mul_u64(weight_values, kernel_area, &weight_values) ||
+        !checked_mul_u64(value_count, 2u, &tensor_bytes) || !checked_mul_u64(weight_values, 2u, &weight_bytes) ||
+        !checked_mul_u64(value_count, output_element_bytes, &output_bytes) || value_count > (uint64_t)UINT32_MAX ||
+        tensor_bytes > (uint64_t)SIZE_MAX || weight_bytes > (uint64_t)SIZE_MAX || output_bytes > (uint64_t)SIZE_MAX) {
+        return metal_fail(error, error_size, "Metal SAM neck 3x3 byte-size overflow");
+    }
+
+    const uint64_t max_buffer_length = metal_device_max_buffer_length(ctx->device);
+    if (tensor_bytes > max_buffer_length || weight_bytes > max_buffer_length || output_bytes > max_buffer_length) {
+        return metal_fail(error,
+                          error_size,
+                          "Metal SAM neck 3x3 buffers exceed maxBufferLength %llu",
+                          (unsigned long long)max_buffer_length);
+    }
+
+    int result = 0;
+    @autoreleasepool {
+        const char *function_name = output_type == UOCR_METAL_DENSE_OUTPUT_F16 ?
+                                        "uocr_sam_neck_conv3x3_f16_to_f16" :
+                                        "uocr_sam_neck_conv3x3_f16_to_f32";
+        id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, function_name, error, error_size);
+        if (pipeline == nil) {
+            return 0;
+        }
+
+        id<MTLBuffer> src = nil;
+        id<MTLBuffer> weight = nil;
+        id<MTLBuffer> dst = nil;
+        id<MTLCommandBuffer> cb = nil;
+        id<MTLComputeCommandEncoder> enc = nil;
+
+        src = [ctx->device newBufferWithBytes:input_nchw_f16
+                                       length:(NSUInteger)tensor_bytes
+                                      options:MTLResourceStorageModeShared];
+        if (src == nil) {
+            result = metal_fail(error, error_size, "failed to allocate Metal SAM neck 3x3 input buffer");
+            goto cleanup_sam_neck_conv3x3;
+        }
+        src.label = @"uocr_sam_neck_conv3x3_input_nchw_f16";
+
+        weight = [ctx->device newBufferWithBytes:weight_f16
+                                          length:(NSUInteger)weight_bytes
+                                         options:MTLResourceStorageModeShared];
+        if (weight == nil) {
+            result = metal_fail(error, error_size, "failed to allocate Metal SAM neck 3x3 weight buffer");
+            goto cleanup_sam_neck_conv3x3;
+        }
+        weight.label = @"uocr_sam_neck_conv3x3_weight_f16";
+
+        dst = [ctx->device newBufferWithLength:(NSUInteger)output_bytes options:MTLResourceStorageModeShared];
+        if (dst == nil) {
+            result = metal_fail(error, error_size, "failed to allocate Metal SAM neck 3x3 output buffer");
+            goto cleanup_sam_neck_conv3x3;
+        }
+        dst.label = @"uocr_sam_neck_conv3x3_output_nchw";
+        memset([dst contents], 0, (size_t)output_bytes);
+
+        const NSUInteger threads_per_group = metal_power2_threadgroup_width(256u, pipeline.maxTotalThreadsPerThreadgroup);
+        const uint64_t threadgroup_bytes = (uint64_t)threads_per_group * (uint64_t)sizeof(float);
+        if (threadgroup_bytes > (uint64_t)ctx->device.maxThreadgroupMemoryLength) {
+            result = metal_fail(error, error_size, "Metal SAM neck 3x3 threadgroup memory exceeds device limit");
+            goto cleanup_sam_neck_conv3x3;
+        }
+
+        cb = [ctx->queue commandBuffer];
+        if (cb == nil) {
+            result = metal_fail(error, error_size, "failed to create Metal SAM neck 3x3 command buffer");
+            goto cleanup_sam_neck_conv3x3;
+        }
+        cb.label = @"uocr_sam_neck_conv3x3_command_buffer";
+
+        enc = [cb computeCommandEncoder];
+        if (enc == nil) {
+            result = metal_fail(error, error_size, "failed to create Metal SAM neck 3x3 command encoder");
+            goto cleanup_sam_neck_conv3x3;
+        }
+
+        uocr_metal_sam_neck_conv3x3_params params;
+        params.grid_width = grid_w;
+        params.grid_height = grid_h;
+        params.channels = UOCR_SAM_NECK_CHANNELS;
+        params.kernel_size = UOCR_SAM_NECK_KERNEL_SIZE;
+
+        [enc setComputePipelineState:pipeline];
+        [enc setBuffer:src offset:0u atIndex:0u];
+        [enc setBuffer:weight offset:0u atIndex:1u];
+        [enc setBuffer:dst offset:0u atIndex:2u];
+        [enc setBytes:&params length:sizeof(params) atIndex:3u];
+        [enc setThreadgroupMemoryLength:threads_per_group * sizeof(float) atIndex:0u];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)value_count, 1u, 1u)
+             threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1u, 1u)];
+        [enc endEncoding];
+
+        [cb commit];
+        [cb waitUntilCompleted];
+        if (cb.status == MTLCommandBufferStatusError) {
+            NSString *description = cb.error != nil ? [cb.error localizedDescription] : @"unknown command-buffer error";
+            result = metal_fail(error, error_size, "Metal SAM neck 3x3 command failed: %s", [description UTF8String]);
+            goto cleanup_sam_neck_conv3x3;
+        }
+
+        memcpy(out_nchw, [dst contents], (size_t)output_bytes);
+        result = 1;
+
+    cleanup_sam_neck_conv3x3:
         [dst release];
         [weight release];
         [src release];
