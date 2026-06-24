@@ -11792,6 +11792,71 @@ static int test_metal_moe_router_f16(void) {
         CHECK(fabsf(top_weights_optional[i] - expected_top_weights[i]) < 2.0e-6f);
     }
 
+    /* Regression guard for the OCR routing contract.  DS4 applies
+     * sqrt(softplus(logits)) plus selected-top-k renormalization/scaling in
+     * its router path; Unlimited-OCR must keep raw softmax probabilities over
+     * all 64 experts and pass those unrenormalized probabilities to the
+     * selected experts.
+     */
+    memset(input, 0, (size_t)TOKENS * HIDDEN * sizeof(uint16_t));
+    memset(weight, 0, (size_t)EXPERTS * HIDDEN * sizeof(uint16_t));
+    input[0] = f32_to_f16_bits(1.0f);
+    float max_contract_logit = -INFINITY;
+    for (uint32_t expert = 0u; expert < (uint32_t)EXPERTS; ++expert) {
+        const float desired = ((float)expert - 31.5f) * 0.125f;
+        weight[expert * (uint32_t)HIDDEN] = f32_to_f16_bits(desired);
+        const float rounded = f16_bits_to_f32(weight[expert * (uint32_t)HIDDEN]);
+        expected_logits[expert] = rounded;
+        if (rounded > max_contract_logit) {
+            max_contract_logit = rounded;
+        }
+    }
+    float contract_denom = 0.0f;
+    for (uint32_t expert = 0u; expert < (uint32_t)EXPERTS; ++expert) {
+        const float value = expf(expected_logits[expert] - max_contract_logit);
+        expected_probs[expert] = value;
+        contract_denom += value;
+    }
+    for (uint32_t expert = 0u; expert < (uint32_t)EXPERTS; ++expert) {
+        expected_probs[expert] /= contract_denom;
+    }
+    memset(expected_top_ids, 0, (size_t)TOKENS * TOP_K * sizeof(uint32_t));
+    memset(expected_top_weights, 0, (size_t)TOKENS * TOP_K * sizeof(float));
+    compute_router_topk_expected(expected_probs,
+                                 0u,
+                                 (uint32_t)EXPERTS,
+                                 (uint32_t)TOP_K,
+                                 expected_top_ids,
+                                 expected_top_weights);
+    memset(logits, 0, (size_t)TOKENS * EXPERTS * sizeof(float));
+    memset(probs, 0, (size_t)TOKENS * EXPERTS * sizeof(float));
+    memset(top_ids, 0xff, (size_t)TOKENS * TOP_K * sizeof(uint32_t));
+    memset(top_weights, 0, (size_t)TOKENS * TOP_K * sizeof(float));
+    CHECK(uocr_metal_context_moe_router_f16(ctx,
+                                            input,
+                                            weight,
+                                            1u,
+                                            logits,
+                                            probs,
+                                            top_ids,
+                                            top_weights,
+                                            error,
+                                            sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    for (uint32_t expert = 0u; expert < (uint32_t)EXPERTS; ++expert) {
+        CHECK(fabsf(logits[expert] - expected_logits[expert]) < 2.0e-6f);
+        CHECK(fabsf(probs[expert] - expected_probs[expert]) < 2.0e-6f);
+    }
+    float selected_sum = 0.0f;
+    for (uint32_t rank = 0u; rank < (uint32_t)TOP_K; ++rank) {
+        CHECK(top_ids[rank] == expected_top_ids[rank]);
+        CHECK(fabsf(top_weights[rank] - expected_top_weights[rank]) < 2.0e-6f);
+        selected_sum += top_weights[rank];
+    }
+    CHECK(selected_sum > 0.40f && selected_sum < 0.75f);
+    CHECK(fabsf(selected_sum - 1.0f) > 0.20f);
+    CHECK(fabsf(selected_sum - 1.5f) > 0.50f);
+
     memset(weight, 0, (size_t)EXPERTS * HIDDEN * sizeof(uint16_t));
     memset(logits, 1, (size_t)TOKENS * EXPERTS * sizeof(float));
     memset(probs, 1, (size_t)TOKENS * EXPERTS * sizeof(float));

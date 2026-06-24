@@ -2620,6 +2620,9 @@ kernel void uocr_moe_router_logits_f16_to_f32(device const half *src [[buffer(0)
     }
 }
 
+// Unlimited-OCR routing contract: softmax(hidden @ router_weight.T) over all
+// 64 experts, greedy top-6, raw selected probabilities, no top-k
+// renormalization/scaling, and no DS4 softplus/sqrt/bias transforms.
 kernel void uocr_moe_router_softmax_topk_f32(device const float *logits [[buffer(0)]],
                                              device float *probs [[buffer(1)]],
                                              device uint *top_expert_ids [[buffer(2)]],
