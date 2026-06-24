@@ -989,7 +989,7 @@ Do not start the stable high-level OCR/PDF API until Gate E2E-0 passes: public f
   - [x] run RMSNorm on synthetic tensor
   - [x] run get_rows on synthetic embedding table
   - [x] run small RoPE kernel
-  - [ ] run small SDPA prefill/decode kernel
+  - [x] run small SDPA prefill/decode kernel
   - [ ] run q8/q4 dot kernels once implemented
 - [x] Add opt-in full-model tests guarded by env vars:
   - [x] `UOCR_MODEL_PATH`

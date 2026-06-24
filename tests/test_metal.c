@@ -14630,6 +14630,140 @@ static int test_metal_decode_attention_f16(void) {
     return 0;
 }
 
+static int test_metal_sdpa_prefill_decode_consistency_f16(void) {
+    if (!uocr_metal_is_available()) {
+        return 0;
+    }
+
+    enum {
+        TOKENS = 4,
+        BATCH_SLOTS = 1,
+        PROMPT_TOKEN_CAPACITY = TOKENS,
+        CACHE_TOKEN_CAPACITY = PROMPT_TOKEN_CAPACITY + UOCR_GENERATED_RING_WINDOW,
+        LAYER = 1,
+        SLOT = 0,
+        HIDDEN = UOCR_ATTENTION_HEADS * UOCR_HEAD_DIM,
+        HEAD_AREA = UOCR_KV_HEADS * UOCR_HEAD_DIM
+    };
+    const uint64_t prompt_values = (uint64_t)TOKENS * (uint64_t)HIDDEN;
+    const uint64_t cache_values = (uint64_t)UOCR_DECODER_LAYERS * (uint64_t)BATCH_SLOTS *
+                                  (uint64_t)CACHE_TOKEN_CAPACITY * (uint64_t)HEAD_AREA;
+    const uint16_t q_values[] = {
+        0x0000u, /* 0.0 */
+        0x2800u, /* 0.03125 */
+        0x2c00u, /* 0.0625 */
+        0xb000u, /* -0.125 */
+        0x3000u  /* 0.125 */
+    };
+    const uint16_t k_values[] = {
+        0x0000u, /* 0.0 */
+        0x2400u, /* 0.015625 */
+        0x2800u, /* 0.03125 */
+        0xac00u, /* -0.0625 */
+        0x2c00u  /* 0.0625 */
+    };
+    const uint16_t v_values[] = {
+        0xbc00u, /* -1.0 */
+        0xb800u, /* -0.5 */
+        0x0000u, /* 0.0 */
+        0x3400u, /* 0.25 */
+        0x3800u, /* 0.5 */
+        0x3c00u  /* 1.0 */
+    };
+    const uint32_t q_count = (uint32_t)(sizeof(q_values) / sizeof(q_values[0]));
+    const uint32_t k_count = (uint32_t)(sizeof(k_values) / sizeof(k_values[0]));
+    const uint32_t v_count = (uint32_t)(sizeof(v_values) / sizeof(v_values[0]));
+
+    uint16_t *q = (uint16_t *)malloc((size_t)prompt_values * sizeof(uint16_t));
+    uint16_t *k = (uint16_t *)malloc((size_t)prompt_values * sizeof(uint16_t));
+    uint16_t *v = (uint16_t *)malloc((size_t)prompt_values * sizeof(uint16_t));
+    float *expected_prefill = (float *)malloc((size_t)prompt_values * sizeof(float));
+    float *prefill_out = (float *)malloc((size_t)prompt_values * sizeof(float));
+    uint16_t *k_cache = (uint16_t *)malloc((size_t)cache_values * sizeof(uint16_t));
+    uint16_t *v_cache = (uint16_t *)malloc((size_t)cache_values * sizeof(uint16_t));
+    float *decode_out = (float *)malloc((size_t)HIDDEN * sizeof(float));
+    CHECK(q != NULL && k != NULL && v != NULL && expected_prefill != NULL && prefill_out != NULL &&
+          k_cache != NULL && v_cache != NULL && decode_out != NULL);
+
+    for (uint64_t i = 0u; i < prompt_values; ++i) {
+        q[i] = q_values[(i * 7u + i / 13u + 1u) % q_count];
+        k[i] = k_values[(i * 11u + i / 17u + 3u) % k_count];
+        v[i] = v_values[(i * 13u + i / 19u + 5u) % v_count];
+    }
+    CHECK(compute_prefill_attention_expected(q, k, v, TOKENS, expected_prefill) == 1);
+
+    char error[1024];
+    memset(error, 0, sizeof(error));
+    uocr_metal_context *ctx = uocr_metal_context_create(UOCR_TEST_METAL_RESOURCE_PATH, error, sizeof(error));
+    CHECK(ctx != NULL);
+
+    memset(prefill_out, 0, (size_t)prompt_values * sizeof(float));
+    CHECK(uocr_metal_context_prefill_attention_f16(ctx,
+                                                   q,
+                                                   k,
+                                                   v,
+                                                   TOKENS,
+                                                   UOCR_METAL_DENSE_OUTPUT_F32,
+                                                   prefill_out,
+                                                   error,
+                                                   sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    for (uint64_t i = 0u; i < prompt_values; ++i) {
+        CHECK(fabsf(prefill_out[i] - expected_prefill[i]) < 8.0e-4f);
+    }
+
+    CHECK(uocr_metal_context_write_kv_cache_f16(ctx,
+                                                k,
+                                                v,
+                                                NULL,
+                                                NULL,
+                                                TOKENS,
+                                                BATCH_SLOTS,
+                                                PROMPT_TOKEN_CAPACITY,
+                                                LAYER,
+                                                SLOT,
+                                                TOKENS,
+                                                0u,
+                                                k_cache,
+                                                v_cache,
+                                                error,
+                                                sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+
+    memset(decode_out, 0, (size_t)HIDDEN * sizeof(float));
+    CHECK(uocr_metal_context_decode_attention_f16(ctx,
+                                                  q + ((uint32_t)TOKENS - 1u) * (uint32_t)HIDDEN,
+                                                  k_cache,
+                                                  v_cache,
+                                                  BATCH_SLOTS,
+                                                  PROMPT_TOKEN_CAPACITY,
+                                                  LAYER,
+                                                  SLOT,
+                                                  TOKENS,
+                                                  0u,
+                                                  UOCR_METAL_DENSE_OUTPUT_F32,
+                                                  decode_out,
+                                                  error,
+                                                  sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    for (uint32_t i = 0u; i < (uint32_t)HIDDEN; ++i) {
+        const uint64_t prefill_index = ((uint64_t)TOKENS - 1u) * (uint64_t)HIDDEN + (uint64_t)i;
+        CHECK(fabsf(decode_out[i] - expected_prefill[prefill_index]) < 1.0e-3f);
+        CHECK(fabsf(decode_out[i] - prefill_out[prefill_index]) < 1.0e-3f);
+    }
+
+    uocr_metal_context_destroy(ctx);
+    free(decode_out);
+    free(v_cache);
+    free(k_cache);
+    free(prefill_out);
+    free(expected_prefill);
+    free(v);
+    free(k);
+    free(q);
+    return 0;
+}
+
 static int test_metal_recent_decoder_primitives_stress(void) {
     if (!uocr_metal_is_available()) {
         return 0;
@@ -15466,6 +15600,7 @@ int main(void) {
     if (test_metal_kv_cache_layout_helpers() != 0) return 1;
     if (test_metal_kv_cache_write_f16() != 0) return 1;
     if (test_metal_decode_attention_f16() != 0) return 1;
+    if (test_metal_sdpa_prefill_decode_consistency_f16() != 0) return 1;
     if (test_metal_recent_decoder_primitives_stress() != 0) return 1;
     if (test_metal_runtime_arenas() != 0) return 1;
     if (test_metal_integrated_decoder_boundary() != 0) return 1;
