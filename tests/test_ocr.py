@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import os
+import sys
+import types
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -109,6 +112,93 @@ def test_ocr_pages_uses_upstream_defaults_and_caps_generation() -> None:
 def test_ocr_pages_rejects_negative_generation_cap() -> None:
     with pytest.raises(ValueError, match="max_gen_tokens must be non-negative"):
         ocr.ocr_pages([Image.new("RGB", (64, 64), (1, 2, 3))], engine=_FakeEngine(), max_gen_tokens=-1)
+
+
+def test_pdf_to_images_rasterizes_with_lazy_pymupdf(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    calls: dict[str, object] = {}
+
+    class _FakePixmap:
+        def __init__(self, page_index: int) -> None:
+            self.page_index = page_index
+
+        def save(self, path: str) -> None:
+            Path(path).write_bytes(f"page {self.page_index}".encode("ascii"))
+
+    class _FakePage:
+        def __init__(self, page_index: int) -> None:
+            self.page_index = page_index
+
+        def get_pixmap(self, *, matrix: object, alpha: bool) -> _FakePixmap:
+            calls.setdefault("pixmap_calls", []).append((self.page_index, matrix, alpha))  # type: ignore[union-attr]
+            return _FakePixmap(self.page_index)
+
+    class _FakeDocument:
+        def __init__(self) -> None:
+            self.closed = False
+            self.pages = [_FakePage(1), _FakePage(2)]
+
+        def __iter__(self):  # type: ignore[no-untyped-def]
+            return iter(self.pages)
+
+        def close(self) -> None:
+            self.closed = True
+            calls["closed"] = True
+
+    fake_doc = _FakeDocument()
+
+    def fake_open(path: str) -> _FakeDocument:
+        calls["open_path"] = path
+        return fake_doc
+
+    def fake_matrix(x_scale: float, y_scale: float) -> tuple[float, float]:
+        calls["matrix"] = (x_scale, y_scale)
+        return (x_scale, y_scale)
+
+    fake_fitz = types.SimpleNamespace(open=fake_open, Matrix=fake_matrix)
+    monkeypatch.setitem(sys.modules, "fitz", fake_fitz)
+
+    out_dir = tmp_path / "pages"
+    paths = ocr.pdf_to_images(tmp_path / "doc.pdf", dpi=144, out_dir=out_dir)
+
+    assert calls["open_path"] == str(tmp_path / "doc.pdf")
+    assert calls["matrix"] == (2.0, 2.0)
+    assert calls["closed"] is True
+    assert paths == [out_dir / "page_0001.png", out_dir / "page_0002.png"]
+    assert [path.read_bytes() for path in paths] == [b"page 1", b"page 2"]
+    assert calls["pixmap_calls"] == [(1, (2.0, 2.0), False), (2, (2.0, 2.0), False)]
+
+
+def test_pdf_to_images_rejects_invalid_dpi() -> None:
+    with pytest.raises(ValueError, match="dpi must be positive"):
+        ocr.pdf_to_images("document.pdf", dpi=0)
+
+
+def test_ocr_pdf_renders_then_uses_multi_page_defaults(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    calls: dict[str, object] = {}
+
+    def fake_pdf_to_images(pdf_path: str | Path, *, dpi: int = 300, out_dir: str | Path | None = None) -> list[Image.Image]:
+        calls["pdf_path"] = pdf_path
+        calls["dpi"] = dpi
+        calls["out_dir"] = out_dir
+        return [Image.new("RGB", (96, 64), (1, 2, 3)), Image.new("RGB", (64, 96), (4, 5, 6))]
+
+    monkeypatch.setattr(ocr, "pdf_to_images", fake_pdf_to_images)
+    fake = _FakeEngine()
+    page_dir = tmp_path / "rendered-pages"
+    result = ocr.ocr_pdf(tmp_path / "doc.pdf", engine=fake, dpi=200, page_output_dir=page_dir, max_gen_tokens=11)
+
+    assert calls == {"pdf_path": tmp_path / "doc.pdf", "dpi": 200, "out_dir": page_dir}
+    assert result.token_ids.tolist() == [EOS_TOKEN_ID]
+    assert result.text == ""
+    assert len(fake.requests) == 1
+
+    request = fake.requests[0]
+    assert request.prompt == MULTI_PROMPT
+    assert request.mode == "multi-page-base"
+    assert request.expected_visual_tokens == 2 * GLOBAL_VISUAL_TOKENS
+    assert request.max_new_tokens == 11
+    assert request.no_repeat_ngram_size == 35
+    assert request.no_repeat_window == 1024
 
 
 @pytest.mark.skipif(not native_library_available(), reason="libunlimitedocr is not built")

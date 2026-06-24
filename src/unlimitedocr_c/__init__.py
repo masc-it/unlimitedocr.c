@@ -107,6 +107,8 @@ from .ocr import (
     generate_prepared,
     ocr_image,
     ocr_pages,
+    ocr_pdf,
+    pdf_to_images,
 )
 
 __all__ = [
@@ -205,4 +207,6 @@ __all__ = [
     "generate_prepared",
     "ocr_image",
     "ocr_pages",
+    "ocr_pdf",
+    "pdf_to_images",
 ]

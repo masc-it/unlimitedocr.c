@@ -1,15 +1,16 @@
 """Thin Python OCR convenience wrapper over the prepared-request C API.
 
 This module intentionally stays small: Python prepares pixels/tokens and decodes
-returned token ids, while the native engine owns Metal inference. Stable OCR/PDF
-postprocessing ergonomics are deferred until after the fp16 image path is fully
-validated.
+returned token ids, while the native engine owns Metal inference. Richer
+PDF/postprocessing ergonomics are deferred until after the fp16 image path is
+fully validated.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from pathlib import Path
+import tempfile
 from typing import Any, Sequence
 
 import numpy as np
@@ -273,6 +274,114 @@ def ocr_pages(
         request,
         engine=engine,
         model_path=model_path,
+        backend=backend,
+        resource_path=resource_path,
+        memory_budget_bytes=memory_budget_bytes,
+        library_path=library_path,
+    )
+
+
+def _import_pymupdf():
+    try:
+        import fitz  # type: ignore[import-not-found]  # PyMuPDF
+    except ModuleNotFoundError as exc:
+        if exc.name == "fitz":
+            raise ModuleNotFoundError(
+                "ocr_pdf() requires PyMuPDF; install the optional 'pymupdf' package to rasterize PDFs"
+            ) from exc
+        raise
+    return fitz
+
+
+def pdf_to_images(pdf_path: str | Path, *, dpi: int = 300, out_dir: str | Path | None = None) -> list[Path]:
+    """Rasterize a PDF to PNG page images using PyMuPDF.
+
+    PyMuPDF is imported lazily so non-PDF OCR does not depend on it.  When
+    ``out_dir`` is omitted, a temporary directory is created and intentionally
+    retained for callers that use this helper directly.  ``ocr_pdf()`` uses its
+    own temporary directory and cleans it up after generation.
+    """
+
+    if dpi <= 0:
+        raise ValueError("dpi must be positive")
+
+    fitz = _import_pymupdf()
+    output_dir = Path(out_dir) if out_dir is not None else Path(tempfile.mkdtemp(prefix="uocr_pdf_"))
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    doc = fitz.open(str(pdf_path))
+    try:
+        matrix = fitz.Matrix(dpi / 72.0, dpi / 72.0)
+        paths: list[Path] = []
+        for index, page in enumerate(doc):
+            path = output_dir / f"page_{index + 1:04d}.png"
+            pixmap = page.get_pixmap(matrix=matrix, alpha=False)
+            pixmap.save(str(path))
+            paths.append(path)
+        return paths
+    finally:
+        doc.close()
+
+
+def ocr_pdf(
+    pdf_path: str | Path,
+    *,
+    model_path: str | Path | None = None,
+    prompt: str = MULTI_PROMPT,
+    tokenizer_path: str | Path | None = None,
+    dpi: int = 300,
+    page_output_dir: str | Path | None = None,
+    max_length: int = 32768,
+    max_gen_tokens: int | None = 512,
+    no_repeat_ngram_size: int = 35,
+    ngram_window: int = 1024,
+    dtype: np.dtype[Any] | type[np.float16] | type[np.float32] = np.float16,
+    engine: Engine | None = None,
+    backend: str = "metal",
+    resource_path: str | Path | None = None,
+    memory_budget_bytes: int = 0,
+    library_path: str | Path | None = None,
+) -> GenerationResult:
+    """Rasterize a PDF in Python and run multi-page OCR through the C engine.
+
+    C still receives only a normal prepared multi-page image request; PDF I/O
+    and rasterization stay on the Python side.  Use ``page_output_dir`` when the
+    rendered PNG pages should be kept for debugging, otherwise a temporary
+    directory is cleaned up after generation.
+    """
+
+    if page_output_dir is None:
+        with tempfile.TemporaryDirectory(prefix="uocr_pdf_") as tmp_dir:
+            pages = pdf_to_images(pdf_path, dpi=dpi, out_dir=tmp_dir)
+            return ocr_pages(
+                pages,
+                model_path=model_path,
+                prompt=prompt,
+                tokenizer_path=tokenizer_path,
+                max_length=max_length,
+                max_gen_tokens=max_gen_tokens,
+                no_repeat_ngram_size=no_repeat_ngram_size,
+                ngram_window=ngram_window,
+                dtype=dtype,
+                engine=engine,
+                backend=backend,
+                resource_path=resource_path,
+                memory_budget_bytes=memory_budget_bytes,
+                library_path=library_path,
+            )
+
+    pages = pdf_to_images(pdf_path, dpi=dpi, out_dir=page_output_dir)
+    return ocr_pages(
+        pages,
+        model_path=model_path,
+        prompt=prompt,
+        tokenizer_path=tokenizer_path,
+        max_length=max_length,
+        max_gen_tokens=max_gen_tokens,
+        no_repeat_ngram_size=no_repeat_ngram_size,
+        ngram_window=ngram_window,
+        dtype=dtype,
+        engine=engine,
         backend=backend,
         resource_path=resource_path,
         memory_budget_bytes=memory_budget_bytes,

@@ -957,7 +957,7 @@ Do not start the stable high-level OCR/PDF API until Gate E2E-0 passes: public f
   - [x] base mode
   - [x] upstream-style `max_length=32768` converted to C `max_new_tokens = max_length - prompt_tokens`, capped by engine limit
   - [x] `ngram_window=1024`
-- [ ] Implement `ocr_pdf()` using PyMuPDF in Python, not C.
+- [x] Implement `ocr_pdf()` using PyMuPDF in Python, not C.
 - [ ] Port useful postprocessing from `/Users/mascit/Downloads/ocrbaidu/src/ocrbaidu/postprocess.py`:
   - [ ] `parse_regions`
   - [ ] `clean_lines`
