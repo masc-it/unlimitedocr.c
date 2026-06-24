@@ -7268,6 +7268,74 @@ int uocr_metal_context_clip_add_abs_pos_f16(uocr_metal_context *ctx,
     return result;
 }
 
+int uocr_metal_context_clip_pre_layernorm_f16(uocr_metal_context *ctx,
+                                              const uint16_t *input_f16,
+                                              const uint16_t *weight_f16,
+                                              const uint16_t *bias_f16,
+                                              uint32_t token_count,
+                                              uocr_metal_layernorm_output_type output_type,
+                                              void *out,
+                                              char *error,
+                                              size_t error_size) {
+    metal_clear_error(error, error_size);
+    if (ctx == NULL || input_f16 == NULL || weight_f16 == NULL || bias_f16 == NULL || out == NULL) {
+        return metal_fail(error, error_size, "invalid Metal CLIP pre-LayerNorm request");
+    }
+    if (token_count != UOCR_CLIP_GLOBAL_TOKENS && token_count != UOCR_CLIP_LOCAL_TOKENS) {
+        return metal_fail(error, error_size, "invalid Metal CLIP pre-LayerNorm token count %u", token_count);
+    }
+    if (UOCR_CLIP_HIDDEN_SIZE != 1024u || UOCR_CLIP_PRE_LAYERNORM_EPS != 1.0e-5f ||
+        UOCR_CLIP_GLOBAL_TOKENS != 257u || UOCR_CLIP_LOCAL_TOKENS != 101u) {
+        return metal_fail(error, error_size, "Metal CLIP pre-LayerNorm constants are inconsistent");
+    }
+
+    const uint64_t parameter_bytes = (uint64_t)UOCR_CLIP_HIDDEN_SIZE * 2u;
+    const uint64_t max_buffer_length = metal_device_max_buffer_length(ctx->device);
+    if (parameter_bytes > (uint64_t)SIZE_MAX || parameter_bytes > max_buffer_length) {
+        return metal_fail(error,
+                          error_size,
+                          "Metal CLIP pre-LayerNorm buffers exceed maxBufferLength %llu",
+                          (unsigned long long)max_buffer_length);
+    }
+
+    @autoreleasepool {
+        id<MTLBuffer> weight = [ctx->device newBufferWithBytes:weight_f16
+                                                        length:(NSUInteger)parameter_bytes
+                                                       options:MTLResourceStorageModeShared];
+        if (weight == nil) {
+            return metal_fail(error, error_size, "failed to allocate Metal CLIP pre-LayerNorm weight buffer");
+        }
+        weight.label = @"uocr_clip_pre_layernorm_weight_f16";
+
+        id<MTLBuffer> bias = [ctx->device newBufferWithBytes:bias_f16
+                                                      length:(NSUInteger)parameter_bytes
+                                                     options:MTLResourceStorageModeShared];
+        if (bias == nil) {
+            [weight release];
+            return metal_fail(error, error_size, "failed to allocate Metal CLIP pre-LayerNorm bias buffer");
+        }
+        bias.label = @"uocr_clip_pre_layernorm_bias_f16";
+
+        const int ok = metal_context_layernorm_f16_with_parameter_buffers(ctx,
+                                                                         input_f16,
+                                                                         weight,
+                                                                         0u,
+                                                                         bias,
+                                                                         0u,
+                                                                         token_count,
+                                                                         UOCR_CLIP_HIDDEN_SIZE,
+                                                                         UOCR_CLIP_PRE_LAYERNORM_EPS,
+                                                                         output_type,
+                                                                         out,
+                                                                         "Metal CLIP pre-LayerNorm",
+                                                                         error,
+                                                                         error_size);
+        [bias release];
+        [weight release];
+        return ok;
+    }
+}
+
 static int metal_context_sam_attention_f16(uocr_metal_context *ctx,
                                            const uint16_t *q_f16,
                                            const uint16_t *k_f16,
