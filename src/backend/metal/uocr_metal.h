@@ -492,6 +492,23 @@ int uocr_metal_context_clip_layernorm_f16(uocr_metal_context *ctx,
                                           char *error,
                                           size_t error_size);
 
+/* Diagnostic CLIP transformer QKV helper. Computes the biased qkv linear
+ * projection with input [tokens,1024], weight [3072,1024], bias [3072], and
+ * writes separate Q/K/V tensors laid out [tokens,16,64]. Dot products are
+ * accumulated in fp32 before casting to the requested output type.
+ */
+int uocr_metal_context_clip_qkv_f16(uocr_metal_context *ctx,
+                                    const uint16_t *input_f16,
+                                    const uint16_t *qkv_weight_f16,
+                                    const uint16_t *qkv_bias_f16,
+                                    uint32_t token_count,
+                                    uocr_metal_dense_output_type output_type,
+                                    void *q_out,
+                                    void *k_out,
+                                    void *v_out,
+                                    char *error,
+                                    size_t error_size);
+
 /* Diagnostic SAM window-attention helper for non-global transformer blocks.
  * Q/K/V are fp16 tensors laid out as [n_windows,14*14,12,64] (equivalent to
  * window-major rows with flattened [head,dim] channels). The helper computes

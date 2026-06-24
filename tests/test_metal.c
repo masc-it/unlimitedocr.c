@@ -79,6 +79,18 @@ static size_t sam_qkv_out_index(uint32_t row, uint32_t head, uint32_t dim) {
     return (size_t)row * UOCR_SAM_HIDDEN_SIZE + (size_t)head * UOCR_SAM_HEAD_DIM + dim;
 }
 
+static size_t clip_qkv_packed_col(uint32_t projection, uint32_t head, uint32_t dim) {
+    return (size_t)projection * UOCR_CLIP_HIDDEN_SIZE + (size_t)head * UOCR_CLIP_HEAD_DIM + dim;
+}
+
+static size_t clip_qkv_weight_index(uint32_t projection, uint32_t head, uint32_t dim, uint32_t input_col) {
+    return clip_qkv_packed_col(projection, head, dim) * UOCR_CLIP_HIDDEN_SIZE + input_col;
+}
+
+static size_t clip_qkv_out_index(uint32_t token, uint32_t head, uint32_t dim) {
+    return (size_t)token * UOCR_CLIP_HIDDEN_SIZE + (size_t)head * UOCR_CLIP_HEAD_DIM + dim;
+}
+
 static size_t sam_window_attention_index(uint32_t window, uint32_t token, uint32_t head, uint32_t dim) {
     return (((size_t)window * UOCR_SAM_WINDOW_TOKENS + token) * UOCR_SAM_ATTENTION_HEADS + head) *
                UOCR_SAM_HEAD_DIM +
@@ -2036,6 +2048,173 @@ static int test_metal_clip_layernorm_f16(void) {
 
     uocr_metal_context_destroy(ctx);
     free(expected);
+    free(bias);
+    free(weight);
+    return 0;
+}
+
+static int test_metal_clip_qkv_f16(void) {
+    if (!uocr_metal_is_available()) {
+        return 0;
+    }
+
+    CHECK(UOCR_CLIP_HIDDEN_SIZE == 1024u);
+    CHECK(UOCR_CLIP_QKV_SIZE == 3072u);
+    CHECK(UOCR_CLIP_ATTENTION_HEADS == 16u);
+    CHECK(UOCR_CLIP_HEAD_DIM == 64u);
+    CHECK(UOCR_CLIP_ATTENTION_HEADS * UOCR_CLIP_HEAD_DIM == UOCR_CLIP_HIDDEN_SIZE);
+
+    const size_t weight_values = (size_t)UOCR_CLIP_QKV_SIZE * UOCR_CLIP_HIDDEN_SIZE;
+    uint16_t *weight = (uint16_t *)calloc(weight_values, sizeof(uint16_t));
+    uint16_t *bias = (uint16_t *)calloc(UOCR_CLIP_QKV_SIZE, sizeof(uint16_t));
+    CHECK(weight != NULL);
+    CHECK(bias != NULL);
+
+    /* Q head 0 dim 0 = input[0] + 0.25. */
+    weight[clip_qkv_weight_index(0u, 0u, 0u, 0u)] = f32_to_f16_bits(1.0f);
+    bias[clip_qkv_packed_col(0u, 0u, 0u)] = f32_to_f16_bits(0.25f);
+    /* Q head 15 dim 63 is bias-only. */
+    bias[clip_qkv_packed_col(0u, UOCR_CLIP_ATTENTION_HEADS - 1u, UOCR_CLIP_HEAD_DIM - 1u)] =
+        f32_to_f16_bits(-0.375f);
+    /* K head 8 dim 17 = -1.5 * input[11] + 0.125. */
+    weight[clip_qkv_weight_index(1u, 8u, 17u, 11u)] = f32_to_f16_bits(-1.5f);
+    bias[clip_qkv_packed_col(1u, 8u, 17u)] = f32_to_f16_bits(0.125f);
+    /* V head 15 dim 63 = input[5] - input[13] - 0.5. */
+    weight[clip_qkv_weight_index(2u, UOCR_CLIP_ATTENTION_HEADS - 1u, UOCR_CLIP_HEAD_DIM - 1u, 5u)] =
+        f32_to_f16_bits(1.0f);
+    weight[clip_qkv_weight_index(2u, UOCR_CLIP_ATTENTION_HEADS - 1u, UOCR_CLIP_HEAD_DIM - 1u, 13u)] =
+        f32_to_f16_bits(-1.0f);
+    bias[clip_qkv_packed_col(2u, UOCR_CLIP_ATTENTION_HEADS - 1u, UOCR_CLIP_HEAD_DIM - 1u)] =
+        f32_to_f16_bits(-0.5f);
+
+    char error[1024];
+    memset(error, 0, sizeof(error));
+    uocr_metal_context *ctx = uocr_metal_context_create(UOCR_TEST_METAL_RESOURCE_PATH, error, sizeof(error));
+    CHECK(ctx != NULL);
+
+    const uint32_t token_counts[] = {UOCR_CLIP_GLOBAL_TOKENS, UOCR_CLIP_LOCAL_TOKENS};
+    for (size_t case_index = 0u; case_index < sizeof(token_counts) / sizeof(token_counts[0]); ++case_index) {
+        const uint32_t tokens = token_counts[case_index];
+        const size_t input_values = (size_t)tokens * UOCR_CLIP_HIDDEN_SIZE;
+        uint16_t *input = (uint16_t *)calloc(input_values, sizeof(uint16_t));
+        float *q_f32 = (float *)calloc(input_values, sizeof(float));
+        float *k_f32 = (float *)calloc(input_values, sizeof(float));
+        float *v_f32 = (float *)calloc(input_values, sizeof(float));
+        uint16_t *q_f16 = (uint16_t *)calloc(input_values, sizeof(uint16_t));
+        uint16_t *k_f16 = (uint16_t *)calloc(input_values, sizeof(uint16_t));
+        uint16_t *v_f16 = (uint16_t *)calloc(input_values, sizeof(uint16_t));
+        CHECK(input != NULL);
+        CHECK(q_f32 != NULL);
+        CHECK(k_f32 != NULL);
+        CHECK(v_f32 != NULL);
+        CHECK(q_f16 != NULL);
+        CHECK(k_f16 != NULL);
+        CHECK(v_f16 != NULL);
+
+        for (uint32_t token = 0u; token < tokens; ++token) {
+            for (uint32_t col = 0u; col < UOCR_CLIP_HIDDEN_SIZE; ++col) {
+                const int mod = (int)((token * 23u + col * 7u + tokens) % 251u) - 125;
+                input[clip_token_index(token, col)] = f32_to_f16_bits((float)mod * 0.001f);
+            }
+        }
+
+        CHECK(uocr_metal_context_clip_qkv_f16(ctx,
+                                               input,
+                                               weight,
+                                               bias,
+                                               tokens,
+                                               UOCR_METAL_DENSE_OUTPUT_F32,
+                                               q_f32,
+                                               k_f32,
+                                               v_f32,
+                                               error,
+                                               sizeof(error)) == 1);
+        CHECK(error[0] == '\0');
+
+        const uint32_t sample_tokens[] = {0u, tokens / 2u, tokens - 1u};
+        for (size_t i = 0u; i < sizeof(sample_tokens) / sizeof(sample_tokens[0]); ++i) {
+            const uint32_t token = sample_tokens[i];
+            const float x0 = f16_bits_to_f32(input[clip_token_index(token, 0u)]);
+            const float x5 = f16_bits_to_f32(input[clip_token_index(token, 5u)]);
+            const float x11 = f16_bits_to_f32(input[clip_token_index(token, 11u)]);
+            const float x13 = f16_bits_to_f32(input[clip_token_index(token, 13u)]);
+            CHECK(fabsf(q_f32[clip_qkv_out_index(token, 0u, 0u)] - (x0 + 0.25f)) <= 1.0e-5f);
+            CHECK(fabsf(q_f32[clip_qkv_out_index(token, UOCR_CLIP_ATTENTION_HEADS - 1u, UOCR_CLIP_HEAD_DIM - 1u)] +
+                        0.375f) <= 1.0e-5f);
+            CHECK(fabsf(k_f32[clip_qkv_out_index(token, 8u, 17u)] - (-1.5f * x11 + 0.125f)) <= 1.0e-5f);
+            CHECK(fabsf(v_f32[clip_qkv_out_index(token,
+                                                 UOCR_CLIP_ATTENTION_HEADS - 1u,
+                                                 UOCR_CLIP_HEAD_DIM - 1u)] -
+                        (x5 - x13 - 0.5f)) <= 1.0e-5f);
+            CHECK(fabsf(q_f32[clip_qkv_out_index(token, 3u, 9u)]) <= 1.0e-5f);
+            CHECK(fabsf(k_f32[clip_qkv_out_index(token, 3u, 9u)]) <= 1.0e-5f);
+            CHECK(fabsf(v_f32[clip_qkv_out_index(token, 3u, 9u)]) <= 1.0e-5f);
+        }
+
+        CHECK(uocr_metal_context_clip_qkv_f16(ctx,
+                                               input,
+                                               weight,
+                                               bias,
+                                               tokens,
+                                               UOCR_METAL_DENSE_OUTPUT_F16,
+                                               q_f16,
+                                               k_f16,
+                                               v_f16,
+                                               error,
+                                               sizeof(error)) == 1);
+        CHECK(error[0] == '\0');
+        for (size_t i = 0u; i < sizeof(sample_tokens) / sizeof(sample_tokens[0]); ++i) {
+            const uint32_t token = sample_tokens[i];
+            const float x0 = f16_bits_to_f32(input[clip_token_index(token, 0u)]);
+            const float x5 = f16_bits_to_f32(input[clip_token_index(token, 5u)]);
+            const float x11 = f16_bits_to_f32(input[clip_token_index(token, 11u)]);
+            const float x13 = f16_bits_to_f32(input[clip_token_index(token, 13u)]);
+            CHECK(q_f16[clip_qkv_out_index(token, 0u, 0u)] == f32_to_f16_bits(x0 + 0.25f));
+            CHECK(q_f16[clip_qkv_out_index(token, UOCR_CLIP_ATTENTION_HEADS - 1u, UOCR_CLIP_HEAD_DIM - 1u)] ==
+                  f32_to_f16_bits(-0.375f));
+            CHECK(k_f16[clip_qkv_out_index(token, 8u, 17u)] == f32_to_f16_bits(-1.5f * x11 + 0.125f));
+            CHECK(v_f16[clip_qkv_out_index(token, UOCR_CLIP_ATTENTION_HEADS - 1u, UOCR_CLIP_HEAD_DIM - 1u)] ==
+                  f32_to_f16_bits(x5 - x13 - 0.5f));
+        }
+
+        free(v_f16);
+        free(k_f16);
+        free(q_f16);
+        free(v_f32);
+        free(k_f32);
+        free(q_f32);
+        free(input);
+    }
+
+    uint16_t one_value = f32_to_f16_bits(0.0f);
+    float one_out = 0.0f;
+    CHECK(uocr_metal_context_clip_qkv_f16(ctx,
+                                           &one_value,
+                                           NULL,
+                                           bias,
+                                           UOCR_CLIP_LOCAL_TOKENS,
+                                           UOCR_METAL_DENSE_OUTPUT_F32,
+                                           &one_out,
+                                           &one_out,
+                                           &one_out,
+                                           error,
+                                           sizeof(error)) == 0);
+    CHECK(strstr(error, "invalid Metal CLIP QKV") != NULL);
+
+    CHECK(uocr_metal_context_clip_qkv_f16(ctx,
+                                           &one_value,
+                                           weight,
+                                           bias,
+                                           UOCR_CLIP_LOCAL_TOKENS - 1u,
+                                           UOCR_METAL_DENSE_OUTPUT_F32,
+                                           &one_out,
+                                           &one_out,
+                                           &one_out,
+                                           error,
+                                           sizeof(error)) == 0);
+    CHECK(strstr(error, "invalid Metal CLIP QKV token count") != NULL);
+
+    uocr_metal_context_destroy(ctx);
     free(bias);
     free(weight);
     return 0;
@@ -12085,6 +12264,7 @@ int main(void) {
     if (test_metal_clip_abs_pos_f16() != 0) return 1;
     if (test_metal_clip_pre_layernorm_f16() != 0) return 1;
     if (test_metal_clip_layernorm_f16() != 0) return 1;
+    if (test_metal_clip_qkv_f16() != 0) return 1;
     if (test_metal_sam_window_partition_f16() != 0) return 1;
     if (test_metal_sam_window_attention_f16() != 0) return 1;
     if (test_metal_sam_global_attention_f16() != 0) return 1;
