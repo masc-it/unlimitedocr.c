@@ -384,9 +384,9 @@ Current priority slice, in order. The coding agent should take the first uncheck
 - [x] Add a converter validation report that fails if expected tensor names are missing or unexpected shapes appear.
 - [x] Identify tensors that are present but not used in the normal upstream OCR path, especially CLIP pixel patch embedding (`vision_model.embeddings.patch_embedding.*`) because CLIP receives SAM feature maps as `patch_embeds`; either preserve them as unused or omit them with explicit provenance.
 - [x] Add a deterministic tensor-order table used by both converter and runtime.
-- [ ] Pack routed experts expert-major:
-  - [ ] `[layer][projection][expert][out_row][packed_input]`
-- [ ] Pack or colocate expert `gate_proj` and `up_proj` so Metal selected-expert kernels can read them together.
+- [x] Pack routed experts expert-major:
+  - [x] `[layer][expert][projection][out_row][packed_input]` with interleaved `gate_proj`, `up_proj`, `down_proj` payloads per expert
+- [x] Pack or colocate expert `gate_proj` and `up_proj` so Metal selected-expert kernels can read them together.
 - [ ] Store both logical and physical input widths for quantized tensors.
 - [ ] Explicitly mark unaligned `Q4_K` hazards:
   - [ ] routed expert `down_proj` input `896`

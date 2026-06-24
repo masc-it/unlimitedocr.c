@@ -288,13 +288,13 @@ LAYER[1..11].MOE.SHARED.{GATE,UP,DOWN}
 VISION.SAM.*, VISION.CLIP.*, PROJECTOR, IMAGE_NEWLINE, VIEW_SEPARATOR
 ```
 
-Routed experts should be packed expert-major for selected-expert kernels:
+Routed experts are packed as interleaved expert-major slabs for selected-expert kernels:
 
 ```text
-[layer][projection][expert][out_row][packed_input]
+[layer][expert][projection: gate, up, down][out_row][packed_input]
 ```
 
-For fused gate/up kernels, the converter may additionally create paired slabs or adjacent offsets so Metal can fetch selected expert `gate` and `up` together.
+This keeps each expert's `gate_proj`, `up_proj`, and `down_proj` payloads contiguous; Metal can fetch selected expert `gate` and `up` together for fused projection and use the same expert stride for the down projection.
 
 ### Quantized physical shapes
 

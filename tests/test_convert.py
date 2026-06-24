@@ -10,6 +10,11 @@ import pytest
 from unlimitedocr_c.convert import (
     EXPECTED_TENSOR_COUNT,
     EXPECTED_TOTAL_BYTES,
+    MOE_EXPERT_PACKING_CONTRACT,
+    MOE_EXPERT_PACKING_LAYOUT,
+    MOE_ROUTED_EXPERT_COUNT,
+    MOE_ROUTED_LAYER_END_EXCLUSIVE,
+    MOE_ROUTED_LAYER_START,
     PADDED_Q4_K_KERNEL_CONTRACT,
     PRESERVED_UNUSED_NORMAL_OCR_PREFIXES,
     UOCR_PROMOTION_NONE,
@@ -232,6 +237,46 @@ def test_fp16_converter_dry_run_against_cached_header() -> None:
     assert clip_patch.usage == "preserved-unused"
     assert "patch_embeds" in clip_patch.reason
     assert "provenance" in clip_patch.reason
+
+
+def test_fp16_converter_packs_routed_experts_interleaved_expert_major() -> None:
+    plan = build_dry_run_plan(project_root() / "data/context", qprofile="fp16")
+    summary = plan.summary_dict()["moe_expert_packing"]
+    assert summary["layout"] == MOE_EXPERT_PACKING_LAYOUT
+    assert summary["contract"] == MOE_EXPERT_PACKING_CONTRACT
+    assert summary["layer_start"] == MOE_ROUTED_LAYER_START
+    assert summary["layer_end_exclusive"] == MOE_ROUTED_LAYER_END_EXCLUSIVE
+    assert summary["expert_count"] == MOE_ROUTED_EXPERT_COUNT
+    assert summary["projection_order"] == ["GATE", "UP", "DOWN"]
+
+    projections = [
+        ("gate_proj", TensorProjection.GATE, "GATE"),
+        ("up_proj", TensorProjection.UP, "UP"),
+        ("down_proj", TensorProjection.DOWN, "DOWN"),
+    ]
+    for layer in range(MOE_ROUTED_LAYER_START, MOE_ROUTED_LAYER_END_EXCLUSIVE):
+        ordered = []
+        for expert in range(MOE_ROUTED_EXPERT_COUNT):
+            per_expert = []
+            for suffix, projection, projection_name in projections:
+                tensor = plan.tensor_by_name(f"model.layers.{layer}.mlp.experts.{expert}.{suffix}.weight")
+                assert tensor.tensor_id == tensor_id_moe_expert(layer, expert, projection)
+                assert tensor.family == "MOE_EXPERT"
+                assert tensor.layer == layer
+                assert tensor.expert == expert
+                assert tensor.projection == projection_name
+                per_expert.append(tensor)
+                ordered.append(tensor)
+
+            gate, up, down = per_expert
+            assert up.payload_offset == gate.payload_offset + gate.output_bytes
+            assert down.payload_offset == up.payload_offset + up.output_bytes
+
+        assert [tensor.tensor_id for tensor in ordered] == sorted(tensor.tensor_id for tensor in ordered)
+        previous_end = ordered[0].payload_offset
+        for tensor in ordered:
+            assert tensor.payload_offset == previous_end
+            previous_end = tensor.payload_offset + tensor.output_bytes
 
 
 def test_dyn_q8_converter_dry_run_records_quant_metadata() -> None:

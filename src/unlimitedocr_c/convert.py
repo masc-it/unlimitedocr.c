@@ -28,12 +28,25 @@ from .tensor_registry import (
     TensorProjection,
     TensorRegistryEntry,
     build_tensor_registry,
+    tensor_id_moe_expert,
     validate_registry_shapes,
 )
 
 EXPECTED_TENSOR_COUNT = 2710
 EXPECTED_TOTAL_BYTES = 6_672_212_480
 EXPECTED_SOURCE_DTYPE = "BF16"
+
+MOE_ROUTED_LAYER_START = 1
+MOE_ROUTED_LAYER_END_EXCLUSIVE = 12
+MOE_ROUTED_EXPERT_COUNT = 64
+MOE_EXPERT_PROJECTION_ORDER = (TensorProjection.GATE, TensorProjection.UP, TensorProjection.DOWN)
+MOE_EXPERT_PACKING_LAYOUT = "interleaved-expert-major"
+MOE_EXPERT_PACKING_CONTRACT = (
+    "For each routed-MoE layer, expert payloads are contiguous as "
+    "[expert][gate_proj,up_proj,down_proj][out_row][packed_input]. "
+    "This gives Metal selected-expert kernels one expert-major slab with "
+    "gate/up colocated for fused projection and down immediately after."
+)
 
 UOCR_FILE_ALIGNMENT = 4096
 UOCR_TENSOR_DATA_ALIGNMENT = 4096
@@ -387,6 +400,14 @@ class DryRunPlan:
             "promotion_reason_histogram": dict(self.promotion_reason_histogram),
             "usage_histogram": dict(self.usage_histogram),
             "family_histogram": dict(self.family_histogram),
+            "moe_expert_packing": {
+                "layout": MOE_EXPERT_PACKING_LAYOUT,
+                "contract": MOE_EXPERT_PACKING_CONTRACT,
+                "layer_start": MOE_ROUTED_LAYER_START,
+                "layer_end_exclusive": MOE_ROUTED_LAYER_END_EXCLUSIVE,
+                "expert_count": MOE_ROUTED_EXPERT_COUNT,
+                "projection_order": [projection.name for projection in MOE_EXPERT_PROJECTION_ORDER],
+            },
         }
 
     def as_dict(self) -> dict[str, Any]:
@@ -517,6 +538,61 @@ def _promotion_reason_histogram(tensors: Iterable[TensorPlan]) -> dict[str, int]
 
 def _family_histogram(tensors: Iterable[TensorPlan]) -> dict[str, int]:
     return dict(Counter(t.family for t in tensors))
+
+
+def _validate_moe_expert_interleaved_layout(tensors: Iterable[TensorPlan], *, require_complete: bool) -> None:
+    """Validate the routed-expert payload order consumed by Metal.
+
+    The integrated Metal decoder forms one no-copy slab per MoE layer starting at
+    expert 0 gate.  It then addresses gate/up/down as offsets inside each expert
+    stride, so converter layout drift would silently corrupt selected-expert
+    projections.  Keep this check in the planner so dry-run and full conversion
+    fail before a `.uocr` file is written.
+    """
+
+    by_id = {tensor.tensor_id: tensor for tensor in tensors}
+    for layer in range(MOE_ROUTED_LAYER_START, MOE_ROUTED_LAYER_END_EXCLUSIVE):
+        expected: list[TensorPlan] = []
+        missing: list[int] = []
+        for expert in range(MOE_ROUTED_EXPERT_COUNT):
+            for projection in MOE_EXPERT_PROJECTION_ORDER:
+                tensor_id = tensor_id_moe_expert(layer, expert, projection)
+                tensor = by_id.get(tensor_id)
+                if tensor is None:
+                    missing.append(tensor_id)
+                    continue
+                expected.append(tensor)
+
+        if missing:
+            if require_complete:
+                first = missing[0]
+                raise ValueError(
+                    f"MoE expert-major packing is incomplete for layer {layer}: "
+                    f"missing {len(missing)} tensors, first tensor_id={first}"
+                )
+            continue
+        if not expected:
+            continue
+
+        previous_end: int | None = None
+        for expert in range(MOE_ROUTED_EXPERT_COUNT):
+            for projection_index, projection in enumerate(MOE_EXPERT_PROJECTION_ORDER):
+                tensor = expected[expert * len(MOE_EXPERT_PROJECTION_ORDER) + projection_index]
+                if tensor.family != TensorFamily.MOE_EXPERT.name:
+                    raise ValueError(f"MoE expert-major tensor {tensor.name} has family {tensor.family}")
+                if tensor.layer != layer or tensor.expert != expert or tensor.projection_id != int(projection):
+                    raise ValueError(
+                        "MoE expert-major metadata mismatch for "
+                        f"{tensor.name}: layer={tensor.layer} expert={tensor.expert} projection={tensor.projection}"
+                    )
+                if tensor.usage_id != UOCR_TENSOR_USAGE_RUNTIME or tensor.output_bytes <= 0 or tensor.payload_offset <= 0:
+                    raise ValueError(f"MoE expert-major tensor {tensor.name} is not a runtime payload tensor")
+                if previous_end is not None and tensor.payload_offset != previous_end:
+                    raise ValueError(
+                        f"MoE expert-major layer {layer} is not contiguous before {tensor.name}: "
+                        f"expected payload offset {previous_end}, got {tensor.payload_offset}"
+                    )
+                previous_end = tensor.payload_offset + tensor.output_bytes
 
 
 def _layout_dry_run_file(tensors: tuple[TensorPlan, ...]) -> tuple[tuple[SectionPlan, ...], tuple[TensorPlan, ...], int, int]:
@@ -1007,6 +1083,7 @@ def build_dry_run_plan(
         for name in sorted(entries, key=lambda key: registry[key].tensor_id)
     )
     sections, tensors, planned_file_size, metadata_bytes = _layout_dry_run_file(tensors)
+    _validate_moe_expert_interleaved_layout(tensors, require_complete=strict)
     total_source_bytes = sum(t.source_bytes for t in tensors)
     total_output_bytes = sum(t.output_bytes for t in tensors)
     if strict and total_source_bytes != EXPECTED_TOTAL_BYTES:
