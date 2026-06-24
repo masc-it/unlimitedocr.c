@@ -440,6 +440,99 @@ static int read_binary_file(const char *path, unsigned char **out_bytes, size_t 
     return 1;
 }
 
+static int read_prepared_tokens_python_dump(const char *dump_dir,
+                                             int32_t **input_ids_out,
+                                             uint8_t **image_mask_out,
+                                             uint32_t *n_tokens_out,
+                                             char *error,
+                                             size_t error_size) {
+    if (input_ids_out == NULL || image_mask_out == NULL || n_tokens_out == NULL) {
+        snprintf(error, error_size, "invalid prepared-token dump request");
+        return 0;
+    }
+    *input_ids_out = NULL;
+    *image_mask_out = NULL;
+    *n_tokens_out = 0u;
+
+    char ids_path[4096];
+    char mask_path[4096];
+    if (!make_fixture_path(dump_dir, "input_ids_i32.bin", ids_path, sizeof(ids_path)) ||
+        !make_fixture_path(dump_dir, "image_mask_u8.bin", mask_path, sizeof(mask_path))) {
+        snprintf(error, error_size, "prepared-token dump path is too long");
+        return 0;
+    }
+
+    unsigned char *ids_bytes = NULL;
+    size_t ids_size = 0u;
+    if (!read_binary_file(ids_path, &ids_bytes, &ids_size, error, error_size)) {
+        return 0;
+    }
+    if (ids_size == 0u || ids_size % sizeof(int32_t) != 0u || ids_size / sizeof(int32_t) > (size_t)UINT32_MAX) {
+        snprintf(error, error_size, "invalid input_ids_i32.bin size %zu", ids_size);
+        free(ids_bytes);
+        return 0;
+    }
+    const uint32_t n_tokens = (uint32_t)(ids_size / sizeof(int32_t));
+
+    unsigned char *mask_bytes = NULL;
+    size_t mask_size = 0u;
+    if (!read_binary_file(mask_path, &mask_bytes, &mask_size, error, error_size)) {
+        free(ids_bytes);
+        return 0;
+    }
+    if (mask_size != (size_t)n_tokens) {
+        snprintf(error,
+                 error_size,
+                 "image_mask_u8.bin size mismatch: expected %u bytes, got %zu",
+                 n_tokens,
+                 mask_size);
+        free(mask_bytes);
+        free(ids_bytes);
+        return 0;
+    }
+
+    int32_t *ids = (int32_t *)malloc((size_t)n_tokens * sizeof(int32_t));
+    uint8_t *mask = (uint8_t *)malloc((size_t)n_tokens * sizeof(uint8_t));
+    if (ids == NULL || mask == NULL) {
+        snprintf(error, error_size, "failed to allocate prepared-token dump buffers");
+        free(mask);
+        free(ids);
+        free(mask_bytes);
+        free(ids_bytes);
+        return 0;
+    }
+    for (uint32_t i = 0u; i < n_tokens; ++i) {
+        const unsigned char *p = ids_bytes + 4u * i;
+        const uint32_t raw = (uint32_t)p[0] | ((uint32_t)p[1] << 8u) | ((uint32_t)p[2] << 16u) |
+                             ((uint32_t)p[3] << 24u);
+        memcpy(&ids[i], &raw, sizeof(ids[i]));
+        if (ids[i] < 0 || (uint32_t)ids[i] >= UOCR_VOCAB_SIZE) {
+            snprintf(error, error_size, "input_ids_i32.bin token %u is out of vocabulary: %d", i, ids[i]);
+            free(mask);
+            free(ids);
+            free(mask_bytes);
+            free(ids_bytes);
+            return 0;
+        }
+        if (mask_bytes[i] > 1u) {
+            snprintf(error, error_size, "image_mask_u8.bin has invalid value %u at token %u", mask_bytes[i], i);
+            free(mask);
+            free(ids);
+            free(mask_bytes);
+            free(ids_bytes);
+            return 0;
+        }
+        mask[i] = (uint8_t)mask_bytes[i];
+    }
+
+    free(mask_bytes);
+    free(ids_bytes);
+    *input_ids_out = ids;
+    *image_mask_out = mask;
+    *n_tokens_out = n_tokens;
+    return 1;
+}
+
 static int read_prompt_embedding_python_dump(const char *dump_dir,
                                              int32_t **input_ids_out,
                                              uint32_t *n_tokens_out,
@@ -7936,6 +8029,125 @@ static int test_public_metal_text_generation_full_model(void) {
     return 0;
 }
 
+static int test_public_metal_text_generated_ids_python_dump_parity(void) {
+    if (!uocr_metal_is_available()) {
+        return 0;
+    }
+    if (!env_flag_enabled("UOCR_RUN_LARGE_TESTS")) {
+        return 0;
+    }
+
+    const char *model_path = getenv("UOCR_MODEL_PATH");
+    const char *dump_dir = getenv("UOCR_LAYER_DUMP_DIR");
+    if (model_path == NULL || model_path[0] == '\0' || dump_dir == NULL || dump_dir[0] == '\0') {
+        printf("UOCR_RUN_LARGE_TESTS=1 but UOCR_MODEL_PATH/UOCR_LAYER_DUMP_DIR are not both set; skipping public Metal text generated-id parity\n");
+        return 0;
+    }
+    if (!fixture_binary_exists(dump_dir, "input_ids_i32.bin") ||
+        !fixture_binary_exists(dump_dir, "image_mask_u8.bin") ||
+        !fixture_binary_exists(dump_dir, "generated_ids_i32.bin")) {
+        printf("UOCR_LAYER_DUMP_DIR has no text generated-id fixture files; skipping public Metal text generated-id parity\n");
+        return 0;
+    }
+
+    char error[1024];
+    memset(error, 0, sizeof(error));
+    int32_t *input_ids = NULL;
+    uint8_t *image_mask = NULL;
+    uint32_t n_tokens = 0u;
+    int32_t *expected_ids = NULL;
+    uint32_t n_expected = 0u;
+    CHECK(read_prepared_tokens_python_dump(dump_dir, &input_ids, &image_mask, &n_tokens, error, sizeof(error)) == 1);
+    CHECK(read_text_generated_ids_python_dump(dump_dir, &expected_ids, &n_expected, error, sizeof(error)) == 1);
+    CHECK(n_tokens > 0u);
+    CHECK(n_expected > 0u);
+
+    for (uint32_t i = 0u; i < n_tokens; ++i) {
+        if (image_mask[i] != 0u) {
+            fprintf(stderr, "public Metal text generated-id parity requires a text-only fixture; image_mask[%u]=%u\n", i, (unsigned)image_mask[i]);
+            free(expected_ids);
+            free(image_mask);
+            free(input_ids);
+            return 1;
+        }
+    }
+
+    uocr_engine_opts opts;
+    memset(&opts, 0, sizeof(opts));
+    opts.model_path = model_path;
+    opts.backend = "metal";
+    opts.resource_path = UOCR_TEST_METAL_RESOURCE_PATH;
+    opts.max_batch = 1u;
+    opts.max_prompt_tokens = n_tokens;
+    opts.max_gen_tokens = n_expected;
+    opts.memory_budget_bytes = UINT64_MAX;
+
+    uocr_engine *engine = uocr_engine_open(&opts);
+    CHECK(engine != NULL);
+    CHECK(strcmp(uocr_engine_backend(engine), "metal") == 0);
+
+    uocr_prepared_request request;
+    memset(&request, 0, sizeof(request));
+    request.input_ids = input_ids;
+    request.image_mask = image_mask;
+    request.n_tokens = n_tokens;
+    request.crop_grid_w = 1u;
+    request.crop_grid_h = 1u;
+    request.max_new_tokens = n_expected;
+
+    uocr_result *result = NULL;
+    const int status = uocr_generate_prepared(engine, &request, 1u, &result);
+    if (status != UOCR_OK) {
+        fprintf(stderr, "public Metal text generated-id parity failed: %s\n", uocr_last_error(engine));
+        uocr_engine_close(engine);
+        free(expected_ids);
+        free(image_mask);
+        free(input_ids);
+        return 1;
+    }
+    CHECK(result != NULL);
+    CHECK(uocr_result_count(result) == 1u);
+
+    uint32_t n_actual = 0u;
+    const int32_t *actual_ids = uocr_result_tokens(result, 0u, &n_actual);
+    CHECK(actual_ids != NULL);
+    if (n_actual != n_expected) {
+        fprintf(stderr,
+                "public Metal text generated-id count mismatch: actual=%u expected=%u\n",
+                n_actual,
+                n_expected);
+        uocr_result_free(result);
+        uocr_engine_close(engine);
+        free(expected_ids);
+        free(image_mask);
+        free(input_ids);
+        return 1;
+    }
+    for (uint32_t i = 0u; i < n_expected; ++i) {
+        if (actual_ids[i] != expected_ids[i]) {
+            fprintf(stderr,
+                    "public Metal text generated-id mismatch at %u: actual=%d expected=%d\n",
+                    i,
+                    actual_ids[i],
+                    expected_ids[i]);
+            uocr_result_free(result);
+            uocr_engine_close(engine);
+            free(expected_ids);
+            free(image_mask);
+            free(input_ids);
+            return 1;
+        }
+    }
+
+    CHECK(strcmp(uocr_last_error(engine), "OK") == 0);
+    uocr_result_free(result);
+    uocr_engine_close(engine);
+    free(expected_ids);
+    free(image_mask);
+    free(input_ids);
+    return 0;
+}
+
 int main(void) {
     CHECK(strcmp(uocr_metal_backend_name(), "metal") == 0);
     if (test_metal_smoke() != 0) return 1;
@@ -7986,5 +8198,6 @@ int main(void) {
     if (test_metal_model_mapping() != 0) return 1;
     if (test_public_engine_open_initializes_metal() != 0) return 1;
     if (test_public_metal_text_generation_full_model() != 0) return 1;
+    if (test_public_metal_text_generated_ids_python_dump_parity() != 0) return 1;
     return 0;
 }

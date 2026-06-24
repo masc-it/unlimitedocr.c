@@ -38,7 +38,7 @@ Current priority slice, in order. The coding agent should take the first uncheck
 - [x] Implement single-request, slot-0, text-only prompt prefill orchestration over all 12 layers using persistent arenas and KV cache; no image features and no batching yet.
 - [x] Implement single-token decode-step orchestration using the existing KV ring helpers, prompt+generated-ring attention, final norm, LM head, no-repeat banning, greedy argmax, and EOS handling.
 - [x] Wire the Metal backend path in `uocr_generate_prepared()` for `n_requests=1`, `views=0`, `fp16` model, and `max_new_tokens>0`; return generated ids with `uocr_result_create_from_generated()` instead of `UOCR_ERROR_NOT_IMPLEMENTED` for that narrow case.
-- [ ] Add an opt-in full-model public API parity test for text-only generated ids (`UOCR_RUN_LARGE_TESTS=1`, `UOCR_MODEL_PATH`, `UOCR_LAYER_DUMP_DIR` or equivalent fixture).
+- [x] Add an opt-in full-model public API parity test for text-only generated ids (`UOCR_RUN_LARGE_TESTS=1`, `UOCR_MODEL_PATH`, `UOCR_LAYER_DUMP_DIR` or equivalent fixture).
 - [ ] Promote the Python-dumped visual-embedding path from direct Metal tests into the same integrated decoder runner via an internal/test-only fixture adapter, without changing the stable v1 prepared-request image API.
 - [ ] Add opt-in generated-id/text parity for the integrated dumped-visual-embedding path.
 - [ ] Start section 16 Metal vision only after the integrated dumped-visual-embedding generation path passes.
@@ -693,7 +693,7 @@ These tasks turn the fp16 decoder primitives/parity helpers into the first real 
 - [x] Maintain a preallocated generated-token buffer and prompt+generated no-repeat state; no allocation is allowed inside the per-token loop after initial bring-up.
 - [x] Stop on EOS id `1` or `max_new_tokens` and return generated ids through `uocr_result_create_from_generated()`.
 - [x] Wire only this narrow path into `uocr_generate_prepared()`; keep CPU-ref and unsupported Metal cases returning clear `UOCR_ERROR_NOT_IMPLEMENTED` messages.
-- [ ] Add opt-in full-model text-only generated-id parity against Python fixtures.
+- [x] Add opt-in full-model text-only generated-id parity against Python fixtures.
 
 ## 15. Decoder with Python-dumped image embeddings
 
@@ -970,7 +970,7 @@ Do not start the high-level OCR API until `uocr_generate_prepared()` can return 
   - [x] `UOCR_HF_DIR`
   - [x] `UOCR_RUN_LARGE_TESTS=1`
 - [ ] Add opt-in integrated fp16 generation tests:
-  - [ ] public `uocr_generate_prepared()` text-only generated ids match Python fixture
+  - [x] public `uocr_generate_prepared()` text-only generated ids match Python fixture
   - [ ] integrated dumped-visual-embedding generated ids/text match Python fixture
   - [ ] unsupported public paths still return clear `UOCR_ERROR_NOT_IMPLEMENTED` messages
   - [ ] no-allocation guard passes around the decode token loop
