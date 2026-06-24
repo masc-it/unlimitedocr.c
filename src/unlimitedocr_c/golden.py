@@ -28,6 +28,7 @@ TOK_EMBED_TENSOR_NAME = "model.embed_tokens.weight"
 PROMPT_EMBEDDINGS_BIN = "prompt_embeddings_f16.bin"
 TEXT_LAYER0_HIDDEN_BIN = "layer_0_hidden_f16.bin"
 TEXT_LAYER1_HIDDEN_BIN = "layer_1_hidden_f16.bin"
+TEXT_DECODER_LAYER_COUNT = 12
 INPUT_IDS_BIN = "input_ids_i32.bin"
 IMAGE_MASK_BIN = "image_mask_u8.bin"
 
@@ -92,6 +93,17 @@ class TextLayer0Dump(PromptEmbeddingDump):
 @dataclass(frozen=True)
 class TextLayer1Dump(TextLayer0Dump):
     layer1_hidden_f16_bits: NDArray[np.uint16]
+
+
+@dataclass(frozen=True)
+class TextDecoderLayersDump(PromptEmbeddingDump):
+    layer_hidden_f16_bits: tuple[NDArray[np.uint16], ...]
+
+
+def text_layer_hidden_filename(layer: int) -> str:
+    if layer < 0 or layer >= TEXT_DECODER_LAYER_COUNT:
+        raise ValueError(f"decoder layer out of range: {layer}")
+    return f"layer_{layer}_hidden_f16.bin"
 
 
 def _read_json_if_exists(path: Path) -> dict[str, Any] | None:
@@ -577,6 +589,25 @@ def compute_text_layer1_hidden_f16_bits(
     return _moe_layer_f16_bits(mlp_input, attn_hidden, hf_dir, layer=1)
 
 
+def compute_text_decoder_layer_hidden_f16_bits(
+    prompt_embeddings_f16_bits: NDArray[np.uint16],
+    hf_dir: str | Path,
+    *,
+    layer_count: int = TEXT_DECODER_LAYER_COUNT,
+) -> tuple[NDArray[np.uint16], ...]:
+    """Run the fp16 text-only decoder reference through ``layer_count`` layers."""
+
+    if layer_count < 1 or layer_count > TEXT_DECODER_LAYER_COUNT:
+        raise ValueError(f"layer_count must be in [1,{TEXT_DECODER_LAYER_COUNT}], got {layer_count}")
+    hidden = compute_text_layer0_hidden_f16_bits(prompt_embeddings_f16_bits, hf_dir)
+    layers: list[NDArray[np.uint16]] = [hidden]
+    for layer in range(1, layer_count):
+        attn_hidden, mlp_input = _attention_block_f16_bits(hidden, hf_dir, layer=layer)
+        hidden = _moe_layer_f16_bits(mlp_input, attn_hidden, hf_dir, layer=layer)
+        layers.append(hidden)
+    return tuple(layers)
+
+
 def dump_prompt_embedding_fixture(
     request: PreparedRequest,
     out_dir: str | Path,
@@ -695,6 +726,41 @@ def dump_text_layer1_fixture(request: PreparedRequest, out_dir: str | Path, hf_d
     return out
 
 
+def dump_text_decoder_layers_fixture(
+    request: PreparedRequest,
+    out_dir: str | Path,
+    hf_dir: str | Path,
+    *,
+    layer_count: int = TEXT_DECODER_LAYER_COUNT,
+) -> Path:
+    """Write prompt embeddings plus fp16 text-only decoder outputs for all layers."""
+
+    out = dump_prompt_embedding_fixture(request, out_dir, hf_dir)
+    prompt_dump = load_prompt_embedding_dump(out)
+    layer_outputs = compute_text_decoder_layer_hidden_f16_bits(
+        prompt_dump.prompt_embeddings_f16_bits,
+        hf_dir,
+        layer_count=layer_count,
+    )
+
+    manifest_path = out / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    for layer, hidden in enumerate(layer_outputs):
+        filename = text_layer_hidden_filename(layer)
+        (out / filename).write_bytes(np.asarray(hidden, dtype=np.dtype("<u2")).tobytes())
+        _add_hidden_tensor_manifest(
+            manifest,
+            f"layer_{layer}_hidden",
+            filename,
+            int(prompt_dump.input_ids.size),
+            hidden,
+            f"FP16 weights/activations with FP32 reductions; layer {layer} text-only decoder prefill",
+        )
+    manifest["text_decoder_layer_count"] = int(layer_count)
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return out
+
+
 def load_prompt_embedding_dump(fixture_dir: str | Path) -> PromptEmbeddingDump:
     root = Path(fixture_dir)
     manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
@@ -784,4 +850,35 @@ def load_text_layer1_dump(fixture_dir: str | Path) -> TextLayer1Dump:
         prompt_embeddings_f16_bits=layer0.prompt_embeddings_f16_bits,
         layer0_hidden_f16_bits=layer0.layer0_hidden_f16_bits,
         layer1_hidden_f16_bits=layer1,
+    )
+
+
+def load_text_decoder_layers_dump(
+    fixture_dir: str | Path,
+    *,
+    layer_count: int | None = None,
+) -> TextDecoderLayersDump:
+    prompt = load_prompt_embedding_dump(fixture_dir)
+    root = Path(fixture_dir)
+    if layer_count is None:
+        manifest_count = prompt.manifest.get("text_decoder_layer_count") if isinstance(prompt.manifest, dict) else None
+        layer_count = int(manifest_count) if manifest_count is not None else TEXT_DECODER_LAYER_COUNT
+    if layer_count < 1 or layer_count > TEXT_DECODER_LAYER_COUNT:
+        raise ValueError(f"layer_count must be in [1,{TEXT_DECODER_LAYER_COUNT}], got {layer_count}")
+    layers = tuple(
+        _load_hidden_tensor_bits(
+            root,
+            prompt.manifest,
+            f"layer_{layer}_hidden",
+            text_layer_hidden_filename(layer),
+            int(prompt.input_ids.size),
+        )
+        for layer in range(layer_count)
+    )
+    return TextDecoderLayersDump(
+        manifest=prompt.manifest,
+        input_ids=prompt.input_ids,
+        image_mask=prompt.image_mask,
+        prompt_embeddings_f16_bits=prompt.prompt_embeddings_f16_bits,
+        layer_hidden_f16_bits=layers,
     )

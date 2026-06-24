@@ -367,6 +367,19 @@ static int make_fixture_path(const char *root, const char *name, char *out, size
     return written >= 0 && (size_t)written < out_size;
 }
 
+static int fixture_binary_exists(const char *root, const char *name) {
+    char path[4096];
+    if (!make_fixture_path(root, name, path, sizeof(path))) {
+        return 0;
+    }
+    FILE *f = fopen(path, "rb");
+    if (f == NULL) {
+        return 0;
+    }
+    fclose(f);
+    return 1;
+}
+
 static int read_binary_file(const char *path, unsigned char **out_bytes, size_t *out_size, char *error, size_t error_size) {
     if (out_bytes == NULL || out_size == NULL) {
         snprintf(error, error_size, "invalid binary read request");
@@ -884,6 +897,383 @@ static int copy_selected_moe_expert_weights(const uocr_model_file *model,
         memcpy(selected_down + (size_t)rank * (size_t)expert_values, down, expert_bytes);
     }
     return 1;
+}
+
+static int compare_hidden_f16(const char *label,
+                              const uint16_t *actual,
+                              const uint16_t *expected,
+                              uint32_t n_tokens,
+                              float max_abs_tolerance,
+                              double mean_abs_tolerance) {
+    const uint64_t hidden_values = (uint64_t)n_tokens * (uint64_t)UOCR_HIDDEN_SIZE;
+    float max_abs = 0.0f;
+    double sum_abs = 0.0;
+    uint64_t max_index = 0u;
+    for (uint64_t i = 0u; i < hidden_values; ++i) {
+        const float diff = fabsf(f16_bits_to_f32(actual[i]) - f16_bits_to_f32(expected[i]));
+        if (diff > max_abs) {
+            max_abs = diff;
+            max_index = i;
+        }
+        sum_abs += (double)diff;
+    }
+    const double mean_abs = sum_abs / (double)hidden_values;
+    if (max_abs > max_abs_tolerance || mean_abs > mean_abs_tolerance) {
+        fprintf(stderr,
+                "%s mismatch: max_abs=%g mean_abs=%g at token %llu col %llu actual=%g expected=%g\n",
+                label,
+                (double)max_abs,
+                mean_abs,
+                (unsigned long long)(max_index / (uint64_t)UOCR_HIDDEN_SIZE),
+                (unsigned long long)(max_index % (uint64_t)UOCR_HIDDEN_SIZE),
+                (double)f16_bits_to_f32(actual[max_index]),
+                (double)f16_bits_to_f32(expected[max_index]));
+        return 0;
+    }
+    return 1;
+}
+
+static int copy_compact_moe_expert_weights(const uocr_model_file *model,
+                                           uint32_t layer,
+                                           const uint32_t *top_expert_ids,
+                                           uint32_t n_tokens,
+                                           uint32_t *remapped_top_expert_ids,
+                                           uint32_t *expert_count_out,
+                                           uint16_t **gate_out,
+                                           uint16_t **up_out,
+                                           uint16_t **down_out,
+                                           char *error,
+                                           size_t error_size) {
+    if (model == NULL || top_expert_ids == NULL || remapped_top_expert_ids == NULL || expert_count_out == NULL ||
+        gate_out == NULL || up_out == NULL || down_out == NULL || n_tokens == 0u || layer == 0u ||
+        layer >= UOCR_DECODER_LAYERS) {
+        snprintf(error, error_size, "invalid compact MoE expert copy request");
+        return 0;
+    }
+    *expert_count_out = 0u;
+    *gate_out = NULL;
+    *up_out = NULL;
+    *down_out = NULL;
+
+    uint32_t experts[UOCR_ROUTED_EXPERTS];
+    uint32_t expert_count = 0u;
+    for (uint32_t token = 0u; token < n_tokens; ++token) {
+        for (uint32_t rank = 0u; rank < UOCR_MOE_TOP_K; ++rank) {
+            const size_t index = (size_t)token * UOCR_MOE_TOP_K + rank;
+            const uint32_t expert = top_expert_ids[index];
+            if (expert >= UOCR_ROUTED_EXPERTS) {
+                snprintf(error, error_size, "compact MoE expert id %u out of range", expert);
+                return 0;
+            }
+            uint32_t remapped = UINT32_MAX;
+            for (uint32_t i = 0u; i < expert_count; ++i) {
+                if (experts[i] == expert) {
+                    remapped = i;
+                    break;
+                }
+            }
+            if (remapped == UINT32_MAX) {
+                if (expert_count >= UOCR_ROUTED_EXPERTS) {
+                    snprintf(error, error_size, "compact MoE expert table overflow");
+                    return 0;
+                }
+                remapped = expert_count;
+                experts[expert_count++] = expert;
+            }
+            remapped_top_expert_ids[index] = remapped;
+        }
+    }
+
+    const uint64_t expert_values = (uint64_t)UOCR_MOE_EXPERT_INTERMEDIATE * (uint64_t)UOCR_HIDDEN_SIZE;
+    uint64_t total_values = 0u;
+    if (expert_count == 0u || expert_values > UINT64_MAX / (uint64_t)expert_count ||
+        (total_values = expert_values * (uint64_t)expert_count) > (uint64_t)SIZE_MAX / sizeof(uint16_t)) {
+        snprintf(error, error_size, "compact MoE expert copy size overflow");
+        return 0;
+    }
+    const size_t expert_bytes = (size_t)expert_values * sizeof(uint16_t);
+    const size_t total_bytes = (size_t)total_values * sizeof(uint16_t);
+    uint16_t *gate = (uint16_t *)malloc(total_bytes);
+    uint16_t *up = (uint16_t *)malloc(total_bytes);
+    uint16_t *down = (uint16_t *)malloc(total_bytes);
+    if (gate == NULL || up == NULL || down == NULL) {
+        snprintf(error, error_size, "failed to allocate compact MoE expert weights");
+        free(down);
+        free(up);
+        free(gate);
+        return 0;
+    }
+
+    for (uint32_t compact = 0u; compact < expert_count; ++compact) {
+        const uint32_t expert = experts[compact];
+        const uint16_t *src_gate = model_tensor_f16_payload(model,
+                                                            uocr_tensor_id_moe_expert(layer,
+                                                                                      expert,
+                                                                                      UOCR_TENSOR_PROJ_GATE),
+                                                            expert_values,
+                                                            error,
+                                                            error_size);
+        const uint16_t *src_up = model_tensor_f16_payload(model,
+                                                          uocr_tensor_id_moe_expert(layer,
+                                                                                    expert,
+                                                                                    UOCR_TENSOR_PROJ_UP),
+                                                          expert_values,
+                                                          error,
+                                                          error_size);
+        const uint16_t *src_down = model_tensor_f16_payload(model,
+                                                            uocr_tensor_id_moe_expert(layer,
+                                                                                      expert,
+                                                                                      UOCR_TENSOR_PROJ_DOWN),
+                                                            expert_values,
+                                                            error,
+                                                            error_size);
+        if (src_gate == NULL || src_up == NULL || src_down == NULL) {
+            free(down);
+            free(up);
+            free(gate);
+            return 0;
+        }
+        memcpy(gate + (size_t)compact * (size_t)expert_values, src_gate, expert_bytes);
+        memcpy(up + (size_t)compact * (size_t)expert_values, src_up, expert_bytes);
+        memcpy(down + (size_t)compact * (size_t)expert_values, src_down, expert_bytes);
+    }
+
+    *expert_count_out = expert_count;
+    *gate_out = gate;
+    *up_out = up;
+    *down_out = down;
+    return 1;
+}
+
+static int run_metal_moe_decoder_layer_from_model_f16(uocr_metal_context *ctx,
+                                                      const uocr_model_file *model,
+                                                      uint32_t layer,
+                                                      const uint16_t *hidden_in,
+                                                      uint32_t n_tokens,
+                                                      uint16_t *hidden_out,
+                                                      char *error,
+                                                      size_t error_size) {
+    if (ctx == NULL || model == NULL || hidden_in == NULL || hidden_out == NULL || n_tokens == 0u || layer == 0u ||
+        layer >= UOCR_DECODER_LAYERS) {
+        snprintf(error, error_size, "invalid Metal MoE decoder-layer parity request");
+        return 0;
+    }
+    const uint64_t hidden_values = (uint64_t)n_tokens * (uint64_t)UOCR_HIDDEN_SIZE;
+    if (hidden_values > (uint64_t)SIZE_MAX / sizeof(uint16_t)) {
+        snprintf(error, error_size, "Metal MoE decoder-layer parity size overflow");
+        return 0;
+    }
+
+    const uint16_t *router_weight = model_tensor_f16_payload(model,
+                                                             uocr_tensor_id_moe_router(layer),
+                                                             (uint64_t)UOCR_ROUTED_EXPERTS * (uint64_t)UOCR_HIDDEN_SIZE,
+                                                             error,
+                                                             error_size);
+    const uint16_t *shared_gate = model_tensor_f16_payload(model,
+                                                           uocr_tensor_id_moe_shared(layer, UOCR_TENSOR_PROJ_GATE),
+                                                           (uint64_t)UOCR_MOE_SHARED_INTERMEDIATE *
+                                                               (uint64_t)UOCR_HIDDEN_SIZE,
+                                                           error,
+                                                           error_size);
+    const uint16_t *shared_up = model_tensor_f16_payload(model,
+                                                         uocr_tensor_id_moe_shared(layer, UOCR_TENSOR_PROJ_UP),
+                                                         (uint64_t)UOCR_MOE_SHARED_INTERMEDIATE *
+                                                             (uint64_t)UOCR_HIDDEN_SIZE,
+                                                         error,
+                                                         error_size);
+    const uint16_t *shared_down = model_tensor_f16_payload(model,
+                                                           uocr_tensor_id_moe_shared(layer, UOCR_TENSOR_PROJ_DOWN),
+                                                           (uint64_t)UOCR_HIDDEN_SIZE *
+                                                               (uint64_t)UOCR_MOE_SHARED_INTERMEDIATE,
+                                                           error,
+                                                           error_size);
+    if (router_weight == NULL || shared_gate == NULL || shared_up == NULL || shared_down == NULL) {
+        return 0;
+    }
+
+    uint16_t *attn_hidden = (uint16_t *)calloc((size_t)hidden_values, sizeof(uint16_t));
+    uint16_t *mlp_input = (uint16_t *)calloc((size_t)hidden_values, sizeof(uint16_t));
+    uint16_t *routed = (uint16_t *)calloc((size_t)hidden_values, sizeof(uint16_t));
+    uint16_t *shared = (uint16_t *)calloc((size_t)hidden_values, sizeof(uint16_t));
+    uint32_t *top_ids = (uint32_t *)calloc((size_t)n_tokens * UOCR_MOE_TOP_K, sizeof(uint32_t));
+    float *top_weights = (float *)calloc((size_t)n_tokens * UOCR_MOE_TOP_K, sizeof(float));
+    if (attn_hidden == NULL || mlp_input == NULL || routed == NULL || shared == NULL || top_ids == NULL ||
+        top_weights == NULL) {
+        snprintf(error, error_size, "failed to allocate Metal MoE decoder-layer parity buffers");
+        free(top_weights);
+        free(top_ids);
+        free(shared);
+        free(routed);
+        free(mlp_input);
+        free(attn_hidden);
+        return 0;
+    }
+
+    int ok = 0;
+    if (run_metal_attention_block_from_model_f16(ctx,
+                                                model,
+                                                layer,
+                                                hidden_in,
+                                                n_tokens,
+                                                attn_hidden,
+                                                mlp_input,
+                                                error,
+                                                error_size) != 1 ||
+        uocr_metal_context_moe_router_f16(ctx,
+                                          mlp_input,
+                                          router_weight,
+                                          n_tokens,
+                                          NULL,
+                                          NULL,
+                                          top_ids,
+                                          top_weights,
+                                          error,
+                                          error_size) != 1 ||
+        uocr_metal_context_moe_shared_experts_f16(ctx,
+                                                  mlp_input,
+                                                  shared_gate,
+                                                  shared_up,
+                                                  shared_down,
+                                                  n_tokens,
+                                                  UOCR_METAL_DENSE_OUTPUT_F16,
+                                                  shared,
+                                                  error,
+                                                  error_size) != 1) {
+        goto cleanup;
+    }
+
+    uint32_t unique_experts[UOCR_ROUTED_EXPERTS];
+    uint32_t unique_count = 0u;
+    for (uint32_t i = 0u; i < n_tokens * UOCR_MOE_TOP_K; ++i) {
+        uint32_t seen = 0u;
+        for (uint32_t j = 0u; j < unique_count; ++j) {
+            if (unique_experts[j] == top_ids[i]) {
+                seen = 1u;
+                break;
+            }
+        }
+        if (!seen && unique_count < UOCR_ROUTED_EXPERTS) {
+            unique_experts[unique_count++] = top_ids[i];
+        }
+    }
+    const uint64_t compact_weight_bytes = (uint64_t)unique_count * (uint64_t)UOCR_MOE_EXPERT_INTERMEDIATE *
+                                          (uint64_t)UOCR_HIDDEN_SIZE * 2u * 3u;
+    if (compact_weight_bytes <= 192ull * 1024ull * 1024ull) {
+        uint32_t *remapped_ids = (uint32_t *)malloc((size_t)n_tokens * UOCR_MOE_TOP_K * sizeof(uint32_t));
+        uint16_t *compact_gate = NULL;
+        uint16_t *compact_up = NULL;
+        uint16_t *compact_down = NULL;
+        uint32_t compact_count = 0u;
+        if (remapped_ids == NULL) {
+            snprintf(error, error_size, "failed to allocate compact MoE remap buffer");
+            goto cleanup;
+        }
+        if (copy_compact_moe_expert_weights(model,
+                                            layer,
+                                            top_ids,
+                                            n_tokens,
+                                            remapped_ids,
+                                            &compact_count,
+                                            &compact_gate,
+                                            &compact_up,
+                                            &compact_down,
+                                            error,
+                                            error_size) != 1 ||
+            uocr_metal_context_moe_selected_experts_prefill_f16(ctx,
+                                                                mlp_input,
+                                                                remapped_ids,
+                                                                top_weights,
+                                                                compact_gate,
+                                                                compact_up,
+                                                                compact_down,
+                                                                n_tokens,
+                                                                UOCR_HIDDEN_SIZE,
+                                                                UOCR_MOE_EXPERT_INTERMEDIATE,
+                                                                compact_count,
+                                                                UOCR_MOE_TOP_K,
+                                                                UOCR_METAL_DENSE_OUTPUT_F16,
+                                                                routed,
+                                                                error,
+                                                                error_size) != 1) {
+            free(compact_down);
+            free(compact_up);
+            free(compact_gate);
+            free(remapped_ids);
+            goto cleanup;
+        }
+        free(compact_down);
+        free(compact_up);
+        free(compact_gate);
+        free(remapped_ids);
+    } else {
+        const uint64_t expert_values = (uint64_t)UOCR_MOE_TOP_K * (uint64_t)UOCR_MOE_EXPERT_INTERMEDIATE *
+                                       (uint64_t)UOCR_HIDDEN_SIZE;
+        if (expert_values > (uint64_t)SIZE_MAX / sizeof(uint16_t)) {
+            snprintf(error, error_size, "selected MoE fallback size overflow");
+            goto cleanup;
+        }
+        uint16_t *selected_gate = (uint16_t *)malloc((size_t)expert_values * sizeof(uint16_t));
+        uint16_t *selected_up = (uint16_t *)malloc((size_t)expert_values * sizeof(uint16_t));
+        uint16_t *selected_down = (uint16_t *)malloc((size_t)expert_values * sizeof(uint16_t));
+        if (selected_gate == NULL || selected_up == NULL || selected_down == NULL) {
+            snprintf(error, error_size, "failed to allocate selected MoE fallback weights");
+            free(selected_down);
+            free(selected_up);
+            free(selected_gate);
+            goto cleanup;
+        }
+        for (uint32_t token = 0u; token < n_tokens; ++token) {
+            if (copy_selected_moe_expert_weights(model,
+                                                 layer,
+                                                 top_ids + (size_t)token * UOCR_MOE_TOP_K,
+                                                 selected_gate,
+                                                 selected_up,
+                                                 selected_down,
+                                                 error,
+                                                 error_size) != 1 ||
+                uocr_metal_context_moe_selected_experts_decode_f16(ctx,
+                                                                   mlp_input + (size_t)token * UOCR_HIDDEN_SIZE,
+                                                                   top_ids + (size_t)token * UOCR_MOE_TOP_K,
+                                                                   top_weights + (size_t)token * UOCR_MOE_TOP_K,
+                                                                   selected_gate,
+                                                                   selected_up,
+                                                                   selected_down,
+                                                                   UOCR_METAL_DENSE_OUTPUT_F16,
+                                                                   routed + (size_t)token * UOCR_HIDDEN_SIZE,
+                                                                   error,
+                                                                   error_size) != 1) {
+                free(selected_down);
+                free(selected_up);
+                free(selected_gate);
+                goto cleanup;
+            }
+        }
+        free(selected_down);
+        free(selected_up);
+        free(selected_gate);
+    }
+
+    if (uocr_metal_context_moe_combine_f16(ctx,
+                                           routed,
+                                           shared,
+                                           attn_hidden,
+                                           n_tokens,
+                                           UOCR_METAL_DENSE_OUTPUT_F16,
+                                           hidden_out,
+                                           error,
+                                           error_size) != 1) {
+        goto cleanup;
+    }
+    ok = 1;
+
+cleanup:
+    free(top_weights);
+    free(top_ids);
+    free(shared);
+    free(routed);
+    free(mlp_input);
+    free(attn_hidden);
+    return ok;
 }
 
 static int test_metal_text_prompt_embedding_python_dump_parity(void) {
@@ -1469,6 +1859,97 @@ static int test_metal_text_layer1_python_dump_parity(void) {
     uocr_metal_context_destroy(ctx);
     uocr_model_file_close(&model);
     free(expected);
+    free(layer0);
+    free(prompt);
+    free(input_ids);
+    return 0;
+}
+
+static int test_metal_text_remaining_layers_python_dump_parity(void) {
+    if (!uocr_metal_is_available()) {
+        return 0;
+    }
+    if (!env_flag_enabled("UOCR_RUN_LARGE_TESTS")) {
+        return 0;
+    }
+
+    const char *model_path = getenv("UOCR_MODEL_PATH");
+    const char *dump_dir = getenv("UOCR_LAYER_DUMP_DIR");
+    if (model_path == NULL || model_path[0] == '\0' || dump_dir == NULL || dump_dir[0] == '\0') {
+        printf("UOCR_RUN_LARGE_TESTS=1 but UOCR_MODEL_PATH/UOCR_LAYER_DUMP_DIR are not both set; skipping text remaining-layer parity\n");
+        return 0;
+    }
+    if (!fixture_binary_exists(dump_dir, "layer_11_hidden_f16.bin")) {
+        printf("UOCR_LAYER_DUMP_DIR has no layer_11_hidden_f16.bin; skipping text remaining-layer parity\n");
+        return 0;
+    }
+
+    char error[1024];
+    memset(error, 0, sizeof(error));
+    int32_t *input_ids = NULL;
+    uint32_t n_tokens = 0u;
+    uint16_t *prompt = NULL;
+    uint16_t *layer0 = NULL;
+    CHECK(read_text_layer0_python_dump(dump_dir, &input_ids, &n_tokens, &prompt, &layer0, error, sizeof(error)) == 1);
+    (void)input_ids;
+    (void)prompt;
+
+    const uint64_t hidden_values = (uint64_t)n_tokens * (uint64_t)UOCR_HIDDEN_SIZE;
+    CHECK(n_tokens > 0u);
+    CHECK(hidden_values <= (uint64_t)SIZE_MAX / sizeof(uint16_t));
+
+    uocr_model_file model;
+    CHECK(uocr_model_file_open(model_path, &model, error, sizeof(error)) == 0);
+    uocr_metal_context *ctx = uocr_metal_context_create(UOCR_TEST_METAL_RESOURCE_PATH, error, sizeof(error));
+    CHECK(ctx != NULL);
+
+    uint16_t *input_hidden = (uint16_t *)malloc((size_t)hidden_values * sizeof(uint16_t));
+    uint16_t *actual = (uint16_t *)calloc((size_t)hidden_values, sizeof(uint16_t));
+    CHECK(input_hidden != NULL);
+    CHECK(actual != NULL);
+    memcpy(input_hidden, layer0, (size_t)hidden_values * sizeof(uint16_t));
+
+    for (uint32_t layer = 2u; layer < UOCR_DECODER_LAYERS; ++layer) {
+        char prev_filename[64];
+        char expected_filename[64];
+        snprintf(prev_filename, sizeof(prev_filename), "layer_%u_hidden_f16.bin", layer - 1u);
+        snprintf(expected_filename, sizeof(expected_filename), "layer_%u_hidden_f16.bin", layer);
+        uint16_t *prev_expected = NULL;
+        uint16_t *expected = NULL;
+        CHECK(read_layer_hidden_python_dump(dump_dir, prev_filename, n_tokens, &prev_expected, error, sizeof(error)) == 1);
+        CHECK(read_layer_hidden_python_dump(dump_dir, expected_filename, n_tokens, &expected, error, sizeof(error)) == 1);
+        memcpy(input_hidden, prev_expected, (size_t)hidden_values * sizeof(uint16_t));
+        memset(actual, 0, (size_t)hidden_values * sizeof(uint16_t));
+        CHECK(run_metal_moe_decoder_layer_from_model_f16(ctx,
+                                                         &model,
+                                                         layer,
+                                                         input_hidden,
+                                                         n_tokens,
+                                                         actual,
+                                                         error,
+                                                         sizeof(error)) == 1);
+        char label[64];
+        snprintf(label, sizeof(label), "text layer%u", layer);
+        const int close = compare_hidden_f16(label, actual, expected, n_tokens, 1.25e-2f, 1.25e-3);
+        free(expected);
+        free(prev_expected);
+        if (!close) {
+            free(actual);
+            free(input_hidden);
+            uocr_metal_context_destroy(ctx);
+            uocr_model_file_close(&model);
+            free(layer0);
+            free(prompt);
+            free(input_ids);
+            return 1;
+        }
+    }
+    CHECK(error[0] == '\0');
+
+    free(actual);
+    free(input_hidden);
+    uocr_metal_context_destroy(ctx);
+    uocr_model_file_close(&model);
     free(layer0);
     free(prompt);
     free(input_ids);
@@ -5552,6 +6033,7 @@ int main(void) {
     if (test_metal_text_prompt_embedding_python_dump_parity() != 0) return 1;
     if (test_metal_text_layer0_python_dump_parity() != 0) return 1;
     if (test_metal_text_layer1_python_dump_parity() != 0) return 1;
+    if (test_metal_text_remaining_layers_python_dump_parity() != 0) return 1;
     if (test_metal_rmsnorm_f16() != 0) return 1;
     if (test_metal_final_rmsnorm_f16() != 0) return 1;
     if (test_metal_lm_head_f16() != 0) return 1;

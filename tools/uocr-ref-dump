@@ -18,7 +18,12 @@ from unlimitedocr_c.frontend import (
     prepare_text,
     save_prepared_request,
 )
-from unlimitedocr_c.golden import dump_prompt_embedding_fixture, dump_text_layer0_fixture, dump_text_layer1_fixture
+from unlimitedocr_c.golden import (
+    dump_prompt_embedding_fixture,
+    dump_text_decoder_layers_fixture,
+    dump_text_layer0_fixture,
+    dump_text_layer1_fixture,
+)
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -51,6 +56,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--dump-text-layer1",
         action="store_true",
         help="also dump text-only prompt embeddings plus decoder layer-0/layer-1 fp16 outputs for Metal parity",
+    )
+    parser.add_argument(
+        "--dump-text-layers",
+        action="store_true",
+        help="also dump text-only prompt embeddings plus all decoder layer fp16 outputs for Metal parity",
     )
     return parser.parse_args(argv)
 
@@ -92,7 +102,11 @@ def main(argv: list[str] | None = None) -> int:
             dtype=dtype,
         )
 
-    if args.dump_text_layer1:
+    if args.dump_text_layers:
+        if args.hf_dir is None:
+            raise SystemExit("--dump-text-layers requires --hf-dir")
+        dump_text_decoder_layers_fixture(request, args.out, args.hf_dir)
+    elif args.dump_text_layer1:
         if args.hf_dir is None:
             raise SystemExit("--dump-text-layer1 requires --hf-dir")
         dump_text_layer1_fixture(request, args.out, args.hf_dir)

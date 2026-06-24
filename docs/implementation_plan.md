@@ -664,7 +664,7 @@ First implementation slice, in order:
   - [x] prompt embeddings
   - [x] layer-0 dense decoder output
   - [x] layer-1 MoE decoder output
-  - [ ] remaining layers 2..11 MoE outputs
+  - [x] remaining layers 2..11 MoE outputs
   - [ ] logits top-k
   - [ ] generated token ids
 

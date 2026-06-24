@@ -9,6 +9,7 @@ from unlimitedocr_c.frontend import PreparedRequest, save_prepared_request
 from unlimitedocr_c.golden import (
     dump_prompt_embedding_fixture,
     load_prompt_embedding_dump,
+    load_text_decoder_layers_dump,
     load_text_layer1_dump,
     read_bf16_rows_as_f16_bits,
     read_bf16_tensor_as_f16_bits,
@@ -156,3 +157,38 @@ def test_load_text_layer1_dump_reads_native_hidden_files(tmp_path) -> None:
     loaded = load_text_layer1_dump(out)
     np.testing.assert_array_equal(loaded.layer0_hidden_f16_bits, layer0)
     np.testing.assert_array_equal(loaded.layer1_hidden_f16_bits, layer1)
+
+
+def test_load_text_decoder_layers_dump_reads_all_native_hidden_files(tmp_path) -> None:
+    request = _tiny_text_request(np.array([0, 1], dtype=np.int32))
+    out = tmp_path / "dump"
+    out.mkdir()
+    save_prepared_request(request, out)
+    request.input_ids.astype(np.dtype("<i4")).tofile(out / "input_ids_i32.bin")
+    request.image_mask.astype(np.uint8).tofile(out / "image_mask_u8.bin")
+    prompt = np.zeros((2, 1280), dtype=np.dtype("<u2"))
+    prompt.tofile(out / "prompt_embeddings_f16.bin")
+    layer_values = []
+    for layer in range(12):
+        value = np.full((2, 1280), 0x3C00 + layer, dtype=np.dtype("<u2"))
+        value.tofile(out / f"layer_{layer}_hidden_f16.bin")
+        layer_values.append(value)
+    manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    manifest["text_decoder_layer_count"] = 12
+    manifest["golden_tensors"] = {
+        "prompt_embeddings": {"file": "prompt_embeddings_f16.bin", "shape": [2, 1280]},
+        **{
+            f"layer_{layer}_hidden": {"file": f"layer_{layer}_hidden_f16.bin", "shape": [2, 1280]}
+            for layer in range(12)
+        },
+    }
+    manifest["native_binary_arrays"] = {
+        "input_ids": {"file": "input_ids_i32.bin", "dtype": "int32_le", "shape": [2]},
+        "image_mask": {"file": "image_mask_u8.bin", "dtype": "uint8", "shape": [2]},
+    }
+    (out / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    loaded = load_text_decoder_layers_dump(out)
+    assert len(loaded.layer_hidden_f16_bits) == 12
+    for actual, expected in zip(loaded.layer_hidden_f16_bits, layer_values, strict=True):
+        np.testing.assert_array_equal(actual, expected)
