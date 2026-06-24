@@ -284,6 +284,13 @@ typedef struct uocr_metal_dense_params {
     uint32_t has_bias;
 } uocr_metal_dense_params;
 
+typedef struct uocr_metal_argmax_params {
+    uint32_t rows;
+    uint32_t vocab_size;
+    uint32_t reserved0;
+    uint32_t reserved1;
+} uocr_metal_argmax_params;
+
 typedef struct uocr_metal_attention_projection_params {
     uint32_t n_tokens;
     uint32_t hidden_size;
@@ -2432,6 +2439,134 @@ int uocr_metal_context_lm_head_f16(uocr_metal_context *ctx,
         memcpy(logits_out_f32, [dst contents], (size_t)output_bytes);
         [dst release];
         [src release];
+    }
+
+    metal_clear_error(error, error_size);
+    return 1;
+}
+
+int uocr_metal_context_argmax_f32(uocr_metal_context *ctx,
+                                  const float *logits_f32,
+                                  uint32_t n_rows,
+                                  uint32_t vocab_size,
+                                  uint32_t *token_ids_out,
+                                  float *scores_out_f32_or_null,
+                                  char *error,
+                                  size_t error_size) {
+    metal_clear_error(error, error_size);
+    if (ctx == NULL || logits_f32 == NULL || token_ids_out == NULL || n_rows == 0u || vocab_size == 0u) {
+        return metal_fail(error, error_size, "invalid Metal argmax request");
+    }
+
+    uint64_t logits_values = 0u;
+    uint64_t logits_bytes = 0u;
+    uint64_t ids_bytes = 0u;
+    uint64_t scores_bytes = 0u;
+    if (!checked_mul_u64((uint64_t)n_rows, (uint64_t)vocab_size, &logits_values) ||
+        !checked_mul_u64(logits_values, (uint64_t)sizeof(float), &logits_bytes) ||
+        !checked_mul_u64((uint64_t)n_rows, (uint64_t)sizeof(uint32_t), &ids_bytes) ||
+        !checked_mul_u64((uint64_t)n_rows, (uint64_t)sizeof(float), &scores_bytes)) {
+        return metal_fail(error, error_size, "Metal argmax byte-size overflow");
+    }
+
+    const uint64_t max_buffer_length = metal_device_max_buffer_length(ctx->device);
+    if (logits_bytes > max_buffer_length || ids_bytes > max_buffer_length || scores_bytes > max_buffer_length ||
+        logits_bytes > (uint64_t)SIZE_MAX || ids_bytes > (uint64_t)SIZE_MAX || scores_bytes > (uint64_t)SIZE_MAX) {
+        return metal_fail(error,
+                          error_size,
+                          "Metal argmax buffers exceed maxBufferLength %llu",
+                          (unsigned long long)max_buffer_length);
+    }
+
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, "uocr_argmax_f32", error, error_size);
+        if (pipeline == nil) {
+            return 0;
+        }
+
+        id<MTLBuffer> logits = [ctx->device newBufferWithBytes:logits_f32
+                                                        length:(NSUInteger)logits_bytes
+                                                       options:MTLResourceStorageModeShared];
+        if (logits == nil) {
+            return metal_fail(error, error_size, "failed to allocate Metal argmax logits buffer");
+        }
+        logits.label = @"uocr_argmax_logits_f32";
+
+        id<MTLBuffer> ids = [ctx->device newBufferWithLength:(NSUInteger)ids_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> scores = [ctx->device newBufferWithLength:(NSUInteger)scores_bytes options:MTLResourceStorageModeShared];
+        if (ids == nil || scores == nil) {
+            [scores release];
+            [ids release];
+            [logits release];
+            return metal_fail(error, error_size, "failed to allocate Metal argmax output buffers");
+        }
+        ids.label = @"uocr_argmax_token_ids";
+        scores.label = @"uocr_argmax_scores";
+        memset([ids contents], 0xff, (size_t)ids_bytes);
+        memset([scores contents], 0, (size_t)scores_bytes);
+
+        id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
+        if (cb == nil) {
+            [scores release];
+            [ids release];
+            [logits release];
+            return metal_fail(error, error_size, "failed to create Metal argmax command buffer");
+        }
+        cb.label = @"uocr_argmax_command_buffer";
+
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        if (enc == nil) {
+            [scores release];
+            [ids release];
+            [logits release];
+            return metal_fail(error, error_size, "failed to create Metal argmax command encoder");
+        }
+
+        uocr_metal_argmax_params params;
+        params.rows = n_rows;
+        params.vocab_size = vocab_size;
+        params.reserved0 = 0u;
+        params.reserved1 = 0u;
+
+        const NSUInteger threads_per_group = metal_power2_threadgroup_width(256u, pipeline.maxTotalThreadsPerThreadgroup);
+        const uint64_t threadgroup_bytes = (uint64_t)threads_per_group * (uint64_t)sizeof(float);
+        uint64_t total_threadgroup_bytes = 0u;
+        if (!checked_mul_u64(threadgroup_bytes, 2u, &total_threadgroup_bytes) ||
+            total_threadgroup_bytes > (uint64_t)ctx->device.maxThreadgroupMemoryLength) {
+            [scores release];
+            [ids release];
+            [logits release];
+            return metal_fail(error, error_size, "Metal argmax threadgroup memory exceeds device limit");
+        }
+
+        [enc setComputePipelineState:pipeline];
+        [enc setBuffer:logits offset:0u atIndex:0u];
+        [enc setBuffer:ids offset:0u atIndex:1u];
+        [enc setBuffer:scores offset:0u atIndex:2u];
+        [enc setBytes:&params length:sizeof(params) atIndex:3u];
+        [enc setThreadgroupMemoryLength:threads_per_group * sizeof(float) atIndex:0u];
+        [enc setThreadgroupMemoryLength:threads_per_group * sizeof(uint32_t) atIndex:1u];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_rows, 1u, 1u)
+             threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1u, 1u)];
+        [enc endEncoding];
+
+        [cb commit];
+        [cb waitUntilCompleted];
+        if (cb.status == MTLCommandBufferStatusError) {
+            NSString *description = cb.error != nil ? [cb.error localizedDescription] : @"unknown command-buffer error";
+            [scores release];
+            [ids release];
+            [logits release];
+            return metal_fail(error, error_size, "Metal argmax command failed: %s", [description UTF8String]);
+        }
+
+        memcpy(token_ids_out, [ids contents], (size_t)ids_bytes);
+        if (scores_out_f32_or_null != NULL) {
+            memcpy(scores_out_f32_or_null, [scores contents], (size_t)scores_bytes);
+        }
+        [scores release];
+        [ids release];
+        [logits release];
     }
 
     metal_clear_error(error, error_size);

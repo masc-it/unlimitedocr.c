@@ -651,7 +651,7 @@ First implementation slice, in order:
 
 - [x] Implement final RMSNorm.
 - [x] Implement fp16 LM head matvec to vocab `129280` with fp32 logits.
-- [ ] Implement greedy argmax.
+- [x] Implement greedy argmax.
 - [ ] Implement no-repeat-ngram banning before argmax:
   - [ ] CPU version first using logits readback if needed
   - [ ] later GPU version for speed

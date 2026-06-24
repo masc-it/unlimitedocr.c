@@ -241,6 +241,19 @@ int uocr_metal_context_lm_head_f16(uocr_metal_context *ctx,
                                    char *error,
                                    size_t error_size);
 
+/* Greedy argmax over fp32 logits. Ties choose the lowest token id, matching
+ * deterministic first-index argmax semantics. scores_out_f32_or_null is
+ * optional and receives the selected logit for each row.
+ */
+int uocr_metal_context_argmax_f32(uocr_metal_context *ctx,
+                                  const float *logits_f32,
+                                  uint32_t n_rows,
+                                  uint32_t vocab_size,
+                                  uint32_t *token_ids_out,
+                                  float *scores_out_f32_or_null,
+                                  char *error,
+                                  size_t error_size);
+
 /* Diagnostic fp16 dense helper for synthetic tests. Computes
  * out[row, out_col] = dot(input[row, :], weight[out_col, :]) + optional bias,
  * where weights are row-major [out_features, in_features]. Dot products are

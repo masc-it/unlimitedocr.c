@@ -285,6 +285,75 @@ kernel void uocr_dense_f16_to_f32(device const half *src [[buffer(0)]],
     }
 }
 
+struct UocrArgmaxParams {
+    uint rows;
+    uint vocab_size;
+    uint reserved0;
+    uint reserved1;
+};
+
+static inline bool uocr_argmax_better(float score, uint id, float best_score, uint best_id) {
+    if (isnan(score)) {
+        return false;
+    }
+    if (best_id == 0xffffffffu) {
+        return true;
+    }
+    if (score > best_score) {
+        return true;
+    }
+    if (score < best_score) {
+        return false;
+    }
+    return id < best_id;
+}
+
+kernel void uocr_argmax_f32(device const float *logits [[buffer(0)]],
+                            device uint *token_ids [[buffer(1)]],
+                            device float *scores [[buffer(2)]],
+                            constant UocrArgmaxParams &params [[buffer(3)]],
+                            threadgroup float *partial_scores [[threadgroup(0)]],
+                            threadgroup uint *partial_ids [[threadgroup(1)]],
+                            uint row [[threadgroup_position_in_grid]],
+                            uint tid [[thread_index_in_threadgroup]],
+                            uint ntg [[threads_per_threadgroup]]) {
+    if (row >= params.rows) {
+        return;
+    }
+
+    float best_score = -INFINITY;
+    uint best_id = 0xffffffffu;
+    const ulong row_base = ulong(row) * ulong(params.vocab_size);
+    for (uint col = tid; col < params.vocab_size; col += ntg) {
+        const float score = logits[row_base + ulong(col)];
+        if (uocr_argmax_better(score, col, best_score, best_id)) {
+            best_score = score;
+            best_id = col;
+        }
+    }
+    partial_scores[tid] = best_score;
+    partial_ids[tid] = best_id;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = ntg >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            const float score = partial_scores[tid + stride];
+            const uint id = partial_ids[tid + stride];
+            if (uocr_argmax_better(score, id, partial_scores[tid], partial_ids[tid])) {
+                partial_scores[tid] = score;
+                partial_ids[tid] = id;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tid == 0) {
+        const uint id = partial_ids[0] == 0xffffffffu ? 0u : partial_ids[0];
+        token_ids[row] = id;
+        scores[row] = partial_ids[0] == 0xffffffffu ? -INFINITY : partial_scores[0];
+    }
+}
+
 struct UocrAttentionProjectionParams {
     uint n_tokens;
     uint hidden_size;

@@ -589,6 +589,80 @@ static int test_metal_lm_head_f16(void) {
     return 0;
 }
 
+static int test_metal_argmax_f32(void) {
+    if (!uocr_metal_is_available()) {
+        return 0;
+    }
+
+    enum { ROWS = 3, VOCAB = UOCR_VOCAB_SIZE };
+    float *logits = (float *)malloc((size_t)ROWS * (size_t)VOCAB * sizeof(float));
+    CHECK(logits != NULL);
+    for (uint32_t i = 0u; i < (uint32_t)(ROWS * VOCAB); ++i) {
+        logits[i] = -1000.0f;
+    }
+    logits[0u * (uint32_t)VOCAB + 17u] = 3.25f;
+    logits[0u * (uint32_t)VOCAB + 42u] = 3.25f; /* tie: lower token id wins */
+    logits[1u * (uint32_t)VOCAB + UOCR_TOKEN_PAD] = -0.5f;
+    logits[1u * (uint32_t)VOCAB + UOCR_TOKEN_IMAGE] = 12.0f;
+    logits[1u * (uint32_t)VOCAB + (uint32_t)VOCAB - 1u] = 11.9f;
+    for (uint32_t col = 0u; col < (uint32_t)VOCAB; ++col) {
+        logits[2u * (uint32_t)VOCAB + col] = -INFINITY;
+    }
+
+    char error[1024];
+    memset(error, 0, sizeof(error));
+    uocr_metal_context *ctx = uocr_metal_context_create(UOCR_TEST_METAL_RESOURCE_PATH, error, sizeof(error));
+    CHECK(ctx != NULL);
+
+    uint32_t token_ids[ROWS] = {UINT32_MAX, UINT32_MAX, UINT32_MAX};
+    float scores[ROWS] = {0.0f, 0.0f, 0.0f};
+    CHECK(uocr_metal_context_argmax_f32(ctx,
+                                        logits,
+                                        ROWS,
+                                        VOCAB,
+                                        token_ids,
+                                        scores,
+                                        error,
+                                        sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    CHECK(token_ids[0] == 17u);
+    CHECK(scores[0] == 3.25f);
+    CHECK(token_ids[1] == (uint32_t)UOCR_TOKEN_IMAGE);
+    CHECK(scores[1] == 12.0f);
+    CHECK(token_ids[2] == 0u);
+    CHECK(isinf(scores[2]) && scores[2] < 0.0f);
+
+    const float small_logits[10] = {
+        -1.0f, 0.5f, 0.5f, -2.0f, 0.25f,
+        -INFINITY, -4.0f, -3.0f, -2.0f, -1.0f,
+    };
+    uint32_t small_ids[2] = {UINT32_MAX, UINT32_MAX};
+    CHECK(uocr_metal_context_argmax_f32(ctx,
+                                        small_logits,
+                                        2u,
+                                        5u,
+                                        small_ids,
+                                        NULL,
+                                        error,
+                                        sizeof(error)) == 1);
+    CHECK(small_ids[0] == 1u);
+    CHECK(small_ids[1] == 4u);
+
+    CHECK(uocr_metal_context_argmax_f32(ctx,
+                                        logits,
+                                        ROWS,
+                                        0u,
+                                        token_ids,
+                                        scores,
+                                        error,
+                                        sizeof(error)) == 0);
+    CHECK(strstr(error, "invalid Metal argmax request") != NULL);
+
+    uocr_metal_context_destroy(ctx);
+    free(logits);
+    return 0;
+}
+
 static int test_metal_dense_f16(void) {
     if (!uocr_metal_is_available()) {
         return 0;
@@ -3516,6 +3590,7 @@ int main(void) {
     if (test_metal_rmsnorm_f16() != 0) return 1;
     if (test_metal_final_rmsnorm_f16() != 0) return 1;
     if (test_metal_lm_head_f16() != 0) return 1;
+    if (test_metal_argmax_f32() != 0) return 1;
     if (test_metal_dense_f16() != 0) return 1;
     if (test_metal_attention_qkvo_f16() != 0) return 1;
     if (test_metal_attention_output_residual_f16() != 0) return 1;
