@@ -69,7 +69,8 @@ add_library(uocr_core STATIC
     src/runtime/uocr_logits_processor.c
     src/runtime/uocr_memory.c
     src/runtime/uocr_request_validation.c
-    src/runtime/uocr_sequence.c)
+    src/runtime/uocr_sequence.c
+    src/runtime/uocr_vision.c)
 target_include_directories(uocr_core
     PUBLIC
         "${CMAKE_CURRENT_SOURCE_DIR}/include"
@@ -206,6 +207,15 @@ if(UOCR_BUILD_TESTS)
     uocr_apply_common_warnings(test_sequence)
     uocr_apply_sanitizers(test_sequence)
     add_test(NAME uocr_sequence COMMAND test_sequence)
+
+    add_executable(test_vision tests/test_vision.c)
+    target_include_directories(test_vision PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/include"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    target_link_libraries(test_vision PRIVATE uocr_core)
+    uocr_apply_common_warnings(test_vision)
+    uocr_apply_sanitizers(test_vision)
+    add_test(NAME uocr_vision COMMAND test_vision)
 
     if(UOCR_METAL_ENABLED AND UOCR_METAL_RUNTIME_COMPILE)
         add_executable(test_metal tests/test_metal.c)

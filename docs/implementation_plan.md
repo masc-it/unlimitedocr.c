@@ -41,7 +41,7 @@ Current priority slice, in order. The coding agent should take the first uncheck
 - [x] Add an opt-in full-model public API parity test for text-only generated ids (`UOCR_RUN_LARGE_TESTS=1`, `UOCR_MODEL_PATH`, `UOCR_LAYER_DUMP_DIR` or equivalent fixture).
 - [x] Promote the Python-dumped visual-embedding path from direct Metal tests into the same integrated decoder runner via an internal/test-only fixture adapter, without changing the stable v1 prepared-request image API.
 - [x] Add opt-in generated-id/text parity for the integrated dumped-visual-embedding path.
-- [ ] Start section 16 Metal vision only after the integrated dumped-visual-embedding generation path passes.
+- [x] Start section 16 Metal vision only after the integrated dumped-visual-embedding generation path passes.
 
 ## 1. Critical facts to encode as asserts
 
@@ -731,7 +731,7 @@ Do not begin this section until sections 14.5 and 15.1 pass for fp16 single-requ
 
 ### 16.1 Vision scheduling and memory
 
-- [ ] Implement view-chunk scheduling so crop mode does not force all local views through vision at once.
+- [x] Implement view-chunk scheduling so crop mode does not force all local views through vision at once.
 - [ ] Process local crops in chunks, append projected features into final visual feature buffer, and reuse SAM/CLIP scratch.
 - [ ] Support one global `1024x1024` view and zero or more local `640x640` views.
 - [ ] Add vision memory estimates to admission control.
