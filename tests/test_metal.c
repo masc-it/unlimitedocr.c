@@ -3154,6 +3154,150 @@ static int test_metal_clip_transformer_f16(void) {
     return 0;
 }
 
+static int test_metal_clip_sam_concat_f16(void) {
+    if (!uocr_metal_is_available()) {
+        return 0;
+    }
+
+    CHECK(UOCR_CLIP_HIDDEN_SIZE == 1024u);
+    CHECK(UOCR_SAM_FEATURE_CHANNELS == 1024u);
+    CHECK(UOCR_PROJECTOR_IN_SIZE == 2048u);
+    CHECK(UOCR_PROJECTOR_IN_SIZE == UOCR_CLIP_HIDDEN_SIZE + UOCR_SAM_FEATURE_CHANNELS);
+
+    char error[1024];
+    memset(error, 0, sizeof(error));
+    uocr_metal_context *ctx = uocr_metal_context_create(UOCR_TEST_METAL_RESOURCE_PATH, error, sizeof(error));
+    CHECK(ctx != NULL);
+
+    const uint32_t grids[] = {UOCR_GLOBAL_GRID_QUERIES, UOCR_LOCAL_GRID_QUERIES};
+    for (size_t case_index = 0u; case_index < sizeof(grids) / sizeof(grids[0]); ++case_index) {
+        const uint32_t grid = grids[case_index];
+        const uint32_t spatial = grid * grid;
+        const uint32_t tokens = UOCR_CLIP_CLASS_TOKENS + spatial;
+        const size_t clip_values = (size_t)tokens * UOCR_CLIP_HIDDEN_SIZE;
+        const size_t sam_values = (size_t)spatial * UOCR_SAM_FEATURE_CHANNELS;
+        const size_t output_values = (size_t)spatial * UOCR_PROJECTOR_IN_SIZE;
+
+        uint16_t *clip_tokens = (uint16_t *)calloc(clip_values, sizeof(uint16_t));
+        uint16_t *sam_nchw = (uint16_t *)calloc(sam_values, sizeof(uint16_t));
+        float *out_f32 = (float *)calloc(output_values, sizeof(float));
+        uint16_t *out_f16 = (uint16_t *)calloc(output_values, sizeof(uint16_t));
+        CHECK(clip_tokens != NULL);
+        CHECK(sam_nchw != NULL);
+        CHECK(out_f32 != NULL);
+        CHECK(out_f16 != NULL);
+
+        for (uint32_t c = 0u; c < UOCR_CLIP_HIDDEN_SIZE; ++c) {
+            clip_tokens[clip_token_index(0u, c)] = f32_to_f16_bits(100.0f + (float)c);
+        }
+        for (uint32_t token = 1u; token < tokens; ++token) {
+            for (uint32_t c = 0u; c < UOCR_CLIP_HIDDEN_SIZE; ++c) {
+                const int mod = (int)((token * 13u + c * 7u + grid) % 127u) - 63;
+                clip_tokens[clip_token_index(token, c)] = f32_to_f16_bits((float)mod * 0.003f);
+            }
+        }
+        for (uint32_t y = 0u; y < grid; ++y) {
+            for (uint32_t x = 0u; x < grid; ++x) {
+                for (uint32_t c = 0u; c < UOCR_SAM_FEATURE_CHANNELS; ++c) {
+                    const int mod = (int)((y * 17u + x * 19u + c * 5u + grid) % 131u) - 65;
+                    sam_nchw[sam_neck_nchw_index(grid, grid, c, y, x)] = f32_to_f16_bits((float)mod * 0.0025f);
+                }
+            }
+        }
+
+        CHECK(uocr_metal_context_clip_sam_concat_f16(ctx,
+                                                     clip_tokens,
+                                                     sam_nchw,
+                                                     grid,
+                                                     grid,
+                                                     UOCR_METAL_DENSE_OUTPUT_F32,
+                                                     out_f32,
+                                                     error,
+                                                     sizeof(error)) == 1);
+        CHECK(error[0] == '\0');
+        CHECK(uocr_metal_context_clip_sam_concat_f16(ctx,
+                                                     clip_tokens,
+                                                     sam_nchw,
+                                                     grid,
+                                                     grid,
+                                                     UOCR_METAL_DENSE_OUTPUT_F16,
+                                                     out_f16,
+                                                     error,
+                                                     sizeof(error)) == 1);
+        CHECK(error[0] == '\0');
+
+        struct concat_sample {
+            uint32_t spatial;
+            uint32_t col;
+        } samples[] = {
+            {0u, 0u},
+            {0u, UOCR_CLIP_HIDDEN_SIZE - 1u},
+            {spatial / 3u, 17u},
+            {spatial / 2u, UOCR_CLIP_HIDDEN_SIZE},
+            {spatial - 1u, UOCR_PROJECTOR_IN_SIZE - 1u},
+        };
+        for (size_t i = 0u; i < sizeof(samples) / sizeof(samples[0]); ++i) {
+            const uint32_t spatial_index = samples[i].spatial;
+            const uint32_t col = samples[i].col;
+            const uint32_t y = spatial_index / grid;
+            const uint32_t x = spatial_index - y * grid;
+            uint16_t expected_bits;
+            if (col < UOCR_CLIP_HIDDEN_SIZE) {
+                expected_bits = clip_tokens[clip_token_index(spatial_index + UOCR_CLIP_CLASS_TOKENS, col)];
+            } else {
+                expected_bits = sam_nchw[sam_neck_nchw_index(grid, grid, col - UOCR_CLIP_HIDDEN_SIZE, y, x)];
+            }
+            const size_t out_index = (size_t)spatial_index * UOCR_PROJECTOR_IN_SIZE + col;
+            CHECK(fabsf(out_f32[out_index] - f16_bits_to_f32(expected_bits)) <= 1.0e-7f);
+            CHECK(out_f16[out_index] == expected_bits);
+            CHECK(out_f16[out_index] != clip_tokens[clip_token_index(0u, col < UOCR_CLIP_HIDDEN_SIZE ? col : 0u)]);
+        }
+
+        free(out_f16);
+        free(out_f32);
+        free(sam_nchw);
+        free(clip_tokens);
+    }
+
+    uint16_t one_value = f32_to_f16_bits(0.0f);
+    float one_out = 0.0f;
+    CHECK(uocr_metal_context_clip_sam_concat_f16(ctx,
+                                                 NULL,
+                                                 &one_value,
+                                                 UOCR_LOCAL_GRID_QUERIES,
+                                                 UOCR_LOCAL_GRID_QUERIES,
+                                                 UOCR_METAL_DENSE_OUTPUT_F32,
+                                                 &one_out,
+                                                 error,
+                                                 sizeof(error)) == 0);
+    CHECK(strstr(error, "invalid Metal CLIP/SAM concat") != NULL);
+
+    CHECK(uocr_metal_context_clip_sam_concat_f16(ctx,
+                                                 &one_value,
+                                                 &one_value,
+                                                 12u,
+                                                 12u,
+                                                 UOCR_METAL_DENSE_OUTPUT_F32,
+                                                 &one_out,
+                                                 error,
+                                                 sizeof(error)) == 0);
+    CHECK(strstr(error, "unsupported Metal CLIP/SAM concat grid") != NULL);
+
+    CHECK(uocr_metal_context_clip_sam_concat_f16(ctx,
+                                                 &one_value,
+                                                 &one_value,
+                                                 UOCR_LOCAL_GRID_QUERIES,
+                                                 UOCR_LOCAL_GRID_QUERIES,
+                                                 (uocr_metal_dense_output_type)99,
+                                                 &one_out,
+                                                 error,
+                                                 sizeof(error)) == 0);
+    CHECK(strstr(error, "unsupported Metal CLIP/SAM concat output type") != NULL);
+
+    uocr_metal_context_destroy(ctx);
+    return 0;
+}
+
 static int test_metal_sam_window_partition_f16(void) {
     if (!uocr_metal_is_available()) {
         return 0;
@@ -13241,6 +13385,7 @@ int main(void) {
     if (test_metal_clip_mlp_f16() != 0) return 1;
     if (test_metal_clip_residual_add_f16() != 0) return 1;
     if (test_metal_clip_transformer_f16() != 0) return 1;
+    if (test_metal_clip_sam_concat_f16() != 0) return 1;
     if (test_metal_sam_window_partition_f16() != 0) return 1;
     if (test_metal_sam_window_attention_f16() != 0) return 1;
     if (test_metal_sam_global_attention_f16() != 0) return 1;

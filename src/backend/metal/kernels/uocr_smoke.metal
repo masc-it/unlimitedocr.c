@@ -694,6 +694,53 @@ kernel void uocr_clip_residual_add_f16_to_f32(device const half *base [[buffer(0
     dst[gid] = float(base[gid]) + float(update[gid]);
 }
 
+struct UocrClipSamConcatParams {
+    uint grid_width;
+    uint grid_height;
+    uint hidden_size;
+    uint projector_in_size;
+};
+
+kernel void uocr_clip_sam_concat_f16_to_f16(device const half *clip_tokens [[buffer(0)]],
+                                            device const half *sam_nchw [[buffer(1)]],
+                                            device half *dst [[buffer(2)]],
+                                            constant UocrClipSamConcatParams &params [[buffer(3)]],
+                                            uint2 gid [[thread_position_in_grid]]) {
+    const uint col = gid.x;
+    const uint spatial = gid.y;
+    const uint spatial_size = params.grid_width * params.grid_height;
+    if (col >= params.projector_in_size || spatial >= spatial_size) {
+        return;
+    }
+    const uint dst_index = spatial * params.projector_in_size + col;
+    if (col < params.hidden_size) {
+        dst[dst_index] = clip_tokens[(spatial + 1u) * params.hidden_size + col];
+        return;
+    }
+    const uint channel = col - params.hidden_size;
+    dst[dst_index] = sam_nchw[channel * spatial_size + spatial];
+}
+
+kernel void uocr_clip_sam_concat_f16_to_f32(device const half *clip_tokens [[buffer(0)]],
+                                            device const half *sam_nchw [[buffer(1)]],
+                                            device float *dst [[buffer(2)]],
+                                            constant UocrClipSamConcatParams &params [[buffer(3)]],
+                                            uint2 gid [[thread_position_in_grid]]) {
+    const uint col = gid.x;
+    const uint spatial = gid.y;
+    const uint spatial_size = params.grid_width * params.grid_height;
+    if (col >= params.projector_in_size || spatial >= spatial_size) {
+        return;
+    }
+    const uint dst_index = spatial * params.projector_in_size + col;
+    if (col < params.hidden_size) {
+        dst[dst_index] = float(clip_tokens[(spatial + 1u) * params.hidden_size + col]);
+        return;
+    }
+    const uint channel = col - params.hidden_size;
+    dst[dst_index] = float(sam_nchw[channel * spatial_size + spatial]);
+}
+
 struct UocrSamWindowAttentionParams {
     uint windows;
     uint tokens_per_window;

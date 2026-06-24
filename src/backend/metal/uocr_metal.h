@@ -620,6 +620,20 @@ int uocr_metal_context_clip_transformer_f16(uocr_metal_context *ctx,
                                             char *error,
                                             size_t error_size);
 
+/* Diagnostic visual projector-input formatter. Concatenates CLIP token features
+ * without CLS and SAM net_3 NCHW feature-map tokens into token-major
+ * [grid_h*grid_w,2048] rows: first 1024 CLIP channels, then 1024 SAM channels.
+ */
+int uocr_metal_context_clip_sam_concat_f16(uocr_metal_context *ctx,
+                                           const uint16_t *clip_tokens_f16,
+                                           const uint16_t *sam_nchw_f16,
+                                           uint32_t grid_w,
+                                           uint32_t grid_h,
+                                           uocr_metal_dense_output_type output_type,
+                                           void *out,
+                                           char *error,
+                                           size_t error_size);
+
 /* Diagnostic SAM window-attention helper for non-global transformer blocks.
  * Q/K/V are fp16 tensors laid out as [n_windows,14*14,12,64] (equivalent to
  * window-major rows with flattened [head,dim] channels). The helper computes

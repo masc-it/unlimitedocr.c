@@ -387,6 +387,13 @@ typedef struct uocr_metal_clip_abs_pos_params {
     uint32_t hidden_size;
 } uocr_metal_clip_abs_pos_params;
 
+typedef struct uocr_metal_clip_sam_concat_params {
+    uint32_t grid_width;
+    uint32_t grid_height;
+    uint32_t hidden_size;
+    uint32_t projector_in_size;
+} uocr_metal_clip_sam_concat_params;
+
 typedef struct uocr_metal_sam_layernorm2d_params {
     uint32_t grid_width;
     uint32_t grid_height;
@@ -437,6 +444,8 @@ _Static_assert(sizeof(uocr_metal_clip_embed_sam_params) == 16u,
                "uocr_metal_clip_embed_sam_params ABI mismatch");
 _Static_assert(sizeof(uocr_metal_clip_abs_pos_params) == 16u,
                "uocr_metal_clip_abs_pos_params ABI mismatch");
+_Static_assert(sizeof(uocr_metal_clip_sam_concat_params) == 16u,
+               "uocr_metal_clip_sam_concat_params ABI mismatch");
 _Static_assert(sizeof(uocr_metal_sam_layernorm2d_params) == 16u,
                "uocr_metal_sam_layernorm2d_params ABI mismatch");
 _Static_assert(sizeof(uocr_metal_sam_rel_pos_attention_params) == 48u,
@@ -8458,6 +8467,165 @@ int uocr_metal_context_clip_transformer_f16(uocr_metal_context *ctx,
 cleanup_clip_transformer:
     free(state_b_f16);
     free(state_a_f16);
+    if (result) {
+        metal_clear_error(error, error_size);
+    }
+    return result;
+}
+
+int uocr_metal_context_clip_sam_concat_f16(uocr_metal_context *ctx,
+                                           const uint16_t *clip_tokens_f16,
+                                           const uint16_t *sam_nchw_f16,
+                                           uint32_t grid_w,
+                                           uint32_t grid_h,
+                                           uocr_metal_dense_output_type output_type,
+                                           void *out,
+                                           char *error,
+                                           size_t error_size) {
+    metal_clear_error(error, error_size);
+    if (ctx == NULL || clip_tokens_f16 == NULL || sam_nchw_f16 == NULL || out == NULL) {
+        return metal_fail(error, error_size, "invalid Metal CLIP/SAM concat request");
+    }
+    if (output_type != UOCR_METAL_DENSE_OUTPUT_F16 && output_type != UOCR_METAL_DENSE_OUTPUT_F32) {
+        return metal_fail(error, error_size, "unsupported Metal CLIP/SAM concat output type %d", (int)output_type);
+    }
+    if (!((grid_w == UOCR_GLOBAL_GRID_QUERIES && grid_h == UOCR_GLOBAL_GRID_QUERIES) ||
+          (grid_w == UOCR_LOCAL_GRID_QUERIES && grid_h == UOCR_LOCAL_GRID_QUERIES))) {
+        return metal_fail(error, error_size, "unsupported Metal CLIP/SAM concat grid %ux%u", grid_w, grid_h);
+    }
+    if (UOCR_CLIP_HIDDEN_SIZE != 1024u || UOCR_SAM_FEATURE_CHANNELS != 1024u || UOCR_PROJECTOR_IN_SIZE != 2048u ||
+        UOCR_PROJECTOR_IN_SIZE != UOCR_CLIP_HIDDEN_SIZE + UOCR_SAM_FEATURE_CHANNELS ||
+        UOCR_CLIP_GLOBAL_TOKENS != 257u || UOCR_CLIP_LOCAL_TOKENS != 101u) {
+        return metal_fail(error, error_size, "Metal CLIP/SAM concat constants are inconsistent");
+    }
+
+    uint64_t spatial = 0u;
+    uint64_t clip_tokens = 0u;
+    uint64_t clip_values = 0u;
+    uint64_t sam_values = 0u;
+    uint64_t output_values = 0u;
+    uint64_t clip_bytes = 0u;
+    uint64_t sam_bytes = 0u;
+    uint64_t output_bytes = 0u;
+    const uint64_t output_element_bytes = output_type == UOCR_METAL_DENSE_OUTPUT_F16 ? 2u : (uint64_t)sizeof(float);
+    if (!checked_mul_u64((uint64_t)grid_w, (uint64_t)grid_h, &spatial) ||
+        !checked_add_u64(spatial, (uint64_t)UOCR_CLIP_CLASS_TOKENS, &clip_tokens) ||
+        (clip_tokens != (uint64_t)UOCR_CLIP_GLOBAL_TOKENS && clip_tokens != (uint64_t)UOCR_CLIP_LOCAL_TOKENS) ||
+        !checked_mul_u64(clip_tokens, (uint64_t)UOCR_CLIP_HIDDEN_SIZE, &clip_values) ||
+        !checked_mul_u64(spatial, (uint64_t)UOCR_SAM_FEATURE_CHANNELS, &sam_values) ||
+        !checked_mul_u64(spatial, (uint64_t)UOCR_PROJECTOR_IN_SIZE, &output_values) ||
+        !checked_mul_u64(clip_values, 2u, &clip_bytes) ||
+        !checked_mul_u64(sam_values, 2u, &sam_bytes) ||
+        !checked_mul_u64(output_values, output_element_bytes, &output_bytes) ||
+        spatial > (uint64_t)UINT32_MAX || clip_bytes > (uint64_t)SIZE_MAX || sam_bytes > (uint64_t)SIZE_MAX ||
+        output_bytes > (uint64_t)SIZE_MAX) {
+        return metal_fail(error, error_size, "Metal CLIP/SAM concat byte-size overflow");
+    }
+
+    const uint64_t max_buffer_length = metal_device_max_buffer_length(ctx->device);
+    if (clip_bytes > max_buffer_length || sam_bytes > max_buffer_length || output_bytes > max_buffer_length) {
+        return metal_fail(error,
+                          error_size,
+                          "Metal CLIP/SAM concat buffers exceed maxBufferLength %llu",
+                          (unsigned long long)max_buffer_length);
+    }
+
+    int result = 0;
+    @autoreleasepool {
+        const char *function_name = output_type == UOCR_METAL_DENSE_OUTPUT_F16 ?
+                                        "uocr_clip_sam_concat_f16_to_f16" :
+                                        "uocr_clip_sam_concat_f16_to_f32";
+        id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, function_name, error, error_size);
+        if (pipeline == nil) {
+            return 0;
+        }
+
+        id<MTLBuffer> clip = nil;
+        id<MTLBuffer> sam = nil;
+        id<MTLBuffer> dst = nil;
+        id<MTLCommandBuffer> cb = nil;
+        id<MTLComputeCommandEncoder> enc = nil;
+
+        clip = [ctx->device newBufferWithBytes:clip_tokens_f16
+                                        length:(NSUInteger)clip_bytes
+                                       options:MTLResourceStorageModeShared];
+        if (clip == nil) {
+            result = metal_fail(error, error_size, "failed to allocate Metal CLIP/SAM concat CLIP buffer");
+            goto cleanup_clip_sam_concat;
+        }
+        clip.label = @"uocr_clip_sam_concat_clip_tokens_f16";
+
+        sam = [ctx->device newBufferWithBytes:sam_nchw_f16
+                                       length:(NSUInteger)sam_bytes
+                                      options:MTLResourceStorageModeShared];
+        if (sam == nil) {
+            result = metal_fail(error, error_size, "failed to allocate Metal CLIP/SAM concat SAM buffer");
+            goto cleanup_clip_sam_concat;
+        }
+        sam.label = @"uocr_clip_sam_concat_sam_nchw_f16";
+
+        dst = [ctx->device newBufferWithLength:(NSUInteger)output_bytes options:MTLResourceStorageModeShared];
+        if (dst == nil) {
+            result = metal_fail(error, error_size, "failed to allocate Metal CLIP/SAM concat output buffer");
+            goto cleanup_clip_sam_concat;
+        }
+        dst.label = @"uocr_clip_sam_concat_output";
+        memset([dst contents], 0, (size_t)output_bytes);
+
+        cb = [ctx->queue commandBuffer];
+        if (cb == nil) {
+            result = metal_fail(error, error_size, "failed to create Metal CLIP/SAM concat command buffer");
+            goto cleanup_clip_sam_concat;
+        }
+        cb.label = @"uocr_clip_sam_concat_command_buffer";
+
+        enc = [cb computeCommandEncoder];
+        if (enc == nil) {
+            result = metal_fail(error, error_size, "failed to create Metal CLIP/SAM concat command encoder");
+            goto cleanup_clip_sam_concat;
+        }
+
+        uocr_metal_clip_sam_concat_params params;
+        params.grid_width = grid_w;
+        params.grid_height = grid_h;
+        params.hidden_size = UOCR_CLIP_HIDDEN_SIZE;
+        params.projector_in_size = UOCR_PROJECTOR_IN_SIZE;
+
+        NSUInteger threads_x = metal_power2_threadgroup_width(256u, pipeline.maxTotalThreadsPerThreadgroup);
+        if (threads_x > (NSUInteger)UOCR_PROJECTOR_IN_SIZE) {
+            threads_x = (NSUInteger)UOCR_PROJECTOR_IN_SIZE;
+        }
+        if (threads_x == 0u) {
+            result = metal_fail(error, error_size, "Metal CLIP/SAM concat has invalid threadgroup width");
+            goto cleanup_clip_sam_concat;
+        }
+
+        [enc setComputePipelineState:pipeline];
+        [enc setBuffer:clip offset:0u atIndex:0u];
+        [enc setBuffer:sam offset:0u atIndex:1u];
+        [enc setBuffer:dst offset:0u atIndex:2u];
+        [enc setBytes:&params length:sizeof(params) atIndex:3u];
+        [enc dispatchThreads:MTLSizeMake((NSUInteger)UOCR_PROJECTOR_IN_SIZE, (NSUInteger)spatial, 1u)
+       threadsPerThreadgroup:MTLSizeMake(threads_x, 1u, 1u)];
+        [enc endEncoding];
+
+        [cb commit];
+        [cb waitUntilCompleted];
+        if (cb.status == MTLCommandBufferStatusError) {
+            NSString *description = cb.error != nil ? [cb.error localizedDescription] : @"unknown command-buffer error";
+            result = metal_fail(error, error_size, "Metal CLIP/SAM concat command failed: %s", [description UTF8String]);
+            goto cleanup_clip_sam_concat;
+        }
+
+        memcpy(out, [dst contents], (size_t)output_bytes);
+        result = 1;
+
+    cleanup_clip_sam_concat:
+        [dst release];
+        [sam release];
+        [clip release];
+    }
+
     if (result) {
         metal_clear_error(error, error_size);
     }
