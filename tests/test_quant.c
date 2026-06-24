@@ -56,6 +56,14 @@ static int test_quant_type_traits(void) {
     CHECK(info.type_size == UOCR_Q4_K_TYPE_SIZE);
     CHECK(strcmp(info.name, "q4_K") == 0);
 
+    CHECK(uocr_quant_get_type_info(UOCR_TENSOR_PADDED_Q4_K, &info) == 1);
+    CHECK(info.is_quantized == 1);
+    CHECK(info.is_enabled == 0);
+    CHECK(info.block_size == UOCR_Q4_K_BLOCK_SIZE);
+    CHECK(info.type_size == UOCR_Q4_K_TYPE_SIZE);
+    uint64_t disabled_row_size = 0u;
+    CHECK(uocr_quant_row_size(UOCR_TENSOR_PADDED_Q4_K, 1024u, &disabled_row_size) == 0);
+
     CHECK(uocr_quant_get_type_info(UOCR_TENSOR_Q2_K, &info) == 1);
     CHECK(info.is_quantized == 1);
     CHECK(info.is_enabled == 0);

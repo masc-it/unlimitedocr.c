@@ -9,6 +9,7 @@ import pytest
 from unlimitedocr_c.convert import (
     EXPECTED_TENSOR_COUNT,
     EXPECTED_TOTAL_BYTES,
+    PADDED_Q4_K_KERNEL_CONTRACT,
     PRESERVED_UNUSED_NORMAL_OCR_PREFIXES,
     UOCR_FILE_HEADER_SIZE,
     UOCR_Q4_K_BLOCK_SIZE,
@@ -20,11 +21,13 @@ from unlimitedocr_c.convert import (
     UOCR_TENSOR_DATA_ALIGNMENT,
     UOCR_TENSOR_PAYLOAD_ALIGNMENT,
     UOCR_TENSOR_Q4_K,
+    UOCR_TENSOR_PADDED_Q4_K,
     UOCR_TENSOR_Q8_0,
     _TENSOR_DIRECTORY_HEADER_STRUCT,
     _TENSOR_ENTRY_STRUCT,
     _tensor_directory_bytes,
     build_dry_run_plan,
+    describe_padded_q4_k_design,
     filter_plan_tensors,
     is_preserved_unused_in_normal_ocr,
     write_uocr_model,
@@ -287,6 +290,38 @@ def test_dyn_q4_converter_dry_run_uses_conservative_policy() -> None:
     router = plan.tensor_by_name("model.layers.1.mlp.gate.weight")
     assert router.qtype == "UOCR_TENSOR_F16"
     assert "router" in router.reason.lower()
+
+
+def test_padded_q4_k_design_is_explicit_and_disabled_by_default() -> None:
+    plan = build_dry_run_plan(project_root() / "data/context", qprofile="dyn-q4")
+    assert "UOCR_TENSOR_PADDED_Q4_K" not in plan.qtype_histogram
+
+    routed_down = plan.tensor_by_name("model.layers.1.mlp.experts.7.down_proj.weight")
+    assert routed_down.qtype == "UOCR_TENSOR_Q8_0"
+
+    routed_design = describe_padded_q4_k_design(routed_down.shape)
+    assert routed_design.qtype == "UOCR_TENSOR_PADDED_Q4_K"
+    assert routed_design.qtype_id == UOCR_TENSOR_PADDED_Q4_K
+    assert routed_design.logical_shape == (1280, 896)
+    assert routed_design.physical_shape == (1280, 1024)
+    assert routed_design.padding_cols == 128
+    assert routed_design.block_size == UOCR_Q4_K_BLOCK_SIZE
+    assert routed_design.row_size == (1024 // UOCR_Q4_K_BLOCK_SIZE) * UOCR_Q4_K_TYPE_SIZE
+    assert routed_design.output_bytes == 1280 * routed_design.row_size
+    assert "zero" in routed_design.kernel_contract
+    assert "logical inner width" in routed_design.kernel_contract
+    assert routed_design.as_dict()["kernel_contract"] == PADDED_Q4_K_KERNEL_CONTRACT
+
+    dense_design = describe_padded_q4_k_design((1280, 6848))
+    assert dense_design.logical_shape == (1280, 6848)
+    assert dense_design.physical_shape == (1280, 6912)
+    assert dense_design.padding_cols == 64
+    assert dense_design.row_size == (6912 // UOCR_Q4_K_BLOCK_SIZE) * UOCR_Q4_K_TYPE_SIZE
+
+    aligned_design = describe_padded_q4_k_design((1280, 1792))
+    assert aligned_design.logical_shape == (1280, 1792)
+    assert aligned_design.physical_shape == (1280, 1792)
+    assert aligned_design.padding_cols == 0
 
 
 def test_filter_plan_tensors_relayouts_single_tensor(tmp_path) -> None:

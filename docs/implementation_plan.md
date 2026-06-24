@@ -837,10 +837,10 @@ Do not begin this section until sections 14.5 and 15.1 pass for fp16 single-requ
   - [x] shared expert down inner dim `1792` -> `Q4_K` candidate after q8 parity
   - [x] LM head -> keep `Q8_0` initially
   - [x] vision -> keep `Q8_0` initially, selective q4 later
-- [ ] Add `PADDED_Q4_K` design but do not enable by default:
-  - [ ] physical width rounded to multiple of `256`
-  - [ ] activation zero-fill/padding in kernels
-  - [ ] logical width retained for output correctness
+- [x] Add `PADDED_Q4_K` design but do not enable by default:
+  - [x] physical width rounded to multiple of `256`
+  - [x] activation zero-fill/padding in kernels
+  - [x] logical width retained for output correctness
 - [ ] Add promotion metadata with reasons: sensitive, unaligned, calibration drift, manual override.
 
 ### 17.4 Metal quantized kernels

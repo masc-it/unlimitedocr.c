@@ -79,6 +79,12 @@ UOCR_Q8_0_TYPE_SIZE = 34
 UOCR_Q4_K_BLOCK_SIZE = 256
 UOCR_Q4_K_TYPE_SIZE = 144
 
+PADDED_Q4_K_KERNEL_CONTRACT = (
+    "PADDED_Q4_K uses Q4_K rows at a physical inner width rounded up to 256; "
+    "Metal kernels must treat activation columns [logical_inner, physical_inner) as zero "
+    "and retain the logical inner width for output correctness."
+)
+
 CONVERTER_VERSION = (0, 1, 0)
 
 CLIP_PIXEL_PATCH_EMBEDDING_PREFIX = "model.vision_model.embeddings.patch_embedding."
@@ -181,7 +187,42 @@ QUANT_TYPE_INFOS: Mapping[str, QuantTypeInfo] = {
     "UOCR_TENSOR_Q4_K": QuantTypeInfo(
         "UOCR_TENSOR_Q4_K", UOCR_TENSOR_Q4_K, "Q4_K", UOCR_Q4_K_BLOCK_SIZE, UOCR_Q4_K_TYPE_SIZE
     ),
+    "UOCR_TENSOR_PADDED_Q4_K": QuantTypeInfo(
+        "UOCR_TENSOR_PADDED_Q4_K",
+        UOCR_TENSOR_PADDED_Q4_K,
+        "PADDED_Q4_K",
+        UOCR_Q4_K_BLOCK_SIZE,
+        UOCR_Q4_K_TYPE_SIZE,
+    ),
 }
+
+
+@dataclass(frozen=True)
+class PaddedQ4KDesign:
+    qtype: str
+    qtype_id: int
+    output_dtype: str
+    logical_shape: tuple[int, int]
+    physical_shape: tuple[int, int]
+    padding_cols: int
+    output_bytes: int
+    block_size: int
+    row_size: int
+    kernel_contract: str
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "qtype": self.qtype,
+            "qtype_id": self.qtype_id,
+            "output_dtype": self.output_dtype,
+            "logical_shape": list(self.logical_shape),
+            "physical_shape": list(self.physical_shape),
+            "padding_cols": self.padding_cols,
+            "output_bytes": self.output_bytes,
+            "block_size": self.block_size,
+            "row_size": self.row_size,
+            "kernel_contract": self.kernel_contract,
+        }
 
 
 @dataclass(frozen=True)
@@ -357,7 +398,7 @@ def _quantized_tensor_metadata(
     info = QUANT_TYPE_INFOS[qtype_name]
     logical_shape = _flatten_weight_shape_for_quantization(shape)
     rows, inner = logical_shape
-    if info.qtype_id == UOCR_TENSOR_Q8_0:
+    if info.qtype_id in {UOCR_TENSOR_Q8_0, UOCR_TENSOR_PADDED_Q4_K}:
         physical_inner = _align_up(inner, info.block_size)
     else:
         if inner % info.block_size != 0:
@@ -366,6 +407,39 @@ def _quantized_tensor_metadata(
     physical_shape = (rows, physical_inner)
     row_size = (physical_inner // info.block_size) * info.type_size
     return logical_shape, physical_shape, rows * row_size, info.block_size, row_size, info.qtype_id, info.output_dtype
+
+
+def describe_padded_q4_k_design(shape: tuple[int, ...]) -> PaddedQ4KDesign:
+    """Return the disabled-by-default PADDED_Q4_K metadata contract for a weight tensor.
+
+    The conservative ``dyn-q4`` profile deliberately keeps unaligned down
+    projections in Q8_0.  This helper documents and tests the future opt-in
+    layout: source weights keep their logical inner width, payload rows are
+    packed at a Q4_K-aligned physical width, and Metal kernels must zero the
+    synthetic activation tail before/while accumulating.
+    """
+
+    (
+        logical_shape,
+        physical_shape,
+        output_bytes,
+        block_size,
+        row_size,
+        qtype_id,
+        output_dtype,
+    ) = _quantized_tensor_metadata(shape, "UOCR_TENSOR_PADDED_Q4_K")
+    return PaddedQ4KDesign(
+        qtype="UOCR_TENSOR_PADDED_Q4_K",
+        qtype_id=qtype_id,
+        output_dtype=output_dtype,
+        logical_shape=logical_shape,
+        physical_shape=physical_shape,
+        padding_cols=physical_shape[1] - logical_shape[1],
+        output_bytes=output_bytes,
+        block_size=block_size,
+        row_size=row_size,
+        kernel_contract=PADDED_Q4_K_KERNEL_CONTRACT,
+    )
 
 
 def _fp16_tensor_metadata(
