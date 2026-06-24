@@ -3242,6 +3242,72 @@ int uocr_metal_context_select_greedy_f32(uocr_metal_context *ctx,
                                          error_size);
 }
 
+int uocr_metal_context_select_next_token_f16(uocr_metal_context *ctx,
+                                             const uint16_t *hidden_f16,
+                                             uint32_t n_rows,
+                                             const uocr_no_repeat_ngram_config *no_repeat_or_null,
+                                             uint16_t *normed_scratch_f16,
+                                             float *logits_scratch_f32,
+                                             uint32_t *token_ids_out,
+                                             float *scores_out_f32_or_null,
+                                             char *error,
+                                             size_t error_size) {
+    metal_clear_error(error, error_size);
+    if (ctx == NULL || hidden_f16 == NULL || normed_scratch_f16 == NULL || logits_scratch_f32 == NULL ||
+        token_ids_out == NULL || n_rows == 0u) {
+        return metal_fail(error, error_size, "invalid Metal next-token selection request");
+    }
+
+    uint64_t hidden_values = 0u;
+    uint64_t logits_values = 0u;
+    if (!checked_mul_u64((uint64_t)n_rows, (uint64_t)UOCR_HIDDEN_SIZE, &hidden_values) ||
+        !checked_mul_u64((uint64_t)n_rows, (uint64_t)UOCR_VOCAB_SIZE, &logits_values) ||
+        hidden_values > (uint64_t)SIZE_MAX / sizeof(uint16_t) ||
+        logits_values > (uint64_t)SIZE_MAX / sizeof(float)) {
+        return metal_fail(error, error_size, "Metal next-token selection scratch byte-size overflow");
+    }
+
+    if (!uocr_metal_context_final_rmsnorm_f16(ctx,
+                                             hidden_f16,
+                                             n_rows,
+                                             UOCR_METAL_RMSNORM_OUTPUT_F16,
+                                             normed_scratch_f16,
+                                             error,
+                                             error_size)) {
+        char detail[512];
+        (void)snprintf(detail, sizeof(detail), "%s", (error != NULL && error[0] != '\0') ? error : "unknown error");
+        return metal_fail(error, error_size, "failed to apply final RMSNorm before next-token selection: %s", detail);
+    }
+
+    if (!uocr_metal_context_lm_head_f16(ctx,
+                                        normed_scratch_f16,
+                                        n_rows,
+                                        logits_scratch_f32,
+                                        error,
+                                        error_size)) {
+        char detail[512];
+        (void)snprintf(detail, sizeof(detail), "%s", (error != NULL && error[0] != '\0') ? error : "unknown error");
+        return metal_fail(error, error_size, "failed to compute LM-head logits before next-token selection: %s", detail);
+    }
+
+    if (!uocr_metal_context_select_greedy_f32(ctx,
+                                             logits_scratch_f32,
+                                             n_rows,
+                                             UOCR_VOCAB_SIZE,
+                                             no_repeat_or_null,
+                                             token_ids_out,
+                                             scores_out_f32_or_null,
+                                             error,
+                                             error_size)) {
+        char detail[512];
+        (void)snprintf(detail, sizeof(detail), "%s", (error != NULL && error[0] != '\0') ? error : "unknown error");
+        return metal_fail(error, error_size, "failed to greedily select next token: %s", detail);
+    }
+
+    metal_clear_error(error, error_size);
+    return 1;
+}
+
 int uocr_metal_context_dense_f16(uocr_metal_context *ctx,
                                  const uint16_t *input_f16,
                                  const uint16_t *weight_f16,

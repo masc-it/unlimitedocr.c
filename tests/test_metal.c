@@ -1274,6 +1274,113 @@ static int test_metal_eos_stop_after_greedy_selection(void) {
     return 0;
 }
 
+static int test_metal_select_next_token_f16(void) {
+    if (!uocr_metal_is_available()) {
+        return 0;
+    }
+
+    enum { ROWS = 2, HIDDEN = UOCR_HIDDEN_SIZE, ROW_COUNT = 3 };
+    const uint32_t rows[ROW_COUNT] = {3u, 4u, (uint32_t)UOCR_TOKEN_EOS};
+    uint16_t final_norm[HIDDEN];
+    uint16_t hidden[ROWS * HIDDEN];
+    uint16_t row_weights[ROW_COUNT * HIDDEN];
+    for (uint32_t i = 0u; i < (uint32_t)HIDDEN; ++i) {
+        final_norm[i] = 0x3c00u; /* 1.0 */
+    }
+    memset(hidden, 0, sizeof(hidden));
+    memset(row_weights, 0, sizeof(row_weights));
+    hidden[0u] = 0x3c00u;                    /* row 0 selects between token 3 and 4. */
+    hidden[(uint32_t)HIDDEN + 1u] = 0x3c00u; /* row 1 selects EOS. */
+    row_weights[0u * (uint32_t)HIDDEN + 0u] = 0x3800u; /* token 3: 0.5 * normed[0] */
+    row_weights[1u * (uint32_t)HIDDEN + 0u] = 0x3c00u; /* token 4: 1.0 * normed[0], then banned */
+    row_weights[2u * (uint32_t)HIDDEN + 1u] = 0x3c00u; /* EOS: 1.0 * normed[1] */
+
+    char path[128];
+    CHECK(uocr_test_make_temp_path(path, sizeof(path)) == 0);
+    CHECK(uocr_test_write_final_norm_and_sparse_lm_head_uocr_model(path,
+                                                                   final_norm,
+                                                                   rows,
+                                                                   row_weights,
+                                                                   ROW_COUNT) == 0);
+
+    char error[1024];
+    memset(error, 0, sizeof(error));
+    uocr_model_file model;
+    CHECK(uocr_model_file_open(path, &model, error, sizeof(error)) == 0);
+
+    uocr_metal_context *ctx = uocr_metal_context_create(UOCR_TEST_METAL_RESOURCE_PATH, error, sizeof(error));
+    CHECK(ctx != NULL);
+    CHECK(uocr_metal_context_map_model(ctx, &model, error, sizeof(error)) == 1);
+
+    uint16_t *normed = (uint16_t *)malloc((size_t)ROWS * HIDDEN * sizeof(uint16_t));
+    float *logits = (float *)malloc((size_t)ROWS * UOCR_VOCAB_SIZE * sizeof(float));
+    CHECK(normed != NULL && logits != NULL);
+    for (uint32_t i = 0u; i < (uint32_t)(ROWS * UOCR_VOCAB_SIZE); ++i) {
+        logits[i] = -12345.0f;
+    }
+
+    const int32_t sequence0[] = {1, 2, 4, 1, 2}; /* current prefix [1,2] bans token 4 */
+    const uocr_no_repeat_ngram_config no_repeat[ROWS] = {
+        {sequence0, 5u, 3u, 0u},
+        {NULL, 0u, 0u, 0u},
+    };
+    uint32_t token_ids[ROWS] = {UINT32_MAX, UINT32_MAX};
+    float scores[ROWS] = {0.0f, 0.0f};
+    CHECK(uocr_metal_context_select_next_token_f16(ctx,
+                                                   hidden,
+                                                   ROWS,
+                                                   no_repeat,
+                                                   normed,
+                                                   logits,
+                                                   token_ids,
+                                                   scores,
+                                                   error,
+                                                   sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    CHECK(token_ids[0] == 3u);
+    CHECK(token_ids[1] == (uint32_t)UOCR_TOKEN_EOS);
+    CHECK(isinf(logits[4u]) && logits[4u] < 0.0f);
+    CHECK(scores[0] == logits[3u]);
+    CHECK(scores[1] == logits[1u * (uint32_t)UOCR_VOCAB_SIZE + (uint32_t)UOCR_TOKEN_EOS]);
+    CHECK(scores[0] > 0.0f && scores[1] > 0.0f);
+
+    const int32_t input_ids[] = {UOCR_TOKEN_BOS, 42};
+    const uint8_t image_mask[] = {0u, 0u};
+    uocr_prepared_request request;
+    memset(&request, 0, sizeof(request));
+    request.input_ids = input_ids;
+    request.image_mask = image_mask;
+    request.n_tokens = 2u;
+    request.max_new_tokens = 4u;
+
+    uocr_sequence_state state;
+    char sequence_error[128];
+    CHECK(uocr_build_sequence_state(&request, &state, sequence_error, sizeof(sequence_error)) == UOCR_OK);
+    int32_t generated[4] = {0};
+    CHECK(uocr_sequence_accept_generated_token(&state, (int32_t)token_ids[1], generated, 4u) == UOCR_OK);
+    CHECK(generated[0] == UOCR_TOKEN_EOS);
+    CHECK(uocr_sequence_generation_done(&state) == 1);
+
+    CHECK(uocr_metal_context_select_next_token_f16(ctx,
+                                                   hidden,
+                                                   ROWS,
+                                                   no_repeat,
+                                                   NULL,
+                                                   logits,
+                                                   token_ids,
+                                                   scores,
+                                                   error,
+                                                   sizeof(error)) == 0);
+    CHECK(strstr(error, "invalid Metal next-token selection request") != NULL);
+
+    free(logits);
+    free(normed);
+    uocr_metal_context_destroy(ctx);
+    uocr_model_file_close(&model);
+    unlink(path);
+    return 0;
+}
+
 static int test_metal_dense_f16(void) {
     if (!uocr_metal_is_available()) {
         return 0;
@@ -4207,6 +4314,7 @@ int main(void) {
     if (test_metal_no_repeat_ngram_gpu_f32() != 0) return 1;
     if (test_metal_select_greedy_with_no_repeat_f32() != 0) return 1;
     if (test_metal_eos_stop_after_greedy_selection() != 0) return 1;
+    if (test_metal_select_next_token_f16() != 0) return 1;
     if (test_metal_dense_f16() != 0) return 1;
     if (test_metal_attention_qkvo_f16() != 0) return 1;
     if (test_metal_attention_output_residual_f16() != 0) return 1;

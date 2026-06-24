@@ -659,6 +659,7 @@ First implementation slice, in order:
   - [x] later GPU version for speed
 - [x] Stop on EOS id `1` or max new tokens.
 - [x] Return generated token ids to C result and Python wrapper.
+- [x] Wire final RMSNorm, LM head, no-repeat bans, greedy argmax, and EOS handoff in a Metal next-token selection helper.
 - [ ] Add text-only fp16 parity test:
   - [x] prompt embeddings
   - [ ] layer outputs

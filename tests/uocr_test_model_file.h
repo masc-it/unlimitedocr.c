@@ -304,6 +304,108 @@ static inline int uocr_test_write_sparse_lm_head_uocr_model(const char *path,
     return failed ? 1 : 0;
 }
 
+static inline int uocr_test_write_final_norm_and_sparse_lm_head_uocr_model(const char *path,
+                                                                            const uint16_t *final_norm_weight_f16,
+                                                                            const uint32_t *rows,
+                                                                            const uint16_t *row_weights_f16,
+                                                                            uint32_t row_count) {
+    if (uocr_test_write_sparse_lm_head_uocr_model(path, rows, row_weights_f16, row_count) != 0) {
+        return 1;
+    }
+    if (path == NULL || final_norm_weight_f16 == NULL) {
+        return 1;
+    }
+
+    const uint64_t section_dir_offset = sizeof(uocr_file_header);
+    const uint32_t section_count = 5u;
+    const uint64_t config_offset = section_dir_offset + section_count * sizeof(uocr_section_entry);
+    const uint64_t tokenizer_offset = uocr_test_align_up_u64(config_offset + sizeof(uocr_config_record), 8u);
+    const uint64_t provenance_offset = uocr_test_align_up_u64(tokenizer_offset + sizeof(uocr_tokenizer_metadata_record), 8u);
+    const uint64_t tensor_dir_offset = uocr_test_align_up_u64(provenance_offset + sizeof(uocr_provenance_record), 8u);
+    const uint64_t one_tensor_dir_size = sizeof(uocr_tensor_directory_header) + sizeof(uocr_tensor_entry);
+    const uint64_t two_tensor_dir_size = sizeof(uocr_tensor_directory_header) + 2u * sizeof(uocr_tensor_entry);
+    const uint64_t tensor_data_offset = uocr_test_align_up_u64(tensor_dir_offset + one_tensor_dir_size, UOCR_TENSOR_DATA_ALIGNMENT);
+    const uint64_t lm_head_size = (uint64_t)UOCR_VOCAB_SIZE * (uint64_t)UOCR_HIDDEN_SIZE * 2u;
+    const uint64_t final_norm_size = (uint64_t)UOCR_HIDDEN_SIZE * 2u;
+    const uint64_t final_norm_offset = uocr_test_align_up_u64(tensor_data_offset + lm_head_size, UOCR_TENSOR_PAYLOAD_ALIGNMENT);
+    const uint64_t tensor_data_size = uocr_test_align_up_u64(final_norm_offset + final_norm_size - tensor_data_offset,
+                                                            UOCR_TENSOR_DATA_ALIGNMENT);
+    const uint64_t file_size = tensor_data_offset + tensor_data_size;
+    const uint64_t second_entry_offset = tensor_dir_offset + sizeof(uocr_tensor_directory_header) + sizeof(uocr_tensor_entry);
+    if (tensor_dir_offset + two_tensor_dir_size > tensor_data_offset || file_size > (uint64_t)LONG_MAX ||
+        final_norm_offset > (uint64_t)LONG_MAX) {
+        return 1;
+    }
+
+    FILE *f = fopen(path, "r+b");
+    if (f == NULL) {
+        perror("fopen");
+        return 1;
+    }
+
+    int failed = 0;
+    uocr_file_header header;
+    uocr_section_entry sections[5];
+    uocr_provenance_record provenance;
+    uocr_tensor_directory_header dir;
+    if (fseek(f, 0L, SEEK_SET) != 0 || fread(&header, 1u, sizeof(header), f) != sizeof(header) ||
+        fseek(f, (long)section_dir_offset, SEEK_SET) != 0 || fread(sections, sizeof(sections[0]), 5u, f) != 5u ||
+        fseek(f, (long)provenance_offset, SEEK_SET) != 0 || fread(&provenance, 1u, sizeof(provenance), f) != sizeof(provenance) ||
+        fseek(f, (long)tensor_dir_offset, SEEK_SET) != 0 || fread(&dir, 1u, sizeof(dir), f) != sizeof(dir)) {
+        failed = 1;
+    }
+
+    header.file_size = file_size;
+    sections[3].size = two_tensor_dir_size;
+    sections[4].size = tensor_data_size;
+    provenance.source_tensor_count = 2u;
+    provenance.runtime_tensor_count = 2u;
+    dir.tensor_count = 2u;
+
+    uocr_tensor_entry final_norm;
+    memset(&final_norm, 0, sizeof(final_norm));
+    final_norm.id = UOCR_TENSOR_ID_FINAL_NORM;
+    final_norm.family = UOCR_TENSOR_FAMILY_FINAL_NORM;
+    final_norm.layer = -1;
+    final_norm.expert = -1;
+    final_norm.projection = UOCR_TENSOR_PROJ_WEIGHT;
+    final_norm.usage = UOCR_TENSOR_USAGE_RUNTIME;
+    final_norm.qtype = UOCR_TENSOR_F16;
+    final_norm.rank = 1u;
+    final_norm.logical_shape[0] = UOCR_HIDDEN_SIZE;
+    final_norm.physical_shape[0] = UOCR_HIDDEN_SIZE;
+    final_norm.payload_offset = final_norm_offset;
+    final_norm.payload_size = final_norm_size;
+
+    if (!failed && (fseek(f, (long)(file_size - 1u), SEEK_SET) != 0 || fputc(0, f) == EOF)) {
+        failed = 1;
+    }
+    if (!failed && (fseek(f, 0L, SEEK_SET) != 0 || fwrite(&header, 1u, sizeof(header), f) != sizeof(header))) {
+        failed = 1;
+    }
+    if (!failed && (fseek(f, (long)section_dir_offset, SEEK_SET) != 0 ||
+                    fwrite(sections, sizeof(sections[0]), 5u, f) != 5u)) {
+        failed = 1;
+    }
+    if (!failed && (fseek(f, (long)provenance_offset, SEEK_SET) != 0 ||
+                    fwrite(&provenance, 1u, sizeof(provenance), f) != sizeof(provenance))) {
+        failed = 1;
+    }
+    if (!failed && (fseek(f, (long)tensor_dir_offset, SEEK_SET) != 0 || fwrite(&dir, 1u, sizeof(dir), f) != sizeof(dir))) {
+        failed = 1;
+    }
+    if (!failed && (fseek(f, (long)second_entry_offset, SEEK_SET) != 0 ||
+                    fwrite(&final_norm, 1u, sizeof(final_norm), f) != sizeof(final_norm))) {
+        failed = 1;
+    }
+    if (!failed && (fseek(f, (long)final_norm_offset, SEEK_SET) != 0 ||
+                    fwrite(final_norm_weight_f16, 1u, (size_t)final_norm_size, f) != (size_t)final_norm_size)) {
+        failed = 1;
+    }
+    failed |= fclose(f) != 0;
+    return failed ? 1 : 0;
+}
+
 static inline int uocr_test_write_sparse_tok_embed_uocr_model(const char *path,
                                                               const uint32_t *rows,
                                                               const uint16_t *row_weights_f16,

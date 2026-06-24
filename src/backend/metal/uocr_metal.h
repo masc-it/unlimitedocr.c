@@ -317,6 +317,24 @@ int uocr_metal_context_select_greedy_f32(uocr_metal_context *ctx,
                                          char *error,
                                          size_t error_size);
 
+/* Decode-time final-token selection helper. This wires the mapped final
+ * RMSNorm, mapped LM head, optional no-repeat-ngram bans, and Metal greedy
+ * argmax into one synchronous stage for bring-up/parity tests. The caller
+ * provides fp16 normalized-hidden scratch sized [n_rows,1280] and fp32 logits
+ * scratch sized [n_rows,129280]; a later production decode loop should bind
+ * persistent Metal arenas directly for every intermediate.
+ */
+int uocr_metal_context_select_next_token_f16(uocr_metal_context *ctx,
+                                             const uint16_t *hidden_f16,
+                                             uint32_t n_rows,
+                                             const uocr_no_repeat_ngram_config *no_repeat_or_null,
+                                             uint16_t *normed_scratch_f16,
+                                             float *logits_scratch_f32,
+                                             uint32_t *token_ids_out,
+                                             float *scores_out_f32_or_null,
+                                             char *error,
+                                             size_t error_size);
+
 /* Diagnostic fp16 dense helper for synthetic tests. Computes
  * out[row, out_col] = dot(input[row, :], weight[out_col, :]) + optional bias,
  * where weights are row-major [out_features, in_features]. Dot products are
