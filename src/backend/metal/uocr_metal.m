@@ -3790,9 +3790,14 @@ int uocr_metal_context_prefill_attention_f16(uocr_metal_context *ctx,
             threads_per_group = 1u;
         }
         uint64_t threadgroup_float_count = 0u;
+        uint64_t requested_threadgroup_bytes = 0u;
         uint64_t threadgroup_bytes = 0u;
+        /* Metal API validation requires threadgroup memory lengths to be
+         * 16-byte aligned; the kernel only touches the requested float range.
+         */
         if (!checked_add_u64((uint64_t)n_tokens, (uint64_t)threads_per_group, &threadgroup_float_count) ||
-            !checked_mul_u64(threadgroup_float_count, (uint64_t)sizeof(float), &threadgroup_bytes) ||
+            !checked_mul_u64(threadgroup_float_count, (uint64_t)sizeof(float), &requested_threadgroup_bytes) ||
+            !align_up_u64_checked(requested_threadgroup_bytes, 16u, &threadgroup_bytes) ||
             threadgroup_bytes > (uint64_t)NSUIntegerMax) {
             return metal_fail(error, error_size, "Metal prefill attention threadgroup memory overflow");
         }
