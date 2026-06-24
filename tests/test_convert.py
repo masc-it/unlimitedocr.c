@@ -13,6 +13,7 @@ from unlimitedocr_c.convert import (
     UOCR_FILE_HEADER_SIZE,
     UOCR_Q8_0_BLOCK_SIZE,
     UOCR_Q8_0_TYPE_SIZE,
+    UOCR_QPROFILE_DYN_Q8,
     UOCR_SECTION_TENSOR_DATA,
     UOCR_TENSOR_DATA_ALIGNMENT,
     UOCR_TENSOR_PAYLOAD_ALIGNMENT,
@@ -41,10 +42,38 @@ def _bf16_payload(values: np.ndarray) -> bytes:
     return ((fp32.view(np.dtype("<u4")) >> np.uint32(16)).astype(np.dtype("<u2"))).tobytes()
 
 
-def _f16_from_bf16_payload(payload: bytes) -> bytes:
+def _f32_from_bf16_payload(payload: bytes) -> np.ndarray:
     words = np.frombuffer(payload, dtype=np.dtype("<u2"))
-    fp32 = (words.astype(np.uint32) << np.uint32(16)).view(np.dtype("<f4"))
-    return fp32.astype(np.dtype("<f2")).tobytes()
+    return (words.astype(np.uint32) << np.uint32(16)).view(np.dtype("<f4"))
+
+
+def _f16_from_bf16_payload(payload: bytes) -> bytes:
+    return _f32_from_bf16_payload(payload).astype(np.dtype("<f2")).tobytes()
+
+
+def _round_away_from_zero(values: np.ndarray) -> np.ndarray:
+    return np.where(values >= 0.0, np.floor(values + 0.5), np.ceil(values - 0.5))
+
+
+def _q8_0_from_bf16_payload(payload: bytes, shape: tuple[int, ...], physical_shape: tuple[int, int]) -> bytes:
+    rows, physical_inner = physical_shape
+    logical_inner = int(np.prod(shape[1:]))
+    values = _f32_from_bf16_payload(payload).reshape(rows, logical_inner)
+    if physical_inner != logical_inner:
+        padded = np.zeros((rows, physical_inner), dtype=np.float32)
+        padded[:, :logical_inner] = values
+        values = padded
+    blocks = values.reshape(-1, UOCR_Q8_0_BLOCK_SIZE)
+    amax = np.max(np.abs(blocks), axis=1)
+    scales = amax / np.float32(127.0)
+    inv_scales = np.divide(
+        np.float32(1.0), scales, out=np.zeros_like(scales, dtype=np.float32), where=scales != 0.0
+    )
+    quantized = np.clip(_round_away_from_zero(blocks * inv_scales[:, None]), -128, 127).astype(np.int8)
+    packed = np.empty((blocks.shape[0], UOCR_Q8_0_TYPE_SIZE), dtype=np.uint8)
+    packed[:, :2] = scales.astype(np.dtype("<f2")).view(np.uint8).reshape(-1, 2)
+    packed[:, 2:] = quantized.view(np.uint8)
+    return packed.tobytes()
 
 
 def _write_tiny_safetensors(hf_dir) -> tuple[dict[str, bytes], dict[str, tuple[int, ...]]]:
@@ -231,6 +260,37 @@ def test_write_uocr_model_streams_bf16_to_fp16_payload(tmp_path) -> None:
     for tensor in plan.tensors:
         actual = raw[tensor.payload_offset : tensor.payload_offset + tensor.output_bytes]
         assert actual == _f16_from_bf16_payload(payloads[tensor.name])
+
+
+def test_write_uocr_model_streams_dyn_q8_payload(tmp_path) -> None:
+    payloads, _shapes = _write_tiny_safetensors(tmp_path)
+    plan = build_dry_run_plan(tmp_path, qprofile="dyn-q8", strict=False)
+    out = tmp_path / "tiny-q8.uocr"
+
+    written = write_uocr_model(plan, out)
+
+    assert written == out
+    raw = out.read_bytes()
+    assert raw[:4] == b"UOCR"
+    assert len(raw) == plan.planned_file_size
+    assert struct.unpack_from("<I", raw, 20)[0] == UOCR_QPROFILE_DYN_Q8
+
+    q8_tensor = plan.tensor_by_name("model.sam_model.tiny_a.weight")
+    assert q8_tensor.qtype == "UOCR_TENSOR_Q8_0"
+    assert q8_tensor.logical_shape == (2, 2)
+    assert q8_tensor.physical_shape == (2, 32)
+    assert q8_tensor.output_bytes == 2 * UOCR_Q8_0_TYPE_SIZE
+    actual_q8 = raw[q8_tensor.payload_offset : q8_tensor.payload_offset + q8_tensor.output_bytes]
+    expected_q8 = _q8_0_from_bf16_payload(payloads[q8_tensor.name], q8_tensor.shape, q8_tensor.physical_shape)
+    assert actual_q8 == expected_q8
+
+    f16_tensor = plan.tensor_by_name("model.vision_model.embeddings.patch_embedding.weight")
+    assert f16_tensor.qtype == "UOCR_TENSOR_F16"
+    actual_f16 = raw[f16_tensor.payload_offset : f16_tensor.payload_offset + f16_tensor.output_bytes]
+    assert actual_f16 == _f16_from_bf16_payload(payloads[f16_tensor.name])
+
+    directory = _tensor_directory_bytes(plan)
+    assert directory in raw
 
 
 def test_write_uocr_model_requires_overwrite_for_existing_output(tmp_path) -> None:

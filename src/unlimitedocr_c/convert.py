@@ -1,10 +1,10 @@
-"""Conversion planning and fp16 `.uocr` writing for Unlimited-OCR.
+"""Conversion planning and `.uocr` writing for Unlimited-OCR.
 
 The planner can run from the cached safetensors header/index only, which keeps
 fast tests independent from the 6.67 GB checkpoint payload.  When the real
 safetensors file is present, the writer streams tensor ranges into the planned
-`.uocr` layout and converts BF16 payload bytes to fp16 without allocating a
-full-model temporary buffer.
+`.uocr` layout and converts BF16 payload bytes to fp16 or Q8_0 without allocating
+a full-model temporary buffer.
 """
 
 from __future__ import annotations
@@ -991,6 +991,14 @@ def _resolve_safetensors_payload_path(plan: DryRunPlan, safetensors_path: str | 
     return source, data_start
 
 
+def _bf16_bytes_to_f32(raw: bytes) -> np.ndarray:
+    if len(raw) % 2 != 0:
+        raise ValueError("BF16 byte buffer length must be even")
+    bf16 = np.frombuffer(raw, dtype=np.dtype("<u2"))
+    fp32_bits = bf16.astype(np.uint32) << np.uint32(16)
+    return fp32_bits.view(np.dtype("<f4"))
+
+
 def _stream_bf16_to_f16(src: BinaryIO, dst: BinaryIO, *, source_bytes: int, chunk_bytes: int = 32 * 1024 * 1024) -> None:
     if source_bytes % 2 != 0:
         raise ValueError(f"BF16 tensor byte count must be even, got {source_bytes}")
@@ -1000,14 +1008,77 @@ def _stream_bf16_to_f16(src: BinaryIO, dst: BinaryIO, *, source_bytes: int, chun
         raw = src.read(min(remaining, chunk_bytes))
         if not raw:
             raise EOFError("unexpected end of safetensors payload while streaming tensor")
-        if len(raw) % 2 != 0:
-            raise ValueError("read an odd number of BF16 bytes")
-        bf16 = np.frombuffer(raw, dtype=np.dtype("<u2"))
-        fp32_bits = (bf16.astype(np.uint32) << np.uint32(16))
-        fp32 = fp32_bits.view(np.dtype("<f4"))
-        fp16 = fp32.astype(np.dtype("<f2"), copy=False)
+        fp16 = _bf16_bytes_to_f32(raw).astype(np.dtype("<f2"), copy=False)
         dst.write(fp16.tobytes())
         remaining -= len(raw)
+
+
+def _round_away_from_zero(values: np.ndarray) -> np.ndarray:
+    return np.where(values >= 0.0, np.floor(values + 0.5), np.ceil(values - 0.5))
+
+
+def _pack_q8_0_rows(rows: np.ndarray) -> bytes:
+    if rows.ndim != 2 or rows.shape[1] % UOCR_Q8_0_BLOCK_SIZE != 0:
+        raise ValueError(f"Q8_0 rows must be [n, multiple_of_{UOCR_Q8_0_BLOCK_SIZE}], got {rows.shape}")
+    blocks = rows.reshape(-1, UOCR_Q8_0_BLOCK_SIZE).astype(np.float32, copy=False)
+    amax = np.max(np.abs(blocks), axis=1)
+    scales = amax / np.float32(127.0)
+    inv_scales = np.divide(
+        np.float32(1.0),
+        scales,
+        out=np.zeros_like(scales, dtype=np.float32),
+        where=scales != 0.0,
+    )
+    quantized = _round_away_from_zero(blocks * inv_scales[:, None])
+    quantized = np.clip(quantized, -128, 127).astype(np.int8, copy=False)
+
+    packed = np.empty((blocks.shape[0], UOCR_Q8_0_TYPE_SIZE), dtype=np.uint8)
+    packed[:, :2] = scales.astype(np.dtype("<f2"), copy=False).view(np.uint8).reshape(-1, 2)
+    packed[:, 2:] = quantized.view(np.uint8)
+    return packed.tobytes()
+
+
+def _stream_bf16_to_q8_0(
+    src: BinaryIO,
+    dst: BinaryIO,
+    *,
+    tensor: TensorPlan,
+    chunk_source_bytes: int = 8 * 1024 * 1024,
+) -> None:
+    if tensor.qtype_id != UOCR_TENSOR_Q8_0:
+        raise ValueError(f"tensor {tensor.name} is not Q8_0")
+    if len(tensor.logical_shape) != 2 or len(tensor.physical_shape) != 2:
+        raise ValueError(f"Q8_0 tensor {tensor.name} must have 2D logical/physical shapes")
+    rows, logical_inner = tensor.logical_shape
+    physical_rows, physical_inner = tensor.physical_shape
+    if physical_rows != rows or physical_inner < logical_inner or physical_inner % UOCR_Q8_0_BLOCK_SIZE != 0:
+        raise ValueError(f"Q8_0 tensor {tensor.name} has invalid logical/physical shapes")
+    if tensor.source_bytes != rows * logical_inner * 2:
+        raise ValueError(f"Q8_0 tensor {tensor.name} source byte count does not match logical shape")
+    expected_row_size = (physical_inner // UOCR_Q8_0_BLOCK_SIZE) * UOCR_Q8_0_TYPE_SIZE
+    if tensor.row_size != expected_row_size or tensor.output_bytes != rows * expected_row_size:
+        raise ValueError(f"Q8_0 tensor {tensor.name} output byte count does not match physical shape")
+
+    source_row_bytes = logical_inner * 2
+    rows_per_chunk = max(1, chunk_source_bytes // max(1, source_row_bytes))
+    rows_done = 0
+    bytes_written = 0
+    while rows_done < rows:
+        batch_rows = min(rows_per_chunk, rows - rows_done)
+        raw = src.read(batch_rows * source_row_bytes)
+        if len(raw) != batch_rows * source_row_bytes:
+            raise EOFError(f"unexpected end of safetensors payload while streaming {tensor.name}")
+        values = _bf16_bytes_to_f32(raw).reshape(batch_rows, logical_inner)
+        if physical_inner != logical_inner:
+            padded = np.zeros((batch_rows, physical_inner), dtype=np.float32)
+            padded[:, :logical_inner] = values
+            values = padded
+        packed = _pack_q8_0_rows(values)
+        dst.write(packed)
+        bytes_written += len(packed)
+        rows_done += batch_rows
+    if bytes_written != tensor.output_bytes:
+        raise IOError(f"tensor {tensor.name} wrote {bytes_written} bytes, expected {tensor.output_bytes}")
 
 
 def write_uocr_model(
@@ -1017,15 +1088,16 @@ def write_uocr_model(
     safetensors_path: str | Path | None = None,
     overwrite: bool = False,
 ) -> Path:
-    """Stream a planned fp16 `.uocr` file to disk.
+    """Stream a planned `.uocr` file to disk.
 
-    The current writer supports the fp16 baseline only.  It converts each BF16
-    safetensors range to fp16 in bounded chunks and writes directly into the
-    mmap-friendly layout produced by :func:`build_dry_run_plan`.
+    The writer supports the fp16 baseline and the first dynamic q8 profile.  It
+    converts each BF16 safetensors range to its planned runtime qtype in bounded
+    chunks and writes directly into the mmap-friendly layout produced by
+    :func:`build_dry_run_plan`.
     """
 
-    if plan.qprofile != "fp16":
-        raise NotImplementedError("only fp16 .uocr writing is implemented")
+    if plan.qprofile not in {"fp16", "dyn-q8"}:
+        raise NotImplementedError("only fp16 and dyn-q8 .uocr writing are implemented")
     if plan.tensor_count == 0:
         raise ValueError("cannot write a .uocr with no tensors")
 
@@ -1090,7 +1162,12 @@ def write_uocr_model(
                 src.seek(data_start + tensor.source_offsets[0])
                 dst.seek(tensor.payload_offset)
                 before = dst.tell()
-                _stream_bf16_to_f16(src, dst, source_bytes=tensor.source_bytes)
+                if tensor.qtype_id == UOCR_TENSOR_F16:
+                    _stream_bf16_to_f16(src, dst, source_bytes=tensor.source_bytes)
+                elif tensor.qtype_id == UOCR_TENSOR_Q8_0:
+                    _stream_bf16_to_q8_0(src, dst, tensor=tensor)
+                else:
+                    raise NotImplementedError(f"writing qtype {tensor.qtype} is not implemented")
                 written = dst.tell() - before
                 if written != tensor.output_bytes:
                     raise IOError(f"tensor {tensor.name} wrote {written} bytes, expected {tensor.output_bytes}")
@@ -1145,7 +1222,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--safetensors", type=Path, default=None, help="explicit source .safetensors payload for --out")
     parser.add_argument("--qprofile", choices=["fp16", "dyn-q8", "dyn-q4"], default="fp16")
     parser.add_argument("--dry-run", action="store_true", help="plan only; does not require full weights")
-    parser.add_argument("--out", type=Path, default=None, help="write an fp16 .uocr file to this path")
+    parser.add_argument("--out", type=Path, default=None, help="write an fp16 or dyn-q8 .uocr file to this path")
     parser.add_argument("--tensor", default=None, help="optional single tensor source name or stable tensor id")
     parser.add_argument("--overwrite", action="store_true", help="replace an existing --out file")
     parser.add_argument("--dump-plan", nargs="?", const="-", default=None, help="write full JSON plan to path or stdout")
@@ -1158,8 +1235,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.out is None and not args.dry_run:
         parser.error("either --dry-run or --out is required")
-    if args.out is not None and args.qprofile != "fp16":
-        parser.error("quantized .uocr writing is not implemented yet; use --dry-run for quantized planning")
+    if args.out is not None and args.qprofile == "dyn-q4":
+        parser.error("dyn-q4 .uocr writing is not implemented yet; use --dry-run after q4 planning lands")
 
     plan = build_dry_run_plan(
         args.hf_dir,
