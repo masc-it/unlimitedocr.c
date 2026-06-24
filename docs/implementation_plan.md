@@ -985,7 +985,7 @@ Do not start the stable high-level OCR/PDF API until Gate E2E-0 passes: public f
   - [x] runtime memory accounting and KV formula tests
   - [ ] CPU reference tiny ops
 - [ ] Add Metal tests that do not need full model weights:
-  - [ ] compile all kernels
+  - [x] compile all kernels
   - [x] run RMSNorm on synthetic tensor
   - [x] run get_rows on synthetic embedding table
   - [ ] run small RoPE kernel

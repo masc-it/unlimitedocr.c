@@ -59,6 +59,37 @@ static int test_metal_smoke(void) {
     return 0;
 }
 
+static int test_metal_compile_all_kernels(void) {
+    if (!uocr_metal_is_available()) {
+        return 0;
+    }
+
+    char error[1024];
+    memset(error, 0, sizeof(error));
+    uocr_metal_context *ctx = uocr_metal_context_create(UOCR_TEST_METAL_RESOURCE_PATH, error, sizeof(error));
+    CHECK(ctx != NULL);
+    CHECK(error[0] == '\0');
+
+    const uint32_t function_count = uocr_metal_context_library_function_count(ctx);
+    CHECK(function_count > 0u);
+    CHECK(uocr_metal_context_pipeline_cache_count(ctx) == 0u);
+
+    uint32_t pipeline_count = 0u;
+    CHECK(uocr_metal_context_compile_all_pipelines(ctx, &pipeline_count, error, sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    CHECK(pipeline_count == function_count);
+    CHECK(uocr_metal_context_pipeline_cache_count(ctx) == function_count);
+
+    uint32_t second_count = 0u;
+    CHECK(uocr_metal_context_compile_all_pipelines(ctx, &second_count, error, sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    CHECK(second_count == function_count);
+    CHECK(uocr_metal_context_pipeline_cache_count(ctx) == function_count);
+
+    uocr_metal_context_destroy(ctx);
+    return 0;
+}
+
 static size_t sam_patch_weight_index(uint32_t out_channel, uint32_t in_channel, uint32_t ky, uint32_t kx) {
     return (size_t)((((out_channel * 3u + in_channel) * UOCR_VISION_PATCH_SIZE + ky) * UOCR_VISION_PATCH_SIZE + kx));
 }
@@ -15339,6 +15370,7 @@ static int test_public_metal_text_generated_ids_python_dump_parity(void) {
 int main(void) {
     CHECK(strcmp(uocr_metal_backend_name(), "metal") == 0);
     if (test_metal_smoke() != 0) return 1;
+    if (test_metal_compile_all_kernels() != 0) return 1;
     if (test_metal_named_scratch_buffers() != 0) return 1;
     if (test_metal_sam_patch_embed_f16() != 0) return 1;
     if (test_metal_sam_abs_pos_f16() != 0) return 1;

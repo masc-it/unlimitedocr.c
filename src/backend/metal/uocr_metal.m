@@ -1307,6 +1307,58 @@ uint32_t uocr_metal_context_tensor_binding_count(const uocr_metal_context *ctx) 
     return ctx != NULL ? ctx->tensor_binding_count : 0u;
 }
 
+uint32_t uocr_metal_context_library_function_count(const uocr_metal_context *ctx) {
+    @autoreleasepool {
+        if (ctx == NULL || ctx->library == nil) {
+            return 0u;
+        }
+        return (uint32_t)[[ctx->library functionNames] count];
+    }
+}
+
+uint32_t uocr_metal_context_pipeline_cache_count(const uocr_metal_context *ctx) {
+    @autoreleasepool {
+        if (ctx == NULL || ctx->pipeline_cache == nil) {
+            return 0u;
+        }
+        return (uint32_t)[ctx->pipeline_cache count];
+    }
+}
+
+int uocr_metal_context_compile_all_pipelines(uocr_metal_context *ctx,
+                                             uint32_t *out_pipeline_count,
+                                             char *error,
+                                             size_t error_size) {
+    metal_clear_error(error, error_size);
+    if (out_pipeline_count != NULL) {
+        *out_pipeline_count = 0u;
+    }
+    if (ctx == NULL || ctx->library == nil) {
+        return metal_fail(error, error_size, "invalid Metal context for pipeline compilation");
+    }
+
+    @autoreleasepool {
+        NSArray<NSString *> *names = [[ctx->library functionNames] sortedArrayUsingSelector:@selector(compare:)];
+        if ([names count] == 0u) {
+            return metal_fail(error, error_size, "Metal library contains no compute functions");
+        }
+        for (NSString *name in names) {
+            const char *function_name = [name UTF8String];
+            if (function_name == NULL || function_name[0] == '\0') {
+                return metal_fail(error, error_size, "Metal library contains an invalid function name");
+            }
+            if (metal_get_pipeline(ctx, function_name, error, error_size) == nil) {
+                return 0;
+            }
+        }
+        if (out_pipeline_count != NULL) {
+            *out_pipeline_count = (uint32_t)[ctx->pipeline_cache count];
+        }
+    }
+    metal_clear_error(error, error_size);
+    return 1;
+}
+
 uint64_t uocr_metal_context_model_view_bytes(const uocr_metal_context *ctx) {
     return ctx != NULL ? ctx->model_view_bytes : 0u;
 }

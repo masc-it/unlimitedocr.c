@@ -136,6 +136,12 @@ int uocr_metal_context_map_model(uocr_metal_context *ctx, const uocr_model_file 
 void uocr_metal_context_unmap_model(uocr_metal_context *ctx);
 uint32_t uocr_metal_context_model_view_count(const uocr_metal_context *ctx);
 uint32_t uocr_metal_context_tensor_binding_count(const uocr_metal_context *ctx);
+uint32_t uocr_metal_context_library_function_count(const uocr_metal_context *ctx);
+uint32_t uocr_metal_context_pipeline_cache_count(const uocr_metal_context *ctx);
+int uocr_metal_context_compile_all_pipelines(uocr_metal_context *ctx,
+                                             uint32_t *out_pipeline_count,
+                                             char *error,
+                                             size_t error_size);
 uint32_t uocr_metal_context_decoder_binding_count(const uocr_metal_context *ctx);
 int uocr_metal_context_decoder_bindings_ready(const uocr_metal_context *ctx);
 uint32_t uocr_metal_context_vision_binding_count(const uocr_metal_context *ctx);
