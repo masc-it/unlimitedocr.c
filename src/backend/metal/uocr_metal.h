@@ -385,9 +385,10 @@ int uocr_metal_context_sam_neck_conv3x3_f16(uocr_metal_context *ctx,
                                             char *error,
                                             size_t error_size);
 
-/* Diagnostic SAM neck LayerNorm2d helper. Normalizes NCHW fp16 tensors
- * [256,grid_h,grid_w] across the channel dimension for each spatial location,
- * applies fp16 weight+bias [256], uses eps=1e-6, and emits NCHW output.
+/* Diagnostic SAM neck LayerNorm2d helper for both neck normalization stages.
+ * Normalizes NCHW fp16 tensors [256,grid_h,grid_w] across the channel dimension
+ * for each spatial location, applies fp16 weight+bias [256], uses eps=1e-6,
+ * and emits NCHW output.
  */
 int uocr_metal_context_sam_layernorm2d_f16(uocr_metal_context *ctx,
                                            const uint16_t *input_nchw_f16,

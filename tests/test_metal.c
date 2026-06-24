@@ -112,6 +112,14 @@ static float sam_neck_conv3x3_expected(const uint16_t *input,
                                        uint32_t y,
                                        uint32_t x,
                                        uint32_t out_channel);
+static float sam_layernorm2d_expected(const uint16_t *input,
+                                       const uint16_t *weight,
+                                       const uint16_t *bias,
+                                       uint32_t grid_w,
+                                       uint32_t grid_h,
+                                       uint32_t y,
+                                       uint32_t x,
+                                       uint32_t channel);
 
 static size_t sam_global_attention_index(uint32_t token, uint32_t head, uint32_t dim) {
     return ((size_t)token * UOCR_SAM_ATTENTION_HEADS + head) * UOCR_SAM_HEAD_DIM + dim;
@@ -791,12 +799,20 @@ static int test_metal_sam_neck_conv3x3_f16(void) {
     const size_t output_values = input_values;
     uint16_t *input = (uint16_t *)calloc(input_values, sizeof(uint16_t));
     uint16_t *weight = (uint16_t *)calloc(weight_values, sizeof(uint16_t));
+    uint16_t *ln_weight = (uint16_t *)calloc(CHANNELS, sizeof(uint16_t));
+    uint16_t *ln_bias = (uint16_t *)calloc(CHANNELS, sizeof(uint16_t));
     float *out_f32 = (float *)calloc(output_values, sizeof(float));
     uint16_t *out_f16 = (uint16_t *)calloc(output_values, sizeof(uint16_t));
+    float *ln_out_f32 = (float *)calloc(output_values, sizeof(float));
+    uint16_t *ln_out_f16 = (uint16_t *)calloc(output_values, sizeof(uint16_t));
     CHECK(input != NULL);
     CHECK(weight != NULL);
+    CHECK(ln_weight != NULL);
+    CHECK(ln_bias != NULL);
     CHECK(out_f32 != NULL);
     CHECK(out_f16 != NULL);
+    CHECK(ln_out_f32 != NULL);
+    CHECK(ln_out_f16 != NULL);
     CHECK(UOCR_SAM_NECK_CHANNELS == 256u);
     CHECK(UOCR_SAM_NECK_KERNEL_SIZE == 3u);
 
@@ -809,6 +825,8 @@ static int test_metal_sam_neck_conv3x3_f16(void) {
         }
     }
     for (uint32_t out_channel = 0u; out_channel < CHANNELS; ++out_channel) {
+        ln_weight[out_channel] = f32_to_f16_bits(0.85f + (float)(out_channel % 13u) * 0.015625f);
+        ln_bias[out_channel] = f32_to_f16_bits(((int)(out_channel % 17u) - 8) * 0.0075f);
         for (uint32_t in_channel = 0u; in_channel < CHANNELS; ++in_channel) {
             for (uint32_t ky = 0u; ky < UOCR_SAM_NECK_KERNEL_SIZE; ++ky) {
                 for (uint32_t kx = 0u; kx < UOCR_SAM_NECK_KERNEL_SIZE; ++kx) {
@@ -882,6 +900,56 @@ static int test_metal_sam_neck_conv3x3_f16(void) {
         CHECK(fabsf(f16_bits_to_f32(out_f16[idx]) - expected) <= 2.0e-3f);
     }
 
+    CHECK(uocr_metal_context_sam_layernorm2d_f16(ctx,
+                                                  out_f16,
+                                                  ln_weight,
+                                                  ln_bias,
+                                                  GRID_W,
+                                                  GRID_H,
+                                                  UOCR_METAL_DENSE_OUTPUT_F32,
+                                                  ln_out_f32,
+                                                  error,
+                                                  sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    for (size_t i = 0u; i < sizeof(samples) / sizeof(samples[0]); ++i) {
+        const size_t idx = sam_neck_nchw_index(GRID_W, GRID_H, samples[i].out_channel, samples[i].y, samples[i].x);
+        const float expected = sam_layernorm2d_expected(out_f16,
+                                                        ln_weight,
+                                                        ln_bias,
+                                                        GRID_W,
+                                                        GRID_H,
+                                                        samples[i].y,
+                                                        samples[i].x,
+                                                        samples[i].out_channel);
+        CHECK(isfinite(expected));
+        CHECK(fabsf(ln_out_f32[idx] - expected) <= 1.2e-4f);
+    }
+
+    CHECK(uocr_metal_context_sam_layernorm2d_f16(ctx,
+                                                  out_f16,
+                                                  ln_weight,
+                                                  ln_bias,
+                                                  GRID_W,
+                                                  GRID_H,
+                                                  UOCR_METAL_DENSE_OUTPUT_F16,
+                                                  ln_out_f16,
+                                                  error,
+                                                  sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    for (size_t i = 0u; i < sizeof(samples) / sizeof(samples[0]); ++i) {
+        const size_t idx = sam_neck_nchw_index(GRID_W, GRID_H, samples[i].out_channel, samples[i].y, samples[i].x);
+        const float expected = sam_layernorm2d_expected(out_f16,
+                                                        ln_weight,
+                                                        ln_bias,
+                                                        GRID_W,
+                                                        GRID_H,
+                                                        samples[i].y,
+                                                        samples[i].x,
+                                                        samples[i].out_channel);
+        CHECK(isfinite(expected));
+        CHECK(fabsf(f16_bits_to_f32(ln_out_f16[idx]) - expected) <= 2.0e-3f);
+    }
+
     CHECK(uocr_metal_context_sam_neck_conv3x3_f16(ctx,
                                                    input,
                                                    NULL,
@@ -905,8 +973,12 @@ static int test_metal_sam_neck_conv3x3_f16(void) {
     CHECK(strstr(error, "invalid Metal SAM neck 3x3 grid") != NULL);
 
     uocr_metal_context_destroy(ctx);
+    free(ln_out_f16);
+    free(ln_out_f32);
     free(out_f16);
     free(out_f32);
+    free(ln_bias);
+    free(ln_weight);
     free(weight);
     free(input);
     return 0;
