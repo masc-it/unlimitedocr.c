@@ -344,6 +344,17 @@ typedef struct uocr_metal_moe_selected_params {
     uint32_t reserved;
 } uocr_metal_moe_selected_params;
 
+typedef struct uocr_metal_moe_prefill_selected_params {
+    uint32_t n_tokens;
+    uint32_t hidden_size;
+    uint32_t intermediate_size;
+    uint32_t expert_count;
+    uint32_t top_k;
+    uint32_t reserved0;
+    uint32_t reserved1;
+    uint32_t reserved2;
+} uocr_metal_moe_prefill_selected_params;
+
 typedef struct uocr_metal_moe_combine_params {
     uint32_t n_tokens;
     uint32_t hidden_size;
@@ -4563,6 +4574,289 @@ int uocr_metal_context_moe_selected_experts_decode_f16(uocr_metal_context *ctx,
         [down_weight release];
         [up_weight release];
         [gate_weight release];
+        [input release];
+        if (!ok) {
+            return 0;
+        }
+    }
+
+    metal_clear_error(error, error_size);
+    return 1;
+}
+
+int uocr_metal_context_moe_selected_experts_prefill_f16(uocr_metal_context *ctx,
+                                                        const uint16_t *input_f16,
+                                                        const uint32_t *top_expert_ids,
+                                                        const float *top_weights_f32,
+                                                        const uint16_t *expert_gate_weight_f16,
+                                                        const uint16_t *expert_up_weight_f16,
+                                                        const uint16_t *expert_down_weight_f16,
+                                                        uint32_t n_tokens,
+                                                        uint32_t hidden_size,
+                                                        uint32_t intermediate_size,
+                                                        uint32_t expert_count,
+                                                        uint32_t top_k,
+                                                        uocr_metal_dense_output_type output_type,
+                                                        void *out,
+                                                        char *error,
+                                                        size_t error_size) {
+    metal_clear_error(error, error_size);
+    if (ctx == NULL || input_f16 == NULL || top_expert_ids == NULL || top_weights_f32 == NULL ||
+        expert_gate_weight_f16 == NULL || expert_up_weight_f16 == NULL || expert_down_weight_f16 == NULL ||
+        out == NULL || n_tokens == 0u || hidden_size == 0u || intermediate_size == 0u || expert_count == 0u ||
+        top_k == 0u) {
+        return metal_fail(error, error_size, "invalid Metal MoE selected-expert prefill request");
+    }
+    if (output_type != UOCR_METAL_DENSE_OUTPUT_F16 && output_type != UOCR_METAL_DENSE_OUTPUT_F32) {
+        return metal_fail(error,
+                          error_size,
+                          "unsupported Metal MoE selected-expert prefill output type %d",
+                          (int)output_type);
+    }
+    if (top_k > expert_count) {
+        return metal_fail(error, error_size, "Metal MoE selected-expert prefill top_k exceeds expert_count");
+    }
+
+    for (uint32_t token = 0u; token < n_tokens; ++token) {
+        for (uint32_t rank = 0u; rank < top_k; ++rank) {
+            const uint32_t expert = top_expert_ids[token * top_k + rank];
+            if (expert >= expert_count) {
+                return metal_fail(error,
+                                  error_size,
+                                  "invalid Metal MoE prefill expert id %u at token %u rank %u",
+                                  expert,
+                                  token,
+                                  rank);
+            }
+            for (uint32_t prev = 0u; prev < rank; ++prev) {
+                if (top_expert_ids[token * top_k + prev] == expert) {
+                    return metal_fail(error,
+                                      error_size,
+                                      "duplicate Metal MoE prefill expert id %u at token %u",
+                                      expert,
+                                      token);
+                }
+            }
+            if (!isfinite(top_weights_f32[token * top_k + rank])) {
+                return metal_fail(error,
+                                  error_size,
+                                  "invalid Metal MoE prefill expert weight at token %u rank %u",
+                                  token,
+                                  rank);
+            }
+        }
+    }
+
+    uint64_t input_values = 0u;
+    uint64_t input_bytes = 0u;
+    uint64_t top_values = 0u;
+    uint64_t top_ids_bytes = 0u;
+    uint64_t top_weights_bytes = 0u;
+    uint64_t weight_values = 0u;
+    uint64_t weight_bytes = 0u;
+    uint64_t mid_values = 0u;
+    uint64_t mid_bytes = 0u;
+    uint64_t output_values = 0u;
+    uint64_t output_bytes = 0u;
+    uint64_t gate_groups = 0u;
+    const uint64_t output_element_bytes = output_type == UOCR_METAL_DENSE_OUTPUT_F16 ? 2u : (uint64_t)sizeof(float);
+    if (!checked_mul_u64((uint64_t)n_tokens, (uint64_t)hidden_size, &input_values) ||
+        !checked_mul_u64(input_values, 2u, &input_bytes) ||
+        !checked_mul_u64((uint64_t)n_tokens, (uint64_t)top_k, &top_values) ||
+        !checked_mul_u64(top_values, (uint64_t)sizeof(uint32_t), &top_ids_bytes) ||
+        !checked_mul_u64(top_values, (uint64_t)sizeof(float), &top_weights_bytes) ||
+        !checked_mul_u64((uint64_t)expert_count, (uint64_t)intermediate_size, &weight_values) ||
+        !checked_mul_u64(weight_values, (uint64_t)hidden_size, &weight_values) ||
+        !checked_mul_u64(weight_values, 2u, &weight_bytes) ||
+        !checked_mul_u64(top_values, (uint64_t)intermediate_size, &mid_values) ||
+        !checked_mul_u64(mid_values, 2u, &mid_bytes) ||
+        !checked_mul_u64((uint64_t)n_tokens, (uint64_t)hidden_size, &output_values) ||
+        !checked_mul_u64(output_values, output_element_bytes, &output_bytes) ||
+        !checked_mul_u64(top_values, (uint64_t)intermediate_size, &gate_groups)) {
+        return metal_fail(error, error_size, "Metal MoE selected-expert prefill byte-size overflow");
+    }
+
+    const uint64_t max_buffer_length = metal_device_max_buffer_length(ctx->device);
+    if (input_bytes > max_buffer_length || top_ids_bytes > max_buffer_length || top_weights_bytes > max_buffer_length ||
+        weight_bytes > max_buffer_length || mid_bytes > max_buffer_length || output_bytes > max_buffer_length ||
+        input_bytes > (uint64_t)SIZE_MAX || top_ids_bytes > (uint64_t)SIZE_MAX ||
+        top_weights_bytes > (uint64_t)SIZE_MAX || weight_bytes > (uint64_t)SIZE_MAX ||
+        mid_bytes > (uint64_t)SIZE_MAX || output_bytes > (uint64_t)SIZE_MAX ||
+        gate_groups > (uint64_t)UINT32_MAX || output_values > (uint64_t)UINT32_MAX) {
+        return metal_fail(error,
+                          error_size,
+                          "Metal MoE selected-expert prefill buffers exceed maxBufferLength %llu",
+                          (unsigned long long)max_buffer_length);
+    }
+
+    @autoreleasepool {
+        id<MTLComputePipelineState> gate_up_pipeline = metal_get_pipeline(ctx,
+                                                                          "uocr_moe_prefill_selected_gate_up_f16",
+                                                                          error,
+                                                                          error_size);
+        if (gate_up_pipeline == nil) {
+            return 0;
+        }
+        const char *down_function_name = output_type == UOCR_METAL_DENSE_OUTPUT_F16 ?
+                                             "uocr_moe_prefill_selected_down_sum_f16_to_f16" :
+                                             "uocr_moe_prefill_selected_down_sum_f16_to_f32";
+        id<MTLComputePipelineState> down_pipeline = metal_get_pipeline(ctx, down_function_name, error, error_size);
+        if (down_pipeline == nil) {
+            return 0;
+        }
+
+        int ok = 0;
+        id<MTLBuffer> input = nil;
+        id<MTLBuffer> top_ids = nil;
+        id<MTLBuffer> top_weights = nil;
+        id<MTLBuffer> gate_weight = nil;
+        id<MTLBuffer> up_weight = nil;
+        id<MTLBuffer> down_weight = nil;
+        id<MTLBuffer> mid = nil;
+        id<MTLBuffer> dst = nil;
+
+        input = [ctx->device newBufferWithBytes:input_f16
+                                         length:(NSUInteger)input_bytes
+                                        options:MTLResourceStorageModeShared];
+        if (input == nil) {
+            (void)metal_fail(error, error_size, "failed to allocate Metal MoE prefill input buffer");
+            goto cleanup;
+        }
+        input.label = @"uocr_moe_prefill_input_f16";
+
+        top_ids = [ctx->device newBufferWithBytes:top_expert_ids
+                                           length:(NSUInteger)top_ids_bytes
+                                          options:MTLResourceStorageModeShared];
+        if (top_ids == nil) {
+            (void)metal_fail(error, error_size, "failed to allocate Metal MoE prefill top-id buffer");
+            goto cleanup;
+        }
+        top_ids.label = @"uocr_moe_prefill_top_ids_u32";
+
+        top_weights = [ctx->device newBufferWithBytes:top_weights_f32
+                                               length:(NSUInteger)top_weights_bytes
+                                              options:MTLResourceStorageModeShared];
+        if (top_weights == nil) {
+            (void)metal_fail(error, error_size, "failed to allocate Metal MoE prefill top-weight buffer");
+            goto cleanup;
+        }
+        top_weights.label = @"uocr_moe_prefill_top_weights_f32";
+
+        gate_weight = [ctx->device newBufferWithBytes:expert_gate_weight_f16
+                                               length:(NSUInteger)weight_bytes
+                                              options:MTLResourceStorageModeShared];
+        if (gate_weight == nil) {
+            (void)metal_fail(error, error_size, "failed to allocate Metal MoE prefill gate-weight buffer");
+            goto cleanup;
+        }
+        gate_weight.label = @"uocr_moe_prefill_gate_weight_f16";
+
+        up_weight = [ctx->device newBufferWithBytes:expert_up_weight_f16
+                                             length:(NSUInteger)weight_bytes
+                                            options:MTLResourceStorageModeShared];
+        if (up_weight == nil) {
+            (void)metal_fail(error, error_size, "failed to allocate Metal MoE prefill up-weight buffer");
+            goto cleanup;
+        }
+        up_weight.label = @"uocr_moe_prefill_up_weight_f16";
+
+        down_weight = [ctx->device newBufferWithBytes:expert_down_weight_f16
+                                               length:(NSUInteger)weight_bytes
+                                              options:MTLResourceStorageModeShared];
+        if (down_weight == nil) {
+            (void)metal_fail(error, error_size, "failed to allocate Metal MoE prefill down-weight buffer");
+            goto cleanup;
+        }
+        down_weight.label = @"uocr_moe_prefill_down_weight_f16";
+
+        mid = [ctx->device newBufferWithLength:(NSUInteger)mid_bytes options:MTLResourceStorageModeShared];
+        if (mid == nil) {
+            (void)metal_fail(error, error_size, "failed to allocate Metal MoE prefill intermediate buffer");
+            goto cleanup;
+        }
+        mid.label = @"uocr_moe_prefill_mid_f16";
+        memset([mid contents], 0, (size_t)mid_bytes);
+
+        dst = [ctx->device newBufferWithLength:(NSUInteger)output_bytes options:MTLResourceStorageModeShared];
+        if (dst == nil) {
+            (void)metal_fail(error, error_size, "failed to allocate Metal MoE prefill output buffer");
+            goto cleanup;
+        }
+        dst.label = @"uocr_moe_prefill_output";
+        memset([dst contents], 0, (size_t)output_bytes);
+
+        id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
+        if (cb == nil) {
+            (void)metal_fail(error, error_size, "failed to create Metal MoE prefill command buffer");
+            goto cleanup;
+        }
+        cb.label = @"uocr_moe_prefill_command_buffer";
+
+        uocr_metal_moe_prefill_selected_params params;
+        params.n_tokens = n_tokens;
+        params.hidden_size = hidden_size;
+        params.intermediate_size = intermediate_size;
+        params.expert_count = expert_count;
+        params.top_k = top_k;
+        params.reserved0 = 0u;
+        params.reserved1 = 0u;
+        params.reserved2 = 0u;
+
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        if (enc == nil) {
+            (void)metal_fail(error, error_size, "failed to create Metal MoE prefill gate/up command encoder");
+            goto cleanup;
+        }
+        const NSUInteger gate_threads = metal_power2_threadgroup_width(256u, gate_up_pipeline.maxTotalThreadsPerThreadgroup);
+        [enc setComputePipelineState:gate_up_pipeline];
+        [enc setBuffer:input offset:0u atIndex:0u];
+        [enc setBuffer:top_ids offset:0u atIndex:1u];
+        [enc setBuffer:gate_weight offset:0u atIndex:2u];
+        [enc setBuffer:up_weight offset:0u atIndex:3u];
+        [enc setBuffer:mid offset:0u atIndex:4u];
+        [enc setBytes:&params length:sizeof(params) atIndex:5u];
+        [enc setThreadgroupMemoryLength:gate_threads * 2u * sizeof(float) atIndex:0u];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)gate_groups, 1u, 1u)
+             threadsPerThreadgroup:MTLSizeMake(gate_threads, 1u, 1u)];
+        [enc endEncoding];
+
+        enc = [cb computeCommandEncoder];
+        if (enc == nil) {
+            (void)metal_fail(error, error_size, "failed to create Metal MoE prefill down command encoder");
+            goto cleanup;
+        }
+        const NSUInteger down_threads = metal_power2_threadgroup_width(256u, down_pipeline.maxTotalThreadsPerThreadgroup);
+        [enc setComputePipelineState:down_pipeline];
+        [enc setBuffer:mid offset:0u atIndex:0u];
+        [enc setBuffer:top_ids offset:0u atIndex:1u];
+        [enc setBuffer:top_weights offset:0u atIndex:2u];
+        [enc setBuffer:down_weight offset:0u atIndex:3u];
+        [enc setBuffer:dst offset:0u atIndex:4u];
+        [enc setBytes:&params length:sizeof(params) atIndex:5u];
+        [enc setThreadgroupMemoryLength:down_threads * sizeof(float) atIndex:0u];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)output_values, 1u, 1u)
+             threadsPerThreadgroup:MTLSizeMake(down_threads, 1u, 1u)];
+        [enc endEncoding];
+
+        [cb commit];
+        [cb waitUntilCompleted];
+        if (cb.status == MTLCommandBufferStatusError) {
+            NSString *description = cb.error != nil ? [cb.error localizedDescription] : @"unknown command-buffer error";
+            (void)metal_fail(error, error_size, "Metal MoE prefill command failed: %s", [description UTF8String]);
+            goto cleanup;
+        }
+
+        memcpy(out, [dst contents], (size_t)output_bytes);
+        ok = 1;
+
+    cleanup:
+        [dst release];
+        [mid release];
+        [down_weight release];
+        [up_weight release];
+        [gate_weight release];
+        [top_weights release];
+        [top_ids release];
         [input release];
         if (!ok) {
             return 0;

@@ -460,6 +460,30 @@ int uocr_metal_context_moe_selected_experts_decode_f16(uocr_metal_context *ctx,
                                                        char *error,
                                                        size_t error_size);
 
+/* Diagnostic token-batched routed-expert prefill helper. Weights are
+ * expert-major [expert,out_row,input_col] for gate/up and
+ * [expert,hidden_row,intermediate_col] for down. top_expert_ids/top_weights are
+ * row-major [n_tokens,top_k]. This is the first prefill-oriented routed path:
+ * it avoids CPU-side per-token selected-weight compaction and lets kernels read
+ * expert-major slabs directly before later optimizing true expert grouping.
+ */
+int uocr_metal_context_moe_selected_experts_prefill_f16(uocr_metal_context *ctx,
+                                                        const uint16_t *input_f16,
+                                                        const uint32_t *top_expert_ids,
+                                                        const float *top_weights_f32,
+                                                        const uint16_t *expert_gate_weight_f16,
+                                                        const uint16_t *expert_up_weight_f16,
+                                                        const uint16_t *expert_down_weight_f16,
+                                                        uint32_t n_tokens,
+                                                        uint32_t hidden_size,
+                                                        uint32_t intermediate_size,
+                                                        uint32_t expert_count,
+                                                        uint32_t top_k,
+                                                        uocr_metal_dense_output_type output_type,
+                                                        void *out,
+                                                        char *error,
+                                                        size_t error_size);
+
 /* Diagnostic MoE combine helper for synthetic decoder tests. Computes the
  * elementwise sum of routed expert output and shared expert output for
  * [n_tokens,1280] fp16 rows. residual_f16_or_null is optional and is added

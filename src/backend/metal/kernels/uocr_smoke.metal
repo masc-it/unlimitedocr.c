@@ -1004,6 +1004,177 @@ kernel void uocr_moe_selected_down_sum_f16_to_f32(device const half *mid [[buffe
     }
 }
 
+struct UocrMoePrefillSelectedParams {
+    uint n_tokens;
+    uint hidden_size;
+    uint intermediate_size;
+    uint expert_count;
+    uint top_k;
+    uint reserved0;
+    uint reserved1;
+    uint reserved2;
+};
+
+kernel void uocr_moe_prefill_selected_gate_up_f16(device const half *src [[buffer(0)]],
+                                                  device const uint *top_expert_ids [[buffer(1)]],
+                                                  device const half *gate_weight [[buffer(2)]],
+                                                  device const half *up_weight [[buffer(3)]],
+                                                  device half *mid [[buffer(4)]],
+                                                  constant UocrMoePrefillSelectedParams &params [[buffer(5)]],
+                                                  threadgroup float *partials [[threadgroup(0)]],
+                                                  uint output_index [[threadgroup_position_in_grid]],
+                                                  uint tid [[thread_index_in_threadgroup]],
+                                                  uint ntg [[threads_per_threadgroup]]) {
+    const uint per_token = params.top_k * params.intermediate_size;
+    const uint token = output_index / per_token;
+    const uint token_rem = output_index - token * per_token;
+    const uint rank = token_rem / params.intermediate_size;
+    const uint out_col = token_rem - rank * params.intermediate_size;
+    if (token >= params.n_tokens || rank >= params.top_k || out_col >= params.intermediate_size) {
+        return;
+    }
+
+    const uint expert = top_expert_ids[token * params.top_k + rank];
+    if (expert >= params.expert_count) {
+        if (tid == 0) {
+            mid[(token * params.top_k + rank) * params.intermediate_size + out_col] = half(0.0f);
+        }
+        return;
+    }
+
+    threadgroup float *gate_partials = partials;
+    threadgroup float *up_partials = partials + ntg;
+    float gate_sum = 0.0f;
+    float up_sum = 0.0f;
+    const ulong src_base = ulong(token) * ulong(params.hidden_size);
+    const ulong weight_base = (ulong(expert) * ulong(params.intermediate_size) + ulong(out_col)) *
+                              ulong(params.hidden_size);
+    for (uint k = tid; k < params.hidden_size; k += ntg) {
+        const float x = float(src[src_base + ulong(k)]);
+        gate_sum += x * float(gate_weight[weight_base + ulong(k)]);
+        up_sum += x * float(up_weight[weight_base + ulong(k)]);
+    }
+    gate_partials[tid] = gate_sum;
+    up_partials[tid] = up_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = ntg >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            gate_partials[tid] += gate_partials[tid + stride];
+            up_partials[tid] += up_partials[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tid == 0) {
+        const float gate = gate_partials[0];
+        const float up = up_partials[0];
+        const float silu = gate / (1.0f + exp(-gate));
+        const ulong mid_index = (ulong(token) * ulong(params.top_k) + ulong(rank)) *
+                                    ulong(params.intermediate_size) +
+                                ulong(out_col);
+        mid[mid_index] = half(silu * up);
+    }
+}
+
+static inline float uocr_moe_prefill_selected_down_dot_f16(device const half *mid,
+                                                           device const uint *top_expert_ids,
+                                                           device const float *top_weights,
+                                                           device const half *down_weight,
+                                                           constant UocrMoePrefillSelectedParams &params,
+                                                           uint token,
+                                                           uint out_col,
+                                                           uint tid,
+                                                           uint ntg,
+                                                           threadgroup float *partials) {
+    float sum = 0.0f;
+    for (uint rank = 0; rank < params.top_k; ++rank) {
+        const uint expert = top_expert_ids[token * params.top_k + rank];
+        if (expert >= params.expert_count) {
+            continue;
+        }
+        float expert_sum = 0.0f;
+        const ulong mid_base = (ulong(token) * ulong(params.top_k) + ulong(rank)) *
+                               ulong(params.intermediate_size);
+        const ulong weight_base = (ulong(expert) * ulong(params.hidden_size) + ulong(out_col)) *
+                                  ulong(params.intermediate_size);
+        for (uint k = tid; k < params.intermediate_size; k += ntg) {
+            expert_sum += float(mid[mid_base + ulong(k)]) * float(down_weight[weight_base + ulong(k)]);
+        }
+        sum += expert_sum * top_weights[token * params.top_k + rank];
+    }
+    partials[tid] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = ntg >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            partials[tid] += partials[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    return partials[0];
+}
+
+kernel void uocr_moe_prefill_selected_down_sum_f16_to_f16(device const half *mid [[buffer(0)]],
+                                                          device const uint *top_expert_ids [[buffer(1)]],
+                                                          device const float *top_weights [[buffer(2)]],
+                                                          device const half *down_weight [[buffer(3)]],
+                                                          device half *dst [[buffer(4)]],
+                                                          constant UocrMoePrefillSelectedParams &params [[buffer(5)]],
+                                                          threadgroup float *partials [[threadgroup(0)]],
+                                                          uint output_index [[threadgroup_position_in_grid]],
+                                                          uint tid [[thread_index_in_threadgroup]],
+                                                          uint ntg [[threads_per_threadgroup]]) {
+    const uint token = output_index / params.hidden_size;
+    const uint out_col = output_index - token * params.hidden_size;
+    if (token >= params.n_tokens || out_col >= params.hidden_size) {
+        return;
+    }
+    const float value = uocr_moe_prefill_selected_down_dot_f16(mid,
+                                                               top_expert_ids,
+                                                               top_weights,
+                                                               down_weight,
+                                                               params,
+                                                               token,
+                                                               out_col,
+                                                               tid,
+                                                               ntg,
+                                                               partials);
+    if (tid == 0) {
+        dst[output_index] = half(value);
+    }
+}
+
+kernel void uocr_moe_prefill_selected_down_sum_f16_to_f32(device const half *mid [[buffer(0)]],
+                                                          device const uint *top_expert_ids [[buffer(1)]],
+                                                          device const float *top_weights [[buffer(2)]],
+                                                          device const half *down_weight [[buffer(3)]],
+                                                          device float *dst [[buffer(4)]],
+                                                          constant UocrMoePrefillSelectedParams &params [[buffer(5)]],
+                                                          threadgroup float *partials [[threadgroup(0)]],
+                                                          uint output_index [[threadgroup_position_in_grid]],
+                                                          uint tid [[thread_index_in_threadgroup]],
+                                                          uint ntg [[threads_per_threadgroup]]) {
+    const uint token = output_index / params.hidden_size;
+    const uint out_col = output_index - token * params.hidden_size;
+    if (token >= params.n_tokens || out_col >= params.hidden_size) {
+        return;
+    }
+    const float value = uocr_moe_prefill_selected_down_dot_f16(mid,
+                                                               top_expert_ids,
+                                                               top_weights,
+                                                               down_weight,
+                                                               params,
+                                                               token,
+                                                               out_col,
+                                                               tid,
+                                                               ntg,
+                                                               partials);
+    if (tid == 0) {
+        dst[output_index] = value;
+    }
+}
+
 struct UocrMoeCombineParams {
     uint n_tokens;
     uint hidden_size;

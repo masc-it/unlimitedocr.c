@@ -645,7 +645,7 @@ First implementation slice, in order:
   - [x] no DS4 router-specific sqrt/softplus/bias behavior
 - [x] Adapt DS4 `argsort.metal` / `dsv4_misc.metal` top-k patterns for OCR's simpler top-6.
 - [x] Implement selected-expert fp16 path for decode.
-- [ ] Implement grouped expert path for prefill later; simple token-by-token selected expert path is acceptable for first parity.
+- [x] Implement token-batched expert-major routed-expert path for prefill; true group-by-expert optimization can follow after parity.
 - [x] Implement shared experts for every MoE layer with intermediate `1792`.
 - [x] Add routed expert result + shared expert result.
 
