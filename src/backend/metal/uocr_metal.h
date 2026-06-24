@@ -327,6 +327,24 @@ int uocr_metal_context_sam_qkv_f16(uocr_metal_context *ctx,
                                    char *error,
                                    size_t error_size);
 
+/* Diagnostic SAM window-attention helper for non-global transformer blocks.
+ * Q/K/V are fp16 tensors laid out as [n_windows,14*14,12,64] (equivalent to
+ * window-major rows with flattened [head,dim] channels). The helper computes
+ * per-window, per-head scaled dot-product attention with scale 1/sqrt(64),
+ * including all 196 tokens supplied by the caller. Padding/window partitioning
+ * remains a separate stage; callers should pass padded window tokens when
+ * matching upstream window_partition() semantics.
+ */
+int uocr_metal_context_sam_window_attention_f16(uocr_metal_context *ctx,
+                                                const uint16_t *q_f16,
+                                                const uint16_t *k_f16,
+                                                const uint16_t *v_f16,
+                                                uint32_t n_windows,
+                                                uocr_metal_dense_output_type output_type,
+                                                void *out,
+                                                char *error,
+                                                size_t error_size);
+
 /* Runtime prompt assembly into the persistent Metal prompt-embedding arena.
  * The arena must have been allocated with uocr_metal_context_allocate_runtime_arenas().
  * slot selects the batch slot. Tests can inspect the private arena with the

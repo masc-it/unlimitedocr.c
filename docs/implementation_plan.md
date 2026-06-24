@@ -749,7 +749,7 @@ Do not begin this section until sections 14.5 and 15.1 pass for fp16 single-requ
 - [ ] Implement SAM transformer blocks `0..11`:
   - [x] LayerNorm eps `1e-6`
   - [x] QKV linear with bias
-  - [ ] window attention size `14` for non-global blocks
+  - [x] window attention size `14` for non-global blocks
   - [ ] global attention for blocks `[2,5,8,11]`
   - [ ] decomposed relative position bias from `rel_pos_h` and `rel_pos_w`
   - [ ] GELU MLP with `mlp_ratio=4`

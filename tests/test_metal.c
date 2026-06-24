@@ -71,6 +71,12 @@ static size_t sam_qkv_out_index(uint32_t row, uint32_t head, uint32_t dim) {
     return (size_t)row * UOCR_SAM_HIDDEN_SIZE + (size_t)head * UOCR_SAM_HEAD_DIM + dim;
 }
 
+static size_t sam_window_attention_index(uint32_t window, uint32_t token, uint32_t head, uint32_t dim) {
+    return (((size_t)window * UOCR_SAM_WINDOW_TOKENS + token) * UOCR_SAM_ATTENTION_HEADS + head) *
+               UOCR_SAM_HEAD_DIM +
+           dim;
+}
+
 static float sam_cubic_weight(float x) {
     const float a = -0.75f;
     const float ax = fabsf(x);
@@ -589,6 +595,39 @@ static int test_metal_sam_layernorm_f16(void) {
     return 0;
 }
 
+static float sam_window_attention_expected(const uint16_t *q,
+                                           const uint16_t *k,
+                                           const uint16_t *v,
+                                           uint32_t window,
+                                           uint32_t token,
+                                           uint32_t head,
+                                           uint32_t dim) {
+    float scores[UOCR_SAM_WINDOW_TOKENS];
+    float max_score = -INFINITY;
+    const float scale = 1.0f / sqrtf((float)UOCR_SAM_HEAD_DIM);
+    for (uint32_t key = 0u; key < UOCR_SAM_WINDOW_TOKENS; ++key) {
+        float score = 0.0f;
+        for (uint32_t d = 0u; d < UOCR_SAM_HEAD_DIM; ++d) {
+            score += f16_bits_to_f32(q[sam_window_attention_index(window, token, head, d)]) *
+                     f16_bits_to_f32(k[sam_window_attention_index(window, key, head, d)]);
+        }
+        score *= scale;
+        scores[key] = score;
+        if (score > max_score) {
+            max_score = score;
+        }
+    }
+
+    float denominator = 0.0f;
+    float value = 0.0f;
+    for (uint32_t key = 0u; key < UOCR_SAM_WINDOW_TOKENS; ++key) {
+        const float weight = expf(scores[key] - max_score);
+        denominator += weight;
+        value += weight * f16_bits_to_f32(v[sam_window_attention_index(window, key, head, dim)]);
+    }
+    return denominator > 0.0f ? value / denominator : 0.0f;
+}
+
 static int test_metal_sam_qkv_f16(void) {
     if (!uocr_metal_is_available()) {
         return 0;
@@ -711,6 +750,124 @@ static int test_metal_sam_qkv_f16(void) {
     free(bias);
     free(weight);
     free(input);
+    return 0;
+}
+
+static int test_metal_sam_window_attention_f16(void) {
+    if (!uocr_metal_is_available()) {
+        return 0;
+    }
+
+    enum {
+        WINDOWS = 1u,
+        VALUES = WINDOWS * UOCR_SAM_WINDOW_TOKENS * UOCR_SAM_HIDDEN_SIZE,
+    };
+    uint16_t *q = (uint16_t *)calloc(VALUES, sizeof(uint16_t));
+    uint16_t *k = (uint16_t *)calloc(VALUES, sizeof(uint16_t));
+    uint16_t *v = (uint16_t *)calloc(VALUES, sizeof(uint16_t));
+    float *out_f32 = (float *)calloc(VALUES, sizeof(float));
+    uint16_t *out_f16 = (uint16_t *)calloc(VALUES, sizeof(uint16_t));
+    CHECK(q != NULL);
+    CHECK(k != NULL);
+    CHECK(v != NULL);
+    CHECK(out_f32 != NULL);
+    CHECK(out_f16 != NULL);
+
+    for (uint32_t window = 0u; window < WINDOWS; ++window) {
+        for (uint32_t token = 0u; token < UOCR_SAM_WINDOW_TOKENS; ++token) {
+            for (uint32_t head = 0u; head < UOCR_SAM_ATTENTION_HEADS; ++head) {
+                for (uint32_t dim = 0u; dim < UOCR_SAM_HEAD_DIM; ++dim) {
+                    const size_t idx = sam_window_attention_index(window, token, head, dim);
+                    const int q_mod = (int)((token + 3u * dim + 5u * head + 7u * window) % 17u) - 8;
+                    const int k_mod = (int)((3u * token + dim + 11u * head + 13u * window) % 19u) - 9;
+                    const int v_mod = (int)((5u * token + 7u * dim + 2u * head + window) % 23u) - 11;
+                    q[idx] = f32_to_f16_bits((float)q_mod * 0.015f);
+                    k[idx] = f32_to_f16_bits((float)k_mod * 0.0125f);
+                    v[idx] = f32_to_f16_bits((float)v_mod * 0.02f);
+                }
+            }
+        }
+    }
+
+    char error[1024];
+    memset(error, 0, sizeof(error));
+    uocr_metal_context *ctx = uocr_metal_context_create(UOCR_TEST_METAL_RESOURCE_PATH, error, sizeof(error));
+    CHECK(ctx != NULL);
+
+    CHECK(uocr_metal_context_sam_window_attention_f16(ctx,
+                                                       q,
+                                                       k,
+                                                       v,
+                                                       WINDOWS,
+                                                       UOCR_METAL_DENSE_OUTPUT_F32,
+                                                       out_f32,
+                                                       error,
+                                                       sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+
+    struct sample {
+        uint32_t window;
+        uint32_t token;
+        uint32_t head;
+        uint32_t dim;
+    } samples[] = {
+        {0u, 0u, 0u, 0u},
+        {0u, 13u, 2u, 5u},
+        {0u, 27u, 5u, 17u},
+        {0u, 91u, 8u, 33u},
+        {0u, UOCR_SAM_WINDOW_TOKENS - 1u, UOCR_SAM_ATTENTION_HEADS - 1u, UOCR_SAM_HEAD_DIM - 1u},
+    };
+    for (size_t i = 0u; i < sizeof(samples) / sizeof(samples[0]); ++i) {
+        const size_t idx = sam_window_attention_index(samples[i].window, samples[i].token, samples[i].head, samples[i].dim);
+        const float expected = sam_window_attention_expected(q,
+                                                             k,
+                                                             v,
+                                                             samples[i].window,
+                                                             samples[i].token,
+                                                             samples[i].head,
+                                                             samples[i].dim);
+        CHECK(fabsf(out_f32[idx] - expected) <= 2.0e-4f);
+    }
+
+    CHECK(uocr_metal_context_sam_window_attention_f16(ctx,
+                                                       q,
+                                                       k,
+                                                       v,
+                                                       WINDOWS,
+                                                       UOCR_METAL_DENSE_OUTPUT_F16,
+                                                       out_f16,
+                                                       error,
+                                                       sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    for (size_t i = 0u; i < sizeof(samples) / sizeof(samples[0]); ++i) {
+        const size_t idx = sam_window_attention_index(samples[i].window, samples[i].token, samples[i].head, samples[i].dim);
+        const float expected = sam_window_attention_expected(q,
+                                                             k,
+                                                             v,
+                                                             samples[i].window,
+                                                             samples[i].token,
+                                                             samples[i].head,
+                                                             samples[i].dim);
+        CHECK(fabsf(f16_bits_to_f32(out_f16[idx]) - expected) <= 2.0e-3f);
+    }
+
+    CHECK(uocr_metal_context_sam_window_attention_f16(ctx,
+                                                       q,
+                                                       k,
+                                                       v,
+                                                       0u,
+                                                       UOCR_METAL_DENSE_OUTPUT_F32,
+                                                       out_f32,
+                                                       error,
+                                                       sizeof(error)) == 0);
+    CHECK(strstr(error, "invalid Metal SAM window attention") != NULL);
+
+    uocr_metal_context_destroy(ctx);
+    free(out_f16);
+    free(out_f32);
+    free(v);
+    free(k);
+    free(q);
     return 0;
 }
 
@@ -9456,6 +9613,7 @@ int main(void) {
     if (test_metal_sam_abs_pos_f16() != 0) return 1;
     if (test_metal_sam_layernorm_f16() != 0) return 1;
     if (test_metal_sam_qkv_f16() != 0) return 1;
+    if (test_metal_sam_window_attention_f16() != 0) return 1;
     if (test_metal_get_rows_f16() != 0) return 1;
     if (test_metal_prompt_assembly_f16() != 0) return 1;
     if (test_metal_prompt_assembly_from_mapped_model_f16() != 0) return 1;
