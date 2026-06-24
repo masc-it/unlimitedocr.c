@@ -39,7 +39,7 @@ Current priority slice, in order. The coding agent should take the first uncheck
 - [x] Implement single-token decode-step orchestration using the existing KV ring helpers, prompt+generated-ring attention, final norm, LM head, no-repeat banning, greedy argmax, and EOS handling.
 - [x] Wire the Metal backend path in `uocr_generate_prepared()` for `n_requests=1`, `views=0`, `fp16` model, and `max_new_tokens>0`; return generated ids with `uocr_result_create_from_generated()` instead of `UOCR_ERROR_NOT_IMPLEMENTED` for that narrow case.
 - [x] Add an opt-in full-model public API parity test for text-only generated ids (`UOCR_RUN_LARGE_TESTS=1`, `UOCR_MODEL_PATH`, `UOCR_LAYER_DUMP_DIR` or equivalent fixture).
-- [ ] Promote the Python-dumped visual-embedding path from direct Metal tests into the same integrated decoder runner via an internal/test-only fixture adapter, without changing the stable v1 prepared-request image API.
+- [x] Promote the Python-dumped visual-embedding path from direct Metal tests into the same integrated decoder runner via an internal/test-only fixture adapter, without changing the stable v1 prepared-request image API.
 - [ ] Add opt-in generated-id/text parity for the integrated dumped-visual-embedding path.
 - [ ] Start section 16 Metal vision only after the integrated dumped-visual-embedding generation path passes.
 
@@ -717,11 +717,11 @@ These tasks turn the fp16 decoder primitives/parity helpers into the first real 
 
 Do this immediately after section 14.5 and before porting SAM/CLIP. The goal is to prove the real decoder/generation loop works for image prompts while vision is still bypassed.
 
-- [ ] Add an internal/test-only request adapter that supplies preformatted fp16 visual feature rows `[image_tokens,1280]` alongside a normal prepared image request.
-- [ ] Reuse the integrated text decoder runner after prompt assembly; do not maintain a separate image-specific decoder loop.
-- [ ] Assemble text tokens plus dumped visual rows into the same prompt arena layout that future Metal vision will produce.
-- [ ] Validate image span length equals dumped visual feature rows and that the prepared request's view/crop metadata still passes normal validation.
-- [ ] Run prefill/decode/generation through the integrated decoder for dumped image embeddings.
+- [x] Add an internal/test-only request adapter that supplies preformatted fp16 visual feature rows `[image_tokens,1280]` alongside a normal prepared image request.
+- [x] Reuse the integrated text decoder runner after prompt assembly; do not maintain a separate image-specific decoder loop.
+- [x] Assemble text tokens plus dumped visual rows into the same prompt arena layout that future Metal vision will produce.
+- [x] Validate image span length equals dumped visual feature rows and that the prepared request's view/crop metadata still passes normal validation.
+- [x] Run prefill/decode/generation through the integrated decoder for dumped image embeddings.
 - [ ] Compare generated ids/text against Python dumped-image fixtures; logits/top-k and router checks remain mandatory diagnostics when generated ids drift.
 - [ ] Keep this path as a permanent opt-in parity mode after Metal vision lands.
 

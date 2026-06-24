@@ -4039,24 +4039,18 @@ int uocr_metal_context_generate_f16(uocr_metal_context *ctx,
         }
     }
 
-    if (request->image_span_length != 0u) {
-        return metal_fail(error,
-                          error_size,
-                          "integrated Metal fp16 decoder currently supports text-only prefill; dumped image embeddings are not wired yet");
-    }
-
     if (!uocr_metal_context_assemble_prompt_from_model_to_arena_f16(ctx,
                                                                     request->input_ids,
                                                                     request->n_tokens,
-                                                                    UINT32_MAX,
-                                                                    0u,
-                                                                    NULL,
+                                                                    request->image_span_length != 0u ? request->image_span_start : UINT32_MAX,
+                                                                    request->image_span_length,
+                                                                    request->image_features_f16,
                                                                     request->slot,
                                                                     error,
                                                                     error_size)) {
         char detail[512];
         (void)snprintf(detail, sizeof(detail), "%s", (error != NULL && error[0] != '\0') ? error : "unknown error");
-        return metal_fail(error, error_size, "failed to assemble integrated text prompt into Metal arena: %s", detail);
+        return metal_fail(error, error_size, "failed to assemble integrated prompt into Metal arena: %s", detail);
     }
 
     if (!metal_run_decoder_prefill_text_f16(ctx, request->slot, request->n_tokens, error, error_size)) {

@@ -3,6 +3,7 @@
 #include "model/uocr_model_file.h"
 #include "model/uocr_tensor_registry.h"
 #include "runtime/uocr_memory.h"
+#include "runtime/uocr_request_validation.h"
 #include "runtime/uocr_sequence.h"
 #include "unlimitedocr.h"
 
@@ -530,6 +531,274 @@ static int read_prepared_tokens_python_dump(const char *dump_dir,
     *input_ids_out = ids;
     *image_mask_out = mask;
     *n_tokens_out = n_tokens;
+    return 1;
+}
+
+static const char *json_find_key_range(const char *start, const char *end, const char *key) {
+    if (start == NULL || end == NULL || key == NULL || end < start) {
+        return NULL;
+    }
+    char pattern[128];
+    const int written = snprintf(pattern, sizeof(pattern), "\"%s\"", key);
+    if (written <= 0 || (size_t)written >= sizeof(pattern)) {
+        return NULL;
+    }
+    const size_t pattern_len = (size_t)written;
+    for (const char *p = start; p + pattern_len <= end; ++p) {
+        if (memcmp(p, pattern, pattern_len) == 0) {
+            return p;
+        }
+    }
+    return NULL;
+}
+
+static const char *json_find_char_range(const char *start, const char *end, char ch) {
+    if (start == NULL || end == NULL || end < start) {
+        return NULL;
+    }
+    for (const char *p = start; p < end; ++p) {
+        if (*p == ch) {
+            return p;
+        }
+    }
+    return NULL;
+}
+
+static const char *json_skip_ws_range(const char *p, const char *end) {
+    while (p != NULL && p < end && (*p == ' ' || *p == '\n' || *p == '\r' || *p == '\t')) {
+        ++p;
+    }
+    return p;
+}
+
+static int json_parse_u32_key_range(const char *start, const char *end, const char *key, uint32_t *out) {
+    const char *p = json_find_key_range(start, end, key);
+    if (p == NULL) {
+        return 0;
+    }
+    p = json_find_char_range(p, end, ':');
+    if (p == NULL) {
+        return 0;
+    }
+    p = json_skip_ws_range(p + 1, end);
+    if (p == NULL || p >= end) {
+        return 0;
+    }
+    errno = 0;
+    char *after = NULL;
+    const unsigned long value = strtoul(p, &after, 10);
+    if (after == p || errno != 0 || value > (unsigned long)UINT32_MAX) {
+        return 0;
+    }
+    *out = (uint32_t)value;
+    return 1;
+}
+
+static int json_parse_string_key_range(const char *start,
+                                       const char *end,
+                                       const char *key,
+                                       char *out,
+                                       size_t out_size) {
+    if (out == NULL || out_size == 0u) {
+        return 0;
+    }
+    const char *p = json_find_key_range(start, end, key);
+    if (p == NULL) {
+        return 0;
+    }
+    p = json_find_char_range(p, end, ':');
+    if (p == NULL) {
+        return 0;
+    }
+    p = json_skip_ws_range(p + 1, end);
+    if (p == NULL || p >= end || *p != '"') {
+        return 0;
+    }
+    const char *value_start = p + 1;
+    const char *value_end = json_find_char_range(value_start, end, '"');
+    if (value_end == NULL || value_end < value_start) {
+        return 0;
+    }
+    const size_t len = (size_t)(value_end - value_start);
+    if (len >= out_size) {
+        return 0;
+    }
+    memcpy(out, value_start, len);
+    out[len] = '\0';
+    return 1;
+}
+
+static int read_prepared_view_stubs_from_manifest(const char *dump_dir,
+                                                  uocr_image_view **views_out,
+                                                  uint32_t *n_views_out,
+                                                  uint32_t *crop_grid_w_out,
+                                                  uint32_t *crop_grid_h_out,
+                                                  char *error,
+                                                  size_t error_size) {
+    if (views_out == NULL || n_views_out == NULL || crop_grid_w_out == NULL || crop_grid_h_out == NULL) {
+        snprintf(error, error_size, "invalid fixture view-manifest request");
+        return 0;
+    }
+    *views_out = NULL;
+    *n_views_out = 0u;
+    *crop_grid_w_out = 0u;
+    *crop_grid_h_out = 0u;
+
+    char manifest_path[4096];
+    if (!make_fixture_path(dump_dir, "manifest.json", manifest_path, sizeof(manifest_path))) {
+        snprintf(error, error_size, "fixture manifest path is too long");
+        return 0;
+    }
+    unsigned char *manifest_bytes = NULL;
+    size_t manifest_size = 0u;
+    if (!read_binary_file(manifest_path, &manifest_bytes, &manifest_size, error, error_size)) {
+        return 0;
+    }
+    char *json = (char *)malloc(manifest_size + 1u);
+    if (json == NULL) {
+        snprintf(error, error_size, "failed to allocate fixture manifest buffer");
+        free(manifest_bytes);
+        return 0;
+    }
+    memcpy(json, manifest_bytes, manifest_size);
+    json[manifest_size] = '\0';
+    free(manifest_bytes);
+
+    const char *json_start = json;
+    const char *json_end = json + manifest_size;
+    uint32_t crop_grid_w = 0u;
+    uint32_t crop_grid_h = 0u;
+    if (!json_parse_u32_key_range(json_start, json_end, "crop_grid_w", &crop_grid_w) ||
+        !json_parse_u32_key_range(json_start, json_end, "crop_grid_h", &crop_grid_h)) {
+        snprintf(error, error_size, "fixture manifest is missing crop grid metadata");
+        free(json);
+        return 0;
+    }
+
+    const char *views_key = json_find_key_range(json_start, json_end, "views");
+    if (views_key == NULL) {
+        snprintf(error, error_size, "fixture manifest is missing views metadata");
+        free(json);
+        return 0;
+    }
+    const char *array_start = json_find_char_range(views_key, json_end, '[');
+    if (array_start == NULL) {
+        snprintf(error, error_size, "fixture manifest views metadata is invalid");
+        free(json);
+        return 0;
+    }
+    const char *array_end = NULL;
+    int bracket_depth = 0;
+    for (const char *p = array_start; p < json_end; ++p) {
+        if (*p == '[') {
+            ++bracket_depth;
+        } else if (*p == ']') {
+            --bracket_depth;
+            if (bracket_depth == 0) {
+                array_end = p;
+                break;
+            }
+        }
+    }
+    if (array_end == NULL) {
+        snprintf(error, error_size, "fixture manifest views array is unterminated");
+        free(json);
+        return 0;
+    }
+
+    uint32_t n_views = 0u;
+    for (const char *p = array_start + 1; p < array_end; ++p) {
+        if (*p == '{') {
+            ++n_views;
+            const char *object_end = json_find_char_range(p + 1, array_end, '}');
+            if (object_end == NULL) {
+                snprintf(error, error_size, "fixture manifest view object is unterminated");
+                free(json);
+                return 0;
+            }
+            p = object_end;
+        }
+    }
+
+    uocr_image_view *views = NULL;
+    if (n_views != 0u) {
+        views = (uocr_image_view *)calloc((size_t)n_views, sizeof(*views));
+        if (views == NULL) {
+            snprintf(error, error_size, "failed to allocate fixture view stubs");
+            free(json);
+            return 0;
+        }
+    }
+
+    static const uint16_t pixel_sentinel = 0u;
+    uint32_t view_index = 0u;
+    for (const char *p = array_start + 1; p < array_end;) {
+        if (*p != '{') {
+            ++p;
+            continue;
+        }
+        const char *object_start = p;
+        const char *object_end = json_find_char_range(object_start + 1, array_end, '}');
+        if (object_end == NULL || view_index >= n_views) {
+            snprintf(error, error_size, "fixture manifest view object parse failure");
+            free(views);
+            free(json);
+            return 0;
+        }
+
+        char kind[32];
+        char format[32];
+        uint32_t width = 0u;
+        uint32_t height = 0u;
+        if (!json_parse_string_key_range(object_start, object_end, "kind", kind, sizeof(kind)) ||
+            !json_parse_string_key_range(object_start, object_end, "format", format, sizeof(format)) ||
+            !json_parse_u32_key_range(object_start, object_end, "width", &width) ||
+            !json_parse_u32_key_range(object_start, object_end, "height", &height)) {
+            snprintf(error, error_size, "fixture manifest view %u is missing kind/format/shape", view_index);
+            free(views);
+            free(json);
+            return 0;
+        }
+
+        views[view_index].pixels = &pixel_sentinel;
+        views[view_index].width = width;
+        views[view_index].height = height;
+        if (strcmp(kind, "global") == 0) {
+            views[view_index].kind = UOCR_VIEW_GLOBAL;
+        } else if (strcmp(kind, "local") == 0) {
+            views[view_index].kind = UOCR_VIEW_LOCAL;
+        } else {
+            snprintf(error, error_size, "fixture manifest view %u has unsupported kind %s", view_index, kind);
+            free(views);
+            free(json);
+            return 0;
+        }
+        if (strcmp(format, "f16_nchw") == 0) {
+            views[view_index].format = UOCR_PIXEL_F16_NCHW;
+        } else if (strcmp(format, "f32_nchw") == 0) {
+            views[view_index].format = UOCR_PIXEL_F32_NCHW;
+        } else {
+            snprintf(error, error_size, "fixture manifest view %u has unsupported format %s", view_index, format);
+            free(views);
+            free(json);
+            return 0;
+        }
+
+        ++view_index;
+        p = object_end + 1;
+    }
+    if (view_index != n_views) {
+        snprintf(error, error_size, "fixture manifest view count changed while parsing");
+        free(views);
+        free(json);
+        return 0;
+    }
+
+    free(json);
+    *views_out = views;
+    *n_views_out = n_views;
+    *crop_grid_w_out = crop_grid_w;
+    *crop_grid_h_out = crop_grid_h;
     return 1;
 }
 
@@ -2917,6 +3186,211 @@ static int test_metal_image_generated_ids_python_dump_parity(void) {
     free(expected_ids);
     free(layer11);
     free(prompt);
+    free(visual_features);
+    free(image_mask);
+    free(input_ids);
+    return 0;
+}
+
+static int test_metal_integrated_image_embedding_python_dump_prefill(void) {
+    if (!uocr_metal_is_available()) {
+        return 0;
+    }
+    if (!env_flag_enabled("UOCR_RUN_LARGE_TESTS")) {
+        return 0;
+    }
+
+    const char *model_path = getenv("UOCR_MODEL_PATH");
+    const char *dump_dir = getenv("UOCR_IMAGE_EMBED_DUMP_DIR");
+    if (model_path == NULL || model_path[0] == '\0' || dump_dir == NULL || dump_dir[0] == '\0') {
+        printf("UOCR_RUN_LARGE_TESTS=1 but UOCR_MODEL_PATH/UOCR_IMAGE_EMBED_DUMP_DIR are not both set; skipping integrated image-embedding prefill parity\n");
+        return 0;
+    }
+    if (!fixture_binary_exists(dump_dir, "visual_features_f16.bin") ||
+        !fixture_binary_exists(dump_dir, "prompt_embeddings_f16.bin") ||
+        !fixture_binary_exists(dump_dir, "layer_11_hidden_f16.bin")) {
+        printf("UOCR_IMAGE_EMBED_DUMP_DIR has no integrated image-embedding fixture files; skipping integrated image-embedding prefill parity\n");
+        return 0;
+    }
+
+    char error[1024];
+    memset(error, 0, sizeof(error));
+    int32_t *input_ids = NULL;
+    uint8_t *image_mask = NULL;
+    uint32_t n_tokens = 0u;
+    uint16_t *visual_features = NULL;
+    uint32_t image_span_start = UOCR_SEQUENCE_NO_IMAGE_SPAN;
+    uint32_t image_span_length = 0u;
+    uint16_t *expected_prompt = NULL;
+    uint16_t *expected_final_hidden = NULL;
+    uocr_image_view *views = NULL;
+    uint32_t n_views = 0u;
+    uint32_t crop_grid_w = 0u;
+    uint32_t crop_grid_h = 0u;
+
+    CHECK(read_image_prompt_embedding_python_dump(dump_dir,
+                                                  &input_ids,
+                                                  &image_mask,
+                                                  &n_tokens,
+                                                  &visual_features,
+                                                  &image_span_start,
+                                                  &image_span_length,
+                                                  &expected_prompt,
+                                                  error,
+                                                  sizeof(error)) == 1);
+    CHECK(read_prepared_view_stubs_from_manifest(dump_dir,
+                                                 &views,
+                                                 &n_views,
+                                                 &crop_grid_w,
+                                                 &crop_grid_h,
+                                                 error,
+                                                 sizeof(error)) == 1);
+    CHECK(read_layer_hidden_python_dump(dump_dir,
+                                        "layer_11_hidden_f16.bin",
+                                        n_tokens,
+                                        &expected_final_hidden,
+                                        error,
+                                        sizeof(error)) == 1);
+    CHECK(n_tokens > 0u);
+    CHECK(image_span_start != UOCR_SEQUENCE_NO_IMAGE_SPAN);
+    CHECK(image_span_length > 0u);
+
+    uocr_prepared_request prepared;
+    memset(&prepared, 0, sizeof(prepared));
+    prepared.input_ids = input_ids;
+    prepared.image_mask = image_mask;
+    prepared.n_tokens = n_tokens;
+    prepared.views = views;
+    prepared.n_views = n_views;
+    prepared.crop_grid_w = crop_grid_w;
+    prepared.crop_grid_h = crop_grid_h;
+    prepared.max_new_tokens = 0u;
+    uocr_request_limits limits;
+    memset(&limits, 0, sizeof(limits));
+    limits.max_prompt_tokens = n_tokens;
+    limits.max_gen_tokens = 1u;
+    CHECK(uocr_validate_prepared_request(&prepared, &limits, error, sizeof(error)) == UOCR_OK);
+    CHECK(uocr_count_image_placeholders(&prepared) == image_span_length);
+
+    const uint32_t max_decoder_tokens = env_u32_or_default("UOCR_IMAGE_DECODER_MAX_TOKENS", 32u);
+    if (n_tokens > max_decoder_tokens) {
+        printf("UOCR_IMAGE_EMBED_DUMP_DIR has %u tokens; set UOCR_IMAGE_DECODER_MAX_TOKENS=%u or higher to run integrated image-embedding prefill parity\n",
+               n_tokens,
+               n_tokens);
+        free(expected_final_hidden);
+        free(views);
+        free(expected_prompt);
+        free(visual_features);
+        free(image_mask);
+        free(input_ids);
+        return 0;
+    }
+
+    uocr_model_file model;
+    CHECK(uocr_model_file_open(model_path, &model, error, sizeof(error)) == 0);
+    uocr_metal_context *ctx = uocr_metal_context_create(UOCR_TEST_METAL_RESOURCE_PATH, error, sizeof(error));
+    CHECK(ctx != NULL);
+    CHECK(uocr_metal_context_map_model(ctx, &model, error, sizeof(error)) == 1);
+    CHECK(uocr_metal_context_allocate_runtime_arenas(ctx, 1u, n_tokens, error, sizeof(error)) == 1);
+
+    uocr_metal_decoder_request_f16 request;
+    memset(&request, 0, sizeof(request));
+    request.input_ids = input_ids;
+    request.image_mask = image_mask;
+    request.image_features_f16 = visual_features;
+    request.n_tokens = n_tokens;
+    request.max_new_tokens = 0u;
+    request.slot = 0u;
+    request.image_span_start = image_span_start;
+    request.image_span_length = image_span_length;
+
+    uocr_metal_decoder_result_f16 result;
+    memset(&result, 0, sizeof(result));
+    CHECK(uocr_metal_context_generate_f16(ctx, &request, &result, error, sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    CHECK(result.generated_count == 0u);
+
+    const uint64_t hidden_values = (uint64_t)n_tokens * (uint64_t)UOCR_HIDDEN_SIZE;
+    CHECK(hidden_values <= (uint64_t)SIZE_MAX / 2u);
+    uint16_t *actual_prompt = (uint16_t *)calloc((size_t)hidden_values, sizeof(uint16_t));
+    uint16_t *actual_final_hidden = (uint16_t *)calloc((size_t)hidden_values, sizeof(uint16_t));
+    CHECK(actual_prompt != NULL);
+    CHECK(actual_final_hidden != NULL);
+    CHECK(uocr_metal_context_read_prompt_arena_f16(ctx,
+                                                   0u,
+                                                   n_tokens,
+                                                   actual_prompt,
+                                                   error,
+                                                   sizeof(error)) == 1);
+    CHECK(uocr_metal_context_read_decoder_final_hidden_f16(ctx,
+                                                           0u,
+                                                           n_tokens,
+                                                           actual_final_hidden,
+                                                           error,
+                                                           sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+
+    for (uint64_t i = 0u; i < hidden_values; ++i) {
+        if (actual_prompt[i] != expected_prompt[i]) {
+            fprintf(stderr,
+                    "integrated image prompt mismatch at token %llu col %llu: actual=0x%04x expected=0x%04x\n",
+                    (unsigned long long)(i / (uint64_t)UOCR_HIDDEN_SIZE),
+                    (unsigned long long)(i % (uint64_t)UOCR_HIDDEN_SIZE),
+                    actual_prompt[i],
+                    expected_prompt[i]);
+            free(actual_final_hidden);
+            free(actual_prompt);
+            uocr_metal_context_destroy(ctx);
+            uocr_model_file_close(&model);
+            free(expected_final_hidden);
+            free(views);
+            free(expected_prompt);
+            free(visual_features);
+            free(image_mask);
+            free(input_ids);
+            return 1;
+        }
+    }
+    if (!compare_hidden_f16("integrated image final hidden",
+                            actual_final_hidden,
+                            expected_final_hidden,
+                            n_tokens,
+                            1.25e-2f,
+                            1.25e-3)) {
+        free(actual_final_hidden);
+        free(actual_prompt);
+        uocr_metal_context_destroy(ctx);
+        uocr_model_file_close(&model);
+        free(expected_final_hidden);
+        free(views);
+        free(expected_prompt);
+        free(visual_features);
+        free(image_mask);
+        free(input_ids);
+        return 1;
+    }
+
+    int32_t generated[2] = {0, 0};
+    request.max_new_tokens = 2u;
+    memset(&result, 0, sizeof(result));
+    result.generated_ids = generated;
+    result.generated_capacity = 2u;
+    CHECK(uocr_metal_context_generate_f16(ctx, &request, &result, error, sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    CHECK(result.generated_count >= 1u);
+    CHECK(result.generated_count <= 2u);
+    for (uint32_t i = 0u; i < result.generated_count; ++i) {
+        CHECK(generated[i] >= 0);
+        CHECK((uint32_t)generated[i] < UOCR_VOCAB_SIZE);
+    }
+
+    free(actual_final_hidden);
+    free(actual_prompt);
+    uocr_metal_context_destroy(ctx);
+    uocr_model_file_close(&model);
+    free(expected_final_hidden);
+    free(views);
+    free(expected_prompt);
     free(visual_features);
     free(image_mask);
     free(input_ids);
@@ -8163,6 +8637,7 @@ int main(void) {
     if (test_metal_image_router_topk_python_dump_parity() != 0) return 1;
     if (test_metal_image_logits_topk_python_dump_parity() != 0) return 1;
     if (test_metal_image_generated_ids_python_dump_parity() != 0) return 1;
+    if (test_metal_integrated_image_embedding_python_dump_prefill() != 0) return 1;
     if (test_metal_text_layer0_python_dump_parity() != 0) return 1;
     if (test_metal_text_layer1_python_dump_parity() != 0) return 1;
     if (test_metal_text_remaining_layers_python_dump_parity() != 0) return 1;
