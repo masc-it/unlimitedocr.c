@@ -34,6 +34,13 @@ int uocr_no_repeat_ngram_collect_banned(const int32_t *sequence,
                                         uint32_t out_capacity,
                                         uint32_t *out_count);
 
+typedef struct uocr_no_repeat_ngram_config {
+    const int32_t *sequence;
+    uint32_t sequence_len;
+    uint32_t ngram_size;
+    uint32_t window;
+} uocr_no_repeat_ngram_config;
+
 /* Apply the same processor in-place by writing -inf to banned logits. */
 int uocr_no_repeat_ngram_apply(float *logits,
                                uint32_t vocab_size,
@@ -43,6 +50,17 @@ int uocr_no_repeat_ngram_apply(float *logits,
                                uint32_t window,
                                const int32_t *whitelist_token_ids,
                                uint32_t whitelist_count);
+
+/* Apply per-row no-repeat configs to a row-major [n_rows, vocab_size] logits
+ * buffer. configs_or_null==NULL is a no-op, and per-row ngram_size==0 disables
+ * the processor for that row. The helper performs no allocation and is the CPU
+ * readback path used before greedy argmax until a GPU logits-processor kernel
+ * is added.
+ */
+int uocr_no_repeat_ngram_apply_batch(float *logits,
+                                     uint32_t n_rows,
+                                     uint32_t vocab_size,
+                                     const uocr_no_repeat_ngram_config *configs_or_null);
 
 #ifdef __cplusplus
 }

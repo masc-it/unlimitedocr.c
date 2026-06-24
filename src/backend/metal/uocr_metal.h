@@ -5,6 +5,7 @@
 #include <stdint.h>
 
 #include "model/uocr_model_file.h"
+#include "runtime/uocr_logits_processor.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -253,6 +254,20 @@ int uocr_metal_context_argmax_f32(uocr_metal_context *ctx,
                                   float *scores_out_f32_or_null,
                                   char *error,
                                   size_t error_size);
+
+/* Decode-time greedy selection helper for the initial correctness path. It
+ * applies CPU no-repeat-ngram bans in-place to readback fp32 logits, then runs
+ * the Metal argmax kernel. no_repeat_or_null==NULL disables banning.
+ */
+int uocr_metal_context_select_greedy_f32(uocr_metal_context *ctx,
+                                         float *logits_f32,
+                                         uint32_t n_rows,
+                                         uint32_t vocab_size,
+                                         const uocr_no_repeat_ngram_config *no_repeat_or_null,
+                                         uint32_t *token_ids_out,
+                                         float *scores_out_f32_or_null,
+                                         char *error,
+                                         size_t error_size);
 
 /* Diagnostic fp16 dense helper for synthetic tests. Computes
  * out[row, out_col] = dot(input[row, :], weight[out_col, :]) + optional bias,

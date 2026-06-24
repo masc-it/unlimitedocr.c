@@ -2573,6 +2573,41 @@ int uocr_metal_context_argmax_f32(uocr_metal_context *ctx,
     return 1;
 }
 
+int uocr_metal_context_select_greedy_f32(uocr_metal_context *ctx,
+                                         float *logits_f32,
+                                         uint32_t n_rows,
+                                         uint32_t vocab_size,
+                                         const uocr_no_repeat_ngram_config *no_repeat_or_null,
+                                         uint32_t *token_ids_out,
+                                         float *scores_out_f32_or_null,
+                                         char *error,
+                                         size_t error_size) {
+    metal_clear_error(error, error_size);
+    if (ctx == NULL || logits_f32 == NULL || token_ids_out == NULL || n_rows == 0u || vocab_size == 0u) {
+        return metal_fail(error, error_size, "invalid Metal greedy selection request");
+    }
+
+    const int no_repeat_status = uocr_no_repeat_ngram_apply_batch(logits_f32,
+                                                                  n_rows,
+                                                                  vocab_size,
+                                                                  no_repeat_or_null);
+    if (no_repeat_status != UOCR_OK) {
+        return metal_fail(error,
+                          error_size,
+                          "failed to apply no-repeat-ngram bans before argmax: status %d",
+                          no_repeat_status);
+    }
+
+    return uocr_metal_context_argmax_f32(ctx,
+                                         logits_f32,
+                                         n_rows,
+                                         vocab_size,
+                                         token_ids_out,
+                                         scores_out_f32_or_null,
+                                         error,
+                                         error_size);
+}
+
 int uocr_metal_context_dense_f16(uocr_metal_context *ctx,
                                  const uint16_t *input_f16,
                                  const uint16_t *weight_f16,

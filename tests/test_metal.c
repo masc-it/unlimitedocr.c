@@ -663,6 +663,81 @@ static int test_metal_argmax_f32(void) {
     return 0;
 }
 
+static int test_metal_select_greedy_with_no_repeat_f32(void) {
+    if (!uocr_metal_is_available()) {
+        return 0;
+    }
+
+    enum { ROWS = 2, VOCAB = UOCR_VOCAB_SIZE };
+    float *logits = (float *)malloc((size_t)ROWS * (size_t)VOCAB * sizeof(float));
+    CHECK(logits != NULL);
+    for (uint32_t i = 0u; i < (uint32_t)(ROWS * VOCAB); ++i) {
+        logits[i] = -1000.0f;
+    }
+    logits[0u * (uint32_t)VOCAB + 3u] = 100.0f;
+    logits[0u * (uint32_t)VOCAB + 4u] = 90.0f;
+    logits[1u * (uint32_t)VOCAB + 8u] = 50.0f;
+    logits[1u * (uint32_t)VOCAB + 9u] = 40.0f;
+
+    const int32_t sequence0[] = {1, 2, 3, 1, 2}; /* current prefix [1,2] bans 3 */
+    const uocr_no_repeat_ngram_config no_repeat[ROWS] = {
+        {sequence0, 5u, 3u, 0u},
+        {NULL, 0u, 0u, 0u},
+    };
+
+    char error[1024];
+    memset(error, 0, sizeof(error));
+    uocr_metal_context *ctx = uocr_metal_context_create(UOCR_TEST_METAL_RESOURCE_PATH, error, sizeof(error));
+    CHECK(ctx != NULL);
+
+    uint32_t token_ids[ROWS] = {UINT32_MAX, UINT32_MAX};
+    float scores[ROWS] = {0.0f, 0.0f};
+    CHECK(uocr_metal_context_select_greedy_f32(ctx,
+                                               logits,
+                                               ROWS,
+                                               VOCAB,
+                                               no_repeat,
+                                               token_ids,
+                                               scores,
+                                               error,
+                                               sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    CHECK(isinf(logits[3u]) && logits[3u] < 0.0f);
+    CHECK(token_ids[0] == 4u);
+    CHECK(scores[0] == 90.0f);
+    CHECK(token_ids[1] == 8u);
+    CHECK(scores[1] == 50.0f);
+
+    logits[0u] = 1.0f;
+    token_ids[0] = UINT32_MAX;
+    CHECK(uocr_metal_context_select_greedy_f32(ctx,
+                                               logits,
+                                               1u,
+                                               VOCAB,
+                                               NULL,
+                                               token_ids,
+                                               NULL,
+                                               error,
+                                               sizeof(error)) == 1);
+    CHECK(token_ids[0] == 4u);
+
+    const uocr_no_repeat_ngram_config invalid[1] = {{NULL, 5u, 3u, 0u}};
+    CHECK(uocr_metal_context_select_greedy_f32(ctx,
+                                               logits,
+                                               1u,
+                                               VOCAB,
+                                               invalid,
+                                               token_ids,
+                                               scores,
+                                               error,
+                                               sizeof(error)) == 0);
+    CHECK(strstr(error, "failed to apply no-repeat-ngram bans") != NULL);
+
+    uocr_metal_context_destroy(ctx);
+    free(logits);
+    return 0;
+}
+
 static int test_metal_dense_f16(void) {
     if (!uocr_metal_is_available()) {
         return 0;
@@ -3591,6 +3666,7 @@ int main(void) {
     if (test_metal_final_rmsnorm_f16() != 0) return 1;
     if (test_metal_lm_head_f16() != 0) return 1;
     if (test_metal_argmax_f32() != 0) return 1;
+    if (test_metal_select_greedy_with_no_repeat_f32() != 0) return 1;
     if (test_metal_dense_f16() != 0) return 1;
     if (test_metal_attention_qkvo_f16() != 0) return 1;
     if (test_metal_attention_output_residual_f16() != 0) return 1;

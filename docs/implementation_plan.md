@@ -652,8 +652,8 @@ First implementation slice, in order:
 - [x] Implement final RMSNorm.
 - [x] Implement fp16 LM head matvec to vocab `129280` with fp32 logits.
 - [x] Implement greedy argmax.
-- [ ] Implement no-repeat-ngram banning before argmax:
-  - [ ] CPU version first using logits readback if needed
+- [x] Implement no-repeat-ngram banning before argmax:
+  - [x] CPU version first using logits readback if needed
   - [ ] later GPU version for speed
 - [ ] Stop on EOS id `1` or max new tokens.
 - [ ] Return generated token ids to C result and Python wrapper.

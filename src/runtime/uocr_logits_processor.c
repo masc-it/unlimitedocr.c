@@ -2,6 +2,7 @@
 
 #include <math.h>
 #include <stddef.h>
+#include <stdint.h>
 
 static int valid_token_id(int32_t token_id, uint32_t vocab_size) {
     return token_id >= 0 && (uint32_t)token_id < vocab_size;
@@ -182,6 +183,40 @@ int uocr_no_repeat_ngram_apply(float *logits,
             continue;
         }
         logits[token_id] = -INFINITY;
+    }
+    return UOCR_OK;
+}
+
+int uocr_no_repeat_ngram_apply_batch(float *logits,
+                                     uint32_t n_rows,
+                                     uint32_t vocab_size,
+                                     const uocr_no_repeat_ngram_config *configs_or_null) {
+    if (vocab_size == 0u) {
+        return UOCR_ERROR_INVALID_ARGUMENT;
+    }
+    if (n_rows == 0u || configs_or_null == NULL) {
+        return UOCR_OK;
+    }
+    if (logits == NULL) {
+        return UOCR_ERROR_INVALID_ARGUMENT;
+    }
+    if ((uint64_t)n_rows > (uint64_t)SIZE_MAX / ((uint64_t)vocab_size * (uint64_t)sizeof(float))) {
+        return UOCR_ERROR_INVALID_ARGUMENT;
+    }
+
+    for (uint32_t row = 0u; row < n_rows; ++row) {
+        const uocr_no_repeat_ngram_config *config = &configs_or_null[row];
+        const int status = uocr_no_repeat_ngram_apply(logits + (size_t)row * (size_t)vocab_size,
+                                                      vocab_size,
+                                                      config->sequence,
+                                                      config->sequence_len,
+                                                      config->ngram_size,
+                                                      config->window,
+                                                      NULL,
+                                                      0u);
+        if (status != UOCR_OK) {
+            return status;
+        }
     }
     return UOCR_OK;
 }

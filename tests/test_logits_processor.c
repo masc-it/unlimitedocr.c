@@ -142,6 +142,40 @@ static int test_apply_sets_negative_infinity(void) {
     return 0;
 }
 
+static int test_apply_batch_no_repeat_before_argmax_path(void) {
+    enum { ROWS = 2, VOCAB = 8 };
+    float logits[ROWS * VOCAB];
+    for (uint32_t i = 0u; i < (uint32_t)(ROWS * VOCAB); ++i) {
+        logits[i] = (float)(i % VOCAB);
+    }
+    logits[0u * VOCAB + 3u] = 100.0f;
+    logits[0u * VOCAB + 4u] = 90.0f;
+    logits[1u * VOCAB + 4u] = 80.0f;
+    logits[1u * VOCAB + 7u] = 70.0f;
+
+    const int32_t sequence0[] = {1, 2, 3, 1, 2}; /* bans 3 for ngram=3 */
+    const int32_t sequence1[] = {4, 5, 4, 5};    /* bans 4 for ngram=2 */
+    const uocr_no_repeat_ngram_config configs[ROWS] = {
+        {sequence0, 5u, 3u, 0u},
+        {sequence1, 4u, 2u, 0u},
+    };
+
+    CHECK(uocr_no_repeat_ngram_apply_batch(logits, ROWS, VOCAB, configs) == UOCR_OK);
+    CHECK(isinf(logits[0u * VOCAB + 3u]) && logits[0u * VOCAB + 3u] < 0.0f);
+    CHECK(logits[0u * VOCAB + 4u] == 90.0f);
+    CHECK(isinf(logits[1u * VOCAB + 4u]) && logits[1u * VOCAB + 4u] < 0.0f);
+    CHECK(logits[1u * VOCAB + 7u] == 70.0f);
+
+    CHECK(uocr_no_repeat_ngram_apply_batch(logits, ROWS, VOCAB, NULL) == UOCR_OK);
+
+    const uocr_no_repeat_ngram_config invalid[ROWS] = {
+        {NULL, 5u, 3u, 0u},
+        {sequence1, 4u, 2u, 0u},
+    };
+    CHECK(uocr_no_repeat_ngram_apply_batch(logits, ROWS, VOCAB, invalid) == UOCR_ERROR_INVALID_ARGUMENT);
+    return 0;
+}
+
 static int test_disabled_and_invalid_inputs(void) {
     const int32_t sequence[] = {1, 2, 3};
     int32_t banned[2] = {123, 456};
@@ -165,6 +199,7 @@ int main(void) {
     if ((status = test_unigram_and_whitelist()) != 0) return status;
     if ((status = test_collect_deduplicates_and_reports_capacity()) != 0) return status;
     if ((status = test_apply_sets_negative_infinity()) != 0) return status;
+    if ((status = test_apply_batch_no_repeat_before_argmax_path()) != 0) return status;
     if ((status = test_disabled_and_invalid_inputs()) != 0) return status;
     return 0;
 }
