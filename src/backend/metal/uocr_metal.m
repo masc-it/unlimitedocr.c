@@ -1,5 +1,6 @@
 #include "backend/metal/uocr_metal.h"
 
+#include "core/uocr_alloc.h"
 #include "model/uocr_constants.h"
 #include "model/uocr_tensor_registry.h"
 #include "quant/uocr_quant.h"
@@ -3526,6 +3527,94 @@ static int metal_decoder_runtime_arenas_ready(const uocr_metal_context *ctx) {
            ctx->runtime_arenas[UOCR_METAL_ARENA_LOGITS_READBACK].buffer != nil;
 }
 
+typedef struct uocr_metal_hot_path_alloc_guard {
+    uocr_alloc_guard core_alloc_guard;
+    uint64_t scratch_capacity;
+    uint64_t runtime_arena_capacity;
+    NSUInteger pipeline_cache_count;
+} uocr_metal_hot_path_alloc_guard;
+
+static uocr_metal_hot_path_alloc_guard metal_hot_path_alloc_guard_begin(const uocr_metal_context *ctx) {
+    uocr_metal_hot_path_alloc_guard guard;
+    guard.core_alloc_guard = uocr_alloc_guard_begin();
+    guard.scratch_capacity = uocr_metal_context_total_scratch_capacity(ctx);
+    guard.runtime_arena_capacity = uocr_metal_context_total_runtime_arena_capacity(ctx);
+    guard.pipeline_cache_count = (ctx != NULL && ctx->pipeline_cache != nil) ? [ctx->pipeline_cache count] : 0u;
+    return guard;
+}
+
+static int metal_hot_path_alloc_guard_end(const uocr_metal_context *ctx,
+                                          const uocr_metal_hot_path_alloc_guard *guard,
+                                          const char *label,
+                                          char *error,
+                                          size_t error_size) {
+    if (ctx == NULL || guard == NULL) {
+        return metal_fail(error, error_size, "invalid %s allocation guard", label != NULL ? label : "Metal hot path");
+    }
+    if (!uocr_alloc_guard_end_no_alloc(&guard->core_alloc_guard)) {
+        return metal_fail(error,
+                          error_size,
+                          "%s allocated through the core allocator",
+                          label != NULL ? label : "Metal hot path");
+    }
+    const uint64_t scratch_capacity = uocr_metal_context_total_scratch_capacity(ctx);
+    if (scratch_capacity != guard->scratch_capacity) {
+        return metal_fail(error,
+                          error_size,
+                          "%s grew Metal scratch capacity from %llu to %llu bytes",
+                          label != NULL ? label : "Metal hot path",
+                          (unsigned long long)guard->scratch_capacity,
+                          (unsigned long long)scratch_capacity);
+    }
+    const uint64_t runtime_arena_capacity = uocr_metal_context_total_runtime_arena_capacity(ctx);
+    if (runtime_arena_capacity != guard->runtime_arena_capacity) {
+        return metal_fail(error,
+                          error_size,
+                          "%s changed runtime arena capacity from %llu to %llu bytes",
+                          label != NULL ? label : "Metal hot path",
+                          (unsigned long long)guard->runtime_arena_capacity,
+                          (unsigned long long)runtime_arena_capacity);
+    }
+    const NSUInteger pipeline_cache_count = ctx->pipeline_cache != nil ? [ctx->pipeline_cache count] : 0u;
+    if (pipeline_cache_count != guard->pipeline_cache_count) {
+        return metal_fail(error,
+                          error_size,
+                          "%s grew Metal pipeline cache from %llu to %llu entries",
+                          label != NULL ? label : "Metal hot path",
+                          (unsigned long long)guard->pipeline_cache_count,
+                          (unsigned long long)pipeline_cache_count);
+    }
+    return 1;
+}
+
+static int metal_prewarm_integrated_decode_pipelines(uocr_metal_context *ctx, char *error, size_t error_size) {
+    static const char *const pipeline_names[] = {
+        "uocr_rmsnorm_f16_to_f16",
+        "uocr_dense_f16_to_f32",
+        "uocr_get_rows_f16_to_f16",
+        "uocr_attention_qkvo_f16_to_f16",
+        "uocr_rope_qk_f16_to_f16",
+        "uocr_kv_cache_write_f16",
+        "uocr_decode_attention_f16_to_f16",
+        "uocr_attention_output_residual_f16_to_f16",
+        "uocr_dense_swiglu_gate_up_f16",
+        "uocr_dense_swiglu_down_f16_to_f16",
+        "uocr_moe_router_logits_f16_to_f32",
+        "uocr_moe_router_softmax_topk_f32",
+        "uocr_moe_prefill_interleaved_gate_up_f16",
+        "uocr_moe_prefill_interleaved_down_sum_f16_to_f16",
+        "uocr_moe_combine_f16_to_f16",
+    };
+    @autoreleasepool {
+        for (uint32_t i = 0u; i < (uint32_t)(sizeof(pipeline_names) / sizeof(pipeline_names[0])); ++i) {
+            if (metal_get_pipeline(ctx, pipeline_names[i], error, error_size) == nil) {
+                return 0;
+            }
+        }
+    }
+    return 1;
+}
+
 static int metal_prompt_arena_slot_offset(const uocr_metal_context *ctx,
                                           uint32_t slot,
                                           uint32_t n_tokens,
@@ -5383,7 +5472,7 @@ int uocr_metal_context_generate_f16(uocr_metal_context *ctx,
         sequence_bytes > (uint64_t)SIZE_MAX) {
         return metal_fail(error, error_size, "integrated Metal fp16 decode sequence buffer size overflow");
     }
-    int32_t *sequence = (int32_t *)malloc((size_t)sequence_bytes);
+    int32_t *sequence = (int32_t *)uocr_malloc((size_t)sequence_bytes);
     if (sequence == NULL) {
         return metal_fail(error, error_size, "failed to allocate integrated Metal fp16 decode sequence buffer");
     }
@@ -5397,7 +5486,7 @@ int uocr_metal_context_generate_f16(uocr_metal_context *ctx,
     if (!metal_logits_arena_slices(ctx, request->slot, &logits, &token_slot) ||
         !metal_hidden_arena_segment_slice(ctx, request->slot, 1u, 1u, &norm_scratch, &one_hidden_bytes) ||
         one_hidden_bytes != (uint64_t)UOCR_HIDDEN_SIZE * 2u) {
-        free(sequence);
+        uocr_free(sequence);
         return metal_fail(error, error_size, "integrated Metal fp16 decode arena slices are invalid");
     }
 
@@ -5407,9 +5496,31 @@ int uocr_metal_context_generate_f16(uocr_metal_context *ctx,
                                         ctx->integrated_prefill_final_segment,
                                         request->n_tokens - 1u,
                                         &hidden_for_selection)) {
-        free(sequence);
+        uocr_free(sequence);
         return metal_fail(error, error_size, "integrated Metal fp16 prefill final-token hidden slice is invalid");
     }
+
+    if (!metal_prewarm_integrated_decode_pipelines(ctx, error, error_size)) {
+        char detail[512];
+        (void)snprintf(detail, sizeof(detail), "%s", (error != NULL && error[0] != '\0') ? error : "unknown error");
+        uocr_free(sequence);
+        return metal_fail(error, error_size, "failed to prepare integrated Metal fp16 decode pipelines: %s", detail);
+    }
+
+    const uocr_metal_hot_path_alloc_guard decode_loop_guard =
+        metal_hot_path_alloc_guard_begin(ctx);
+    int decode_loop_ok = 1;
+    char decode_loop_error[512];
+    decode_loop_error[0] = '\0';
+
+#define UOCR_METAL_DECODE_LOOP_FAIL(...)                    \
+    do {                                                    \
+        (void)snprintf(decode_loop_error,                   \
+                       sizeof(decode_loop_error),           \
+                       __VA_ARGS__);                        \
+        decode_loop_ok = 0;                                 \
+        goto decode_loop_done;                              \
+    } while (0)
 
     while (result->generated_count < request->max_new_tokens) {
         uint32_t token_id = UINT32_MAX;
@@ -5429,12 +5540,10 @@ int uocr_metal_context_generate_f16(uocr_metal_context *ctx,
                                                            error_size)) {
             char detail[512];
             (void)snprintf(detail, sizeof(detail), "%s", (error != NULL && error[0] != '\0') ? error : "unknown error");
-            free(sequence);
-            return metal_fail(error, error_size, "integrated Metal fp16 next-token selection failed: %s", detail);
+            UOCR_METAL_DECODE_LOOP_FAIL("integrated Metal fp16 next-token selection failed: %s", detail);
         }
         if (token_id >= UOCR_VOCAB_SIZE) {
-            free(sequence);
-            return metal_fail(error, error_size, "integrated Metal fp16 selected invalid token id %u", token_id);
+            UOCR_METAL_DECODE_LOOP_FAIL("integrated Metal fp16 selected invalid token id %u", token_id);
         }
 
         result->generated_ids[result->generated_count] = (int32_t)token_id;
@@ -5455,8 +5564,7 @@ int uocr_metal_context_generate_f16(uocr_metal_context *ctx,
 
         int32_t *token_ptr = metal_token_slice_cpu_ptr(token_slot);
         if (token_ptr == NULL) {
-            free(sequence);
-            return metal_fail(error, error_size, "integrated Metal fp16 token-id arena is not CPU-visible");
+            UOCR_METAL_DECODE_LOOP_FAIL("integrated Metal fp16 token-id arena is not CPU-visible");
         }
         *token_ptr = (int32_t)token_id;
         uocr_metal_buffer_slice decode_input;
@@ -5466,8 +5574,7 @@ int uocr_metal_context_generate_f16(uocr_metal_context *ctx,
             !metal_run_token_embedding_from_token_slot_f16(ctx, token_slot, decode_input, error, error_size)) {
             char detail[512];
             (void)snprintf(detail, sizeof(detail), "%s", (error != NULL && error[0] != '\0') ? error : "unknown error");
-            free(sequence);
-            return metal_fail(error, error_size, "integrated Metal fp16 generated-token embedding failed: %s", detail);
+            UOCR_METAL_DECODE_LOOP_FAIL("integrated Metal fp16 generated-token embedding failed: %s", detail);
         }
         if (!metal_run_decoder_decode_one_f16(ctx,
                                               request->slot,
@@ -5477,17 +5584,29 @@ int uocr_metal_context_generate_f16(uocr_metal_context *ctx,
                                               error_size)) {
             char detail[512];
             (void)snprintf(detail, sizeof(detail), "%s", (error != NULL && error[0] != '\0') ? error : "unknown error");
-            free(sequence);
-            return metal_fail(error, error_size, "integrated Metal fp16 decode step failed: %s", detail);
+            UOCR_METAL_DECODE_LOOP_FAIL("integrated Metal fp16 decode step failed: %s", detail);
         }
         if (!metal_hidden_arena_segment_slice(ctx, request->slot, 0u, 1u, &hidden_for_selection, &one_hidden_bytes) ||
             one_hidden_bytes != (uint64_t)UOCR_HIDDEN_SIZE * 2u) {
-            free(sequence);
-            return metal_fail(error, error_size, "integrated Metal fp16 decode hidden slice is invalid");
+            UOCR_METAL_DECODE_LOOP_FAIL("integrated Metal fp16 decode hidden slice is invalid");
         }
     }
 
-    free(sequence);
+decode_loop_done:
+#undef UOCR_METAL_DECODE_LOOP_FAIL
+
+    if (!metal_hot_path_alloc_guard_end(ctx,
+                                        &decode_loop_guard,
+                                        "integrated Metal fp16 decode token loop",
+                                        error,
+                                        error_size)) {
+        uocr_free(sequence);
+        return 0;
+    }
+    uocr_free(sequence);
+    if (!decode_loop_ok) {
+        return metal_fail(error, error_size, "%s", decode_loop_error);
+    }
     metal_clear_error(error, error_size);
     return 1;
 }
