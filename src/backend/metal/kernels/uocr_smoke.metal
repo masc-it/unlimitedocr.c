@@ -672,6 +672,28 @@ kernel void uocr_clip_quickgelu_f16_to_f32(device const half *src [[buffer(0)]],
     dst[gid] = uocr_quickgelu(float(src[gid]));
 }
 
+kernel void uocr_clip_residual_add_f16_to_f16(device const half *base [[buffer(0)]],
+                                              device const half *update [[buffer(1)]],
+                                              device half *dst [[buffer(2)]],
+                                              constant uint &value_count [[buffer(3)]],
+                                              uint gid [[thread_position_in_grid]]) {
+    if (gid >= value_count) {
+        return;
+    }
+    dst[gid] = half(float(base[gid]) + float(update[gid]));
+}
+
+kernel void uocr_clip_residual_add_f16_to_f32(device const half *base [[buffer(0)]],
+                                              device const half *update [[buffer(1)]],
+                                              device float *dst [[buffer(2)]],
+                                              constant uint &value_count [[buffer(3)]],
+                                              uint gid [[thread_position_in_grid]]) {
+    if (gid >= value_count) {
+        return;
+    }
+    dst[gid] = float(base[gid]) + float(update[gid]);
+}
+
 struct UocrSamWindowAttentionParams {
     uint windows;
     uint tokens_per_window;

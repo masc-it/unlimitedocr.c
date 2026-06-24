@@ -566,6 +566,19 @@ int uocr_metal_context_clip_mlp_f16(uocr_metal_context *ctx,
                                     char *error,
                                     size_t error_size);
 
+/* Diagnostic CLIP residual helper for transformer block wiring. Adds two fp16
+ * [tokens,1024] tensors with fp32 arithmetic before casting. Use it for both
+ * x + out_proj(attention(norm1(x))) and x + MLP(norm2(x)).
+ */
+int uocr_metal_context_clip_residual_add_f16(uocr_metal_context *ctx,
+                                             const uint16_t *base_f16,
+                                             const uint16_t *update_f16,
+                                             uint32_t token_count,
+                                             uocr_metal_dense_output_type output_type,
+                                             void *out,
+                                             char *error,
+                                             size_t error_size);
+
 /* Diagnostic SAM window-attention helper for non-global transformer blocks.
  * Q/K/V are fp16 tensors laid out as [n_windows,14*14,12,64] (equivalent to
  * window-major rows with flattened [head,dim] channels). The helper computes

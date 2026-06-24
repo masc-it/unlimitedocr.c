@@ -781,7 +781,7 @@ Do not begin this section until sections 14.5 and 15.1 pass for fp16 single-requ
   - [x] output projection
   - [x] QuickGELU: `x * sigmoid(1.702*x)`
   - [x] MLP `1024 -> 4096 -> 1024`
-  - [ ] residual connections
+  - [x] residual connections
 - [ ] Validate CLIP output against Python dumps.
 
 ### 16.4 Projector and visual feature formatting
