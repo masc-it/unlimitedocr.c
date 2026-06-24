@@ -13463,6 +13463,24 @@ static int test_metal_rope_qk_f16(void) {
         CHECK(fabsf(f16_bits_to_f32(k_out_f16[i]) - expected_k[i]) < 4.0e-3f);
     }
 
+    memset(q_out_f32, 0, (size_t)TOKENS * HIDDEN * sizeof(float));
+    memset(k_out_f32, 0, (size_t)TOKENS * HIDDEN * sizeof(float));
+    CHECK(uocr_metal_context_rope_qk_f16(ctx,
+                                         q,
+                                         k,
+                                         1u,
+                                         0u,
+                                         UOCR_METAL_DENSE_OUTPUT_F32,
+                                         q_out_f32,
+                                         k_out_f32,
+                                         error,
+                                         sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    for (uint32_t i = 0u; i < HIDDEN; ++i) {
+        CHECK(fabsf(q_out_f32[i] - f16_bits_to_f32(q[i])) < 1.0e-6f);
+        CHECK(fabsf(k_out_f32[i] - f16_bits_to_f32(k[i])) < 1.0e-6f);
+    }
+
     CHECK(uocr_metal_context_rope_qk_f16(ctx,
                                          q,
                                          k,
