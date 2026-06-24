@@ -81,6 +81,10 @@ static size_t sam_global_attention_index(uint32_t token, uint32_t head, uint32_t
     return ((size_t)token * UOCR_SAM_ATTENTION_HEADS + head) * UOCR_SAM_HEAD_DIM + dim;
 }
 
+static size_t sam_rel_pos_attention_index(uint32_t window, uint32_t token, uint32_t head, uint32_t dim, uint32_t tokens) {
+    return (((size_t)window * tokens + token) * UOCR_SAM_ATTENTION_HEADS + head) * UOCR_SAM_HEAD_DIM + dim;
+}
+
 static float sam_cubic_weight(float x) {
     const float a = -0.75f;
     const float ax = fabsf(x);
@@ -668,6 +672,84 @@ static float sam_global_attention_expected(const uint16_t *q,
     return denominator > 0.0f ? value / denominator : 0.0f;
 }
 
+static float sam_rel_pos_table_reference(const uint16_t *rel_pos,
+                                         uint32_t source_length,
+                                         uint32_t target_length,
+                                         uint32_t target_index,
+                                         uint32_t dim) {
+    if (source_length == target_length) {
+        return f16_bits_to_f32(rel_pos[(size_t)target_index * UOCR_SAM_HEAD_DIM + dim]);
+    }
+    const float source_x = ((float)target_index + 0.5f) * (float)source_length / (float)target_length - 0.5f;
+    int index0 = (int)floorf(source_x);
+    int index1 = index0 + 1;
+    const float t = source_x - floorf(source_x);
+    if (index0 < 0) index0 = 0;
+    if (index1 < 0) index1 = 0;
+    if (index0 >= (int)source_length) index0 = (int)source_length - 1;
+    if (index1 >= (int)source_length) index1 = (int)source_length - 1;
+    const float v0 = f16_bits_to_f32(rel_pos[(size_t)(uint32_t)index0 * UOCR_SAM_HEAD_DIM + dim]);
+    const float v1 = f16_bits_to_f32(rel_pos[(size_t)(uint32_t)index1 * UOCR_SAM_HEAD_DIM + dim]);
+    return v0 * (1.0f - t) + v1 * t;
+}
+
+static float sam_rel_pos_attention_expected(const uint16_t *q,
+                                            const uint16_t *k,
+                                            const uint16_t *v,
+                                            const uint16_t *rel_pos_h,
+                                            const uint16_t *rel_pos_w,
+                                            uint32_t windows,
+                                            uint32_t grid_w,
+                                            uint32_t grid_h,
+                                            uint32_t rel_pos_h_length,
+                                            uint32_t rel_pos_w_length,
+                                            uint32_t window,
+                                            uint32_t token,
+                                            uint32_t head,
+                                            uint32_t dim) {
+    (void)windows;
+    const uint32_t tokens = grid_w * grid_h;
+    float scores[64];
+    if (tokens > (uint32_t)(sizeof(scores) / sizeof(scores[0]))) {
+        return NAN;
+    }
+    const uint32_t query_y = token / grid_w;
+    const uint32_t query_x = token - query_y * grid_w;
+    const uint32_t target_h_length = 2u * grid_h - 1u;
+    const uint32_t target_w_length = 2u * grid_w - 1u;
+    const float scale = 1.0f / sqrtf((float)UOCR_SAM_HEAD_DIM);
+    float max_score = -INFINITY;
+    for (uint32_t key = 0u; key < tokens; ++key) {
+        const uint32_t key_y = key / grid_w;
+        const uint32_t key_x = key - key_y * grid_w;
+        const uint32_t rel_h_index = (uint32_t)((int)query_y - (int)key_y + (int)grid_h - 1);
+        const uint32_t rel_w_index = (uint32_t)((int)query_x - (int)key_x + (int)grid_w - 1);
+        float qk = 0.0f;
+        float rel = 0.0f;
+        for (uint32_t d = 0u; d < UOCR_SAM_HEAD_DIM; ++d) {
+            const float q_value = f16_bits_to_f32(q[sam_rel_pos_attention_index(window, token, head, d, tokens)]);
+            qk += q_value * f16_bits_to_f32(k[sam_rel_pos_attention_index(window, key, head, d, tokens)]);
+            rel += q_value *
+                   (sam_rel_pos_table_reference(rel_pos_h, rel_pos_h_length, target_h_length, rel_h_index, d) +
+                    sam_rel_pos_table_reference(rel_pos_w, rel_pos_w_length, target_w_length, rel_w_index, d));
+        }
+        const float score = qk * scale + rel;
+        scores[key] = score;
+        if (score > max_score) {
+            max_score = score;
+        }
+    }
+
+    float denominator = 0.0f;
+    float value = 0.0f;
+    for (uint32_t key = 0u; key < tokens; ++key) {
+        const float weight = expf(scores[key] - max_score);
+        denominator += weight;
+        value += weight * f16_bits_to_f32(v[sam_rel_pos_attention_index(window, key, head, dim, tokens)]);
+    }
+    return denominator > 0.0f ? value / denominator : 0.0f;
+}
+
 static int test_metal_sam_qkv_f16(void) {
     if (!uocr_metal_is_available()) {
         return 0;
@@ -929,6 +1011,8 @@ static int test_metal_sam_global_attention_f16(void) {
     CHECK(out_f16 != NULL);
 
     CHECK(UOCR_SAM_BLOCKS == 12u);
+    CHECK(UOCR_SAM_WINDOW_REL_POS_SIZE == 27u);
+    CHECK(UOCR_SAM_MAX_REL_POS_SIZE == 127u);
     for (uint32_t block = 0u; block < UOCR_SAM_BLOCKS; ++block) {
         const int expected_global = block == 2u || block == 5u || block == 8u || block == 11u;
         CHECK(uocr_sam_block_uses_global_attention(block) == expected_global);
@@ -1040,6 +1124,204 @@ static int test_metal_sam_global_attention_f16(void) {
     uocr_metal_context_destroy(ctx);
     free(out_f16);
     free(out_f32);
+    free(v);
+    free(k);
+    free(q);
+    return 0;
+}
+
+static int test_metal_sam_rel_pos_attention_f16(void) {
+    if (!uocr_metal_is_available()) {
+        return 0;
+    }
+
+    enum {
+        WINDOWS = 2u,
+        GRID_W = 4u,
+        GRID_H = 3u,
+        TOKENS = GRID_W * GRID_H,
+        VALUES = WINDOWS * TOKENS * UOCR_SAM_HIDDEN_SIZE,
+        REL_H = 2u * GRID_H - 1u,
+        REL_W = 11u,
+    };
+    uint16_t *q = (uint16_t *)calloc(VALUES, sizeof(uint16_t));
+    uint16_t *k = (uint16_t *)calloc(VALUES, sizeof(uint16_t));
+    uint16_t *v = (uint16_t *)calloc(VALUES, sizeof(uint16_t));
+    uint16_t *rel_h = (uint16_t *)calloc((size_t)REL_H * UOCR_SAM_HEAD_DIM, sizeof(uint16_t));
+    uint16_t *rel_w = (uint16_t *)calloc((size_t)REL_W * UOCR_SAM_HEAD_DIM, sizeof(uint16_t));
+    float *out_f32 = (float *)calloc(VALUES, sizeof(float));
+    uint16_t *out_f16 = (uint16_t *)calloc(VALUES, sizeof(uint16_t));
+    CHECK(q != NULL);
+    CHECK(k != NULL);
+    CHECK(v != NULL);
+    CHECK(rel_h != NULL);
+    CHECK(rel_w != NULL);
+    CHECK(out_f32 != NULL);
+    CHECK(out_f16 != NULL);
+
+    for (uint32_t window = 0u; window < WINDOWS; ++window) {
+        for (uint32_t token = 0u; token < TOKENS; ++token) {
+            for (uint32_t head = 0u; head < UOCR_SAM_ATTENTION_HEADS; ++head) {
+                for (uint32_t dim = 0u; dim < UOCR_SAM_HEAD_DIM; ++dim) {
+                    const size_t idx = sam_rel_pos_attention_index(window, token, head, dim, TOKENS);
+                    const int q_mod = (int)((window + 2u * token + 3u * head + dim) % 19u) - 9;
+                    const int k_mod = (int)((5u * window + token + head + 2u * dim) % 23u) - 11;
+                    const int v_mod = (int)((7u * window + 3u * token + head + dim) % 29u) - 14;
+                    q[idx] = f32_to_f16_bits((float)q_mod * 0.0125f);
+                    k[idx] = f32_to_f16_bits((float)k_mod * 0.01f);
+                    v[idx] = f32_to_f16_bits((float)v_mod * 0.015f);
+                }
+            }
+        }
+    }
+    for (uint32_t i = 0u; i < REL_H; ++i) {
+        for (uint32_t dim = 0u; dim < UOCR_SAM_HEAD_DIM; ++dim) {
+            const int mod = (int)((3u * i + dim) % 17u) - 8;
+            rel_h[(size_t)i * UOCR_SAM_HEAD_DIM + dim] = f32_to_f16_bits((float)mod * 0.004f);
+        }
+    }
+    for (uint32_t i = 0u; i < REL_W; ++i) {
+        for (uint32_t dim = 0u; dim < UOCR_SAM_HEAD_DIM; ++dim) {
+            const int mod = (int)((5u * i + 2u * dim) % 19u) - 9;
+            rel_w[(size_t)i * UOCR_SAM_HEAD_DIM + dim] = f32_to_f16_bits((float)mod * 0.0035f);
+        }
+    }
+
+    char error[1024];
+    memset(error, 0, sizeof(error));
+    uocr_metal_context *ctx = uocr_metal_context_create(UOCR_TEST_METAL_RESOURCE_PATH, error, sizeof(error));
+    CHECK(ctx != NULL);
+
+    CHECK(uocr_metal_context_sam_rel_pos_attention_f16(ctx,
+                                                        q,
+                                                        k,
+                                                        v,
+                                                        rel_h,
+                                                        rel_w,
+                                                        WINDOWS,
+                                                        GRID_W,
+                                                        GRID_H,
+                                                        REL_H,
+                                                        REL_W,
+                                                        UOCR_METAL_DENSE_OUTPUT_F32,
+                                                        out_f32,
+                                                        error,
+                                                        sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+
+    struct rel_sample {
+        uint32_t window;
+        uint32_t token;
+        uint32_t head;
+        uint32_t dim;
+    } samples[] = {
+        {0u, 0u, 0u, 0u},
+        {0u, 5u, 2u, 7u},
+        {1u, 3u, 4u, 19u},
+        {1u, TOKENS - 1u, UOCR_SAM_ATTENTION_HEADS - 1u, UOCR_SAM_HEAD_DIM - 1u},
+    };
+    for (size_t i = 0u; i < sizeof(samples) / sizeof(samples[0]); ++i) {
+        const size_t idx = sam_rel_pos_attention_index(samples[i].window,
+                                                       samples[i].token,
+                                                       samples[i].head,
+                                                       samples[i].dim,
+                                                       TOKENS);
+        const float expected = sam_rel_pos_attention_expected(q,
+                                                              k,
+                                                              v,
+                                                              rel_h,
+                                                              rel_w,
+                                                              WINDOWS,
+                                                              GRID_W,
+                                                              GRID_H,
+                                                              REL_H,
+                                                              REL_W,
+                                                              samples[i].window,
+                                                              samples[i].token,
+                                                              samples[i].head,
+                                                              samples[i].dim);
+        CHECK(isfinite(expected));
+        CHECK(fabsf(out_f32[idx] - expected) <= 2.5e-4f);
+    }
+
+    CHECK(uocr_metal_context_sam_rel_pos_attention_f16(ctx,
+                                                        q,
+                                                        k,
+                                                        v,
+                                                        rel_h,
+                                                        rel_w,
+                                                        WINDOWS,
+                                                        GRID_W,
+                                                        GRID_H,
+                                                        REL_H,
+                                                        REL_W,
+                                                        UOCR_METAL_DENSE_OUTPUT_F16,
+                                                        out_f16,
+                                                        error,
+                                                        sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    for (size_t i = 0u; i < sizeof(samples) / sizeof(samples[0]); ++i) {
+        const size_t idx = sam_rel_pos_attention_index(samples[i].window,
+                                                       samples[i].token,
+                                                       samples[i].head,
+                                                       samples[i].dim,
+                                                       TOKENS);
+        const float expected = sam_rel_pos_attention_expected(q,
+                                                              k,
+                                                              v,
+                                                              rel_h,
+                                                              rel_w,
+                                                              WINDOWS,
+                                                              GRID_W,
+                                                              GRID_H,
+                                                              REL_H,
+                                                              REL_W,
+                                                              samples[i].window,
+                                                              samples[i].token,
+                                                              samples[i].head,
+                                                              samples[i].dim);
+        CHECK(isfinite(expected));
+        CHECK(fabsf(f16_bits_to_f32(out_f16[idx]) - expected) <= 2.0e-3f);
+    }
+
+    CHECK(uocr_metal_context_sam_rel_pos_attention_f16(ctx,
+                                                        q,
+                                                        k,
+                                                        v,
+                                                        rel_h,
+                                                        rel_w,
+                                                        0u,
+                                                        GRID_W,
+                                                        GRID_H,
+                                                        REL_H,
+                                                        REL_W,
+                                                        UOCR_METAL_DENSE_OUTPUT_F32,
+                                                        out_f32,
+                                                        error,
+                                                        sizeof(error)) == 0);
+    CHECK(strstr(error, "invalid Metal SAM relative-position attention") != NULL);
+    CHECK(uocr_metal_context_sam_rel_pos_attention_f16(ctx,
+                                                        q,
+                                                        k,
+                                                        v,
+                                                        rel_h,
+                                                        rel_w,
+                                                        WINDOWS,
+                                                        GRID_W,
+                                                        GRID_H,
+                                                        UOCR_SAM_MAX_REL_POS_SIZE + 1u,
+                                                        REL_W,
+                                                        UOCR_METAL_DENSE_OUTPUT_F32,
+                                                        out_f32,
+                                                        error,
+                                                        sizeof(error)) == 0);
+    CHECK(strstr(error, "exceed") != NULL);
+
+    uocr_metal_context_destroy(ctx);
+    free(out_f16);
+    free(out_f32);
+    free(rel_w);
+    free(rel_h);
     free(v);
     free(k);
     free(q);
@@ -9790,6 +10072,7 @@ int main(void) {
     if (test_metal_sam_qkv_f16() != 0) return 1;
     if (test_metal_sam_window_attention_f16() != 0) return 1;
     if (test_metal_sam_global_attention_f16() != 0) return 1;
+    if (test_metal_sam_rel_pos_attention_f16() != 0) return 1;
     if (test_metal_get_rows_f16() != 0) return 1;
     if (test_metal_prompt_assembly_f16() != 0) return 1;
     if (test_metal_prompt_assembly_from_mapped_model_f16() != 0) return 1;

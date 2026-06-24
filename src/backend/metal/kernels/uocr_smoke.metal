@@ -737,6 +737,230 @@ kernel void uocr_sam_window_attention_f16_to_f32(device const half *q_src [[buff
     }
 }
 
+struct UocrSamRelPosAttentionParams {
+    uint windows;
+    uint grid_width;
+    uint grid_height;
+    uint tokens_per_window;
+    uint heads;
+    uint head_dim;
+    uint rel_pos_h_length;
+    uint rel_pos_w_length;
+    float scale;
+    uint reserved0;
+    uint reserved1;
+    uint reserved2;
+};
+
+static inline ulong uocr_sam_rel_pos_attention_index(constant UocrSamRelPosAttentionParams &params,
+                                                     uint window,
+                                                     uint token,
+                                                     uint head,
+                                                     uint dim) {
+    return (((ulong(window) * ulong(params.tokens_per_window) + ulong(token)) * ulong(params.heads) + ulong(head)) *
+            ulong(params.head_dim)) +
+           ulong(dim);
+}
+
+static inline float uocr_sam_rel_pos_table_value(device const half *rel_pos,
+                                                 uint source_length,
+                                                 uint target_length,
+                                                 uint target_index,
+                                                 uint dim,
+                                                 uint head_dim) {
+    if (source_length == target_length) {
+        return float(rel_pos[ulong(target_index) * ulong(head_dim) + ulong(dim)]);
+    }
+
+    const float source_x = (float(target_index) + 0.5f) * float(source_length) / float(target_length) - 0.5f;
+    int index0 = int(floor(source_x));
+    int index1 = index0 + 1;
+    const float t = source_x - floor(source_x);
+    index0 = clamp(index0, 0, int(source_length) - 1);
+    index1 = clamp(index1, 0, int(source_length) - 1);
+    const float v0 = float(rel_pos[ulong(uint(index0)) * ulong(head_dim) + ulong(dim)]);
+    const float v1 = float(rel_pos[ulong(uint(index1)) * ulong(head_dim) + ulong(dim)]);
+    return v0 * (1.0f - t) + v1 * t;
+}
+
+static inline float uocr_sam_rel_pos_attention_score(device const half *q_src,
+                                                     device const half *k_src,
+                                                     device const half *rel_pos_h,
+                                                     device const half *rel_pos_w,
+                                                     constant UocrSamRelPosAttentionParams &params,
+                                                     uint window,
+                                                     uint query_token,
+                                                     uint key_token,
+                                                     uint head,
+                                                     uint tid,
+                                                     threadgroup float *partials) {
+    const uint query_y = query_token / params.grid_width;
+    const uint query_x = query_token - query_y * params.grid_width;
+    const uint key_y = key_token / params.grid_width;
+    const uint key_x = key_token - key_y * params.grid_width;
+    const uint target_h_length = 2u * params.grid_height - 1u;
+    const uint target_w_length = 2u * params.grid_width - 1u;
+    const uint rel_h_index = uint(int(query_y) - int(key_y) + int(params.grid_height) - 1);
+    const uint rel_w_index = uint(int(query_x) - int(key_x) + int(params.grid_width) - 1);
+
+    if (tid < params.head_dim) {
+        const ulong q_index = uocr_sam_rel_pos_attention_index(params, window, query_token, head, tid);
+        const ulong k_index = uocr_sam_rel_pos_attention_index(params, window, key_token, head, tid);
+        partials[tid] = float(q_src[q_index]) * float(k_src[k_index]);
+    } else {
+        partials[tid] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = params.head_dim >> 1u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            partials[tid] += partials[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const float qk_score = partials[0] * params.scale;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid < params.head_dim) {
+        const ulong q_index = uocr_sam_rel_pos_attention_index(params, window, query_token, head, tid);
+        const float q = float(q_src[q_index]);
+        const float rh = uocr_sam_rel_pos_table_value(rel_pos_h,
+                                                      params.rel_pos_h_length,
+                                                      target_h_length,
+                                                      rel_h_index,
+                                                      tid,
+                                                      params.head_dim);
+        const float rw = uocr_sam_rel_pos_table_value(rel_pos_w,
+                                                      params.rel_pos_w_length,
+                                                      target_w_length,
+                                                      rel_w_index,
+                                                      tid,
+                                                      params.head_dim);
+        partials[tid] = q * (rh + rw);
+    } else {
+        partials[tid] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = params.head_dim >> 1u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            partials[tid] += partials[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    return qk_score + partials[0];
+}
+
+kernel void uocr_sam_rel_pos_attention_f16_to_f16(device const half *q_src [[buffer(0)]],
+                                                  device const half *k_src [[buffer(1)]],
+                                                  device const half *v_src [[buffer(2)]],
+                                                  device const half *rel_pos_h [[buffer(3)]],
+                                                  device const half *rel_pos_w [[buffer(4)]],
+                                                  device half *dst [[buffer(5)]],
+                                                  constant UocrSamRelPosAttentionParams &params [[buffer(6)]],
+                                                  threadgroup float *partials [[threadgroup(0)]],
+                                                  uint group_index [[threadgroup_position_in_grid]],
+                                                  uint tid [[thread_index_in_threadgroup]],
+                                                  uint ntg [[threads_per_threadgroup]]) {
+    const uint groups_per_window = params.tokens_per_window * params.heads;
+    const uint window = group_index / groups_per_window;
+    const uint window_rem = group_index - window * groups_per_window;
+    const uint query_token = window_rem / params.heads;
+    const uint head = window_rem - query_token * params.heads;
+    if (window >= params.windows || query_token >= params.tokens_per_window || head >= params.heads ||
+        params.grid_width == 0u || params.grid_height == 0u ||
+        params.tokens_per_window != params.grid_width * params.grid_height ||
+        params.head_dim == 0u || params.head_dim > ntg) {
+        return;
+    }
+
+    float acc = 0.0f;
+    float m = -3.4028234663852886e38f;
+    float l = 0.0f;
+    for (uint key_token = 0u; key_token < params.tokens_per_window; ++key_token) {
+        const float score = uocr_sam_rel_pos_attention_score(q_src,
+                                                             k_src,
+                                                             rel_pos_h,
+                                                             rel_pos_w,
+                                                             params,
+                                                             window,
+                                                             query_token,
+                                                             key_token,
+                                                             head,
+                                                             tid,
+                                                             partials);
+        const float mnew = max(m, score);
+        const float corr = exp(m - mnew);
+        const float e = exp(score - mnew);
+        if (tid < params.head_dim) {
+            const ulong v_index = uocr_sam_rel_pos_attention_index(params, window, key_token, head, tid);
+            acc = acc * corr + e * float(v_src[v_index]);
+        }
+        l = l * corr + e;
+        m = mnew;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tid < params.head_dim) {
+        const ulong dst_index = uocr_sam_rel_pos_attention_index(params, window, query_token, head, tid);
+        dst[dst_index] = half(l > 0.0f ? acc / l : 0.0f);
+    }
+}
+
+kernel void uocr_sam_rel_pos_attention_f16_to_f32(device const half *q_src [[buffer(0)]],
+                                                  device const half *k_src [[buffer(1)]],
+                                                  device const half *v_src [[buffer(2)]],
+                                                  device const half *rel_pos_h [[buffer(3)]],
+                                                  device const half *rel_pos_w [[buffer(4)]],
+                                                  device float *dst [[buffer(5)]],
+                                                  constant UocrSamRelPosAttentionParams &params [[buffer(6)]],
+                                                  threadgroup float *partials [[threadgroup(0)]],
+                                                  uint group_index [[threadgroup_position_in_grid]],
+                                                  uint tid [[thread_index_in_threadgroup]],
+                                                  uint ntg [[threads_per_threadgroup]]) {
+    const uint groups_per_window = params.tokens_per_window * params.heads;
+    const uint window = group_index / groups_per_window;
+    const uint window_rem = group_index - window * groups_per_window;
+    const uint query_token = window_rem / params.heads;
+    const uint head = window_rem - query_token * params.heads;
+    if (window >= params.windows || query_token >= params.tokens_per_window || head >= params.heads ||
+        params.grid_width == 0u || params.grid_height == 0u ||
+        params.tokens_per_window != params.grid_width * params.grid_height ||
+        params.head_dim == 0u || params.head_dim > ntg) {
+        return;
+    }
+
+    float acc = 0.0f;
+    float m = -3.4028234663852886e38f;
+    float l = 0.0f;
+    for (uint key_token = 0u; key_token < params.tokens_per_window; ++key_token) {
+        const float score = uocr_sam_rel_pos_attention_score(q_src,
+                                                             k_src,
+                                                             rel_pos_h,
+                                                             rel_pos_w,
+                                                             params,
+                                                             window,
+                                                             query_token,
+                                                             key_token,
+                                                             head,
+                                                             tid,
+                                                             partials);
+        const float mnew = max(m, score);
+        const float corr = exp(m - mnew);
+        const float e = exp(score - mnew);
+        if (tid < params.head_dim) {
+            const ulong v_index = uocr_sam_rel_pos_attention_index(params, window, key_token, head, tid);
+            acc = acc * corr + e * float(v_src[v_index]);
+        }
+        l = l * corr + e;
+        m = mnew;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tid < params.head_dim) {
+        const ulong dst_index = uocr_sam_rel_pos_attention_index(params, window, query_token, head, tid);
+        dst[dst_index] = l > 0.0f ? acc / l : 0.0f;
+    }
+}
+
 struct UocrArgmaxParams {
     uint rows;
     uint vocab_size;

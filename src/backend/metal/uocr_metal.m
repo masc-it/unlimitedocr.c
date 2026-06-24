@@ -337,8 +337,25 @@ typedef struct uocr_metal_sam_window_attention_params {
     uint32_t reserved2;
 } uocr_metal_sam_window_attention_params;
 
+typedef struct uocr_metal_sam_rel_pos_attention_params {
+    uint32_t windows;
+    uint32_t grid_width;
+    uint32_t grid_height;
+    uint32_t tokens_per_window;
+    uint32_t heads;
+    uint32_t head_dim;
+    uint32_t rel_pos_h_length;
+    uint32_t rel_pos_w_length;
+    float scale;
+    uint32_t reserved0;
+    uint32_t reserved1;
+    uint32_t reserved2;
+} uocr_metal_sam_rel_pos_attention_params;
+
 _Static_assert(sizeof(uocr_metal_sam_window_attention_params) == 32u,
                "uocr_metal_sam_window_attention_params ABI mismatch");
+_Static_assert(sizeof(uocr_metal_sam_rel_pos_attention_params) == 48u,
+               "uocr_metal_sam_rel_pos_attention_params ABI mismatch");
 
 typedef struct uocr_metal_argmax_params {
     uint32_t rows;
@@ -6089,6 +6106,265 @@ int uocr_metal_context_sam_global_attention_f16(uocr_metal_context *ctx,
                                            "Metal SAM global attention",
                                            error,
                                            error_size);
+}
+
+int uocr_metal_context_sam_rel_pos_attention_f16(uocr_metal_context *ctx,
+                                                 const uint16_t *q_f16,
+                                                 const uint16_t *k_f16,
+                                                 const uint16_t *v_f16,
+                                                 const uint16_t *rel_pos_h_f16,
+                                                 const uint16_t *rel_pos_w_f16,
+                                                 uint32_t n_windows,
+                                                 uint32_t grid_w,
+                                                 uint32_t grid_h,
+                                                 uint32_t rel_pos_h_length,
+                                                 uint32_t rel_pos_w_length,
+                                                 uocr_metal_dense_output_type output_type,
+                                                 void *out,
+                                                 char *error,
+                                                 size_t error_size) {
+    metal_clear_error(error, error_size);
+    if (ctx == NULL || q_f16 == NULL || k_f16 == NULL || v_f16 == NULL || rel_pos_h_f16 == NULL ||
+        rel_pos_w_f16 == NULL || out == NULL || n_windows == 0u || grid_w == 0u || grid_h == 0u ||
+        rel_pos_h_length == 0u || rel_pos_w_length == 0u) {
+        return metal_fail(error, error_size, "invalid Metal SAM relative-position attention request");
+    }
+    if (output_type != UOCR_METAL_DENSE_OUTPUT_F16 && output_type != UOCR_METAL_DENSE_OUTPUT_F32) {
+        return metal_fail(error,
+                          error_size,
+                          "unsupported Metal SAM relative-position attention output type %d",
+                          (int)output_type);
+    }
+    if (UOCR_SAM_ATTENTION_HEADS * UOCR_SAM_HEAD_DIM != UOCR_SAM_HIDDEN_SIZE ||
+        UOCR_SAM_MAX_GRID_TOKENS != UOCR_SAM_MAX_GRID_SIZE * UOCR_SAM_MAX_GRID_SIZE ||
+        UOCR_SAM_MAX_REL_POS_SIZE != 2u * UOCR_SAM_MAX_GRID_SIZE - 1u ||
+        UOCR_SAM_WINDOW_REL_POS_SIZE != 2u * UOCR_SAM_WINDOW_SIZE - 1u) {
+        return metal_fail(error, error_size, "Metal SAM relative-position attention constants are inconsistent");
+    }
+    if (grid_w > UOCR_SAM_MAX_GRID_SIZE || grid_h > UOCR_SAM_MAX_GRID_SIZE ||
+        rel_pos_h_length > UOCR_SAM_MAX_REL_POS_SIZE || rel_pos_w_length > UOCR_SAM_MAX_REL_POS_SIZE) {
+        return metal_fail(error,
+                          error_size,
+                          "Metal SAM relative-position attention dimensions exceed max grid/rel-pos limits");
+    }
+
+    uint64_t tokens = 0u;
+    uint64_t attention_values = 0u;
+    uint64_t input_bytes = 0u;
+    uint64_t output_bytes = 0u;
+    uint64_t rel_h_values = 0u;
+    uint64_t rel_w_values = 0u;
+    uint64_t rel_h_bytes = 0u;
+    uint64_t rel_w_bytes = 0u;
+    uint64_t group_count = 0u;
+    const uint64_t output_element_bytes = output_type == UOCR_METAL_DENSE_OUTPUT_F16 ? 2u : (uint64_t)sizeof(float);
+    if (!checked_mul_u64((uint64_t)grid_w, (uint64_t)grid_h, &tokens) || tokens == 0u ||
+        tokens > (uint64_t)UOCR_SAM_MAX_GRID_TOKENS || tokens > (uint64_t)UINT32_MAX ||
+        !checked_mul_u64((uint64_t)n_windows, tokens, &attention_values) ||
+        !checked_mul_u64(attention_values, (uint64_t)UOCR_SAM_HIDDEN_SIZE, &attention_values) ||
+        !checked_mul_u64(attention_values, 2u, &input_bytes) ||
+        !checked_mul_u64(attention_values, output_element_bytes, &output_bytes) ||
+        !checked_mul_u64((uint64_t)rel_pos_h_length, (uint64_t)UOCR_SAM_HEAD_DIM, &rel_h_values) ||
+        !checked_mul_u64((uint64_t)rel_pos_w_length, (uint64_t)UOCR_SAM_HEAD_DIM, &rel_w_values) ||
+        !checked_mul_u64(rel_h_values, 2u, &rel_h_bytes) ||
+        !checked_mul_u64(rel_w_values, 2u, &rel_w_bytes) ||
+        !checked_mul_u64((uint64_t)n_windows, tokens, &group_count) ||
+        !checked_mul_u64(group_count, (uint64_t)UOCR_SAM_ATTENTION_HEADS, &group_count) ||
+        input_bytes > (uint64_t)SIZE_MAX || output_bytes > (uint64_t)SIZE_MAX ||
+        rel_h_bytes > (uint64_t)SIZE_MAX || rel_w_bytes > (uint64_t)SIZE_MAX ||
+        group_count > (uint64_t)UINT32_MAX) {
+        return metal_fail(error, error_size, "Metal SAM relative-position attention byte-size overflow");
+    }
+
+    const uint64_t target_rel_h_length = 2u * (uint64_t)grid_h - 1u;
+    const uint64_t target_rel_w_length = 2u * (uint64_t)grid_w - 1u;
+    if (target_rel_h_length > (uint64_t)UOCR_SAM_MAX_REL_POS_SIZE ||
+        target_rel_w_length > (uint64_t)UOCR_SAM_MAX_REL_POS_SIZE) {
+        return metal_fail(error, error_size, "Metal SAM relative-position attention target rel-pos overflow");
+    }
+
+    const uint64_t max_buffer_length = metal_device_max_buffer_length(ctx->device);
+    if (input_bytes > max_buffer_length || output_bytes > max_buffer_length ||
+        rel_h_bytes > max_buffer_length || rel_w_bytes > max_buffer_length) {
+        return metal_fail(error,
+                          error_size,
+                          "Metal SAM relative-position attention buffers exceed maxBufferLength %llu",
+                          (unsigned long long)max_buffer_length);
+    }
+
+    @autoreleasepool {
+        const char *function_name = output_type == UOCR_METAL_DENSE_OUTPUT_F16 ?
+                                        "uocr_sam_rel_pos_attention_f16_to_f16" :
+                                        "uocr_sam_rel_pos_attention_f16_to_f32";
+        id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, function_name, error, error_size);
+        if (pipeline == nil) {
+            return 0;
+        }
+
+        id<MTLBuffer> q_src = [ctx->device newBufferWithBytes:q_f16
+                                                       length:(NSUInteger)input_bytes
+                                                      options:MTLResourceStorageModeShared];
+        if (q_src == nil) {
+            return metal_fail(error, error_size, "failed to allocate Metal SAM relative-position attention Q buffer");
+        }
+        q_src.label = @"uocr_sam_rel_pos_attention_q_f16";
+
+        id<MTLBuffer> k_src = [ctx->device newBufferWithBytes:k_f16
+                                                       length:(NSUInteger)input_bytes
+                                                      options:MTLResourceStorageModeShared];
+        if (k_src == nil) {
+            [q_src release];
+            return metal_fail(error, error_size, "failed to allocate Metal SAM relative-position attention K buffer");
+        }
+        k_src.label = @"uocr_sam_rel_pos_attention_k_f16";
+
+        id<MTLBuffer> v_src = [ctx->device newBufferWithBytes:v_f16
+                                                       length:(NSUInteger)input_bytes
+                                                      options:MTLResourceStorageModeShared];
+        if (v_src == nil) {
+            [k_src release];
+            [q_src release];
+            return metal_fail(error, error_size, "failed to allocate Metal SAM relative-position attention V buffer");
+        }
+        v_src.label = @"uocr_sam_rel_pos_attention_v_f16";
+
+        id<MTLBuffer> rel_h = [ctx->device newBufferWithBytes:rel_pos_h_f16
+                                                      length:(NSUInteger)rel_h_bytes
+                                                     options:MTLResourceStorageModeShared];
+        if (rel_h == nil) {
+            [v_src release];
+            [k_src release];
+            [q_src release];
+            return metal_fail(error, error_size, "failed to allocate Metal SAM relative-position H buffer");
+        }
+        rel_h.label = @"uocr_sam_rel_pos_h_f16";
+
+        id<MTLBuffer> rel_w = [ctx->device newBufferWithBytes:rel_pos_w_f16
+                                                      length:(NSUInteger)rel_w_bytes
+                                                     options:MTLResourceStorageModeShared];
+        if (rel_w == nil) {
+            [rel_h release];
+            [v_src release];
+            [k_src release];
+            [q_src release];
+            return metal_fail(error, error_size, "failed to allocate Metal SAM relative-position W buffer");
+        }
+        rel_w.label = @"uocr_sam_rel_pos_w_f16";
+
+        id<MTLBuffer> dst = [ctx->device newBufferWithLength:(NSUInteger)output_bytes options:MTLResourceStorageModeShared];
+        if (dst == nil) {
+            [rel_w release];
+            [rel_h release];
+            [v_src release];
+            [k_src release];
+            [q_src release];
+            return metal_fail(error, error_size, "failed to allocate Metal SAM relative-position attention output buffer");
+        }
+        dst.label = @"uocr_sam_rel_pos_attention_output";
+        memset([dst contents], 0, (size_t)output_bytes);
+
+        id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
+        if (cb == nil) {
+            [dst release];
+            [rel_w release];
+            [rel_h release];
+            [v_src release];
+            [k_src release];
+            [q_src release];
+            return metal_fail(error, error_size, "failed to create Metal SAM relative-position attention command buffer");
+        }
+        cb.label = @"uocr_sam_rel_pos_attention_command_buffer";
+
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        if (enc == nil) {
+            [dst release];
+            [rel_w release];
+            [rel_h release];
+            [v_src release];
+            [k_src release];
+            [q_src release];
+            return metal_fail(error, error_size, "failed to create Metal SAM relative-position attention command encoder");
+        }
+
+        uocr_metal_sam_rel_pos_attention_params params;
+        params.windows = n_windows;
+        params.grid_width = grid_w;
+        params.grid_height = grid_h;
+        params.tokens_per_window = (uint32_t)tokens;
+        params.heads = UOCR_SAM_ATTENTION_HEADS;
+        params.head_dim = UOCR_SAM_HEAD_DIM;
+        params.rel_pos_h_length = rel_pos_h_length;
+        params.rel_pos_w_length = rel_pos_w_length;
+        params.scale = 1.0f / sqrtf((float)UOCR_SAM_HEAD_DIM);
+        params.reserved0 = 0u;
+        params.reserved1 = 0u;
+        params.reserved2 = 0u;
+
+        const NSUInteger threads_per_group = metal_power2_threadgroup_width((NSUInteger)UOCR_SAM_HEAD_DIM,
+                                                                            pipeline.maxTotalThreadsPerThreadgroup);
+        if (threads_per_group < (NSUInteger)UOCR_SAM_HEAD_DIM) {
+            [dst release];
+            [rel_w release];
+            [rel_h release];
+            [v_src release];
+            [k_src release];
+            [q_src release];
+            return metal_fail(error,
+                              error_size,
+                              "Metal SAM relative-position attention needs at least %u threads",
+                              UOCR_SAM_HEAD_DIM);
+        }
+        const uint64_t threadgroup_bytes = (uint64_t)threads_per_group * (uint64_t)sizeof(float);
+        if (threadgroup_bytes > (uint64_t)ctx->device.maxThreadgroupMemoryLength) {
+            [dst release];
+            [rel_w release];
+            [rel_h release];
+            [v_src release];
+            [k_src release];
+            [q_src release];
+            return metal_fail(error, error_size, "Metal SAM relative-position attention threadgroup memory exceeds device limit");
+        }
+
+        [enc setComputePipelineState:pipeline];
+        [enc setBuffer:q_src offset:0u atIndex:0u];
+        [enc setBuffer:k_src offset:0u atIndex:1u];
+        [enc setBuffer:v_src offset:0u atIndex:2u];
+        [enc setBuffer:rel_h offset:0u atIndex:3u];
+        [enc setBuffer:rel_w offset:0u atIndex:4u];
+        [enc setBuffer:dst offset:0u atIndex:5u];
+        [enc setBytes:&params length:sizeof(params) atIndex:6u];
+        [enc setThreadgroupMemoryLength:threads_per_group * sizeof(float) atIndex:0u];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)group_count, 1u, 1u)
+             threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1u, 1u)];
+        [enc endEncoding];
+
+        [cb commit];
+        [cb waitUntilCompleted];
+        if (cb.status == MTLCommandBufferStatusError) {
+            NSString *description = cb.error != nil ? [cb.error localizedDescription] : @"unknown command-buffer error";
+            [dst release];
+            [rel_w release];
+            [rel_h release];
+            [v_src release];
+            [k_src release];
+            [q_src release];
+            return metal_fail(error,
+                              error_size,
+                              "Metal SAM relative-position attention command failed: %s",
+                              [description UTF8String]);
+        }
+
+        memcpy(out, [dst contents], (size_t)output_bytes);
+        [dst release];
+        [rel_w release];
+        [rel_h release];
+        [v_src release];
+        [k_src release];
+        [q_src release];
+    }
+
+    metal_clear_error(error, error_size);
+    return 1;
 }
 
 int uocr_metal_context_final_rmsnorm_f16(uocr_metal_context *ctx,

@@ -349,7 +349,8 @@ int uocr_metal_context_sam_window_attention_f16(uocr_metal_context *ctx,
  * 11. Q/K/V are fp16 tensors laid out as [grid_h*grid_w,12,64], and every
  * spatial token attends to every other token. The helper supports any positive
  * grid up to the SAM 64x64 patch grid; production views use 64x64 global and
- * 40x40 local grids. Relative-position bias is a separate follow-up stage.
+ * 40x40 local grids. Relative-position bias is handled by the rel-pos helper
+ * below.
  */
 int uocr_metal_context_sam_global_attention_f16(uocr_metal_context *ctx,
                                                 const uint16_t *q_f16,
@@ -361,6 +362,31 @@ int uocr_metal_context_sam_global_attention_f16(uocr_metal_context *ctx,
                                                 void *out,
                                                 char *error,
                                                 size_t error_size);
+
+/* Diagnostic SAM attention helper with decomposed relative-position bias from
+ * rel_pos_h and rel_pos_w. Q/K/V are fp16 tensors laid out as
+ * [n_windows,grid_h*grid_w,12,64]. The score is
+ * (q dot k) / sqrt(64) + q dot rel_h[q_y-k_y] + q dot rel_w[q_x-k_x], matching
+ * upstream add_decomposed_rel_pos() + scaled_dot_product_attention() semantics.
+ * rel_pos_* tables are [rel_pos_*_length,64] and are linearly interpolated at
+ * runtime when the source length differs from 2*grid_{h,w}-1 (for example,
+ * 64x64-trained global tables on a 40x40 local view).
+ */
+int uocr_metal_context_sam_rel_pos_attention_f16(uocr_metal_context *ctx,
+                                                 const uint16_t *q_f16,
+                                                 const uint16_t *k_f16,
+                                                 const uint16_t *v_f16,
+                                                 const uint16_t *rel_pos_h_f16,
+                                                 const uint16_t *rel_pos_w_f16,
+                                                 uint32_t n_windows,
+                                                 uint32_t grid_w,
+                                                 uint32_t grid_h,
+                                                 uint32_t rel_pos_h_length,
+                                                 uint32_t rel_pos_w_length,
+                                                 uocr_metal_dense_output_type output_type,
+                                                 void *out,
+                                                 char *error,
+                                                 size_t error_size);
 
 /* Runtime prompt assembly into the persistent Metal prompt-embedding arena.
  * The arena must have been allocated with uocr_metal_context_allocate_runtime_arenas().
