@@ -1,6 +1,7 @@
 #include "backend/metal/uocr_metal.h"
 
 #include "model/uocr_constants.h"
+#include "model/uocr_tensor_registry.h"
 #include "runtime/uocr_memory.h"
 
 #include <errno.h>
@@ -936,11 +937,10 @@ int uocr_metal_context_get_model_view_info(const uocr_metal_context *ctx,
     return 1;
 }
 
-int uocr_metal_context_get_tensor_binding(const uocr_metal_context *ctx,
-                                          uint32_t tensor_id,
-                                          uocr_metal_tensor_binding *out_binding) {
-    if (ctx == NULL || out_binding == NULL || tensor_id == 0u) {
-        return 0;
+static const uocr_metal_tensor_binding_internal *metal_find_tensor_binding(const uocr_metal_context *ctx,
+                                                                            uint32_t tensor_id) {
+    if (ctx == NULL || ctx->tensor_bindings == NULL || tensor_id == 0u) {
+        return NULL;
     }
     uint32_t lo = 0u;
     uint32_t hi = ctx->tensor_binding_count;
@@ -948,11 +948,7 @@ int uocr_metal_context_get_tensor_binding(const uocr_metal_context *ctx,
         const uint32_t mid = lo + (hi - lo) / 2u;
         const uint32_t mid_id = ctx->tensor_bindings[mid].tensor_id;
         if (mid_id == tensor_id) {
-            out_binding->tensor_id = ctx->tensor_bindings[mid].tensor_id;
-            out_binding->view_index = ctx->tensor_bindings[mid].view_index;
-            out_binding->inner_offset = ctx->tensor_bindings[mid].inner_offset;
-            out_binding->payload_size = ctx->tensor_bindings[mid].payload_size;
-            return 1;
+            return &ctx->tensor_bindings[mid];
         }
         if (mid_id < tensor_id) {
             lo = mid + 1u;
@@ -960,7 +956,62 @@ int uocr_metal_context_get_tensor_binding(const uocr_metal_context *ctx,
             hi = mid;
         }
     }
-    return 0;
+    return NULL;
+}
+
+int uocr_metal_context_get_tensor_binding(const uocr_metal_context *ctx,
+                                          uint32_t tensor_id,
+                                          uocr_metal_tensor_binding *out_binding) {
+    if (out_binding == NULL) {
+        return 0;
+    }
+    const uocr_metal_tensor_binding_internal *binding = metal_find_tensor_binding(ctx, tensor_id);
+    if (binding == NULL) {
+        return 0;
+    }
+    out_binding->tensor_id = binding->tensor_id;
+    out_binding->view_index = binding->view_index;
+    out_binding->inner_offset = binding->inner_offset;
+    out_binding->payload_size = binding->payload_size;
+    return 1;
+}
+
+static int metal_get_mapped_tensor_buffer(const uocr_metal_context *ctx,
+                                          uint32_t tensor_id,
+                                          uint64_t expected_payload_size,
+                                          id<MTLBuffer> *out_buffer,
+                                          NSUInteger *out_offset,
+                                          char *error,
+                                          size_t error_size) {
+    if (out_buffer == NULL || out_offset == NULL) {
+        return metal_fail(error, error_size, "invalid Metal mapped tensor output request");
+    }
+    *out_buffer = nil;
+    *out_offset = 0u;
+    if (ctx == NULL || ctx->model_views == NULL || ctx->model_view_count == 0u) {
+        return metal_fail(error, error_size, "Metal mapped tensor %u requires mapped model views", tensor_id);
+    }
+    const uocr_metal_tensor_binding_internal *binding = metal_find_tensor_binding(ctx, tensor_id);
+    if (binding == NULL) {
+        return metal_fail(error, error_size, "Metal mapped tensor %u is not present in mapped model views", tensor_id);
+    }
+    if (binding->view_index >= ctx->model_view_count || ctx->model_views[binding->view_index].buffer == nil) {
+        return metal_fail(error, error_size, "Metal mapped tensor %u has an invalid model-view binding", tensor_id);
+    }
+    if (binding->payload_size != expected_payload_size) {
+        return metal_fail(error,
+                          error_size,
+                          "Metal mapped tensor %u payload size mismatch: got %llu expected %llu",
+                          tensor_id,
+                          (unsigned long long)binding->payload_size,
+                          (unsigned long long)expected_payload_size);
+    }
+    if (binding->inner_offset > (uint64_t)NSUIntegerMax) {
+        return metal_fail(error, error_size, "Metal mapped tensor %u offset exceeds platform limit", tensor_id);
+    }
+    *out_buffer = ctx->model_views[binding->view_index].buffer;
+    *out_offset = (NSUInteger)binding->inner_offset;
+    return 1;
 }
 
 static int scratch_slot_valid(uocr_metal_scratch_slot slot) {
@@ -2031,25 +2082,27 @@ int uocr_metal_context_assemble_prompt_f16(uocr_metal_context *ctx,
     return 1;
 }
 
-int uocr_metal_context_rmsnorm_f16(uocr_metal_context *ctx,
-                                   const uint16_t *input_f16,
-                                   const uint16_t *weight_f16,
-                                   uint32_t n_rows,
-                                   uint32_t hidden_size,
-                                   float eps,
-                                   uocr_metal_rmsnorm_output_type output_type,
-                                   void *out,
-                                   char *error,
-                                   size_t error_size) {
-    metal_clear_error(error, error_size);
-    if (ctx == NULL || input_f16 == NULL || weight_f16 == NULL || out == NULL || n_rows == 0u || hidden_size == 0u) {
-        return metal_fail(error, error_size, "invalid Metal RMSNorm request");
+static int metal_context_rmsnorm_f16_with_weight_buffer(uocr_metal_context *ctx,
+                                                         const uint16_t *input_f16,
+                                                         id<MTLBuffer> weight_buffer,
+                                                         NSUInteger weight_offset,
+                                                         uint32_t n_rows,
+                                                         uint32_t hidden_size,
+                                                         float eps,
+                                                         uocr_metal_rmsnorm_output_type output_type,
+                                                         void *out,
+                                                         const char *op_name,
+                                                         char *error,
+                                                         size_t error_size) {
+    const char *op = op_name != NULL ? op_name : "Metal RMSNorm";
+    if (ctx == NULL || input_f16 == NULL || weight_buffer == nil || out == NULL || n_rows == 0u || hidden_size == 0u) {
+        return metal_fail(error, error_size, "invalid %s request", op);
     }
     if (!(eps > 0.0f)) {
-        return metal_fail(error, error_size, "Metal RMSNorm eps must be positive");
+        return metal_fail(error, error_size, "%s eps must be positive", op);
     }
     if (output_type != UOCR_METAL_RMSNORM_OUTPUT_F16 && output_type != UOCR_METAL_RMSNORM_OUTPUT_F32) {
-        return metal_fail(error, error_size, "unsupported Metal RMSNorm output type %d", (int)output_type);
+        return metal_fail(error, error_size, "unsupported %s output type %d", op, (int)output_type);
     }
 
     uint64_t input_values = 0u;
@@ -2061,16 +2114,27 @@ int uocr_metal_context_rmsnorm_f16(uocr_metal_context *ctx,
         !checked_mul_u64(input_values, 2u, &input_bytes) ||
         !checked_mul_u64((uint64_t)hidden_size, 2u, &weight_bytes) ||
         !checked_mul_u64(input_values, output_element_bytes, &output_bytes)) {
-        return metal_fail(error, error_size, "Metal RMSNorm byte-size overflow");
+        return metal_fail(error, error_size, "%s byte-size overflow", op);
     }
 
     const uint64_t max_buffer_length = metal_device_max_buffer_length(ctx->device);
-    if (input_bytes > max_buffer_length || weight_bytes > max_buffer_length || output_bytes > max_buffer_length ||
-        input_bytes > (uint64_t)SIZE_MAX || weight_bytes > (uint64_t)SIZE_MAX || output_bytes > (uint64_t)SIZE_MAX) {
+    if (input_bytes > max_buffer_length || output_bytes > max_buffer_length ||
+        input_bytes > (uint64_t)SIZE_MAX || output_bytes > (uint64_t)SIZE_MAX) {
         return metal_fail(error,
                           error_size,
-                          "Metal RMSNorm buffers exceed maxBufferLength %llu",
+                          "%s buffers exceed maxBufferLength %llu",
+                          op,
                           (unsigned long long)max_buffer_length);
+    }
+    const uint64_t weight_length = (uint64_t)[weight_buffer length];
+    if ((uint64_t)weight_offset > weight_length || weight_bytes > weight_length - (uint64_t)weight_offset) {
+        return metal_fail(error,
+                          error_size,
+                          "%s weight buffer is too small: offset=%llu need=%llu length=%llu",
+                          op,
+                          (unsigned long long)weight_offset,
+                          (unsigned long long)weight_bytes,
+                          (unsigned long long)weight_length);
     }
 
     @autoreleasepool {
@@ -2086,24 +2150,14 @@ int uocr_metal_context_rmsnorm_f16(uocr_metal_context *ctx,
                                                      length:(NSUInteger)input_bytes
                                                     options:MTLResourceStorageModeShared];
         if (src == nil) {
-            return metal_fail(error, error_size, "failed to allocate Metal RMSNorm input buffer");
+            return metal_fail(error, error_size, "failed to allocate %s input buffer", op);
         }
         src.label = @"uocr_rmsnorm_input_f16";
 
-        id<MTLBuffer> weight = [ctx->device newBufferWithBytes:weight_f16
-                                                        length:(NSUInteger)weight_bytes
-                                                       options:MTLResourceStorageModeShared];
-        if (weight == nil) {
-            [src release];
-            return metal_fail(error, error_size, "failed to allocate Metal RMSNorm weight buffer");
-        }
-        weight.label = @"uocr_rmsnorm_weight_f16";
-
         id<MTLBuffer> dst = [ctx->device newBufferWithLength:(NSUInteger)output_bytes options:MTLResourceStorageModeShared];
         if (dst == nil) {
-            [weight release];
             [src release];
-            return metal_fail(error, error_size, "failed to allocate Metal RMSNorm output buffer");
+            return metal_fail(error, error_size, "failed to allocate %s output buffer", op);
         }
         dst.label = @"uocr_rmsnorm_output";
         memset([dst contents], 0, (size_t)output_bytes);
@@ -2111,18 +2165,16 @@ int uocr_metal_context_rmsnorm_f16(uocr_metal_context *ctx,
         id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
         if (cb == nil) {
             [dst release];
-            [weight release];
             [src release];
-            return metal_fail(error, error_size, "failed to create Metal RMSNorm command buffer");
+            return metal_fail(error, error_size, "failed to create %s command buffer", op);
         }
         cb.label = @"uocr_rmsnorm_command_buffer";
 
         id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
         if (enc == nil) {
             [dst release];
-            [weight release];
             [src release];
-            return metal_fail(error, error_size, "failed to create Metal RMSNorm command encoder");
+            return metal_fail(error, error_size, "failed to create %s command encoder", op);
         }
 
         uocr_metal_rmsnorm_params params;
@@ -2132,9 +2184,16 @@ int uocr_metal_context_rmsnorm_f16(uocr_metal_context *ctx,
         params.reserved = 0u;
 
         const NSUInteger threads_per_group = metal_power2_threadgroup_width(256u, pipeline.maxTotalThreadsPerThreadgroup);
+        const uint64_t threadgroup_bytes = (uint64_t)threads_per_group * (uint64_t)sizeof(float);
+        if (threadgroup_bytes > (uint64_t)ctx->device.maxThreadgroupMemoryLength) {
+            [dst release];
+            [src release];
+            return metal_fail(error, error_size, "%s threadgroup memory exceeds device limit", op);
+        }
+
         [enc setComputePipelineState:pipeline];
         [enc setBuffer:src offset:0u atIndex:0u];
-        [enc setBuffer:weight offset:0u atIndex:1u];
+        [enc setBuffer:weight_buffer offset:weight_offset atIndex:1u];
         [enc setBuffer:dst offset:0u atIndex:2u];
         [enc setBytes:&params length:sizeof(params) atIndex:3u];
         [enc setThreadgroupMemoryLength:threads_per_group * sizeof(float) atIndex:0u];
@@ -2147,19 +2206,108 @@ int uocr_metal_context_rmsnorm_f16(uocr_metal_context *ctx,
         if (cb.status == MTLCommandBufferStatusError) {
             NSString *description = cb.error != nil ? [cb.error localizedDescription] : @"unknown command-buffer error";
             [dst release];
-            [weight release];
             [src release];
-            return metal_fail(error, error_size, "Metal RMSNorm command failed: %s", [description UTF8String]);
+            return metal_fail(error, error_size, "%s command failed: %s", op, [description UTF8String]);
         }
 
         memcpy(out, [dst contents], (size_t)output_bytes);
         [dst release];
-        [weight release];
         [src release];
     }
 
     metal_clear_error(error, error_size);
     return 1;
+}
+
+int uocr_metal_context_rmsnorm_f16(uocr_metal_context *ctx,
+                                   const uint16_t *input_f16,
+                                   const uint16_t *weight_f16,
+                                   uint32_t n_rows,
+                                   uint32_t hidden_size,
+                                   float eps,
+                                   uocr_metal_rmsnorm_output_type output_type,
+                                   void *out,
+                                   char *error,
+                                   size_t error_size) {
+    metal_clear_error(error, error_size);
+    if (ctx == NULL || input_f16 == NULL || weight_f16 == NULL || out == NULL || n_rows == 0u || hidden_size == 0u) {
+        return metal_fail(error, error_size, "invalid Metal RMSNorm request");
+    }
+
+    uint64_t weight_bytes = 0u;
+    if (!checked_mul_u64((uint64_t)hidden_size, 2u, &weight_bytes) || weight_bytes > (uint64_t)SIZE_MAX) {
+        return metal_fail(error, error_size, "Metal RMSNorm byte-size overflow");
+    }
+    const uint64_t max_buffer_length = metal_device_max_buffer_length(ctx->device);
+    if (weight_bytes > max_buffer_length) {
+        return metal_fail(error,
+                          error_size,
+                          "Metal RMSNorm buffers exceed maxBufferLength %llu",
+                          (unsigned long long)max_buffer_length);
+    }
+
+    @autoreleasepool {
+        id<MTLBuffer> weight = [ctx->device newBufferWithBytes:weight_f16
+                                                        length:(NSUInteger)weight_bytes
+                                                       options:MTLResourceStorageModeShared];
+        if (weight == nil) {
+            return metal_fail(error, error_size, "failed to allocate Metal RMSNorm weight buffer");
+        }
+        weight.label = @"uocr_rmsnorm_weight_f16";
+        const int ok = metal_context_rmsnorm_f16_with_weight_buffer(ctx,
+                                                                    input_f16,
+                                                                    weight,
+                                                                    0u,
+                                                                    n_rows,
+                                                                    hidden_size,
+                                                                    eps,
+                                                                    output_type,
+                                                                    out,
+                                                                    "Metal RMSNorm",
+                                                                    error,
+                                                                    error_size);
+        [weight release];
+        return ok;
+    }
+}
+
+int uocr_metal_context_final_rmsnorm_f16(uocr_metal_context *ctx,
+                                         const uint16_t *input_f16,
+                                         uint32_t n_rows,
+                                         uocr_metal_rmsnorm_output_type output_type,
+                                         void *out,
+                                         char *error,
+                                         size_t error_size) {
+    metal_clear_error(error, error_size);
+    if (ctx == NULL || input_f16 == NULL || out == NULL || n_rows == 0u) {
+        return metal_fail(error, error_size, "invalid Metal final RMSNorm request");
+    }
+
+    id<MTLBuffer> weight = nil;
+    NSUInteger weight_offset = 0u;
+    const uint64_t expected_payload_size = (uint64_t)UOCR_HIDDEN_SIZE * 2u;
+    if (!metal_get_mapped_tensor_buffer(ctx,
+                                        UOCR_TENSOR_ID_FINAL_NORM,
+                                        expected_payload_size,
+                                        &weight,
+                                        &weight_offset,
+                                        error,
+                                        error_size)) {
+        return 0;
+    }
+
+    return metal_context_rmsnorm_f16_with_weight_buffer(ctx,
+                                                        input_f16,
+                                                        weight,
+                                                        weight_offset,
+                                                        n_rows,
+                                                        UOCR_HIDDEN_SIZE,
+                                                        UOCR_RMS_NORM_EPS,
+                                                        output_type,
+                                                        out,
+                                                        "Metal final RMSNorm",
+                                                        error,
+                                                        error_size);
 }
 
 int uocr_metal_context_dense_f16(uocr_metal_context *ctx,

@@ -217,6 +217,18 @@ int uocr_metal_context_rmsnorm_f16(uocr_metal_context *ctx,
                                    char *error,
                                    size_t error_size);
 
+/* Final decoder RMSNorm helper. Binds the mmap-backed FINAL_NORM tensor from
+ * mapped .uocr model views, applies the fixed Unlimited-OCR hidden size and
+ * eps=1e-6, and returns either fp16 activations or fp32 diagnostics.
+ */
+int uocr_metal_context_final_rmsnorm_f16(uocr_metal_context *ctx,
+                                         const uint16_t *input_f16,
+                                         uint32_t n_rows,
+                                         uocr_metal_rmsnorm_output_type output_type,
+                                         void *out,
+                                         char *error,
+                                         size_t error_size);
+
 /* Diagnostic fp16 dense helper for synthetic tests. Computes
  * out[row, out_col] = dot(input[row, :], weight[out_col, :]) + optional bias,
  * where weights are row-major [out_features, in_features]. Dot products are

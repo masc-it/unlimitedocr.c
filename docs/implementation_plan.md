@@ -649,7 +649,7 @@ First implementation slice, in order:
 
 ### 14.4 LM head and generation loop
 
-- [ ] Implement final RMSNorm.
+- [x] Implement final RMSNorm.
 - [ ] Implement fp16 LM head matvec to vocab `129280` with fp32 logits.
 - [ ] Implement greedy argmax.
 - [ ] Implement no-repeat-ngram banning before argmax:

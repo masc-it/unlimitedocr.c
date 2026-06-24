@@ -439,6 +439,96 @@ static int test_metal_rmsnorm_f16(void) {
     return 0;
 }
 
+static int test_metal_final_rmsnorm_f16(void) {
+    if (!uocr_metal_is_available()) {
+        return 0;
+    }
+
+    enum { ROWS = 2, HIDDEN = UOCR_HIDDEN_SIZE };
+    uint16_t input[ROWS * HIDDEN];
+    uint16_t weight[HIDDEN];
+    for (uint32_t row = 0u; row < (uint32_t)ROWS; ++row) {
+        for (uint32_t col = 0u; col < (uint32_t)HIDDEN; ++col) {
+            const int centered = (int)((row * 13u + col * 5u) % 17u) - 8;
+            input[row * (uint32_t)HIDDEN + col] = f32_to_f16_bits((float)centered * 0.0625f);
+        }
+    }
+    for (uint32_t col = 0u; col < (uint32_t)HIDDEN; ++col) {
+        weight[col] = f32_to_f16_bits(0.5f + (float)((col * 3u) % 11u) * 0.03125f);
+    }
+
+    float expected[ROWS * HIDDEN];
+    for (uint32_t row = 0u; row < (uint32_t)ROWS; ++row) {
+        float sum = 0.0f;
+        for (uint32_t col = 0u; col < (uint32_t)HIDDEN; ++col) {
+            const float x = f16_bits_to_f32(input[row * (uint32_t)HIDDEN + col]);
+            sum += x * x;
+        }
+        const float scale = 1.0f / sqrtf(sum / (float)HIDDEN + UOCR_RMS_NORM_EPS);
+        for (uint32_t col = 0u; col < (uint32_t)HIDDEN; ++col) {
+            const float x = f16_bits_to_f32(input[row * (uint32_t)HIDDEN + col]);
+            const float w = f16_bits_to_f32(weight[col]);
+            expected[row * (uint32_t)HIDDEN + col] = x * scale * w;
+        }
+    }
+
+    char path[128];
+    CHECK(uocr_test_make_temp_path(path, sizeof(path)) == 0);
+    CHECK(uocr_test_write_single_final_norm_uocr_model(path, weight) == 0);
+
+    char error[1024];
+    memset(error, 0, sizeof(error));
+    uocr_model_file model;
+    CHECK(uocr_model_file_open(path, &model, error, sizeof(error)) == 0);
+
+    uocr_metal_context *ctx = uocr_metal_context_create(UOCR_TEST_METAL_RESOURCE_PATH, error, sizeof(error));
+    CHECK(ctx != NULL);
+    CHECK(uocr_metal_context_map_model(ctx, &model, error, sizeof(error)) == 1);
+
+    float out_f32[ROWS * HIDDEN];
+    memset(out_f32, 0, sizeof(out_f32));
+    CHECK(uocr_metal_context_final_rmsnorm_f16(ctx,
+                                               input,
+                                               ROWS,
+                                               UOCR_METAL_RMSNORM_OUTPUT_F32,
+                                               out_f32,
+                                               error,
+                                               sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    for (uint32_t i = 0u; i < (uint32_t)(ROWS * HIDDEN); ++i) {
+        CHECK(fabsf(out_f32[i] - expected[i]) < 3.0e-4f);
+    }
+
+    uint16_t out_f16[ROWS * HIDDEN];
+    memset(out_f16, 0, sizeof(out_f16));
+    CHECK(uocr_metal_context_final_rmsnorm_f16(ctx,
+                                               input,
+                                               ROWS,
+                                               UOCR_METAL_RMSNORM_OUTPUT_F16,
+                                               out_f16,
+                                               error,
+                                               sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    for (uint32_t i = 0u; i < (uint32_t)(ROWS * HIDDEN); ++i) {
+        CHECK(fabsf(f16_bits_to_f32(out_f16[i]) - expected[i]) < 4.0e-3f);
+    }
+
+    uocr_metal_context_unmap_model(ctx);
+    CHECK(uocr_metal_context_final_rmsnorm_f16(ctx,
+                                               input,
+                                               ROWS,
+                                               UOCR_METAL_RMSNORM_OUTPUT_F32,
+                                               out_f32,
+                                               error,
+                                               sizeof(error)) == 0);
+    CHECK(strstr(error, "mapped model views") != NULL);
+
+    uocr_metal_context_destroy(ctx);
+    uocr_model_file_close(&model);
+    unlink(path);
+    return 0;
+}
+
 static int test_metal_dense_f16(void) {
     if (!uocr_metal_is_available()) {
         return 0;
@@ -3364,6 +3454,7 @@ int main(void) {
     if (test_metal_get_rows_f16() != 0) return 1;
     if (test_metal_prompt_assembly_f16() != 0) return 1;
     if (test_metal_rmsnorm_f16() != 0) return 1;
+    if (test_metal_final_rmsnorm_f16() != 0) return 1;
     if (test_metal_dense_f16() != 0) return 1;
     if (test_metal_attention_qkvo_f16() != 0) return 1;
     if (test_metal_attention_output_residual_f16() != 0) return 1;
