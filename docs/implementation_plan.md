@@ -789,16 +789,16 @@ Do not begin this section until sections 14.5 and 15.1 pass for fp16 single-requ
 - [x] Concatenate CLIP token features without CLS and SAM feature-map tokens: `1024 + 1024 = 2048`.
 - [x] Implement linear projector `2048 -> 1280` with bias.
 - [ ] Validate projected features against Python dumps.
-- [ ] Format global view features:
-  - [ ] reshape to grid `16x16` for `1024`
-  - [ ] append `image_newline` after each row -> `272` tokens
-  - [ ] append `view_seperator` -> `273` tokens
-- [ ] Format local crop features:
-  - [ ] each local `640` crop produces `10x10`
-  - [ ] reshape local crops as upstream: `view(height_crop_num, width_crop_num, h2, w2, dim).permute(0,2,1,3,4)`
-  - [ ] append newline after each stitched local row
-- [ ] Crop-mode final feature order must be local features first, then global row/newline features, then separator.
-- [ ] Non-crop/multi-page final feature order must be per-image global row/newline features plus separator.
+- [x] Format global view features:
+  - [x] reshape to grid `16x16` for `1024`
+  - [x] append `image_newline` after each row -> `272` tokens
+  - [x] append `view_seperator` -> `273` tokens
+- [x] Format local crop features:
+  - [x] each local `640` crop produces `10x10`
+  - [x] reshape local crops as upstream: `view(height_crop_num, width_crop_num, h2, w2, dim).permute(0,2,1,3,4)`
+  - [x] append newline after each stitched local row
+- [x] Crop-mode final feature order must be local features first, then global row/newline features, then separator.
+- [x] Non-crop/multi-page final feature order must be per-image global row/newline features plus separator.
 - [ ] Validate final visual feature buffer length and values against Python dumps.
 
 ## 17. Dynamic q8/q4 converter and kernels
