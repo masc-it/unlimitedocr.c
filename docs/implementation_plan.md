@@ -13,7 +13,7 @@ The plan is intentionally model-specific. The converter absorbs Hugging Face nam
 
 ## 0. Refined execution order and acceptance gates
 
-- [ ] **Gate A: frontend fixtures are exact.** Python prepared-request fixtures must match upstream for prompt text, token ids, image mask, crop grid, and preprocessed pixels before C inference work depends on them.
+- [x] **Gate A: frontend fixtures are exact.** Python prepared-request fixtures must match upstream for prompt text, token ids, image mask, crop grid, and preprocessed pixels before C inference work depends on them.
 - [ ] **Gate B: fp16 `.uocr` is structurally exact.** The converter/loader must account for all `2710` safetensors tensors from the current header, either as runtime tensors or explicitly marked unused/provenance-only.
 - [ ] **Gate C: integrated decoder works without vision.** The public Metal fp16 text-only generation path in `uocr_generate_prepared()` must match Python layer/logit/generated-id dumps before image paths are introduced.
 - [ ] **Gate D: integrated decoder works with dumped image embeddings.** The same generation loop, fed with Python-dumped visual embeddings, must match Python prompt/layer/router/logit/generated-id dumps before implementing the Metal vision stack.
@@ -236,7 +236,7 @@ Current priority slice, in order. The coding agent should take the first uncheck
   - [x] crop grid equality
   - [x] pixel tensor equality within exact/near-exact tolerance
   - [x] visual placeholder count equality
-- [ ] Keep the native tokenizer/image frontend out of v1; record it under later tasks only.
+- [x] Keep the native tokenizer/image frontend out of v1; record it under later tasks only.
 
 ## 5. Python golden tensor dumper
 
