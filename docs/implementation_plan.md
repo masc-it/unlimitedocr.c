@@ -40,7 +40,7 @@ Current priority slice, in order. The coding agent should take the first uncheck
 - [x] Wire the Metal backend path in `uocr_generate_prepared()` for `n_requests=1`, `views=0`, `fp16` model, and `max_new_tokens>0`; return generated ids with `uocr_result_create_from_generated()` instead of `UOCR_ERROR_NOT_IMPLEMENTED` for that narrow case.
 - [x] Add an opt-in full-model public API parity test for text-only generated ids (`UOCR_RUN_LARGE_TESTS=1`, `UOCR_MODEL_PATH`, `UOCR_LAYER_DUMP_DIR` or equivalent fixture).
 - [x] Promote the Python-dumped visual-embedding path from direct Metal tests into the same integrated decoder runner via an internal/test-only fixture adapter, without changing the stable v1 prepared-request image API.
-- [ ] Add opt-in generated-id/text parity for the integrated dumped-visual-embedding path.
+- [x] Add opt-in generated-id/text parity for the integrated dumped-visual-embedding path.
 - [ ] Start section 16 Metal vision only after the integrated dumped-visual-embedding generation path passes.
 
 ## 1. Critical facts to encode as asserts
@@ -710,7 +710,7 @@ These tasks turn the fp16 decoder primitives/parity helpers into the first real 
   - [x] per-layer hidden states
   - [x] router top-6 agreement
   - [x] logits
-  - [ ] generated ids/text
+  - [x] generated ids/text
 - [ ] Keep this mode available permanently as a parity/debug path even after Metal vision exists.
 
 ### 15.1 Integrated dumped-embedding generation path
@@ -722,7 +722,7 @@ Do this immediately after section 14.5 and before porting SAM/CLIP. The goal is 
 - [x] Assemble text tokens plus dumped visual rows into the same prompt arena layout that future Metal vision will produce.
 - [x] Validate image span length equals dumped visual feature rows and that the prepared request's view/crop metadata still passes normal validation.
 - [x] Run prefill/decode/generation through the integrated decoder for dumped image embeddings.
-- [ ] Compare generated ids/text against Python dumped-image fixtures; logits/top-k and router checks remain mandatory diagnostics when generated ids drift.
+- [x] Compare generated ids/text against Python dumped-image fixtures; logits/top-k and router checks remain mandatory diagnostics when generated ids drift.
 - [ ] Keep this path as a permanent opt-in parity mode after Metal vision lands.
 
 ## 16. Metal fp16 vision encoder
@@ -971,7 +971,7 @@ Do not start the high-level OCR API until `uocr_generate_prepared()` can return 
   - [x] `UOCR_RUN_LARGE_TESTS=1`
 - [ ] Add opt-in integrated fp16 generation tests:
   - [x] public `uocr_generate_prepared()` text-only generated ids match Python fixture
-  - [ ] integrated dumped-visual-embedding generated ids/text match Python fixture
+  - [x] integrated dumped-visual-embedding generated ids/text match Python fixture
   - [ ] unsupported public paths still return clear `UOCR_ERROR_NOT_IMPLEMENTED` messages
   - [ ] no-allocation guard passes around the decode token loop
 - [ ] Define fp16 parity thresholds per stage:

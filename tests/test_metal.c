@@ -441,6 +441,74 @@ static int read_binary_file(const char *path, unsigned char **out_bytes, size_t 
     return 1;
 }
 
+static int read_text_file_allow_empty(const char *path, char **out_text, size_t *out_size, char *error, size_t error_size) {
+    if (out_text == NULL || out_size == NULL) {
+        snprintf(error, error_size, "invalid text read request");
+        return 0;
+    }
+    *out_text = NULL;
+    *out_size = 0u;
+    FILE *f = fopen(path, "rb");
+    if (f == NULL) {
+        snprintf(error, error_size, "failed to open %s", path);
+        return 0;
+    }
+    if (fseek(f, 0L, SEEK_END) != 0) {
+        snprintf(error, error_size, "failed to seek %s", path);
+        fclose(f);
+        return 0;
+    }
+    const long size_long = ftell(f);
+    if (size_long < 0) {
+        snprintf(error, error_size, "failed to tell %s", path);
+        fclose(f);
+        return 0;
+    }
+    if (fseek(f, 0L, SEEK_SET) != 0) {
+        snprintf(error, error_size, "failed to rewind %s", path);
+        fclose(f);
+        return 0;
+    }
+    if ((uint64_t)size_long > (uint64_t)SIZE_MAX - 1u) {
+        snprintf(error, error_size, "text file %s is too large", path);
+        fclose(f);
+        return 0;
+    }
+    const size_t alloc_size = (size_t)size_long + 1u;
+    char *text = (char *)malloc(alloc_size);
+    if (text == NULL) {
+        snprintf(error, error_size, "failed to allocate %zu bytes for %s", alloc_size, path);
+        fclose(f);
+        return 0;
+    }
+    if (size_long > 0 && fread(text, 1u, (size_t)size_long, f) != (size_t)size_long) {
+        snprintf(error, error_size, "failed to read %s", path);
+        free(text);
+        fclose(f);
+        return 0;
+    }
+    fclose(f);
+    text[(size_t)size_long] = '\0';
+    *out_text = text;
+    *out_size = (size_t)size_long;
+    return 1;
+}
+
+static int read_generated_text_python_dump(const char *dump_dir, char **text_out, char *error, size_t error_size) {
+    if (text_out == NULL) {
+        snprintf(error, error_size, "invalid generated-text dump request");
+        return 0;
+    }
+    *text_out = NULL;
+    char path[4096];
+    if (!make_fixture_path(dump_dir, "generated_text.txt", path, sizeof(path))) {
+        snprintf(error, error_size, "generated-text dump path is too long");
+        return 0;
+    }
+    size_t text_size = 0u;
+    return read_text_file_allow_empty(path, text_out, &text_size, error, error_size);
+}
+
 static int read_prepared_tokens_python_dump(const char *dump_dir,
                                              int32_t **input_ids_out,
                                              uint8_t **image_mask_out,
@@ -3395,6 +3463,212 @@ static int test_metal_integrated_image_embedding_python_dump_prefill(void) {
     free(image_mask);
     free(input_ids);
     return 0;
+}
+
+static int test_metal_integrated_image_embedding_generated_ids_python_dump_parity(void) {
+    if (!uocr_metal_is_available()) {
+        return 0;
+    }
+    if (!env_flag_enabled("UOCR_RUN_LARGE_TESTS")) {
+        return 0;
+    }
+
+    const char *model_path = getenv("UOCR_MODEL_PATH");
+    const char *dump_dir = getenv("UOCR_IMAGE_EMBED_DUMP_DIR");
+    if (model_path == NULL || model_path[0] == '\0' || dump_dir == NULL || dump_dir[0] == '\0') {
+        printf("UOCR_RUN_LARGE_TESTS=1 but UOCR_MODEL_PATH/UOCR_IMAGE_EMBED_DUMP_DIR are not both set; skipping integrated image-embedding generated-id/text parity\n");
+        return 0;
+    }
+    if (!fixture_binary_exists(dump_dir, "visual_features_f16.bin") ||
+        !fixture_binary_exists(dump_dir, "prompt_embeddings_f16.bin") ||
+        !fixture_binary_exists(dump_dir, "generated_ids_i32.bin") ||
+        !fixture_binary_exists(dump_dir, "generated_text.txt")) {
+        printf("UOCR_IMAGE_EMBED_DUMP_DIR has no integrated image-embedding generated id/text fixture files; skipping integrated image-embedding generated-id/text parity\n");
+        return 0;
+    }
+
+    char error[1024];
+    memset(error, 0, sizeof(error));
+    int exit_code = 1;
+    int32_t *input_ids = NULL;
+    uint8_t *image_mask = NULL;
+    uint32_t n_tokens = 0u;
+    uint16_t *visual_features = NULL;
+    uint32_t image_span_start = UOCR_SEQUENCE_NO_IMAGE_SPAN;
+    uint32_t image_span_length = 0u;
+    uint16_t *prompt = NULL;
+    uocr_image_view *views = NULL;
+    uint32_t n_views = 0u;
+    uint32_t crop_grid_w = 0u;
+    uint32_t crop_grid_h = 0u;
+    int32_t *expected_ids = NULL;
+    uint32_t n_expected = 0u;
+    char *expected_text = NULL;
+    int32_t *generated = NULL;
+    float *scores = NULL;
+    uocr_model_file model;
+    memset(&model, 0, sizeof(model));
+    int model_open = 0;
+    uocr_metal_context *ctx = NULL;
+
+    if (read_image_prompt_embedding_python_dump(dump_dir,
+                                                &input_ids,
+                                                &image_mask,
+                                                &n_tokens,
+                                                &visual_features,
+                                                &image_span_start,
+                                                &image_span_length,
+                                                &prompt,
+                                                error,
+                                                sizeof(error)) != 1 ||
+        read_prepared_view_stubs_from_manifest(dump_dir,
+                                               &views,
+                                               &n_views,
+                                               &crop_grid_w,
+                                               &crop_grid_h,
+                                               error,
+                                               sizeof(error)) != 1 ||
+        read_text_generated_ids_python_dump(dump_dir, &expected_ids, &n_expected, error, sizeof(error)) != 1 ||
+        read_generated_text_python_dump(dump_dir, &expected_text, error, sizeof(error)) != 1) {
+        fprintf(stderr, "failed to read integrated image-embedding generated-id fixture: %s\n", error);
+        goto cleanup;
+    }
+    if (n_tokens == 0u || image_span_start == UOCR_SEQUENCE_NO_IMAGE_SPAN || image_span_length == 0u ||
+        n_expected == 0u) {
+        fprintf(stderr,
+                "invalid integrated image-embedding generated-id fixture: tokens=%u span_start=%u span_length=%u generated=%u\n",
+                n_tokens,
+                image_span_start,
+                image_span_length,
+                n_expected);
+        goto cleanup;
+    }
+
+    const uint32_t max_decoder_tokens = env_u32_or_default("UOCR_IMAGE_DECODER_MAX_TOKENS", 32u);
+    if (n_tokens > max_decoder_tokens) {
+        printf("UOCR_IMAGE_EMBED_DUMP_DIR has %u tokens; set UOCR_IMAGE_DECODER_MAX_TOKENS=%u or higher to run integrated image-embedding generated-id/text parity\n",
+               n_tokens,
+               n_tokens);
+        exit_code = 0;
+        goto cleanup;
+    }
+
+    uocr_prepared_request prepared;
+    memset(&prepared, 0, sizeof(prepared));
+    prepared.input_ids = input_ids;
+    prepared.image_mask = image_mask;
+    prepared.n_tokens = n_tokens;
+    prepared.views = views;
+    prepared.n_views = n_views;
+    prepared.crop_grid_w = crop_grid_w;
+    prepared.crop_grid_h = crop_grid_h;
+    prepared.max_new_tokens = n_expected;
+    prepared.no_repeat_ngram_size = 0u;
+    prepared.no_repeat_window = 0u;
+    uocr_request_limits limits;
+    memset(&limits, 0, sizeof(limits));
+    limits.max_prompt_tokens = n_tokens;
+    limits.max_gen_tokens = n_expected;
+    if (uocr_validate_prepared_request(&prepared, &limits, error, sizeof(error)) != UOCR_OK) {
+        fprintf(stderr, "integrated image-embedding generated-id fixture validation failed: %s\n", error);
+        goto cleanup;
+    }
+    if (uocr_count_image_placeholders(&prepared) != image_span_length) {
+        fprintf(stderr,
+                "integrated image-embedding generated-id fixture image-span mismatch: placeholders=%u span=%u\n",
+                uocr_count_image_placeholders(&prepared),
+                image_span_length);
+        goto cleanup;
+    }
+
+    if (uocr_model_file_open(model_path, &model, error, sizeof(error)) != 0) {
+        fprintf(stderr, "failed to open model for integrated image-embedding generated-id parity: %s\n", error);
+        goto cleanup;
+    }
+    model_open = 1;
+    ctx = uocr_metal_context_create(UOCR_TEST_METAL_RESOURCE_PATH, error, sizeof(error));
+    if (ctx == NULL) {
+        fprintf(stderr, "failed to create Metal context for integrated image-embedding generated-id parity: %s\n", error);
+        goto cleanup;
+    }
+    if (uocr_metal_context_map_model(ctx, &model, error, sizeof(error)) != 1 ||
+        uocr_metal_context_allocate_runtime_arenas(ctx, 1u, n_tokens, error, sizeof(error)) != 1) {
+        fprintf(stderr, "failed to prepare Metal context for integrated image-embedding generated-id parity: %s\n", error);
+        goto cleanup;
+    }
+
+    generated = (int32_t *)calloc((size_t)n_expected, sizeof(int32_t));
+    scores = (float *)calloc((size_t)n_expected, sizeof(float));
+    if (generated == NULL || scores == NULL) {
+        fprintf(stderr, "failed to allocate integrated image-embedding generated-id output buffers\n");
+        goto cleanup;
+    }
+
+    uocr_metal_decoder_request_f16 request;
+    memset(&request, 0, sizeof(request));
+    request.input_ids = input_ids;
+    request.image_mask = image_mask;
+    request.image_features_f16 = visual_features;
+    request.n_tokens = n_tokens;
+    request.max_new_tokens = n_expected;
+    request.slot = 0u;
+    request.image_span_start = image_span_start;
+    request.image_span_length = image_span_length;
+    request.no_repeat_ngram_size = 0u;
+    request.no_repeat_window = 0u;
+
+    uocr_metal_decoder_result_f16 result;
+    memset(&result, 0, sizeof(result));
+    result.generated_ids = generated;
+    result.generated_scores_f32_or_null = scores;
+    result.generated_capacity = n_expected;
+    if (uocr_metal_context_generate_f16(ctx, &request, &result, error, sizeof(error)) != 1) {
+        fprintf(stderr, "integrated image-embedding generated-id generation failed: %s\n", error);
+        goto cleanup;
+    }
+    if (result.generated_count != n_expected) {
+        fprintf(stderr,
+                "integrated image-embedding generated-id count mismatch: actual=%u expected=%u decoded_text='%s'\n",
+                result.generated_count,
+                n_expected,
+                expected_text != NULL ? expected_text : "");
+        goto cleanup;
+    }
+    for (uint32_t i = 0u; i < n_expected; ++i) {
+        if (generated[i] != expected_ids[i]) {
+            fprintf(stderr,
+                    "integrated image-embedding generated-id mismatch at %u: actual=%d expected=%d score=%g decoded_text='%s'\n",
+                    i,
+                    generated[i],
+                    expected_ids[i],
+                    (double)scores[i],
+                    expected_text != NULL ? expected_text : "");
+            goto cleanup;
+        }
+    }
+
+    /* C does not own tokenizer decoding in v1. The fixture's generated_text.txt is
+       loaded above, and exact generated-id parity makes that decoded text parity
+       deterministic for the Python-owned tokenizer/frontend path. */
+    exit_code = 0;
+
+cleanup:
+    if (ctx != NULL) {
+        uocr_metal_context_destroy(ctx);
+    }
+    if (model_open) {
+        uocr_model_file_close(&model);
+    }
+    free(scores);
+    free(generated);
+    free(expected_text);
+    free(expected_ids);
+    free(views);
+    free(prompt);
+    free(visual_features);
+    free(image_mask);
+    free(input_ids);
+    return exit_code;
 }
 
 static int test_metal_text_prompt_embedding_full_model_parity(void) {
@@ -8638,6 +8912,7 @@ int main(void) {
     if (test_metal_image_logits_topk_python_dump_parity() != 0) return 1;
     if (test_metal_image_generated_ids_python_dump_parity() != 0) return 1;
     if (test_metal_integrated_image_embedding_python_dump_prefill() != 0) return 1;
+    if (test_metal_integrated_image_embedding_generated_ids_python_dump_parity() != 0) return 1;
     if (test_metal_text_layer0_python_dump_parity() != 0) return 1;
     if (test_metal_text_layer1_python_dump_parity() != 0) return 1;
     if (test_metal_text_remaining_layers_python_dump_parity() != 0) return 1;
