@@ -899,6 +899,114 @@ static int copy_selected_moe_expert_weights(const uocr_model_file *model,
     return 1;
 }
 
+static int read_text_logits_topk_python_dump(const char *dump_dir,
+                                              int32_t **ids_out,
+                                              float **scores_out,
+                                              uint32_t *top_k_out,
+                                              char *error,
+                                              size_t error_size) {
+    if (ids_out == NULL || scores_out == NULL || top_k_out == NULL) {
+        snprintf(error, error_size, "invalid logits top-k dump request");
+        return 0;
+    }
+    *ids_out = NULL;
+    *scores_out = NULL;
+    *top_k_out = 0u;
+
+    char ids_path[4096];
+    char scores_path[4096];
+    if (!make_fixture_path(dump_dir, "logits_topk_ids_i32.bin", ids_path, sizeof(ids_path)) ||
+        !make_fixture_path(dump_dir, "logits_topk_scores_f32.bin", scores_path, sizeof(scores_path))) {
+        snprintf(error, error_size, "logits top-k dump path is too long");
+        return 0;
+    }
+
+    unsigned char *ids_bytes = NULL;
+    unsigned char *scores_bytes = NULL;
+    size_t ids_size = 0u;
+    size_t scores_size = 0u;
+    if (!read_binary_file(ids_path, &ids_bytes, &ids_size, error, error_size) ||
+        !read_binary_file(scores_path, &scores_bytes, &scores_size, error, error_size)) {
+        free(scores_bytes);
+        free(ids_bytes);
+        return 0;
+    }
+    if (ids_size == 0u || ids_size % sizeof(int32_t) != 0u || scores_size != ids_size) {
+        snprintf(error,
+                 error_size,
+                 "logits top-k size mismatch: ids=%zu bytes scores=%zu bytes",
+                 ids_size,
+                 scores_size);
+        free(scores_bytes);
+        free(ids_bytes);
+        return 0;
+    }
+    const uint32_t top_k = (uint32_t)(ids_size / sizeof(int32_t));
+    int32_t *ids = (int32_t *)malloc((size_t)top_k * sizeof(int32_t));
+    float *scores = (float *)malloc((size_t)top_k * sizeof(float));
+    if (ids == NULL || scores == NULL) {
+        snprintf(error, error_size, "failed to allocate logits top-k buffers");
+        free(scores);
+        free(ids);
+        free(scores_bytes);
+        free(ids_bytes);
+        return 0;
+    }
+    for (uint32_t i = 0u; i < top_k; ++i) {
+        const uint32_t id_bits = (uint32_t)ids_bytes[4u * i] | ((uint32_t)ids_bytes[4u * i + 1u] << 8u) |
+                                 ((uint32_t)ids_bytes[4u * i + 2u] << 16u) |
+                                 ((uint32_t)ids_bytes[4u * i + 3u] << 24u);
+        const uint32_t score_bits = (uint32_t)scores_bytes[4u * i] | ((uint32_t)scores_bytes[4u * i + 1u] << 8u) |
+                                    ((uint32_t)scores_bytes[4u * i + 2u] << 16u) |
+                                    ((uint32_t)scores_bytes[4u * i + 3u] << 24u);
+        ids[i] = (int32_t)id_bits;
+        memcpy(scores + i, &score_bits, sizeof(float));
+        if (ids[i] < 0 || ids[i] >= (int32_t)UOCR_VOCAB_SIZE || !isfinite(scores[i])) {
+            snprintf(error, error_size, "invalid logits top-k entry at rank %u", i);
+            free(scores);
+            free(ids);
+            free(scores_bytes);
+            free(ids_bytes);
+            return 0;
+        }
+    }
+    free(scores_bytes);
+    free(ids_bytes);
+    *ids_out = ids;
+    *scores_out = scores;
+    *top_k_out = top_k;
+    return 1;
+}
+
+static void compute_logits_topk_f32(const float *logits,
+                                    uint32_t vocab_size,
+                                    uint32_t top_k,
+                                    int32_t *ids_out,
+                                    float *scores_out) {
+    for (uint32_t rank = 0u; rank < top_k; ++rank) {
+        uint32_t best_id = 0u;
+        float best_score = -INFINITY;
+        for (uint32_t token = 0u; token < vocab_size; ++token) {
+            int already_selected = 0;
+            for (uint32_t prev = 0u; prev < rank; ++prev) {
+                if ((uint32_t)ids_out[prev] == token) {
+                    already_selected = 1;
+                    break;
+                }
+            }
+            if (already_selected || isnan(logits[token])) {
+                continue;
+            }
+            if (logits[token] > best_score || (logits[token] == best_score && token < best_id)) {
+                best_score = logits[token];
+                best_id = token;
+            }
+        }
+        ids_out[rank] = (int32_t)best_id;
+        scores_out[rank] = best_score;
+    }
+}
+
 static int compare_hidden_f16(const char *label,
                               const uint16_t *actual,
                               const uint16_t *expected,
@@ -1950,6 +2058,142 @@ static int test_metal_text_remaining_layers_python_dump_parity(void) {
     free(input_hidden);
     uocr_metal_context_destroy(ctx);
     uocr_model_file_close(&model);
+    free(layer0);
+    free(prompt);
+    free(input_ids);
+    return 0;
+}
+
+static int test_metal_text_logits_topk_python_dump_parity(void) {
+    if (!uocr_metal_is_available()) {
+        return 0;
+    }
+    if (!env_flag_enabled("UOCR_RUN_LARGE_TESTS")) {
+        return 0;
+    }
+
+    const char *model_path = getenv("UOCR_MODEL_PATH");
+    const char *dump_dir = getenv("UOCR_LAYER_DUMP_DIR");
+    if (model_path == NULL || model_path[0] == '\0' || dump_dir == NULL || dump_dir[0] == '\0') {
+        printf("UOCR_RUN_LARGE_TESTS=1 but UOCR_MODEL_PATH/UOCR_LAYER_DUMP_DIR are not both set; skipping text logits top-k parity\n");
+        return 0;
+    }
+    if (!fixture_binary_exists(dump_dir, "logits_topk_ids_i32.bin") ||
+        !fixture_binary_exists(dump_dir, "logits_topk_scores_f32.bin")) {
+        printf("UOCR_LAYER_DUMP_DIR has no logits_topk files; skipping text logits top-k parity\n");
+        return 0;
+    }
+
+    char error[1024];
+    memset(error, 0, sizeof(error));
+    int32_t *input_ids = NULL;
+    uint32_t n_tokens = 0u;
+    uint16_t *prompt = NULL;
+    uint16_t *layer0 = NULL;
+    uint16_t *layer11 = NULL;
+    int32_t *expected_ids = NULL;
+    float *expected_scores = NULL;
+    uint32_t top_k = 0u;
+    CHECK(read_text_layer0_python_dump(dump_dir, &input_ids, &n_tokens, &prompt, &layer0, error, sizeof(error)) == 1);
+    CHECK(read_layer_hidden_python_dump(dump_dir,
+                                        "layer_11_hidden_f16.bin",
+                                        n_tokens,
+                                        &layer11,
+                                        error,
+                                        sizeof(error)) == 1);
+    CHECK(read_text_logits_topk_python_dump(dump_dir,
+                                            &expected_ids,
+                                            &expected_scores,
+                                            &top_k,
+                                            error,
+                                            sizeof(error)) == 1);
+    CHECK(n_tokens > 0u);
+    CHECK(top_k > 0u && top_k <= 128u);
+
+    uocr_model_file model;
+    CHECK(uocr_model_file_open(model_path, &model, error, sizeof(error)) == 0);
+    uocr_metal_context *ctx = uocr_metal_context_create(UOCR_TEST_METAL_RESOURCE_PATH, error, sizeof(error));
+    CHECK(ctx != NULL);
+    CHECK(uocr_metal_context_map_model(ctx, &model, error, sizeof(error)) == 1);
+
+    uint16_t *normed = (uint16_t *)calloc((size_t)UOCR_HIDDEN_SIZE, sizeof(uint16_t));
+    float *logits = (float *)malloc((size_t)UOCR_VOCAB_SIZE * sizeof(float));
+    int32_t *actual_ids = (int32_t *)malloc((size_t)top_k * sizeof(int32_t));
+    float *actual_scores = (float *)malloc((size_t)top_k * sizeof(float));
+    CHECK(normed != NULL);
+    CHECK(logits != NULL);
+    CHECK(actual_ids != NULL);
+    CHECK(actual_scores != NULL);
+
+    const uint16_t *last_hidden = layer11 + (size_t)(n_tokens - 1u) * UOCR_HIDDEN_SIZE;
+    CHECK(uocr_metal_context_final_rmsnorm_f16(ctx,
+                                               last_hidden,
+                                               1u,
+                                               UOCR_METAL_RMSNORM_OUTPUT_F16,
+                                               normed,
+                                               error,
+                                               sizeof(error)) == 1);
+    CHECK(uocr_metal_context_lm_head_f16(ctx, normed, 1u, logits, error, sizeof(error)) == 1);
+    compute_logits_topk_f32(logits, UOCR_VOCAB_SIZE, top_k, actual_ids, actual_scores);
+    CHECK(error[0] == '\0');
+
+    for (uint32_t rank = 0u; rank < top_k; ++rank) {
+        if (actual_ids[rank] != expected_ids[rank]) {
+            fprintf(stderr,
+                    "text logits top-k id mismatch at rank %u: actual=%d expected=%d actual_score=%g expected_score=%g\n",
+                    rank,
+                    actual_ids[rank],
+                    expected_ids[rank],
+                    (double)actual_scores[rank],
+                    (double)expected_scores[rank]);
+            free(actual_scores);
+            free(actual_ids);
+            free(logits);
+            free(normed);
+            uocr_metal_context_destroy(ctx);
+            uocr_model_file_close(&model);
+            free(expected_scores);
+            free(expected_ids);
+            free(layer11);
+            free(layer0);
+            free(prompt);
+            free(input_ids);
+            return 1;
+        }
+        const float diff = fabsf(actual_scores[rank] - expected_scores[rank]);
+        if (diff > 2.5e-2f) {
+            fprintf(stderr,
+                    "text logits top-k score mismatch at rank %u token %d: actual=%g expected=%g diff=%g\n",
+                    rank,
+                    actual_ids[rank],
+                    (double)actual_scores[rank],
+                    (double)expected_scores[rank],
+                    (double)diff);
+            free(actual_scores);
+            free(actual_ids);
+            free(logits);
+            free(normed);
+            uocr_metal_context_destroy(ctx);
+            uocr_model_file_close(&model);
+            free(expected_scores);
+            free(expected_ids);
+            free(layer11);
+            free(layer0);
+            free(prompt);
+            free(input_ids);
+            return 1;
+        }
+    }
+
+    free(actual_scores);
+    free(actual_ids);
+    free(logits);
+    free(normed);
+    uocr_metal_context_destroy(ctx);
+    uocr_model_file_close(&model);
+    free(expected_scores);
+    free(expected_ids);
+    free(layer11);
     free(layer0);
     free(prompt);
     free(input_ids);
@@ -6034,6 +6278,7 @@ int main(void) {
     if (test_metal_text_layer0_python_dump_parity() != 0) return 1;
     if (test_metal_text_layer1_python_dump_parity() != 0) return 1;
     if (test_metal_text_remaining_layers_python_dump_parity() != 0) return 1;
+    if (test_metal_text_logits_topk_python_dump_parity() != 0) return 1;
     if (test_metal_rmsnorm_f16() != 0) return 1;
     if (test_metal_final_rmsnorm_f16() != 0) return 1;
     if (test_metal_lm_head_f16() != 0) return 1;

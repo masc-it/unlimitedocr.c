@@ -25,10 +25,15 @@ HIDDEN_SIZE = 1280
 
 
 TOK_EMBED_TENSOR_NAME = "model.embed_tokens.weight"
+FINAL_NORM_TENSOR_NAME = "model.norm.weight"
+LM_HEAD_TENSOR_NAME = "lm_head.weight"
 PROMPT_EMBEDDINGS_BIN = "prompt_embeddings_f16.bin"
 TEXT_LAYER0_HIDDEN_BIN = "layer_0_hidden_f16.bin"
 TEXT_LAYER1_HIDDEN_BIN = "layer_1_hidden_f16.bin"
+LOGITS_TOPK_IDS_BIN = "logits_topk_ids_i32.bin"
+LOGITS_TOPK_SCORES_BIN = "logits_topk_scores_f32.bin"
 TEXT_DECODER_LAYER_COUNT = 12
+DEFAULT_LOGITS_TOP_K = 16
 INPUT_IDS_BIN = "input_ids_i32.bin"
 IMAGE_MASK_BIN = "image_mask_u8.bin"
 
@@ -98,6 +103,12 @@ class TextLayer1Dump(TextLayer0Dump):
 @dataclass(frozen=True)
 class TextDecoderLayersDump(PromptEmbeddingDump):
     layer_hidden_f16_bits: tuple[NDArray[np.uint16], ...]
+
+
+@dataclass(frozen=True)
+class TextLogitsTopKDump(TextDecoderLayersDump):
+    logits_topk_ids: NDArray[np.int32]
+    logits_topk_scores_f32: NDArray[np.float32]
 
 
 def text_layer_hidden_filename(layer: int) -> str:
@@ -608,6 +619,80 @@ def compute_text_decoder_layer_hidden_f16_bits(
     return tuple(layers)
 
 
+def _lm_head_topk_from_normed_f16_bits(
+    normed_hidden_f16_bits: NDArray[np.uint16],
+    hf_dir: str | Path,
+    *,
+    top_k: int = DEFAULT_LOGITS_TOP_K,
+    chunk_rows: int = 4096,
+) -> tuple[NDArray[np.int32], NDArray[np.float32]]:
+    normed = np.asarray(normed_hidden_f16_bits, dtype=np.dtype("<u2"))
+    if normed.shape != (HIDDEN_SIZE,):
+        raise ValueError(f"normalized hidden row must have shape [{HIDDEN_SIZE}], got {normed.shape}")
+    if top_k <= 0 or top_k > MODEL_VOCAB_SIZE:
+        raise ValueError(f"top_k must be in [1,{MODEL_VOCAB_SIZE}], got {top_k}")
+    if chunk_rows <= 0:
+        raise ValueError("chunk_rows must be positive")
+
+    tensor = find_safetensors_tensor(hf_dir, LM_HEAD_TENSOR_NAME)
+    expected_shape = (MODEL_VOCAB_SIZE, HIDDEN_SIZE)
+    if tensor.dtype != "BF16":
+        raise ValueError(f"{LM_HEAD_TENSOR_NAME} must be BF16, got {tensor.dtype}")
+    if tensor.shape != expected_shape:
+        raise ValueError(f"{LM_HEAD_TENSOR_NAME} shape mismatch: expected {expected_shape}, got {tensor.shape}")
+
+    row_bytes = HIDDEN_SIZE * 2
+    expected_bytes = MODEL_VOCAB_SIZE * row_bytes
+    if tensor.tensor_end - tensor.tensor_start != expected_bytes:
+        raise ValueError(
+            f"{LM_HEAD_TENSOR_NAME} byte-size mismatch: expected {expected_bytes}, "
+            f"got {tensor.tensor_end - tensor.tensor_start}"
+        )
+
+    hidden = _f16_to_f32(normed)
+    best_ids = np.empty((0,), dtype=np.int32)
+    best_scores = np.empty((0,), dtype=np.float32)
+    with tensor.path.open("rb") as f:
+        for row_start in range(0, MODEL_VOCAB_SIZE, chunk_rows):
+            rows = min(chunk_rows, MODEL_VOCAB_SIZE - row_start)
+            f.seek(tensor.data_start + tensor.tensor_start + row_start * row_bytes)
+            raw = f.read(rows * row_bytes)
+            if len(raw) != rows * row_bytes:
+                raise ValueError(f"failed to read {LM_HEAD_TENSOR_NAME} rows {row_start}..{row_start + rows}")
+            bf16_words = np.frombuffer(raw, dtype=np.dtype("<u2"), count=rows * HIDDEN_SIZE).reshape(
+                (rows, HIDDEN_SIZE)
+            )
+            weight = _f16_to_f32(bf16_words_to_f16_bits(bf16_words))
+            scores = np.matmul(weight, hidden).astype(np.float32, copy=False)
+            scores = np.where(np.isfinite(scores), scores, np.float32(-np.inf)).astype(np.float32, copy=False)
+            ids = (np.arange(rows, dtype=np.int32) + np.int32(row_start)).astype(np.int32, copy=False)
+            if best_ids.size:
+                ids = np.concatenate((best_ids, ids))
+                scores = np.concatenate((best_scores, scores))
+            order = np.lexsort((ids, -scores))[:top_k]
+            best_ids = ids[order].astype(np.int32, copy=False)
+            best_scores = scores[order].astype(np.float32, copy=False)
+    return best_ids, best_scores
+
+
+def compute_text_logits_topk_f32(
+    final_hidden_f16_bits: NDArray[np.uint16],
+    hf_dir: str | Path,
+    *,
+    top_k: int = DEFAULT_LOGITS_TOP_K,
+) -> tuple[NDArray[np.int32], NDArray[np.float32]]:
+    """Compute fp32 LM-head top-k logits for the next token after a text-only prompt."""
+
+    hidden = _validate_hidden_bits("final decoder hidden", final_hidden_f16_bits)
+    final_norm_weight = read_bf16_tensor_as_f16_bits(
+        hf_dir,
+        FINAL_NORM_TENSOR_NAME,
+        expected_shape=(HIDDEN_SIZE,),
+    )
+    normed = _rmsnorm_f16_bits(hidden[-1:, :], final_norm_weight)[0]
+    return _lm_head_topk_from_normed_f16_bits(normed, hf_dir, top_k=top_k)
+
+
 def dump_prompt_embedding_fixture(
     request: PreparedRequest,
     out_dir: str | Path,
@@ -761,6 +846,37 @@ def dump_text_decoder_layers_fixture(
     return out
 
 
+def dump_text_logits_topk_fixture(
+    request: PreparedRequest,
+    out_dir: str | Path,
+    hf_dir: str | Path,
+    *,
+    top_k: int = DEFAULT_LOGITS_TOP_K,
+) -> Path:
+    """Write all text-only decoder layers plus next-token LM-head top-k logits."""
+
+    out = dump_text_decoder_layers_fixture(request, out_dir, hf_dir, layer_count=TEXT_DECODER_LAYER_COUNT)
+    layers = load_text_decoder_layers_dump(out)
+    ids, scores = compute_text_logits_topk_f32(layers.layer_hidden_f16_bits[-1], hf_dir, top_k=top_k)
+    np.asarray(ids, dtype=np.dtype("<i4")).tofile(out / LOGITS_TOPK_IDS_BIN)
+    np.asarray(scores, dtype=np.dtype("<f4")).tofile(out / LOGITS_TOPK_SCORES_BIN)
+
+    manifest_path = out / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["golden_tensors"]["logits_topk"] = {
+        "ids_file": LOGITS_TOPK_IDS_BIN,
+        "scores_file": LOGITS_TOPK_SCORES_BIN,
+        "ids_dtype": "int32_le",
+        "scores_dtype": "float32_le",
+        "shape": [int(top_k)],
+        "source": f"final RMSNorm {FINAL_NORM_TENSOR_NAME} and LM head {LM_HEAD_TENSOR_NAME}",
+        "reference_dtype_mode": "FP16 final norm activations/weights with FP32 LM-head reductions",
+        "rank_order": "score descending, token id ascending on ties",
+    }
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return out
+
+
 def load_prompt_embedding_dump(fixture_dir: str | Path) -> PromptEmbeddingDump:
     root = Path(fixture_dir)
     manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
@@ -881,4 +997,31 @@ def load_text_decoder_layers_dump(
         image_mask=prompt.image_mask,
         prompt_embeddings_f16_bits=prompt.prompt_embeddings_f16_bits,
         layer_hidden_f16_bits=layers,
+    )
+
+
+def load_text_logits_topk_dump(fixture_dir: str | Path) -> TextLogitsTopKDump:
+    layers = load_text_decoder_layers_dump(fixture_dir)
+    root = Path(fixture_dir)
+    golden = layers.manifest.get("golden_tensors", {}).get("logits_topk", {})
+    if not isinstance(golden, dict):
+        raise ValueError(f"missing logits_topk metadata in {root}")
+    shape = golden.get("shape")
+    if not isinstance(shape, list) or len(shape) != 1:
+        raise ValueError(f"invalid logits_topk shape metadata in {root}")
+    top_k = int(shape[0])
+    ids = np.fromfile(root / LOGITS_TOPK_IDS_BIN, dtype=np.dtype("<i4"))
+    scores = np.fromfile(root / LOGITS_TOPK_SCORES_BIN, dtype=np.dtype("<f4"))
+    if ids.shape != (top_k,) or scores.shape != (top_k,):
+        raise ValueError(f"logits_topk shape mismatch in {root}: ids={ids.shape} scores={scores.shape}")
+    if top_k <= 0 or np.any(ids < 0) or np.any(ids >= MODEL_VOCAB_SIZE):
+        raise ValueError(f"invalid logits_topk ids in {root}")
+    return TextLogitsTopKDump(
+        manifest=layers.manifest,
+        input_ids=layers.input_ids,
+        image_mask=layers.image_mask,
+        prompt_embeddings_f16_bits=layers.prompt_embeddings_f16_bits,
+        layer_hidden_f16_bits=layers.layer_hidden_f16_bits,
+        logits_topk_ids=ids.astype(np.int32, copy=False),
+        logits_topk_scores_f32=scores.astype(np.float32, copy=False),
     )
