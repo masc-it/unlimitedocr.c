@@ -1,6 +1,7 @@
 #include <stdio.h>
 
 #include "model/uocr_model_file.h"
+#include "quant/uocr_quant.h"
 #include "unlimitedocr.h"
 
 static void print_hash_prefix(const uint8_t hash[32]) {
@@ -225,7 +226,10 @@ int main(int argc, char **argv) {
         printf("  largest_tensors:\n");
         for (uint32_t i = 0u; i < top_count; ++i) {
             const uocr_tensor_entry *tensor = &model.tensors[top[i]];
-            printf("    [%u] id=%u family=%s qtype=%s qtype_reason=%s promotion=%s offset=%llu size=%llu offset_alignment=%llu\n",
+            uint32_t logical_input_width = 0u;
+            uint32_t physical_input_width = 0u;
+            const int has_input_widths = uocr_quant_tensor_input_widths(tensor, &logical_input_width, &physical_input_width);
+            printf("    [%u] id=%u family=%s qtype=%s qtype_reason=%s promotion=%s offset=%llu size=%llu offset_alignment=%llu",
                    i,
                    tensor->id,
                    uocr_tensor_family_name(tensor->family),
@@ -235,6 +239,13 @@ int main(int argc, char **argv) {
                    (unsigned long long)tensor->payload_offset,
                    (unsigned long long)tensor->payload_size,
                    (unsigned long long)natural_alignment(tensor->payload_offset));
+            if (has_input_widths) {
+                printf(" input_width=%u/%u padding=%u",
+                       logical_input_width,
+                       physical_input_width,
+                       physical_input_width - logical_input_width);
+            }
+            printf("\n");
         }
     }
 

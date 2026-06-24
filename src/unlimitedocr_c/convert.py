@@ -101,6 +101,8 @@ UOCR_TENSOR_PADDED_Q4_K = 21
 UOCR_TENSOR_Q2_K = 30
 UOCR_TENSOR_IQ2_XXS = 31
 
+QUANTIZED_QTYPE_IDS = frozenset({UOCR_TENSOR_Q8_0, UOCR_TENSOR_Q4_K, UOCR_TENSOR_PADDED_Q4_K})
+
 UOCR_Q8_0_BLOCK_SIZE = 32
 UOCR_Q8_0_TYPE_SIZE = 34
 UOCR_Q4_K_BLOCK_SIZE = 256
@@ -250,6 +252,9 @@ class PaddedQ4KDesign:
     logical_shape: tuple[int, int]
     physical_shape: tuple[int, int]
     padding_cols: int
+    logical_input_width: int
+    physical_input_width: int
+    input_padding_width: int
     output_bytes: int
     block_size: int
     row_size: int
@@ -263,6 +268,9 @@ class PaddedQ4KDesign:
             "logical_shape": list(self.logical_shape),
             "physical_shape": list(self.physical_shape),
             "padding_cols": self.padding_cols,
+            "logical_input_width": self.logical_input_width,
+            "physical_input_width": self.physical_input_width,
+            "input_padding_width": self.input_padding_width,
             "output_bytes": self.output_bytes,
             "block_size": self.block_size,
             "row_size": self.row_size,
@@ -287,6 +295,9 @@ class TensorPlan:
     payload_alignment: int
     block_size: int
     row_size: int
+    logical_input_width: int
+    physical_input_width: int
+    input_padding_width: int
     tensor_id: int
     family: str
     family_id: int
@@ -319,6 +330,9 @@ class TensorPlan:
             "payload_alignment": self.payload_alignment,
             "block_size": self.block_size,
             "row_size": self.row_size,
+            "logical_input_width": self.logical_input_width,
+            "physical_input_width": self.physical_input_width,
+            "input_padding_width": self.input_padding_width,
             "tensor_id": self.tensor_id,
             "family": self.family,
             "family_id": self.family_id,
@@ -400,6 +414,7 @@ class DryRunPlan:
             "promotion_reason_histogram": dict(self.promotion_reason_histogram),
             "usage_histogram": dict(self.usage_histogram),
             "family_histogram": dict(self.family_histogram),
+            "quantized_input_widths": quantized_input_width_summary(self.tensors),
             "moe_expert_packing": {
                 "layout": MOE_EXPERT_PACKING_LAYOUT,
                 "contract": MOE_EXPERT_PACKING_CONTRACT,
@@ -493,13 +508,19 @@ def describe_padded_q4_k_design(shape: tuple[int, ...]) -> PaddedQ4KDesign:
         qtype_id,
         output_dtype,
     ) = _quantized_tensor_metadata(shape, "UOCR_TENSOR_PADDED_Q4_K")
+    logical_input_width, physical_input_width, input_padding_width = _quantized_input_widths(
+        qtype_id, logical_shape, physical_shape
+    )
     return PaddedQ4KDesign(
         qtype="UOCR_TENSOR_PADDED_Q4_K",
         qtype_id=qtype_id,
         output_dtype=output_dtype,
         logical_shape=logical_shape,
         physical_shape=physical_shape,
-        padding_cols=physical_shape[1] - logical_shape[1],
+        padding_cols=input_padding_width,
+        logical_input_width=logical_input_width,
+        physical_input_width=physical_input_width,
+        input_padding_width=input_padding_width,
         output_bytes=output_bytes,
         block_size=block_size,
         row_size=row_size,
@@ -538,6 +559,101 @@ def _promotion_reason_histogram(tensors: Iterable[TensorPlan]) -> dict[str, int]
 
 def _family_histogram(tensors: Iterable[TensorPlan]) -> dict[str, int]:
     return dict(Counter(t.family for t in tensors))
+
+
+def _is_quantized_qtype(qtype_id: int) -> bool:
+    return qtype_id in QUANTIZED_QTYPE_IDS
+
+
+def _quantized_input_widths(
+    qtype_id: int,
+    logical_shape: tuple[int, ...],
+    physical_shape: tuple[int, ...],
+) -> tuple[int, int, int]:
+    """Return explicit Metal input-width metadata for quantized weights.
+
+    Quantized tensors are stored as row-major `[rows, inner]` payloads even when
+    the source was a convolution.  The logical width is the real model inner
+    dimension; the physical width is the packed/padded dimension consumed by
+    block quantized kernels.  Plain fp16/f32 tensors return zero widths so callers
+    do not accidentally treat rank-4 conv shapes as quantized input widths.
+    """
+
+    if not _is_quantized_qtype(qtype_id):
+        return 0, 0, 0
+    if len(logical_shape) != 2 or len(physical_shape) != 2:
+        raise ValueError(
+            f"quantized tensor metadata must use 2D logical/physical shapes, "
+            f"got logical={logical_shape} physical={physical_shape}"
+        )
+    if physical_shape[0] != logical_shape[0]:
+        raise ValueError(
+            f"quantized tensor row count mismatch: logical={logical_shape[0]} physical={physical_shape[0]}"
+        )
+    logical_input_width = int(logical_shape[1])
+    physical_input_width = int(physical_shape[1])
+    if logical_input_width <= 0 or physical_input_width <= 0:
+        raise ValueError(
+            f"quantized input widths must be positive, got logical={logical_input_width} "
+            f"physical={physical_input_width}"
+        )
+    if physical_input_width < logical_input_width:
+        raise ValueError(
+            f"quantized physical input width {physical_input_width} is smaller than logical {logical_input_width}"
+        )
+    return logical_input_width, physical_input_width, physical_input_width - logical_input_width
+
+
+def quantized_input_width_summary(tensors: Iterable[TensorPlan]) -> dict[str, Any]:
+    quantized = [tensor for tensor in tensors if _is_quantized_qtype(tensor.qtype_id)]
+    padded = [tensor for tensor in quantized if tensor.input_padding_width > 0]
+    max_padding = max((tensor.input_padding_width for tensor in padded), default=0)
+    return {
+        "contract": (
+            "Quantized tensors store logical_input_width as the true model inner dimension and "
+            "physical_input_width as the packed/padded inner dimension consumed by Metal kernels; "
+            "input_padding_width columns must be treated as zero."
+        ),
+        "quantized_tensor_count": len(quantized),
+        "padded_tensor_count": len(padded),
+        "max_padding_width": max_padding,
+    }
+
+
+def _validate_quantized_input_width_contract(tensors: Iterable[TensorPlan]) -> None:
+    for tensor in tensors:
+        is_quantized = _is_quantized_qtype(tensor.qtype_id)
+        if not is_quantized:
+            if tensor.logical_input_width != 0 or tensor.physical_input_width != 0 or tensor.input_padding_width != 0:
+                raise ValueError(f"plain tensor {tensor.name} must not carry quantized input-width metadata")
+            continue
+
+        logical, physical, padding = _quantized_input_widths(
+            tensor.qtype_id, tensor.logical_shape, tensor.physical_shape
+        )
+        if (tensor.logical_input_width, tensor.physical_input_width, tensor.input_padding_width) != (
+            logical,
+            physical,
+            padding,
+        ):
+            raise ValueError(f"quantized input-width metadata mismatch for {tensor.name}")
+        if tensor.block_size <= 0 or tensor.row_size <= 0:
+            raise ValueError(f"quantized tensor {tensor.name} must record block_size and row_size")
+        if physical % tensor.block_size != 0:
+            raise ValueError(
+                f"quantized tensor {tensor.name} physical input width {physical} is not a multiple of "
+                f"block_size {tensor.block_size}"
+            )
+        info = QUANT_TYPE_INFOS.get(tensor.qtype)
+        if info is not None:
+            expected_row_size = (physical // info.block_size) * info.type_size
+            if tensor.block_size != info.block_size or tensor.row_size != expected_row_size:
+                raise ValueError(
+                    f"quantized tensor {tensor.name} row metadata mismatch: block_size={tensor.block_size}, "
+                    f"row_size={tensor.row_size}, expected row_size={expected_row_size}"
+                )
+        if tensor.qtype_id == UOCR_TENSOR_Q4_K and padding != 0:
+            raise ValueError(f"Q4_K tensor {tensor.name} must not use padded input width")
 
 
 def _validate_moe_expert_interleaved_layout(tensors: Iterable[TensorPlan], *, require_complete: bool) -> None:
@@ -970,6 +1086,9 @@ def _make_tensor_plan(name: str, entry: Mapping[str, Any], qprofile: str, regist
         raise ValueError(f"unknown qprofile {qprofile!r}")
 
     qtype_reason_id, promotion_reason_id = _qtype_metadata_for_selection(qprofile, qtype, reason)
+    logical_input_width, physical_input_width, input_padding_width = _quantized_input_widths(
+        qtype_id, logical_shape, physical_shape
+    )
 
     return TensorPlan(
         name=name,
@@ -987,6 +1106,9 @@ def _make_tensor_plan(name: str, entry: Mapping[str, Any], qprofile: str, regist
         payload_alignment=UOCR_TENSOR_PAYLOAD_ALIGNMENT,
         block_size=block_size,
         row_size=row_size,
+        logical_input_width=logical_input_width,
+        physical_input_width=physical_input_width,
+        input_padding_width=input_padding_width,
         tensor_id=registry_entry.tensor_id,
         family=registry_entry.family.name,
         family_id=int(registry_entry.family),
@@ -1007,6 +1129,7 @@ def _make_tensor_plan(name: str, entry: Mapping[str, Any], qprofile: str, regist
 def _relayout_plan(plan: DryRunPlan, tensors: Iterable[TensorPlan]) -> DryRunPlan:
     ordered = tuple(sorted(tensors, key=lambda tensor: tensor.tensor_id))
     sections, laid_out, planned_file_size, metadata_bytes = _layout_dry_run_file(ordered)
+    _validate_quantized_input_width_contract(laid_out)
     return replace(
         plan,
         tensors=laid_out,
@@ -1083,6 +1206,7 @@ def build_dry_run_plan(
         for name in sorted(entries, key=lambda key: registry[key].tensor_id)
     )
     sections, tensors, planned_file_size, metadata_bytes = _layout_dry_run_file(tensors)
+    _validate_quantized_input_width_contract(tensors)
     _validate_moe_expert_interleaved_layout(tensors, require_complete=strict)
     total_source_bytes = sum(t.source_bytes for t in tensors)
     total_output_bytes = sum(t.output_bytes for t in tensors)

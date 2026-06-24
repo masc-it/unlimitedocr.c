@@ -43,6 +43,12 @@ int uocr_quant_tensor_payload_size(uint32_t qtype,
                                    const uint32_t *physical_shape,
                                    uint32_t rank,
                                    uint64_t *out_payload_size);
+/* Returns the true model inner width and the packed/padded inner width for a
+ * quantized tensor entry. Plain tensors or invalid metadata return 0.
+ */
+int uocr_quant_tensor_input_widths(const uocr_tensor_entry *tensor,
+                                   uint32_t *out_logical_input_width,
+                                   uint32_t *out_physical_input_width);
 int uocr_quant_q8_0_dequantize_row_f32(const void *row,
                                        uint32_t logical_cols,
                                        uint32_t physical_cols,

@@ -141,6 +141,38 @@ static int test_q8_cpu_dequant_and_dot(void) {
     return 0;
 }
 
+static int test_quant_tensor_input_widths(void) {
+    uint32_t logical = 0u;
+    uint32_t physical = 0u;
+    uocr_tensor_entry tensor;
+
+    CHECK(make_quant_tensor(&tensor, UOCR_TENSOR_Q8_0, 2u, 64u, 4096u) == 0);
+    CHECK(uocr_quant_tensor_input_widths(&tensor, &logical, &physical) == 1);
+    CHECK(logical == 64u);
+    CHECK(physical == 64u);
+
+    tensor.logical_shape[1] = 33u;
+    tensor.physical_shape[1] = 64u;
+    CHECK(uocr_quant_tensor_input_widths(&tensor, &logical, &physical) == 1);
+    CHECK(logical == 33u);
+    CHECK(physical == 64u);
+
+    CHECK(make_quant_tensor(&tensor, UOCR_TENSOR_Q4_K, 3u, 256u, 4096u) == 0);
+    CHECK(uocr_quant_tensor_input_widths(&tensor, &logical, &physical) == 1);
+    CHECK(logical == 256u);
+    CHECK(physical == 256u);
+    tensor.logical_shape[1] = 384u;
+    tensor.physical_shape[1] = 512u;
+    CHECK(uocr_quant_tensor_input_widths(&tensor, &logical, &physical) == 0);
+
+    tensor.qtype = UOCR_TENSOR_F16;
+    CHECK(uocr_quant_tensor_input_widths(&tensor, &logical, &physical) == 0);
+    CHECK(uocr_quant_tensor_input_widths(NULL, &logical, &physical) == 0);
+    CHECK(uocr_quant_tensor_input_widths(&tensor, NULL, &physical) == 0);
+    CHECK(uocr_quant_tensor_input_widths(&tensor, &logical, NULL) == 0);
+    return 0;
+}
+
 static int test_quant_tensor_validation(void) {
     char error[256];
     uocr_tensor_entry tensor;
@@ -192,6 +224,7 @@ int main(void) {
     if (test_quant_type_traits() != 0) return 1;
     if (test_quant_row_sizes() != 0) return 1;
     if (test_q8_cpu_dequant_and_dot() != 0) return 1;
+    if (test_quant_tensor_input_widths() != 0) return 1;
     if (test_quant_tensor_validation() != 0) return 1;
     return 0;
 }

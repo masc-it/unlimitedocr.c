@@ -159,6 +159,46 @@ int uocr_quant_tensor_payload_size(uint32_t qtype,
     return checked_mul_u64(rows, row_size, out_payload_size);
 }
 
+int uocr_quant_tensor_input_widths(const uocr_tensor_entry *tensor,
+                                   uint32_t *out_logical_input_width,
+                                   uint32_t *out_physical_input_width) {
+    if (out_logical_input_width == NULL || out_physical_input_width == NULL) {
+        return 0;
+    }
+    *out_logical_input_width = 0u;
+    *out_physical_input_width = 0u;
+    if (tensor == NULL || tensor->rank < 2u || tensor->rank > UOCR_TENSOR_MAX_DIMS) {
+        return 0;
+    }
+
+    uocr_quant_type_info info;
+    if (!uocr_quant_get_type_info(tensor->qtype, &info) || info.is_quantized == 0) {
+        return 0;
+    }
+    for (uint32_t i = 0u; i < tensor->rank; ++i) {
+        if (tensor->logical_shape[i] == 0u || tensor->physical_shape[i] == 0u) {
+            return 0;
+        }
+    }
+    for (uint32_t i = 0u; i + 1u < tensor->rank; ++i) {
+        if (tensor->logical_shape[i] != tensor->physical_shape[i]) {
+            return 0;
+        }
+    }
+
+    const uint32_t logical = tensor->logical_shape[tensor->rank - 1u];
+    const uint32_t physical = tensor->physical_shape[tensor->rank - 1u];
+    if (logical == 0u || physical < logical || info.block_size == 0u || (physical % info.block_size) != 0u) {
+        return 0;
+    }
+    if (physical != logical && tensor->qtype != UOCR_TENSOR_Q8_0 && tensor->qtype != UOCR_TENSOR_PADDED_Q4_K) {
+        return 0;
+    }
+    *out_logical_input_width = logical;
+    *out_physical_input_width = physical;
+    return 1;
+}
+
 static float f16_bits_to_f32(uint16_t h) {
     const uint32_t sign = ((uint32_t)h & 0x8000u) << 16u;
     uint32_t exp = ((uint32_t)h >> 10u) & 0x1fu;

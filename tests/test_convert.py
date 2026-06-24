@@ -289,6 +289,11 @@ def test_dyn_q8_converter_dry_run_records_quant_metadata() -> None:
     assert 0 < plan.summary_dict()["compression_ratio"] < 1
     assert plan.qtype_histogram["UOCR_TENSOR_Q8_0"] > 0
     assert plan.qtype_histogram["UOCR_TENSOR_F16"] > 0
+    width_summary = plan.summary_dict()["quantized_input_widths"]
+    assert width_summary["quantized_tensor_count"] == plan.qtype_histogram["UOCR_TENSOR_Q8_0"]
+    assert width_summary["padded_tensor_count"] > 0
+    assert width_summary["max_padding_width"] > 0
+    assert "logical_input_width" in width_summary["contract"]
     assert plan.qtype_reason_histogram["policy"] == plan.qtype_histogram["UOCR_TENSOR_Q8_0"]
     assert plan.qtype_reason_histogram["sensitive"] == plan.qtype_histogram["UOCR_TENSOR_F16"]
     assert plan.promotion_reason_histogram["none"] == plan.qtype_histogram["UOCR_TENSOR_Q8_0"]
@@ -300,6 +305,9 @@ def test_dyn_q8_converter_dry_run_records_quant_metadata() -> None:
     assert lm_head.shape == (129_280, 1280)
     assert lm_head.logical_shape == (129_280, 1280)
     assert lm_head.physical_shape == (129_280, 1280)
+    assert lm_head.logical_input_width == 1280
+    assert lm_head.physical_input_width == 1280
+    assert lm_head.input_padding_width == 0
     assert lm_head.block_size == UOCR_Q8_0_BLOCK_SIZE
     assert lm_head.row_size == (1280 // UOCR_Q8_0_BLOCK_SIZE) * UOCR_Q8_0_TYPE_SIZE
     assert lm_head.output_bytes == 129_280 * lm_head.row_size
@@ -313,11 +321,17 @@ def test_dyn_q8_converter_dry_run_records_quant_metadata() -> None:
     assert sam_patch.shape == (768, 3, 16, 16)
     assert sam_patch.logical_shape == (768, 768)
     assert sam_patch.physical_shape == (768, 768)
+    assert sam_patch.logical_input_width == 768
+    assert sam_patch.physical_input_width == 768
+    assert sam_patch.input_padding_width == 0
     assert sam_patch.output_bytes == 768 * ((768 // UOCR_Q8_0_BLOCK_SIZE) * UOCR_Q8_0_TYPE_SIZE)
 
     router = plan.tensor_by_name("model.layers.1.mlp.gate.weight")
     assert router.qtype == "UOCR_TENSOR_F16"
     assert router.logical_shape == router.shape
+    assert router.logical_input_width == 0
+    assert router.physical_input_width == 0
+    assert router.input_padding_width == 0
     assert "router" in router.reason.lower()
     assert router.qtype_reason == "sensitive"
     assert router.qtype_reason_id == UOCR_QTYPE_REASON_SENSITIVE
@@ -335,7 +349,14 @@ def test_dyn_q8_converter_dry_run_records_quant_metadata() -> None:
     assert raw_patch.shape == (1024, 3, 14, 14)
     assert raw_patch.logical_shape == (1024, 588)
     assert raw_patch.physical_shape == (1024, 608)
+    assert raw_patch.logical_input_width == 588
+    assert raw_patch.physical_input_width == 608
+    assert raw_patch.input_padding_width == 20
     assert raw_patch.row_size == (608 // UOCR_Q8_0_BLOCK_SIZE) * UOCR_Q8_0_TYPE_SIZE
+    raw_patch_dict = raw_patch.as_dict()
+    assert raw_patch_dict["logical_input_width"] == 588
+    assert raw_patch_dict["physical_input_width"] == 608
+    assert raw_patch_dict["input_padding_width"] == 20
 
     payload = _tensor_directory_bytes(filter_plan_tensors(plan, "model.sam_model.patch_embed.proj.weight"))
     header_size = _TENSOR_DIRECTORY_HEADER_STRUCT.size
@@ -358,6 +379,12 @@ def test_dyn_q4_converter_dry_run_uses_conservative_policy() -> None:
     assert plan.qtype_histogram["UOCR_TENSOR_Q4_K"] > 0
     assert plan.qtype_histogram["UOCR_TENSOR_Q8_0"] > 0
     assert plan.qtype_histogram["UOCR_TENSOR_F16"] > 0
+    width_summary = plan.summary_dict()["quantized_input_widths"]
+    assert width_summary["quantized_tensor_count"] == (
+        plan.qtype_histogram["UOCR_TENSOR_Q4_K"] + plan.qtype_histogram["UOCR_TENSOR_Q8_0"]
+    )
+    assert width_summary["padded_tensor_count"] > 0
+    assert width_summary["max_padding_width"] > 0
     assert plan.qtype_reason_histogram["policy"] == plan.qtype_histogram["UOCR_TENSOR_Q4_K"]
     assert plan.qtype_reason_histogram["unaligned"] > 0
     assert plan.qtype_reason_histogram["sensitive"] > 0
@@ -370,6 +397,9 @@ def test_dyn_q4_converter_dry_run_uses_conservative_policy() -> None:
     assert attn_q.qtype_id == UOCR_TENSOR_Q4_K
     assert attn_q.logical_shape == (1280, 1280)
     assert attn_q.physical_shape == (1280, 1280)
+    assert attn_q.logical_input_width == 1280
+    assert attn_q.physical_input_width == 1280
+    assert attn_q.input_padding_width == 0
     assert attn_q.block_size == UOCR_Q4_K_BLOCK_SIZE
     assert attn_q.row_size == (1280 // UOCR_Q4_K_BLOCK_SIZE) * UOCR_Q4_K_TYPE_SIZE
     assert "attention projection" in attn_q.reason
@@ -382,12 +412,18 @@ def test_dyn_q4_converter_dry_run_uses_conservative_policy() -> None:
     assert expert_gate.qtype == "UOCR_TENSOR_Q4_K"
     assert expert_gate.logical_shape == (896, 1280)
     assert expert_gate.physical_shape == (896, 1280)
+    assert expert_gate.logical_input_width == 1280
+    assert expert_gate.physical_input_width == 1280
+    assert expert_gate.input_padding_width == 0
     assert "routed expert gate/up" in expert_gate.reason
 
     expert_down = plan.tensor_by_name("model.layers.1.mlp.experts.7.down_proj.weight")
     assert expert_down.qtype == "UOCR_TENSOR_Q8_0"
     assert expert_down.logical_shape == (1280, 896)
     assert expert_down.physical_shape == (1280, 896)
+    assert expert_down.logical_input_width == 896
+    assert expert_down.physical_input_width == 896
+    assert expert_down.input_padding_width == 0
     assert expert_down.row_size == (896 // UOCR_Q8_0_BLOCK_SIZE) * UOCR_Q8_0_TYPE_SIZE
     assert "routed expert down" in expert_down.reason
     assert "Q8_0" in expert_down.reason
@@ -400,6 +436,9 @@ def test_dyn_q4_converter_dry_run_uses_conservative_policy() -> None:
     assert dense_down.qtype == "UOCR_TENSOR_Q8_0"
     assert dense_down.logical_shape == (1280, 6848)
     assert dense_down.physical_shape == (1280, 6848)
+    assert dense_down.logical_input_width == 6848
+    assert dense_down.physical_input_width == 6848
+    assert dense_down.input_padding_width == 0
     assert dense_down.row_size == (6848 // UOCR_Q8_0_BLOCK_SIZE) * UOCR_Q8_0_TYPE_SIZE
     assert "dense layer-0 down" in dense_down.reason
 
@@ -407,6 +446,9 @@ def test_dyn_q4_converter_dry_run_uses_conservative_policy() -> None:
     assert shared_down.qtype == "UOCR_TENSOR_Q4_K"
     assert shared_down.logical_shape == (1280, 1792)
     assert shared_down.physical_shape == (1280, 1792)
+    assert shared_down.logical_input_width == 1792
+    assert shared_down.physical_input_width == 1792
+    assert shared_down.input_padding_width == 0
     assert shared_down.row_size == (1792 // UOCR_Q4_K_BLOCK_SIZE) * UOCR_Q4_K_TYPE_SIZE
     assert "shared expert down" in shared_down.reason
 
@@ -444,23 +486,36 @@ def test_padded_q4_k_design_is_explicit_and_disabled_by_default() -> None:
     assert routed_design.logical_shape == (1280, 896)
     assert routed_design.physical_shape == (1280, 1024)
     assert routed_design.padding_cols == 128
+    assert routed_design.logical_input_width == 896
+    assert routed_design.physical_input_width == 1024
+    assert routed_design.input_padding_width == 128
     assert routed_design.block_size == UOCR_Q4_K_BLOCK_SIZE
     assert routed_design.row_size == (1024 // UOCR_Q4_K_BLOCK_SIZE) * UOCR_Q4_K_TYPE_SIZE
     assert routed_design.output_bytes == 1280 * routed_design.row_size
     assert "zero" in routed_design.kernel_contract
     assert "logical inner width" in routed_design.kernel_contract
-    assert routed_design.as_dict()["kernel_contract"] == PADDED_Q4_K_KERNEL_CONTRACT
+    routed_design_dict = routed_design.as_dict()
+    assert routed_design_dict["kernel_contract"] == PADDED_Q4_K_KERNEL_CONTRACT
+    assert routed_design_dict["logical_input_width"] == 896
+    assert routed_design_dict["physical_input_width"] == 1024
+    assert routed_design_dict["input_padding_width"] == 128
 
     dense_design = describe_padded_q4_k_design((1280, 6848))
     assert dense_design.logical_shape == (1280, 6848)
     assert dense_design.physical_shape == (1280, 6912)
     assert dense_design.padding_cols == 64
+    assert dense_design.logical_input_width == 6848
+    assert dense_design.physical_input_width == 6912
+    assert dense_design.input_padding_width == 64
     assert dense_design.row_size == (6912 // UOCR_Q4_K_BLOCK_SIZE) * UOCR_Q4_K_TYPE_SIZE
 
     aligned_design = describe_padded_q4_k_design((1280, 1792))
     assert aligned_design.logical_shape == (1280, 1792)
     assert aligned_design.physical_shape == (1280, 1792)
     assert aligned_design.padding_cols == 0
+    assert aligned_design.logical_input_width == 1792
+    assert aligned_design.physical_input_width == 1792
+    assert aligned_design.input_padding_width == 0
 
 
 def test_filter_plan_tensors_relayouts_single_tensor(tmp_path) -> None:
@@ -517,6 +572,9 @@ def test_write_uocr_model_streams_dyn_q8_payload(tmp_path) -> None:
     assert q8_tensor.qtype == "UOCR_TENSOR_Q8_0"
     assert q8_tensor.logical_shape == (2, 2)
     assert q8_tensor.physical_shape == (2, 32)
+    assert q8_tensor.logical_input_width == 2
+    assert q8_tensor.physical_input_width == 32
+    assert q8_tensor.input_padding_width == 30
     assert q8_tensor.output_bytes == 2 * UOCR_Q8_0_TYPE_SIZE
     actual_q8 = raw[q8_tensor.payload_offset : q8_tensor.payload_offset + q8_tensor.output_bytes]
     expected_q8 = _q8_0_from_bf16_payload(payloads[q8_tensor.name], q8_tensor.shape, q8_tensor.physical_shape)

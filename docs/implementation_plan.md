@@ -387,7 +387,7 @@ Current priority slice, in order. The coding agent should take the first uncheck
 - [x] Pack routed experts expert-major:
   - [x] `[layer][expert][projection][out_row][packed_input]` with interleaved `gate_proj`, `up_proj`, `down_proj` payloads per expert
 - [x] Pack or colocate expert `gate_proj` and `up_proj` so Metal selected-expert kernels can read them together.
-- [ ] Store both logical and physical input widths for quantized tensors.
+- [x] Store both logical and physical input widths for quantized tensors.
 - [ ] Explicitly mark unaligned `Q4_K` hazards:
   - [ ] routed expert `down_proj` input `896`
   - [ ] dense layer-0 `down_proj` input `6848`
