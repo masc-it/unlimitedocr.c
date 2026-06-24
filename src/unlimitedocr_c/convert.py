@@ -48,6 +48,20 @@ MOE_EXPERT_PACKING_CONTRACT = (
     "gate/up colocated for fused projection and down immediately after."
 )
 
+Q4_HAZARD_NONE = 0
+Q4_HAZARD_ROUTED_EXPERT_DOWN = 1
+Q4_HAZARD_DENSE_LAYER0_DOWN = 2
+Q4_HAZARD_ROUTED_EXPERT_DOWN_NAME = "routed-expert-down"
+Q4_HAZARD_DENSE_LAYER0_DOWN_NAME = "dense-layer0-down"
+Q4_HAZARD_ROUTED_EXPERT_DOWN_COUNT = (MOE_ROUTED_LAYER_END_EXCLUSIVE - MOE_ROUTED_LAYER_START) * MOE_ROUTED_EXPERT_COUNT
+Q4_HAZARD_DENSE_LAYER0_DOWN_COUNT = 1
+Q4_UNALIGNED_HAZARD_CONTRACT = (
+    "Plain Q4_K requires an input width divisible by 256. OCR routed expert down_proj "
+    "(896) and dense layer-0 down_proj (6848) are explicit hazards: dyn-q4 keeps "
+    "them as Q8_0 unless a future PADDED_Q4_K path records the padded width and "
+    "zero-fills padded activation columns."
+)
+
 UOCR_FILE_ALIGNMENT = 4096
 UOCR_TENSOR_DATA_ALIGNMENT = 4096
 UOCR_TENSOR_PAYLOAD_ALIGNMENT = 16
@@ -141,6 +155,22 @@ PROMOTION_REASON_NAMES: Mapping[int, str] = {
     UOCR_PROMOTION_UNALIGNED: "unaligned",
     UOCR_PROMOTION_CALIBRATION_DRIFT: "calibration-drift",
     UOCR_PROMOTION_MANUAL_OVERRIDE: "manual-override",
+}
+
+Q4_UNALIGNED_HAZARD_NAMES: Mapping[int, str] = {
+    Q4_HAZARD_NONE: "none",
+    Q4_HAZARD_ROUTED_EXPERT_DOWN: Q4_HAZARD_ROUTED_EXPERT_DOWN_NAME,
+    Q4_HAZARD_DENSE_LAYER0_DOWN: Q4_HAZARD_DENSE_LAYER0_DOWN_NAME,
+}
+
+Q4_UNALIGNED_HAZARD_DESCRIPTIONS: Mapping[int, str] = {
+    Q4_HAZARD_ROUTED_EXPERT_DOWN: "routed expert down_proj input width 896 is not Q4_K-aligned",
+    Q4_HAZARD_DENSE_LAYER0_DOWN: "dense layer-0 down_proj input width 6848 is not Q4_K-aligned",
+}
+
+Q4_UNALIGNED_HAZARD_EXPECTED_COUNTS: Mapping[int, int] = {
+    Q4_HAZARD_ROUTED_EXPERT_DOWN: Q4_HAZARD_ROUTED_EXPERT_DOWN_COUNT,
+    Q4_HAZARD_DENSE_LAYER0_DOWN: Q4_HAZARD_DENSE_LAYER0_DOWN_COUNT,
 }
 
 SECTION_NAMES: Mapping[int, str] = {
@@ -312,6 +342,11 @@ class TensorPlan:
     qtype_reason_id: int
     promotion_reason: str
     promotion_reason_id: int
+    q4_hazard: str
+    q4_hazard_id: int
+    q4_hazard_logical_input_width: int
+    q4_hazard_required_physical_input_width: int
+    q4_hazard_padding_width: int
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -347,6 +382,11 @@ class TensorPlan:
             "qtype_reason_id": self.qtype_reason_id,
             "promotion_reason": self.promotion_reason,
             "promotion_reason_id": self.promotion_reason_id,
+            "q4_hazard": self.q4_hazard,
+            "q4_hazard_id": self.q4_hazard_id,
+            "q4_hazard_logical_input_width": self.q4_hazard_logical_input_width,
+            "q4_hazard_required_physical_input_width": self.q4_hazard_required_physical_input_width,
+            "q4_hazard_padding_width": self.q4_hazard_padding_width,
         }
 
 
@@ -415,6 +455,7 @@ class DryRunPlan:
             "usage_histogram": dict(self.usage_histogram),
             "family_histogram": dict(self.family_histogram),
             "quantized_input_widths": quantized_input_width_summary(self.tensors),
+            "q4_unaligned_hazards": q4_unaligned_hazard_summary(self.tensors),
             "moe_expert_packing": {
                 "layout": MOE_EXPERT_PACKING_LAYOUT,
                 "contract": MOE_EXPERT_PACKING_CONTRACT,
@@ -618,6 +659,109 @@ def quantized_input_width_summary(tensors: Iterable[TensorPlan]) -> dict[str, An
         "padded_tensor_count": len(padded),
         "max_padding_width": max_padding,
     }
+
+
+def _q4_unaligned_hazard_for_tensor(
+    shape: tuple[int, ...], registry_entry: TensorRegistryEntry
+) -> tuple[int, int, int, int]:
+    if len(shape) < 2:
+        return Q4_HAZARD_NONE, 0, 0, 0
+    _rows, logical_input_width = _flatten_weight_shape_for_quantization(shape)
+    if logical_input_width % UOCR_Q4_K_BLOCK_SIZE == 0:
+        return Q4_HAZARD_NONE, 0, 0, 0
+
+    hazard_id = Q4_HAZARD_NONE
+    if (
+        registry_entry.family == TensorFamily.MOE_EXPERT
+        and registry_entry.projection == TensorProjection.DOWN
+        and logical_input_width == 896
+    ):
+        hazard_id = Q4_HAZARD_ROUTED_EXPERT_DOWN
+    elif (
+        registry_entry.family == TensorFamily.LAYER_DENSE_MLP
+        and registry_entry.layer == 0
+        and registry_entry.projection == TensorProjection.DOWN
+        and logical_input_width == 6848
+    ):
+        hazard_id = Q4_HAZARD_DENSE_LAYER0_DOWN
+
+    if hazard_id == Q4_HAZARD_NONE:
+        return Q4_HAZARD_NONE, 0, 0, 0
+    required_physical_width = _align_up(logical_input_width, UOCR_Q4_K_BLOCK_SIZE)
+    return hazard_id, logical_input_width, required_physical_width, required_physical_width - logical_input_width
+
+
+def q4_unaligned_hazard_summary(tensors: Iterable[TensorPlan]) -> dict[str, Any]:
+    hazards = [tensor for tensor in tensors if tensor.q4_hazard_id != Q4_HAZARD_NONE]
+    by_kind = dict(Counter(tensor.q4_hazard for tensor in hazards))
+    examples: dict[str, dict[str, Any]] = {}
+    for tensor in hazards:
+        if tensor.q4_hazard in examples:
+            continue
+        examples[tensor.q4_hazard] = {
+            "name": tensor.name,
+            "logical_input_width": tensor.q4_hazard_logical_input_width,
+            "required_physical_input_width": tensor.q4_hazard_required_physical_input_width,
+            "padding_width": tensor.q4_hazard_padding_width,
+            "fallback_qtype": tensor.qtype,
+            "qtype_reason": tensor.qtype_reason,
+            "promotion_reason": tensor.promotion_reason,
+            "description": Q4_UNALIGNED_HAZARD_DESCRIPTIONS.get(tensor.q4_hazard_id, ""),
+        }
+    return {
+        "contract": Q4_UNALIGNED_HAZARD_CONTRACT,
+        "block_size": UOCR_Q4_K_BLOCK_SIZE,
+        "total_count": len(hazards),
+        "by_kind": by_kind,
+        "examples": examples,
+    }
+
+
+def _validate_q4_unaligned_hazard_contract(
+    tensors: Iterable[TensorPlan], *, qprofile: str, require_complete: bool
+) -> None:
+    counts: Counter[int] = Counter()
+    for tensor in tensors:
+        if tensor.q4_hazard_id == Q4_HAZARD_NONE:
+            if (
+                tensor.q4_hazard != "none"
+                or tensor.q4_hazard_logical_input_width != 0
+                or tensor.q4_hazard_required_physical_input_width != 0
+                or tensor.q4_hazard_padding_width != 0
+            ):
+                raise ValueError(f"tensor {tensor.name} has inconsistent empty Q4 hazard metadata")
+            continue
+
+        counts[tensor.q4_hazard_id] += 1
+        if tensor.q4_hazard != Q4_UNALIGNED_HAZARD_NAMES.get(tensor.q4_hazard_id):
+            raise ValueError(f"tensor {tensor.name} has inconsistent Q4 hazard name {tensor.q4_hazard!r}")
+        if tensor.q4_hazard_logical_input_width <= 0:
+            raise ValueError(f"tensor {tensor.name} Q4 hazard logical width is missing")
+        if tensor.q4_hazard_logical_input_width % UOCR_Q4_K_BLOCK_SIZE == 0:
+            raise ValueError(f"tensor {tensor.name} is marked as a Q4 hazard but its logical width is aligned")
+        expected_physical = _align_up(tensor.q4_hazard_logical_input_width, UOCR_Q4_K_BLOCK_SIZE)
+        if tensor.q4_hazard_required_physical_input_width != expected_physical:
+            raise ValueError(f"tensor {tensor.name} Q4 hazard required physical width is wrong")
+        if tensor.q4_hazard_padding_width != expected_physical - tensor.q4_hazard_logical_input_width:
+            raise ValueError(f"tensor {tensor.name} Q4 hazard padding width is wrong")
+        if qprofile == "dyn-q4":
+            if tensor.qtype_id == UOCR_TENSOR_Q4_K:
+                raise ValueError(f"dyn-q4 tensor {tensor.name} is an unaligned hazard but uses plain Q4_K")
+            if tensor.qtype_id != UOCR_TENSOR_Q8_0:
+                raise ValueError(f"dyn-q4 tensor {tensor.name} Q4 hazard must use Q8_0 fallback")
+            if tensor.qtype_reason_id != UOCR_QTYPE_REASON_UNALIGNED:
+                raise ValueError(f"dyn-q4 tensor {tensor.name} Q4 hazard must use unaligned qtype reason")
+            if tensor.promotion_reason_id != UOCR_PROMOTION_UNALIGNED:
+                raise ValueError(f"dyn-q4 tensor {tensor.name} Q4 hazard must use unaligned promotion reason")
+
+    if require_complete and qprofile == "dyn-q4":
+        for hazard_id, expected_count in Q4_UNALIGNED_HAZARD_EXPECTED_COUNTS.items():
+            actual_count = counts.get(hazard_id, 0)
+            if actual_count != expected_count:
+                raise ValueError(
+                    f"dyn-q4 Q4 hazard {Q4_UNALIGNED_HAZARD_NAMES[hazard_id]} count mismatch: "
+                    f"got {actual_count}, expected {expected_count}"
+                )
 
 
 def _validate_quantized_input_width_contract(tensors: Iterable[TensorPlan]) -> None:
@@ -1089,6 +1233,12 @@ def _make_tensor_plan(name: str, entry: Mapping[str, Any], qprofile: str, regist
     logical_input_width, physical_input_width, input_padding_width = _quantized_input_widths(
         qtype_id, logical_shape, physical_shape
     )
+    (
+        q4_hazard_id,
+        q4_hazard_logical_input_width,
+        q4_hazard_required_physical_input_width,
+        q4_hazard_padding_width,
+    ) = _q4_unaligned_hazard_for_tensor(shape, registry_entry)
 
     return TensorPlan(
         name=name,
@@ -1123,6 +1273,11 @@ def _make_tensor_plan(name: str, entry: Mapping[str, Any], qprofile: str, regist
         qtype_reason_id=qtype_reason_id,
         promotion_reason=_reason_name(PROMOTION_REASON_NAMES, promotion_reason_id),
         promotion_reason_id=promotion_reason_id,
+        q4_hazard=Q4_UNALIGNED_HAZARD_NAMES[q4_hazard_id],
+        q4_hazard_id=q4_hazard_id,
+        q4_hazard_logical_input_width=q4_hazard_logical_input_width,
+        q4_hazard_required_physical_input_width=q4_hazard_required_physical_input_width,
+        q4_hazard_padding_width=q4_hazard_padding_width,
     )
 
 
@@ -1130,6 +1285,7 @@ def _relayout_plan(plan: DryRunPlan, tensors: Iterable[TensorPlan]) -> DryRunPla
     ordered = tuple(sorted(tensors, key=lambda tensor: tensor.tensor_id))
     sections, laid_out, planned_file_size, metadata_bytes = _layout_dry_run_file(ordered)
     _validate_quantized_input_width_contract(laid_out)
+    _validate_q4_unaligned_hazard_contract(laid_out, qprofile=plan.qprofile, require_complete=False)
     return replace(
         plan,
         tensors=laid_out,
@@ -1207,6 +1363,7 @@ def build_dry_run_plan(
     )
     sections, tensors, planned_file_size, metadata_bytes = _layout_dry_run_file(tensors)
     _validate_quantized_input_width_contract(tensors)
+    _validate_q4_unaligned_hazard_contract(tensors, qprofile=qprofile, require_complete=strict)
     _validate_moe_expert_interleaved_layout(tensors, require_complete=strict)
     total_source_bytes = sum(t.source_bytes for t in tensors)
     total_output_bytes = sum(t.output_bytes for t in tensors)
@@ -1637,6 +1794,9 @@ def _print_summary(plan: DryRunPlan, *, dry_run: bool) -> None:
     print(f"qtype reasons: {dict(plan.qtype_reason_histogram)}")
     print(f"promotion reasons: {dict(plan.promotion_reason_histogram)}")
     print(f"usage: {dict(plan.usage_histogram)}")
+    q4_hazards = q4_unaligned_hazard_summary(plan.tensors)
+    if q4_hazards["total_count"]:
+        print(f"q4 unaligned hazards: {q4_hazards['by_kind']}")
     print("families:")
     for family, count in sorted(plan.family_histogram.items()):
         print(f"  {family}: {count}")

@@ -17,6 +17,13 @@ from unlimitedocr_c.convert import (
     MOE_ROUTED_LAYER_START,
     PADDED_Q4_K_KERNEL_CONTRACT,
     PRESERVED_UNUSED_NORMAL_OCR_PREFIXES,
+    Q4_HAZARD_DENSE_LAYER0_DOWN,
+    Q4_HAZARD_DENSE_LAYER0_DOWN_COUNT,
+    Q4_HAZARD_DENSE_LAYER0_DOWN_NAME,
+    Q4_HAZARD_ROUTED_EXPERT_DOWN,
+    Q4_HAZARD_ROUTED_EXPERT_DOWN_COUNT,
+    Q4_HAZARD_ROUTED_EXPERT_DOWN_NAME,
+    Q4_UNALIGNED_HAZARD_CONTRACT,
     UOCR_PROMOTION_NONE,
     UOCR_PROMOTION_SENSITIVE,
     UOCR_PROMOTION_UNALIGNED,
@@ -392,6 +399,25 @@ def test_dyn_q4_converter_dry_run_uses_conservative_policy() -> None:
     assert plan.promotion_reason_histogram["unaligned"] > 0
     assert plan.promotion_reason_histogram["sensitive"] > 0
 
+    hazard_summary = plan.summary_dict()["q4_unaligned_hazards"]
+    assert hazard_summary["contract"] == Q4_UNALIGNED_HAZARD_CONTRACT
+    assert hazard_summary["block_size"] == UOCR_Q4_K_BLOCK_SIZE
+    assert hazard_summary["total_count"] == Q4_HAZARD_ROUTED_EXPERT_DOWN_COUNT + Q4_HAZARD_DENSE_LAYER0_DOWN_COUNT
+    assert hazard_summary["by_kind"] == {
+        Q4_HAZARD_DENSE_LAYER0_DOWN_NAME: Q4_HAZARD_DENSE_LAYER0_DOWN_COUNT,
+        Q4_HAZARD_ROUTED_EXPERT_DOWN_NAME: Q4_HAZARD_ROUTED_EXPERT_DOWN_COUNT,
+    }
+    assert hazard_summary["examples"][Q4_HAZARD_ROUTED_EXPERT_DOWN_NAME]["logical_input_width"] == 896
+    assert hazard_summary["examples"][Q4_HAZARD_ROUTED_EXPERT_DOWN_NAME]["required_physical_input_width"] == 1024
+    assert hazard_summary["examples"][Q4_HAZARD_DENSE_LAYER0_DOWN_NAME]["logical_input_width"] == 6848
+    assert hazard_summary["examples"][Q4_HAZARD_DENSE_LAYER0_DOWN_NAME]["required_physical_input_width"] == 6912
+
+    hazard_tensors = [tensor for tensor in plan.tensors if tensor.q4_hazard_id != 0]
+    assert len(hazard_tensors) == hazard_summary["total_count"]
+    assert {tensor.qtype for tensor in hazard_tensors} == {"UOCR_TENSOR_Q8_0"}
+    assert {tensor.qtype_reason for tensor in hazard_tensors} == {"unaligned"}
+    assert {tensor.promotion_reason for tensor in hazard_tensors} == {"unaligned"}
+
     attn_q = plan.tensor_by_name("model.layers.3.self_attn.q_proj.weight")
     assert attn_q.qtype == "UOCR_TENSOR_Q4_K"
     assert attn_q.qtype_id == UOCR_TENSOR_Q4_K
@@ -400,6 +426,8 @@ def test_dyn_q4_converter_dry_run_uses_conservative_policy() -> None:
     assert attn_q.logical_input_width == 1280
     assert attn_q.physical_input_width == 1280
     assert attn_q.input_padding_width == 0
+    assert attn_q.q4_hazard == "none"
+    assert attn_q.q4_hazard_id == 0
     assert attn_q.block_size == UOCR_Q4_K_BLOCK_SIZE
     assert attn_q.row_size == (1280 // UOCR_Q4_K_BLOCK_SIZE) * UOCR_Q4_K_TYPE_SIZE
     assert "attention projection" in attn_q.reason
@@ -424,6 +452,11 @@ def test_dyn_q4_converter_dry_run_uses_conservative_policy() -> None:
     assert expert_down.logical_input_width == 896
     assert expert_down.physical_input_width == 896
     assert expert_down.input_padding_width == 0
+    assert expert_down.q4_hazard == Q4_HAZARD_ROUTED_EXPERT_DOWN_NAME
+    assert expert_down.q4_hazard_id == Q4_HAZARD_ROUTED_EXPERT_DOWN
+    assert expert_down.q4_hazard_logical_input_width == 896
+    assert expert_down.q4_hazard_required_physical_input_width == 1024
+    assert expert_down.q4_hazard_padding_width == 128
     assert expert_down.row_size == (896 // UOCR_Q8_0_BLOCK_SIZE) * UOCR_Q8_0_TYPE_SIZE
     assert "routed expert down" in expert_down.reason
     assert "Q8_0" in expert_down.reason
@@ -439,6 +472,11 @@ def test_dyn_q4_converter_dry_run_uses_conservative_policy() -> None:
     assert dense_down.logical_input_width == 6848
     assert dense_down.physical_input_width == 6848
     assert dense_down.input_padding_width == 0
+    assert dense_down.q4_hazard == Q4_HAZARD_DENSE_LAYER0_DOWN_NAME
+    assert dense_down.q4_hazard_id == Q4_HAZARD_DENSE_LAYER0_DOWN
+    assert dense_down.q4_hazard_logical_input_width == 6848
+    assert dense_down.q4_hazard_required_physical_input_width == 6912
+    assert dense_down.q4_hazard_padding_width == 64
     assert dense_down.row_size == (6848 // UOCR_Q8_0_BLOCK_SIZE) * UOCR_Q8_0_TYPE_SIZE
     assert "dense layer-0 down" in dense_down.reason
 

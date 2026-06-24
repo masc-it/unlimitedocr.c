@@ -303,7 +303,7 @@ Store both logical and physical input width. This is important because DS4/GGML 
 - Q4_K-aligned examples: attention projections `1280`, LM head input `1280`, routed expert `gate/up` input `1280`, shared expert down input `1792`, projector input `2048`.
 - Not Q4_K-aligned: routed expert `down_proj` input `896`, dense layer-0 `down_proj` input `6848`.
 
-Initial policy should keep unaligned down projections in `Q8_0`, unless the converter emits `PADDED_Q4_K` and kernels zero-pad activations to the physical width. Converter plans expose `logical_input_width`, `physical_input_width`, and `input_padding_width` explicitly for every quantized tensor; the `.uocr` tensor directory stores the same contract as the final dimension of `logical_shape` and `physical_shape`, with C helpers to read those widths for Metal kernels.
+Initial policy keeps unaligned down projections in `Q8_0`, unless the converter emits `PADDED_Q4_K` and kernels zero-pad activations to the physical width. Converter plans expose `logical_input_width`, `physical_input_width`, and `input_padding_width` explicitly for every quantized tensor; the `.uocr` tensor directory stores the same contract as the final dimension of `logical_shape` and `physical_shape`, with C helpers to read those widths for Metal kernels. The converter also marks the two current plain-`Q4_K` hazards (`routed-expert-down` at `896`, `dense-layer0-down` at `6848`) and validates that `dyn-q4` keeps them as unaligned `Q8_0` fallbacks until a padded-q4 path is enabled.
 
 ## Converter design
 
