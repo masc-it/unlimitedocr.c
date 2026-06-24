@@ -845,8 +845,8 @@ Do not begin this section until sections 14.5 and 15.1 pass for fp16 single-requ
 
 ### 17.4 Metal quantized kernels
 
-- [ ] Adapt DS4 `metal/dense.metal` Q8_0 matvec for OCR shapes.
-- [ ] Add Q8_0 linear kernels for decode and prefill.
+- [x] Adapt DS4 `metal/dense.metal` Q8_0 matvec for OCR shapes.
+- [x] Add Q8_0 linear kernels for decode and prefill.
 - [ ] Adapt DS4 Q8_0 shared gate/up SwiGLU pattern for OCR shared experts if helpful.
 - [ ] Adapt DS4 `metal/moe.metal` Q4_K selected-expert kernels for OCR routed experts.
 - [ ] Ensure OCR MoE routing math stays OCR-specific; do not import DS4 router softplus/sqrt/scaling behavior.

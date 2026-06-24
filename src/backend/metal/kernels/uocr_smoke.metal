@@ -520,6 +520,17 @@ struct UocrDenseParams {
     uint has_bias;
 };
 
+struct UocrDenseQ8Params {
+    uint input_rows;
+    uint logical_in_features;
+    uint physical_in_features;
+    uint out_features;
+    uint weight_row_size;
+    uint has_bias;
+    uint reserved0;
+    uint reserved1;
+};
+
 static inline float uocr_dense_dot_f16(device const half *src,
                                        device const half *weight,
                                        constant UocrDenseParams &params,
@@ -586,6 +597,79 @@ kernel void uocr_dense_f16_to_f32(device const half *src [[buffer(0)]],
     }
 
     float value = uocr_dense_dot_f16(src, weight, params, row, out_col, tid, ntg, partials);
+    if (tid == 0) {
+        if (params.has_bias != 0u) {
+            value += float(bias[out_col]);
+        }
+        dst[row * params.out_features + out_col] = value;
+    }
+}
+
+static inline float uocr_dense_dot_q8_0(device const half *src,
+                                        device const uchar *weight,
+                                        constant UocrDenseQ8Params &params,
+                                        uint row,
+                                        uint out_col,
+                                        uint tid,
+                                        uint ntg,
+                                        threadgroup float *partials) {
+    float sum = 0.0f;
+    const uint src_base = row * params.logical_in_features;
+    for (uint k = tid; k < params.logical_in_features; k += ntg) {
+        sum += float(src[src_base + k]) * uocr_q8_0_load_value(weight, params.weight_row_size, out_col, k);
+    }
+    partials[tid] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = ntg >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            partials[tid] += partials[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    return partials[0];
+}
+
+kernel void uocr_dense_q8_0_to_f16(device const half *src [[buffer(0)]],
+                                   device const uchar *weight [[buffer(1)]],
+                                   device const half *bias [[buffer(2)]],
+                                   device half *dst [[buffer(3)]],
+                                   constant UocrDenseQ8Params &params [[buffer(4)]],
+                                   threadgroup float *partials [[threadgroup(0)]],
+                                   uint output_index [[threadgroup_position_in_grid]],
+                                   uint tid [[thread_index_in_threadgroup]],
+                                   uint ntg [[threads_per_threadgroup]]) {
+    const uint row = output_index / params.out_features;
+    const uint out_col = output_index - row * params.out_features;
+    if (row >= params.input_rows || out_col >= params.out_features) {
+        return;
+    }
+
+    float value = uocr_dense_dot_q8_0(src, weight, params, row, out_col, tid, ntg, partials);
+    if (tid == 0) {
+        if (params.has_bias != 0u) {
+            value += float(bias[out_col]);
+        }
+        dst[row * params.out_features + out_col] = half(value);
+    }
+}
+
+kernel void uocr_dense_q8_0_to_f32(device const half *src [[buffer(0)]],
+                                   device const uchar *weight [[buffer(1)]],
+                                   device const half *bias [[buffer(2)]],
+                                   device float *dst [[buffer(3)]],
+                                   constant UocrDenseQ8Params &params [[buffer(4)]],
+                                   threadgroup float *partials [[threadgroup(0)]],
+                                   uint output_index [[threadgroup_position_in_grid]],
+                                   uint tid [[thread_index_in_threadgroup]],
+                                   uint ntg [[threads_per_threadgroup]]) {
+    const uint row = output_index / params.out_features;
+    const uint out_col = output_index - row * params.out_features;
+    if (row >= params.input_rows || out_col >= params.out_features) {
+        return;
+    }
+
+    float value = uocr_dense_dot_q8_0(src, weight, params, row, out_col, tid, ntg, partials);
     if (tid == 0) {
         if (params.has_bias != 0u) {
             value += float(bias[out_col]);

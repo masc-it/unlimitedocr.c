@@ -10586,6 +10586,168 @@ static int test_metal_dense_f16(void) {
     return 0;
 }
 
+static int test_metal_dense_q8_0(void) {
+    if (!uocr_metal_is_available()) {
+        return 0;
+    }
+
+    enum { ROWS = 3, LOGICAL_IN_FEATURES = 1277, PHYSICAL_IN_FEATURES = 1280, OUT_FEATURES = 64 };
+    enum { WEIGHT_ROW_SIZE = (PHYSICAL_IN_FEATURES / 32) * 34 };
+    const uint16_t input_values[] = {
+        0xb400u, /* -0.25 */
+        0xb000u, /* -0.125 */
+        0x0000u, /* 0.0 */
+        0x2c00u, /* 0.0625 */
+        0x3000u, /* 0.125 */
+        0x3400u  /* 0.25 */
+    };
+    const uint16_t bias_values[] = {
+        0x0000u, /* 0.0 */
+        0x3000u, /* 0.125 */
+        0xb000u, /* -0.125 */
+        0x2c00u  /* 0.0625 */
+    };
+    const uint32_t input_value_count = (uint32_t)(sizeof(input_values) / sizeof(input_values[0]));
+    const uint32_t bias_value_count = (uint32_t)(sizeof(bias_values) / sizeof(bias_values[0]));
+
+    uint16_t *input = (uint16_t *)malloc((size_t)ROWS * LOGICAL_IN_FEATURES * sizeof(uint16_t));
+    uint8_t *weight = (uint8_t *)malloc((size_t)OUT_FEATURES * WEIGHT_ROW_SIZE);
+    uint16_t *bias = (uint16_t *)malloc((size_t)OUT_FEATURES * sizeof(uint16_t));
+    float *expected = (float *)malloc((size_t)ROWS * OUT_FEATURES * sizeof(float));
+    float *out_f32 = (float *)malloc((size_t)ROWS * OUT_FEATURES * sizeof(float));
+    uint16_t *out_f16 = (uint16_t *)malloc((size_t)OUT_FEATURES * sizeof(uint16_t));
+    CHECK(input != NULL && weight != NULL && bias != NULL && expected != NULL && out_f32 != NULL && out_f16 != NULL);
+
+    for (uint32_t i = 0u; i < (uint32_t)(ROWS * LOGICAL_IN_FEATURES); ++i) {
+        input[i] = input_values[(i * 19u + i / 31u + 2u) % input_value_count];
+    }
+    memset(weight, 0, (size_t)OUT_FEATURES * WEIGHT_ROW_SIZE);
+    for (uint32_t out_col = 0u; out_col < (uint32_t)OUT_FEATURES; ++out_col) {
+        uint8_t *row_base = weight + (size_t)out_col * WEIGHT_ROW_SIZE;
+        for (uint32_t block = 0u; block < (uint32_t)(PHYSICAL_IN_FEATURES / 32); ++block) {
+            uint8_t *packed = row_base + (size_t)block * 34u;
+            const float scale = 0.00390625f * (float)(1u + ((out_col + block) % 4u));
+            write_q8_scale_le(packed, f32_to_f16_bits(scale));
+            int8_t *qs = (int8_t *)(void *)(packed + 2u);
+            for (uint32_t i = 0u; i < 32u; ++i) {
+                const uint32_t logical_col = block * 32u + i;
+                qs[i] = logical_col < (uint32_t)LOGICAL_IN_FEATURES ?
+                            (int8_t)(((int)(out_col * 13u + block * 7u + i * 5u) % 17) - 8) :
+                            (int8_t)(77 + (int)i); /* physical padding must be ignored */
+            }
+        }
+    }
+    for (uint32_t i = 0u; i < (uint32_t)OUT_FEATURES; ++i) {
+        bias[i] = bias_values[(i * 7u + 1u) % bias_value_count];
+    }
+
+    for (uint32_t row = 0u; row < (uint32_t)ROWS; ++row) {
+        for (uint32_t col = 0u; col < (uint32_t)OUT_FEATURES; ++col) {
+            float sum = f16_bits_to_f32(bias[col]);
+            for (uint32_t k = 0u; k < (uint32_t)LOGICAL_IN_FEATURES; ++k) {
+                sum += f16_bits_to_f32(input[row * (uint32_t)LOGICAL_IN_FEATURES + k]) *
+                       q8_0_expected_value(weight, WEIGHT_ROW_SIZE, col, k);
+            }
+            expected[row * (uint32_t)OUT_FEATURES + col] = sum;
+        }
+    }
+
+    char error[1024];
+    memset(error, 0, sizeof(error));
+    uocr_metal_context *ctx = uocr_metal_context_create(UOCR_TEST_METAL_RESOURCE_PATH, error, sizeof(error));
+    CHECK(ctx != NULL);
+
+    memset(out_f32, 0, (size_t)ROWS * OUT_FEATURES * sizeof(float));
+    CHECK(uocr_metal_context_dense_q8_0(ctx,
+                                        input,
+                                        weight,
+                                        bias,
+                                        ROWS,
+                                        LOGICAL_IN_FEATURES,
+                                        PHYSICAL_IN_FEATURES,
+                                        OUT_FEATURES,
+                                        UOCR_METAL_DENSE_OUTPUT_F32,
+                                        out_f32,
+                                        error,
+                                        sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    for (uint32_t i = 0u; i < (uint32_t)(ROWS * OUT_FEATURES); ++i) {
+        CHECK(fabsf(out_f32[i] - expected[i]) < 5.0e-3f);
+    }
+
+    memset(out_f16, 0, (size_t)OUT_FEATURES * sizeof(uint16_t));
+    CHECK(uocr_metal_context_dense_q8_0(ctx,
+                                        input,
+                                        weight,
+                                        bias,
+                                        1u,
+                                        LOGICAL_IN_FEATURES,
+                                        PHYSICAL_IN_FEATURES,
+                                        OUT_FEATURES,
+                                        UOCR_METAL_DENSE_OUTPUT_F16,
+                                        out_f16,
+                                        error,
+                                        sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    for (uint32_t i = 0u; i < (uint32_t)OUT_FEATURES; ++i) {
+        CHECK(fabsf(f16_bits_to_f32(out_f16[i]) - expected[i]) < 7.5e-2f);
+    }
+
+    memset(out_f32, 0, (size_t)ROWS * OUT_FEATURES * sizeof(float));
+    CHECK(uocr_metal_context_dense_q8_0(ctx,
+                                        input,
+                                        weight,
+                                        NULL,
+                                        1u,
+                                        LOGICAL_IN_FEATURES,
+                                        PHYSICAL_IN_FEATURES,
+                                        OUT_FEATURES,
+                                        UOCR_METAL_DENSE_OUTPUT_F32,
+                                        out_f32,
+                                        error,
+                                        sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    for (uint32_t col = 0u; col < (uint32_t)OUT_FEATURES; ++col) {
+        CHECK(fabsf(out_f32[col] - (expected[col] - f16_bits_to_f32(bias[col]))) < 5.0e-3f);
+    }
+
+    CHECK(uocr_metal_context_dense_q8_0(ctx,
+                                        input,
+                                        weight,
+                                        bias,
+                                        ROWS,
+                                        LOGICAL_IN_FEATURES,
+                                        PHYSICAL_IN_FEATURES,
+                                        OUT_FEATURES,
+                                        (uocr_metal_dense_output_type)99,
+                                        out_f32,
+                                        error,
+                                        sizeof(error)) == 0);
+    CHECK(strstr(error, "unsupported Metal Q8_0 dense output type") != NULL);
+    CHECK(uocr_metal_context_dense_q8_0(ctx,
+                                        input,
+                                        weight,
+                                        bias,
+                                        ROWS,
+                                        LOGICAL_IN_FEATURES,
+                                        1279u,
+                                        OUT_FEATURES,
+                                        UOCR_METAL_DENSE_OUTPUT_F32,
+                                        out_f32,
+                                        error,
+                                        sizeof(error)) == 0);
+    CHECK(strstr(error, "widths") != NULL);
+
+    uocr_metal_context_destroy(ctx);
+    free(out_f16);
+    free(out_f32);
+    free(expected);
+    free(bias);
+    free(weight);
+    free(input);
+    return 0;
+}
+
 static int test_metal_attention_qkvo_f16(void) {
     if (!uocr_metal_is_available()) {
         return 0;
@@ -13917,6 +14079,7 @@ int main(void) {
     if (test_metal_eos_stop_after_greedy_selection() != 0) return 1;
     if (test_metal_select_next_token_f16() != 0) return 1;
     if (test_metal_dense_f16() != 0) return 1;
+    if (test_metal_dense_q8_0() != 0) return 1;
     if (test_metal_attention_qkvo_f16() != 0) return 1;
     if (test_metal_attention_output_residual_f16() != 0) return 1;
     if (test_metal_dense_swiglu_f16() != 0) return 1;

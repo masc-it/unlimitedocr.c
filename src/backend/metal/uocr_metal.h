@@ -967,6 +967,25 @@ int uocr_metal_context_dense_f16(uocr_metal_context *ctx,
                                  char *error,
                                  size_t error_size);
 
+/* Diagnostic Q8_0 dense helper. Computes
+ * out[row, out_col] = dot(input[row, :logical_in_features],
+ *                        dequant(weight[out_col, :logical_in_features])) + optional bias,
+ * where packed weights are row-major [out_features, physical_in_features / 32]
+ * GGML Q8_0 blocks. physical_in_features may include padded columns.
+ */
+int uocr_metal_context_dense_q8_0(uocr_metal_context *ctx,
+                                  const uint16_t *input_f16,
+                                  const void *weight_q8_0,
+                                  const uint16_t *bias_f16_or_null,
+                                  uint32_t input_rows,
+                                  uint32_t logical_in_features,
+                                  uint32_t physical_in_features,
+                                  uint32_t out_features,
+                                  uocr_metal_dense_output_type output_type,
+                                  void *out,
+                                  char *error,
+                                  size_t error_size);
+
 /* Diagnostic attention projection helper for synthetic tests. Computes the
  * decoder Q/K/V/O fp16 projections for hidden size 1280 with row-major
  * [1280,1280] weights and fp32 accumulation.
