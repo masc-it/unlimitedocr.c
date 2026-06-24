@@ -1000,7 +1000,7 @@ Do not start the stable high-level OCR/PDF API until Gate E2E-0 passes: public f
   - [x] integrated dumped-visual-embedding generated ids/text match Python fixture
   - [x] public `uocr_generate_prepared()` image path with real views returns valid generated ids on fp16 Metal
   - [ ] public image generated ids/text match Python fixture for at least one base/global image
-  - [ ] unsupported public paths still return clear `UOCR_ERROR_NOT_IMPLEMENTED` messages
+  - [x] unsupported public paths still return clear `UOCR_ERROR_NOT_IMPLEMENTED` messages
   - [ ] no-allocation guard passes around the decode token loop
 - [ ] Define fp16 parity thresholds per stage:
   - [ ] prompt embeddings: near exact within dtype tolerance

@@ -6,7 +6,14 @@ import os
 import numpy as np
 import pytest
 
-from unlimitedocr_c.ffi import Engine, EngineOptions, UOCR_MEMORY_KV_CACHE, _copy_result_tokens, find_library_path
+from unlimitedocr_c.ffi import (
+    Engine,
+    EngineOptions,
+    UOCR_ERROR_NOT_IMPLEMENTED,
+    UOCR_MEMORY_KV_CACHE,
+    _copy_result_tokens,
+    find_library_path,
+)
 from unlimitedocr_c.frontend import (
     GLOBAL_VISUAL_TOKENS,
     MODEL_VOCAB_SIZE,
@@ -52,6 +59,16 @@ def _assert_single_generated_id(generated: np.ndarray, tokenizer_path: str) -> t
     decoded = tokenizer.decode([token_id], skip_special_tokens=False)
     assert isinstance(decoded, str)
     return token_id, decoded
+
+
+def _metal_engine_or_skip(options: EngineOptions) -> Engine:
+    try:
+        return Engine(options)
+    except RuntimeError as exc:
+        message = str(exc)
+        if "Metal" in message or "metal" in message:
+            pytest.skip(f"Metal backend unavailable: {message}")
+        raise
 
 
 class _FakeResultLib:
@@ -116,6 +133,67 @@ def test_ctypes_image_validation_smoke() -> None:
         outputs = engine.generate_prepared(req)
     assert len(outputs) == 1
     assert outputs[0].shape == (0,)
+
+
+def test_cpu_ref_generation_not_implemented_message() -> None:
+    req = prepare_text("hello", max_new_tokens=1)
+    with Engine(EngineOptions(backend="cpu-ref", max_prompt_tokens=64, max_gen_tokens=1)) as engine:
+        with pytest.raises(RuntimeError) as exc_info:
+            engine.generate_prepared(req)
+    message = str(exc_info.value)
+    assert f"failed ({UOCR_ERROR_NOT_IMPLEMENTED})" in message
+    assert "inference kernels are not implemented yet" in message
+    assert "max_new_tokens=0" in message
+
+
+def test_metal_generation_unsupported_paths_are_clear() -> None:
+    resource_path = project_root() / "src" / "backend" / "metal"
+    text_request = prepare_text("hello", max_new_tokens=1)
+    with _metal_engine_or_skip(
+        EngineOptions(
+            backend="metal",
+            resource_path=str(resource_path),
+            max_batch=2,
+            max_prompt_tokens=512,
+            max_gen_tokens=1,
+        )
+    ) as engine:
+        with pytest.raises(RuntimeError) as exc_info:
+            engine.generate_prepared([text_request, text_request])
+    message = str(exc_info.value)
+    assert f"failed ({UOCR_ERROR_NOT_IMPLEMENTED})" in message
+    assert "Metal generation currently supports exactly one request" in message
+
+    with _metal_engine_or_skip(
+        EngineOptions(
+            backend="metal",
+            resource_path=str(resource_path),
+            max_batch=1,
+            max_prompt_tokens=512,
+            max_gen_tokens=1,
+        )
+    ) as engine:
+        with pytest.raises(RuntimeError) as exc_info:
+            engine.generate_prepared(text_request)
+    message = str(exc_info.value)
+    assert f"failed ({UOCR_ERROR_NOT_IMPLEMENTED})" in message
+    assert "Metal fp16 text generation requires a mapped fp16 .uocr model" in message
+
+    image_request = prepare_image(Image.new("RGB", (64, 64), (1, 2, 3)), preset="base", max_new_tokens=1)
+    with _metal_engine_or_skip(
+        EngineOptions(
+            backend="metal",
+            resource_path=str(resource_path),
+            max_batch=1,
+            max_prompt_tokens=image_request.n_tokens,
+            max_gen_tokens=1,
+        )
+    ) as engine:
+        with pytest.raises(RuntimeError) as exc_info:
+            engine.generate_prepared(image_request)
+    message = str(exc_info.value)
+    assert f"failed ({UOCR_ERROR_NOT_IMPLEMENTED})" in message
+    assert "Metal fp16 image generation requires a mapped fp16 .uocr model" in message
 
 
 @pytest.mark.skipif(
