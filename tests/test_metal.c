@@ -1914,6 +1914,133 @@ static int test_metal_clip_pre_layernorm_f16(void) {
     return 0;
 }
 
+static int test_metal_clip_layernorm_f16(void) {
+    if (!uocr_metal_is_available()) {
+        return 0;
+    }
+
+    CHECK(UOCR_CLIP_BLOCKS == 24u);
+    CHECK(UOCR_CLIP_ATTENTION_HEADS == 16u);
+    CHECK(UOCR_CLIP_HEAD_DIM == 64u);
+    CHECK(UOCR_CLIP_QKV_SIZE == 3072u);
+    CHECK(UOCR_CLIP_MLP_INTERMEDIATE == 4096u);
+    CHECK(UOCR_CLIP_LAYERNORM_EPS == 1.0e-5f);
+
+    uint16_t *weight = (uint16_t *)calloc(UOCR_CLIP_HIDDEN_SIZE, sizeof(uint16_t));
+    uint16_t *bias = (uint16_t *)calloc(UOCR_CLIP_HIDDEN_SIZE, sizeof(uint16_t));
+    float *expected = (float *)calloc(UOCR_CLIP_HIDDEN_SIZE, sizeof(float));
+    CHECK(weight != NULL);
+    CHECK(bias != NULL);
+    CHECK(expected != NULL);
+
+    for (uint32_t col = 0u; col < UOCR_CLIP_HIDDEN_SIZE; ++col) {
+        weight[col] = f32_to_f16_bits(0.7f + 0.0035f * (float)(col % 41u));
+        bias[col] = f32_to_f16_bits(0.03f - 0.0025f * (float)(col % 31u));
+    }
+
+    char error[1024];
+    memset(error, 0, sizeof(error));
+    uocr_metal_context *ctx = uocr_metal_context_create(UOCR_TEST_METAL_RESOURCE_PATH, error, sizeof(error));
+    CHECK(ctx != NULL);
+
+    const uint32_t token_counts[] = {UOCR_CLIP_GLOBAL_TOKENS, UOCR_CLIP_LOCAL_TOKENS};
+    for (size_t case_index = 0u; case_index < sizeof(token_counts) / sizeof(token_counts[0]); ++case_index) {
+        const uint32_t tokens = token_counts[case_index];
+        const size_t values = (size_t)tokens * UOCR_CLIP_HIDDEN_SIZE;
+        uint16_t *input = (uint16_t *)calloc(values, sizeof(uint16_t));
+        float *out_f32 = (float *)calloc(values, sizeof(float));
+        uint16_t *out_f16 = (uint16_t *)calloc(values, sizeof(uint16_t));
+        CHECK(input != NULL);
+        CHECK(out_f32 != NULL);
+        CHECK(out_f16 != NULL);
+
+        for (uint32_t token = 0u; token < tokens; ++token) {
+            for (uint32_t col = 0u; col < UOCR_CLIP_HIDDEN_SIZE; ++col) {
+                const float wave = sinf((float)(token + 1u) * 0.03f + (float)col * 0.011f) * 0.08f;
+                const float offset = (float)((token * 7u + col * 3u) % 17u) * 0.001f;
+                input[clip_token_index(token, col)] = f32_to_f16_bits(wave + offset);
+            }
+        }
+
+        CHECK(uocr_metal_context_clip_layernorm_f16(ctx,
+                                                     input,
+                                                     weight,
+                                                     bias,
+                                                     tokens,
+                                                     UOCR_METAL_LAYERNORM_OUTPUT_F32,
+                                                     out_f32,
+                                                     error,
+                                                     sizeof(error)) == 1);
+        CHECK(error[0] == '\0');
+
+        const uint32_t rows[] = {0u, tokens / 3u, tokens - 1u};
+        const uint32_t cols[] = {0u, 2u, 64u, 509u, 900u, UOCR_CLIP_HIDDEN_SIZE - 1u};
+        for (size_t row_index = 0u; row_index < sizeof(rows) / sizeof(rows[0]); ++row_index) {
+            const uint32_t row = rows[row_index];
+            clip_layernorm_expected(input, weight, bias, row, expected);
+            for (size_t col_index = 0u; col_index < sizeof(cols) / sizeof(cols[0]); ++col_index) {
+                const uint32_t col = cols[col_index];
+                const size_t idx = clip_token_index(row, col);
+                CHECK(fabsf(out_f32[idx] - expected[col]) <= 7.0e-4f);
+            }
+        }
+
+        CHECK(uocr_metal_context_clip_layernorm_f16(ctx,
+                                                     input,
+                                                     weight,
+                                                     bias,
+                                                     tokens,
+                                                     UOCR_METAL_LAYERNORM_OUTPUT_F16,
+                                                     out_f16,
+                                                     error,
+                                                     sizeof(error)) == 1);
+        CHECK(error[0] == '\0');
+        for (size_t row_index = 0u; row_index < sizeof(rows) / sizeof(rows[0]); ++row_index) {
+            const uint32_t row = rows[row_index];
+            clip_layernorm_expected(input, weight, bias, row, expected);
+            for (size_t col_index = 0u; col_index < sizeof(cols) / sizeof(cols[0]); ++col_index) {
+                const uint32_t col = cols[col_index];
+                const size_t idx = clip_token_index(row, col);
+                CHECK(fabsf(f16_bits_to_f32(out_f16[idx]) - expected[col]) <= 2.0e-3f);
+            }
+        }
+
+        free(out_f16);
+        free(out_f32);
+        free(input);
+    }
+
+    uint16_t one_value = f32_to_f16_bits(0.0f);
+    float one_out = 0.0f;
+    CHECK(uocr_metal_context_clip_layernorm_f16(ctx,
+                                                 &one_value,
+                                                 NULL,
+                                                 bias,
+                                                 UOCR_CLIP_LOCAL_TOKENS,
+                                                 UOCR_METAL_LAYERNORM_OUTPUT_F32,
+                                                 &one_out,
+                                                 error,
+                                                 sizeof(error)) == 0);
+    CHECK(strstr(error, "invalid Metal CLIP LayerNorm") != NULL);
+
+    CHECK(uocr_metal_context_clip_layernorm_f16(ctx,
+                                                 &one_value,
+                                                 weight,
+                                                 bias,
+                                                 UOCR_CLIP_MAX_TOKENS + 1u,
+                                                 UOCR_METAL_LAYERNORM_OUTPUT_F32,
+                                                 &one_out,
+                                                 error,
+                                                 sizeof(error)) == 0);
+    CHECK(strstr(error, "invalid Metal CLIP LayerNorm token count") != NULL);
+
+    uocr_metal_context_destroy(ctx);
+    free(expected);
+    free(bias);
+    free(weight);
+    return 0;
+}
+
 static int test_metal_sam_window_partition_f16(void) {
     if (!uocr_metal_is_available()) {
         return 0;
@@ -11957,6 +12084,7 @@ int main(void) {
     if (test_metal_clip_embed_sam_f16() != 0) return 1;
     if (test_metal_clip_abs_pos_f16() != 0) return 1;
     if (test_metal_clip_pre_layernorm_f16() != 0) return 1;
+    if (test_metal_clip_layernorm_f16() != 0) return 1;
     if (test_metal_sam_window_partition_f16() != 0) return 1;
     if (test_metal_sam_window_attention_f16() != 0) return 1;
     if (test_metal_sam_global_attention_f16() != 0) return 1;

@@ -478,6 +478,20 @@ int uocr_metal_context_clip_pre_layernorm_f16(uocr_metal_context *ctx,
                                               char *error,
                                               size_t error_size);
 
+/* Diagnostic CLIP transformer LayerNorm helper for layer_norm1/layer_norm2 in
+ * each ViT block. It uses the same fp32 mean/variance path as pre-LayerNorm,
+ * hidden size 1024, and upstream epsilon 1e-5.
+ */
+int uocr_metal_context_clip_layernorm_f16(uocr_metal_context *ctx,
+                                          const uint16_t *input_f16,
+                                          const uint16_t *weight_f16,
+                                          const uint16_t *bias_f16,
+                                          uint32_t token_count,
+                                          uocr_metal_layernorm_output_type output_type,
+                                          void *out,
+                                          char *error,
+                                          size_t error_size);
+
 /* Diagnostic SAM window-attention helper for non-global transformer blocks.
  * Q/K/V are fp16 tensors laid out as [n_windows,14*14,12,64] (equivalent to
  * window-major rows with flattened [head,dim] channels). The helper computes

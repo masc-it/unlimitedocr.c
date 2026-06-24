@@ -7268,25 +7268,31 @@ int uocr_metal_context_clip_add_abs_pos_f16(uocr_metal_context *ctx,
     return result;
 }
 
-int uocr_metal_context_clip_pre_layernorm_f16(uocr_metal_context *ctx,
-                                              const uint16_t *input_f16,
-                                              const uint16_t *weight_f16,
-                                              const uint16_t *bias_f16,
-                                              uint32_t token_count,
-                                              uocr_metal_layernorm_output_type output_type,
-                                              void *out,
-                                              char *error,
-                                              size_t error_size) {
+static int metal_context_clip_token_layernorm_f16(uocr_metal_context *ctx,
+                                                   const uint16_t *input_f16,
+                                                   const uint16_t *weight_f16,
+                                                   const uint16_t *bias_f16,
+                                                   uint32_t token_count,
+                                                   uocr_metal_layernorm_output_type output_type,
+                                                   void *out,
+                                                   const char *op_name,
+                                                   const char *invalid_request_message,
+                                                   const char *invalid_token_count_message,
+                                                   NSString *weight_label,
+                                                   NSString *bias_label,
+                                                   char *error,
+                                                   size_t error_size) {
     metal_clear_error(error, error_size);
     if (ctx == NULL || input_f16 == NULL || weight_f16 == NULL || bias_f16 == NULL || out == NULL) {
-        return metal_fail(error, error_size, "invalid Metal CLIP pre-LayerNorm request");
+        return metal_fail(error, error_size, "%s", invalid_request_message);
     }
     if (token_count != UOCR_CLIP_GLOBAL_TOKENS && token_count != UOCR_CLIP_LOCAL_TOKENS) {
-        return metal_fail(error, error_size, "invalid Metal CLIP pre-LayerNorm token count %u", token_count);
+        return metal_fail(error, error_size, "%s %u", invalid_token_count_message, token_count);
     }
-    if (UOCR_CLIP_HIDDEN_SIZE != 1024u || UOCR_CLIP_PRE_LAYERNORM_EPS != 1.0e-5f ||
-        UOCR_CLIP_GLOBAL_TOKENS != 257u || UOCR_CLIP_LOCAL_TOKENS != 101u) {
-        return metal_fail(error, error_size, "Metal CLIP pre-LayerNorm constants are inconsistent");
+    if (UOCR_CLIP_HIDDEN_SIZE != 1024u || UOCR_CLIP_BLOCKS != 24u || UOCR_CLIP_LAYERNORM_EPS != 1.0e-5f ||
+        UOCR_CLIP_PRE_LAYERNORM_EPS != UOCR_CLIP_LAYERNORM_EPS || UOCR_CLIP_GLOBAL_TOKENS != 257u ||
+        UOCR_CLIP_LOCAL_TOKENS != 101u) {
+        return metal_fail(error, error_size, "%s constants are inconsistent", op_name);
     }
 
     const uint64_t parameter_bytes = (uint64_t)UOCR_CLIP_HIDDEN_SIZE * 2u;
@@ -7294,7 +7300,8 @@ int uocr_metal_context_clip_pre_layernorm_f16(uocr_metal_context *ctx,
     if (parameter_bytes > (uint64_t)SIZE_MAX || parameter_bytes > max_buffer_length) {
         return metal_fail(error,
                           error_size,
-                          "Metal CLIP pre-LayerNorm buffers exceed maxBufferLength %llu",
+                          "%s buffers exceed maxBufferLength %llu",
+                          op_name,
                           (unsigned long long)max_buffer_length);
     }
 
@@ -7303,18 +7310,18 @@ int uocr_metal_context_clip_pre_layernorm_f16(uocr_metal_context *ctx,
                                                         length:(NSUInteger)parameter_bytes
                                                        options:MTLResourceStorageModeShared];
         if (weight == nil) {
-            return metal_fail(error, error_size, "failed to allocate Metal CLIP pre-LayerNorm weight buffer");
+            return metal_fail(error, error_size, "failed to allocate %s weight buffer", op_name);
         }
-        weight.label = @"uocr_clip_pre_layernorm_weight_f16";
+        weight.label = weight_label;
 
         id<MTLBuffer> bias = [ctx->device newBufferWithBytes:bias_f16
                                                       length:(NSUInteger)parameter_bytes
                                                      options:MTLResourceStorageModeShared];
         if (bias == nil) {
             [weight release];
-            return metal_fail(error, error_size, "failed to allocate Metal CLIP pre-LayerNorm bias buffer");
+            return metal_fail(error, error_size, "failed to allocate %s bias buffer", op_name);
         }
-        bias.label = @"uocr_clip_pre_layernorm_bias_f16";
+        bias.label = bias_label;
 
         const int ok = metal_context_layernorm_f16_with_parameter_buffers(ctx,
                                                                          input_f16,
@@ -7324,16 +7331,66 @@ int uocr_metal_context_clip_pre_layernorm_f16(uocr_metal_context *ctx,
                                                                          0u,
                                                                          token_count,
                                                                          UOCR_CLIP_HIDDEN_SIZE,
-                                                                         UOCR_CLIP_PRE_LAYERNORM_EPS,
+                                                                         UOCR_CLIP_LAYERNORM_EPS,
                                                                          output_type,
                                                                          out,
-                                                                         "Metal CLIP pre-LayerNorm",
+                                                                         op_name,
                                                                          error,
                                                                          error_size);
         [bias release];
         [weight release];
         return ok;
     }
+}
+
+int uocr_metal_context_clip_pre_layernorm_f16(uocr_metal_context *ctx,
+                                              const uint16_t *input_f16,
+                                              const uint16_t *weight_f16,
+                                              const uint16_t *bias_f16,
+                                              uint32_t token_count,
+                                              uocr_metal_layernorm_output_type output_type,
+                                              void *out,
+                                              char *error,
+                                              size_t error_size) {
+    return metal_context_clip_token_layernorm_f16(ctx,
+                                                  input_f16,
+                                                  weight_f16,
+                                                  bias_f16,
+                                                  token_count,
+                                                  output_type,
+                                                  out,
+                                                  "Metal CLIP pre-LayerNorm",
+                                                  "invalid Metal CLIP pre-LayerNorm request",
+                                                  "invalid Metal CLIP pre-LayerNorm token count",
+                                                  @"uocr_clip_pre_layernorm_weight_f16",
+                                                  @"uocr_clip_pre_layernorm_bias_f16",
+                                                  error,
+                                                  error_size);
+}
+
+int uocr_metal_context_clip_layernorm_f16(uocr_metal_context *ctx,
+                                          const uint16_t *input_f16,
+                                          const uint16_t *weight_f16,
+                                          const uint16_t *bias_f16,
+                                          uint32_t token_count,
+                                          uocr_metal_layernorm_output_type output_type,
+                                          void *out,
+                                          char *error,
+                                          size_t error_size) {
+    return metal_context_clip_token_layernorm_f16(ctx,
+                                                  input_f16,
+                                                  weight_f16,
+                                                  bias_f16,
+                                                  token_count,
+                                                  output_type,
+                                                  out,
+                                                  "Metal CLIP LayerNorm",
+                                                  "invalid Metal CLIP LayerNorm request",
+                                                  "invalid Metal CLIP LayerNorm token count",
+                                                  @"uocr_clip_layernorm_weight_f16",
+                                                  @"uocr_clip_layernorm_bias_f16",
+                                                  error,
+                                                  error_size);
 }
 
 static int metal_context_sam_attention_f16(uocr_metal_context *ctx,
