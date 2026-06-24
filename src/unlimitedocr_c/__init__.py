@@ -9,6 +9,15 @@ from .convert import (
     write_uocr_model,
 )
 from .tensor_registry import TensorFamily, TensorProjection
+from .drift import (
+    CandidateDriftReport,
+    DriftComparisonReport,
+    RouterDriftMetrics,
+    TensorDriftMetrics,
+    compare_candidate_layer_drift,
+    compare_layer_drift,
+    tensor_drift_metrics,
+)
 from .golden import (
     PromptEmbeddingDump,
     ImagePromptEmbeddingDump,
@@ -85,6 +94,13 @@ __all__ = [
     "write_uocr_model",
     "TensorFamily",
     "TensorProjection",
+    "CandidateDriftReport",
+    "DriftComparisonReport",
+    "RouterDriftMetrics",
+    "TensorDriftMetrics",
+    "compare_candidate_layer_drift",
+    "compare_layer_drift",
+    "tensor_drift_metrics",
     "PromptEmbeddingDump",
     "ImagePromptEmbeddingDump",
     "ImageDecoderLayersDump",

@@ -852,7 +852,7 @@ Do not begin this section until sections 14.5 and 15.1 pass for fp16 single-requ
 - [x] Ensure OCR MoE routing math stays OCR-specific; do not import DS4 router softplus/sqrt/scaling behavior.
 - [x] Implement q8 fallback path for unaligned down projections.
 - [x] Add optional padded q4 kernels only after q8/q4 baseline is correct.
-- [ ] Compare q8/q4 layer drift against fp16 golden dumps.
+- [x] Compare q8/q4 layer drift against fp16 golden dumps.
 
 ## 18. Calibration and dynamic promotion loop
 
