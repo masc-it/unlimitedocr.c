@@ -751,7 +751,7 @@ Do not resume quantization, batching, CUDA, or high-level OCR/PDF/postprocess AP
 - [x] Wire public `uocr_generate_prepared()` Metal fp16 image case for `n_requests=1`, `max_new_tokens>0`, and fp16 `.uocr`; pass `image_span_start`, `image_span_length`, and `image_features_f16` into the existing integrated decoder.
 - [x] Add opt-in full-model public image smoke test that returns valid generated ids from real image pixels.
 - [x] Add parity tests for final visual features and first generated ids/text against Python/HF dumps.
-- [ ] Extend the public image smoke from one base/global image to gundam `[1,1]`, gundam real multi-crop, and multi-page base mode.
+- [x] Extend the public image smoke from one base/global image to gundam `[1,1]`, gundam real multi-crop, and multi-page base mode.
 
 ### 16.1 Vision scheduling and memory
 
@@ -998,7 +998,7 @@ Do not start the stable high-level OCR/PDF API until Gate E2E-0 passes: public f
 - [ ] Add opt-in integrated fp16 generation tests:
   - [x] public `uocr_generate_prepared()` text-only generated ids match Python fixture
   - [x] integrated dumped-visual-embedding generated ids/text match Python fixture
-  - [ ] public `uocr_generate_prepared()` image path with real views returns valid generated ids on fp16 Metal
+  - [x] public `uocr_generate_prepared()` image path with real views returns valid generated ids on fp16 Metal
   - [ ] public image generated ids/text match Python fixture for at least one base/global image
   - [ ] unsupported public paths still return clear `UOCR_ERROR_NOT_IMPLEMENTED` messages
   - [ ] no-allocation guard passes around the decode token loop

@@ -7,7 +7,15 @@ import numpy as np
 import pytest
 
 from unlimitedocr_c.ffi import Engine, EngineOptions, UOCR_MEMORY_KV_CACHE, _copy_result_tokens, find_library_path
-from unlimitedocr_c.frontend import MODEL_VOCAB_SIZE, load_tokenizer, prepare_image, prepare_text, project_root
+from unlimitedocr_c.frontend import (
+    GLOBAL_VISUAL_TOKENS,
+    MODEL_VOCAB_SIZE,
+    load_tokenizer,
+    prepare_image,
+    prepare_pages,
+    prepare_text,
+    project_root,
+)
 from PIL import Image
 
 
@@ -24,6 +32,26 @@ pytestmark = pytest.mark.skipif(not native_library_available(), reason="libunlim
 
 def _large_metal_test_enabled() -> bool:
     return os.environ.get("UOCR_RUN_LARGE_TESTS") == "1" and bool(os.environ.get("UOCR_MODEL_PATH"))
+
+
+def _gradient_image(width: int, height: int, phase: int = 0) -> Image.Image:
+    x = np.linspace(0, 255, width, dtype=np.uint8)
+    y = np.linspace(0, 255, height, dtype=np.uint8)[:, None]
+    pixels = np.empty((height, width, 3), dtype=np.uint8)
+    pixels[..., 0] = ((x[None, :].astype(np.uint16) + phase) % 256).astype(np.uint8)
+    pixels[..., 1] = ((y.astype(np.uint16) + 2 * phase) % 256).astype(np.uint8)
+    pixels[..., 2] = ((pixels[..., 0].astype(np.uint16) + pixels[..., 1].astype(np.uint16)) // 2).astype(np.uint8)
+    return Image.fromarray(pixels, mode="RGB")
+
+
+def _assert_single_generated_id(generated: np.ndarray, tokenizer_path: str) -> tuple[int, str]:
+    assert generated.shape == (1,)
+    token_id = int(generated[0])
+    assert 0 <= token_id < MODEL_VOCAB_SIZE
+    tokenizer = load_tokenizer(tokenizer_path)
+    decoded = tokenizer.decode([token_id], skip_special_tokens=False)
+    assert isinstance(decoded, str)
+    return token_id, decoded
 
 
 class _FakeResultLib:
@@ -95,17 +123,8 @@ def test_ctypes_image_validation_smoke() -> None:
     reason="set UOCR_RUN_LARGE_TESTS=1 and UOCR_MODEL_PATH to run the full-model Metal public image smoke test",
 )
 def test_public_metal_image_generation_smoke() -> None:
-    width, height = 160, 96
-    x = np.linspace(0, 255, width, dtype=np.uint8)
-    y = np.linspace(0, 255, height, dtype=np.uint8)[:, None]
-    pixels = np.empty((height, width, 3), dtype=np.uint8)
-    pixels[..., 0] = x[None, :]
-    pixels[..., 1] = y
-    pixels[..., 2] = ((pixels[..., 0].astype(np.uint16) + pixels[..., 1].astype(np.uint16)) // 2).astype(np.uint8)
-    image = Image.fromarray(pixels, mode="RGB")
-
-    req = prepare_image(image, preset="base", max_new_tokens=1)
-    assert req.expected_visual_tokens == 273
+    req = prepare_image(_gradient_image(160, 96), preset="base", max_new_tokens=1)
+    assert req.expected_visual_tokens == GLOBAL_VISUAL_TOKENS
     assert len(req.views) == 1
     assert req.views[0].kind == "global"
 
@@ -125,12 +144,55 @@ def test_public_metal_image_generation_smoke() -> None:
         outputs = engine.generate_prepared(req)
 
     assert len(outputs) == 1
-    generated = outputs[0]
-    assert generated.shape == (1,)
-    token_id = int(generated[0])
-    assert 0 <= token_id < MODEL_VOCAB_SIZE
-
-    tokenizer = load_tokenizer(req.tokenizer_path)
-    decoded = tokenizer.decode([token_id], skip_special_tokens=False)
+    token_id, decoded = _assert_single_generated_id(outputs[0], req.tokenizer_path)
     print(f"public Metal image smoke generated token id={token_id} decoded={decoded!r}")
-    assert isinstance(decoded, str)
+
+
+@pytest.mark.skipif(
+    not _large_metal_test_enabled(),
+    reason="set UOCR_RUN_LARGE_TESTS=1 and UOCR_MODEL_PATH to run the extended full-model Metal image smoke test",
+)
+def test_public_metal_image_generation_extended_smoke() -> None:
+    gundam_1x1 = prepare_image(_gradient_image(512, 384, phase=3), preset="gundam", max_new_tokens=1)
+    assert gundam_1x1.expected_visual_tokens == GLOBAL_VISUAL_TOKENS
+    assert (gundam_1x1.crop_grid_w, gundam_1x1.crop_grid_h) == (1, 1)
+    assert [view.kind for view in gundam_1x1.views] == ["global"]
+
+    gundam_multicrop = prepare_image(_gradient_image(960, 640, phase=7), preset="gundam", max_new_tokens=1)
+    assert gundam_multicrop.expected_visual_tokens > GLOBAL_VISUAL_TOKENS
+    assert gundam_multicrop.crop_grid_w > 1 or gundam_multicrop.crop_grid_h > 1
+    assert gundam_multicrop.views[-1].kind == "global"
+    assert all(view.kind == "local" for view in gundam_multicrop.views[:-1])
+
+    pages = prepare_pages([_gradient_image(128, 128, phase=11), _gradient_image(96, 160, phase=17)], max_new_tokens=1)
+    assert pages.expected_visual_tokens == 2 * GLOBAL_VISUAL_TOKENS
+    assert [view.kind for view in pages.views] == ["global", "global"]
+
+    cases = [
+        ("gundam [1,1]", gundam_1x1),
+        ("gundam multi-crop", gundam_multicrop),
+        ("multi-page base", pages),
+    ]
+
+    model_path = os.environ["UOCR_MODEL_PATH"]
+    resource_path = project_root() / "src" / "backend" / "metal"
+    with Engine(
+        EngineOptions(
+            model_path=model_path,
+            backend="metal",
+            resource_path=str(resource_path),
+            max_batch=1,
+            max_prompt_tokens=max(request.n_tokens for _, request in cases),
+            max_gen_tokens=1,
+            memory_budget_bytes=(1 << 64) - 1,
+        )
+    ) as engine:
+        for label, request in cases:
+            outputs = engine.generate_prepared(request)
+            assert len(outputs) == 1
+            token_id, decoded = _assert_single_generated_id(outputs[0], request.tokenizer_path)
+            print(
+                f"public Metal image extended smoke {label}: "
+                f"views={len(request.views)} grid={request.crop_grid_w}x{request.crop_grid_h} "
+                f"visual={request.expected_visual_tokens} token id={token_id} decoded={decoded!r}"
+            )
