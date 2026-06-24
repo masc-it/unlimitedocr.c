@@ -1,6 +1,7 @@
 #include "model/uocr_model_file.h"
 
 #include "core/uocr_alloc.h"
+#include "quant/uocr_quant.h"
 
 #include <errno.h>
 #include <stdarg.h>
@@ -390,17 +391,6 @@ static int validate_provenance(const uint8_t *bytes,
     return 0;
 }
 
-static uint64_t tensor_shape_elements(const uint32_t shape[UOCR_TENSOR_MAX_DIMS], uint32_t rank) {
-    uint64_t elements = 1u;
-    for (uint32_t i = 0u; i < rank; ++i) {
-        if (shape[i] == 0u || elements > UINT64_MAX / shape[i]) {
-            return 0u;
-        }
-        elements *= shape[i];
-    }
-    return elements;
-}
-
 static int validate_tensor_directory(const uint8_t *bytes,
                                      size_t file_size,
                                      const uocr_section_entry *directory_section,
@@ -481,11 +471,12 @@ static int validate_tensor_directory(const uint8_t *bytes,
         if (tensor->usage != UOCR_TENSOR_USAGE_RUNTIME && tensor->usage != UOCR_TENSOR_USAGE_PRESERVED_UNUSED) {
             return fail(error, error_size, "tensor entry %u has unknown usage %u", i, tensor->usage);
         }
-        if (tensor->qtype != UOCR_TENSOR_F16 && tensor->qtype != UOCR_TENSOR_F32 &&
-            tensor->qtype != UOCR_TENSOR_Q8_0 && tensor->qtype != UOCR_TENSOR_Q4_K &&
-            tensor->qtype != UOCR_TENSOR_PADDED_Q4_K && tensor->qtype != UOCR_TENSOR_Q2_K &&
-            tensor->qtype != UOCR_TENSOR_IQ2_XXS) {
+        uocr_quant_type_info qtype_info;
+        if (!uocr_quant_get_type_info(tensor->qtype, &qtype_info)) {
             return fail(error, error_size, "tensor entry %u has unknown qtype %u", i, tensor->qtype);
+        }
+        if (!uocr_quant_is_enabled(tensor->qtype)) {
+            return fail(error, error_size, "tensor entry %u qtype %s is disabled", i, qtype_info.name);
         }
         if (tensor_data_section == NULL) {
             return fail(error, error_size, "tensor entry %u has payload but tensor-data section is missing", i);
@@ -501,21 +492,13 @@ static int validate_tensor_directory(const uint8_t *bytes,
                         (unsigned long long)tensor->payload_offset,
                         UOCR_TENSOR_PAYLOAD_ALIGNMENT);
         }
-        if (tensor->qtype == UOCR_TENSOR_F16 || tensor->qtype == UOCR_TENSOR_F32) {
-            const uint64_t elements = tensor_shape_elements(tensor->physical_shape, tensor->rank);
-            const uint64_t element_bytes = tensor->qtype == UOCR_TENSOR_F16 ? 2u : 4u;
-            if (elements == 0u || elements > UINT64_MAX / element_bytes) {
-                return fail(error, error_size, "tensor entry %u has invalid physical shape", i);
-            }
-            const uint64_t expected_payload_size = elements * element_bytes;
-            if (tensor->payload_size != expected_payload_size) {
-                return fail(error,
-                            error_size,
-                            "tensor entry %u payload size mismatch: got %llu expected %llu",
-                            i,
-                            (unsigned long long)tensor->payload_size,
-                            (unsigned long long)expected_payload_size);
-            }
+        char quant_error[256];
+        if (!uocr_quant_validate_tensor_entry(tensor, quant_error, sizeof(quant_error))) {
+            return fail(error,
+                        error_size,
+                        "tensor entry %u quantization metadata invalid: %s",
+                        i,
+                        quant_error);
         }
         if (!checked_range(tensor->payload_offset, tensor->payload_size, file_size)) {
             return fail(error, error_size, "tensor entry %u payload is out of range", i);

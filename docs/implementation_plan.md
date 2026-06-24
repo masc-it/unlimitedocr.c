@@ -805,12 +805,12 @@ Do not begin this section until sections 14.5 and 15.1 pass for fp16 single-requ
 
 ### 17.1 Quantization foundations
 
-- [ ] Vendor/adapt DS4 `data/ds4/gguf-tools/quants.[ch]` into `src/quant/` with attribution/license notes.
-- [ ] Keep only needed initial formats:
-  - [ ] `Q8_0`, block size `32`, type size `34`
-  - [ ] `Q4_K`, block size `256`, type size `144`
-- [ ] Keep `Q2_K` and `IQ2_XXS` code disabled or behind later experimental flags.
-- [ ] Implement qtype row-size helpers and alignment validation.
+- [x] Vendor/adapt DS4 `data/ds4/gguf-tools/quants.[ch]` into `src/quant/` with attribution/license notes.
+- [x] Keep only needed initial formats:
+  - [x] `Q8_0`, block size `32`, type size `34`
+  - [x] `Q4_K`, block size `256`, type size `144`
+- [x] Keep `Q2_K` and `IQ2_XXS` code disabled or behind later experimental flags.
+- [x] Implement qtype row-size helpers and alignment validation.
 - [ ] Add quantized tensor metadata to `.uocr` with logical and physical widths.
 
 ### 17.2 `dyn-q8` profile

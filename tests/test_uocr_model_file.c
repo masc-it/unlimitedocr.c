@@ -1,5 +1,6 @@
 #include "model/uocr_model_file.h"
 #include "model/uocr_tensor_registry.h"
+#include "quant/uocr_quant.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -222,6 +223,94 @@ static int write_synthetic_uocr_with_tensors(const char *path, synthetic_tensor_
     return failed ? 1 : 0;
 }
 
+static int write_synthetic_quant_uocr(const char *path, int corrupt_row_size) {
+    uint64_t row_size = 0u;
+    if (!uocr_quant_row_size(UOCR_TENSOR_Q8_0, 64u, &row_size)) {
+        return 1;
+    }
+
+    const uint64_t section_dir_offset = sizeof(uocr_file_header);
+    const uint32_t section_count = 3u;
+    const uint64_t config_offset = section_dir_offset + section_count * sizeof(uocr_section_entry);
+    const uint64_t tensor_dir_offset = align_up_u64(config_offset + sizeof(uocr_config_record), 8u);
+    const uint64_t tensor_dir_size = sizeof(uocr_tensor_directory_header) + sizeof(uocr_tensor_entry);
+    const uint64_t tensor_data_offset = align_up_u64(tensor_dir_offset + tensor_dir_size, UOCR_TENSOR_DATA_ALIGNMENT);
+    const uint64_t tensor_data_size = row_size * 2u;
+    const uint64_t file_size = tensor_data_offset + tensor_data_size;
+
+    uint8_t *buffer = (uint8_t *)calloc(1u, (size_t)file_size);
+    if (buffer == NULL) {
+        return 1;
+    }
+
+    uocr_file_header *header = (uocr_file_header *)(void *)buffer;
+    memcpy(header->magic, UOCR_FILE_MAGIC, 4u);
+    header->version = UOCR_FORMAT_VERSION;
+    header->header_size = (uint32_t)sizeof(uocr_file_header);
+    header->endian_marker = UOCR_ENDIAN_MARKER;
+    header->required_alignment = UOCR_TENSOR_DATA_ALIGNMENT;
+    header->qprofile = UOCR_QPROFILE_DYN_Q8;
+    header->section_count = section_count;
+    header->file_size = file_size;
+    header->section_dir_offset = section_dir_offset;
+
+    uocr_section_entry *sections = (uocr_section_entry *)(void *)(buffer + section_dir_offset);
+    sections[0].type = UOCR_SECTION_CONFIG;
+    sections[0].offset = config_offset;
+    sections[0].size = sizeof(uocr_config_record);
+    sections[0].alignment = 8u;
+    sections[1].type = UOCR_SECTION_TENSOR_DIRECTORY;
+    sections[1].offset = tensor_dir_offset;
+    sections[1].size = tensor_dir_size;
+    sections[1].alignment = 8u;
+    sections[2].type = UOCR_SECTION_TENSOR_DATA;
+    sections[2].offset = tensor_data_offset;
+    sections[2].size = tensor_data_size;
+    sections[2].alignment = UOCR_TENSOR_DATA_ALIGNMENT;
+
+    uocr_config_record config = uocr_default_config_record();
+    memcpy(buffer + config_offset, &config, sizeof(config));
+
+    uocr_tensor_directory_header *dir = (uocr_tensor_directory_header *)(void *)(buffer + tensor_dir_offset);
+    dir->magic = UOCR_TENSOR_DIR_MAGIC;
+    dir->version = UOCR_FORMAT_VERSION;
+    dir->entry_size = (uint32_t)sizeof(uocr_tensor_entry);
+    dir->tensor_count = 1u;
+
+    uocr_tensor_entry *tensor = (uocr_tensor_entry *)(void *)(buffer + tensor_dir_offset + sizeof(*dir));
+    tensor->id = UOCR_TENSOR_ID_LM_HEAD;
+    tensor->family = UOCR_TENSOR_FAMILY_LM_HEAD;
+    tensor->layer = -1;
+    tensor->expert = -1;
+    tensor->projection = UOCR_TENSOR_PROJ_WEIGHT;
+    tensor->usage = UOCR_TENSOR_USAGE_RUNTIME;
+    tensor->qtype = UOCR_TENSOR_Q8_0;
+    tensor->rank = 2u;
+    tensor->logical_shape[0] = 2u;
+    tensor->logical_shape[1] = 64u;
+    tensor->physical_shape[0] = 2u;
+    tensor->physical_shape[1] = 64u;
+    tensor->payload_offset = tensor_data_offset;
+    tensor->payload_size = tensor_data_size;
+    tensor->block_size = UOCR_Q8_0_BLOCK_SIZE;
+    tensor->row_size = corrupt_row_size ? (uint32_t)(row_size - 1u) : (uint32_t)row_size;
+
+    for (uint64_t i = 0u; i < tensor_data_size; ++i) {
+        buffer[tensor_data_offset + i] = (uint8_t)(i & 0xffu);
+    }
+
+    FILE *f = fopen(path, "wb");
+    if (f == NULL) {
+        free(buffer);
+        perror("fopen");
+        return 1;
+    }
+    int failed = fwrite(buffer, 1u, (size_t)file_size, f) != (size_t)file_size;
+    failed |= fclose(f) != 0;
+    free(buffer);
+    return failed ? 1 : 0;
+}
+
 static int make_temp_path(char *path, size_t path_size) {
     const char *template_path = "/tmp/uocr-model-file-XXXXXX";
     if (strlen(template_path) + 1u > path_size) {
@@ -318,6 +407,38 @@ static int test_rejects_bad_tensor_data_alignment(void) {
     return 0;
 }
 
+static int test_valid_quantized_tensor_directory(void) {
+    char path[128];
+    CHECK(make_temp_path(path, sizeof(path)) == 0);
+    CHECK(write_synthetic_quant_uocr(path, 0) == 0);
+
+    char error[512];
+    uocr_model_file model;
+    CHECK(uocr_model_file_open(path, &model, error, sizeof(error)) == 0);
+    CHECK(model.header->qprofile == UOCR_QPROFILE_DYN_Q8);
+    CHECK(model.tensor_count == 1u);
+    CHECK(model.tensors[0].qtype == UOCR_TENSOR_Q8_0);
+    CHECK(model.tensors[0].block_size == UOCR_Q8_0_BLOCK_SIZE);
+    CHECK(model.tensors[0].row_size == UOCR_Q8_0_TYPE_SIZE * 2u);
+    CHECK(model.tensors[0].payload_size == (uint64_t)model.tensors[0].row_size * 2u);
+    uocr_model_file_close(&model);
+    unlink(path);
+    return 0;
+}
+
+static int test_rejects_bad_quantized_row_size(void) {
+    char path[128];
+    CHECK(make_temp_path(path, sizeof(path)) == 0);
+    CHECK(write_synthetic_quant_uocr(path, 1) == 0);
+
+    char error[512];
+    uocr_model_file model;
+    CHECK(uocr_model_file_open(path, &model, error, sizeof(error)) != 0);
+    CHECK(strstr(error, "row size mismatch") != NULL);
+    unlink(path);
+    return 0;
+}
+
 static int test_rejects_unsorted_tensor_directory(void) {
     char path[128];
     CHECK(make_temp_path(path, sizeof(path)) == 0);
@@ -378,6 +499,8 @@ int main(void) {
     if (test_valid_tensor_directory() != 0) return 1;
     if (test_rejects_tensor_payload_out_of_range() != 0) return 1;
     if (test_rejects_bad_tensor_data_alignment() != 0) return 1;
+    if (test_valid_quantized_tensor_directory() != 0) return 1;
+    if (test_rejects_bad_quantized_row_size() != 0) return 1;
     if (test_rejects_unsorted_tensor_directory() != 0) return 1;
     if (test_rejects_bad_tokenizer_metadata() != 0) return 1;
     if (test_rejects_bad_provenance() != 0) return 1;
