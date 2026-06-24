@@ -273,11 +273,11 @@ static inline uocr_config_record uocr_default_config_record(void) {
     cfg.rope_theta = UOCR_ROPE_THETA;
     cfg.max_positions = UOCR_MAX_POSITIONS;
     cfg.generated_ring_window = UOCR_GENERATED_RING_WINDOW;
-    cfg.dense_first_layers = 1u;
+    cfg.dense_first_layers = UOCR_DENSE_FIRST_LAYERS;
     cfg.routed_experts = UOCR_ROUTED_EXPERTS;
     cfg.moe_top_k = UOCR_MOE_TOP_K;
     cfg.moe_expert_intermediate = UOCR_MOE_EXPERT_INTERMEDIATE;
-    cfg.shared_experts = 2u;
+    cfg.shared_experts = UOCR_MOE_SHARED_EXPERTS;
     cfg.dense_layer0_intermediate = UOCR_DENSE_LAYER0_INTERMEDIATE;
     cfg.projector_in = UOCR_PROJECTOR_IN_SIZE;
     cfg.projector_out = UOCR_HIDDEN_SIZE;

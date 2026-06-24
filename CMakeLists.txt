@@ -155,6 +155,15 @@ if(UOCR_BUILD_TESTS)
     uocr_apply_sanitizers(test_api)
     add_test(NAME uocr_api COMMAND test_api)
 
+    add_executable(test_constants tests/test_constants.c)
+    target_include_directories(test_constants PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/include"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    target_link_libraries(test_constants PRIVATE uocr_core)
+    uocr_apply_common_warnings(test_constants)
+    uocr_apply_sanitizers(test_constants)
+    add_test(NAME uocr_constants COMMAND test_constants)
+
     add_executable(test_uocr_model_file tests/test_uocr_model_file.c)
     target_include_directories(test_uocr_model_file PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/include"

@@ -55,16 +55,16 @@ Current priority slice, in order. The coding agent should take the first uncheck
 
 ## 1. Critical facts to encode as asserts
 
-- [ ] Assert model constants from `data/context/config.json` and `configuration_deepseek_v2.py` defaults:
-  - [ ] vocab `129280`, hidden `1280`, layers `12`, heads `10`, KV heads `10`, head dim `128`
+- [x] Assert model constants from `data/context/config.json` and `configuration_deepseek_v2.py` defaults:
+  - [x] vocab `129280`, hidden `1280`, layers `12`, heads `10`, KV heads `10`, head dim `128`
   - [x] max positions `32768`, generated ring window `128`, RoPE theta `10000`
-  - [ ] dense layer-0 intermediate `6848`
-  - [ ] MoE layers `1..11`, routed experts `64`, top-k `6`, routed intermediate `896`, shared experts `2`
-  - [ ] `hidden_act="silu"`, `rms_norm_eps=1e-6`, `attention_bias=false`, `attention_dropout=0.0`
-  - [ ] MoE `scoring_func="softmax"`, `topk_method="greedy"`, `routed_scaling_factor=1.0`, `norm_topk_prob=false`
-- [ ] Assert tokenizer facts:
-  - [ ] BPE vocab `128000`, total vocab `129280`, added tokens `830`
-  - [ ] BOS `0`, EOS `1`, PAD `2`, `<image>` `128815`
+  - [x] dense layer-0 intermediate `6848`
+  - [x] MoE layers `1..11`, routed experts `64`, top-k `6`, routed intermediate `896`, shared experts `2`
+  - [x] `hidden_act="silu"`, `rms_norm_eps=1e-6`, `attention_bias=false`, `attention_dropout=0.0`
+  - [x] MoE `scoring_func="softmax"`, `topk_method="greedy"`, `routed_scaling_factor=1.0`, `norm_topk_prob=false`
+- [x] Assert tokenizer facts:
+  - [x] BPE vocab `128000`, total vocab `129280`, added tokens `830`
+  - [x] BOS `0`, EOS `1`, PAD `2`, `<image>` `128815`
 - [ ] Assert current safetensors facts:
   - [x] total weight payload `6,672,212,480` bytes from `model.safetensors.index.json`
   - [x] `2710` tensor entries in the safetensors header / index
