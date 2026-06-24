@@ -105,6 +105,7 @@ from .ocr import (
     default_resource_path,
     generate,
     generate_prepared,
+    ocr_image,
 )
 
 __all__ = [
@@ -201,4 +202,5 @@ __all__ = [
     "default_resource_path",
     "generate",
     "generate_prepared",
+    "ocr_image",
 ]

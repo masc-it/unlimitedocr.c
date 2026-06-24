@@ -946,12 +946,12 @@ Do not start the stable high-level OCR/PDF API until Gate E2E-0 passes: public f
   - [x] call C engine
   - [x] decode returned token ids with HF tokenizer
   - [x] strip trailing EOS text if present
-- [ ] Implement `ocr_image()` matching local wrapper defaults:
-  - [ ] prompt `"<image>document parsing."`
-  - [ ] gundam preset default
-  - [ ] upstream-style `max_length=32768` converted to C `max_new_tokens = max_length - prompt_tokens`, capped by engine limit
-  - [ ] `no_repeat_ngram_size=35`
-  - [ ] `ngram_window=128`
+- [x] Implement `ocr_image()` matching local wrapper defaults:
+  - [x] prompt `"<image>document parsing."`
+  - [x] gundam preset default
+  - [x] upstream-style `max_length=32768` converted to C `max_new_tokens = max_length - prompt_tokens`, capped by engine limit
+  - [x] `no_repeat_ngram_size=35`
+  - [x] `ngram_window=128`
 - [ ] Implement `ocr_pages()` matching upstream multi-page defaults:
   - [ ] prompt `"<image>Multi page parsing."`
   - [ ] base mode

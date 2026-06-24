@@ -8,7 +8,7 @@ validated.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -76,6 +76,19 @@ def _decode_single_output(outputs: list[NDArray[np.int32]], tokenizer_path: str 
         raise RuntimeError(f"expected one generated output, got {len(outputs)}")
     token_ids = np.ascontiguousarray(outputs[0], dtype=np.int32)
     return GenerationResult(token_ids=token_ids, text=decode_generated_ids(token_ids, tokenizer_path))
+
+
+def _cap_max_new_tokens(request: PreparedRequest, max_gen_tokens: int | None) -> PreparedRequest:
+    """Cap a prepared request's generation budget to the chosen engine limit."""
+
+    if max_gen_tokens is None:
+        return request
+    if max_gen_tokens < 0:
+        raise ValueError("max_gen_tokens must be non-negative")
+    cap = int(max_gen_tokens)
+    if request.max_new_tokens <= cap:
+        return request
+    return replace(request, max_new_tokens=cap)
 
 
 def generate_prepared(
@@ -158,6 +171,55 @@ def generate(
         no_repeat_window=no_repeat_window,
         dtype=dtype,
     )
+    return generate_prepared(
+        request,
+        engine=engine,
+        model_path=model_path,
+        backend=backend,
+        resource_path=resource_path,
+        memory_budget_bytes=memory_budget_bytes,
+        library_path=library_path,
+    )
+
+
+def ocr_image(
+    image: ImageInput,
+    *,
+    model_path: str | Path | None = None,
+    prompt: str = SINGLE_PROMPT,
+    preset: str | Preset = "gundam",
+    tokenizer_path: str | Path | None = None,
+    max_length: int = 32768,
+    max_gen_tokens: int | None = 512,
+    no_repeat_ngram_size: int = 35,
+    ngram_window: int = 128,
+    dtype: np.dtype[Any] | type[np.float16] | type[np.float32] = np.float16,
+    engine: Engine | None = None,
+    backend: str = "metal",
+    resource_path: str | Path | None = None,
+    memory_budget_bytes: int = 0,
+    library_path: str | Path | None = None,
+) -> GenerationResult:
+    """Run single-image OCR with the upstream wrapper defaults.
+
+    Upstream specifies ``max_length`` as total sequence length.  The C API takes
+    ``max_new_tokens``, so this first prepares the prompt to compute
+    ``max_length - prompt_tokens`` and then caps that value to ``max_gen_tokens``
+    (the engine generation limit used when this helper opens its own engine).
+    """
+
+    request = prepare_image(
+        image,
+        prompt=prompt,
+        preset=preset,
+        tokenizer_path=tokenizer_path,
+        max_length=max_length,
+        max_new_tokens=None,
+        no_repeat_ngram_size=no_repeat_ngram_size,
+        no_repeat_window=ngram_window,
+        dtype=dtype,
+    )
+    request = _cap_max_new_tokens(request, max_gen_tokens)
     return generate_prepared(
         request,
         engine=engine,
