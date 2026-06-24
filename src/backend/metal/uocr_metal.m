@@ -41,6 +41,23 @@ typedef struct uocr_metal_tensor_binding_internal {
     uint64_t payload_size;
 } uocr_metal_tensor_binding_internal;
 
+#define UOCR_METAL_DECODER_REQUIRED_TENSOR_COUNT \
+    (3u + (UOCR_DECODER_LAYERS * 6u) + 3u + ((UOCR_DECODER_LAYERS - 1u) * (1u + 3u + UOCR_ROUTED_EXPERTS * 3u)))
+
+typedef struct uocr_metal_decoder_binding {
+    uint32_t tensor_id;
+    uint32_t reserved;
+    id<MTLBuffer> buffer;
+    NSUInteger offset;
+    uint64_t payload_size;
+} uocr_metal_decoder_binding;
+
+typedef struct uocr_metal_decoder_binding_cache {
+    int valid;
+    uint32_t count;
+    uocr_metal_decoder_binding tensors[UOCR_METAL_DECODER_REQUIRED_TENSOR_COUNT];
+} uocr_metal_decoder_binding_cache;
+
 typedef struct uocr_metal_payload_span {
     uint32_t tensor_index;
     uint32_t tensor_id;
@@ -77,6 +94,8 @@ struct uocr_metal_context {
     uint64_t last_model_warmup_bytes;
     uocr_metal_scratch_buffer scratch[UOCR_METAL_SCRATCH_COUNT];
     uocr_metal_runtime_arena runtime_arenas[UOCR_METAL_ARENA_COUNT];
+    uocr_metal_decoder_binding_cache decoder_bindings;
+    char decoder_binding_error[256];
     uocr_metal_kv_cache_layout kv_cache_layout;
     int has_kv_cache_layout;
 };
@@ -796,6 +815,12 @@ static int find_view_for_payload(const uocr_metal_model_view *views,
     return 0;
 }
 
+static void metal_invalidate_decoder_binding_cache(uocr_metal_context *ctx, const char *reason);
+static int metal_refresh_decoder_binding_cache(uocr_metal_context *ctx,
+                                               const uocr_model_file *model,
+                                               char *error,
+                                               size_t error_size);
+
 static uocr_metal_tensor_binding_internal *build_tensor_bindings(const uocr_model_file *model,
                                                                   const uocr_metal_model_view *views,
                                                                   uint32_t view_count,
@@ -854,6 +879,7 @@ void uocr_metal_context_unmap_model(uocr_metal_context *ctx) {
         free(ctx->tensor_bindings);
         ctx->tensor_bindings = NULL;
         ctx->tensor_binding_count = 0u;
+        metal_invalidate_decoder_binding_cache(ctx, "no mapped model");
         ctx->model_view_bytes = 0u;
         ctx->last_model_warmup_bytes = 0u;
     }
@@ -946,6 +972,14 @@ int uocr_metal_context_map_model(uocr_metal_context *ctx, const uocr_model_file 
     ctx->tensor_bindings = bindings;
     ctx->tensor_binding_count = payload_count;
     ctx->model_view_bytes = tensor_data->size;
+
+    char decoder_error[256];
+    memset(decoder_error, 0, sizeof(decoder_error));
+    if (!metal_refresh_decoder_binding_cache(ctx, model, decoder_error, sizeof(decoder_error))) {
+        metal_invalidate_decoder_binding_cache(ctx,
+                                               decoder_error[0] != '\0' ? decoder_error : "decoder tensor bindings are not available");
+    }
+
     metal_clear_error(error, error_size);
     return 1;
 }
@@ -1048,6 +1082,398 @@ static int metal_get_mapped_tensor_buffer(const uocr_metal_context *ctx,
     *out_buffer = ctx->model_views[binding->view_index].buffer;
     *out_offset = (NSUInteger)binding->inner_offset;
     return 1;
+}
+
+static void metal_invalidate_decoder_binding_cache(uocr_metal_context *ctx, const char *reason) {
+    if (ctx == NULL) {
+        return;
+    }
+    memset(&ctx->decoder_bindings, 0, sizeof(ctx->decoder_bindings));
+    if (reason == NULL || reason[0] == '\0') {
+        reason = "decoder tensor bindings are not validated";
+    }
+    (void)snprintf(ctx->decoder_binding_error, sizeof(ctx->decoder_binding_error), "%s", reason);
+}
+
+static int metal_tensor_expected_payload_bytes(uint32_t rank,
+                                               const uint32_t dims[UOCR_TENSOR_MAX_DIMS],
+                                               uint64_t *out_bytes) {
+    if (dims == NULL || out_bytes == NULL || rank == 0u || rank > UOCR_TENSOR_MAX_DIMS) {
+        return 0;
+    }
+    uint64_t values = 1u;
+    for (uint32_t i = 0u; i < rank; ++i) {
+        if (dims[i] == 0u || !checked_mul_u64(values, (uint64_t)dims[i], &values)) {
+            return 0;
+        }
+    }
+    return checked_mul_u64(values, 2u, out_bytes);
+}
+
+static int metal_validate_decoder_tensor_metadata(const uocr_tensor_entry *tensor,
+                                                  uint32_t tensor_id,
+                                                  uint32_t family,
+                                                  int32_t layer,
+                                                  int32_t expert,
+                                                  uint32_t projection,
+                                                  uint32_t rank,
+                                                  const uint32_t dims[UOCR_TENSOR_MAX_DIMS],
+                                                  uint64_t expected_payload_size,
+                                                  char *error,
+                                                  size_t error_size) {
+    if (tensor == NULL) {
+        return metal_fail(error, error_size, "missing decoder tensor %u", tensor_id);
+    }
+    if (tensor->id != tensor_id) {
+        return metal_fail(error, error_size, "decoder tensor id mismatch: got %u expected %u", tensor->id, tensor_id);
+    }
+    if (tensor->usage != UOCR_TENSOR_USAGE_RUNTIME) {
+        return metal_fail(error,
+                          error_size,
+                          "decoder tensor %u has unsupported usage %s",
+                          tensor_id,
+                          uocr_tensor_usage_name(tensor->usage));
+    }
+    if (tensor->qtype != UOCR_TENSOR_F16) {
+        return metal_fail(error,
+                          error_size,
+                          "decoder tensor %u has unsupported qtype %s; integrated fp16 decoder requires f16",
+                          tensor_id,
+                          uocr_tensor_qtype_name(tensor->qtype));
+    }
+    if (tensor->family != family || tensor->layer != layer || tensor->expert != expert || tensor->projection != projection) {
+        return metal_fail(error,
+                          error_size,
+                          "decoder tensor %u registry metadata mismatch: family=%s layer=%d expert=%d projection=%u",
+                          tensor_id,
+                          uocr_tensor_family_name(tensor->family),
+                          tensor->layer,
+                          tensor->expert,
+                          tensor->projection);
+    }
+    if (tensor->rank != rank) {
+        return metal_fail(error,
+                          error_size,
+                          "decoder tensor %u rank mismatch: got %u expected %u",
+                          tensor_id,
+                          tensor->rank,
+                          rank);
+    }
+    for (uint32_t i = 0u; i < rank; ++i) {
+        if (tensor->logical_shape[i] != dims[i] || tensor->physical_shape[i] != dims[i]) {
+            return metal_fail(error,
+                              error_size,
+                              "decoder tensor %u shape[%u] mismatch: logical=%u physical=%u expected=%u",
+                              tensor_id,
+                              i,
+                              tensor->logical_shape[i],
+                              tensor->physical_shape[i],
+                              dims[i]);
+        }
+    }
+    for (uint32_t i = rank; i < UOCR_TENSOR_MAX_DIMS; ++i) {
+        if (tensor->logical_shape[i] != 0u || tensor->physical_shape[i] != 0u) {
+            return metal_fail(error,
+                              error_size,
+                              "decoder tensor %u has non-zero trailing shape[%u]: logical=%u physical=%u",
+                              tensor_id,
+                              i,
+                              tensor->logical_shape[i],
+                              tensor->physical_shape[i]);
+        }
+    }
+    if (tensor->payload_size != expected_payload_size) {
+        return metal_fail(error,
+                          error_size,
+                          "decoder tensor %u payload size mismatch: got %llu expected %llu",
+                          tensor_id,
+                          (unsigned long long)tensor->payload_size,
+                          (unsigned long long)expected_payload_size);
+    }
+    return 1;
+}
+
+static int metal_append_decoder_binding(uocr_metal_context *ctx,
+                                        const uocr_model_file *model,
+                                        uocr_metal_decoder_binding_cache *cache,
+                                        uint32_t tensor_id,
+                                        uint32_t family,
+                                        int32_t layer,
+                                        int32_t expert,
+                                        uint32_t projection,
+                                        uint32_t rank,
+                                        const uint32_t dims[UOCR_TENSOR_MAX_DIMS],
+                                        char *error,
+                                        size_t error_size) {
+    if (ctx == NULL || model == NULL || cache == NULL || cache->count >= UOCR_METAL_DECODER_REQUIRED_TENSOR_COUNT) {
+        return metal_fail(error, error_size, "decoder tensor binding cache overflow");
+    }
+    uint64_t expected_payload_size = 0u;
+    if (!metal_tensor_expected_payload_bytes(rank, dims, &expected_payload_size)) {
+        return metal_fail(error, error_size, "decoder tensor %u expected byte-size overflow", tensor_id);
+    }
+    const uocr_tensor_entry *tensor = uocr_model_file_find_tensor(model, tensor_id);
+    if (!metal_validate_decoder_tensor_metadata(tensor,
+                                                tensor_id,
+                                                family,
+                                                layer,
+                                                expert,
+                                                projection,
+                                                rank,
+                                                dims,
+                                                expected_payload_size,
+                                                error,
+                                                error_size)) {
+        return 0;
+    }
+
+    id<MTLBuffer> buffer = nil;
+    NSUInteger offset = 0u;
+    if (!metal_get_mapped_tensor_buffer(ctx, tensor_id, expected_payload_size, &buffer, &offset, error, error_size)) {
+        return 0;
+    }
+
+    uocr_metal_decoder_binding *binding = &cache->tensors[cache->count++];
+    binding->tensor_id = tensor_id;
+    binding->reserved = 0u;
+    binding->buffer = buffer;
+    binding->offset = offset;
+    binding->payload_size = expected_payload_size;
+    return 1;
+}
+
+static int metal_append_decoder_binding1(uocr_metal_context *ctx,
+                                         const uocr_model_file *model,
+                                         uocr_metal_decoder_binding_cache *cache,
+                                         uint32_t tensor_id,
+                                         uint32_t family,
+                                         int32_t layer,
+                                         int32_t expert,
+                                         uint32_t projection,
+                                         uint32_t d0,
+                                         char *error,
+                                         size_t error_size) {
+    const uint32_t dims[UOCR_TENSOR_MAX_DIMS] = {d0, 0u, 0u, 0u};
+    return metal_append_decoder_binding(ctx, model, cache, tensor_id, family, layer, expert, projection, 1u, dims, error, error_size);
+}
+
+static int metal_append_decoder_binding2(uocr_metal_context *ctx,
+                                         const uocr_model_file *model,
+                                         uocr_metal_decoder_binding_cache *cache,
+                                         uint32_t tensor_id,
+                                         uint32_t family,
+                                         int32_t layer,
+                                         int32_t expert,
+                                         uint32_t projection,
+                                         uint32_t d0,
+                                         uint32_t d1,
+                                         char *error,
+                                         size_t error_size) {
+    const uint32_t dims[UOCR_TENSOR_MAX_DIMS] = {d0, d1, 0u, 0u};
+    return metal_append_decoder_binding(ctx, model, cache, tensor_id, family, layer, expert, projection, 2u, dims, error, error_size);
+}
+
+static int metal_refresh_decoder_binding_cache(uocr_metal_context *ctx,
+                                               const uocr_model_file *model,
+                                               char *error,
+                                               size_t error_size) {
+    metal_clear_error(error, error_size);
+    if (ctx == NULL || model == NULL || ctx->model_views == NULL || ctx->tensor_bindings == NULL) {
+        return metal_fail(error, error_size, "decoder tensor binding validation requires a mapped model");
+    }
+
+    uocr_metal_decoder_binding_cache cache;
+    memset(&cache, 0, sizeof(cache));
+
+#define APPEND1(tensor_id, family, layer, expert, projection, d0) \
+    do { \
+        if (!metal_append_decoder_binding1(ctx, model, &cache, (tensor_id), (family), (layer), (expert), (projection), (d0), error, error_size)) { \
+            return 0; \
+        } \
+    } while (0)
+#define APPEND2(tensor_id, family, layer, expert, projection, d0, d1) \
+    do { \
+        if (!metal_append_decoder_binding2(ctx, model, &cache, (tensor_id), (family), (layer), (expert), (projection), (d0), (d1), error, error_size)) { \
+            return 0; \
+        } \
+    } while (0)
+
+    APPEND2(UOCR_TENSOR_ID_TOK_EMBED,
+            UOCR_TENSOR_FAMILY_TOK_EMBED,
+            -1,
+            -1,
+            UOCR_TENSOR_PROJ_WEIGHT,
+            UOCR_VOCAB_SIZE,
+            UOCR_HIDDEN_SIZE);
+    APPEND2(UOCR_TENSOR_ID_LM_HEAD,
+            UOCR_TENSOR_FAMILY_LM_HEAD,
+            -1,
+            -1,
+            UOCR_TENSOR_PROJ_WEIGHT,
+            UOCR_VOCAB_SIZE,
+            UOCR_HIDDEN_SIZE);
+    APPEND1(UOCR_TENSOR_ID_FINAL_NORM,
+            UOCR_TENSOR_FAMILY_FINAL_NORM,
+            -1,
+            -1,
+            UOCR_TENSOR_PROJ_WEIGHT,
+            UOCR_HIDDEN_SIZE);
+
+    for (uint32_t layer = 0u; layer < UOCR_DECODER_LAYERS; ++layer) {
+        APPEND1(uocr_tensor_id_layer_input_norm(layer),
+                UOCR_TENSOR_FAMILY_LAYER_NORM,
+                (int32_t)layer,
+                -1,
+                UOCR_TENSOR_PROJ_WEIGHT,
+                UOCR_HIDDEN_SIZE);
+        APPEND1(uocr_tensor_id_layer_post_attn_norm(layer),
+                UOCR_TENSOR_FAMILY_LAYER_NORM,
+                (int32_t)layer,
+                -1,
+                UOCR_TENSOR_PROJ_WEIGHT,
+                UOCR_HIDDEN_SIZE);
+        APPEND2(uocr_tensor_id_layer_attn(layer, UOCR_TENSOR_PROJ_Q),
+                UOCR_TENSOR_FAMILY_LAYER_ATTN,
+                (int32_t)layer,
+                -1,
+                UOCR_TENSOR_PROJ_Q,
+                UOCR_HIDDEN_SIZE,
+                UOCR_HIDDEN_SIZE);
+        APPEND2(uocr_tensor_id_layer_attn(layer, UOCR_TENSOR_PROJ_K),
+                UOCR_TENSOR_FAMILY_LAYER_ATTN,
+                (int32_t)layer,
+                -1,
+                UOCR_TENSOR_PROJ_K,
+                UOCR_HIDDEN_SIZE,
+                UOCR_HIDDEN_SIZE);
+        APPEND2(uocr_tensor_id_layer_attn(layer, UOCR_TENSOR_PROJ_V),
+                UOCR_TENSOR_FAMILY_LAYER_ATTN,
+                (int32_t)layer,
+                -1,
+                UOCR_TENSOR_PROJ_V,
+                UOCR_HIDDEN_SIZE,
+                UOCR_HIDDEN_SIZE);
+        APPEND2(uocr_tensor_id_layer_attn(layer, UOCR_TENSOR_PROJ_O),
+                UOCR_TENSOR_FAMILY_LAYER_ATTN,
+                (int32_t)layer,
+                -1,
+                UOCR_TENSOR_PROJ_O,
+                UOCR_HIDDEN_SIZE,
+                UOCR_HIDDEN_SIZE);
+    }
+
+    APPEND2(uocr_tensor_id_layer_dense_mlp(UOCR_TENSOR_PROJ_GATE),
+            UOCR_TENSOR_FAMILY_LAYER_DENSE_MLP,
+            0,
+            -1,
+            UOCR_TENSOR_PROJ_GATE,
+            UOCR_DENSE_LAYER0_INTERMEDIATE,
+            UOCR_HIDDEN_SIZE);
+    APPEND2(uocr_tensor_id_layer_dense_mlp(UOCR_TENSOR_PROJ_UP),
+            UOCR_TENSOR_FAMILY_LAYER_DENSE_MLP,
+            0,
+            -1,
+            UOCR_TENSOR_PROJ_UP,
+            UOCR_DENSE_LAYER0_INTERMEDIATE,
+            UOCR_HIDDEN_SIZE);
+    APPEND2(uocr_tensor_id_layer_dense_mlp(UOCR_TENSOR_PROJ_DOWN),
+            UOCR_TENSOR_FAMILY_LAYER_DENSE_MLP,
+            0,
+            -1,
+            UOCR_TENSOR_PROJ_DOWN,
+            UOCR_HIDDEN_SIZE,
+            UOCR_DENSE_LAYER0_INTERMEDIATE);
+
+    for (uint32_t layer = 1u; layer < UOCR_DECODER_LAYERS; ++layer) {
+        APPEND2(uocr_tensor_id_moe_router(layer),
+                UOCR_TENSOR_FAMILY_MOE_ROUTER,
+                (int32_t)layer,
+                -1,
+                UOCR_TENSOR_PROJ_WEIGHT,
+                UOCR_ROUTED_EXPERTS,
+                UOCR_HIDDEN_SIZE);
+        APPEND2(uocr_tensor_id_moe_shared(layer, UOCR_TENSOR_PROJ_GATE),
+                UOCR_TENSOR_FAMILY_MOE_SHARED,
+                (int32_t)layer,
+                -1,
+                UOCR_TENSOR_PROJ_GATE,
+                UOCR_MOE_SHARED_INTERMEDIATE,
+                UOCR_HIDDEN_SIZE);
+        APPEND2(uocr_tensor_id_moe_shared(layer, UOCR_TENSOR_PROJ_UP),
+                UOCR_TENSOR_FAMILY_MOE_SHARED,
+                (int32_t)layer,
+                -1,
+                UOCR_TENSOR_PROJ_UP,
+                UOCR_MOE_SHARED_INTERMEDIATE,
+                UOCR_HIDDEN_SIZE);
+        APPEND2(uocr_tensor_id_moe_shared(layer, UOCR_TENSOR_PROJ_DOWN),
+                UOCR_TENSOR_FAMILY_MOE_SHARED,
+                (int32_t)layer,
+                -1,
+                UOCR_TENSOR_PROJ_DOWN,
+                UOCR_HIDDEN_SIZE,
+                UOCR_MOE_SHARED_INTERMEDIATE);
+        for (uint32_t expert = 0u; expert < UOCR_ROUTED_EXPERTS; ++expert) {
+            APPEND2(uocr_tensor_id_moe_expert(layer, expert, UOCR_TENSOR_PROJ_GATE),
+                    UOCR_TENSOR_FAMILY_MOE_EXPERT,
+                    (int32_t)layer,
+                    (int32_t)expert,
+                    UOCR_TENSOR_PROJ_GATE,
+                    UOCR_MOE_EXPERT_INTERMEDIATE,
+                    UOCR_HIDDEN_SIZE);
+            APPEND2(uocr_tensor_id_moe_expert(layer, expert, UOCR_TENSOR_PROJ_UP),
+                    UOCR_TENSOR_FAMILY_MOE_EXPERT,
+                    (int32_t)layer,
+                    (int32_t)expert,
+                    UOCR_TENSOR_PROJ_UP,
+                    UOCR_MOE_EXPERT_INTERMEDIATE,
+                    UOCR_HIDDEN_SIZE);
+            APPEND2(uocr_tensor_id_moe_expert(layer, expert, UOCR_TENSOR_PROJ_DOWN),
+                    UOCR_TENSOR_FAMILY_MOE_EXPERT,
+                    (int32_t)layer,
+                    (int32_t)expert,
+                    UOCR_TENSOR_PROJ_DOWN,
+                    UOCR_HIDDEN_SIZE,
+                    UOCR_MOE_EXPERT_INTERMEDIATE);
+        }
+    }
+
+#undef APPEND1
+#undef APPEND2
+
+    if (cache.count != UOCR_METAL_DECODER_REQUIRED_TENSOR_COUNT) {
+        return metal_fail(error,
+                          error_size,
+                          "decoder tensor binding count mismatch: got %u expected %u",
+                          cache.count,
+                          (uint32_t)UOCR_METAL_DECODER_REQUIRED_TENSOR_COUNT);
+    }
+    cache.valid = 1;
+    ctx->decoder_bindings = cache;
+    ctx->decoder_binding_error[0] = '\0';
+    return 1;
+}
+
+static const uocr_metal_decoder_binding *metal_find_decoder_binding(const uocr_metal_context *ctx,
+                                                                    uint32_t tensor_id) {
+    if (ctx == NULL || !ctx->decoder_bindings.valid || tensor_id == 0u) {
+        return NULL;
+    }
+    for (uint32_t i = 0u; i < ctx->decoder_bindings.count; ++i) {
+        if (ctx->decoder_bindings.tensors[i].tensor_id == tensor_id) {
+            return &ctx->decoder_bindings.tensors[i];
+        }
+    }
+    return NULL;
+}
+
+uint32_t uocr_metal_context_decoder_binding_count(const uocr_metal_context *ctx) {
+    return ctx != NULL && ctx->decoder_bindings.valid ? ctx->decoder_bindings.count : 0u;
+}
+
+int uocr_metal_context_decoder_bindings_ready(const uocr_metal_context *ctx) {
+    return ctx != NULL && ctx->decoder_bindings.valid &&
+           ctx->decoder_bindings.count == UOCR_METAL_DECODER_REQUIRED_TENSOR_COUNT;
 }
 
 static int scratch_slot_valid(uocr_metal_scratch_slot slot) {
@@ -1783,6 +2209,18 @@ int uocr_metal_context_generate_f16(uocr_metal_context *ctx,
 
     if (!metal_decoder_runtime_arenas_ready(ctx)) {
         return metal_fail(error, error_size, "Metal integrated decoder requires allocated runtime arenas");
+    }
+    if (!uocr_metal_context_decoder_bindings_ready(ctx) ||
+        metal_find_decoder_binding(ctx, UOCR_TENSOR_ID_TOK_EMBED) == NULL ||
+        metal_find_decoder_binding(ctx, UOCR_TENSOR_ID_FINAL_NORM) == NULL ||
+        metal_find_decoder_binding(ctx, UOCR_TENSOR_ID_LM_HEAD) == NULL) {
+        const char *binding_error = ctx->decoder_binding_error[0] != '\0' ?
+                                        ctx->decoder_binding_error :
+                                        "decoder tensor bindings are not validated";
+        return metal_fail(error,
+                          error_size,
+                          "Metal integrated decoder requires validated fp16 decoder tensor bindings: %s",
+                          binding_error);
     }
     if (request->input_ids == NULL || request->image_mask == NULL || request->n_tokens == 0u) {
         return metal_fail(error, error_size, "Metal integrated decoder requires input ids, image mask, and prompt tokens");

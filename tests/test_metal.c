@@ -7667,8 +7667,8 @@ static int test_metal_integrated_decoder_boundary(void) {
 
     CHECK(uocr_metal_context_allocate_runtime_arenas(ctx, 1u, 8u, error, sizeof(error)) == 1);
     memset(error, 0, sizeof(error));
-    CHECK(uocr_metal_context_generate_f16(ctx, &request, &result, error, sizeof(error)) == 1);
-    CHECK(error[0] == '\0');
+    CHECK(uocr_metal_context_generate_f16(ctx, &request, &result, error, sizeof(error)) == 0);
+    CHECK(strstr(error, "requires validated fp16 decoder tensor bindings") != NULL);
     CHECK(result.generated_count == 0u);
     CHECK(result.stopped_on_eos == 0u);
     CHECK(result.last_token_id == UINT32_MAX);
@@ -7679,17 +7679,74 @@ static int test_metal_integrated_decoder_boundary(void) {
     result.generated_capacity = 1u;
     memset(error, 0, sizeof(error));
     CHECK(uocr_metal_context_generate_f16(ctx, &request, &result, error, sizeof(error)) == 0);
-    CHECK(strstr(error, "prefill/decode loop is not implemented yet") != NULL);
+    CHECK(strstr(error, "requires validated fp16 decoder tensor bindings") != NULL);
     CHECK(result.generated_count == 0u);
     CHECK(result.last_token_id == UINT32_MAX);
 
+    uocr_metal_context_destroy(ctx);
+    return 0;
+}
+
+static int test_metal_decoder_binding_cache_full_model(void) {
+    if (!uocr_metal_is_available()) {
+        return 0;
+    }
+    if (!env_flag_enabled("UOCR_RUN_LARGE_TESTS")) {
+        return 0;
+    }
+
+    const char *model_path = getenv("UOCR_MODEL_PATH");
+    if (model_path == NULL || model_path[0] == '\0') {
+        printf("UOCR_RUN_LARGE_TESTS=1 but UOCR_MODEL_PATH is not set; skipping decoder binding cache validation\n");
+        return 0;
+    }
+
+    enum {
+        EXPECTED_DECODER_BINDINGS = 3u + (UOCR_DECODER_LAYERS * 6u) + 3u +
+                                    ((UOCR_DECODER_LAYERS - 1u) *
+                                     (1u + 3u + UOCR_ROUTED_EXPERTS * 3u))
+    };
+    const int32_t input_ids[3] = {UOCR_TOKEN_BOS, 42, 77};
+    const uint8_t image_mask[3] = {0u, 0u, 0u};
+    int32_t generated[1] = {0};
+    char error[1024];
+    memset(error, 0, sizeof(error));
+
+    uocr_model_file model;
+    CHECK(uocr_model_file_open(model_path, &model, error, sizeof(error)) == 0);
+    uocr_metal_context *ctx = uocr_metal_context_create(UOCR_TEST_METAL_RESOURCE_PATH, error, sizeof(error));
+    CHECK(ctx != NULL);
+    CHECK(uocr_metal_context_map_model(ctx, &model, error, sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    CHECK(uocr_metal_context_decoder_bindings_ready(ctx) == 1);
+    CHECK(uocr_metal_context_decoder_binding_count(ctx) == EXPECTED_DECODER_BINDINGS);
+    CHECK(uocr_metal_context_allocate_runtime_arenas(ctx, 1u, 8u, error, sizeof(error)) == 1);
+
+    uocr_metal_decoder_request_f16 request;
+    memset(&request, 0, sizeof(request));
+    request.input_ids = input_ids;
+    request.image_mask = image_mask;
+    request.n_tokens = 3u;
     request.max_new_tokens = 0u;
-    request.image_span_start = 1u;
+    request.slot = 0u;
+    request.image_span_start = UINT32_MAX;
+    request.image_span_length = 0u;
+    uocr_metal_decoder_result_f16 result;
+    memset(&result, 0, sizeof(result));
+    CHECK(uocr_metal_context_generate_f16(ctx, &request, &result, error, sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    CHECK(result.generated_count == 0u);
+
+    request.max_new_tokens = 1u;
+    result.generated_ids = generated;
+    result.generated_capacity = 1u;
     memset(error, 0, sizeof(error));
     CHECK(uocr_metal_context_generate_f16(ctx, &request, &result, error, sizeof(error)) == 0);
-    CHECK(strstr(error, "text-only requests") != NULL);
+    CHECK(strstr(error, "prefill/decode loop is not implemented yet") != NULL);
+    CHECK(result.generated_count == 0u);
 
     uocr_metal_context_destroy(ctx);
+    uocr_model_file_close(&model);
     return 0;
 }
 
@@ -7713,6 +7770,8 @@ static int test_metal_model_mapping(void) {
     CHECK(error[0] == '\0');
     CHECK(uocr_metal_context_model_view_count(ctx) == 1u);
     CHECK(uocr_metal_context_tensor_binding_count(ctx) == 2u);
+    CHECK(uocr_metal_context_decoder_binding_count(ctx) == 0u);
+    CHECK(uocr_metal_context_decoder_bindings_ready(ctx) == 0);
     CHECK(uocr_metal_context_model_view_bytes(ctx) == UOCR_TENSOR_DATA_ALIGNMENT);
 
     uocr_metal_model_view_info view_info;
@@ -7745,6 +7804,8 @@ static int test_metal_model_mapping(void) {
     uocr_metal_context_unmap_model(ctx);
     CHECK(uocr_metal_context_model_view_count(ctx) == 0u);
     CHECK(uocr_metal_context_tensor_binding_count(ctx) == 0u);
+    CHECK(uocr_metal_context_decoder_binding_count(ctx) == 0u);
+    CHECK(uocr_metal_context_decoder_bindings_ready(ctx) == 0);
     CHECK(uocr_metal_context_model_view_bytes(ctx) == 0u);
 
     uocr_metal_context_destroy(ctx);
@@ -7840,6 +7901,7 @@ int main(void) {
     if (test_metal_recent_decoder_primitives_stress() != 0) return 1;
     if (test_metal_runtime_arenas() != 0) return 1;
     if (test_metal_integrated_decoder_boundary() != 0) return 1;
+    if (test_metal_decoder_binding_cache_full_model() != 0) return 1;
     if (test_metal_model_mapping() != 0) return 1;
     if (test_public_engine_open_initializes_metal() != 0) return 1;
     return 0;
