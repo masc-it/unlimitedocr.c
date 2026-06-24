@@ -7,6 +7,8 @@
 
 #include "uocr_test_model_file.h"
 
+#include <errno.h>
+#include <limits.h>
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -158,6 +160,262 @@ static uint16_t f32_to_f16_bits(float value) {
         }
     }
     return (uint16_t)(sign | ((uint32_t)half_exponent << 10u) | rounded_mantissa);
+}
+
+static int env_flag_enabled(const char *name) {
+    const char *value = getenv(name);
+    return value != NULL && (strcmp(value, "1") == 0 || strcmp(value, "true") == 0 || strcmp(value, "TRUE") == 0 ||
+                             strcmp(value, "yes") == 0 || strcmp(value, "YES") == 0);
+}
+
+static uint16_t bf16_bits_to_f16_bits(uint16_t bf16) {
+    uint32_t bits = ((uint32_t)bf16) << 16u;
+    float value = 0.0f;
+    memcpy(&value, &bits, sizeof(value));
+    return f32_to_f16_bits(value);
+}
+
+static int read_safetensors_u64_le(FILE *f, uint64_t *out) {
+    unsigned char bytes[8];
+    if (fread(bytes, 1u, sizeof(bytes), f) != sizeof(bytes)) {
+        return 0;
+    }
+    uint64_t value = 0u;
+    for (uint32_t i = 0u; i < 8u; ++i) {
+        value |= ((uint64_t)bytes[i]) << (8u * i);
+    }
+    *out = value;
+    return 1;
+}
+
+static const char *parse_u64_after(const char *cursor, uint64_t *out) {
+    if (cursor == NULL || out == NULL) {
+        return NULL;
+    }
+    while (*cursor == ' ' || *cursor == '\t' || *cursor == '\r' || *cursor == '\n') {
+        ++cursor;
+    }
+    errno = 0;
+    char *end = NULL;
+    const unsigned long long value = strtoull(cursor, &end, 10);
+    if (errno != 0 || end == cursor) {
+        return NULL;
+    }
+    *out = (uint64_t)value;
+    return end;
+}
+
+static int find_safetensors_tensor_range(const char *header,
+                                         const char *tensor_name,
+                                         uint64_t *out_start,
+                                         uint64_t *out_end) {
+    if (header == NULL || tensor_name == NULL || out_start == NULL || out_end == NULL) {
+        return 0;
+    }
+
+    char key[256];
+    if (snprintf(key, sizeof(key), "\"%s\"", tensor_name) >= (int)sizeof(key)) {
+        return 0;
+    }
+    const char *entry = strstr(header, key);
+    if (entry == NULL) {
+        return 0;
+    }
+    const char *next_entry = strstr(entry + strlen(key), "},\"");
+    const char *dtype = strstr(entry, "\"dtype\":\"BF16\"");
+    const char *shape = strstr(entry, "\"shape\":[129280,1280]");
+    const char *offsets = strstr(entry, "\"data_offsets\":[");
+    if (dtype == NULL || shape == NULL || offsets == NULL ||
+        (next_entry != NULL && (dtype > next_entry || shape > next_entry || offsets > next_entry))) {
+        return 0;
+    }
+    offsets += strlen("\"data_offsets\":[");
+    uint64_t start = 0u;
+    uint64_t end = 0u;
+    const char *cursor = parse_u64_after(offsets, &start);
+    if (cursor == NULL || *cursor != ',') {
+        return 0;
+    }
+    cursor = parse_u64_after(cursor + 1, &end);
+    if (cursor == NULL || *cursor != ']' || end <= start) {
+        return 0;
+    }
+    *out_start = start;
+    *out_end = end;
+    return 1;
+}
+
+static int make_safetensors_path(const char *hf_dir, char *out, size_t out_size) {
+    static const char *candidates[] = {"model-00001-of-000001.safetensors", "model.safetensors"};
+    if (hf_dir == NULL || hf_dir[0] == '\0' || out == NULL || out_size == 0u) {
+        return 0;
+    }
+    for (uint32_t i = 0u; i < (uint32_t)(sizeof(candidates) / sizeof(candidates[0])); ++i) {
+        if (snprintf(out, out_size, "%s/%s", hf_dir, candidates[i]) >= (int)out_size) {
+            return 0;
+        }
+        if (access(out, R_OK) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int read_hf_embed_rows_as_f16(const char *hf_dir,
+                                     const int32_t *token_ids,
+                                     uint32_t n_tokens,
+                                     uint16_t *out_f16,
+                                     char *error,
+                                     size_t error_size) {
+    if (error != NULL && error_size > 0u) {
+        error[0] = '\0';
+    }
+    if (hf_dir == NULL || token_ids == NULL || out_f16 == NULL || n_tokens == 0u) {
+        snprintf(error, error_size, "invalid HF embedding row request");
+        return 0;
+    }
+
+    char path[4096];
+    if (!make_safetensors_path(hf_dir, path, sizeof(path))) {
+        snprintf(error, error_size, "no safetensors payload found under %s", hf_dir);
+        return 0;
+    }
+
+    FILE *f = fopen(path, "rb");
+    if (f == NULL) {
+        snprintf(error, error_size, "failed to open %s", path);
+        return 0;
+    }
+
+    uint64_t header_len = 0u;
+    if (!read_safetensors_u64_le(f, &header_len) || header_len == 0u || header_len > 256ull * 1024ull * 1024ull) {
+        snprintf(error, error_size, "invalid safetensors header length in %s", path);
+        fclose(f);
+        return 0;
+    }
+    char *header = (char *)malloc((size_t)header_len + 1u);
+    if (header == NULL) {
+        snprintf(error, error_size, "failed to allocate safetensors header buffer");
+        fclose(f);
+        return 0;
+    }
+    if (fread(header, 1u, (size_t)header_len, f) != (size_t)header_len) {
+        snprintf(error, error_size, "failed to read safetensors header from %s", path);
+        free(header);
+        fclose(f);
+        return 0;
+    }
+    header[header_len] = '\0';
+
+    uint64_t tensor_start = 0u;
+    uint64_t tensor_end = 0u;
+    if (!find_safetensors_tensor_range(header, "model.embed_tokens.weight", &tensor_start, &tensor_end)) {
+        snprintf(error, error_size, "failed to locate model.embed_tokens.weight in %s", path);
+        free(header);
+        fclose(f);
+        return 0;
+    }
+    free(header);
+
+    const uint64_t data_start = 8u + header_len;
+    const uint64_t row_bytes = (uint64_t)UOCR_HIDDEN_SIZE * 2u;
+    const uint64_t expected_tensor_bytes = (uint64_t)UOCR_VOCAB_SIZE * row_bytes;
+    if (tensor_end - tensor_start != expected_tensor_bytes) {
+        snprintf(error,
+                 error_size,
+                 "unexpected token embedding byte size %llu in %s",
+                 (unsigned long long)(tensor_end - tensor_start),
+                 path);
+        fclose(f);
+        return 0;
+    }
+
+    unsigned char row[UOCR_HIDDEN_SIZE * 2u];
+    for (uint32_t token = 0u; token < n_tokens; ++token) {
+        if (token_ids[token] < 0 || (uint32_t)token_ids[token] >= UOCR_VOCAB_SIZE) {
+            snprintf(error, error_size, "token id %d out of vocab", token_ids[token]);
+            fclose(f);
+            return 0;
+        }
+        const uint64_t row_offset = data_start + tensor_start + (uint64_t)(uint32_t)token_ids[token] * row_bytes;
+        if (row_offset > (uint64_t)LONG_MAX || fseek(f, (long)row_offset, SEEK_SET) != 0) {
+            snprintf(error, error_size, "failed to seek token embedding row %d", token_ids[token]);
+            fclose(f);
+            return 0;
+        }
+        if (fread(row, 1u, sizeof(row), f) != sizeof(row)) {
+            snprintf(error, error_size, "failed to read token embedding row %d", token_ids[token]);
+            fclose(f);
+            return 0;
+        }
+        for (uint32_t col = 0u; col < (uint32_t)UOCR_HIDDEN_SIZE; ++col) {
+            const uint16_t bf16 = (uint16_t)row[2u * col] | (uint16_t)((uint16_t)row[2u * col + 1u] << 8u);
+            out_f16[token * (uint32_t)UOCR_HIDDEN_SIZE + col] = bf16_bits_to_f16_bits(bf16);
+        }
+    }
+
+    fclose(f);
+    return 1;
+}
+
+static int test_metal_text_prompt_embedding_full_model_parity(void) {
+    if (!uocr_metal_is_available()) {
+        return 0;
+    }
+    if (!env_flag_enabled("UOCR_RUN_LARGE_TESTS")) {
+        return 0;
+    }
+
+    const char *model_path = getenv("UOCR_MODEL_PATH");
+    const char *hf_dir = getenv("UOCR_HF_DIR");
+    if (model_path == NULL || model_path[0] == '\0' || hf_dir == NULL || hf_dir[0] == '\0') {
+        printf("UOCR_RUN_LARGE_TESTS=1 but UOCR_MODEL_PATH/UOCR_HF_DIR are not both set; skipping full prompt parity\n");
+        return 0;
+    }
+
+    enum { TOKENS = 6 };
+    const int32_t token_ids[TOKENS] = {0, 1, 2, 42, 1000, 128000};
+    uint16_t expected[TOKENS * UOCR_HIDDEN_SIZE];
+    char error[1024];
+    memset(error, 0, sizeof(error));
+    CHECK(read_hf_embed_rows_as_f16(hf_dir, token_ids, TOKENS, expected, error, sizeof(error)) == 1);
+
+    uocr_model_file model;
+    CHECK(uocr_model_file_open(model_path, &model, error, sizeof(error)) == 0);
+
+    uocr_metal_context *ctx = uocr_metal_context_create(UOCR_TEST_METAL_RESOURCE_PATH, error, sizeof(error));
+    CHECK(ctx != NULL);
+    CHECK(uocr_metal_context_map_model(ctx, &model, error, sizeof(error)) == 1);
+
+    uint16_t actual[TOKENS * UOCR_HIDDEN_SIZE];
+    memset(actual, 0, sizeof(actual));
+    CHECK(uocr_metal_context_assemble_prompt_from_model_f16(ctx,
+                                                            token_ids,
+                                                            TOKENS,
+                                                            UINT32_MAX,
+                                                            0u,
+                                                            NULL,
+                                                            actual,
+                                                            error,
+                                                            sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+
+    for (uint32_t i = 0u; i < (uint32_t)(TOKENS * UOCR_HIDDEN_SIZE); ++i) {
+        if (actual[i] != expected[i]) {
+            fprintf(stderr,
+                    "prompt embedding mismatch at flat index %u: actual=0x%04x expected=0x%04x\n",
+                    i,
+                    actual[i],
+                    expected[i]);
+            uocr_metal_context_destroy(ctx);
+            uocr_model_file_close(&model);
+            return 1;
+        }
+    }
+
+    uocr_metal_context_destroy(ctx);
+    uocr_model_file_close(&model);
+    return 0;
 }
 
 static int test_metal_get_rows_f16(void) {
@@ -3897,6 +4155,7 @@ int main(void) {
     if (test_metal_get_rows_f16() != 0) return 1;
     if (test_metal_prompt_assembly_f16() != 0) return 1;
     if (test_metal_prompt_assembly_from_mapped_model_f16() != 0) return 1;
+    if (test_metal_text_prompt_embedding_full_model_parity() != 0) return 1;
     if (test_metal_rmsnorm_f16() != 0) return 1;
     if (test_metal_final_rmsnorm_f16() != 0) return 1;
     if (test_metal_lm_head_f16() != 0) return 1;

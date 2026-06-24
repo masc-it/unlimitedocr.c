@@ -659,7 +659,7 @@ First implementation slice, in order:
 - [x] Stop on EOS id `1` or max new tokens.
 - [x] Return generated token ids to C result and Python wrapper.
 - [ ] Add text-only fp16 parity test:
-  - [ ] prompt embeddings
+  - [x] prompt embeddings
   - [ ] layer outputs
   - [ ] logits top-k
   - [ ] generated token ids
@@ -918,10 +918,10 @@ First implementation slice, in order:
   - [ ] run small RoPE kernel
   - [ ] run small SDPA prefill/decode kernel
   - [ ] run q8/q4 dot kernels once implemented
-- [ ] Add opt-in full-model tests guarded by env vars:
-  - [ ] `UOCR_MODEL_PATH`
-  - [ ] `UOCR_HF_DIR`
-  - [ ] `UOCR_RUN_LARGE_TESTS=1`
+- [x] Add opt-in full-model tests guarded by env vars:
+  - [x] `UOCR_MODEL_PATH`
+  - [x] `UOCR_HF_DIR`
+  - [x] `UOCR_RUN_LARGE_TESTS=1`
 - [ ] Define fp16 parity thresholds per stage:
   - [ ] prompt embeddings: near exact within dtype tolerance
   - [ ] vision projected features: small absolute/relative tolerance after fp16 conversion
