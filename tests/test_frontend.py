@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import importlib.util
 import sys
 
@@ -7,6 +8,8 @@ import numpy as np
 from PIL import Image
 
 from unlimitedocr_c.frontend import (
+    EXPECTED_OUTPUT_IDS_NPY,
+    EXPECTED_TEXT_TXT,
     GLOBAL_VISUAL_TOKENS,
     IMAGE_TOKEN_ID,
     LOCAL_QUERIES,
@@ -138,7 +141,46 @@ def test_fixture_roundtrip(tmp_path) -> None:
     assert manifest["image_mask_count"] == GLOBAL_VISUAL_TOKENS
     assert manifest["source_images"][0]["width"] == 320
     assert manifest["source_images"][0]["height"] == 240
+    assert "expected_output" not in manifest
+    assert not (tmp_path / EXPECTED_OUTPUT_IDS_NPY).exists()
+    assert not (tmp_path / EXPECTED_TEXT_TXT).exists()
     np.testing.assert_array_equal(input_ids, req.input_ids)
     np.testing.assert_array_equal(image_mask, req.image_mask)
     assert views["view_0"].dtype == np.float32
     assert views["view_0"].shape == (3, 1024, 1024)
+
+
+def test_fixture_serializes_optional_expected_output(tmp_path) -> None:
+    req = replace(
+        prepare_text("hello", max_new_tokens=3),
+        expected_output_ids=np.array([42, 43, 1], dtype=np.int64),
+        expected_text="answer\n",
+    )
+    save_prepared_request(req, tmp_path)
+
+    manifest, input_ids, image_mask, views = load_prepared_fixture(tmp_path)
+    assert manifest["mode"] == "text-only"
+    assert views == {}
+    np.testing.assert_array_equal(input_ids, req.input_ids)
+    np.testing.assert_array_equal(image_mask, req.image_mask)
+
+    expected = manifest["expected_output"]
+    assert expected == {
+        "ids_dtype": "int32",
+        "ids_file": EXPECTED_OUTPUT_IDS_NPY,
+        "ids_shape": [3],
+        "text_file": EXPECTED_TEXT_TXT,
+    }
+    np.testing.assert_array_equal(np.load(tmp_path / EXPECTED_OUTPUT_IDS_NPY), np.array([42, 43, 1], dtype=np.int32))
+    assert (tmp_path / EXPECTED_TEXT_TXT).read_text(encoding="utf-8") == "answer\n"
+
+
+def test_fixture_rejects_non_1d_expected_output_ids(tmp_path) -> None:
+    req = replace(prepare_text("hello", max_new_tokens=3), expected_output_ids=np.zeros((1, 2), dtype=np.int32))
+    try:
+        save_prepared_request(req, tmp_path)
+    except ValueError as exc:
+        assert "expected_output_ids must be a 1D int32 array" in str(exc)
+    else:  # pragma: no cover - defensive assertion
+        raise AssertionError("save_prepared_request accepted non-1D expected output ids")
+    assert not (tmp_path / "manifest.json").exists()

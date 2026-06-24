@@ -80,6 +80,8 @@ from .ffi import (
 from .frontend import (
     BOS_TOKEN_ID,
     EOS_TOKEN_ID,
+    EXPECTED_OUTPUT_IDS_NPY,
+    EXPECTED_TEXT_TXT,
     IMAGE_TOKEN_ID,
     MULTI_PROMPT,
     PAD_TOKEN_ID,
@@ -182,6 +184,8 @@ __all__ = [
     "load_library",
     "BOS_TOKEN_ID",
     "EOS_TOKEN_ID",
+    "EXPECTED_OUTPUT_IDS_NPY",
+    "EXPECTED_TEXT_TXT",
     "IMAGE_TOKEN_ID",
     "MULTI_PROMPT",
     "PAD_TOKEN_ID",

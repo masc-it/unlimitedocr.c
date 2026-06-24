@@ -38,6 +38,8 @@ GLOBAL_VISUAL_TOKENS = (GLOBAL_QUERIES + 1) * GLOBAL_QUERIES + 1
 
 SINGLE_PROMPT = "<image>document parsing."
 MULTI_PROMPT = "<image>Multi page parsing."
+EXPECTED_OUTPUT_IDS_NPY = "expected_output_ids.npy"
+EXPECTED_TEXT_TXT = "expected_text.txt"
 
 ViewKind = Literal["global", "local"]
 PixelFormat = Literal["f16_nchw", "f32_nchw"]
@@ -104,6 +106,8 @@ class PreparedRequest:
     tokenizer_path: str
     source_images: tuple[dict[str, Any], ...] = ()
     model_vocab_size: int = MODEL_VOCAB_SIZE
+    expected_output_ids: NDArray[np.int32] | None = None
+    expected_text: str | None = None
 
     @property
     def n_tokens(self) -> int:
@@ -114,7 +118,7 @@ class PreparedRequest:
         return int(self.image_mask.sum(dtype=np.uint64))
 
     def manifest(self) -> dict[str, Any]:
-        return {
+        manifest: dict[str, Any] = {
             "version": 1,
             "mode": self.mode,
             "prompt": self.prompt,
@@ -144,6 +148,17 @@ class PreparedRequest:
                 for i, view in enumerate(self.views)
             ],
         }
+        expected_output: dict[str, Any] = {}
+        if self.expected_output_ids is not None:
+            ids = np.asarray(self.expected_output_ids, dtype=np.int32)
+            expected_output["ids_file"] = EXPECTED_OUTPUT_IDS_NPY
+            expected_output["ids_dtype"] = str(ids.dtype)
+            expected_output["ids_shape"] = list(ids.shape)
+        if self.expected_text is not None:
+            expected_output["text_file"] = EXPECTED_TEXT_TXT
+        if expected_output:
+            manifest["expected_output"] = expected_output
+        return manifest
 
 
 def project_root() -> Path:
@@ -510,6 +525,13 @@ def prepare_text(prompt: str,
 def save_prepared_request(request: PreparedRequest, out_dir: str | Path) -> None:
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
+    if request.expected_output_ids is not None:
+        expected_ids = np.ascontiguousarray(request.expected_output_ids, dtype=np.int32)
+        if expected_ids.ndim != 1:
+            raise ValueError(f"expected_output_ids must be a 1D int32 array, got shape {expected_ids.shape}")
+        np.save(out / EXPECTED_OUTPUT_IDS_NPY, expected_ids)
+    if request.expected_text is not None:
+        (out / EXPECTED_TEXT_TXT).write_text(request.expected_text, encoding="utf-8")
     (out / "manifest.json").write_text(json.dumps(request.manifest(), indent=2, sort_keys=True) + "\n", encoding="utf-8")
     np.save(out / "input_ids.npy", request.input_ids)
     np.save(out / "image_mask.npy", request.image_mask)

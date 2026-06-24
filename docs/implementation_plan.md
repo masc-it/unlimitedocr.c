@@ -223,10 +223,10 @@ Current priority slice, in order. The coding agent should take the first uncheck
   - [x] optional original upstream-style `max_length` in fixture metadata for parity debugging
   - [x] `no_repeat_ngram_size`
   - [x] `no_repeat_window`
-- [ ] Add fixture serialization:
+- [x] Add fixture serialization:
   - [x] `manifest.json` with prompt, preset, grid, image mask counts, expected visual count, dtype, shape, and source image metadata; token ids/mask are stored as `.npy` arrays
   - [x] one `.npy` per token/mask array plus a single `.npz` with named view arrays
-  - [ ] optional `expected_output_ids.npy` and `expected_text.txt`
+  - [x] optional `expected_output_ids.npy` and `expected_text.txt`
 - [x] Add `tools/uocr-ref-dump` Python CLI to emit prepared-request fixtures without requiring C.
 - [ ] Add pytest frontend parity tests against the upstream remote code path in `data/context/modeling_unlimitedocr.py`:
   - [x] local frontend smoke tests for rendered prompt, token ids, image mask, crop grid, pixels, fixture roundtrip
