@@ -811,18 +811,18 @@ Do not begin this section until sections 14.5 and 15.1 pass for fp16 single-requ
   - [x] `Q4_K`, block size `256`, type size `144`
 - [x] Keep `Q2_K` and `IQ2_XXS` code disabled or behind later experimental flags.
 - [x] Implement qtype row-size helpers and alignment validation.
-- [ ] Add quantized tensor metadata to `.uocr` with logical and physical widths.
+- [x] Add quantized tensor metadata to `.uocr` with logical and physical widths.
 
 ### 17.2 `dyn-q8` profile
 
-- [ ] Implement qtype policy for `dyn-q8`:
-  - [ ] large decoder linears -> `Q8_0`
-  - [ ] LM head -> `Q8_0`
-  - [ ] token embedding -> `Q8_0` or fp16 if embedding parity drifts; q8 embedding gather needs a dequantizing get-rows kernel
-  - [ ] vision conv/linear weights -> `Q8_0`
-  - [ ] MoE router weights -> fp16
-  - [ ] norms/biases/position/newline/separator -> fp16
-- [ ] Add converter dry-run qtype histogram and memory estimate.
+- [x] Implement qtype policy for `dyn-q8`:
+  - [x] large decoder linears -> `Q8_0`
+  - [x] LM head -> `Q8_0`
+  - [x] token embedding -> `Q8_0` or fp16 if embedding parity drifts; q8 embedding gather needs a dequantizing get-rows kernel
+  - [x] vision conv/linear weights -> `Q8_0`
+  - [x] MoE router weights -> fp16
+  - [x] norms/biases/position/newline/separator -> fp16
+- [x] Add converter dry-run qtype histogram and memory estimate.
 - [ ] Emit q8 `.uocr`.
 - [ ] Add CPU dequant/dot tests for q8 tensors.
 - [ ] Add Metal tests for Q8_0 get-rows/dequant because token embeddings and possibly LM-head-adjacent paths need it.

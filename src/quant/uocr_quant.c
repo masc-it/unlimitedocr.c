@@ -219,7 +219,17 @@ static int validate_quant_shape(const uocr_tensor_entry *tensor,
                               tensor->logical_shape[i]);
         }
     }
-    if (tensor->physical_shape[tensor->rank - 1u] != tensor->logical_shape[tensor->rank - 1u]) {
+    const uint32_t logical_inner = tensor->logical_shape[tensor->rank - 1u];
+    const uint32_t physical_inner = tensor->physical_shape[tensor->rank - 1u];
+    if (physical_inner < logical_inner) {
+        return quant_fail(error,
+                          error_size,
+                          "%s tensor entry physical inner dimension %u is smaller than logical %u",
+                          info->name,
+                          physical_inner,
+                          logical_inner);
+    }
+    if (physical_inner != logical_inner && tensor->qtype != UOCR_TENSOR_Q8_0) {
         return quant_fail(error, error_size, "%s tensor entry uses unsupported padded inner dimension", info->name);
     }
     return 1;

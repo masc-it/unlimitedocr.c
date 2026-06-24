@@ -11,9 +11,15 @@ from unlimitedocr_c.convert import (
     EXPECTED_TOTAL_BYTES,
     PRESERVED_UNUSED_NORMAL_OCR_PREFIXES,
     UOCR_FILE_HEADER_SIZE,
+    UOCR_Q8_0_BLOCK_SIZE,
+    UOCR_Q8_0_TYPE_SIZE,
     UOCR_SECTION_TENSOR_DATA,
     UOCR_TENSOR_DATA_ALIGNMENT,
     UOCR_TENSOR_PAYLOAD_ALIGNMENT,
+    UOCR_TENSOR_Q8_0,
+    _TENSOR_DIRECTORY_HEADER_STRUCT,
+    _TENSOR_ENTRY_STRUCT,
+    _tensor_directory_bytes,
     build_dry_run_plan,
     filter_plan_tensors,
     is_preserved_unused_in_normal_ocr,
@@ -133,6 +139,61 @@ def test_fp16_converter_dry_run_against_cached_header() -> None:
     assert clip_patch.usage == "preserved-unused"
     assert "patch_embeds" in clip_patch.reason
     assert "provenance" in clip_patch.reason
+
+
+def test_dyn_q8_converter_dry_run_records_quant_metadata() -> None:
+    plan = build_dry_run_plan(project_root() / "data/context", qprofile="dyn-q8")
+
+    assert plan.tensor_count == EXPECTED_TENSOR_COUNT
+    assert plan.total_source_bytes == EXPECTED_TOTAL_BYTES
+    assert plan.total_output_bytes < EXPECTED_TOTAL_BYTES
+    assert plan.summary_dict()["estimated_savings_bytes"] == EXPECTED_TOTAL_BYTES - plan.total_output_bytes
+    assert 0 < plan.summary_dict()["compression_ratio"] < 1
+    assert plan.qtype_histogram["UOCR_TENSOR_Q8_0"] > 0
+    assert plan.qtype_histogram["UOCR_TENSOR_F16"] > 0
+
+    lm_head = plan.tensor_by_name("lm_head.weight")
+    assert lm_head.qtype == "UOCR_TENSOR_Q8_0"
+    assert lm_head.qtype_id == UOCR_TENSOR_Q8_0
+    assert lm_head.shape == (129_280, 1280)
+    assert lm_head.logical_shape == (129_280, 1280)
+    assert lm_head.physical_shape == (129_280, 1280)
+    assert lm_head.block_size == UOCR_Q8_0_BLOCK_SIZE
+    assert lm_head.row_size == (1280 // UOCR_Q8_0_BLOCK_SIZE) * UOCR_Q8_0_TYPE_SIZE
+    assert lm_head.output_bytes == 129_280 * lm_head.row_size
+
+    sam_patch = plan.tensor_by_name("model.sam_model.patch_embed.proj.weight")
+    assert sam_patch.qtype == "UOCR_TENSOR_Q8_0"
+    assert sam_patch.shape == (768, 3, 16, 16)
+    assert sam_patch.logical_shape == (768, 768)
+    assert sam_patch.physical_shape == (768, 768)
+    assert sam_patch.output_bytes == 768 * ((768 // UOCR_Q8_0_BLOCK_SIZE) * UOCR_Q8_0_TYPE_SIZE)
+
+    router = plan.tensor_by_name("model.layers.1.mlp.gate.weight")
+    assert router.qtype == "UOCR_TENSOR_F16"
+    assert router.logical_shape == router.shape
+    assert "router" in router.reason.lower()
+
+    pos_embed = plan.tensor_by_name("model.sam_model.pos_embed")
+    assert pos_embed.qtype == "UOCR_TENSOR_F16"
+    assert pos_embed.logical_shape == pos_embed.shape
+    assert "pos" in pos_embed.reason.lower()
+
+    raw_patch = plan.tensor_by_name("model.vision_model.embeddings.patch_embedding.weight")
+    assert raw_patch.usage == "preserved-unused"
+    assert raw_patch.qtype == "UOCR_TENSOR_Q8_0"
+    assert raw_patch.shape == (1024, 3, 14, 14)
+    assert raw_patch.logical_shape == (1024, 588)
+    assert raw_patch.physical_shape == (1024, 608)
+    assert raw_patch.row_size == (608 // UOCR_Q8_0_BLOCK_SIZE) * UOCR_Q8_0_TYPE_SIZE
+
+    payload = _tensor_directory_bytes(filter_plan_tensors(plan, "model.sam_model.patch_embed.proj.weight"))
+    header_size = _TENSOR_DIRECTORY_HEADER_STRUCT.size
+    entry = _TENSOR_ENTRY_STRUCT.unpack_from(payload, header_size)
+    assert entry[6] == UOCR_TENSOR_Q8_0
+    assert entry[8] == 2
+    assert entry[9:13] == (768, 768, 0, 0)
+    assert entry[13:17] == (768, 768, 0, 0)
 
 
 def test_filter_plan_tensors_relayouts_single_tensor(tmp_path) -> None:

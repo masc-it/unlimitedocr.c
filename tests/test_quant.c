@@ -94,6 +94,27 @@ static int test_quant_tensor_validation(void) {
     CHECK(uocr_quant_validate_tensor_entry(&tensor, error, sizeof(error)) == 1);
     CHECK(error[0] == '\0');
 
+    memset(&tensor, 0, sizeof(tensor));
+    tensor.id = 1u;
+    tensor.family = UOCR_TENSOR_FAMILY_LAYER_ATTN;
+    tensor.layer = 0;
+    tensor.expert = -1;
+    tensor.projection = UOCR_TENSOR_PROJ_WEIGHT;
+    tensor.usage = UOCR_TENSOR_USAGE_RUNTIME;
+    tensor.qtype = UOCR_TENSOR_Q8_0;
+    tensor.rank = 2u;
+    tensor.logical_shape[0] = 1u;
+    tensor.logical_shape[1] = 33u;
+    tensor.physical_shape[0] = 1u;
+    tensor.physical_shape[1] = 64u;
+    tensor.payload_offset = 4096u;
+    tensor.block_size = UOCR_Q8_0_BLOCK_SIZE;
+    tensor.row_size = UOCR_Q8_0_TYPE_SIZE * 2u;
+    tensor.payload_size = tensor.row_size;
+    CHECK(uocr_quant_validate_tensor_entry(&tensor, error, sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+
+    CHECK(make_quant_tensor(&tensor, UOCR_TENSOR_Q8_0, 2u, 64u, 4096u) == 0);
     tensor.row_size = 67u;
     CHECK(uocr_quant_validate_tensor_entry(&tensor, error, sizeof(error)) == 0);
     CHECK(strstr(error, "row size mismatch") != NULL);

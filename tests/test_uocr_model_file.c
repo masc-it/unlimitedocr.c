@@ -223,9 +223,11 @@ static int write_synthetic_uocr_with_tensors(const char *path, synthetic_tensor_
     return failed ? 1 : 0;
 }
 
-static int write_synthetic_quant_uocr(const char *path, int corrupt_row_size) {
+static int write_synthetic_quant_uocr(const char *path, int corrupt_row_size, int padded_inner) {
+    const uint32_t logical_cols = padded_inner ? 33u : 64u;
+    const uint32_t physical_cols = 64u;
     uint64_t row_size = 0u;
-    if (!uocr_quant_row_size(UOCR_TENSOR_Q8_0, 64u, &row_size)) {
+    if (!uocr_quant_row_size(UOCR_TENSOR_Q8_0, physical_cols, &row_size)) {
         return 1;
     }
 
@@ -287,9 +289,9 @@ static int write_synthetic_quant_uocr(const char *path, int corrupt_row_size) {
     tensor->qtype = UOCR_TENSOR_Q8_0;
     tensor->rank = 2u;
     tensor->logical_shape[0] = 2u;
-    tensor->logical_shape[1] = 64u;
+    tensor->logical_shape[1] = logical_cols;
     tensor->physical_shape[0] = 2u;
-    tensor->physical_shape[1] = 64u;
+    tensor->physical_shape[1] = physical_cols;
     tensor->payload_offset = tensor_data_offset;
     tensor->payload_size = tensor_data_size;
     tensor->block_size = UOCR_Q8_0_BLOCK_SIZE;
@@ -410,7 +412,7 @@ static int test_rejects_bad_tensor_data_alignment(void) {
 static int test_valid_quantized_tensor_directory(void) {
     char path[128];
     CHECK(make_temp_path(path, sizeof(path)) == 0);
-    CHECK(write_synthetic_quant_uocr(path, 0) == 0);
+    CHECK(write_synthetic_quant_uocr(path, 0, 0) == 0);
 
     char error[512];
     uocr_model_file model;
@@ -429,12 +431,30 @@ static int test_valid_quantized_tensor_directory(void) {
 static int test_rejects_bad_quantized_row_size(void) {
     char path[128];
     CHECK(make_temp_path(path, sizeof(path)) == 0);
-    CHECK(write_synthetic_quant_uocr(path, 1) == 0);
+    CHECK(write_synthetic_quant_uocr(path, 1, 0) == 0);
 
     char error[512];
     uocr_model_file model;
     CHECK(uocr_model_file_open(path, &model, error, sizeof(error)) != 0);
     CHECK(strstr(error, "row size mismatch") != NULL);
+    unlink(path);
+    return 0;
+}
+
+static int test_valid_padded_q8_tensor_directory(void) {
+    char path[128];
+    CHECK(make_temp_path(path, sizeof(path)) == 0);
+    CHECK(write_synthetic_quant_uocr(path, 0, 1) == 0);
+
+    char error[512];
+    uocr_model_file model;
+    CHECK(uocr_model_file_open(path, &model, error, sizeof(error)) == 0);
+    CHECK(model.tensor_count == 1u);
+    CHECK(model.tensors[0].qtype == UOCR_TENSOR_Q8_0);
+    CHECK(model.tensors[0].logical_shape[1] == 33u);
+    CHECK(model.tensors[0].physical_shape[1] == 64u);
+    CHECK(model.tensors[0].row_size == UOCR_Q8_0_TYPE_SIZE * 2u);
+    uocr_model_file_close(&model);
     unlink(path);
     return 0;
 }
@@ -501,6 +521,7 @@ int main(void) {
     if (test_rejects_bad_tensor_data_alignment() != 0) return 1;
     if (test_valid_quantized_tensor_directory() != 0) return 1;
     if (test_rejects_bad_quantized_row_size() != 0) return 1;
+    if (test_valid_padded_q8_tensor_directory() != 0) return 1;
     if (test_rejects_unsorted_tensor_directory() != 0) return 1;
     if (test_rejects_bad_tokenizer_metadata() != 0) return 1;
     if (test_rejects_bad_provenance() != 0) return 1;

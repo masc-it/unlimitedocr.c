@@ -24,6 +24,7 @@ import numpy as np
 
 from .frontend import project_root
 from .tensor_registry import (
+    TensorFamily,
     TensorProjection,
     TensorRegistryEntry,
     build_tensor_registry,
@@ -64,6 +65,19 @@ UOCR_TENSOR_DIR_MAGIC = 0x52494454
 UOCR_TENSOR_USAGE_RUNTIME = 1
 UOCR_TENSOR_USAGE_PRESERVED_UNUSED = 2
 UOCR_TENSOR_USAGE_OMITTED_WITH_REASON = 3
+
+UOCR_TENSOR_F16 = 1
+UOCR_TENSOR_F32 = 2
+UOCR_TENSOR_Q8_0 = 10
+UOCR_TENSOR_Q4_K = 20
+UOCR_TENSOR_PADDED_Q4_K = 21
+UOCR_TENSOR_Q2_K = 30
+UOCR_TENSOR_IQ2_XXS = 31
+
+UOCR_Q8_0_BLOCK_SIZE = 32
+UOCR_Q8_0_TYPE_SIZE = 34
+UOCR_Q4_K_BLOCK_SIZE = 256
+UOCR_Q4_K_TYPE_SIZE = 144
 
 CONVERTER_VERSION = (0, 1, 0)
 
@@ -152,10 +166,30 @@ KEY_TENSOR_SHAPES: Mapping[str, tuple[int, ...]] = {
 
 
 @dataclass(frozen=True)
+class QuantTypeInfo:
+    name: str
+    qtype_id: int
+    output_dtype: str
+    block_size: int
+    type_size: int
+
+
+QUANT_TYPE_INFOS: Mapping[str, QuantTypeInfo] = {
+    "UOCR_TENSOR_Q8_0": QuantTypeInfo(
+        "UOCR_TENSOR_Q8_0", UOCR_TENSOR_Q8_0, "Q8_0", UOCR_Q8_0_BLOCK_SIZE, UOCR_Q8_0_TYPE_SIZE
+    ),
+    "UOCR_TENSOR_Q4_K": QuantTypeInfo(
+        "UOCR_TENSOR_Q4_K", UOCR_TENSOR_Q4_K, "Q4_K", UOCR_Q4_K_BLOCK_SIZE, UOCR_Q4_K_TYPE_SIZE
+    ),
+}
+
+
+@dataclass(frozen=True)
 class TensorPlan:
     name: str
     source_dtype: str
     shape: tuple[int, ...]
+    logical_shape: tuple[int, ...]
     physical_shape: tuple[int, ...]
     source_offsets: tuple[int, int]
     source_bytes: int
@@ -183,6 +217,7 @@ class TensorPlan:
             "name": self.name,
             "source_dtype": self.source_dtype,
             "shape": list(self.shape),
+            "logical_shape": list(self.logical_shape),
             "physical_shape": list(self.physical_shape),
             "source_offsets": list(self.source_offsets),
             "source_bytes": self.source_bytes,
@@ -256,6 +291,11 @@ class DryRunPlan:
             "tensor_count": self.tensor_count,
             "total_source_bytes": self.total_source_bytes,
             "total_output_bytes": self.total_output_bytes,
+            "estimated_weight_bytes": self.total_output_bytes,
+            "estimated_savings_bytes": self.total_source_bytes - self.total_output_bytes,
+            "compression_ratio": (
+                (self.total_output_bytes / self.total_source_bytes) if self.total_source_bytes else 0.0
+            ),
             "planned_file_size": self.planned_file_size,
             "metadata_bytes": self.metadata_bytes,
             "sections": [section.as_dict() for section in self.sections],
@@ -293,6 +333,45 @@ def _sha256_file(path: Path | None) -> bytes:
 
 def _product(shape: Iterable[int]) -> int:
     return math.prod(int(dim) for dim in shape)
+
+
+def _flatten_weight_shape_for_quantization(shape: tuple[int, ...]) -> tuple[int, int]:
+    """Return the logical `[rows, inner]` view stored for quantized weights.
+
+    Linear and embedding weights are already two-dimensional.  Conv kernels are
+    packed row-major as `[out_channels, in_channels * kh * kw]`, matching the
+    quantized-kernel contract described in the architecture notes while keeping
+    the original safetensors shape available as :attr:`TensorPlan.shape`.
+    """
+
+    if len(shape) < 2:
+        raise ValueError(f"quantized tensor rank must be at least 2, got {shape}")
+    if any(dim <= 0 for dim in shape):
+        raise ValueError(f"quantized tensor shape must be positive, got {shape}")
+    return int(shape[0]), _product(shape[1:])
+
+
+def _quantized_tensor_metadata(
+    shape: tuple[int, ...], qtype_name: str
+) -> tuple[tuple[int, int], tuple[int, int], int, int, int, int, str]:
+    info = QUANT_TYPE_INFOS[qtype_name]
+    logical_shape = _flatten_weight_shape_for_quantization(shape)
+    rows, inner = logical_shape
+    if info.qtype_id == UOCR_TENSOR_Q8_0:
+        physical_inner = _align_up(inner, info.block_size)
+    else:
+        if inner % info.block_size != 0:
+            raise ValueError(f"inner dimension {inner} is not aligned to {info.name} block size {info.block_size}")
+        physical_inner = inner
+    physical_shape = (rows, physical_inner)
+    row_size = (physical_inner // info.block_size) * info.type_size
+    return logical_shape, physical_shape, rows * row_size, info.block_size, row_size, info.qtype_id, info.output_dtype
+
+
+def _fp16_tensor_metadata(
+    shape: tuple[int, ...], source_bytes: int
+) -> tuple[tuple[int, ...], tuple[int, ...], int, int, int, int, str]:
+    return shape, shape, source_bytes, 0, 0, UOCR_TENSOR_F16, "F16"
 
 
 def _align_up(value: int, alignment: int) -> int:
@@ -494,6 +573,52 @@ def _usage_for_name(name: str) -> tuple[str, int, str]:
     return "runtime", 1, "fp16 baseline"
 
 
+def _dyn_q8_mandatory_fp16_reason(name: str, registry_entry: TensorRegistryEntry) -> str | None:
+    if registry_entry.family == TensorFamily.MOE_ROUTER:
+        return "dyn-q8 fp16 keep-list: MoE router weights must preserve top-k expert selection"
+    if registry_entry.family in {
+        TensorFamily.FINAL_NORM,
+        TensorFamily.LAYER_NORM,
+        TensorFamily.IMAGE_NEWLINE,
+        TensorFamily.VIEW_SEPARATOR,
+    }:
+        return "dyn-q8 fp16 keep-list: norms and special visual embeddings stay fp16"
+    if registry_entry.projection == TensorProjection.BIAS or name.endswith(".bias"):
+        return "dyn-q8 fp16 keep-list: biases stay fp16"
+    lowered = name.lower()
+    if "norm" in lowered:
+        return "dyn-q8 fp16 keep-list: normalization parameters stay fp16"
+    if "pos" in lowered or "position" in lowered or "rel_pos" in lowered:
+        return "dyn-q8 fp16 keep-list: positional embeddings/tables stay fp16"
+    if lowered.endswith("class_embedding"):
+        return "dyn-q8 fp16 keep-list: CLIP class embedding stays fp16"
+    return None
+
+
+def _dyn_q8_quant_reason(name: str, shape: tuple[int, ...], registry_entry: TensorRegistryEntry) -> str | None:
+    keep_reason = _dyn_q8_mandatory_fp16_reason(name, registry_entry)
+    if keep_reason is not None or len(shape) < 2:
+        return None
+    if name == "lm_head.weight":
+        return "dyn-q8 policy: LM head -> Q8_0"
+    if name == "model.embed_tokens.weight":
+        return "dyn-q8 policy: token embedding -> Q8_0"
+    if not name.endswith(".weight"):
+        return None
+    if registry_entry.family in {
+        TensorFamily.LAYER_ATTN,
+        TensorFamily.LAYER_DENSE_MLP,
+        TensorFamily.MOE_EXPERT,
+        TensorFamily.MOE_SHARED,
+    }:
+        return "dyn-q8 policy: large decoder linear -> Q8_0"
+    if registry_entry.family in {TensorFamily.VISION_SAM, TensorFamily.VISION_CLIP}:
+        return "dyn-q8 policy: vision conv/linear weight -> Q8_0"
+    if registry_entry.family == TensorFamily.PROJECTOR:
+        return "dyn-q8 policy: visual projector linear weight -> Q8_0"
+    return None
+
+
 def _projection_for_plan(registry_entry: TensorRegistryEntry) -> tuple[str, int]:
     projection = registry_entry.projection
     if projection == TensorProjection.NONE:
@@ -502,28 +627,61 @@ def _projection_for_plan(registry_entry: TensorRegistryEntry) -> tuple[str, int]
 
 
 def _make_tensor_plan(name: str, entry: Mapping[str, Any], qprofile: str, registry_entry: TensorRegistryEntry) -> TensorPlan:
-    if qprofile != "fp16":
-        raise NotImplementedError("only fp16 dry-run planning is implemented")
+    if qprofile == "dyn-q4":
+        raise NotImplementedError("dyn-q4 planning is not implemented until the conservative q4 policy is defined")
     shape = tuple(int(dim) for dim in entry["shape"])
     offsets = (int(entry["data_offsets"][0]), int(entry["data_offsets"][1]))
     source_bytes = offsets[1] - offsets[0]
-    usage, usage_id, reason = _usage_for_name(name)
+    usage, usage_id, base_reason = _usage_for_name(name)
     projection_name, projection_id = _projection_for_plan(registry_entry)
+
+    qtype = "UOCR_TENSOR_F16"
+    reason = base_reason
+    logical_shape, physical_shape, output_bytes, block_size, row_size, qtype_id, output_dtype = _fp16_tensor_metadata(
+        shape, source_bytes
+    )
+
+    if qprofile == "dyn-q8":
+        quant_reason = _dyn_q8_quant_reason(name, shape, registry_entry)
+        if quant_reason is not None:
+            try:
+                (
+                    logical_shape,
+                    physical_shape,
+                    output_bytes,
+                    block_size,
+                    row_size,
+                    qtype_id,
+                    output_dtype,
+                ) = _quantized_tensor_metadata(shape, "UOCR_TENSOR_Q8_0")
+                qtype = "UOCR_TENSOR_Q8_0"
+                reason = quant_reason
+            except ValueError as exc:
+                reason = f"dyn-q8 fp16 fallback: {quant_reason}; {exc}"
+        else:
+            reason = (
+                _dyn_q8_mandatory_fp16_reason(name, registry_entry)
+                or "dyn-q8 fp16 keep-list: non-weight or small tensor"
+            )
+    elif qprofile != "fp16":
+        raise ValueError(f"unknown qprofile {qprofile!r}")
+
     return TensorPlan(
         name=name,
         source_dtype=str(entry["dtype"]),
         shape=shape,
-        physical_shape=shape,
+        logical_shape=logical_shape,
+        physical_shape=physical_shape,
         source_offsets=offsets,
         source_bytes=source_bytes,
-        output_dtype="F16",
-        qtype="UOCR_TENSOR_F16",
-        qtype_id=1,
-        output_bytes=source_bytes,
+        output_dtype=output_dtype,
+        qtype=qtype,
+        qtype_id=qtype_id,
+        output_bytes=output_bytes,
         payload_offset=0,
         payload_alignment=UOCR_TENSOR_PAYLOAD_ALIGNMENT,
-        block_size=0,
-        row_size=0,
+        block_size=block_size,
+        row_size=row_size,
         tensor_id=registry_entry.tensor_id,
         family=registry_entry.family.name,
         family_id=int(registry_entry.family),
@@ -586,8 +744,10 @@ def build_dry_run_plan(
     strict: bool = True,
 ) -> DryRunPlan:
     hf_dir = Path(hf_dir)
-    if qprofile != "fp16":
-        raise NotImplementedError("only --qprofile fp16 is implemented for the first converter milestone")
+    if qprofile not in QPROFILE_IDS:
+        raise ValueError(f"unknown qprofile {qprofile!r}")
+    if qprofile == "dyn-q4":
+        raise NotImplementedError("--qprofile dyn-q4 is deferred until the conservative q4 policy is implemented")
 
     validate_config(hf_dir)
 
@@ -759,9 +919,9 @@ def _tensor_directory_bytes(plan: DryRunPlan) -> bytes:
         len(plan.tensors),
     )
     for tensor in plan.tensors:
-        if len(tensor.shape) > 4 or len(tensor.physical_shape) > 4:
-            raise ValueError(f"tensor {tensor.name} rank exceeds .uocr limit: {len(tensor.shape)}")
-        logical_shape = tuple(int(dim) for dim in tensor.shape) + (0,) * (4 - len(tensor.shape))
+        if len(tensor.logical_shape) > 4 or len(tensor.physical_shape) > 4:
+            raise ValueError(f"tensor {tensor.name} rank exceeds .uocr limit: {len(tensor.logical_shape)}")
+        logical_shape = tuple(int(dim) for dim in tensor.logical_shape) + (0,) * (4 - len(tensor.logical_shape))
         physical_shape = tuple(int(dim) for dim in tensor.physical_shape) + (0,) * (4 - len(tensor.physical_shape))
         payload += _TENSOR_ENTRY_STRUCT.pack(
             tensor.tensor_id,
@@ -772,7 +932,7 @@ def _tensor_directory_bytes(plan: DryRunPlan) -> bytes:
             tensor.usage_id,
             tensor.qtype_id,
             0,
-            len(tensor.shape),
+            len(tensor.logical_shape),
             *logical_shape,
             *physical_shape,
             tensor.payload_offset,
@@ -952,6 +1112,10 @@ def _print_summary(plan: DryRunPlan, *, dry_run: bool) -> None:
     print(f"tensors: {plan.tensor_count}")
     print(f"source bytes: {plan.total_source_bytes}")
     print(f"planned output bytes: {plan.total_output_bytes}")
+    if plan.total_source_bytes:
+        savings = plan.total_source_bytes - plan.total_output_bytes
+        ratio = plan.total_output_bytes / plan.total_source_bytes
+        print(f"estimated weight savings: {savings} ({ratio:.3f}x source bytes)")
     print(f"planned file size: {plan.planned_file_size}")
     tensor_data = next((section for section in plan.sections if section.section_type == UOCR_SECTION_TENSOR_DATA), None)
     if tensor_data is not None:
@@ -974,7 +1138,7 @@ def _write_dump(plan: DryRunPlan, path: str) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Plan or write an Unlimited-OCR fp16 .uocr conversion")
+    parser = argparse.ArgumentParser(description="Plan an Unlimited-OCR conversion or write an fp16 .uocr file")
     parser.add_argument("--hf-dir", type=Path, default=project_root() / "data/context")
     parser.add_argument("--header", type=Path, default=None, help="optional safetensors header/cache path")
     parser.add_argument("--index", type=Path, default=None, help="optional safetensors index path")
@@ -994,8 +1158,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.out is None and not args.dry_run:
         parser.error("either --dry-run or --out is required")
-    if args.qprofile != "fp16":
-        parser.error("only --qprofile fp16 is implemented in this milestone")
+    if args.out is not None and args.qprofile != "fp16":
+        parser.error("quantized .uocr writing is not implemented yet; use --dry-run for quantized planning")
 
     plan = build_dry_run_plan(
         args.hf_dir,
