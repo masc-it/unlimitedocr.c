@@ -732,8 +732,8 @@ Do not begin this section until sections 14.5 and 15.1 pass for fp16 single-requ
 ### 16.1 Vision scheduling and memory
 
 - [x] Implement view-chunk scheduling so crop mode does not force all local views through vision at once.
-- [ ] Process local crops in chunks, append projected features into final visual feature buffer, and reuse SAM/CLIP scratch.
-- [ ] Support one global `1024x1024` view and zero or more local `640x640` views.
+- [x] Process local crops in chunks, append projected features into final visual feature buffer, and reuse SAM/CLIP scratch.
+- [x] Support one global `1024x1024` view and zero or more local `640x640` views.
 - [ ] Add vision memory estimates to admission control.
 
 ### 16.2 SAM-like encoder

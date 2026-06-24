@@ -32,10 +32,17 @@ typedef struct uocr_vision_schedule {
     uint32_t global_view_count;
     uint32_t max_views_per_chunk;
     uint32_t max_chunk_views;
+    uint32_t max_chunk_projected_tokens;
     uint32_t final_visual_tokens;
     uint32_t projected_tokens_total;
-    uint32_t reserved0;
 } uocr_vision_schedule;
+
+typedef int (*uocr_vision_project_chunk_f16_fn)(const uocr_vision_chunk *chunk,
+                                                uint16_t *projected_scratch_f16,
+                                                uint32_t projected_scratch_rows,
+                                                void *user_data,
+                                                char *error,
+                                                size_t error_size);
 
 /*
  * Build the view-processing schedule used by the Metal vision bring-up path.
@@ -58,6 +65,30 @@ int uocr_plan_vision_schedule(const uocr_prepared_request *request,
                               uocr_vision_schedule *out_schedule,
                               char *error,
                               size_t error_size);
+
+/*
+ * Execute the schedule with a caller-supplied per-chunk projector and format the
+ * projected grids into the final visual-feature order expected by the decoder.
+ *
+ * The projector receives the same reusable scratch buffer for every chunk and
+ * must write ``chunk->projected_token_count`` rows of fp16 hidden-size features
+ * into it.  This lets the Metal vision path keep SAM/CLIP/projector temporaries
+ * bounded by one chunk, then immediately scatter/append rows into the final
+ * `[visual_tokens,1280]` buffer.
+ */
+int uocr_process_vision_chunks_f16(const uocr_prepared_request *request,
+                                   uint32_t max_views_per_chunk,
+                                   uocr_vision_project_chunk_f16_fn project_chunk,
+                                   void *project_user_data,
+                                   uint16_t *projected_scratch_f16,
+                                   uint32_t projected_scratch_rows,
+                                   const uint16_t *image_newline_f16,
+                                   const uint16_t *view_separator_f16,
+                                   uint16_t *out_visual_features_f16,
+                                   uint32_t out_visual_rows,
+                                   uocr_vision_schedule *out_schedule,
+                                   char *error,
+                                   size_t error_size);
 
 #ifdef __cplusplus
 }
