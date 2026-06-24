@@ -228,14 +228,14 @@ Current priority slice, in order. The coding agent should take the first uncheck
   - [x] one `.npy` per token/mask array plus a single `.npz` with named view arrays
   - [x] optional `expected_output_ids.npy` and `expected_text.txt`
 - [x] Add `tools/uocr-ref-dump` Python CLI to emit prepared-request fixtures without requiring C.
-- [ ] Add pytest frontend parity tests against the upstream remote code path in `data/context/modeling_unlimitedocr.py`:
+- [x] Add pytest frontend parity tests against the upstream remote code path in `data/context/modeling_unlimitedocr.py`:
   - [x] local frontend smoke tests for rendered prompt, token ids, image mask, crop grid, pixels, fixture roundtrip
   - [x] rendered prompt equality
-  - [ ] token ids equality
-  - [ ] image mask equality
-  - [ ] crop grid equality
-  - [ ] pixel tensor equality within exact/near-exact tolerance
-  - [ ] visual placeholder count equality
+  - [x] token ids equality
+  - [x] image mask equality
+  - [x] crop grid equality
+  - [x] pixel tensor equality within exact/near-exact tolerance
+  - [x] visual placeholder count equality
 - [ ] Keep the native tokenizer/image frontend out of v1; record it under later tasks only.
 
 ## 5. Python golden tensor dumper
