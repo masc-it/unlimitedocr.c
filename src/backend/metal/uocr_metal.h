@@ -141,6 +141,21 @@ int uocr_metal_context_decoder_bindings_ready(const uocr_metal_context *ctx);
 uint32_t uocr_metal_context_vision_binding_count(const uocr_metal_context *ctx);
 int uocr_metal_context_vision_bindings_ready(const uocr_metal_context *ctx);
 const char *uocr_metal_context_vision_binding_error(const uocr_metal_context *ctx);
+
+/* Production fp16 vision encoder boundary. The request must already satisfy the
+ * public prepared-request contract. The runner processes public preprocessed
+ * views through SAM -> CLIP -> projector in bounded chunks, then formats rows
+ * with image_newline/view_separator into out_visual_features_f16
+ * [out_visual_rows,1280]. max_views_per_chunk==0 means one view per chunk.
+ */
+int uocr_metal_context_encode_visual_features_f16(uocr_metal_context *ctx,
+                                                  const uocr_prepared_request *request,
+                                                  uint32_t max_views_per_chunk,
+                                                  uint16_t *out_visual_features_f16,
+                                                  uint32_t out_visual_rows,
+                                                  char *error,
+                                                  size_t error_size);
+
 uint64_t uocr_metal_context_model_view_bytes(const uocr_metal_context *ctx);
 int uocr_metal_context_get_model_view_info(const uocr_metal_context *ctx,
                                            uint32_t view_index,

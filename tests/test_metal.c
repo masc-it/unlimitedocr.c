@@ -14898,6 +14898,66 @@ static int test_metal_integrated_decoder_boundary(void) {
     return 0;
 }
 
+static int test_metal_vision_runner_requires_bindings(void) {
+    if (!uocr_metal_is_available()) {
+        return 0;
+    }
+
+    char error[1024];
+    memset(error, 0, sizeof(error));
+    uocr_metal_context *ctx = uocr_metal_context_create(UOCR_TEST_METAL_RESOURCE_PATH, error, sizeof(error));
+    CHECK(ctx != NULL);
+
+    const uint32_t n_tokens = 1u + UOCR_GLOBAL_VISUAL_TOKENS;
+    int32_t *input_ids = (int32_t *)calloc((size_t)n_tokens, sizeof(int32_t));
+    uint8_t *image_mask = (uint8_t *)calloc((size_t)n_tokens, sizeof(uint8_t));
+    uint16_t *pixels = (uint16_t *)calloc(3u, sizeof(uint16_t));
+    uint16_t *visual = (uint16_t *)calloc((size_t)UOCR_GLOBAL_VISUAL_TOKENS * (size_t)UOCR_HIDDEN_SIZE, sizeof(uint16_t));
+    CHECK(input_ids != NULL);
+    CHECK(image_mask != NULL);
+    CHECK(pixels != NULL);
+    CHECK(visual != NULL);
+
+    input_ids[0] = UOCR_TOKEN_BOS;
+    for (uint32_t i = 1u; i < n_tokens; ++i) {
+        input_ids[i] = UOCR_TOKEN_IMAGE;
+        image_mask[i] = 1u;
+    }
+    uocr_image_view view;
+    memset(&view, 0, sizeof(view));
+    view.pixels = pixels;
+    view.width = UOCR_GLOBAL_VIEW_SIZE;
+    view.height = UOCR_GLOBAL_VIEW_SIZE;
+    view.format = UOCR_PIXEL_F16_NCHW;
+    view.kind = UOCR_VIEW_GLOBAL;
+
+    uocr_prepared_request request;
+    memset(&request, 0, sizeof(request));
+    request.input_ids = input_ids;
+    request.image_mask = image_mask;
+    request.n_tokens = n_tokens;
+    request.views = &view;
+    request.n_views = 1u;
+    request.crop_grid_w = 1u;
+    request.crop_grid_h = 1u;
+
+    CHECK(uocr_metal_context_encode_visual_features_f16(ctx,
+                                                        &request,
+                                                        1u,
+                                                        visual,
+                                                        UOCR_GLOBAL_VISUAL_TOKENS,
+                                                        error,
+                                                        sizeof(error)) == 0);
+    CHECK(strstr(error, "requires validated fp16 vision tensor bindings") != NULL);
+
+    free(visual);
+    free(pixels);
+    free(image_mask);
+    free(input_ids);
+    uocr_metal_context_destroy(ctx);
+    return 0;
+}
+
 static int test_metal_decoder_binding_cache_full_model(void) {
     if (!uocr_metal_is_available()) {
         return 0;
@@ -15359,6 +15419,7 @@ int main(void) {
     if (test_metal_recent_decoder_primitives_stress() != 0) return 1;
     if (test_metal_runtime_arenas() != 0) return 1;
     if (test_metal_integrated_decoder_boundary() != 0) return 1;
+    if (test_metal_vision_runner_requires_bindings() != 0) return 1;
     if (test_metal_decoder_binding_cache_full_model() != 0) return 1;
     if (test_metal_model_mapping() != 0) return 1;
     if (test_public_engine_open_initializes_metal() != 0) return 1;

@@ -4,6 +4,7 @@
 #include "model/uocr_tensor_registry.h"
 #include "quant/uocr_quant.h"
 #include "runtime/uocr_memory.h"
+#include "runtime/uocr_vision.h"
 
 #include <errno.h>
 #include <limits.h>
@@ -1123,6 +1124,9 @@ static int metal_refresh_vision_binding_cache(uocr_metal_context *ctx,
                                               const uocr_model_file *model,
                                               char *error,
                                               size_t error_size);
+static int metal_sam_transformer_block_has_weights(const uocr_metal_sam_transformer_block_f16 *block);
+static int metal_clip_transformer_block_has_weights(const uocr_metal_clip_transformer_block_f16 *block);
+static void metal_copy_error_detail(char *detail, size_t detail_size, const char *error);
 
 static uocr_metal_tensor_binding_internal *build_tensor_bindings(const uocr_model_file *model,
                                                                   const uocr_metal_model_view *views,
@@ -2157,6 +2161,643 @@ const char *uocr_metal_context_vision_binding_error(const uocr_metal_context *ct
         return "vision tensor bindings are not validated";
     }
     return ctx->vision_binding_error;
+}
+
+static const uocr_metal_vision_binding *metal_find_vision_binding(const uocr_metal_context *ctx,
+                                                                  uint32_t tensor_id) {
+    if (ctx == NULL || !ctx->vision_bindings.valid || tensor_id == 0u) {
+        return NULL;
+    }
+    for (uint32_t i = 0u; i < ctx->vision_bindings.count; ++i) {
+        if (ctx->vision_bindings.tensors[i].tensor_id == tensor_id) {
+            return &ctx->vision_bindings.tensors[i];
+        }
+    }
+    return NULL;
+}
+
+static const uint16_t *metal_require_vision_tensor_f16(const uocr_metal_context *ctx,
+                                                       uint32_t tensor_id,
+                                                       const char *role,
+                                                       char *error,
+                                                       size_t error_size) {
+    const uocr_metal_vision_binding *binding = metal_find_vision_binding(ctx, tensor_id);
+    if (binding == NULL) {
+        if (role == NULL || role[0] == '\0') {
+            role = "vision tensor";
+        }
+        (void)metal_fail(error, error_size, "missing validated %s binding for tensor %u", role, tensor_id);
+        return NULL;
+    }
+    if ((binding->payload_size % 2u) != 0u || ((uint64_t)binding->offset % 2u) != 0u) {
+        if (role == NULL || role[0] == '\0') {
+            role = "vision tensor";
+        }
+        (void)metal_fail(error, error_size, "%s tensor %u has an unaligned fp16 payload", role, tensor_id);
+        return NULL;
+    }
+    if (binding->buffer == nil) {
+        (void)metal_fail(error, error_size, "vision tensor %u has a nil Metal buffer binding", tensor_id);
+        return NULL;
+    }
+    const uint8_t *contents = (const uint8_t *)[binding->buffer contents];
+    if (contents == NULL) {
+        (void)metal_fail(error, error_size, "vision tensor %u is not CPU-visible", tensor_id);
+        return NULL;
+    }
+    return (const uint16_t *)(const void *)(contents + binding->offset);
+}
+
+static uint32_t metal_sam_sorted_block_index_for_layer(uint32_t layer) {
+    if (layer <= 1u) {
+        return layer;
+    }
+    if (layer <= 9u) {
+        return layer + 2u;
+    }
+    return layer - 8u;
+}
+
+static uint32_t metal_clip_sorted_layer_index_for_layer(uint32_t layer) {
+    if (layer <= 1u) {
+        return layer;
+    }
+    if (layer >= 10u && layer <= 19u) {
+        return 2u + (layer - 10u);
+    }
+    if (layer == 2u) {
+        return 12u;
+    }
+    if (layer >= 20u && layer <= 23u) {
+        return 13u + (layer - 20u);
+    }
+    return 17u + (layer - 3u);
+}
+
+typedef struct uocr_metal_vision_weights_f16 {
+    const uint16_t *image_newline_f16;
+    const uint16_t *view_separator_f16;
+    const uint16_t *projector_weight_f16;
+    const uint16_t *projector_bias_f16;
+    const uint16_t *sam_patch_weight_f16;
+    const uint16_t *sam_patch_bias_f16;
+    const uint16_t *sam_pos_embed_f16;
+    const uint16_t *sam_neck_conv1x1_weight_f16;
+    const uint16_t *sam_neck_norm1_weight_f16;
+    const uint16_t *sam_neck_norm1_bias_f16;
+    const uint16_t *sam_neck_conv3x3_weight_f16;
+    const uint16_t *sam_neck_norm2_weight_f16;
+    const uint16_t *sam_neck_norm2_bias_f16;
+    const uint16_t *sam_net2_weight_f16;
+    const uint16_t *sam_net3_weight_f16;
+    const uint16_t *clip_class_embedding_f16;
+    const uint16_t *clip_pos_embed_f16;
+    const uint16_t *clip_pre_ln_weight_f16;
+    const uint16_t *clip_pre_ln_bias_f16;
+    uocr_metal_sam_transformer_block_f16 sam_blocks[UOCR_SAM_BLOCKS];
+    uocr_metal_clip_transformer_block_f16 clip_blocks[UOCR_CLIP_BLOCKS];
+} uocr_metal_vision_weights_f16;
+
+static int metal_load_vision_weights_from_bindings(uocr_metal_context *ctx,
+                                                   uocr_metal_vision_weights_f16 *out_weights,
+                                                   char *error,
+                                                   size_t error_size) {
+    if (ctx == NULL || out_weights == NULL) {
+        return metal_fail(error, error_size, "invalid Metal vision weight-loading request");
+    }
+    memset(out_weights, 0, sizeof(*out_weights));
+
+#define VISION_TENSOR_PTR(tensor_id, role) metal_require_vision_tensor_f16(ctx, (tensor_id), (role), error, error_size)
+#define ASSIGN_PTR(field, tensor_id, role)              \
+    do {                                                \
+        (out_weights->field) = VISION_TENSOR_PTR((tensor_id), (role)); \
+        if ((out_weights->field) == NULL) {             \
+            return 0;                                   \
+        }                                               \
+    } while (0)
+
+    ASSIGN_PTR(image_newline_f16, UOCR_TENSOR_ID_IMAGE_NEWLINE, "image newline");
+    ASSIGN_PTR(view_separator_f16, UOCR_TENSOR_ID_VIEW_SEPARATOR, "view separator");
+    ASSIGN_PTR(projector_weight_f16, UOCR_TENSOR_ID_PROJECTOR_WEIGHT, "visual projector weight");
+    ASSIGN_PTR(projector_bias_f16, UOCR_TENSOR_ID_PROJECTOR_BIAS, "visual projector bias");
+
+    const uint32_t sam_extra = UOCR_TENSOR_ID_VISION_SAM_BASE + UOCR_SAM_BLOCKS * 14u;
+    ASSIGN_PTR(sam_neck_conv1x1_weight_f16, sam_extra + 0u, "SAM neck 1x1 weight");
+    ASSIGN_PTR(sam_neck_norm1_bias_f16, sam_extra + 1u, "SAM neck norm1 bias");
+    ASSIGN_PTR(sam_neck_norm1_weight_f16, sam_extra + 2u, "SAM neck norm1 weight");
+    ASSIGN_PTR(sam_neck_conv3x3_weight_f16, sam_extra + 3u, "SAM neck 3x3 weight");
+    ASSIGN_PTR(sam_neck_norm2_bias_f16, sam_extra + 4u, "SAM neck norm2 bias");
+    ASSIGN_PTR(sam_neck_norm2_weight_f16, sam_extra + 5u, "SAM neck norm2 weight");
+    ASSIGN_PTR(sam_net2_weight_f16, sam_extra + 6u, "SAM net_2 weight");
+    ASSIGN_PTR(sam_net3_weight_f16, sam_extra + 7u, "SAM net_3 weight");
+    ASSIGN_PTR(sam_patch_bias_f16, sam_extra + 8u, "SAM patch bias");
+    ASSIGN_PTR(sam_patch_weight_f16, sam_extra + 9u, "SAM patch weight");
+    ASSIGN_PTR(sam_pos_embed_f16, sam_extra + 10u, "SAM absolute position embedding");
+
+    ASSIGN_PTR(clip_class_embedding_f16, UOCR_TENSOR_ID_VISION_CLIP_BASE + 0u, "CLIP class embedding");
+    ASSIGN_PTR(clip_pos_embed_f16, UOCR_TENSOR_ID_VISION_CLIP_BASE + 2u, "CLIP position embedding");
+    ASSIGN_PTR(clip_pre_ln_bias_f16, UOCR_TENSOR_ID_VISION_CLIP_BASE + 3u, "CLIP pre-LayerNorm bias");
+    ASSIGN_PTR(clip_pre_ln_weight_f16, UOCR_TENSOR_ID_VISION_CLIP_BASE + 4u, "CLIP pre-LayerNorm weight");
+
+    for (uint32_t layer = 0u; layer < UOCR_SAM_BLOCKS; ++layer) {
+        const uint32_t base = UOCR_TENSOR_ID_VISION_SAM_BASE + metal_sam_sorted_block_index_for_layer(layer) * 14u;
+        uocr_metal_sam_transformer_block_f16 *block = &out_weights->sam_blocks[layer];
+        block->proj_bias_f16 = VISION_TENSOR_PTR(base + 0u, "SAM attention projection bias");
+        block->proj_weight_f16 = VISION_TENSOR_PTR(base + 1u, "SAM attention projection weight");
+        block->qkv_bias_f16 = VISION_TENSOR_PTR(base + 2u, "SAM attention qkv bias");
+        block->qkv_weight_f16 = VISION_TENSOR_PTR(base + 3u, "SAM attention qkv weight");
+        block->rel_pos_h_f16 = VISION_TENSOR_PTR(base + 4u, "SAM relative position H");
+        block->rel_pos_w_f16 = VISION_TENSOR_PTR(base + 5u, "SAM relative position W");
+        block->mlp_lin1_bias_f16 = VISION_TENSOR_PTR(base + 6u, "SAM MLP lin1 bias");
+        block->mlp_lin1_weight_f16 = VISION_TENSOR_PTR(base + 7u, "SAM MLP lin1 weight");
+        block->mlp_lin2_bias_f16 = VISION_TENSOR_PTR(base + 8u, "SAM MLP lin2 bias");
+        block->mlp_lin2_weight_f16 = VISION_TENSOR_PTR(base + 9u, "SAM MLP lin2 weight");
+        block->norm1_bias_f16 = VISION_TENSOR_PTR(base + 10u, "SAM norm1 bias");
+        block->norm1_weight_f16 = VISION_TENSOR_PTR(base + 11u, "SAM norm1 weight");
+        block->norm2_bias_f16 = VISION_TENSOR_PTR(base + 12u, "SAM norm2 bias");
+        block->norm2_weight_f16 = VISION_TENSOR_PTR(base + 13u, "SAM norm2 weight");
+        block->rel_pos_h_length = uocr_sam_block_uses_global_attention(layer) ? UOCR_SAM_MAX_REL_POS_SIZE : UOCR_SAM_WINDOW_REL_POS_SIZE;
+        block->rel_pos_w_length = block->rel_pos_h_length;
+        if (!metal_sam_transformer_block_has_weights(block)) {
+            return metal_fail(error, error_size, "incomplete SAM transformer block %u vision bindings", layer);
+        }
+    }
+
+    for (uint32_t layer = 0u; layer < UOCR_CLIP_BLOCKS; ++layer) {
+        const uint32_t base = UOCR_TENSOR_ID_VISION_CLIP_BASE + 5u + metal_clip_sorted_layer_index_for_layer(layer) * 12u;
+        uocr_metal_clip_transformer_block_f16 *block = &out_weights->clip_blocks[layer];
+        block->ln1_bias_f16 = VISION_TENSOR_PTR(base + 0u, "CLIP layer_norm1 bias");
+        block->ln1_weight_f16 = VISION_TENSOR_PTR(base + 1u, "CLIP layer_norm1 weight");
+        block->ln2_bias_f16 = VISION_TENSOR_PTR(base + 2u, "CLIP layer_norm2 bias");
+        block->ln2_weight_f16 = VISION_TENSOR_PTR(base + 3u, "CLIP layer_norm2 weight");
+        block->mlp_fc1_bias_f16 = VISION_TENSOR_PTR(base + 4u, "CLIP MLP fc1 bias");
+        block->mlp_fc1_weight_f16 = VISION_TENSOR_PTR(base + 5u, "CLIP MLP fc1 weight");
+        block->mlp_fc2_bias_f16 = VISION_TENSOR_PTR(base + 6u, "CLIP MLP fc2 bias");
+        block->mlp_fc2_weight_f16 = VISION_TENSOR_PTR(base + 7u, "CLIP MLP fc2 weight");
+        block->out_proj_bias_f16 = VISION_TENSOR_PTR(base + 8u, "CLIP attention output bias");
+        block->out_proj_weight_f16 = VISION_TENSOR_PTR(base + 9u, "CLIP attention output weight");
+        block->qkv_bias_f16 = VISION_TENSOR_PTR(base + 10u, "CLIP attention qkv bias");
+        block->qkv_weight_f16 = VISION_TENSOR_PTR(base + 11u, "CLIP attention qkv weight");
+        if (!metal_clip_transformer_block_has_weights(block)) {
+            return metal_fail(error, error_size, "incomplete CLIP transformer block %u vision bindings", layer);
+        }
+    }
+
+#undef ASSIGN_PTR
+#undef VISION_TENSOR_PTR
+
+    return 1;
+}
+
+typedef struct uocr_metal_vision_host_scratch {
+    uint16_t *sam_patch_bhwc_f16;
+    uint16_t *sam_pos_bhwc_f16;
+    uint16_t *sam_transformer_bhwc_f16;
+    uint16_t *sam_neck_a_nchw_f16;
+    uint16_t *sam_neck_b_nchw_f16;
+    uint16_t *sam_net2_nchw_f16;
+    uint16_t *sam_net3_nchw_f16;
+    uint16_t *clip_a_f16;
+    uint16_t *clip_b_f16;
+    uint16_t *clip_final_f16;
+    uint16_t *concat_f16;
+} uocr_metal_vision_host_scratch;
+
+static void metal_vision_host_scratch_free(uocr_metal_vision_host_scratch *scratch) {
+    if (scratch == NULL) {
+        return;
+    }
+    free(scratch->concat_f16);
+    free(scratch->clip_final_f16);
+    free(scratch->clip_b_f16);
+    free(scratch->clip_a_f16);
+    free(scratch->sam_net3_nchw_f16);
+    free(scratch->sam_net2_nchw_f16);
+    free(scratch->sam_neck_b_nchw_f16);
+    free(scratch->sam_neck_a_nchw_f16);
+    free(scratch->sam_transformer_bhwc_f16);
+    free(scratch->sam_pos_bhwc_f16);
+    free(scratch->sam_patch_bhwc_f16);
+    memset(scratch, 0, sizeof(*scratch));
+}
+
+static int metal_alloc_f16_values(uint16_t **out,
+                                  uint64_t value_count,
+                                  const char *label,
+                                  char *error,
+                                  size_t error_size) {
+    if (out == NULL || value_count == 0u) {
+        return metal_fail(error, error_size, "invalid Metal vision scratch allocation request");
+    }
+    uint64_t bytes = 0u;
+    if (!checked_mul_u64(value_count, 2u, &bytes) || bytes > (uint64_t)SIZE_MAX) {
+        return metal_fail(error, error_size, "Metal vision scratch allocation for %s overflows", label != NULL ? label : "buffer");
+    }
+    *out = (uint16_t *)malloc((size_t)bytes);
+    if (*out == NULL) {
+        return metal_fail(error,
+                          error_size,
+                          "failed to allocate Metal vision scratch buffer %s (%llu bytes)",
+                          label != NULL ? label : "buffer",
+                          (unsigned long long)bytes);
+    }
+    return 1;
+}
+
+static int metal_vision_host_scratch_init(uocr_metal_vision_host_scratch *scratch,
+                                          char *error,
+                                          size_t error_size) {
+    if (scratch == NULL) {
+        return metal_fail(error, error_size, "Metal vision scratch output is null");
+    }
+    memset(scratch, 0, sizeof(*scratch));
+    const uint64_t sam_bhwc_values = (uint64_t)UOCR_SAM_MAX_GRID_TOKENS * (uint64_t)UOCR_SAM_HIDDEN_SIZE;
+    const uint64_t sam_neck_values = (uint64_t)UOCR_SAM_NECK_CHANNELS * (uint64_t)UOCR_SAM_MAX_GRID_TOKENS;
+    const uint64_t max_net2_grid = (uint64_t)((UOCR_SAM_MAX_GRID_SIZE + 1u) / 2u);
+    const uint64_t max_net3_grid = (max_net2_grid + 1u) / 2u;
+    const uint64_t sam_net2_values = (uint64_t)UOCR_SAM_NET2_CHANNELS * max_net2_grid * max_net2_grid;
+    const uint64_t sam_net3_values = (uint64_t)UOCR_SAM_NET3_CHANNELS * max_net3_grid * max_net3_grid;
+    const uint64_t clip_values = (uint64_t)UOCR_CLIP_MAX_TOKENS * (uint64_t)UOCR_CLIP_HIDDEN_SIZE;
+    const uint64_t concat_values = (uint64_t)UOCR_GLOBAL_GRID_QUERIES * (uint64_t)UOCR_GLOBAL_GRID_QUERIES * (uint64_t)UOCR_PROJECTOR_IN_SIZE;
+
+#define ALLOC_SCRATCH(field, values, label)                              \
+    do {                                                                 \
+        if (!metal_alloc_f16_values(&(scratch->field), (values), (label), error, error_size)) { \
+            metal_vision_host_scratch_free(scratch);                     \
+            return 0;                                                    \
+        }                                                                \
+    } while (0)
+
+    ALLOC_SCRATCH(sam_patch_bhwc_f16, sam_bhwc_values, "SAM patch BHWC");
+    ALLOC_SCRATCH(sam_pos_bhwc_f16, sam_bhwc_values, "SAM positioned BHWC");
+    ALLOC_SCRATCH(sam_transformer_bhwc_f16, sam_bhwc_values, "SAM transformer BHWC");
+    ALLOC_SCRATCH(sam_neck_a_nchw_f16, sam_neck_values, "SAM neck A NCHW");
+    ALLOC_SCRATCH(sam_neck_b_nchw_f16, sam_neck_values, "SAM neck B NCHW");
+    ALLOC_SCRATCH(sam_net2_nchw_f16, sam_net2_values, "SAM net_2 NCHW");
+    ALLOC_SCRATCH(sam_net3_nchw_f16, sam_net3_values, "SAM net_3 NCHW");
+    ALLOC_SCRATCH(clip_a_f16, clip_values, "CLIP token A");
+    ALLOC_SCRATCH(clip_b_f16, clip_values, "CLIP token B");
+    ALLOC_SCRATCH(clip_final_f16, clip_values, "CLIP transformer output");
+    ALLOC_SCRATCH(concat_f16, concat_values, "CLIP/SAM concat");
+
+#undef ALLOC_SCRATCH
+
+    return 1;
+}
+
+typedef struct uocr_metal_vision_project_context {
+    uocr_metal_context *ctx;
+    const uocr_prepared_request *request;
+    const uocr_metal_vision_weights_f16 *weights;
+    uocr_metal_vision_host_scratch *scratch;
+} uocr_metal_vision_project_context;
+
+static int metal_encode_one_view_projected_f16(uocr_metal_vision_project_context *project,
+                                               const uocr_image_view *view,
+                                               uint16_t *out_projected_rows_f16,
+                                               char *error,
+                                               size_t error_size) {
+    if (project == NULL || project->ctx == NULL || project->weights == NULL || project->scratch == NULL ||
+        view == NULL || out_projected_rows_f16 == NULL) {
+        return metal_fail(error, error_size, "invalid Metal vision view-encoding request");
+    }
+    const uint32_t expected_patch_grid = view->width / UOCR_VISION_PATCH_SIZE;
+    const uint32_t expected_projected_grid = view->kind == UOCR_VIEW_LOCAL ? UOCR_LOCAL_GRID_QUERIES : UOCR_GLOBAL_GRID_QUERIES;
+    const uint32_t expected_clip_tokens = UOCR_CLIP_CLASS_TOKENS + expected_projected_grid * expected_projected_grid;
+    const uocr_metal_vision_weights_f16 *weights = project->weights;
+    uocr_metal_vision_host_scratch *scratch = project->scratch;
+    uocr_metal_context *ctx = project->ctx;
+
+#define RUN_VISION_STEP(step_name, call_expr)                                                        \
+    do {                                                                                             \
+        if (!(call_expr)) {                                                                          \
+            char detail[512];                                                                        \
+            metal_copy_error_detail(detail, sizeof(detail), error);                                   \
+            return metal_fail(error, error_size, "failed to compute Metal vision %s: %s", step_name, detail); \
+        }                                                                                            \
+    } while (0)
+
+    uint32_t patch_grid_w = 0u;
+    uint32_t patch_grid_h = 0u;
+    RUN_VISION_STEP("SAM patch embedding",
+                    uocr_metal_context_sam_patch_embed_f16(ctx,
+                                                            view->pixels,
+                                                            view->format,
+                                                            view->width,
+                                                            view->height,
+                                                            weights->sam_patch_weight_f16,
+                                                            weights->sam_patch_bias_f16,
+                                                            scratch->sam_patch_bhwc_f16,
+                                                            &patch_grid_w,
+                                                            &patch_grid_h,
+                                                            error,
+                                                            error_size));
+    if (patch_grid_w != expected_patch_grid || patch_grid_h != expected_patch_grid) {
+        return metal_fail(error,
+                          error_size,
+                          "SAM patch embedding produced grid %ux%u, expected %ux%u",
+                          patch_grid_w,
+                          patch_grid_h,
+                          expected_patch_grid,
+                          expected_patch_grid);
+    }
+
+    RUN_VISION_STEP("SAM absolute position add",
+                    uocr_metal_context_sam_add_abs_pos_f16(ctx,
+                                                            scratch->sam_patch_bhwc_f16,
+                                                            weights->sam_pos_embed_f16,
+                                                            patch_grid_w,
+                                                            patch_grid_h,
+                                                            scratch->sam_pos_bhwc_f16,
+                                                            error,
+                                                            error_size));
+    RUN_VISION_STEP("SAM transformer",
+                    uocr_metal_context_sam_transformer_f16(ctx,
+                                                            scratch->sam_pos_bhwc_f16,
+                                                            weights->sam_blocks,
+                                                            UOCR_SAM_BLOCKS,
+                                                            patch_grid_w,
+                                                            patch_grid_h,
+                                                            UOCR_METAL_DENSE_OUTPUT_F16,
+                                                            scratch->sam_transformer_bhwc_f16,
+                                                            error,
+                                                            error_size));
+    RUN_VISION_STEP("SAM neck 1x1 convolution",
+                    uocr_metal_context_sam_neck_conv1x1_f16(ctx,
+                                                             scratch->sam_transformer_bhwc_f16,
+                                                             weights->sam_neck_conv1x1_weight_f16,
+                                                             patch_grid_w,
+                                                             patch_grid_h,
+                                                             UOCR_METAL_DENSE_OUTPUT_F16,
+                                                             scratch->sam_neck_a_nchw_f16,
+                                                             error,
+                                                             error_size));
+    RUN_VISION_STEP("SAM neck LayerNorm2d-1",
+                    uocr_metal_context_sam_layernorm2d_f16(ctx,
+                                                            scratch->sam_neck_a_nchw_f16,
+                                                            weights->sam_neck_norm1_weight_f16,
+                                                            weights->sam_neck_norm1_bias_f16,
+                                                            patch_grid_w,
+                                                            patch_grid_h,
+                                                            UOCR_METAL_DENSE_OUTPUT_F16,
+                                                            scratch->sam_neck_b_nchw_f16,
+                                                            error,
+                                                            error_size));
+    RUN_VISION_STEP("SAM neck 3x3 convolution",
+                    uocr_metal_context_sam_neck_conv3x3_f16(ctx,
+                                                             scratch->sam_neck_b_nchw_f16,
+                                                             weights->sam_neck_conv3x3_weight_f16,
+                                                             patch_grid_w,
+                                                             patch_grid_h,
+                                                             UOCR_METAL_DENSE_OUTPUT_F16,
+                                                             scratch->sam_neck_a_nchw_f16,
+                                                             error,
+                                                             error_size));
+    RUN_VISION_STEP("SAM neck LayerNorm2d-2",
+                    uocr_metal_context_sam_layernorm2d_f16(ctx,
+                                                            scratch->sam_neck_a_nchw_f16,
+                                                            weights->sam_neck_norm2_weight_f16,
+                                                            weights->sam_neck_norm2_bias_f16,
+                                                            patch_grid_w,
+                                                            patch_grid_h,
+                                                            UOCR_METAL_DENSE_OUTPUT_F16,
+                                                            scratch->sam_neck_b_nchw_f16,
+                                                            error,
+                                                            error_size));
+    RUN_VISION_STEP("SAM net_2 convolution",
+                    uocr_metal_context_sam_net2_conv3x3_stride2_f16(ctx,
+                                                                     scratch->sam_neck_b_nchw_f16,
+                                                                     weights->sam_net2_weight_f16,
+                                                                     patch_grid_w,
+                                                                     patch_grid_h,
+                                                                     UOCR_METAL_DENSE_OUTPUT_F16,
+                                                                     scratch->sam_net2_nchw_f16,
+                                                                     error,
+                                                                     error_size));
+    const uint32_t net2_grid_w = (patch_grid_w + 1u) / 2u;
+    const uint32_t net2_grid_h = (patch_grid_h + 1u) / 2u;
+    RUN_VISION_STEP("SAM net_3 convolution",
+                    uocr_metal_context_sam_net3_conv3x3_stride2_f16(ctx,
+                                                                     scratch->sam_net2_nchw_f16,
+                                                                     weights->sam_net3_weight_f16,
+                                                                     net2_grid_w,
+                                                                     net2_grid_h,
+                                                                     UOCR_METAL_DENSE_OUTPUT_F16,
+                                                                     scratch->sam_net3_nchw_f16,
+                                                                     error,
+                                                                     error_size));
+    const uint32_t sam_grid_w = (net2_grid_w + 1u) / 2u;
+    const uint32_t sam_grid_h = (net2_grid_h + 1u) / 2u;
+    if (sam_grid_w != expected_projected_grid || sam_grid_h != expected_projected_grid) {
+        return metal_fail(error,
+                          error_size,
+                          "SAM net output grid %ux%u, expected %ux%u",
+                          sam_grid_w,
+                          sam_grid_h,
+                          expected_projected_grid,
+                          expected_projected_grid);
+    }
+
+    RUN_VISION_STEP("CLIP SAM embedding",
+                    uocr_metal_context_clip_embed_sam_f16(ctx,
+                                                           scratch->sam_net3_nchw_f16,
+                                                           weights->clip_class_embedding_f16,
+                                                           sam_grid_w,
+                                                           sam_grid_h,
+                                                           UOCR_METAL_DENSE_OUTPUT_F16,
+                                                           scratch->clip_a_f16,
+                                                           error,
+                                                           error_size));
+    RUN_VISION_STEP("CLIP absolute position add",
+                    uocr_metal_context_clip_add_abs_pos_f16(ctx,
+                                                             scratch->clip_a_f16,
+                                                             weights->clip_pos_embed_f16,
+                                                             sam_grid_w,
+                                                             sam_grid_h,
+                                                             UOCR_METAL_DENSE_OUTPUT_F16,
+                                                             scratch->clip_b_f16,
+                                                             error,
+                                                             error_size));
+    RUN_VISION_STEP("CLIP pre-LayerNorm",
+                    uocr_metal_context_clip_pre_layernorm_f16(ctx,
+                                                               scratch->clip_b_f16,
+                                                               weights->clip_pre_ln_weight_f16,
+                                                               weights->clip_pre_ln_bias_f16,
+                                                               expected_clip_tokens,
+                                                               UOCR_METAL_LAYERNORM_OUTPUT_F16,
+                                                               scratch->clip_a_f16,
+                                                               error,
+                                                               error_size));
+    RUN_VISION_STEP("CLIP transformer",
+                    uocr_metal_context_clip_transformer_f16(ctx,
+                                                             scratch->clip_a_f16,
+                                                             weights->clip_blocks,
+                                                             UOCR_CLIP_BLOCKS,
+                                                             expected_clip_tokens,
+                                                             UOCR_METAL_DENSE_OUTPUT_F16,
+                                                             scratch->clip_final_f16,
+                                                             error,
+                                                             error_size));
+    RUN_VISION_STEP("CLIP/SAM concat",
+                    uocr_metal_context_clip_sam_concat_f16(ctx,
+                                                            scratch->clip_final_f16,
+                                                            scratch->sam_net3_nchw_f16,
+                                                            sam_grid_w,
+                                                            sam_grid_h,
+                                                            UOCR_METAL_DENSE_OUTPUT_F16,
+                                                            scratch->concat_f16,
+                                                            error,
+                                                            error_size));
+    RUN_VISION_STEP("visual projector",
+                    uocr_metal_context_visual_projector_f16(ctx,
+                                                             scratch->concat_f16,
+                                                             weights->projector_weight_f16,
+                                                             weights->projector_bias_f16,
+                                                             sam_grid_w * sam_grid_h,
+                                                             UOCR_METAL_DENSE_OUTPUT_F16,
+                                                             out_projected_rows_f16,
+                                                             error,
+                                                             error_size));
+
+#undef RUN_VISION_STEP
+
+    return 1;
+}
+
+static int metal_project_vision_chunk_f16(const uocr_vision_chunk *chunk,
+                                          uint16_t *projected_scratch_f16,
+                                          uint32_t projected_scratch_rows,
+                                          void *user_data,
+                                          char *error,
+                                          size_t error_size) {
+    if (chunk == NULL || projected_scratch_f16 == NULL || user_data == NULL) {
+        (void)metal_fail(error, error_size, "invalid Metal vision chunk projection request");
+        return UOCR_ERROR_INVALID_ARGUMENT;
+    }
+    if (projected_scratch_rows < chunk->projected_token_count) {
+        (void)metal_fail(error,
+                         error_size,
+                         "Metal vision projected scratch has %u rows, need %u",
+                         projected_scratch_rows,
+                         chunk->projected_token_count);
+        return UOCR_ERROR_OUT_OF_MEMORY;
+    }
+
+    uocr_metal_vision_project_context *project = (uocr_metal_vision_project_context *)user_data;
+    if (project->request == NULL || chunk->first_view > project->request->n_views ||
+        chunk->view_count > project->request->n_views - chunk->first_view) {
+        (void)metal_fail(error, error_size, "Metal vision chunk view range is invalid");
+        return UOCR_ERROR_INVALID_ARGUMENT;
+    }
+
+    for (uint32_t view_index = 0u; view_index < chunk->view_count; ++view_index) {
+        const uocr_image_view *view = &project->request->views[chunk->first_view + view_index];
+        uint16_t *projected_out = &projected_scratch_f16[(size_t)view_index * (size_t)chunk->projected_tokens_per_view * (size_t)UOCR_HIDDEN_SIZE];
+        if (!metal_encode_one_view_projected_f16(project, view, projected_out, error, error_size)) {
+            return UOCR_ERROR_INTERNAL;
+        }
+    }
+
+    return UOCR_OK;
+}
+
+int uocr_metal_context_encode_visual_features_f16(uocr_metal_context *ctx,
+                                                  const uocr_prepared_request *request,
+                                                  uint32_t max_views_per_chunk,
+                                                  uint16_t *out_visual_features_f16,
+                                                  uint32_t out_visual_rows,
+                                                  char *error,
+                                                  size_t error_size) {
+    metal_clear_error(error, error_size);
+    if (ctx == NULL || request == NULL) {
+        return metal_fail(error, error_size, "Metal vision encoding requires a context and prepared request");
+    }
+    if (!uocr_metal_context_vision_bindings_ready(ctx)) {
+        return metal_fail(error,
+                          error_size,
+                          "Metal vision encoding requires validated fp16 vision tensor bindings: %s",
+                          uocr_metal_context_vision_binding_error(ctx));
+    }
+    if (out_visual_rows != 0u && out_visual_features_f16 == NULL) {
+        return metal_fail(error, error_size, "Metal vision output buffer is null for %u rows", out_visual_rows);
+    }
+
+    uocr_vision_schedule schedule;
+    memset(&schedule, 0, sizeof(schedule));
+    const int plan_status = uocr_plan_vision_schedule(request,
+                                                      max_views_per_chunk,
+                                                      NULL,
+                                                      0u,
+                                                      &schedule,
+                                                      error,
+                                                      error_size);
+    if (plan_status != UOCR_OK) {
+        char detail[512];
+        metal_copy_error_detail(detail, sizeof(detail), error);
+        return metal_fail(error, error_size, "invalid Metal vision request: %s", detail);
+    }
+    if (out_visual_rows != schedule.final_visual_tokens) {
+        return metal_fail(error,
+                          error_size,
+                          "Metal vision output row count mismatch: got %u expected %u",
+                          out_visual_rows,
+                          schedule.final_visual_tokens);
+    }
+    if (schedule.final_visual_tokens == 0u) {
+        metal_clear_error(error, error_size);
+        return 1;
+    }
+
+    uocr_metal_vision_weights_f16 weights;
+    if (!metal_load_vision_weights_from_bindings(ctx, &weights, error, error_size)) {
+        return 0;
+    }
+
+    uocr_metal_vision_host_scratch scratch;
+    if (!metal_vision_host_scratch_init(&scratch, error, error_size)) {
+        return 0;
+    }
+
+    uint16_t *projected_scratch_f16 = NULL;
+    if (!metal_alloc_f16_values(&projected_scratch_f16,
+                                (uint64_t)schedule.max_chunk_projected_tokens * (uint64_t)UOCR_HIDDEN_SIZE,
+                                "projected visual chunk rows",
+                                error,
+                                error_size)) {
+        metal_vision_host_scratch_free(&scratch);
+        return 0;
+    }
+
+    uocr_metal_vision_project_context project;
+    memset(&project, 0, sizeof(project));
+    project.ctx = ctx;
+    project.request = request;
+    project.weights = &weights;
+    project.scratch = &scratch;
+
+    const int process_status = uocr_process_vision_chunks_f16(request,
+                                                              max_views_per_chunk,
+                                                              metal_project_vision_chunk_f16,
+                                                              &project,
+                                                              projected_scratch_f16,
+                                                              schedule.max_chunk_projected_tokens,
+                                                              weights.image_newline_f16,
+                                                              weights.view_separator_f16,
+                                                              out_visual_features_f16,
+                                                              out_visual_rows,
+                                                              NULL,
+                                                              error,
+                                                              error_size);
+    free(projected_scratch_f16);
+    metal_vision_host_scratch_free(&scratch);
+    if (process_status != UOCR_OK) {
+        char detail[512];
+        metal_copy_error_detail(detail, sizeof(detail), error);
+        return metal_fail(error, error_size, "Metal vision encoding failed: %s", detail);
+    }
+
+    metal_clear_error(error, error_size);
+    return 1;
 }
 
 static int scratch_slot_valid(uocr_metal_scratch_slot slot) {
