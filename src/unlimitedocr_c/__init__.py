@@ -9,6 +9,13 @@ from .convert import (
     write_uocr_model,
 )
 from .tensor_registry import TensorFamily, TensorProjection
+from .golden import (
+    PromptEmbeddingDump,
+    bf16_words_to_f16_bits,
+    dump_prompt_embedding_fixture,
+    load_prompt_embedding_dump,
+    read_bf16_rows_as_f16_bits,
+)
 from .ffi import (
     Engine,
     EngineOptions,
@@ -50,6 +57,11 @@ __all__ = [
     "write_uocr_model",
     "TensorFamily",
     "TensorProjection",
+    "PromptEmbeddingDump",
+    "bf16_words_to_f16_bits",
+    "dump_prompt_embedding_fixture",
+    "load_prompt_embedding_dump",
+    "read_bf16_rows_as_f16_bits",
     "Engine",
     "EngineOptions",
     "MemoryReport",

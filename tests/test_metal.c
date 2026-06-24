@@ -358,6 +358,222 @@ static int read_hf_embed_rows_as_f16(const char *hf_dir,
     return 1;
 }
 
+static int make_fixture_path(const char *root, const char *name, char *out, size_t out_size) {
+    if (root == NULL || root[0] == '\0' || name == NULL || out == NULL || out_size == 0u) {
+        return 0;
+    }
+    const int written = snprintf(out, out_size, "%s/%s", root, name);
+    return written >= 0 && (size_t)written < out_size;
+}
+
+static int read_binary_file(const char *path, unsigned char **out_bytes, size_t *out_size, char *error, size_t error_size) {
+    if (out_bytes == NULL || out_size == NULL) {
+        snprintf(error, error_size, "invalid binary read request");
+        return 0;
+    }
+    *out_bytes = NULL;
+    *out_size = 0u;
+    FILE *f = fopen(path, "rb");
+    if (f == NULL) {
+        snprintf(error, error_size, "failed to open %s", path);
+        return 0;
+    }
+    if (fseek(f, 0L, SEEK_END) != 0) {
+        snprintf(error, error_size, "failed to seek %s", path);
+        fclose(f);
+        return 0;
+    }
+    const long size_long = ftell(f);
+    if (size_long <= 0) {
+        snprintf(error, error_size, "invalid empty binary file %s", path);
+        fclose(f);
+        return 0;
+    }
+    if (fseek(f, 0L, SEEK_SET) != 0) {
+        snprintf(error, error_size, "failed to rewind %s", path);
+        fclose(f);
+        return 0;
+    }
+    unsigned char *bytes = (unsigned char *)malloc((size_t)size_long);
+    if (bytes == NULL) {
+        snprintf(error, error_size, "failed to allocate %ld bytes for %s", size_long, path);
+        fclose(f);
+        return 0;
+    }
+    if (fread(bytes, 1u, (size_t)size_long, f) != (size_t)size_long) {
+        snprintf(error, error_size, "failed to read %s", path);
+        free(bytes);
+        fclose(f);
+        return 0;
+    }
+    fclose(f);
+    *out_bytes = bytes;
+    *out_size = (size_t)size_long;
+    return 1;
+}
+
+static int read_prompt_embedding_python_dump(const char *dump_dir,
+                                             int32_t **input_ids_out,
+                                             uint32_t *n_tokens_out,
+                                             uint16_t **embeddings_out,
+                                             char *error,
+                                             size_t error_size) {
+    if (input_ids_out == NULL || n_tokens_out == NULL || embeddings_out == NULL) {
+        snprintf(error, error_size, "invalid prompt embedding dump request");
+        return 0;
+    }
+    *input_ids_out = NULL;
+    *n_tokens_out = 0u;
+    *embeddings_out = NULL;
+
+    char ids_path[4096];
+    char embeddings_path[4096];
+    if (!make_fixture_path(dump_dir, "input_ids_i32.bin", ids_path, sizeof(ids_path)) ||
+        !make_fixture_path(dump_dir, "prompt_embeddings_f16.bin", embeddings_path, sizeof(embeddings_path))) {
+        snprintf(error, error_size, "prompt embedding dump path is too long");
+        return 0;
+    }
+
+    unsigned char *ids_bytes = NULL;
+    size_t ids_size = 0u;
+    if (!read_binary_file(ids_path, &ids_bytes, &ids_size, error, error_size)) {
+        return 0;
+    }
+    if (ids_size % sizeof(int32_t) != 0u || ids_size / sizeof(int32_t) > (size_t)UINT32_MAX) {
+        snprintf(error, error_size, "invalid input_ids_i32.bin size %zu", ids_size);
+        free(ids_bytes);
+        return 0;
+    }
+    const uint32_t n_tokens = (uint32_t)(ids_size / sizeof(int32_t));
+    if (n_tokens == 0u) {
+        snprintf(error, error_size, "prompt embedding dump has no tokens");
+        free(ids_bytes);
+        return 0;
+    }
+
+    uint64_t expected_embedding_bytes = (uint64_t)n_tokens * (uint64_t)UOCR_HIDDEN_SIZE * 2u;
+    if (expected_embedding_bytes > (uint64_t)SIZE_MAX) {
+        snprintf(error, error_size, "prompt embedding dump size overflow");
+        free(ids_bytes);
+        return 0;
+    }
+
+    unsigned char *embedding_bytes = NULL;
+    size_t embedding_size = 0u;
+    if (!read_binary_file(embeddings_path, &embedding_bytes, &embedding_size, error, error_size)) {
+        free(ids_bytes);
+        return 0;
+    }
+    if ((uint64_t)embedding_size != expected_embedding_bytes) {
+        snprintf(error,
+                 error_size,
+                 "prompt_embeddings_f16.bin size mismatch: expected %llu bytes, got %zu",
+                 (unsigned long long)expected_embedding_bytes,
+                 embedding_size);
+        free(embedding_bytes);
+        free(ids_bytes);
+        return 0;
+    }
+
+    int32_t *ids = (int32_t *)malloc((size_t)n_tokens * sizeof(int32_t));
+    uint16_t *embeddings = (uint16_t *)malloc((size_t)expected_embedding_bytes);
+    if (ids == NULL || embeddings == NULL) {
+        snprintf(error, error_size, "failed to allocate prompt embedding dump buffers");
+        free(embeddings);
+        free(ids);
+        free(embedding_bytes);
+        free(ids_bytes);
+        return 0;
+    }
+    for (uint32_t i = 0u; i < n_tokens; ++i) {
+        const unsigned char *p = ids_bytes + 4u * i;
+        const uint32_t raw = (uint32_t)p[0] | ((uint32_t)p[1] << 8u) | ((uint32_t)p[2] << 16u) | ((uint32_t)p[3] << 24u);
+        memcpy(&ids[i], &raw, sizeof(ids[i]));
+    }
+    const size_t embedding_values = embedding_size / sizeof(uint16_t);
+    for (size_t i = 0u; i < embedding_values; ++i) {
+        embeddings[i] = (uint16_t)embedding_bytes[2u * i] | (uint16_t)((uint16_t)embedding_bytes[2u * i + 1u] << 8u);
+    }
+
+    free(embedding_bytes);
+    free(ids_bytes);
+    *input_ids_out = ids;
+    *n_tokens_out = n_tokens;
+    *embeddings_out = embeddings;
+    return 1;
+}
+
+static int test_metal_text_prompt_embedding_python_dump_parity(void) {
+    if (!uocr_metal_is_available()) {
+        return 0;
+    }
+    if (!env_flag_enabled("UOCR_RUN_LARGE_TESTS")) {
+        return 0;
+    }
+
+    const char *model_path = getenv("UOCR_MODEL_PATH");
+    const char *dump_dir = getenv("UOCR_PROMPT_DUMP_DIR");
+    if (model_path == NULL || model_path[0] == '\0' || dump_dir == NULL || dump_dir[0] == '\0') {
+        printf("UOCR_RUN_LARGE_TESTS=1 but UOCR_MODEL_PATH/UOCR_PROMPT_DUMP_DIR are not both set; skipping Python prompt dump parity\n");
+        return 0;
+    }
+
+    char error[1024];
+    memset(error, 0, sizeof(error));
+    int32_t *input_ids = NULL;
+    uint32_t n_tokens = 0u;
+    uint16_t *expected = NULL;
+    CHECK(read_prompt_embedding_python_dump(dump_dir, &input_ids, &n_tokens, &expected, error, sizeof(error)) == 1);
+
+    uocr_model_file model;
+    CHECK(uocr_model_file_open(model_path, &model, error, sizeof(error)) == 0);
+
+    uocr_metal_context *ctx = uocr_metal_context_create(UOCR_TEST_METAL_RESOURCE_PATH, error, sizeof(error));
+    CHECK(ctx != NULL);
+    CHECK(uocr_metal_context_map_model(ctx, &model, error, sizeof(error)) == 1);
+
+    uint64_t output_bytes = (uint64_t)n_tokens * (uint64_t)UOCR_HIDDEN_SIZE * 2u;
+    CHECK(output_bytes <= (uint64_t)SIZE_MAX);
+    uint16_t *actual = (uint16_t *)malloc((size_t)output_bytes);
+    CHECK(actual != NULL);
+    memset(actual, 0, (size_t)output_bytes);
+    CHECK(uocr_metal_context_assemble_prompt_from_model_f16(ctx,
+                                                            input_ids,
+                                                            n_tokens,
+                                                            UINT32_MAX,
+                                                            0u,
+                                                            NULL,
+                                                            actual,
+                                                            error,
+                                                            sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+
+    const uint64_t values = (uint64_t)n_tokens * (uint64_t)UOCR_HIDDEN_SIZE;
+    for (uint64_t i = 0u; i < values; ++i) {
+        if (actual[i] != expected[i]) {
+            fprintf(stderr,
+                    "Python prompt dump mismatch at token %llu col %llu: actual=0x%04x expected=0x%04x\n",
+                    (unsigned long long)(i / (uint64_t)UOCR_HIDDEN_SIZE),
+                    (unsigned long long)(i % (uint64_t)UOCR_HIDDEN_SIZE),
+                    actual[i],
+                    expected[i]);
+            free(actual);
+            uocr_metal_context_destroy(ctx);
+            uocr_model_file_close(&model);
+            free(expected);
+            free(input_ids);
+            return 1;
+        }
+    }
+
+    free(actual);
+    uocr_metal_context_destroy(ctx);
+    uocr_model_file_close(&model);
+    free(expected);
+    free(input_ids);
+    return 0;
+}
+
 static int test_metal_text_prompt_embedding_full_model_parity(void) {
     if (!uocr_metal_is_available()) {
         return 0;
@@ -4307,6 +4523,7 @@ int main(void) {
     if (test_metal_prompt_assembly_f16() != 0) return 1;
     if (test_metal_prompt_assembly_from_mapped_model_f16() != 0) return 1;
     if (test_metal_text_prompt_embedding_full_model_parity() != 0) return 1;
+    if (test_metal_text_prompt_embedding_python_dump_parity() != 0) return 1;
     if (test_metal_rmsnorm_f16() != 0) return 1;
     if (test_metal_final_rmsnorm_f16() != 0) return 1;
     if (test_metal_lm_head_f16() != 0) return 1;
