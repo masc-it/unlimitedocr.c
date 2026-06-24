@@ -656,7 +656,7 @@ First implementation slice, in order:
   - [x] CPU version first using logits readback if needed
   - [ ] later GPU version for speed
 - [x] Stop on EOS id `1` or max new tokens.
-- [ ] Return generated token ids to C result and Python wrapper.
+- [x] Return generated token ids to C result and Python wrapper.
 - [ ] Add text-only fp16 parity test:
   - [ ] prompt embeddings
   - [ ] layer outputs

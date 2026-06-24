@@ -227,6 +227,20 @@ def _view_kind(kind: str) -> int:
     raise ValueError(f"unsupported view kind {kind!r}")
 
 
+def _copy_result_tokens(lib: ct.CDLL, result: ct.c_void_p) -> list[NDArray[np.int32]]:
+    count = lib.uocr_result_count(result)
+    outputs: list[NDArray[np.int32]] = []
+    for i in range(count):
+        n_tokens = ct.c_uint32()
+        ptr = lib.uocr_result_tokens(result, i, ct.byref(n_tokens))
+        if n_tokens.value == 0 or not ptr:
+            outputs.append(np.empty((0,), dtype=np.int32))
+        else:
+            array = np.ctypeslib.as_array(ptr, shape=(n_tokens.value,)).copy()
+            outputs.append(array.astype(np.int32, copy=False))
+    return outputs
+
+
 def as_c_request(request: PreparedRequest) -> _PreparedKeepalive:
     input_ids = np.ascontiguousarray(request.input_ids, dtype=np.int32)
     image_mask = np.ascontiguousarray(request.image_mask, dtype=np.uint8)
@@ -347,16 +361,6 @@ class Engine:
         if status != UOCR_OK:
             raise RuntimeError(f"uocr_generate_prepared failed ({status}): {self.last_error()}")
         try:
-            count = self._lib.uocr_result_count(result)
-            outputs: list[NDArray[np.int32]] = []
-            for i in range(count):
-                n_tokens = ct.c_uint32()
-                ptr = self._lib.uocr_result_tokens(result, i, ct.byref(n_tokens))
-                if n_tokens.value == 0 or not ptr:
-                    outputs.append(np.empty((0,), dtype=np.int32))
-                else:
-                    array = np.ctypeslib.as_array(ptr, shape=(n_tokens.value,)).copy()
-                    outputs.append(array.astype(np.int32, copy=False))
-            return outputs
+            return _copy_result_tokens(self._lib, result)
         finally:
             self._lib.uocr_result_free(result)

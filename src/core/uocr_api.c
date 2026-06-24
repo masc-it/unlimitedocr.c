@@ -5,6 +5,7 @@
 #include <string.h>
 
 #include "core/uocr_alloc.h"
+#include "core/uocr_result.h"
 #include "model/uocr_constants.h"
 #include "model/uocr_model_file.h"
 #include "runtime/uocr_memory.h"
@@ -40,12 +41,6 @@ struct uocr_engine {
     uocr_metal_context *metal;
 #endif
     char last_error[512];
-};
-
-struct uocr_result {
-    uint32_t n_sequences;
-    int32_t **tokens;
-    uint32_t *n_tokens;
 };
 
 static UOCR_THREAD_LOCAL char g_last_error[512] = "OK";
@@ -414,22 +409,6 @@ int uocr_engine_memory_report(const uocr_engine *engine, uocr_memory_report *out
     return UOCR_OK;
 }
 
-static int allocate_empty_result(uint32_t n_requests, uocr_result **out_result) {
-    uocr_result *result = (uocr_result *)uocr_calloc(1u, sizeof(*result));
-    if (result == NULL) {
-        return UOCR_ERROR_OUT_OF_MEMORY;
-    }
-    result->n_sequences = n_requests;
-    result->tokens = (int32_t **)uocr_calloc(n_requests, sizeof(result->tokens[0]));
-    result->n_tokens = (uint32_t *)uocr_calloc(n_requests, sizeof(result->n_tokens[0]));
-    if (result->tokens == NULL || result->n_tokens == NULL) {
-        uocr_result_free(result);
-        return UOCR_ERROR_OUT_OF_MEMORY;
-    }
-    *out_result = result;
-    return UOCR_OK;
-}
-
 int uocr_generate_prepared(uocr_engine *engine,
                            const uocr_prepared_request *requests,
                            uint32_t n_requests,
@@ -503,41 +482,10 @@ int uocr_generate_prepared(uocr_engine *engine,
                                  "inference kernels are not implemented yet; use max_new_tokens=0 for ABI smoke tests");
     }
 
-    const int status = allocate_empty_result(n_requests, out_result);
+    const int status = uocr_result_create_empty(n_requests, out_result);
     if (status != UOCR_OK) {
         return set_engine_errorf(engine, status, "failed to allocate result");
     }
     clear_engine_error(engine);
     return UOCR_OK;
-}
-
-uint32_t uocr_result_count(const uocr_result *result) {
-    return result != NULL ? result->n_sequences : 0u;
-}
-
-const int32_t *uocr_result_tokens(const uocr_result *result, uint32_t index, uint32_t *n_tokens) {
-    if (n_tokens != NULL) {
-        *n_tokens = 0u;
-    }
-    if (result == NULL || index >= result->n_sequences) {
-        return NULL;
-    }
-    if (n_tokens != NULL) {
-        *n_tokens = result->n_tokens[index];
-    }
-    return result->tokens[index];
-}
-
-void uocr_result_free(uocr_result *result) {
-    if (result == NULL) {
-        return;
-    }
-    if (result->tokens != NULL) {
-        for (uint32_t i = 0u; i < result->n_sequences; ++i) {
-            uocr_free(result->tokens[i]);
-        }
-    }
-    uocr_free(result->tokens);
-    uocr_free(result->n_tokens);
-    uocr_free(result);
 }
