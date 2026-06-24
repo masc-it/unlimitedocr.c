@@ -102,6 +102,14 @@ static size_t clip_projection_weight_index(uint32_t out_channel, uint32_t in_cha
     return (size_t)out_channel * UOCR_CLIP_HIDDEN_SIZE + in_channel;
 }
 
+static size_t clip_mlp_fc1_weight_index(uint32_t out_channel, uint32_t in_channel) {
+    return (size_t)out_channel * UOCR_CLIP_HIDDEN_SIZE + in_channel;
+}
+
+static size_t clip_mlp_fc2_weight_index(uint32_t out_channel, uint32_t in_channel) {
+    return (size_t)out_channel * UOCR_CLIP_MLP_INTERMEDIATE + in_channel;
+}
+
 static size_t sam_window_attention_index(uint32_t window, uint32_t token, uint32_t head, uint32_t dim) {
     return (((size_t)window * UOCR_SAM_WINDOW_TOKENS + token) * UOCR_SAM_ATTENTION_HEADS + head) *
                UOCR_SAM_HEAD_DIM +
@@ -2636,6 +2644,200 @@ static int test_metal_clip_quickgelu_f16(void) {
     CHECK(strstr(error, "unsupported Metal CLIP QuickGELU output type") != NULL);
 
     uocr_metal_context_destroy(ctx);
+    return 0;
+}
+
+static float clip_mlp_expected(const uint16_t *input,
+                               const uint16_t *fc1_weight,
+                               const uint16_t *fc1_bias,
+                               const uint16_t *fc2_weight,
+                               const uint16_t *fc2_bias,
+                               uint32_t token,
+                               uint32_t out_channel) {
+    float sum = f16_bits_to_f32(fc2_bias[out_channel]);
+    for (uint32_t mid = 0u; mid < UOCR_CLIP_MLP_INTERMEDIATE; ++mid) {
+        float lin1 = f16_bits_to_f32(fc1_bias[mid]);
+        for (uint32_t k = 0u; k < UOCR_CLIP_HIDDEN_SIZE; ++k) {
+            const uint16_t weight_bits = fc1_weight[clip_mlp_fc1_weight_index(mid, k)];
+            if (weight_bits != 0u) {
+                lin1 += f16_bits_to_f32(input[clip_token_index(token, k)]) * f16_bits_to_f32(weight_bits);
+            }
+        }
+        const uint16_t lin1_f16 = f32_to_f16_bits(lin1);
+        const uint16_t activated_f16 = f32_to_f16_bits(quickgelu_expected_from_f16(lin1_f16));
+        const uint16_t fc2_weight_bits = fc2_weight[clip_mlp_fc2_weight_index(out_channel, mid)];
+        if (fc2_weight_bits != 0u) {
+            sum += f16_bits_to_f32(activated_f16) * f16_bits_to_f32(fc2_weight_bits);
+        }
+    }
+    return sum;
+}
+
+static int test_metal_clip_mlp_f16(void) {
+    if (!uocr_metal_is_available()) {
+        return 0;
+    }
+
+    CHECK(UOCR_CLIP_HIDDEN_SIZE == 1024u);
+    CHECK(UOCR_CLIP_MLP_INTERMEDIATE == 4096u);
+    CHECK(UOCR_CLIP_GLOBAL_TOKENS == 257u);
+    CHECK(UOCR_CLIP_LOCAL_TOKENS == 101u);
+
+    const size_t fc1_weight_values = (size_t)UOCR_CLIP_MLP_INTERMEDIATE * UOCR_CLIP_HIDDEN_SIZE;
+    const size_t fc2_weight_values = (size_t)UOCR_CLIP_HIDDEN_SIZE * UOCR_CLIP_MLP_INTERMEDIATE;
+    uint16_t *fc1_weight = (uint16_t *)calloc(fc1_weight_values, sizeof(uint16_t));
+    uint16_t *fc1_bias = (uint16_t *)calloc(UOCR_CLIP_MLP_INTERMEDIATE, sizeof(uint16_t));
+    uint16_t *fc2_weight = (uint16_t *)calloc(fc2_weight_values, sizeof(uint16_t));
+    uint16_t *fc2_bias = (uint16_t *)calloc(UOCR_CLIP_HIDDEN_SIZE, sizeof(uint16_t));
+    CHECK(fc1_weight != NULL);
+    CHECK(fc1_bias != NULL);
+    CHECK(fc2_weight != NULL);
+    CHECK(fc2_bias != NULL);
+
+    const uint32_t active_mids[] = {0u, 7u, 1023u, 2048u, UOCR_CLIP_MLP_INTERMEDIATE - 1u};
+    const float fc1_scale[] = {0.25f, -0.5f, 0.75f, -0.125f, 0.375f};
+    for (size_t i = 0u; i < sizeof(active_mids) / sizeof(active_mids[0]); ++i) {
+        const uint32_t mid = active_mids[i];
+        fc1_bias[mid] = f32_to_f16_bits(((float)((int)i - 2)) * 0.05f);
+        fc1_weight[clip_mlp_fc1_weight_index(mid, (uint32_t)((i * 113u + 3u) % UOCR_CLIP_HIDDEN_SIZE))] =
+            f32_to_f16_bits(fc1_scale[i]);
+        fc1_weight[clip_mlp_fc1_weight_index(mid, (uint32_t)((i * 251u + 17u) % UOCR_CLIP_HIDDEN_SIZE))] =
+            f32_to_f16_bits(-0.5f * fc1_scale[i]);
+    }
+    for (uint32_t channel = 0u; channel < UOCR_CLIP_HIDDEN_SIZE; ++channel) {
+        fc2_bias[channel] = f32_to_f16_bits(((float)((int)(channel % 13u) - 6)) * 0.02f);
+    }
+    const uint32_t active_outputs[] = {0u, 3u, 17u, 511u, UOCR_CLIP_HIDDEN_SIZE - 1u};
+    for (size_t out_i = 0u; out_i < sizeof(active_outputs) / sizeof(active_outputs[0]); ++out_i) {
+        const uint32_t out_channel = active_outputs[out_i];
+        for (size_t mid_i = 0u; mid_i < sizeof(active_mids) / sizeof(active_mids[0]); ++mid_i) {
+            const int mod = (int)((out_i + 1u) * 7u + (mid_i + 3u) * 5u) % 11 - 5;
+            fc2_weight[clip_mlp_fc2_weight_index(out_channel, active_mids[mid_i])] =
+                f32_to_f16_bits((float)mod * 0.125f);
+        }
+    }
+
+    char error[1024];
+    memset(error, 0, sizeof(error));
+    uocr_metal_context *ctx = uocr_metal_context_create(UOCR_TEST_METAL_RESOURCE_PATH, error, sizeof(error));
+    CHECK(ctx != NULL);
+
+    struct clip_mlp_case {
+        uint32_t tokens;
+        uocr_metal_dense_output_type output_type;
+    } cases[] = {
+        {UOCR_CLIP_GLOBAL_TOKENS, UOCR_METAL_DENSE_OUTPUT_F32},
+        {UOCR_CLIP_LOCAL_TOKENS, UOCR_METAL_DENSE_OUTPUT_F16},
+    };
+    for (size_t case_index = 0u; case_index < sizeof(cases) / sizeof(cases[0]); ++case_index) {
+        const uint32_t tokens = cases[case_index].tokens;
+        const size_t input_values = (size_t)tokens * UOCR_CLIP_HIDDEN_SIZE;
+        uint16_t *input = (uint16_t *)calloc(input_values, sizeof(uint16_t));
+        float *out_f32 = (float *)calloc(input_values, sizeof(float));
+        uint16_t *out_f16 = (uint16_t *)calloc(input_values, sizeof(uint16_t));
+        CHECK(input != NULL);
+        CHECK(out_f32 != NULL);
+        CHECK(out_f16 != NULL);
+
+        for (uint32_t token = 0u; token < tokens; ++token) {
+            for (uint32_t channel = 0u; channel < UOCR_CLIP_HIDDEN_SIZE; ++channel) {
+                const int mod = (int)((token * 11u + channel * 19u + tokens) % 73u) - 36;
+                input[clip_token_index(token, channel)] = f32_to_f16_bits((float)mod * 0.01f);
+            }
+        }
+
+        CHECK(uocr_metal_context_clip_mlp_f16(ctx,
+                                              input,
+                                              fc1_weight,
+                                              fc1_bias,
+                                              fc2_weight,
+                                              fc2_bias,
+                                              tokens,
+                                              cases[case_index].output_type,
+                                              cases[case_index].output_type == UOCR_METAL_DENSE_OUTPUT_F32 ?
+                                                  (void *)out_f32 :
+                                                  (void *)out_f16,
+                                              error,
+                                              sizeof(error)) == 1);
+        CHECK(error[0] == '\0');
+
+        struct clip_mlp_sample {
+            uint32_t token;
+            uint32_t channel;
+        } samples[] = {
+            {0u, 0u},
+            {tokens / 3u, 3u},
+            {tokens / 2u, 17u},
+            {tokens - 1u, 511u},
+            {tokens - 1u, UOCR_CLIP_HIDDEN_SIZE - 1u},
+        };
+        for (size_t i = 0u; i < sizeof(samples) / sizeof(samples[0]); ++i) {
+            const size_t idx = clip_token_index(samples[i].token, samples[i].channel);
+            const float expected = clip_mlp_expected(input,
+                                                     fc1_weight,
+                                                     fc1_bias,
+                                                     fc2_weight,
+                                                     fc2_bias,
+                                                     samples[i].token,
+                                                     samples[i].channel);
+            if (cases[case_index].output_type == UOCR_METAL_DENSE_OUTPUT_F32) {
+                CHECK(fabsf(out_f32[idx] - expected) <= 2.5e-4f);
+            } else {
+                CHECK(fabsf(f16_bits_to_f32(out_f16[idx]) - expected) <= 2.0e-3f);
+            }
+        }
+
+        free(out_f16);
+        free(out_f32);
+        free(input);
+    }
+
+    uint16_t one_value = f32_to_f16_bits(0.0f);
+    float one_out = 0.0f;
+    CHECK(uocr_metal_context_clip_mlp_f16(ctx,
+                                          NULL,
+                                          fc1_weight,
+                                          fc1_bias,
+                                          fc2_weight,
+                                          fc2_bias,
+                                          UOCR_CLIP_LOCAL_TOKENS,
+                                          UOCR_METAL_DENSE_OUTPUT_F32,
+                                          &one_out,
+                                          error,
+                                          sizeof(error)) == 0);
+    CHECK(strstr(error, "invalid Metal CLIP MLP") != NULL);
+
+    CHECK(uocr_metal_context_clip_mlp_f16(ctx,
+                                          &one_value,
+                                          fc1_weight,
+                                          fc1_bias,
+                                          fc2_weight,
+                                          fc2_bias,
+                                          UOCR_CLIP_LOCAL_TOKENS - 1u,
+                                          UOCR_METAL_DENSE_OUTPUT_F32,
+                                          &one_out,
+                                          error,
+                                          sizeof(error)) == 0);
+    CHECK(strstr(error, "invalid Metal CLIP MLP token count") != NULL);
+
+    CHECK(uocr_metal_context_clip_mlp_f16(ctx,
+                                          &one_value,
+                                          fc1_weight,
+                                          fc1_bias,
+                                          fc2_weight,
+                                          fc2_bias,
+                                          UOCR_CLIP_LOCAL_TOKENS,
+                                          (uocr_metal_dense_output_type)99,
+                                          &one_out,
+                                          error,
+                                          sizeof(error)) == 0);
+    CHECK(strstr(error, "unsupported Metal CLIP MLP output type") != NULL);
+
+    uocr_metal_context_destroy(ctx);
+    free(fc2_bias);
+    free(fc2_weight);
+    free(fc1_bias);
+    free(fc1_weight);
     return 0;
 }
 
@@ -12723,6 +12925,7 @@ int main(void) {
     if (test_metal_clip_attention_f16() != 0) return 1;
     if (test_metal_clip_output_projection_f16() != 0) return 1;
     if (test_metal_clip_quickgelu_f16() != 0) return 1;
+    if (test_metal_clip_mlp_f16() != 0) return 1;
     if (test_metal_sam_window_partition_f16() != 0) return 1;
     if (test_metal_sam_window_attention_f16() != 0) return 1;
     if (test_metal_sam_global_attention_f16() != 0) return 1;

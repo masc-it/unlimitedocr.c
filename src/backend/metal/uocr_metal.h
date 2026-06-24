@@ -549,6 +549,23 @@ int uocr_metal_context_clip_quickgelu_f16(uocr_metal_context *ctx,
                                           char *error,
                                           size_t error_size);
 
+/* Diagnostic CLIP MLP helper. Computes fc1 [4096,1024] + bias, QuickGELU,
+ * then fc2 [1024,4096] + bias for 257-token global or 101-token local CLIP
+ * sequences. Intermediate activations are kept in fp16 to match the current
+ * Metal fp16 vision bring-up path.
+ */
+int uocr_metal_context_clip_mlp_f16(uocr_metal_context *ctx,
+                                    const uint16_t *input_f16,
+                                    const uint16_t *fc1_weight_f16,
+                                    const uint16_t *fc1_bias_f16,
+                                    const uint16_t *fc2_weight_f16,
+                                    const uint16_t *fc2_bias_f16,
+                                    uint32_t token_count,
+                                    uocr_metal_dense_output_type output_type,
+                                    void *out,
+                                    char *error,
+                                    size_t error_size);
+
 /* Diagnostic SAM window-attention helper for non-global transformer blocks.
  * Q/K/V are fp16 tensors laid out as [n_windows,14*14,12,64] (equivalent to
  * window-major rows with flattened [head,dim] channels). The helper computes

@@ -7913,6 +7913,149 @@ int uocr_metal_context_clip_quickgelu_f16(uocr_metal_context *ctx,
     return result;
 }
 
+int uocr_metal_context_clip_mlp_f16(uocr_metal_context *ctx,
+                                    const uint16_t *input_f16,
+                                    const uint16_t *fc1_weight_f16,
+                                    const uint16_t *fc1_bias_f16,
+                                    const uint16_t *fc2_weight_f16,
+                                    const uint16_t *fc2_bias_f16,
+                                    uint32_t token_count,
+                                    uocr_metal_dense_output_type output_type,
+                                    void *out,
+                                    char *error,
+                                    size_t error_size) {
+    metal_clear_error(error, error_size);
+    if (ctx == NULL || input_f16 == NULL || fc1_weight_f16 == NULL || fc1_bias_f16 == NULL ||
+        fc2_weight_f16 == NULL || fc2_bias_f16 == NULL || out == NULL) {
+        return metal_fail(error, error_size, "invalid Metal CLIP MLP request");
+    }
+    if (token_count != UOCR_CLIP_GLOBAL_TOKENS && token_count != UOCR_CLIP_LOCAL_TOKENS) {
+        return metal_fail(error, error_size, "invalid Metal CLIP MLP token count %u", token_count);
+    }
+    if (output_type != UOCR_METAL_DENSE_OUTPUT_F16 && output_type != UOCR_METAL_DENSE_OUTPUT_F32) {
+        return metal_fail(error, error_size, "unsupported Metal CLIP MLP output type %d", (int)output_type);
+    }
+    if (UOCR_CLIP_HIDDEN_SIZE != 1024u || UOCR_CLIP_MLP_INTERMEDIATE != 4096u ||
+        UOCR_CLIP_GLOBAL_TOKENS != 257u || UOCR_CLIP_LOCAL_TOKENS != 101u) {
+        return metal_fail(error, error_size, "Metal CLIP MLP constants are inconsistent");
+    }
+
+    uint64_t input_values = 0u;
+    uint64_t mid_values = 0u;
+    uint64_t output_values = 0u;
+    uint64_t fc1_weight_values = 0u;
+    uint64_t fc2_weight_values = 0u;
+    uint64_t input_bytes = 0u;
+    uint64_t mid_bytes = 0u;
+    uint64_t output_bytes = 0u;
+    uint64_t fc1_weight_bytes = 0u;
+    uint64_t fc2_weight_bytes = 0u;
+    uint64_t fc1_bias_bytes = 0u;
+    uint64_t fc2_bias_bytes = 0u;
+    const uint64_t output_element_bytes = output_type == UOCR_METAL_DENSE_OUTPUT_F16 ? 2u : (uint64_t)sizeof(float);
+    if (!checked_mul_u64((uint64_t)token_count, (uint64_t)UOCR_CLIP_HIDDEN_SIZE, &input_values) ||
+        !checked_mul_u64((uint64_t)token_count, (uint64_t)UOCR_CLIP_MLP_INTERMEDIATE, &mid_values) ||
+        !checked_mul_u64((uint64_t)token_count, (uint64_t)UOCR_CLIP_HIDDEN_SIZE, &output_values) ||
+        !checked_mul_u64((uint64_t)UOCR_CLIP_MLP_INTERMEDIATE, (uint64_t)UOCR_CLIP_HIDDEN_SIZE, &fc1_weight_values) ||
+        !checked_mul_u64((uint64_t)UOCR_CLIP_HIDDEN_SIZE, (uint64_t)UOCR_CLIP_MLP_INTERMEDIATE, &fc2_weight_values) ||
+        !checked_mul_u64(input_values, 2u, &input_bytes) ||
+        !checked_mul_u64(mid_values, 2u, &mid_bytes) ||
+        !checked_mul_u64(output_values, output_element_bytes, &output_bytes) ||
+        !checked_mul_u64(fc1_weight_values, 2u, &fc1_weight_bytes) ||
+        !checked_mul_u64(fc2_weight_values, 2u, &fc2_weight_bytes) ||
+        !checked_mul_u64((uint64_t)UOCR_CLIP_MLP_INTERMEDIATE, 2u, &fc1_bias_bytes) ||
+        !checked_mul_u64((uint64_t)UOCR_CLIP_HIDDEN_SIZE, 2u, &fc2_bias_bytes) ||
+        input_bytes > (uint64_t)SIZE_MAX || mid_bytes > (uint64_t)SIZE_MAX || output_bytes > (uint64_t)SIZE_MAX ||
+        fc1_weight_bytes > (uint64_t)SIZE_MAX || fc2_weight_bytes > (uint64_t)SIZE_MAX ||
+        fc1_bias_bytes > (uint64_t)SIZE_MAX || fc2_bias_bytes > (uint64_t)SIZE_MAX) {
+        return metal_fail(error, error_size, "Metal CLIP MLP byte-size overflow");
+    }
+
+    const uint64_t max_buffer_length = metal_device_max_buffer_length(ctx->device);
+    if (input_bytes > max_buffer_length || mid_bytes > max_buffer_length || output_bytes > max_buffer_length ||
+        fc1_weight_bytes > max_buffer_length || fc2_weight_bytes > max_buffer_length ||
+        fc1_bias_bytes > max_buffer_length || fc2_bias_bytes > max_buffer_length) {
+        return metal_fail(error,
+                          error_size,
+                          "Metal CLIP MLP buffers exceed maxBufferLength %llu",
+                          (unsigned long long)max_buffer_length);
+    }
+
+    int result = 0;
+    uint16_t *fc1_out_f16 = (uint16_t *)malloc((size_t)mid_bytes);
+    uint16_t *activated_f16 = (uint16_t *)malloc((size_t)mid_bytes);
+    if (fc1_out_f16 == NULL || activated_f16 == NULL) {
+        result = metal_fail(error, error_size, "failed to allocate Metal CLIP MLP intermediate buffers");
+        goto cleanup_clip_mlp;
+    }
+
+    if (!uocr_metal_context_dense_f16(ctx,
+                                      input_f16,
+                                      fc1_weight_f16,
+                                      fc1_bias_f16,
+                                      token_count,
+                                      UOCR_CLIP_HIDDEN_SIZE,
+                                      UOCR_CLIP_MLP_INTERMEDIATE,
+                                      UOCR_METAL_DENSE_OUTPUT_F16,
+                                      fc1_out_f16,
+                                      error,
+                                      error_size)) {
+        char detail[512];
+        (void)snprintf(detail,
+                       sizeof(detail),
+                       "%s",
+                       (error != NULL && error[0] != '\0') ? error : "unknown error");
+        result = metal_fail(error, error_size, "failed to compute Metal CLIP MLP fc1: %s", detail);
+        goto cleanup_clip_mlp;
+    }
+
+    if (!uocr_metal_context_clip_quickgelu_f16(ctx,
+                                               fc1_out_f16,
+                                               token_count,
+                                               UOCR_METAL_DENSE_OUTPUT_F16,
+                                               activated_f16,
+                                               error,
+                                               error_size)) {
+        char detail[512];
+        (void)snprintf(detail,
+                       sizeof(detail),
+                       "%s",
+                       (error != NULL && error[0] != '\0') ? error : "unknown error");
+        result = metal_fail(error, error_size, "failed to compute Metal CLIP MLP QuickGELU: %s", detail);
+        goto cleanup_clip_mlp;
+    }
+
+    if (!uocr_metal_context_dense_f16(ctx,
+                                      activated_f16,
+                                      fc2_weight_f16,
+                                      fc2_bias_f16,
+                                      token_count,
+                                      UOCR_CLIP_MLP_INTERMEDIATE,
+                                      UOCR_CLIP_HIDDEN_SIZE,
+                                      output_type,
+                                      out,
+                                      error,
+                                      error_size)) {
+        char detail[512];
+        (void)snprintf(detail,
+                       sizeof(detail),
+                       "%s",
+                       (error != NULL && error[0] != '\0') ? error : "unknown error");
+        result = metal_fail(error, error_size, "failed to compute Metal CLIP MLP fc2: %s", detail);
+        goto cleanup_clip_mlp;
+    }
+
+    result = 1;
+
+cleanup_clip_mlp:
+    free(activated_f16);
+    free(fc1_out_f16);
+    if (result) {
+        metal_clear_error(error, error_size);
+    }
+    return result;
+}
+
 static int metal_context_sam_attention_f16(uocr_metal_context *ctx,
                                            const uint16_t *q_f16,
                                            const uint16_t *k_f16,
