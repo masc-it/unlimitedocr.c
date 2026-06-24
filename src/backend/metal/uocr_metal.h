@@ -345,6 +345,23 @@ int uocr_metal_context_sam_window_attention_f16(uocr_metal_context *ctx,
                                                 char *error,
                                                 size_t error_size);
 
+/* Diagnostic SAM global-attention helper for transformer blocks 2, 5, 8, and
+ * 11. Q/K/V are fp16 tensors laid out as [grid_h*grid_w,12,64], and every
+ * spatial token attends to every other token. The helper supports any positive
+ * grid up to the SAM 64x64 patch grid; production views use 64x64 global and
+ * 40x40 local grids. Relative-position bias is a separate follow-up stage.
+ */
+int uocr_metal_context_sam_global_attention_f16(uocr_metal_context *ctx,
+                                                const uint16_t *q_f16,
+                                                const uint16_t *k_f16,
+                                                const uint16_t *v_f16,
+                                                uint32_t grid_w,
+                                                uint32_t grid_h,
+                                                uocr_metal_dense_output_type output_type,
+                                                void *out,
+                                                char *error,
+                                                size_t error_size);
+
 /* Runtime prompt assembly into the persistent Metal prompt-embedding arena.
  * The arena must have been allocated with uocr_metal_context_allocate_runtime_arenas().
  * slot selects the batch slot. Tests can inspect the private arena with the

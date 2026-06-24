@@ -41,8 +41,11 @@
 #define UOCR_SAM_ATTENTION_HEADS 12u
 #define UOCR_SAM_HEAD_DIM 64u
 #define UOCR_SAM_QKV_SIZE (3u * UOCR_SAM_HIDDEN_SIZE)
+#define UOCR_SAM_BLOCKS 12u
 #define UOCR_SAM_WINDOW_SIZE 14u
 #define UOCR_SAM_WINDOW_TOKENS (UOCR_SAM_WINDOW_SIZE * UOCR_SAM_WINDOW_SIZE)
+#define UOCR_SAM_MAX_GRID_SIZE (UOCR_GLOBAL_VIEW_SIZE / UOCR_VISION_PATCH_SIZE)
+#define UOCR_SAM_MAX_GRID_TOKENS (UOCR_SAM_MAX_GRID_SIZE * UOCR_SAM_MAX_GRID_SIZE)
 #define UOCR_SAM_FEATURE_CHANNELS 1024u
 #define UOCR_CLIP_HIDDEN_SIZE 1024u
 #define UOCR_PROJECTOR_IN_SIZE 2048u
@@ -57,6 +60,10 @@ static inline uint32_t uocr_global_visual_token_count(void) {
 
 static inline uint32_t uocr_local_visual_token_count(uint32_t grid_w, uint32_t grid_h) {
     return (UOCR_LOCAL_GRID_QUERIES * grid_w + 1u) * (UOCR_LOCAL_GRID_QUERIES * grid_h);
+}
+
+static inline int uocr_sam_block_uses_global_attention(uint32_t block_index) {
+    return block_index == 2u || block_index == 5u || block_index == 8u || block_index == 11u;
 }
 
 #endif /* UOCR_MODEL_CONSTANTS_H */

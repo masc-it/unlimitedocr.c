@@ -5841,52 +5841,47 @@ int uocr_metal_context_sam_qkv_f16(uocr_metal_context *ctx,
     return 1;
 }
 
-int uocr_metal_context_sam_window_attention_f16(uocr_metal_context *ctx,
-                                                const uint16_t *q_f16,
-                                                const uint16_t *k_f16,
-                                                const uint16_t *v_f16,
-                                                uint32_t n_windows,
-                                                uocr_metal_dense_output_type output_type,
-                                                void *out,
-                                                char *error,
-                                                size_t error_size) {
-    metal_clear_error(error, error_size);
-    if (ctx == NULL || q_f16 == NULL || k_f16 == NULL || v_f16 == NULL || out == NULL || n_windows == 0u) {
-        return metal_fail(error, error_size, "invalid Metal SAM window attention request");
-    }
-    if (output_type != UOCR_METAL_DENSE_OUTPUT_F16 && output_type != UOCR_METAL_DENSE_OUTPUT_F32) {
-        return metal_fail(error, error_size, "unsupported Metal SAM window attention output type %d", (int)output_type);
-    }
-    if (UOCR_SAM_ATTENTION_HEADS * UOCR_SAM_HEAD_DIM != UOCR_SAM_HIDDEN_SIZE ||
-        UOCR_SAM_WINDOW_TOKENS != UOCR_SAM_WINDOW_SIZE * UOCR_SAM_WINDOW_SIZE) {
-        return metal_fail(error, error_size, "Metal SAM window attention constants are inconsistent");
-    }
-
-    uint64_t window_values = 0u;
+static int metal_context_sam_attention_f16(uocr_metal_context *ctx,
+                                           const uint16_t *q_f16,
+                                           const uint16_t *k_f16,
+                                           const uint16_t *v_f16,
+                                           uint32_t windows,
+                                           uint32_t tokens_per_window,
+                                           uocr_metal_dense_output_type output_type,
+                                           void *out,
+                                           const char *diagnostic_name,
+                                           char *error,
+                                           size_t error_size) {
+    uint64_t attention_values = 0u;
     uint64_t input_bytes = 0u;
     uint64_t output_bytes = 0u;
     uint64_t group_count = 0u;
     const uint64_t output_element_bytes = output_type == UOCR_METAL_DENSE_OUTPUT_F16 ? 2u : (uint64_t)sizeof(float);
-    if (!checked_mul_u64((uint64_t)n_windows, (uint64_t)UOCR_SAM_WINDOW_TOKENS, &window_values) ||
-        !checked_mul_u64(window_values, (uint64_t)UOCR_SAM_HIDDEN_SIZE, &window_values) ||
-        !checked_mul_u64(window_values, 2u, &input_bytes) ||
-        !checked_mul_u64(window_values, output_element_bytes, &output_bytes) ||
-        !checked_mul_u64((uint64_t)n_windows, (uint64_t)UOCR_SAM_WINDOW_TOKENS, &group_count) ||
+    if (!checked_mul_u64((uint64_t)windows, (uint64_t)tokens_per_window, &attention_values) ||
+        !checked_mul_u64(attention_values, (uint64_t)UOCR_SAM_HIDDEN_SIZE, &attention_values) ||
+        !checked_mul_u64(attention_values, 2u, &input_bytes) ||
+        !checked_mul_u64(attention_values, output_element_bytes, &output_bytes) ||
+        !checked_mul_u64((uint64_t)windows, (uint64_t)tokens_per_window, &group_count) ||
         !checked_mul_u64(group_count, (uint64_t)UOCR_SAM_ATTENTION_HEADS, &group_count) ||
         input_bytes > (uint64_t)SIZE_MAX || output_bytes > (uint64_t)SIZE_MAX ||
         group_count > (uint64_t)UINT32_MAX) {
-        return metal_fail(error, error_size, "Metal SAM window attention byte-size overflow");
+        return metal_fail(error, error_size, "%s byte-size overflow", diagnostic_name);
     }
 
     const uint64_t max_buffer_length = metal_device_max_buffer_length(ctx->device);
     if (input_bytes > max_buffer_length || output_bytes > max_buffer_length) {
         return metal_fail(error,
                           error_size,
-                          "Metal SAM window attention buffers exceed maxBufferLength %llu",
+                          "%s buffers exceed maxBufferLength %llu",
+                          diagnostic_name,
                           (unsigned long long)max_buffer_length);
     }
 
     @autoreleasepool {
+        /* The Metal kernel is an all-to-all attention primitive parameterized
+         * by tokens_per_window. Global attention is represented as one window
+         * spanning the whole SAM patch grid.
+         */
         const char *function_name = output_type == UOCR_METAL_DENSE_OUTPUT_F16 ?
                                         "uocr_sam_window_attention_f16_to_f16" :
                                         "uocr_sam_window_attention_f16_to_f32";
@@ -5899,18 +5894,18 @@ int uocr_metal_context_sam_window_attention_f16(uocr_metal_context *ctx,
                                                        length:(NSUInteger)input_bytes
                                                       options:MTLResourceStorageModeShared];
         if (q_src == nil) {
-            return metal_fail(error, error_size, "failed to allocate Metal SAM window attention Q buffer");
+            return metal_fail(error, error_size, "failed to allocate %s Q buffer", diagnostic_name);
         }
-        q_src.label = @"uocr_sam_window_attention_q_f16";
+        q_src.label = @"uocr_sam_attention_q_f16";
 
         id<MTLBuffer> k_src = [ctx->device newBufferWithBytes:k_f16
                                                        length:(NSUInteger)input_bytes
                                                       options:MTLResourceStorageModeShared];
         if (k_src == nil) {
             [q_src release];
-            return metal_fail(error, error_size, "failed to allocate Metal SAM window attention K buffer");
+            return metal_fail(error, error_size, "failed to allocate %s K buffer", diagnostic_name);
         }
-        k_src.label = @"uocr_sam_window_attention_k_f16";
+        k_src.label = @"uocr_sam_attention_k_f16";
 
         id<MTLBuffer> v_src = [ctx->device newBufferWithBytes:v_f16
                                                        length:(NSUInteger)input_bytes
@@ -5918,18 +5913,18 @@ int uocr_metal_context_sam_window_attention_f16(uocr_metal_context *ctx,
         if (v_src == nil) {
             [k_src release];
             [q_src release];
-            return metal_fail(error, error_size, "failed to allocate Metal SAM window attention V buffer");
+            return metal_fail(error, error_size, "failed to allocate %s V buffer", diagnostic_name);
         }
-        v_src.label = @"uocr_sam_window_attention_v_f16";
+        v_src.label = @"uocr_sam_attention_v_f16";
 
         id<MTLBuffer> dst = [ctx->device newBufferWithLength:(NSUInteger)output_bytes options:MTLResourceStorageModeShared];
         if (dst == nil) {
             [v_src release];
             [k_src release];
             [q_src release];
-            return metal_fail(error, error_size, "failed to allocate Metal SAM window attention output buffer");
+            return metal_fail(error, error_size, "failed to allocate %s output buffer", diagnostic_name);
         }
-        dst.label = @"uocr_sam_window_attention_output";
+        dst.label = @"uocr_sam_attention_output";
         memset([dst contents], 0, (size_t)output_bytes);
 
         id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
@@ -5938,9 +5933,9 @@ int uocr_metal_context_sam_window_attention_f16(uocr_metal_context *ctx,
             [v_src release];
             [k_src release];
             [q_src release];
-            return metal_fail(error, error_size, "failed to create Metal SAM window attention command buffer");
+            return metal_fail(error, error_size, "failed to create %s command buffer", diagnostic_name);
         }
-        cb.label = @"uocr_sam_window_attention_command_buffer";
+        cb.label = @"uocr_sam_attention_command_buffer";
 
         id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
         if (enc == nil) {
@@ -5948,12 +5943,12 @@ int uocr_metal_context_sam_window_attention_f16(uocr_metal_context *ctx,
             [v_src release];
             [k_src release];
             [q_src release];
-            return metal_fail(error, error_size, "failed to create Metal SAM window attention command encoder");
+            return metal_fail(error, error_size, "failed to create %s command encoder", diagnostic_name);
         }
 
         uocr_metal_sam_window_attention_params params;
-        params.windows = n_windows;
-        params.tokens_per_window = UOCR_SAM_WINDOW_TOKENS;
+        params.windows = windows;
+        params.tokens_per_window = tokens_per_window;
         params.heads = UOCR_SAM_ATTENTION_HEADS;
         params.head_dim = UOCR_SAM_HEAD_DIM;
         params.scale = 1.0f / sqrtf((float)UOCR_SAM_HEAD_DIM);
@@ -5968,7 +5963,7 @@ int uocr_metal_context_sam_window_attention_f16(uocr_metal_context *ctx,
             [v_src release];
             [k_src release];
             [q_src release];
-            return metal_fail(error, error_size, "Metal SAM window attention needs at least %u threads", UOCR_SAM_HEAD_DIM);
+            return metal_fail(error, error_size, "%s needs at least %u threads", diagnostic_name, UOCR_SAM_HEAD_DIM);
         }
         const uint64_t threadgroup_bytes = (uint64_t)threads_per_group * (uint64_t)sizeof(float);
         if (threadgroup_bytes > (uint64_t)ctx->device.maxThreadgroupMemoryLength) {
@@ -5976,7 +5971,7 @@ int uocr_metal_context_sam_window_attention_f16(uocr_metal_context *ctx,
             [v_src release];
             [k_src release];
             [q_src release];
-            return metal_fail(error, error_size, "Metal SAM window attention threadgroup memory exceeds device limit");
+            return metal_fail(error, error_size, "%s threadgroup memory exceeds device limit", diagnostic_name);
         }
 
         [enc setComputePipelineState:pipeline];
@@ -5998,7 +5993,7 @@ int uocr_metal_context_sam_window_attention_f16(uocr_metal_context *ctx,
             [v_src release];
             [k_src release];
             [q_src release];
-            return metal_fail(error, error_size, "Metal SAM window attention command failed: %s", [description UTF8String]);
+            return metal_fail(error, error_size, "%s command failed: %s", diagnostic_name, [description UTF8String]);
         }
 
         memcpy(out, [dst contents], (size_t)output_bytes);
@@ -6010,6 +6005,90 @@ int uocr_metal_context_sam_window_attention_f16(uocr_metal_context *ctx,
 
     metal_clear_error(error, error_size);
     return 1;
+}
+
+int uocr_metal_context_sam_window_attention_f16(uocr_metal_context *ctx,
+                                                const uint16_t *q_f16,
+                                                const uint16_t *k_f16,
+                                                const uint16_t *v_f16,
+                                                uint32_t n_windows,
+                                                uocr_metal_dense_output_type output_type,
+                                                void *out,
+                                                char *error,
+                                                size_t error_size) {
+    metal_clear_error(error, error_size);
+    if (ctx == NULL || q_f16 == NULL || k_f16 == NULL || v_f16 == NULL || out == NULL || n_windows == 0u) {
+        return metal_fail(error, error_size, "invalid Metal SAM window attention request");
+    }
+    if (output_type != UOCR_METAL_DENSE_OUTPUT_F16 && output_type != UOCR_METAL_DENSE_OUTPUT_F32) {
+        return metal_fail(error, error_size, "unsupported Metal SAM window attention output type %d", (int)output_type);
+    }
+    if (UOCR_SAM_ATTENTION_HEADS * UOCR_SAM_HEAD_DIM != UOCR_SAM_HIDDEN_SIZE ||
+        UOCR_SAM_WINDOW_TOKENS != UOCR_SAM_WINDOW_SIZE * UOCR_SAM_WINDOW_SIZE) {
+        return metal_fail(error, error_size, "Metal SAM window attention constants are inconsistent");
+    }
+
+    return metal_context_sam_attention_f16(ctx,
+                                           q_f16,
+                                           k_f16,
+                                           v_f16,
+                                           n_windows,
+                                           UOCR_SAM_WINDOW_TOKENS,
+                                           output_type,
+                                           out,
+                                           "Metal SAM window attention",
+                                           error,
+                                           error_size);
+}
+
+int uocr_metal_context_sam_global_attention_f16(uocr_metal_context *ctx,
+                                                const uint16_t *q_f16,
+                                                const uint16_t *k_f16,
+                                                const uint16_t *v_f16,
+                                                uint32_t grid_w,
+                                                uint32_t grid_h,
+                                                uocr_metal_dense_output_type output_type,
+                                                void *out,
+                                                char *error,
+                                                size_t error_size) {
+    metal_clear_error(error, error_size);
+    if (ctx == NULL || q_f16 == NULL || k_f16 == NULL || v_f16 == NULL || out == NULL ||
+        grid_w == 0u || grid_h == 0u) {
+        return metal_fail(error, error_size, "invalid Metal SAM global attention request");
+    }
+    if (output_type != UOCR_METAL_DENSE_OUTPUT_F16 && output_type != UOCR_METAL_DENSE_OUTPUT_F32) {
+        return metal_fail(error, error_size, "unsupported Metal SAM global attention output type %d", (int)output_type);
+    }
+    if (UOCR_SAM_ATTENTION_HEADS * UOCR_SAM_HEAD_DIM != UOCR_SAM_HIDDEN_SIZE ||
+        UOCR_SAM_MAX_GRID_TOKENS != UOCR_SAM_MAX_GRID_SIZE * UOCR_SAM_MAX_GRID_SIZE) {
+        return metal_fail(error, error_size, "Metal SAM global attention constants are inconsistent");
+    }
+    if (grid_w > UOCR_SAM_MAX_GRID_SIZE || grid_h > UOCR_SAM_MAX_GRID_SIZE) {
+        return metal_fail(error,
+                          error_size,
+                          "Metal SAM global attention grid %ux%u exceeds max %ux%u",
+                          grid_w,
+                          grid_h,
+                          UOCR_SAM_MAX_GRID_SIZE,
+                          UOCR_SAM_MAX_GRID_SIZE);
+    }
+    uint64_t tokens = 0u;
+    if (!checked_mul_u64((uint64_t)grid_w, (uint64_t)grid_h, &tokens) || tokens == 0u ||
+        tokens > (uint64_t)UOCR_SAM_MAX_GRID_TOKENS || tokens > (uint64_t)UINT32_MAX) {
+        return metal_fail(error, error_size, "Metal SAM global attention token-count overflow");
+    }
+
+    return metal_context_sam_attention_f16(ctx,
+                                           q_f16,
+                                           k_f16,
+                                           v_f16,
+                                           1u,
+                                           (uint32_t)tokens,
+                                           output_type,
+                                           out,
+                                           "Metal SAM global attention",
+                                           error,
+                                           error_size);
 }
 
 int uocr_metal_context_final_rmsnorm_f16(uocr_metal_context *ctx,
