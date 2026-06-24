@@ -60,7 +60,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--dump-image-decoder-layers",
         action="store_true",
-        help="also dump image prompt embeddings plus all decoder layer fp16 outputs for Metal parity",
+        help="also dump image prompt embeddings, all decoder layer fp16 outputs, and MoE router top-k files for Metal parity",
     )
     parser.add_argument(
         "--visual-features-f16",

@@ -38,6 +38,8 @@ TEXT_DECODER_LAYER_COUNT = 12
 DEFAULT_LOGITS_TOP_K = 16
 INPUT_IDS_BIN = "input_ids_i32.bin"
 IMAGE_MASK_BIN = "image_mask_u8.bin"
+ROUTER_TOP_IDS_DTYPE = np.dtype("<u4")
+ROUTER_TOP_WEIGHTS_DTYPE = np.dtype("<f4")
 
 ATTENTION_HEADS = 10
 HEAD_DIM = 128
@@ -128,12 +130,26 @@ class ImagePromptEmbeddingDump(PromptEmbeddingDump):
 @dataclass(frozen=True)
 class ImageDecoderLayersDump(ImagePromptEmbeddingDump):
     layer_hidden_f16_bits: tuple[NDArray[np.uint16], ...]
+    router_top_ids: dict[int, NDArray[np.uint32]]
+    router_top_weights_f32: dict[int, NDArray[np.float32]]
 
 
 def text_layer_hidden_filename(layer: int) -> str:
     if layer < 0 or layer >= TEXT_DECODER_LAYER_COUNT:
         raise ValueError(f"decoder layer out of range: {layer}")
     return f"layer_{layer}_hidden_f16.bin"
+
+
+def router_top_ids_filename(layer: int) -> str:
+    if layer <= 0 or layer >= TEXT_DECODER_LAYER_COUNT:
+        raise ValueError(f"MoE router layer out of range: {layer}")
+    return f"layer_{layer}_router_top_ids_u32.bin"
+
+
+def router_top_weights_filename(layer: int) -> str:
+    if layer <= 0 or layer >= TEXT_DECODER_LAYER_COUNT:
+        raise ValueError(f"MoE router layer out of range: {layer}")
+    return f"layer_{layer}_router_top_weights_f32.bin"
 
 
 def _read_json_if_exists(path: Path) -> dict[str, Any] | None:
@@ -588,13 +604,13 @@ def _moe_shared_f16_bits(hidden_bits: NDArray[np.uint16], hf_dir: str | Path, *,
     )
 
 
-def _moe_layer_f16_bits(
+def _moe_layer_f16_bits_with_router(
     mlp_input_bits: NDArray[np.uint16],
     residual_bits: NDArray[np.uint16],
     hf_dir: str | Path,
     *,
     layer: int,
-) -> NDArray[np.uint16]:
+) -> tuple[NDArray[np.uint16], NDArray[np.uint32], NDArray[np.float32]]:
     prefix = f"model.layers.{layer}.mlp"
     router_weight = read_bf16_tensor_as_f16_bits(
         hf_dir,
@@ -605,7 +621,18 @@ def _moe_layer_f16_bits(
     routed = _moe_selected_routed_f16_bits(mlp_input_bits, top_ids, top_weights, hf_dir, layer=layer)
     shared = _moe_shared_f16_bits(mlp_input_bits, hf_dir, layer=layer)
     combined = _f16_to_f32(routed) + _f16_to_f32(shared) + _f16_to_f32(residual_bits)
-    return _f32_to_f16_bits(combined)
+    return _f32_to_f16_bits(combined), top_ids, top_weights
+
+
+def _moe_layer_f16_bits(
+    mlp_input_bits: NDArray[np.uint16],
+    residual_bits: NDArray[np.uint16],
+    hf_dir: str | Path,
+    *,
+    layer: int,
+) -> NDArray[np.uint16]:
+    hidden, _, _ = _moe_layer_f16_bits_with_router(mlp_input_bits, residual_bits, hf_dir, layer=layer)
+    return hidden
 
 
 def compute_text_layer1_hidden_f16_bits(
@@ -961,12 +988,29 @@ def dump_image_decoder_layers_fixture(
         tensor_name=tensor_name,
         expected_shape=expected_shape,
     )
+    if layer_count < 1 or layer_count > TEXT_DECODER_LAYER_COUNT:
+        raise ValueError(f"layer_count must be in [1,{TEXT_DECODER_LAYER_COUNT}], got {layer_count}")
     prompt_dump = load_image_prompt_embedding_dump(out)
-    layer_outputs = compute_text_decoder_layer_hidden_f16_bits(
-        prompt_dump.prompt_embeddings_f16_bits,
-        hf_dir,
-        layer_count=layer_count,
-    )
+    hidden = compute_text_layer0_hidden_f16_bits(prompt_dump.prompt_embeddings_f16_bits, hf_dir)
+    layer_outputs: list[NDArray[np.uint16]] = [hidden]
+    router_topk: dict[str, Any] = {}
+    for layer in range(1, layer_count):
+        attn_hidden, mlp_input = _attention_block_f16_bits(hidden, hf_dir, layer=layer)
+        hidden, top_ids, top_weights = _moe_layer_f16_bits_with_router(mlp_input, attn_hidden, hf_dir, layer=layer)
+        ids_file = router_top_ids_filename(layer)
+        weights_file = router_top_weights_filename(layer)
+        np.asarray(top_ids, dtype=ROUTER_TOP_IDS_DTYPE).tofile(out / ids_file)
+        np.asarray(top_weights, dtype=ROUTER_TOP_WEIGHTS_DTYPE).tofile(out / weights_file)
+        router_topk[f"layer_{layer}"] = {
+            "ids_file": ids_file,
+            "weights_file": weights_file,
+            "ids_dtype": "uint32_le",
+            "weights_dtype": "float32_le",
+            "shape": [int(prompt_dump.input_ids.size), MOE_TOP_K],
+            "source": f"model.layers.{layer}.mlp.gate.weight softmax/top-{MOE_TOP_K}",
+            "reference_dtype_mode": "FP16 router inputs/weights with FP32 logits and softmax",
+        }
+        layer_outputs.append(hidden)
 
     manifest_path = out / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -982,7 +1026,9 @@ def dump_image_decoder_layers_fixture(
             f"FP16 weights/activations with FP32 reductions; layer {layer} image-embedding decoder prefill",
         )
     manifest["image_decoder_layer_count"] = int(layer_count)
+    manifest["router_topk"] = router_topk
     manifest["image_embedding_fixture"]["decoder_layers_file_pattern"] = "layer_{layer}_hidden_f16.bin"
+    manifest["image_embedding_fixture"]["router_topk_file_pattern"] = "layer_{layer}_router_top_{ids,weights}.{u32,f32}.bin"
     manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return out
 
@@ -1217,16 +1263,51 @@ def load_image_decoder_layers_dump(fixture_dir: str | Path) -> ImageDecoderLayer
     layer_count = int(prompt.manifest.get("image_decoder_layer_count", TEXT_DECODER_LAYER_COUNT))
     if layer_count < 1 or layer_count > TEXT_DECODER_LAYER_COUNT:
         raise ValueError(f"invalid image decoder layer count {layer_count} in {root}")
+    n_tokens = int(prompt.input_ids.size)
     layers = tuple(
         _load_hidden_tensor_bits(
             root,
             prompt.manifest,
             f"layer_{layer}_hidden",
             text_layer_hidden_filename(layer),
-            int(prompt.input_ids.size),
+            n_tokens,
         )
         for layer in range(layer_count)
     )
+
+    router_ids: dict[int, NDArray[np.uint32]] = {}
+    router_weights: dict[int, NDArray[np.float32]] = {}
+    router_manifest = prompt.manifest.get("router_topk", {}) if isinstance(prompt.manifest, dict) else {}
+    if isinstance(router_manifest, dict):
+        for layer in range(1, layer_count):
+            meta = router_manifest.get(f"layer_{layer}")
+            if not isinstance(meta, dict):
+                continue
+            shape = meta.get("shape", [n_tokens, MOE_TOP_K])
+            if not isinstance(shape, list) or len(shape) != 2:
+                raise ValueError(f"invalid router_topk layer {layer} shape metadata in {root}")
+            rows = int(shape[0])
+            top_k = int(shape[1])
+            if rows != n_tokens or top_k != MOE_TOP_K:
+                raise ValueError(f"router_topk layer {layer} shape {shape} does not match prompt/top-k")
+            ids_file = meta.get("ids_file", router_top_ids_filename(layer))
+            weights_file = meta.get("weights_file", router_top_weights_filename(layer))
+            if not isinstance(ids_file, str) or not isinstance(weights_file, str):
+                raise ValueError(f"invalid router_topk layer {layer} filenames in {root}")
+            ids = np.fromfile(root / ids_file, dtype=ROUTER_TOP_IDS_DTYPE)
+            weights = np.fromfile(root / weights_file, dtype=ROUTER_TOP_WEIGHTS_DTYPE)
+            expected_values = rows * top_k
+            if ids.size != expected_values or weights.size != expected_values:
+                raise ValueError(
+                    f"router_topk layer {layer} size mismatch: ids={ids.size} weights={weights.size} expected={expected_values}"
+                )
+            ids = ids.reshape((rows, top_k))
+            weights = weights.reshape((rows, top_k))
+            if np.any(ids >= MOE_EXPERTS) or not np.all(np.isfinite(weights)):
+                raise ValueError(f"invalid router_topk layer {layer} values in {root}")
+            router_ids[layer] = ids.astype(np.uint32, copy=False)
+            router_weights[layer] = weights.astype(np.float32, copy=False)
+
     return ImageDecoderLayersDump(
         manifest=prompt.manifest,
         input_ids=prompt.input_ids,
@@ -1236,6 +1317,8 @@ def load_image_decoder_layers_dump(fixture_dir: str | Path) -> ImageDecoderLayer
         image_span_start=prompt.image_span_start,
         image_span_length=prompt.image_span_length,
         layer_hidden_f16_bits=layers,
+        router_top_ids=router_ids,
+        router_top_weights_f32=router_weights,
     )
 
 

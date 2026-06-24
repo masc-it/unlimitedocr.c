@@ -1276,6 +1276,100 @@ static int read_text_generated_ids_python_dump(const char *dump_dir,
     return 1;
 }
 
+static int read_router_topk_python_dump(const char *dump_dir,
+                                         uint32_t layer,
+                                         uint32_t n_tokens,
+                                         uint32_t **ids_out,
+                                         float **weights_out,
+                                         char *error,
+                                         size_t error_size) {
+    if (ids_out == NULL || weights_out == NULL || n_tokens == 0u || layer == 0u || layer >= UOCR_DECODER_LAYERS) {
+        snprintf(error, error_size, "invalid router top-k dump request");
+        return 0;
+    }
+    *ids_out = NULL;
+    *weights_out = NULL;
+
+    char ids_name[64];
+    char weights_name[64];
+    snprintf(ids_name, sizeof(ids_name), "layer_%u_router_top_ids_u32.bin", layer);
+    snprintf(weights_name, sizeof(weights_name), "layer_%u_router_top_weights_f32.bin", layer);
+    char ids_path[4096];
+    char weights_path[4096];
+    if (!make_fixture_path(dump_dir, ids_name, ids_path, sizeof(ids_path)) ||
+        !make_fixture_path(dump_dir, weights_name, weights_path, sizeof(weights_path))) {
+        snprintf(error, error_size, "router top-k dump path is too long");
+        return 0;
+    }
+
+    unsigned char *ids_bytes = NULL;
+    unsigned char *weights_bytes = NULL;
+    size_t ids_size = 0u;
+    size_t weights_size = 0u;
+    if (!read_binary_file(ids_path, &ids_bytes, &ids_size, error, error_size) ||
+        !read_binary_file(weights_path, &weights_bytes, &weights_size, error, error_size)) {
+        free(weights_bytes);
+        free(ids_bytes);
+        return 0;
+    }
+
+    uint64_t expected_values = 0u;
+    if ((uint64_t)n_tokens > UINT64_MAX / (uint64_t)UOCR_MOE_TOP_K ||
+        (expected_values = (uint64_t)n_tokens * (uint64_t)UOCR_MOE_TOP_K) > (uint64_t)SIZE_MAX / sizeof(uint32_t)) {
+        snprintf(error, error_size, "router top-k dump size overflow");
+        free(weights_bytes);
+        free(ids_bytes);
+        return 0;
+    }
+    const uint64_t expected_bytes = expected_values * sizeof(uint32_t);
+    if ((uint64_t)ids_size != expected_bytes || (uint64_t)weights_size != expected_bytes) {
+        snprintf(error,
+                 error_size,
+                 "router top-k dump size mismatch for layer %u: ids=%zu weights=%zu expected=%llu",
+                 layer,
+                 ids_size,
+                 weights_size,
+                 (unsigned long long)expected_bytes);
+        free(weights_bytes);
+        free(ids_bytes);
+        return 0;
+    }
+
+    uint32_t *ids = (uint32_t *)malloc((size_t)expected_values * sizeof(uint32_t));
+    float *weights = (float *)malloc((size_t)expected_values * sizeof(float));
+    if (ids == NULL || weights == NULL) {
+        snprintf(error, error_size, "failed to allocate router top-k dump buffers");
+        free(weights);
+        free(ids);
+        free(weights_bytes);
+        free(ids_bytes);
+        return 0;
+    }
+    for (uint64_t i = 0u; i < expected_values; ++i) {
+        const uint32_t id_bits = (uint32_t)ids_bytes[4u * i] | ((uint32_t)ids_bytes[4u * i + 1u] << 8u) |
+                                 ((uint32_t)ids_bytes[4u * i + 2u] << 16u) |
+                                 ((uint32_t)ids_bytes[4u * i + 3u] << 24u);
+        const uint32_t weight_bits = (uint32_t)weights_bytes[4u * i] | ((uint32_t)weights_bytes[4u * i + 1u] << 8u) |
+                                     ((uint32_t)weights_bytes[4u * i + 2u] << 16u) |
+                                     ((uint32_t)weights_bytes[4u * i + 3u] << 24u);
+        ids[i] = id_bits;
+        memcpy(weights + i, &weight_bits, sizeof(float));
+        if (ids[i] >= UOCR_ROUTED_EXPERTS || !isfinite(weights[i])) {
+            snprintf(error, error_size, "invalid router top-k entry at flat index %llu", (unsigned long long)i);
+            free(weights);
+            free(ids);
+            free(weights_bytes);
+            free(ids_bytes);
+            return 0;
+        }
+    }
+    free(weights_bytes);
+    free(ids_bytes);
+    *ids_out = ids;
+    *weights_out = weights;
+    return 1;
+}
+
 static void compute_logits_topk_f32(const float *logits,
                                     uint32_t vocab_size,
                                     uint32_t top_k,
@@ -2223,6 +2317,196 @@ static int test_metal_image_decoder_layers_python_dump_parity(void) {
     uocr_metal_context_destroy(ctx);
     uocr_model_file_close(&model);
     free(expected_prompt);
+    free(visual_features);
+    free(image_mask);
+    free(input_ids);
+    return 0;
+}
+
+static int test_metal_image_router_topk_python_dump_parity(void) {
+    if (!uocr_metal_is_available()) {
+        return 0;
+    }
+    if (!env_flag_enabled("UOCR_RUN_LARGE_TESTS")) {
+        return 0;
+    }
+
+    const char *model_path = getenv("UOCR_MODEL_PATH");
+    const char *dump_dir = getenv("UOCR_IMAGE_EMBED_DUMP_DIR");
+    if (model_path == NULL || model_path[0] == '\0' || dump_dir == NULL || dump_dir[0] == '\0') {
+        printf("UOCR_RUN_LARGE_TESTS=1 but UOCR_MODEL_PATH/UOCR_IMAGE_EMBED_DUMP_DIR are not both set; skipping image router top-k parity\n");
+        return 0;
+    }
+    if (!fixture_binary_exists(dump_dir, "layer_1_router_top_ids_u32.bin") ||
+        !fixture_binary_exists(dump_dir, "layer_1_router_top_weights_f32.bin")) {
+        printf("UOCR_IMAGE_EMBED_DUMP_DIR has no router top-k files; skipping image router top-k parity\n");
+        return 0;
+    }
+
+    char error[1024];
+    memset(error, 0, sizeof(error));
+    int32_t *input_ids = NULL;
+    uint8_t *image_mask = NULL;
+    uint32_t n_tokens = 0u;
+    uint16_t *visual_features = NULL;
+    uint32_t image_span_start = UOCR_SEQUENCE_NO_IMAGE_SPAN;
+    uint32_t image_span_length = 0u;
+    uint16_t *prompt = NULL;
+    CHECK(read_image_prompt_embedding_python_dump(dump_dir,
+                                                  &input_ids,
+                                                  &image_mask,
+                                                  &n_tokens,
+                                                  &visual_features,
+                                                  &image_span_start,
+                                                  &image_span_length,
+                                                  &prompt,
+                                                  error,
+                                                  sizeof(error)) == 1);
+    CHECK(n_tokens > 0u);
+    (void)image_span_start;
+    (void)image_span_length;
+    (void)visual_features;
+    (void)image_mask;
+    (void)input_ids;
+
+    const uint32_t max_decoder_tokens = env_u32_or_default("UOCR_IMAGE_DECODER_MAX_TOKENS", 32u);
+    if (n_tokens > max_decoder_tokens) {
+        printf("UOCR_IMAGE_EMBED_DUMP_DIR has %u tokens; set UOCR_IMAGE_DECODER_MAX_TOKENS=%u or higher to run image router top-k parity\n",
+               n_tokens,
+               n_tokens);
+        free(prompt);
+        free(visual_features);
+        free(image_mask);
+        free(input_ids);
+        return 0;
+    }
+
+    const uint64_t hidden_values = (uint64_t)n_tokens * (uint64_t)UOCR_HIDDEN_SIZE;
+    CHECK(hidden_values <= (uint64_t)SIZE_MAX / sizeof(uint16_t));
+
+    uocr_model_file model;
+    CHECK(uocr_model_file_open(model_path, &model, error, sizeof(error)) == 0);
+    uocr_metal_context *ctx = uocr_metal_context_create(UOCR_TEST_METAL_RESOURCE_PATH, error, sizeof(error));
+    CHECK(ctx != NULL);
+
+    uint16_t *attn_hidden = (uint16_t *)calloc((size_t)hidden_values, sizeof(uint16_t));
+    uint16_t *mlp_input = (uint16_t *)calloc((size_t)hidden_values, sizeof(uint16_t));
+    uint32_t *actual_ids = (uint32_t *)calloc((size_t)n_tokens * UOCR_MOE_TOP_K, sizeof(uint32_t));
+    float *actual_weights = (float *)calloc((size_t)n_tokens * UOCR_MOE_TOP_K, sizeof(float));
+    CHECK(attn_hidden != NULL);
+    CHECK(mlp_input != NULL);
+    CHECK(actual_ids != NULL);
+    CHECK(actual_weights != NULL);
+
+    for (uint32_t layer = 1u; layer < UOCR_DECODER_LAYERS; ++layer) {
+        char prev_filename[64];
+        snprintf(prev_filename, sizeof(prev_filename), "layer_%u_hidden_f16.bin", layer - 1u);
+        uint16_t *prev_hidden = NULL;
+        CHECK(read_layer_hidden_python_dump(dump_dir, prev_filename, n_tokens, &prev_hidden, error, sizeof(error)) == 1);
+        uint32_t *expected_ids = NULL;
+        float *expected_weights = NULL;
+        CHECK(read_router_topk_python_dump(dump_dir,
+                                           layer,
+                                           n_tokens,
+                                           &expected_ids,
+                                           &expected_weights,
+                                           error,
+                                           sizeof(error)) == 1);
+        const uint16_t *router_weight = model_tensor_f16_payload(&model,
+                                                                 uocr_tensor_id_moe_router(layer),
+                                                                 (uint64_t)UOCR_ROUTED_EXPERTS *
+                                                                     (uint64_t)UOCR_HIDDEN_SIZE,
+                                                                 error,
+                                                                 sizeof(error));
+        CHECK(router_weight != NULL);
+        memset(attn_hidden, 0, (size_t)hidden_values * sizeof(uint16_t));
+        memset(mlp_input, 0, (size_t)hidden_values * sizeof(uint16_t));
+        memset(actual_ids, 0, (size_t)n_tokens * UOCR_MOE_TOP_K * sizeof(uint32_t));
+        memset(actual_weights, 0, (size_t)n_tokens * UOCR_MOE_TOP_K * sizeof(float));
+        CHECK(run_metal_attention_block_from_model_f16(ctx,
+                                                       &model,
+                                                       layer,
+                                                       prev_hidden,
+                                                       n_tokens,
+                                                       attn_hidden,
+                                                       mlp_input,
+                                                       error,
+                                                       sizeof(error)) == 1);
+        CHECK(uocr_metal_context_moe_router_f16(ctx,
+                                                mlp_input,
+                                                router_weight,
+                                                n_tokens,
+                                                NULL,
+                                                NULL,
+                                                actual_ids,
+                                                actual_weights,
+                                                error,
+                                                sizeof(error)) == 1);
+        const uint64_t values = (uint64_t)n_tokens * (uint64_t)UOCR_MOE_TOP_K;
+        for (uint64_t i = 0u; i < values; ++i) {
+            if (actual_ids[i] != expected_ids[i]) {
+                fprintf(stderr,
+                        "image router top-k id mismatch layer %u token %llu rank %llu: actual=%u expected=%u\n",
+                        layer,
+                        (unsigned long long)(i / (uint64_t)UOCR_MOE_TOP_K),
+                        (unsigned long long)(i % (uint64_t)UOCR_MOE_TOP_K),
+                        actual_ids[i],
+                        expected_ids[i]);
+                free(expected_weights);
+                free(expected_ids);
+                free(prev_hidden);
+                free(actual_weights);
+                free(actual_ids);
+                free(mlp_input);
+                free(attn_hidden);
+                uocr_metal_context_destroy(ctx);
+                uocr_model_file_close(&model);
+                free(prompt);
+                free(visual_features);
+                free(image_mask);
+                free(input_ids);
+                return 1;
+            }
+            const float diff = fabsf(actual_weights[i] - expected_weights[i]);
+            if (diff > 5.0e-5f) {
+                fprintf(stderr,
+                        "image router top-k weight mismatch layer %u token %llu rank %llu expert %u: actual=%g expected=%g diff=%g\n",
+                        layer,
+                        (unsigned long long)(i / (uint64_t)UOCR_MOE_TOP_K),
+                        (unsigned long long)(i % (uint64_t)UOCR_MOE_TOP_K),
+                        actual_ids[i],
+                        (double)actual_weights[i],
+                        (double)expected_weights[i],
+                        (double)diff);
+                free(expected_weights);
+                free(expected_ids);
+                free(prev_hidden);
+                free(actual_weights);
+                free(actual_ids);
+                free(mlp_input);
+                free(attn_hidden);
+                uocr_metal_context_destroy(ctx);
+                uocr_model_file_close(&model);
+                free(prompt);
+                free(visual_features);
+                free(image_mask);
+                free(input_ids);
+                return 1;
+            }
+        }
+        free(expected_weights);
+        free(expected_ids);
+        free(prev_hidden);
+    }
+    CHECK(error[0] == '\0');
+
+    free(actual_weights);
+    free(actual_ids);
+    free(mlp_input);
+    free(attn_hidden);
+    uocr_metal_context_destroy(ctx);
+    uocr_model_file_close(&model);
+    free(prompt);
     free(visual_features);
     free(image_mask);
     free(input_ids);
@@ -7150,6 +7434,7 @@ int main(void) {
     if (test_metal_image_prompt_embedding_python_dump_parity() != 0) return 1;
     if (test_metal_image_prompt_decoder_smoke_python_dump() != 0) return 1;
     if (test_metal_image_decoder_layers_python_dump_parity() != 0) return 1;
+    if (test_metal_image_router_topk_python_dump_parity() != 0) return 1;
     if (test_metal_text_layer0_python_dump_parity() != 0) return 1;
     if (test_metal_text_layer1_python_dump_parity() != 0) return 1;
     if (test_metal_text_remaining_layers_python_dump_parity() != 0) return 1;

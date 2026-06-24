@@ -681,7 +681,7 @@ First implementation slice, in order:
 - [ ] Compare against Python:
   - [x] final prompt embeddings
   - [x] per-layer hidden states
-  - [ ] router top-6 agreement
+  - [x] router top-6 agreement
   - [ ] logits
   - [ ] generated ids/text
 - [ ] Keep this mode available permanently as a parity/debug path even after Metal vision exists.

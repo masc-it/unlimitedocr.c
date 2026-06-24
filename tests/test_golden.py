@@ -196,10 +196,17 @@ def test_load_image_decoder_layers_dump_reads_native_hidden_files(tmp_path) -> N
     prompt[1:2] = visual
     layer0 = np.full((3, 1280), 0x3C00, dtype=np.dtype("<u2"))
     layer1 = np.full((3, 1280), 0x4000, dtype=np.dtype("<u2"))
+    router_ids = np.array([[1, 2, 3, 4, 5, 6], [7, 8, 9, 10, 11, 12], [63, 0, 1, 2, 3, 4]], dtype=np.dtype("<u4"))
+    router_weights = np.array(
+        [[0.5, 0.25, 0.125, 0.0625, 0.03125, 0.015625]] * 3,
+        dtype=np.dtype("<f4"),
+    )
     visual.tofile(out / "visual_features_f16.bin")
     prompt.tofile(out / "prompt_embeddings_f16.bin")
     layer0.tofile(out / "layer_0_hidden_f16.bin")
     layer1.tofile(out / "layer_1_hidden_f16.bin")
+    router_ids.tofile(out / "layer_1_router_top_ids_u32.bin")
+    router_weights.tofile(out / "layer_1_router_top_weights_f32.bin")
     manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
     manifest["image_decoder_layer_count"] = 2
     manifest["image_embedding_fixture"] = {
@@ -214,6 +221,13 @@ def test_load_image_decoder_layers_dump_reads_native_hidden_files(tmp_path) -> N
         "layer_0_hidden": {"file": "layer_0_hidden_f16.bin", "shape": [3, 1280]},
         "layer_1_hidden": {"file": "layer_1_hidden_f16.bin", "shape": [3, 1280]},
     }
+    manifest["router_topk"] = {
+        "layer_1": {
+            "ids_file": "layer_1_router_top_ids_u32.bin",
+            "weights_file": "layer_1_router_top_weights_f32.bin",
+            "shape": [3, 6],
+        }
+    }
     manifest["native_binary_arrays"] = {
         "input_ids": {"file": "input_ids_i32.bin", "dtype": "int32_le", "shape": [3]},
         "image_mask": {"file": "image_mask_u8.bin", "dtype": "uint8", "shape": [3]},
@@ -227,6 +241,8 @@ def test_load_image_decoder_layers_dump_reads_native_hidden_files(tmp_path) -> N
     assert len(loaded.layer_hidden_f16_bits) == 2
     np.testing.assert_array_equal(loaded.layer_hidden_f16_bits[0], layer0)
     np.testing.assert_array_equal(loaded.layer_hidden_f16_bits[1], layer1)
+    np.testing.assert_array_equal(loaded.router_top_ids[1], router_ids)
+    np.testing.assert_array_equal(loaded.router_top_weights_f32[1], router_weights)
 
 
 def test_load_text_layer1_dump_reads_native_hidden_files(tmp_path) -> None:
