@@ -5,10 +5,13 @@ const STOP_COMMAND = "implementation-loop-stop";
 const STATUS_KEY = "implementation-loop";
 const CONTEXT_THRESHOLD_PERCENT = 60;
 const MAX_RETRIES = 5;
+const RETRY_DELAY_MS = 10_000;
 const QA_CHECKPOINT_INTERVAL = 5;
 
 const IMPLEMENTATION_PROMPT = `read the context in @docs/implementation_plan.md @docs/architecture.md
 @docs/foundations.md and proceed with the next implementation item.
+
+when you pick up the item, explain what it is about and what is needed for.
 
 when you're done and the code works as intended, check of the item checkbox in the plan doc and commit with a short message.
 
@@ -41,6 +44,8 @@ export default function (pi: ExtensionAPI) {
 	let runId = 0;
 	let retryCount = 0;
 	let compactionRetryCount = 0;
+	let retryTimeout: ReturnType<typeof setTimeout> | undefined;
+	let compactionRetryTimeout: ReturnType<typeof setTimeout> | undefined;
 	let qaDue = false;
 	let lastPromptKind: PromptKind = "implementation";
 
@@ -56,7 +61,25 @@ export default function (pi: ExtensionAPI) {
 		}
 	}
 
+	function clearRetryTimeout() {
+		if (retryTimeout === undefined) return;
+		clearTimeout(retryTimeout);
+		retryTimeout = undefined;
+	}
+
+	function clearCompactionRetryTimeout() {
+		if (compactionRetryTimeout === undefined) return;
+		clearTimeout(compactionRetryTimeout);
+		compactionRetryTimeout = undefined;
+	}
+
+	function clearRetryTimers() {
+		clearRetryTimeout();
+		clearCompactionRetryTimeout();
+	}
+
 	function stopLoop(ctx: ExtensionContext, message: string, level: "info" | "warning" | "error" = "info") {
+		clearRetryTimers();
 		running = false;
 		compacting = false;
 		sending = false;
@@ -110,15 +133,33 @@ export default function (pi: ExtensionAPI) {
 
 	function retryPrompt(ctx: ExtensionContext, reason: string) {
 		if (!running) return;
+		if (retryTimeout !== undefined) {
+			setStatus(ctx, `implementation-loop retry ${retryCount}/${MAX_RETRIES} already scheduled`);
+			return;
+		}
+		if (ctx.hasPendingMessages()) {
+			setStatus(ctx, `implementation-loop retry ${retryCount}/${MAX_RETRIES} waiting for queued prompt`);
+			return;
+		}
 		if (retryCount >= MAX_RETRIES) {
 			stopLoop(ctx, `/${COMMAND} stopped: ${reason} after ${MAX_RETRIES} retries.`, "error");
 			return;
 		}
 
 		retryCount += 1;
-		setStatus(ctx, `implementation-loop retry ${retryCount}/${MAX_RETRIES}`);
-		notify(ctx, `/${COMMAND}: ${reason}; retrying ${retryCount}/${MAX_RETRIES}.`, "warning");
-		queuePrompt(ctx, lastPromptKind, true);
+		const expectedRunId = runId;
+		const retryKind = lastPromptKind;
+		setStatus(ctx, `implementation-loop retry ${retryCount}/${MAX_RETRIES} in 10s`);
+		notify(ctx, `/${COMMAND}: ${reason}; retrying ${retryCount}/${MAX_RETRIES} in 10 seconds.`, "warning");
+		retryTimeout = setTimeout(() => {
+			retryTimeout = undefined;
+			if (!running || expectedRunId !== runId) return;
+			if (ctx.hasPendingMessages()) {
+				setStatus(ctx, `implementation-loop retry ${retryCount}/${MAX_RETRIES} waiting for queued prompt`);
+				return;
+			}
+			queuePrompt(ctx, retryKind, true);
+		}, RETRY_DELAY_MS);
 	}
 
 	function retryCompaction(
@@ -129,15 +170,27 @@ export default function (pi: ExtensionAPI) {
 		onCompacted?: CompactionContinuation,
 	) {
 		if (!running || expectedRunId !== runId) return;
+		if (compactionRetryTimeout !== undefined) {
+			setStatus(ctx, `implementation-loop compaction retry ${compactionRetryCount}/${MAX_RETRIES} already scheduled`);
+			return;
+		}
 		if (compactionRetryCount >= MAX_RETRIES) {
 			stopLoop(ctx, `/${COMMAND} stopped: compaction failed after ${MAX_RETRIES} retries (${reason}).`, "error");
 			return;
 		}
 
 		compactionRetryCount += 1;
-		setStatus(ctx, `implementation-loop compaction retry ${compactionRetryCount}/${MAX_RETRIES}`);
-		notify(ctx, `/${COMMAND}: compaction failed (${reason}); retrying ${compactionRetryCount}/${MAX_RETRIES}.`, "warning");
-		void Promise.resolve().then(() => startCompaction(ctx, expectedRunId, percent, onCompacted));
+		setStatus(ctx, `implementation-loop compaction retry ${compactionRetryCount}/${MAX_RETRIES} in 10s`);
+		notify(
+			ctx,
+			`/${COMMAND}: compaction failed (${reason}); retrying ${compactionRetryCount}/${MAX_RETRIES} in 10 seconds.`,
+			"warning",
+		);
+		compactionRetryTimeout = setTimeout(() => {
+			compactionRetryTimeout = undefined;
+			if (!running || expectedRunId !== runId) return;
+			startCompaction(ctx, expectedRunId, percent, onCompacted);
+		}, RETRY_DELAY_MS);
 	}
 
 	function runCompactionContinuation(ctx: ExtensionContext, continuation: CompactionContinuation) {
@@ -157,6 +210,8 @@ export default function (pi: ExtensionAPI) {
 	) {
 		if (!running || compacting || expectedRunId !== runId) return;
 
+		clearRetryTimeout();
+		clearCompactionRetryTimeout();
 		compacting = true;
 		setStatus(ctx, `implementation-loop compacting (${percent.toFixed(1)}%)`);
 		notify(ctx, `/${COMMAND}: context at ${percent.toFixed(1)}%; compacting before continuing.`, "info");
@@ -254,6 +309,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", (_event, ctx) => {
+		clearRetryTimers();
 		setStatus(ctx, undefined);
 	});
 
@@ -265,6 +321,7 @@ export default function (pi: ExtensionAPI) {
 			const agentError = findAgentError(event.messages as readonly MessageLike[]);
 			if (!agentError) {
 				retryCount = 0;
+				clearRetryTimeout();
 			}
 
 			const percent = contextPercent(ctx);
@@ -298,6 +355,7 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
+			clearRetryTimers();
 			running = true;
 			compacting = false;
 			sending = false;
