@@ -660,7 +660,7 @@ First implementation slice, in order:
 - [x] Stop on EOS id `1` or max new tokens.
 - [x] Return generated token ids to C result and Python wrapper.
 - [x] Wire final RMSNorm, LM head, no-repeat bans, greedy argmax, and EOS handoff in a Metal next-token selection helper.
-- [ ] Add text-only fp16 parity test:
+- [x] Add text-only fp16 parity test:
   - [x] prompt embeddings
   - [x] layer-0 dense decoder output
   - [x] layer-1 MoE decoder output
@@ -670,13 +670,13 @@ First implementation slice, in order:
 
 ## 15. Decoder with Python-dumped image embeddings
 
-- [ ] Add a C/Metal test mode accepting precomputed projected visual embeddings from Python fixtures.
-- [ ] Bypass C vision encoder in this mode.
-- [ ] Assemble prompt embeddings with direct spans:
-  - [ ] text embeddings before image
-  - [ ] dumped visual embeddings
-  - [ ] text embeddings after image
-- [ ] Validate image placeholder count against dumped visual feature length.
+- [x] Add a C/Metal test mode accepting precomputed projected visual embeddings from Python fixtures.
+- [x] Bypass C vision encoder in this mode.
+- [x] Assemble prompt embeddings with direct spans:
+  - [x] text embeddings before image
+  - [x] dumped visual embeddings
+  - [x] text embeddings after image
+- [x] Validate image placeholder count against dumped visual feature length.
 - [ ] Run full decoder prefill/decode with dumped image embeddings.
 - [ ] Compare against Python:
   - [ ] final prompt embeddings

@@ -33,6 +33,7 @@ TEXT_LAYER1_HIDDEN_BIN = "layer_1_hidden_f16.bin"
 LOGITS_TOPK_IDS_BIN = "logits_topk_ids_i32.bin"
 LOGITS_TOPK_SCORES_BIN = "logits_topk_scores_f32.bin"
 GENERATED_IDS_BIN = "generated_ids_i32.bin"
+VISUAL_FEATURES_BIN = "visual_features_f16.bin"
 TEXT_DECODER_LAYER_COUNT = 12
 DEFAULT_LOGITS_TOP_K = 16
 INPUT_IDS_BIN = "input_ids_i32.bin"
@@ -115,6 +116,13 @@ class TextLogitsTopKDump(TextDecoderLayersDump):
 @dataclass(frozen=True)
 class TextGeneratedIdsDump(TextLogitsTopKDump):
     generated_ids: NDArray[np.int32]
+
+
+@dataclass(frozen=True)
+class ImagePromptEmbeddingDump(PromptEmbeddingDump):
+    visual_features_f16_bits: NDArray[np.uint16]
+    image_span_start: int
+    image_span_length: int
 
 
 def text_layer_hidden_filename(layer: int) -> str:
@@ -713,6 +721,70 @@ def compute_text_generated_ids(
     return ids.astype(np.int32, copy=False)
 
 
+def _contiguous_image_span(mask: NDArray[np.uint8]) -> tuple[int, int]:
+    mask_arr = np.asarray(mask, dtype=np.uint8)
+    if mask_arr.ndim != 1:
+        raise ValueError(f"image mask must be rank-1, got shape {mask_arr.shape}")
+    image_indices = np.flatnonzero(mask_arr != 0)
+    if image_indices.size == 0:
+        raise ValueError("image prompt fixture requires at least one image placeholder")
+    if np.any(mask_arr[image_indices] != 1):
+        raise ValueError("image mask values must be 0 or 1")
+    start = int(image_indices[0])
+    end = int(image_indices[-1]) + 1
+    if end - start != int(image_indices.size):
+        raise ValueError("image placeholders must occupy one contiguous span")
+    return start, end - start
+
+
+def _validate_visual_features_f16_bits(
+    visual_features_f16_bits: NDArray[np.uint16],
+    *,
+    expected_rows: int,
+    hidden_size: int,
+) -> NDArray[np.uint16]:
+    visual = np.asarray(visual_features_f16_bits, dtype=np.dtype("<u2"))
+    if visual.ndim == 1:
+        if visual.size != expected_rows * hidden_size:
+            raise ValueError(
+                f"visual feature flat size mismatch: expected {expected_rows * hidden_size}, got {visual.size}"
+            )
+        visual = visual.reshape((expected_rows, hidden_size))
+    if visual.shape != (expected_rows, hidden_size):
+        raise ValueError(f"visual features must have shape {(expected_rows, hidden_size)}, got {visual.shape}")
+    return np.ascontiguousarray(visual, dtype=np.dtype("<u2"))
+
+
+def compute_prompt_embeddings_with_visual_features_f16_bits(
+    request: PreparedRequest,
+    visual_features_f16_bits: NDArray[np.uint16],
+    hf_dir: str | Path,
+    *,
+    tensor_name: str = TOK_EMBED_TENSOR_NAME,
+    expected_shape: tuple[int, int] = (MODEL_VOCAB_SIZE, HIDDEN_SIZE),
+) -> NDArray[np.uint16]:
+    """Assemble prompt embeddings by splicing dumped visual features into one image span."""
+
+    if request.image_mask.shape != request.input_ids.shape:
+        raise ValueError("input_ids and image_mask must have matching shapes")
+    image_span_start, image_span_length = _contiguous_image_span(request.image_mask)
+    hidden_size = int(expected_shape[1])
+    visual = _validate_visual_features_f16_bits(
+        visual_features_f16_bits,
+        expected_rows=image_span_length,
+        hidden_size=hidden_size,
+    )
+    embeddings = read_bf16_rows_as_f16_bits(
+        hf_dir,
+        np.asarray(request.input_ids, dtype=np.dtype("<i4")),
+        tensor_name=tensor_name,
+        expected_shape=expected_shape,
+    )
+    embeddings = np.array(embeddings, dtype=np.dtype("<u2"), copy=True)
+    embeddings[image_span_start : image_span_start + image_span_length, :] = visual
+    return embeddings
+
+
 def dump_prompt_embedding_fixture(
     request: PreparedRequest,
     out_dir: str | Path,
@@ -721,15 +793,12 @@ def dump_prompt_embedding_fixture(
     tensor_name: str = TOK_EMBED_TENSOR_NAME,
     expected_shape: tuple[int, int] = (MODEL_VOCAB_SIZE, HIDDEN_SIZE),
 ) -> Path:
-    """Write a prepared-request fixture plus text-only prompt embeddings.
-
-    The current Metal parity target is text-only prompt assembly.  Image prompt
-    dumps need projected visual features and will be added with the image-embed
-    debug path.
-    """
+    """Write a prepared-request fixture plus text-only prompt embeddings."""
 
     if np.any(request.image_mask != 0):
-        raise NotImplementedError("prompt embedding dumps currently require text-only requests")
+        raise NotImplementedError(
+            "text prompt embedding dumps require text-only requests; use dump_image_prompt_embedding_fixture"
+        )
 
     out = Path(out_dir)
     save_prepared_request(request, out)
@@ -754,6 +823,84 @@ def dump_prompt_embedding_fixture(
             "reference_dtype_mode": "BF16 safetensors rows converted to FP16",
             "stats": _f16_stats(embeddings),
         }
+    }
+    manifest["native_binary_arrays"] = {
+        "input_ids": {"file": INPUT_IDS_BIN, "dtype": "int32_le", "shape": [int(request.n_tokens)]},
+        "image_mask": {"file": IMAGE_MASK_BIN, "dtype": "uint8", "shape": [int(request.n_tokens)]},
+    }
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return out
+
+
+def dump_image_prompt_embedding_fixture(
+    request: PreparedRequest,
+    out_dir: str | Path,
+    hf_dir: str | Path,
+    visual_features_f16_bits: NDArray[np.uint16],
+    *,
+    tensor_name: str = TOK_EMBED_TENSOR_NAME,
+    expected_shape: tuple[int, int] = (MODEL_VOCAB_SIZE, HIDDEN_SIZE),
+) -> Path:
+    """Write an image-prompt fixture using precomputed formatted visual feature rows.
+
+    visual_features_f16_bits must already be the final projected/formatted
+    visual token sequence, including newline/separator rows, in the same order
+    as the image placeholder span. This bypasses the C vision encoder while
+    keeping prompt assembly and decoder inputs identical to the full path.
+    """
+
+    out = Path(out_dir)
+    save_prepared_request(request, out)
+    ids_le = np.asarray(request.input_ids, dtype=np.dtype("<i4"))
+    mask_u8 = np.asarray(request.image_mask, dtype=np.uint8)
+    image_span_start, image_span_length = _contiguous_image_span(mask_u8)
+    hidden_size = int(expected_shape[1])
+    visual = _validate_visual_features_f16_bits(
+        visual_features_f16_bits,
+        expected_rows=image_span_length,
+        hidden_size=hidden_size,
+    )
+    embeddings = compute_prompt_embeddings_with_visual_features_f16_bits(
+        request,
+        visual,
+        hf_dir,
+        tensor_name=tensor_name,
+        expected_shape=expected_shape,
+    )
+
+    (out / INPUT_IDS_BIN).write_bytes(ids_le.tobytes())
+    (out / IMAGE_MASK_BIN).write_bytes(mask_u8.tobytes())
+    (out / VISUAL_FEATURES_BIN).write_bytes(visual.tobytes())
+    (out / PROMPT_EMBEDDINGS_BIN).write_bytes(np.asarray(embeddings, dtype=np.dtype("<u2")).tobytes())
+
+    manifest_path = out / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["image_embedding_fixture"] = {
+        "bypasses_c_vision_encoder": True,
+        "image_span_start": image_span_start,
+        "image_span_length": image_span_length,
+        "visual_features_file": VISUAL_FEATURES_BIN,
+        "feature_order": "preformatted rows matching the contiguous image placeholder span",
+    }
+    manifest["golden_tensors"] = {
+        "visual_features": {
+            "file": VISUAL_FEATURES_BIN,
+            "dtype": "float16",
+            "storage": "uint16_le",
+            "shape": [image_span_length, hidden_size],
+            "source": "precomputed Python visual encoder/projector fixture",
+            "reference_dtype_mode": "already formatted projected visual features in FP16",
+            "stats": _f16_stats(visual),
+        },
+        "prompt_embeddings": {
+            "file": PROMPT_EMBEDDINGS_BIN,
+            "dtype": "float16",
+            "storage": "uint16_le",
+            "shape": [int(request.n_tokens), hidden_size],
+            "source": f"{tensor_name} plus {VISUAL_FEATURES_BIN}",
+            "reference_dtype_mode": "BF16 text-token rows converted to FP16 with visual rows spliced directly",
+            "stats": _f16_stats(embeddings),
+        },
     }
     manifest["native_binary_arrays"] = {
         "input_ids": {"file": INPUT_IDS_BIN, "dtype": "int32_le", "shape": [int(request.n_tokens)]},
@@ -944,6 +1091,8 @@ def load_prompt_embedding_dump(fixture_dir: str | Path) -> PromptEmbeddingDump:
     hidden_size = int(shape[1])
     if n_tokens != int(input_ids.size) or hidden_size <= 0:
         raise ValueError(f"prompt embedding shape {shape} does not match {input_ids.size} input ids")
+    if image_mask.shape != input_ids.shape:
+        raise ValueError(f"image_mask shape {image_mask.shape} does not match input ids {input_ids.shape}")
     expected_values = n_tokens * hidden_size
     if embeddings.size != expected_values:
         raise ValueError(f"prompt embedding size mismatch: expected {expected_values} f16 values, got {embeddings.size}")
@@ -952,6 +1101,33 @@ def load_prompt_embedding_dump(fixture_dir: str | Path) -> PromptEmbeddingDump:
         input_ids=input_ids,
         image_mask=image_mask,
         prompt_embeddings_f16_bits=embeddings.reshape((n_tokens, hidden_size)),
+    )
+
+
+def load_image_prompt_embedding_dump(fixture_dir: str | Path) -> ImagePromptEmbeddingDump:
+    prompt = load_prompt_embedding_dump(fixture_dir)
+    root = Path(fixture_dir)
+    image_span_start, image_span_length = _contiguous_image_span(prompt.image_mask)
+    hidden_size = int(prompt.prompt_embeddings_f16_bits.shape[1])
+    golden = prompt.manifest.get("golden_tensors", {}).get("visual_features", {})
+    shape = golden.get("shape", [image_span_length, hidden_size]) if isinstance(golden, dict) else []
+    if not isinstance(shape, list) or len(shape) != 2:
+        raise ValueError(f"invalid visual_features shape metadata in {root}")
+    rows = int(shape[0])
+    visual_hidden = int(shape[1])
+    if rows != image_span_length or visual_hidden != hidden_size:
+        raise ValueError(f"visual_features shape {shape} does not match image span/hidden size")
+    visual = np.fromfile(root / VISUAL_FEATURES_BIN, dtype=np.dtype("<u2"))
+    if visual.size != rows * visual_hidden:
+        raise ValueError(f"visual_features size mismatch: expected {rows * visual_hidden}, got {visual.size}")
+    return ImagePromptEmbeddingDump(
+        manifest=prompt.manifest,
+        input_ids=prompt.input_ids,
+        image_mask=prompt.image_mask,
+        prompt_embeddings_f16_bits=prompt.prompt_embeddings_f16_bits,
+        visual_features_f16_bits=visual.reshape((rows, visual_hidden)),
+        image_span_start=image_span_start,
+        image_span_length=image_span_length,
     )
 
 

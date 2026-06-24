@@ -605,6 +605,159 @@ static int read_text_layer0_python_dump(const char *dump_dir,
     return 1;
 }
 
+static int read_image_prompt_embedding_python_dump(const char *dump_dir,
+                                                   int32_t **input_ids_out,
+                                                   uint8_t **image_mask_out,
+                                                   uint32_t *n_tokens_out,
+                                                   uint16_t **visual_features_out,
+                                                   uint32_t *image_span_start_out,
+                                                   uint32_t *image_span_length_out,
+                                                   uint16_t **prompt_embeddings_out,
+                                                   char *error,
+                                                   size_t error_size) {
+    if (input_ids_out == NULL || image_mask_out == NULL || n_tokens_out == NULL || visual_features_out == NULL ||
+        image_span_start_out == NULL || image_span_length_out == NULL || prompt_embeddings_out == NULL) {
+        snprintf(error, error_size, "invalid image prompt embedding dump request");
+        return 0;
+    }
+    *input_ids_out = NULL;
+    *image_mask_out = NULL;
+    *n_tokens_out = 0u;
+    *visual_features_out = NULL;
+    *image_span_start_out = UOCR_SEQUENCE_NO_IMAGE_SPAN;
+    *image_span_length_out = 0u;
+    *prompt_embeddings_out = NULL;
+
+    if (!read_prompt_embedding_python_dump(dump_dir,
+                                           input_ids_out,
+                                           n_tokens_out,
+                                           prompt_embeddings_out,
+                                           error,
+                                           error_size)) {
+        return 0;
+    }
+
+    char mask_path[4096];
+    if (!make_fixture_path(dump_dir, "image_mask_u8.bin", mask_path, sizeof(mask_path))) {
+        snprintf(error, error_size, "image prompt dump path is too long");
+        goto fail;
+    }
+    unsigned char *mask_bytes = NULL;
+    size_t mask_size = 0u;
+    if (!read_binary_file(mask_path, &mask_bytes, &mask_size, error, error_size)) {
+        goto fail;
+    }
+    if (mask_size != (size_t)(*n_tokens_out)) {
+        snprintf(error,
+                 error_size,
+                 "image_mask_u8.bin size mismatch: expected %u bytes, got %zu",
+                 *n_tokens_out,
+                 mask_size);
+        free(mask_bytes);
+        goto fail;
+    }
+    uint32_t image_count = 0u;
+    for (uint32_t i = 0u; i < *n_tokens_out; ++i) {
+        if (mask_bytes[i] > 1u) {
+            snprintf(error, error_size, "image_mask_u8.bin has invalid value %u at token %u", mask_bytes[i], i);
+            free(mask_bytes);
+            goto fail;
+        }
+        image_count += (uint32_t)mask_bytes[i];
+    }
+    if (image_count == 0u) {
+        snprintf(error, error_size, "image prompt dump has no image placeholders");
+        free(mask_bytes);
+        goto fail;
+    }
+
+    uocr_prepared_request request;
+    memset(&request, 0, sizeof(request));
+    request.input_ids = *input_ids_out;
+    request.image_mask = mask_bytes;
+    request.n_tokens = *n_tokens_out;
+    request.max_new_tokens = 1u;
+    uocr_sequence_state state;
+    memset(&state, 0, sizeof(state));
+    if (uocr_build_sequence_state(&request, &state, error, error_size) != UOCR_OK ||
+        state.image_span_start == UOCR_SEQUENCE_NO_IMAGE_SPAN || state.image_span_length == 0u) {
+        free(mask_bytes);
+        goto fail;
+    }
+    if (state.image_span_length != image_count) {
+        snprintf(error,
+                 error_size,
+                 "image placeholder count mismatch: span=%u count=%u",
+                 state.image_span_length,
+                 image_count);
+        free(mask_bytes);
+        goto fail;
+    }
+
+    if ((uint64_t)state.image_span_length > UINT64_MAX / (uint64_t)UOCR_HIDDEN_SIZE ||
+        (uint64_t)state.image_span_length * (uint64_t)UOCR_HIDDEN_SIZE > UINT64_MAX / 2u) {
+        snprintf(error, error_size, "image visual feature dump size overflow");
+        free(mask_bytes);
+        goto fail;
+    }
+    const uint64_t expected_visual_bytes =
+        (uint64_t)state.image_span_length * (uint64_t)UOCR_HIDDEN_SIZE * 2u;
+    if (expected_visual_bytes > (uint64_t)SIZE_MAX) {
+        snprintf(error, error_size, "image visual feature dump size overflow");
+        free(mask_bytes);
+        goto fail;
+    }
+
+    char visual_path[4096];
+    if (!make_fixture_path(dump_dir, "visual_features_f16.bin", visual_path, sizeof(visual_path))) {
+        snprintf(error, error_size, "visual feature dump path is too long");
+        free(mask_bytes);
+        goto fail;
+    }
+    unsigned char *visual_bytes = NULL;
+    size_t visual_size = 0u;
+    if (!read_binary_file(visual_path, &visual_bytes, &visual_size, error, error_size)) {
+        free(mask_bytes);
+        goto fail;
+    }
+    if ((uint64_t)visual_size != expected_visual_bytes) {
+        snprintf(error,
+                 error_size,
+                 "visual_features_f16.bin size mismatch: expected %llu bytes, got %zu",
+                 (unsigned long long)expected_visual_bytes,
+                 visual_size);
+        free(visual_bytes);
+        free(mask_bytes);
+        goto fail;
+    }
+    uint16_t *visual = (uint16_t *)malloc((size_t)expected_visual_bytes);
+    if (visual == NULL) {
+        snprintf(error, error_size, "failed to allocate visual feature dump buffer");
+        free(visual_bytes);
+        free(mask_bytes);
+        goto fail;
+    }
+    const size_t visual_values = visual_size / sizeof(uint16_t);
+    for (size_t i = 0u; i < visual_values; ++i) {
+        visual[i] = (uint16_t)visual_bytes[2u * i] | (uint16_t)((uint16_t)visual_bytes[2u * i + 1u] << 8u);
+    }
+    free(visual_bytes);
+
+    *image_mask_out = mask_bytes;
+    *visual_features_out = visual;
+    *image_span_start_out = state.image_span_start;
+    *image_span_length_out = state.image_span_length;
+    return 1;
+
+fail:
+    free(*prompt_embeddings_out);
+    free(*input_ids_out);
+    *prompt_embeddings_out = NULL;
+    *input_ids_out = NULL;
+    *n_tokens_out = 0u;
+    return 0;
+}
+
 static const uint16_t *model_tensor_f16_payload(const uocr_model_file *model,
                                                 uint32_t tensor_id,
                                                 uint64_t expected_values,
@@ -1503,6 +1656,102 @@ static int test_metal_text_prompt_embedding_python_dump_parity(void) {
     uocr_metal_context_destroy(ctx);
     uocr_model_file_close(&model);
     free(expected);
+    free(input_ids);
+    return 0;
+}
+
+static int test_metal_image_prompt_embedding_python_dump_parity(void) {
+    if (!uocr_metal_is_available()) {
+        return 0;
+    }
+    if (!env_flag_enabled("UOCR_RUN_LARGE_TESTS")) {
+        return 0;
+    }
+
+    const char *model_path = getenv("UOCR_MODEL_PATH");
+    const char *dump_dir = getenv("UOCR_IMAGE_EMBED_DUMP_DIR");
+    if (model_path == NULL || model_path[0] == '\0' || dump_dir == NULL || dump_dir[0] == '\0') {
+        printf("UOCR_RUN_LARGE_TESTS=1 but UOCR_MODEL_PATH/UOCR_IMAGE_EMBED_DUMP_DIR are not both set; skipping image prompt embedding parity\n");
+        return 0;
+    }
+    if (!fixture_binary_exists(dump_dir, "visual_features_f16.bin")) {
+        printf("UOCR_IMAGE_EMBED_DUMP_DIR has no visual_features_f16.bin; skipping image prompt embedding parity\n");
+        return 0;
+    }
+
+    char error[1024];
+    memset(error, 0, sizeof(error));
+    int32_t *input_ids = NULL;
+    uint8_t *image_mask = NULL;
+    uint32_t n_tokens = 0u;
+    uint16_t *visual_features = NULL;
+    uint32_t image_span_start = UOCR_SEQUENCE_NO_IMAGE_SPAN;
+    uint32_t image_span_length = 0u;
+    uint16_t *expected = NULL;
+    CHECK(read_image_prompt_embedding_python_dump(dump_dir,
+                                                  &input_ids,
+                                                  &image_mask,
+                                                  &n_tokens,
+                                                  &visual_features,
+                                                  &image_span_start,
+                                                  &image_span_length,
+                                                  &expected,
+                                                  error,
+                                                  sizeof(error)) == 1);
+    CHECK(n_tokens > 0u);
+    CHECK(image_span_start != UOCR_SEQUENCE_NO_IMAGE_SPAN);
+    CHECK(image_span_length > 0u);
+
+    uocr_model_file model;
+    CHECK(uocr_model_file_open(model_path, &model, error, sizeof(error)) == 0);
+
+    uocr_metal_context *ctx = uocr_metal_context_create(UOCR_TEST_METAL_RESOURCE_PATH, error, sizeof(error));
+    CHECK(ctx != NULL);
+    CHECK(uocr_metal_context_map_model(ctx, &model, error, sizeof(error)) == 1);
+
+    const uint64_t output_bytes = (uint64_t)n_tokens * (uint64_t)UOCR_HIDDEN_SIZE * 2u;
+    CHECK(output_bytes <= (uint64_t)SIZE_MAX);
+    uint16_t *actual = (uint16_t *)malloc((size_t)output_bytes);
+    CHECK(actual != NULL);
+    memset(actual, 0, (size_t)output_bytes);
+
+    CHECK(uocr_metal_context_assemble_prompt_from_model_f16(ctx,
+                                                            input_ids,
+                                                            n_tokens,
+                                                            image_span_start,
+                                                            image_span_length,
+                                                            visual_features,
+                                                            actual,
+                                                            error,
+                                                            sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+
+    const uint64_t values = (uint64_t)n_tokens * (uint64_t)UOCR_HIDDEN_SIZE;
+    for (uint64_t i = 0u; i < values; ++i) {
+        if (actual[i] != expected[i]) {
+            fprintf(stderr,
+                    "Python image prompt dump mismatch at token %llu col %llu: actual=0x%04x expected=0x%04x\n",
+                    (unsigned long long)(i / (uint64_t)UOCR_HIDDEN_SIZE),
+                    (unsigned long long)(i % (uint64_t)UOCR_HIDDEN_SIZE),
+                    actual[i],
+                    expected[i]);
+            free(actual);
+            uocr_metal_context_destroy(ctx);
+            uocr_model_file_close(&model);
+            free(expected);
+            free(visual_features);
+            free(image_mask);
+            free(input_ids);
+            return 1;
+        }
+    }
+
+    free(actual);
+    uocr_metal_context_destroy(ctx);
+    uocr_model_file_close(&model);
+    free(expected);
+    free(visual_features);
+    free(image_mask);
     free(input_ids);
     return 0;
 }
@@ -6425,6 +6674,7 @@ int main(void) {
     if (test_metal_prompt_assembly_from_mapped_model_f16() != 0) return 1;
     if (test_metal_text_prompt_embedding_full_model_parity() != 0) return 1;
     if (test_metal_text_prompt_embedding_python_dump_parity() != 0) return 1;
+    if (test_metal_image_prompt_embedding_python_dump_parity() != 0) return 1;
     if (test_metal_text_layer0_python_dump_parity() != 0) return 1;
     if (test_metal_text_layer1_python_dump_parity() != 0) return 1;
     if (test_metal_text_remaining_layers_python_dump_parity() != 0) return 1;

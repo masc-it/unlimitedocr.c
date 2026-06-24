@@ -7,7 +7,9 @@ import numpy as np
 
 from unlimitedocr_c.frontend import PreparedRequest, save_prepared_request
 from unlimitedocr_c.golden import (
+    dump_image_prompt_embedding_fixture,
     dump_prompt_embedding_fixture,
+    load_image_prompt_embedding_dump,
     load_prompt_embedding_dump,
     load_text_decoder_layers_dump,
     load_text_generated_ids_dump,
@@ -57,6 +59,25 @@ def _tiny_text_request(input_ids: np.ndarray) -> PreparedRequest:
         mode="text-only",
         prompt="fixture",
         rendered_prompt="fixture",
+        max_new_tokens=0,
+        max_length=0,
+        no_repeat_ngram_size=0,
+        no_repeat_window=0,
+        tokenizer_path="synthetic-tokenizer.json",
+        model_vocab_size=6,
+    )
+
+
+def _tiny_image_request(input_ids: np.ndarray, image_mask: np.ndarray) -> PreparedRequest:
+    return PreparedRequest(
+        input_ids=np.asarray(input_ids, dtype=np.int32),
+        image_mask=np.asarray(image_mask, dtype=np.uint8),
+        views=(),
+        crop_grid_w=1,
+        crop_grid_h=1,
+        mode="synthetic-image",
+        prompt="<image>fixture",
+        rendered_prompt="<image>fixture",
         max_new_tokens=0,
         max_length=0,
         no_repeat_ngram_size=0,
@@ -127,6 +148,36 @@ def test_dump_prompt_embedding_fixture_writes_native_c_files(tmp_path) -> None:
     )
     assert loaded.manifest["golden_tensors"]["prompt_embeddings"]["shape"] == [3, 4]
     assert loaded.manifest["native_binary_arrays"]["input_ids"]["file"] == "input_ids_i32.bin"
+
+
+def test_dump_image_prompt_embedding_fixture_splices_visual_features(tmp_path) -> None:
+    values = np.arange(24, dtype=np.float32).reshape(6, 4) / np.float32(8.0)
+    _write_tiny_embedding_safetensors(tmp_path, values)
+    request = _tiny_image_request(
+        np.array([0, 5, 5, 2], dtype=np.int32),
+        np.array([0, 1, 1, 0], dtype=np.uint8),
+    )
+    visual = np.array(
+        [
+            [0x3C00, 0x4000, 0x4200, 0x4400],
+            [0xBC00, 0xC000, 0xC200, 0xC400],
+        ],
+        dtype=np.dtype("<u2"),
+    )
+    out = tmp_path / "dump"
+
+    dump_image_prompt_embedding_fixture(request, out, tmp_path, visual, expected_shape=(6, 4))
+    loaded = load_image_prompt_embedding_dump(out)
+
+    expected = _expected_f16_bits_from_bf16_trunc(values[request.input_ids])
+    expected[1:3] = visual
+    np.testing.assert_array_equal(loaded.input_ids, request.input_ids)
+    np.testing.assert_array_equal(loaded.image_mask, request.image_mask)
+    np.testing.assert_array_equal(loaded.visual_features_f16_bits, visual)
+    np.testing.assert_array_equal(loaded.prompt_embeddings_f16_bits, expected)
+    assert loaded.image_span_start == 1
+    assert loaded.image_span_length == 2
+    assert loaded.manifest["image_embedding_fixture"]["bypasses_c_vision_encoder"] is True
 
 
 def test_load_text_layer1_dump_reads_native_hidden_files(tmp_path) -> None:

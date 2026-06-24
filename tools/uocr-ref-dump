@@ -19,6 +19,8 @@ from unlimitedocr_c.frontend import (
     save_prepared_request,
 )
 from unlimitedocr_c.golden import (
+    HIDDEN_SIZE,
+    dump_image_prompt_embedding_fixture,
     dump_prompt_embedding_fixture,
     dump_text_decoder_layers_fixture,
     dump_text_generated_ids_fixture,
@@ -48,6 +50,17 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--dump-prompt-embeddings",
         action="store_true",
         help="also dump text-only prompt embeddings from model.embed_tokens.weight for C/Metal parity",
+    )
+    parser.add_argument(
+        "--dump-image-prompt-embeddings",
+        action="store_true",
+        help="also dump prompt embeddings with precomputed formatted visual feature rows spliced into the image span",
+    )
+    parser.add_argument(
+        "--visual-features-f16",
+        type=Path,
+        default=None,
+        help="raw uint16 little-endian fp16 visual feature rows [image_tokens,1280] for --dump-image-prompt-embeddings",
     )
     parser.add_argument(
         "--dump-text-layer0",
@@ -119,6 +132,26 @@ def main(argv: list[str] | None = None) -> int:
         if args.hf_dir is None:
             raise SystemExit("--dump-text-generated-ids requires --hf-dir")
         dump_text_generated_ids_fixture(request, args.out, args.hf_dir, top_k=args.logits_top_k)
+    elif args.dump_image_prompt_embeddings:
+        if args.hf_dir is None:
+            raise SystemExit("--dump-image-prompt-embeddings requires --hf-dir")
+        if args.visual_features_f16 is None:
+            raise SystemExit("--dump-image-prompt-embeddings requires --visual-features-f16")
+        visual = np.fromfile(args.visual_features_f16, dtype=np.dtype("<u2"))
+        image_tokens = int(request.image_mask.sum(dtype=np.uint64))
+        expected_values = image_tokens * HIDDEN_SIZE
+        if image_tokens <= 0:
+            raise SystemExit("--dump-image-prompt-embeddings requires an image/page request with image tokens")
+        if visual.size != expected_values:
+            raise SystemExit(
+                f"--visual-features-f16 size mismatch: expected {expected_values} fp16 values for {image_tokens} image tokens, got {visual.size}"
+            )
+        dump_image_prompt_embedding_fixture(
+            request,
+            args.out,
+            args.hf_dir,
+            visual.reshape((image_tokens, HIDDEN_SIZE)),
+        )
     elif args.dump_text_logits_topk:
         if args.hf_dir is None:
             raise SystemExit("--dump-text-logits-topk requires --hf-dir")
