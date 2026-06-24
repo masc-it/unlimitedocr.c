@@ -986,6 +986,26 @@ int uocr_metal_context_dense_q8_0(uocr_metal_context *ctx,
                                   char *error,
                                   size_t error_size);
 
+/* Diagnostic Q4_K/PADDED_Q4_K dense helper. Computes
+ * out[row, out_col] = dot(input[row, :logical_in_features],
+ *                        dequant(weight[out_col, :logical_in_features])) + optional bias,
+ * where packed weights are row-major [out_features, physical_in_features / 256]
+ * GGML Q4_K blocks. physical_in_features may include padded columns; those
+ * activation columns are treated as zero by never reading beyond logical width.
+ */
+int uocr_metal_context_dense_q4_k(uocr_metal_context *ctx,
+                                  const uint16_t *input_f16,
+                                  const void *weight_q4_k,
+                                  const uint16_t *bias_f16_or_null,
+                                  uint32_t input_rows,
+                                  uint32_t logical_in_features,
+                                  uint32_t physical_in_features,
+                                  uint32_t out_features,
+                                  uocr_metal_dense_output_type output_type,
+                                  void *out,
+                                  char *error,
+                                  size_t error_size);
+
 /* Diagnostic attention projection helper for synthetic tests. Computes the
  * decoder Q/K/V/O fp16 projections for hidden size 1280 with row-major
  * [1280,1280] weights and fp32 accumulation.
@@ -1151,6 +1171,25 @@ int uocr_metal_context_moe_selected_experts_decode_q4_k_q8_0(uocr_metal_context 
                                                              char *error,
                                                              size_t error_size);
 
+/* Diagnostic optional padded-Q4 decode helper. Gate/up use selected-rank-major
+ * Q4_K rows [6,896,physical_hidden]; routed down weights use selected-rank-major
+ * PADDED_Q4_K rows [6,1280,physical_intermediate]. Only the logical 896 down
+ * input columns participate, so padded activation columns are zero by contract.
+ */
+int uocr_metal_context_moe_selected_experts_decode_q4_k_padded(uocr_metal_context *ctx,
+                                                               const uint16_t *input_f16,
+                                                               const uint32_t *top_expert_ids,
+                                                               const float *top_weights_f32,
+                                                               const void *selected_gate_weight_q4_k,
+                                                               const void *selected_up_weight_q4_k,
+                                                               const void *selected_down_weight_padded_q4_k,
+                                                               uint32_t physical_hidden_features,
+                                                               uint32_t physical_intermediate_features,
+                                                               uocr_metal_dense_output_type output_type,
+                                                               void *out,
+                                                               char *error,
+                                                               size_t error_size);
+
 /* Diagnostic token-batched routed-expert prefill helper. Weights are
  * expert-major [expert,out_row,input_col] for gate/up and
  * [expert,hidden_row,intermediate_col] for down. top_expert_ids/top_weights are
@@ -1220,6 +1259,30 @@ int uocr_metal_context_moe_selected_experts_prefill_q4_k_q8_0(uocr_metal_context
                                                               void *out,
                                                               char *error,
                                                               size_t error_size);
+
+/* Diagnostic optional padded-Q4 prefill helper. Gate/up are expert-major Q4_K
+ * slabs [expert,intermediate,physical_hidden]; routed down weights are
+ * expert-major PADDED_Q4_K rows [expert,hidden,physical_intermediate]. The
+ * logical intermediate width is retained and padded activation columns are zero.
+ */
+int uocr_metal_context_moe_selected_experts_prefill_q4_k_padded(uocr_metal_context *ctx,
+                                                                const uint16_t *input_f16,
+                                                                const uint32_t *top_expert_ids,
+                                                                const float *top_weights_f32,
+                                                                const void *expert_gate_weight_q4_k,
+                                                                const void *expert_up_weight_q4_k,
+                                                                const void *expert_down_weight_padded_q4_k,
+                                                                uint32_t n_tokens,
+                                                                uint32_t hidden_size,
+                                                                uint32_t physical_hidden_size,
+                                                                uint32_t intermediate_size,
+                                                                uint32_t physical_intermediate_size,
+                                                                uint32_t expert_count,
+                                                                uint32_t top_k,
+                                                                uocr_metal_dense_output_type output_type,
+                                                                void *out,
+                                                                char *error,
+                                                                size_t error_size);
 
 /* Diagnostic MoE combine helper for synthetic decoder tests. Computes the
  * elementwise sum of routed expert output and shared expert output for
