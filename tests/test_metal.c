@@ -9457,6 +9457,28 @@ static float q4_k_expected_value(const uint8_t *table, uint32_t row_size, uint32
            f16_bits_to_f32(dmin_bits) * (float)q4_k_min_value(scales, group);
 }
 
+static void set_q4_k_scale_min(uint8_t *table,
+                                 uint32_t row_size,
+                                 uint32_t row,
+                                 uint32_t block,
+                                 uint32_t group,
+                                 uint8_t scale,
+                                 uint8_t min) {
+    uint8_t *packed = table + (size_t)row * row_size + (size_t)block * UOCR_Q4_K_TYPE_SIZE;
+    uint8_t *scales = packed + 4u;
+    scale = (uint8_t)(scale & 63u);
+    min = (uint8_t)(min & 63u);
+    if (group < 4u) {
+        scales[group] = (uint8_t)((scales[group] & 0xc0u) | scale);
+        scales[group + 4u] = (uint8_t)((scales[group + 4u] & 0xc0u) | min);
+    } else {
+        const uint32_t k = group - 4u;
+        scales[8u + k] = (uint8_t)((scale & 0x0fu) | (uint8_t)((min & 0x0fu) << 4u));
+        scales[k] = (uint8_t)((scales[k] & 0x3fu) | (uint8_t)((scale & 0x30u) << 2u));
+        scales[4u + k] = (uint8_t)((scales[4u + k] & 0x3fu) | (uint8_t)((min & 0x30u) << 2u));
+    }
+}
+
 static void set_q4_k_q(uint8_t *table, uint32_t row_size, uint32_t row, uint32_t col, uint8_t q) {
     const uint32_t block = col / UOCR_Q4_K_BLOCK_SIZE;
     const uint32_t in_block = col % UOCR_Q4_K_BLOCK_SIZE;
@@ -11013,6 +11035,144 @@ static int test_metal_dense_q4_k(void) {
     free(bias);
     free(weight);
     free(input);
+    return 0;
+}
+
+static int test_metal_quantized_dense_dot_edges(void) {
+    if (!uocr_metal_is_available()) {
+        return 0;
+    }
+
+    char error[1024];
+    memset(error, 0, sizeof(error));
+    uocr_metal_context *ctx = uocr_metal_context_create(UOCR_TEST_METAL_RESOURCE_PATH, error, sizeof(error));
+    CHECK(ctx != NULL);
+
+    {
+        enum { ROWS = 2, LOGICAL_IN = 33, PHYSICAL_IN = 64, OUT_FEATURES = 3 };
+        enum { WEIGHT_ROW_SIZE = (PHYSICAL_IN / 32) * 34 };
+        uint16_t input[ROWS * LOGICAL_IN];
+        uint8_t weight[OUT_FEATURES * WEIGHT_ROW_SIZE];
+        uint16_t bias[OUT_FEATURES] = {
+            0x3000u, /* 0.125 */
+            0xb000u, /* -0.125 */
+            0x0000u  /* 0.0 */
+        };
+        float expected[ROWS * OUT_FEATURES];
+        float out[ROWS * OUT_FEATURES];
+        memset(input, 0, sizeof(input));
+        memset(weight, 0, sizeof(weight));
+
+        input[0u * (uint32_t)LOGICAL_IN + 0u] = 0x3c00u;  /* 1.0 */
+        input[0u * (uint32_t)LOGICAL_IN + 31u] = 0xb800u; /* -0.5 */
+        input[0u * (uint32_t)LOGICAL_IN + 32u] = 0x3400u; /* 0.25 */
+        input[1u * (uint32_t)LOGICAL_IN + 0u] = 0xbc00u;  /* -1.0 */
+        input[1u * (uint32_t)LOGICAL_IN + 31u] = 0x3800u; /* 0.5 */
+        input[1u * (uint32_t)LOGICAL_IN + 32u] = 0x4000u; /* 2.0 */
+
+        for (uint32_t out_col = 0u; out_col < (uint32_t)OUT_FEATURES; ++out_col) {
+            uint8_t *row_base = weight + (size_t)out_col * WEIGHT_ROW_SIZE;
+            write_q8_scale_le(row_base, f32_to_f16_bits(0.03125f * (float)(out_col + 1u)));
+            write_q8_scale_le(row_base + 34u, f32_to_f16_bits(0.0625f * (float)(out_col + 1u)));
+            set_q8_0_q(weight, (uint32_t)WEIGHT_ROW_SIZE, out_col, 0u, (int8_t)-128);
+            set_q8_0_q(weight, (uint32_t)WEIGHT_ROW_SIZE, out_col, 31u, (int8_t)127);
+            set_q8_0_q(weight, (uint32_t)WEIGHT_ROW_SIZE, out_col, 32u, (int8_t)(-7 + (int)out_col));
+            set_q8_0_q(weight, (uint32_t)WEIGHT_ROW_SIZE, out_col, 33u, (int8_t)99); /* physical padding */
+        }
+        for (uint32_t row = 0u; row < (uint32_t)ROWS; ++row) {
+            for (uint32_t col = 0u; col < (uint32_t)OUT_FEATURES; ++col) {
+                float sum = f16_bits_to_f32(bias[col]);
+                for (uint32_t k = 0u; k < (uint32_t)LOGICAL_IN; ++k) {
+                    sum += f16_bits_to_f32(input[row * (uint32_t)LOGICAL_IN + k]) *
+                           q8_0_expected_value(weight, (uint32_t)WEIGHT_ROW_SIZE, col, k);
+                }
+                expected[row * (uint32_t)OUT_FEATURES + col] = sum;
+            }
+        }
+
+        memset(out, 0, sizeof(out));
+        CHECK(uocr_metal_context_dense_q8_0(ctx,
+                                            input,
+                                            weight,
+                                            bias,
+                                            ROWS,
+                                            LOGICAL_IN,
+                                            PHYSICAL_IN,
+                                            OUT_FEATURES,
+                                            UOCR_METAL_DENSE_OUTPUT_F32,
+                                            out,
+                                            error,
+                                            sizeof(error)) == 1);
+        CHECK(error[0] == '\0');
+        for (uint32_t i = 0u; i < (uint32_t)(ROWS * OUT_FEATURES); ++i) {
+            CHECK(fabsf(out[i] - expected[i]) < 1.0e-5f);
+        }
+    }
+
+    {
+        enum { ROWS = 2, LOGICAL_IN = 145, PHYSICAL_IN = 256, OUT_FEATURES = 3 };
+        enum { WEIGHT_ROW_SIZE = (PHYSICAL_IN / UOCR_Q4_K_BLOCK_SIZE) * UOCR_Q4_K_TYPE_SIZE };
+        const uint32_t selected_cols[] = {0u, 31u, 64u, 128u, 144u};
+        const uint16_t selected_values[ROWS][5] = {
+            {0x3c00u, 0xb800u, 0x3400u, 0x4000u, 0xbc00u}, /* 1, -0.5, 0.25, 2, -1 */
+            {0xbc00u, 0x3800u, 0xb400u, 0x3c00u, 0x3400u}  /* -1, 0.5, -0.25, 1, 0.25 */
+        };
+        uint16_t input[ROWS * LOGICAL_IN];
+        uint8_t weight[OUT_FEATURES * WEIGHT_ROW_SIZE];
+        float expected[ROWS * OUT_FEATURES];
+        float out[ROWS * OUT_FEATURES];
+        memset(input, 0, sizeof(input));
+        init_q4_k_rows(weight, (uint32_t)OUT_FEATURES, (uint32_t)WEIGHT_ROW_SIZE, (uint32_t)PHYSICAL_IN, f32_to_f16_bits(0.03125f));
+
+        for (uint32_t row = 0u; row < (uint32_t)ROWS; ++row) {
+            for (uint32_t i = 0u; i < (uint32_t)(sizeof(selected_cols) / sizeof(selected_cols[0])); ++i) {
+                input[row * (uint32_t)LOGICAL_IN + selected_cols[i]] = selected_values[row][i];
+            }
+        }
+        for (uint32_t out_col = 0u; out_col < (uint32_t)OUT_FEATURES; ++out_col) {
+            uint8_t *row_base = weight + (size_t)out_col * WEIGHT_ROW_SIZE;
+            write_q8_scale_le(row_base + 2u, f32_to_f16_bits(0.015625f * (float)(out_col + 1u)));
+            set_q4_k_scale_min(weight, (uint32_t)WEIGHT_ROW_SIZE, out_col, 0u, 0u, (uint8_t)(3u + out_col), 2u);
+            set_q4_k_scale_min(weight, (uint32_t)WEIGHT_ROW_SIZE, out_col, 0u, 2u, (uint8_t)(17u + out_col), 5u);
+            set_q4_k_scale_min(weight, (uint32_t)WEIGHT_ROW_SIZE, out_col, 0u, 4u, (uint8_t)(49u + out_col), 37u);
+            set_q4_k_q(weight, (uint32_t)WEIGHT_ROW_SIZE, out_col, 0u, (uint8_t)(15u - out_col));
+            set_q4_k_q(weight, (uint32_t)WEIGHT_ROW_SIZE, out_col, 31u, 0u); /* min-only value */
+            set_q4_k_q(weight, (uint32_t)WEIGHT_ROW_SIZE, out_col, 64u, (uint8_t)(7u + out_col));
+            set_q4_k_q(weight, (uint32_t)WEIGHT_ROW_SIZE, out_col, 128u, (uint8_t)(11u - out_col));
+            set_q4_k_q(weight, (uint32_t)WEIGHT_ROW_SIZE, out_col, 144u, (uint8_t)(4u + out_col));
+            set_q4_k_q(weight, (uint32_t)WEIGHT_ROW_SIZE, out_col, 145u, 15u); /* physical padding */
+        }
+        for (uint32_t row = 0u; row < (uint32_t)ROWS; ++row) {
+            for (uint32_t col = 0u; col < (uint32_t)OUT_FEATURES; ++col) {
+                float sum = 0.0f;
+                for (uint32_t k = 0u; k < (uint32_t)LOGICAL_IN; ++k) {
+                    sum += f16_bits_to_f32(input[row * (uint32_t)LOGICAL_IN + k]) *
+                           q4_k_expected_value(weight, (uint32_t)WEIGHT_ROW_SIZE, col, k);
+                }
+                expected[row * (uint32_t)OUT_FEATURES + col] = sum;
+            }
+        }
+
+        memset(out, 0, sizeof(out));
+        CHECK(uocr_metal_context_dense_q4_k(ctx,
+                                            input,
+                                            weight,
+                                            NULL,
+                                            ROWS,
+                                            LOGICAL_IN,
+                                            PHYSICAL_IN,
+                                            OUT_FEATURES,
+                                            UOCR_METAL_DENSE_OUTPUT_F32,
+                                            out,
+                                            error,
+                                            sizeof(error)) == 1);
+        CHECK(error[0] == '\0');
+        for (uint32_t i = 0u; i < (uint32_t)(ROWS * OUT_FEATURES); ++i) {
+            CHECK(fabsf(out[i] - expected[i]) < 1.0e-5f);
+        }
+    }
+
+    uocr_metal_context_destroy(ctx);
     return 0;
 }
 
@@ -15583,6 +15743,7 @@ int main(void) {
     if (test_metal_dense_f16() != 0) return 1;
     if (test_metal_dense_q8_0() != 0) return 1;
     if (test_metal_dense_q4_k() != 0) return 1;
+    if (test_metal_quantized_dense_dot_edges() != 0) return 1;
     if (test_metal_attention_qkvo_f16() != 0) return 1;
     if (test_metal_attention_output_residual_f16() != 0) return 1;
     if (test_metal_dense_swiglu_f16() != 0) return 1;

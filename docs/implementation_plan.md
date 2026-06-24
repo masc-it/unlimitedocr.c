@@ -990,7 +990,7 @@ Do not start the stable high-level OCR/PDF API until Gate E2E-0 passes: public f
   - [x] run get_rows on synthetic embedding table
   - [x] run small RoPE kernel
   - [x] run small SDPA prefill/decode kernel
-  - [ ] run q8/q4 dot kernels once implemented
+  - [x] run q8/q4 dot kernels once implemented
 - [x] Add opt-in full-model tests guarded by env vars:
   - [x] `UOCR_MODEL_PATH`
   - [x] `UOCR_HF_DIR`
