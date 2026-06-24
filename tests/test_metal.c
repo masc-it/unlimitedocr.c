@@ -1624,6 +1624,120 @@ static int test_metal_moe_selected_experts_decode_f16(void) {
     return 0;
 }
 
+static int test_metal_moe_combine_f16(void) {
+    if (!uocr_metal_is_available()) {
+        return 0;
+    }
+
+    enum { TOKENS = 3, HIDDEN = UOCR_HIDDEN_SIZE };
+    const uint16_t routed_values[] = {
+        0xb800u, /* -0.5 */
+        0xb000u, /* -0.125 */
+        0x0000u, /* 0.0 */
+        0x3000u, /* 0.125 */
+        0x3800u  /* 0.5 */
+    };
+    const uint16_t shared_values[] = {
+        0xb400u, /* -0.25 */
+        0xa800u, /* -0.03125 */
+        0x2800u, /* 0.03125 */
+        0x3400u  /* 0.25 */
+    };
+    const uint16_t residual_values[] = {
+        0xbc00u, /* -1.0 */
+        0x0000u, /* 0.0 */
+        0x2c00u, /* 0.0625 */
+        0x3c00u  /* 1.0 */
+    };
+    const uint32_t routed_value_count = (uint32_t)(sizeof(routed_values) / sizeof(routed_values[0]));
+    const uint32_t shared_value_count = (uint32_t)(sizeof(shared_values) / sizeof(shared_values[0]));
+    const uint32_t residual_value_count = (uint32_t)(sizeof(residual_values) / sizeof(residual_values[0]));
+
+    uint16_t *routed = (uint16_t *)malloc((size_t)TOKENS * HIDDEN * sizeof(uint16_t));
+    uint16_t *shared = (uint16_t *)malloc((size_t)TOKENS * HIDDEN * sizeof(uint16_t));
+    uint16_t *residual = (uint16_t *)malloc((size_t)TOKENS * HIDDEN * sizeof(uint16_t));
+    float *expected_residual = (float *)malloc((size_t)TOKENS * HIDDEN * sizeof(float));
+    float *expected_no_residual = (float *)malloc((size_t)TOKENS * HIDDEN * sizeof(float));
+    float *out_f32 = (float *)malloc((size_t)TOKENS * HIDDEN * sizeof(float));
+    uint16_t *out_f16 = (uint16_t *)malloc((size_t)TOKENS * HIDDEN * sizeof(uint16_t));
+    CHECK(routed != NULL && shared != NULL && residual != NULL && expected_residual != NULL &&
+          expected_no_residual != NULL && out_f32 != NULL && out_f16 != NULL);
+
+    for (uint32_t i = 0u; i < (uint32_t)(TOKENS * HIDDEN); ++i) {
+        routed[i] = routed_values[(i * 5u + i / 17u + 1u) % routed_value_count];
+        shared[i] = shared_values[(i * 7u + i / 23u + 2u) % shared_value_count];
+        residual[i] = residual_values[(i * 11u + i / 31u + 3u) % residual_value_count];
+        expected_no_residual[i] = f16_bits_to_f32(routed[i]) + f16_bits_to_f32(shared[i]);
+        expected_residual[i] = expected_no_residual[i] + f16_bits_to_f32(residual[i]);
+    }
+
+    char error[1024];
+    memset(error, 0, sizeof(error));
+    uocr_metal_context *ctx = uocr_metal_context_create(UOCR_TEST_METAL_RESOURCE_PATH, error, sizeof(error));
+    CHECK(ctx != NULL);
+
+    memset(out_f32, 0, (size_t)TOKENS * HIDDEN * sizeof(float));
+    CHECK(uocr_metal_context_moe_combine_f16(ctx,
+                                             routed,
+                                             shared,
+                                             residual,
+                                             TOKENS,
+                                             UOCR_METAL_DENSE_OUTPUT_F32,
+                                             out_f32,
+                                             error,
+                                             sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    for (uint32_t i = 0u; i < (uint32_t)(TOKENS * HIDDEN); ++i) {
+        CHECK(fabsf(out_f32[i] - expected_residual[i]) < 1.0e-7f);
+    }
+
+    memset(out_f16, 0, (size_t)TOKENS * HIDDEN * sizeof(uint16_t));
+    CHECK(uocr_metal_context_moe_combine_f16(ctx,
+                                             routed,
+                                             shared,
+                                             NULL,
+                                             TOKENS,
+                                             UOCR_METAL_DENSE_OUTPUT_F16,
+                                             out_f16,
+                                             error,
+                                             sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    for (uint32_t i = 0u; i < (uint32_t)(TOKENS * HIDDEN); ++i) {
+        CHECK(fabsf(f16_bits_to_f32(out_f16[i]) - expected_no_residual[i]) < 8.0e-4f);
+    }
+
+    CHECK(uocr_metal_context_moe_combine_f16(ctx,
+                                             routed,
+                                             shared,
+                                             residual,
+                                             TOKENS,
+                                             (uocr_metal_dense_output_type)99,
+                                             out_f32,
+                                             error,
+                                             sizeof(error)) == 0);
+    CHECK(strstr(error, "unsupported Metal MoE combine output type") != NULL);
+    CHECK(uocr_metal_context_moe_combine_f16(ctx,
+                                             routed,
+                                             shared,
+                                             residual,
+                                             0u,
+                                             UOCR_METAL_DENSE_OUTPUT_F32,
+                                             out_f32,
+                                             error,
+                                             sizeof(error)) == 0);
+    CHECK(strstr(error, "invalid Metal MoE combine request") != NULL);
+
+    uocr_metal_context_destroy(ctx);
+    free(out_f16);
+    free(out_f32);
+    free(expected_no_residual);
+    free(expected_residual);
+    free(residual);
+    free(shared);
+    free(routed);
+    return 0;
+}
+
 static void compute_rope_expected(const uint16_t *src,
                                   uint32_t n_tokens,
                                   uint32_t position_start,
@@ -3257,6 +3371,7 @@ int main(void) {
     if (test_metal_moe_shared_experts_f16() != 0) return 1;
     if (test_metal_moe_router_f16() != 0) return 1;
     if (test_metal_moe_selected_experts_decode_f16() != 0) return 1;
+    if (test_metal_moe_combine_f16() != 0) return 1;
     if (test_metal_rope_qk_f16() != 0) return 1;
     if (test_metal_prefill_attention_f16() != 0) return 1;
     if (test_metal_prefill_attention_varlen_f16() != 0) return 1;

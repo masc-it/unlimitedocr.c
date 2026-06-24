@@ -318,6 +318,13 @@ typedef struct uocr_metal_moe_selected_params {
     uint32_t reserved;
 } uocr_metal_moe_selected_params;
 
+typedef struct uocr_metal_moe_combine_params {
+    uint32_t n_tokens;
+    uint32_t hidden_size;
+    uint32_t has_residual;
+    uint32_t reserved;
+} uocr_metal_moe_combine_params;
+
 typedef struct uocr_metal_rope_qk_params {
     uint32_t n_tokens;
     uint32_t heads;
@@ -3411,6 +3418,152 @@ int uocr_metal_context_moe_selected_experts_decode_f16(uocr_metal_context *ctx,
         [up_weight release];
         [gate_weight release];
         [input release];
+        if (!ok) {
+            return 0;
+        }
+    }
+
+    metal_clear_error(error, error_size);
+    return 1;
+}
+
+int uocr_metal_context_moe_combine_f16(uocr_metal_context *ctx,
+                                       const uint16_t *routed_f16,
+                                       const uint16_t *shared_f16,
+                                       const uint16_t *residual_f16_or_null,
+                                       uint32_t n_tokens,
+                                       uocr_metal_dense_output_type output_type,
+                                       void *out,
+                                       char *error,
+                                       size_t error_size) {
+    metal_clear_error(error, error_size);
+    if (ctx == NULL || routed_f16 == NULL || shared_f16 == NULL || out == NULL || n_tokens == 0u) {
+        return metal_fail(error, error_size, "invalid Metal MoE combine request");
+    }
+    if (output_type != UOCR_METAL_DENSE_OUTPUT_F16 && output_type != UOCR_METAL_DENSE_OUTPUT_F32) {
+        return metal_fail(error, error_size, "unsupported Metal MoE combine output type %d", (int)output_type);
+    }
+
+    uint64_t value_count = 0u;
+    uint64_t input_bytes = 0u;
+    uint64_t output_bytes = 0u;
+    const uint64_t output_element_bytes = output_type == UOCR_METAL_DENSE_OUTPUT_F16 ? 2u : (uint64_t)sizeof(float);
+    if (!checked_mul_u64((uint64_t)n_tokens, (uint64_t)UOCR_HIDDEN_SIZE, &value_count) ||
+        !checked_mul_u64(value_count, 2u, &input_bytes) ||
+        !checked_mul_u64(value_count, output_element_bytes, &output_bytes)) {
+        return metal_fail(error, error_size, "Metal MoE combine byte-size overflow");
+    }
+
+    const uint64_t max_buffer_length = metal_device_max_buffer_length(ctx->device);
+    if (input_bytes > max_buffer_length || output_bytes > max_buffer_length ||
+        input_bytes > (uint64_t)SIZE_MAX || output_bytes > (uint64_t)SIZE_MAX ||
+        value_count > (uint64_t)UINT32_MAX) {
+        return metal_fail(error,
+                          error_size,
+                          "Metal MoE combine buffers exceed maxBufferLength %llu",
+                          (unsigned long long)max_buffer_length);
+    }
+
+    @autoreleasepool {
+        const char *function_name = output_type == UOCR_METAL_DENSE_OUTPUT_F16 ?
+                                        "uocr_moe_combine_f16_to_f16" :
+                                        "uocr_moe_combine_f16_to_f32";
+        id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, function_name, error, error_size);
+        if (pipeline == nil) {
+            return 0;
+        }
+
+        int ok = 0;
+        id<MTLBuffer> routed = nil;
+        id<MTLBuffer> shared = nil;
+        id<MTLBuffer> residual = nil;
+        id<MTLBuffer> dst = nil;
+
+        routed = [ctx->device newBufferWithBytes:routed_f16
+                                          length:(NSUInteger)input_bytes
+                                         options:MTLResourceStorageModeShared];
+        if (routed == nil) {
+            (void)metal_fail(error, error_size, "failed to allocate Metal MoE combine routed buffer");
+            goto cleanup;
+        }
+        routed.label = @"uocr_moe_combine_routed_f16";
+
+        shared = [ctx->device newBufferWithBytes:shared_f16
+                                          length:(NSUInteger)input_bytes
+                                         options:MTLResourceStorageModeShared];
+        if (shared == nil) {
+            (void)metal_fail(error, error_size, "failed to allocate Metal MoE combine shared buffer");
+            goto cleanup;
+        }
+        shared.label = @"uocr_moe_combine_shared_f16";
+
+        id<MTLBuffer> residual_arg = shared;
+        if (residual_f16_or_null != NULL) {
+            residual = [ctx->device newBufferWithBytes:residual_f16_or_null
+                                                length:(NSUInteger)input_bytes
+                                               options:MTLResourceStorageModeShared];
+            if (residual == nil) {
+                (void)metal_fail(error, error_size, "failed to allocate Metal MoE combine residual buffer");
+                goto cleanup;
+            }
+            residual.label = @"uocr_moe_combine_residual_f16";
+            residual_arg = residual;
+        }
+
+        dst = [ctx->device newBufferWithLength:(NSUInteger)output_bytes options:MTLResourceStorageModeShared];
+        if (dst == nil) {
+            (void)metal_fail(error, error_size, "failed to allocate Metal MoE combine output buffer");
+            goto cleanup;
+        }
+        dst.label = @"uocr_moe_combine_output";
+        memset([dst contents], 0, (size_t)output_bytes);
+
+        id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
+        if (cb == nil) {
+            (void)metal_fail(error, error_size, "failed to create Metal MoE combine command buffer");
+            goto cleanup;
+        }
+        cb.label = @"uocr_moe_combine_command_buffer";
+
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        if (enc == nil) {
+            (void)metal_fail(error, error_size, "failed to create Metal MoE combine command encoder");
+            goto cleanup;
+        }
+
+        uocr_metal_moe_combine_params params;
+        params.n_tokens = n_tokens;
+        params.hidden_size = UOCR_HIDDEN_SIZE;
+        params.has_residual = residual_f16_or_null != NULL ? 1u : 0u;
+        params.reserved = 0u;
+
+        const NSUInteger threads_per_group = metal_power2_threadgroup_width(256u, pipeline.maxTotalThreadsPerThreadgroup);
+        [enc setComputePipelineState:pipeline];
+        [enc setBuffer:routed offset:0u atIndex:0u];
+        [enc setBuffer:shared offset:0u atIndex:1u];
+        [enc setBuffer:residual_arg offset:0u atIndex:2u];
+        [enc setBuffer:dst offset:0u atIndex:3u];
+        [enc setBytes:&params length:sizeof(params) atIndex:4u];
+        [enc dispatchThreads:MTLSizeMake((NSUInteger)value_count, 1u, 1u)
+            threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1u, 1u)];
+        [enc endEncoding];
+
+        [cb commit];
+        [cb waitUntilCompleted];
+        if (cb.status == MTLCommandBufferStatusError) {
+            NSString *description = cb.error != nil ? [cb.error localizedDescription] : @"unknown command-buffer error";
+            (void)metal_fail(error, error_size, "Metal MoE combine command failed: %s", [description UTF8String]);
+            goto cleanup;
+        }
+
+        memcpy(out, [dst contents], (size_t)output_bytes);
+        ok = 1;
+
+    cleanup:
+        [dst release];
+        [residual release];
+        [shared release];
+        [routed release];
         if (!ok) {
             return 0;
         }

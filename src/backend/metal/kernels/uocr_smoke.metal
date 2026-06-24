@@ -880,6 +880,51 @@ kernel void uocr_moe_selected_down_sum_f16_to_f32(device const half *mid [[buffe
     }
 }
 
+struct UocrMoeCombineParams {
+    uint n_tokens;
+    uint hidden_size;
+    uint has_residual;
+    uint reserved;
+};
+
+static inline float uocr_moe_combine_value_f16(device const half *routed,
+                                               device const half *shared,
+                                               device const half *residual,
+                                               constant UocrMoeCombineParams &params,
+                                               uint gid) {
+    float value = float(routed[gid]) + float(shared[gid]);
+    if (params.has_residual != 0u) {
+        value += float(residual[gid]);
+    }
+    return value;
+}
+
+kernel void uocr_moe_combine_f16_to_f16(device const half *routed [[buffer(0)]],
+                                        device const half *shared [[buffer(1)]],
+                                        device const half *residual [[buffer(2)]],
+                                        device half *dst [[buffer(3)]],
+                                        constant UocrMoeCombineParams &params [[buffer(4)]],
+                                        uint gid [[thread_position_in_grid]]) {
+    const uint total = params.n_tokens * params.hidden_size;
+    if (gid >= total) {
+        return;
+    }
+    dst[gid] = half(uocr_moe_combine_value_f16(routed, shared, residual, params, gid));
+}
+
+kernel void uocr_moe_combine_f16_to_f32(device const half *routed [[buffer(0)]],
+                                        device const half *shared [[buffer(1)]],
+                                        device const half *residual [[buffer(2)]],
+                                        device float *dst [[buffer(3)]],
+                                        constant UocrMoeCombineParams &params [[buffer(4)]],
+                                        uint gid [[thread_position_in_grid]]) {
+    const uint total = params.n_tokens * params.hidden_size;
+    if (gid >= total) {
+        return;
+    }
+    dst[gid] = uocr_moe_combine_value_f16(routed, shared, residual, params, gid);
+}
+
 struct UocrRopeQKParams {
     uint n_tokens;
     uint heads;

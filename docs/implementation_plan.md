@@ -645,7 +645,7 @@ First implementation slice, in order:
 - [x] Implement selected-expert fp16 path for decode.
 - [ ] Implement grouped expert path for prefill later; simple token-by-token selected expert path is acceptable for first parity.
 - [x] Implement shared experts for every MoE layer with intermediate `1792`.
-- [ ] Add routed expert result + shared expert result.
+- [x] Add routed expert result + shared expert result.
 
 ### 14.4 LM head and generation loop
 

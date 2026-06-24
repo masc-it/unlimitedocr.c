@@ -342,6 +342,22 @@ int uocr_metal_context_moe_selected_experts_decode_f16(uocr_metal_context *ctx,
                                                        char *error,
                                                        size_t error_size);
 
+/* Diagnostic MoE combine helper for synthetic decoder tests. Computes the
+ * elementwise sum of routed expert output and shared expert output for
+ * [n_tokens,1280] fp16 rows. residual_f16_or_null is optional and is added
+ * after the routed+shared MoE result when a full decoder-layer output is being
+ * diagnosed; pass NULL to match the DeepSeekV2MoE module output itself.
+ */
+int uocr_metal_context_moe_combine_f16(uocr_metal_context *ctx,
+                                       const uint16_t *routed_f16,
+                                       const uint16_t *shared_f16,
+                                       const uint16_t *residual_f16_or_null,
+                                       uint32_t n_tokens,
+                                       uocr_metal_dense_output_type output_type,
+                                       void *out,
+                                       char *error,
+                                       size_t error_size);
+
 /* Diagnostic RoPE helper for synthetic decoder tests. Applies Unlimited-OCR's
  * Llama-style split-half RoPE to projected Q and K tensors shaped
  * [n_tokens, 10 heads, 128 dim], using monotonically increasing positions
