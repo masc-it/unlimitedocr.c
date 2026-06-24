@@ -6924,6 +6924,34 @@ int uocr_metal_context_sam_net2_conv3x3_stride2_f16(uocr_metal_context *ctx,
                                                       error_size);
 }
 
+int uocr_metal_context_sam_net3_conv3x3_stride2_f16(uocr_metal_context *ctx,
+                                                    const uint16_t *input_nchw_f16,
+                                                    const uint16_t *weight_f16,
+                                                    uint32_t grid_w,
+                                                    uint32_t grid_h,
+                                                    uocr_metal_dense_output_type output_type,
+                                                    void *out_nchw,
+                                                    char *error,
+                                                    size_t error_size) {
+    if (UOCR_SAM_NET2_CHANNELS != 512u || UOCR_SAM_NET3_CHANNELS != 1024u ||
+        UOCR_SAM_FEATURE_CHANNELS != 1024u || UOCR_SAM_NECK_KERNEL_SIZE != 3u ||
+        UOCR_SAM_NET_STRIDE != 2u) {
+        return metal_fail(error, error_size, "Metal SAM net_3 constants are inconsistent");
+    }
+    return metal_context_sam_conv3x3_stride2_nchw_f16(ctx,
+                                                      input_nchw_f16,
+                                                      weight_f16,
+                                                      grid_w,
+                                                      grid_h,
+                                                      UOCR_SAM_NET2_CHANNELS,
+                                                      UOCR_SAM_NET3_CHANNELS,
+                                                      output_type,
+                                                      out_nchw,
+                                                      "Metal SAM net_3",
+                                                      error,
+                                                      error_size);
+}
+
 static int metal_context_sam_attention_f16(uocr_metal_context *ctx,
                                            const uint16_t *q_f16,
                                            const uint16_t *k_f16,

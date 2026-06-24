@@ -761,7 +761,7 @@ Do not begin this section until sections 14.5 and 15.1 pass for fp16 single-requ
   - [x] `3x3` conv `256 -> 256`, padding `1`, no bias
   - [x] `LayerNorm2d(256, eps=1e-6)`
   - [x] `net_2`: `3x3` stride-2 `256 -> 512`, padding `1`
-  - [ ] `net_3`: `3x3` stride-2 `512 -> 1024`, padding `1`
+  - [x] `net_3`: `3x3` stride-2 `512 -> 1024`, padding `1`
 - [ ] Validate SAM output against Python dumps for `1024` and `640` views.
 
 ### 16.3 CLIP-like encoder

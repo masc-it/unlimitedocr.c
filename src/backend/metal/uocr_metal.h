@@ -416,6 +416,21 @@ int uocr_metal_context_sam_net2_conv3x3_stride2_f16(uocr_metal_context *ctx,
                                                     char *error,
                                                     size_t error_size);
 
+/* Diagnostic SAM net_3 stride-2 convolution helper. Consumes NCHW fp16
+ * [512,grid_h,grid_w], applies Conv2d weight [1024,512,3,3] with padding=1,
+ * stride=2, no bias, accumulates in fp32, and emits NCHW output
+ * [1024,ceil(grid_h/2),ceil(grid_w/2)].
+ */
+int uocr_metal_context_sam_net3_conv3x3_stride2_f16(uocr_metal_context *ctx,
+                                                    const uint16_t *input_nchw_f16,
+                                                    const uint16_t *weight_f16,
+                                                    uint32_t grid_w,
+                                                    uint32_t grid_h,
+                                                    uocr_metal_dense_output_type output_type,
+                                                    void *out_nchw,
+                                                    char *error,
+                                                    size_t error_size);
+
 /* Diagnostic SAM window-attention helper for non-global transformer blocks.
  * Q/K/V are fp16 tensors laid out as [n_windows,14*14,12,64] (equivalent to
  * window-major rows with flattened [head,dim] channels). The helper computes
