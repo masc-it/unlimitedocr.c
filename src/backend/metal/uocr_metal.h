@@ -431,6 +431,22 @@ int uocr_metal_context_sam_net3_conv3x3_stride2_f16(uocr_metal_context *ctx,
                                                     char *error,
                                                     size_t error_size);
 
+/* Diagnostic CLIP embedding helper for the SAM-output path. Consumes SAM net
+ * output in NCHW fp16 layout [1024,grid_h,grid_w], flattens spatial features
+ * in row-major order, prepends the fp16 CLIP class embedding [1024], and emits
+ * token-major [1 + grid_h*grid_w,1024] embeddings. This deliberately does not
+ * use the raw-pixel CLIP patch_embedding weights.
+ */
+int uocr_metal_context_clip_embed_sam_f16(uocr_metal_context *ctx,
+                                          const uint16_t *sam_nchw_f16,
+                                          const uint16_t *class_embedding_f16,
+                                          uint32_t grid_w,
+                                          uint32_t grid_h,
+                                          uocr_metal_dense_output_type output_type,
+                                          void *out_tokens,
+                                          char *error,
+                                          size_t error_size);
+
 /* Diagnostic SAM window-attention helper for non-global transformer blocks.
  * Q/K/V are fp16 tensors laid out as [n_windows,14*14,12,64] (equivalent to
  * window-major rows with flattened [head,dim] channels). The helper computes

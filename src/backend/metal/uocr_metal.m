@@ -373,6 +373,13 @@ typedef struct uocr_metal_sam_conv3x3_stride2_params {
     uint32_t stride;
 } uocr_metal_sam_conv3x3_stride2_params;
 
+typedef struct uocr_metal_clip_embed_sam_params {
+    uint32_t grid_width;
+    uint32_t grid_height;
+    uint32_t hidden_size;
+    uint32_t token_count;
+} uocr_metal_clip_embed_sam_params;
+
 typedef struct uocr_metal_sam_layernorm2d_params {
     uint32_t grid_width;
     uint32_t grid_height;
@@ -419,6 +426,8 @@ _Static_assert(sizeof(uocr_metal_sam_neck_conv3x3_params) == 16u,
                "uocr_metal_sam_neck_conv3x3_params ABI mismatch");
 _Static_assert(sizeof(uocr_metal_sam_conv3x3_stride2_params) == 32u,
                "uocr_metal_sam_conv3x3_stride2_params ABI mismatch");
+_Static_assert(sizeof(uocr_metal_clip_embed_sam_params) == 16u,
+               "uocr_metal_clip_embed_sam_params ABI mismatch");
 _Static_assert(sizeof(uocr_metal_sam_layernorm2d_params) == 16u,
                "uocr_metal_sam_layernorm2d_params ABI mismatch");
 _Static_assert(sizeof(uocr_metal_sam_rel_pos_attention_params) == 48u,
@@ -6950,6 +6959,157 @@ int uocr_metal_context_sam_net3_conv3x3_stride2_f16(uocr_metal_context *ctx,
                                                       "Metal SAM net_3",
                                                       error,
                                                       error_size);
+}
+
+int uocr_metal_context_clip_embed_sam_f16(uocr_metal_context *ctx,
+                                          const uint16_t *sam_nchw_f16,
+                                          const uint16_t *class_embedding_f16,
+                                          uint32_t grid_w,
+                                          uint32_t grid_h,
+                                          uocr_metal_dense_output_type output_type,
+                                          void *out_tokens,
+                                          char *error,
+                                          size_t error_size) {
+    metal_clear_error(error, error_size);
+    if (ctx == NULL || sam_nchw_f16 == NULL || class_embedding_f16 == NULL || out_tokens == NULL) {
+        return metal_fail(error, error_size, "invalid Metal CLIP SAM embedding request");
+    }
+    if (output_type != UOCR_METAL_DENSE_OUTPUT_F16 && output_type != UOCR_METAL_DENSE_OUTPUT_F32) {
+        return metal_fail(error, error_size, "unsupported Metal CLIP SAM embedding output type %d", (int)output_type);
+    }
+    if (grid_w == 0u || grid_h == 0u || grid_w > UOCR_CLIP_MAX_GRID_SIZE || grid_h > UOCR_CLIP_MAX_GRID_SIZE) {
+        return metal_fail(error, error_size, "invalid Metal CLIP SAM embedding grid %ux%u", grid_w, grid_h);
+    }
+    if (UOCR_CLIP_HIDDEN_SIZE != 1024u || UOCR_SAM_FEATURE_CHANNELS != UOCR_CLIP_HIDDEN_SIZE ||
+        UOCR_CLIP_CLASS_TOKENS != 1u || UOCR_CLIP_MAX_GRID_SIZE != UOCR_GLOBAL_GRID_QUERIES) {
+        return metal_fail(error, error_size, "Metal CLIP SAM embedding constants are inconsistent");
+    }
+
+    uint64_t spatial = 0u;
+    uint64_t input_values = 0u;
+    uint64_t output_tokens = 0u;
+    uint64_t output_values = 0u;
+    uint64_t input_bytes = 0u;
+    uint64_t class_bytes = 0u;
+    uint64_t output_bytes = 0u;
+    const uint64_t output_element_bytes = output_type == UOCR_METAL_DENSE_OUTPUT_F16 ? 2u : (uint64_t)sizeof(float);
+    if (!checked_mul_u64((uint64_t)grid_w, (uint64_t)grid_h, &spatial) ||
+        !checked_mul_u64(spatial, (uint64_t)UOCR_CLIP_HIDDEN_SIZE, &input_values) ||
+        !checked_add_u64(spatial, (uint64_t)UOCR_CLIP_CLASS_TOKENS, &output_tokens) ||
+        !checked_mul_u64(output_tokens, (uint64_t)UOCR_CLIP_HIDDEN_SIZE, &output_values) ||
+        !checked_mul_u64(input_values, 2u, &input_bytes) ||
+        !checked_mul_u64((uint64_t)UOCR_CLIP_HIDDEN_SIZE, 2u, &class_bytes) ||
+        !checked_mul_u64(output_values, output_element_bytes, &output_bytes) ||
+        output_tokens > (uint64_t)UINT32_MAX || output_tokens > (uint64_t)UOCR_CLIP_MAX_TOKENS ||
+        input_bytes > (uint64_t)SIZE_MAX || class_bytes > (uint64_t)SIZE_MAX || output_bytes > (uint64_t)SIZE_MAX) {
+        return metal_fail(error, error_size, "Metal CLIP SAM embedding byte-size overflow");
+    }
+
+    const uint64_t max_buffer_length = metal_device_max_buffer_length(ctx->device);
+    if (input_bytes > max_buffer_length || class_bytes > max_buffer_length || output_bytes > max_buffer_length) {
+        return metal_fail(error,
+                          error_size,
+                          "Metal CLIP SAM embedding buffers exceed maxBufferLength %llu",
+                          (unsigned long long)max_buffer_length);
+    }
+
+    int result = 0;
+    @autoreleasepool {
+        const char *function_name = output_type == UOCR_METAL_DENSE_OUTPUT_F16 ?
+                                        "uocr_clip_embed_sam_f16_to_f16" :
+                                        "uocr_clip_embed_sam_f16_to_f32";
+        id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, function_name, error, error_size);
+        if (pipeline == nil) {
+            return 0;
+        }
+
+        id<MTLBuffer> src = [ctx->device newBufferWithBytes:sam_nchw_f16
+                                                     length:(NSUInteger)input_bytes
+                                                    options:MTLResourceStorageModeShared];
+        if (src == nil) {
+            return metal_fail(error, error_size, "failed to allocate Metal CLIP SAM embedding input buffer");
+        }
+        src.label = @"uocr_clip_embed_sam_input_nchw_f16";
+
+        id<MTLBuffer> cls = [ctx->device newBufferWithBytes:class_embedding_f16
+                                                     length:(NSUInteger)class_bytes
+                                                    options:MTLResourceStorageModeShared];
+        if (cls == nil) {
+            [src release];
+            return metal_fail(error, error_size, "failed to allocate Metal CLIP SAM embedding class buffer");
+        }
+        cls.label = @"uocr_clip_embed_sam_class_f16";
+
+        id<MTLBuffer> dst = [ctx->device newBufferWithLength:(NSUInteger)output_bytes options:MTLResourceStorageModeShared];
+        if (dst == nil) {
+            [cls release];
+            [src release];
+            return metal_fail(error, error_size, "failed to allocate Metal CLIP SAM embedding output buffer");
+        }
+        dst.label = @"uocr_clip_embed_sam_output_tokens";
+        memset([dst contents], 0, (size_t)output_bytes);
+
+        id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
+        if (cb == nil) {
+            [dst release];
+            [cls release];
+            [src release];
+            return metal_fail(error, error_size, "failed to create Metal CLIP SAM embedding command buffer");
+        }
+        cb.label = @"uocr_clip_embed_sam_command_buffer";
+
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        if (enc == nil) {
+            [dst release];
+            [cls release];
+            [src release];
+            return metal_fail(error, error_size, "failed to create Metal CLIP SAM embedding command encoder");
+        }
+
+        uocr_metal_clip_embed_sam_params params;
+        params.grid_width = grid_w;
+        params.grid_height = grid_h;
+        params.hidden_size = UOCR_CLIP_HIDDEN_SIZE;
+        params.token_count = (uint32_t)output_tokens;
+
+        NSUInteger threads_x = pipeline.threadExecutionWidth;
+        if (threads_x == 0u) {
+            threads_x = 1u;
+        }
+        if (threads_x > (NSUInteger)UOCR_CLIP_HIDDEN_SIZE) {
+            threads_x = (NSUInteger)UOCR_CLIP_HIDDEN_SIZE;
+        }
+        [enc setComputePipelineState:pipeline];
+        [enc setBuffer:src offset:0u atIndex:0u];
+        [enc setBuffer:cls offset:0u atIndex:1u];
+        [enc setBuffer:dst offset:0u atIndex:2u];
+        [enc setBytes:&params length:sizeof(params) atIndex:3u];
+        [enc dispatchThreads:MTLSizeMake((NSUInteger)UOCR_CLIP_HIDDEN_SIZE, (NSUInteger)output_tokens, 1u)
+       threadsPerThreadgroup:MTLSizeMake(threads_x, 1u, 1u)];
+        [enc endEncoding];
+
+        [cb commit];
+        [cb waitUntilCompleted];
+        if (cb.status == MTLCommandBufferStatusError) {
+            NSString *description = cb.error != nil ? [cb.error localizedDescription] : @"unknown command-buffer error";
+            result = metal_fail(error,
+                                error_size,
+                                "Metal CLIP SAM embedding command failed: %s",
+                                [description UTF8String]);
+        } else {
+            memcpy(out_tokens, [dst contents], (size_t)output_bytes);
+            result = 1;
+        }
+
+        [dst release];
+        [cls release];
+        [src release];
+    }
+
+    if (result) {
+        metal_clear_error(error, error_size);
+    }
+    return result;
 }
 
 static int metal_context_sam_attention_f16(uocr_metal_context *ctx,

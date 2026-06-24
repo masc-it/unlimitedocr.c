@@ -755,7 +755,7 @@ Do not begin this section until sections 14.5 and 15.1 pass for fp16 single-requ
   - [x] GELU MLP with `mlp_ratio=4`
   - [x] residual connections
 - [x] Implement window partition/unpartition with padding exactly like upstream.
-- [ ] Implement SAM neck/net:
+- [x] Implement SAM neck/net:
   - [x] `1x1` conv `768 -> 256`, no bias
   - [x] `LayerNorm2d(256, eps=1e-6)`
   - [x] `3x3` conv `256 -> 256`, padding `1`, no bias
@@ -766,9 +766,9 @@ Do not begin this section until sections 14.5 and 15.1 pass for fp16 single-requ
 
 ### 16.3 CLIP-like encoder
 
-- [ ] Implement CLIP embeddings using SAM output as `patch_embeds`; do not use raw-pixel patch embedding in the normal path.
+- [x] Implement CLIP embeddings using SAM output as `patch_embeds`; do not use raw-pixel patch embedding in the normal path.
 - [ ] Treat `vision_model.embeddings.patch_embedding.*` as unused in normal OCR inference unless a later parity test proves an alternate path needs it.
-- [ ] Flatten SAM features to token sequence and prepend class embedding.
+- [x] Flatten SAM features to token sequence and prepend class embedding.
 - [ ] Add CLIP absolute position embedding using upstream bicubic interpolation with antialias and `align_corners=False`.
 - [ ] Support token lengths:
   - [ ] `257` for `16x16 + CLS`

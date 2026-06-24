@@ -1304,6 +1304,57 @@ kernel void uocr_sam_conv3x3_stride2_f16_to_f32(device const half *src_nchw [[bu
     }
 }
 
+struct UocrClipEmbedSamParams {
+    uint grid_width;
+    uint grid_height;
+    uint hidden_size;
+    uint token_count;
+};
+
+static inline float uocr_clip_embedding_from_sam_value(device const half *sam_nchw,
+                                                       device const half *class_embedding,
+                                                       constant UocrClipEmbedSamParams &params,
+                                                       uint token,
+                                                       uint channel) {
+    if (token == 0u) {
+        return float(class_embedding[channel]);
+    }
+    const uint spatial = token - 1u;
+    const uint y = spatial / params.grid_width;
+    const uint x = spatial - y * params.grid_width;
+    const ulong spatial_size = ulong(params.grid_width) * ulong(params.grid_height);
+    const ulong src_index = ulong(channel) * spatial_size + ulong(y) * ulong(params.grid_width) + ulong(x);
+    return float(sam_nchw[src_index]);
+}
+
+kernel void uocr_clip_embed_sam_f16_to_f16(device const half *sam_nchw [[buffer(0)]],
+                                           device const half *class_embedding [[buffer(1)]],
+                                           device half *dst_tokens [[buffer(2)]],
+                                           constant UocrClipEmbedSamParams &params [[buffer(3)]],
+                                           uint2 gid [[thread_position_in_grid]]) {
+    const uint channel = gid.x;
+    const uint token = gid.y;
+    if (channel >= params.hidden_size || token >= params.token_count) {
+        return;
+    }
+    const float value = uocr_clip_embedding_from_sam_value(sam_nchw, class_embedding, params, token, channel);
+    dst_tokens[ulong(token) * ulong(params.hidden_size) + ulong(channel)] = half(value);
+}
+
+kernel void uocr_clip_embed_sam_f16_to_f32(device const half *sam_nchw [[buffer(0)]],
+                                           device const half *class_embedding [[buffer(1)]],
+                                           device float *dst_tokens [[buffer(2)]],
+                                           constant UocrClipEmbedSamParams &params [[buffer(3)]],
+                                           uint2 gid [[thread_position_in_grid]]) {
+    const uint channel = gid.x;
+    const uint token = gid.y;
+    if (channel >= params.hidden_size || token >= params.token_count) {
+        return;
+    }
+    dst_tokens[ulong(token) * ulong(params.hidden_size) + ulong(channel)] =
+        uocr_clip_embedding_from_sam_value(sam_nchw, class_embedding, params, token, channel);
+}
+
 struct UocrSamLayerNorm2dParams {
     uint grid_width;
     uint grid_height;
