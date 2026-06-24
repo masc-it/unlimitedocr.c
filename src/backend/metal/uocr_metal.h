@@ -1114,10 +1114,10 @@ int uocr_metal_context_moe_selected_experts_decode_f16(uocr_metal_context *ctx,
 
 /* Diagnostic Q4_K selected-routed-expert decode helper. Gate/up weights are
  * compacted in selected-rank-major order as GGML Q4_K rows
- * [6,896,physical_hidden/256 blocks]. The current dyn-q4 bring-up keeps the
- * unaligned routed down projection fp16 here; the q8 down fallback is a
- * separate follow-up item. Only logical hidden columns participate in the
- * dot product, so physical_hidden_features may be padded.
+ * [6,896,physical_hidden/256 blocks]. This legacy diagnostic variant keeps
+ * the routed down projection fp16; use the Q4_K+Q8_0 variant below for the
+ * dyn-q4 unaligned-down fallback. Only logical hidden columns participate in
+ * the dot product, so physical_hidden_features may be padded.
  */
 int uocr_metal_context_moe_selected_experts_decode_q4_k(uocr_metal_context *ctx,
                                                         const uint16_t *input_f16,
@@ -1131,6 +1131,25 @@ int uocr_metal_context_moe_selected_experts_decode_q4_k(uocr_metal_context *ctx,
                                                         void *out,
                                                         char *error,
                                                         size_t error_size);
+
+/* Diagnostic dyn-q4 fallback decode helper. Gate/up use Q4_K rows as above,
+ * while routed down-projection weights are selected-rank-major GGML Q8_0 rows
+ * [6,1280,physical_intermediate/32 blocks]. The logical routed-down input is
+ * 896; physical_intermediate_features may be padded for Q8_0 row layout.
+ */
+int uocr_metal_context_moe_selected_experts_decode_q4_k_q8_0(uocr_metal_context *ctx,
+                                                             const uint16_t *input_f16,
+                                                             const uint32_t *top_expert_ids,
+                                                             const float *top_weights_f32,
+                                                             const void *selected_gate_weight_q4_k,
+                                                             const void *selected_up_weight_q4_k,
+                                                             const void *selected_down_weight_q8_0,
+                                                             uint32_t physical_hidden_features,
+                                                             uint32_t physical_intermediate_features,
+                                                             uocr_metal_dense_output_type output_type,
+                                                             void *out,
+                                                             char *error,
+                                                             size_t error_size);
 
 /* Diagnostic token-batched routed-expert prefill helper. Weights are
  * expert-major [expert,out_row,input_col] for gate/up and
@@ -1158,7 +1177,7 @@ int uocr_metal_context_moe_selected_experts_prefill_f16(uocr_metal_context *ctx,
 
 /* Diagnostic token-batched Q4_K routed-expert prefill helper. Gate/up weights
  * are expert-major Q4_K slabs [expert,intermediate,physical_hidden], while the
- * routed down projection remains fp16 until the unaligned q8 fallback is wired.
+ * routed down projection remains fp16 for fp16-vs-q4 diagnostics.
  */
 int uocr_metal_context_moe_selected_experts_prefill_q4_k(uocr_metal_context *ctx,
                                                          const uint16_t *input_f16,
@@ -1177,6 +1196,30 @@ int uocr_metal_context_moe_selected_experts_prefill_q4_k(uocr_metal_context *ctx
                                                          void *out,
                                                          char *error,
                                                          size_t error_size);
+
+/* Diagnostic token-batched dyn-q4 fallback helper. Gate/up are expert-major
+ * Q4_K slabs [expert,intermediate,physical_hidden]; routed down weights are
+ * expert-major GGML Q8_0 rows [expert,hidden,physical_intermediate]. The
+ * logical intermediate width is retained, so padded Q8_0 columns are ignored.
+ */
+int uocr_metal_context_moe_selected_experts_prefill_q4_k_q8_0(uocr_metal_context *ctx,
+                                                              const uint16_t *input_f16,
+                                                              const uint32_t *top_expert_ids,
+                                                              const float *top_weights_f32,
+                                                              const void *expert_gate_weight_q4_k,
+                                                              const void *expert_up_weight_q4_k,
+                                                              const void *expert_down_weight_q8_0,
+                                                              uint32_t n_tokens,
+                                                              uint32_t hidden_size,
+                                                              uint32_t physical_hidden_size,
+                                                              uint32_t intermediate_size,
+                                                              uint32_t physical_intermediate_size,
+                                                              uint32_t expert_count,
+                                                              uint32_t top_k,
+                                                              uocr_metal_dense_output_type output_type,
+                                                              void *out,
+                                                              char *error,
+                                                              size_t error_size);
 
 /* Diagnostic MoE combine helper for synthetic decoder tests. Computes the
  * elementwise sum of routed expert output and shared expert output for

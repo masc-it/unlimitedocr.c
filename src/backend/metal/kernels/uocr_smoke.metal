@@ -2734,6 +2734,17 @@ struct UocrMoeSelectedQ4Params {
     uint reserved2;
 };
 
+struct UocrMoeSelectedDownQ8Params {
+    uint hidden_size;
+    uint intermediate_size;
+    uint physical_intermediate_size;
+    uint top_k;
+    uint down_row_size;
+    uint reserved0;
+    uint reserved1;
+    uint reserved2;
+};
+
 kernel void uocr_moe_selected_gate_up_f16(device const half *src [[buffer(0)]],
                                           device const half *gate_weight [[buffer(1)]],
                                           device const half *up_weight [[buffer(2)]],
@@ -2892,6 +2903,73 @@ kernel void uocr_moe_selected_down_sum_f16_to_f32(device const half *mid [[buffe
     }
 }
 
+static inline float uocr_moe_selected_down_sum_dot_q8_0(device const half *mid,
+                                                        device const uchar *down_weight,
+                                                        device const float *top_weights,
+                                                        constant UocrMoeSelectedDownQ8Params &params,
+                                                        uint out_col,
+                                                        uint tid,
+                                                        uint ntg,
+                                                        threadgroup float *partials) {
+    float sum = 0.0f;
+    for (uint rank = 0; rank < params.top_k; ++rank) {
+        float expert_sum = 0.0f;
+        const ulong mid_base = ulong(rank) * ulong(params.intermediate_size);
+        const uint weight_row = rank * params.hidden_size + out_col;
+        for (uint k = tid; k < params.intermediate_size; k += ntg) {
+            expert_sum += float(mid[mid_base + ulong(k)]) *
+                          uocr_q8_0_load_value(down_weight, params.down_row_size, weight_row, k);
+        }
+        sum += expert_sum * top_weights[rank];
+    }
+    partials[tid] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = ntg >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            partials[tid] += partials[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    return partials[0];
+}
+
+kernel void uocr_moe_selected_down_sum_q8_0_to_f16(device const half *mid [[buffer(0)]],
+                                                   device const uchar *down_weight [[buffer(1)]],
+                                                   device const float *top_weights [[buffer(2)]],
+                                                   device half *dst [[buffer(3)]],
+                                                   constant UocrMoeSelectedDownQ8Params &params [[buffer(4)]],
+                                                   threadgroup float *partials [[threadgroup(0)]],
+                                                   uint out_col [[threadgroup_position_in_grid]],
+                                                   uint tid [[thread_index_in_threadgroup]],
+                                                   uint ntg [[threads_per_threadgroup]]) {
+    if (out_col >= params.hidden_size) {
+        return;
+    }
+    const float value = uocr_moe_selected_down_sum_dot_q8_0(mid, down_weight, top_weights, params, out_col, tid, ntg, partials);
+    if (tid == 0) {
+        dst[out_col] = half(value);
+    }
+}
+
+kernel void uocr_moe_selected_down_sum_q8_0_to_f32(device const half *mid [[buffer(0)]],
+                                                   device const uchar *down_weight [[buffer(1)]],
+                                                   device const float *top_weights [[buffer(2)]],
+                                                   device float *dst [[buffer(3)]],
+                                                   constant UocrMoeSelectedDownQ8Params &params [[buffer(4)]],
+                                                   threadgroup float *partials [[threadgroup(0)]],
+                                                   uint out_col [[threadgroup_position_in_grid]],
+                                                   uint tid [[thread_index_in_threadgroup]],
+                                                   uint ntg [[threads_per_threadgroup]]) {
+    if (out_col >= params.hidden_size) {
+        return;
+    }
+    const float value = uocr_moe_selected_down_sum_dot_q8_0(mid, down_weight, top_weights, params, out_col, tid, ntg, partials);
+    if (tid == 0) {
+        dst[out_col] = value;
+    }
+}
+
 struct UocrMoePrefillSelectedParams {
     uint n_tokens;
     uint hidden_size;
@@ -2911,6 +2989,17 @@ struct UocrMoePrefillSelectedQ4Params {
     uint expert_count;
     uint top_k;
     uint gate_row_size;
+    uint reserved0;
+};
+
+struct UocrMoePrefillSelectedDownQ8Params {
+    uint n_tokens;
+    uint hidden_size;
+    uint intermediate_size;
+    uint physical_intermediate_size;
+    uint expert_count;
+    uint top_k;
+    uint down_row_size;
     uint reserved0;
 };
 
@@ -3141,6 +3230,104 @@ kernel void uocr_moe_prefill_selected_down_sum_f16_to_f32(device const half *mid
                                                                tid,
                                                                ntg,
                                                                partials);
+    if (tid == 0) {
+        dst[output_index] = value;
+    }
+}
+
+static inline float uocr_moe_prefill_selected_down_dot_q8_0(device const half *mid,
+                                                            device const uint *top_expert_ids,
+                                                            device const float *top_weights,
+                                                            device const uchar *down_weight,
+                                                            constant UocrMoePrefillSelectedDownQ8Params &params,
+                                                            uint token,
+                                                            uint out_col,
+                                                            uint tid,
+                                                            uint ntg,
+                                                            threadgroup float *partials) {
+    float sum = 0.0f;
+    for (uint rank = 0; rank < params.top_k; ++rank) {
+        const uint expert = top_expert_ids[token * params.top_k + rank];
+        if (expert >= params.expert_count) {
+            continue;
+        }
+        float expert_sum = 0.0f;
+        const ulong mid_base = (ulong(token) * ulong(params.top_k) + ulong(rank)) *
+                               ulong(params.intermediate_size);
+        const uint weight_row = expert * params.hidden_size + out_col;
+        for (uint k = tid; k < params.intermediate_size; k += ntg) {
+            expert_sum += float(mid[mid_base + ulong(k)]) *
+                          uocr_q8_0_load_value(down_weight, params.down_row_size, weight_row, k);
+        }
+        sum += expert_sum * top_weights[token * params.top_k + rank];
+    }
+    partials[tid] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = ntg >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            partials[tid] += partials[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    return partials[0];
+}
+
+kernel void uocr_moe_prefill_selected_down_sum_q8_0_to_f16(device const half *mid [[buffer(0)]],
+                                                           device const uint *top_expert_ids [[buffer(1)]],
+                                                           device const float *top_weights [[buffer(2)]],
+                                                           device const uchar *down_weight [[buffer(3)]],
+                                                           device half *dst [[buffer(4)]],
+                                                           constant UocrMoePrefillSelectedDownQ8Params &params [[buffer(5)]],
+                                                           threadgroup float *partials [[threadgroup(0)]],
+                                                           uint output_index [[threadgroup_position_in_grid]],
+                                                           uint tid [[thread_index_in_threadgroup]],
+                                                           uint ntg [[threads_per_threadgroup]]) {
+    const uint token = output_index / params.hidden_size;
+    const uint out_col = output_index - token * params.hidden_size;
+    if (token >= params.n_tokens || out_col >= params.hidden_size) {
+        return;
+    }
+    const float value = uocr_moe_prefill_selected_down_dot_q8_0(mid,
+                                                                top_expert_ids,
+                                                                top_weights,
+                                                                down_weight,
+                                                                params,
+                                                                token,
+                                                                out_col,
+                                                                tid,
+                                                                ntg,
+                                                                partials);
+    if (tid == 0) {
+        dst[output_index] = half(value);
+    }
+}
+
+kernel void uocr_moe_prefill_selected_down_sum_q8_0_to_f32(device const half *mid [[buffer(0)]],
+                                                           device const uint *top_expert_ids [[buffer(1)]],
+                                                           device const float *top_weights [[buffer(2)]],
+                                                           device const uchar *down_weight [[buffer(3)]],
+                                                           device float *dst [[buffer(4)]],
+                                                           constant UocrMoePrefillSelectedDownQ8Params &params [[buffer(5)]],
+                                                           threadgroup float *partials [[threadgroup(0)]],
+                                                           uint output_index [[threadgroup_position_in_grid]],
+                                                           uint tid [[thread_index_in_threadgroup]],
+                                                           uint ntg [[threads_per_threadgroup]]) {
+    const uint token = output_index / params.hidden_size;
+    const uint out_col = output_index - token * params.hidden_size;
+    if (token >= params.n_tokens || out_col >= params.hidden_size) {
+        return;
+    }
+    const float value = uocr_moe_prefill_selected_down_dot_q8_0(mid,
+                                                                top_expert_ids,
+                                                                top_weights,
+                                                                down_weight,
+                                                                params,
+                                                                token,
+                                                                out_col,
+                                                                tid,
+                                                                ntg,
+                                                                partials);
     if (tid == 0) {
         dst[output_index] = value;
     }
