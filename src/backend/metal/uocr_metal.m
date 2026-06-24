@@ -8187,6 +8187,283 @@ int uocr_metal_context_clip_residual_add_f16(uocr_metal_context *ctx,
     return result;
 }
 
+static int metal_clip_transformer_block_has_weights(const uocr_metal_clip_transformer_block_f16 *block) {
+    return block != NULL && block->ln1_weight_f16 != NULL && block->ln1_bias_f16 != NULL &&
+           block->qkv_weight_f16 != NULL && block->qkv_bias_f16 != NULL &&
+           block->out_proj_weight_f16 != NULL && block->out_proj_bias_f16 != NULL &&
+           block->ln2_weight_f16 != NULL && block->ln2_bias_f16 != NULL &&
+           block->mlp_fc1_weight_f16 != NULL && block->mlp_fc1_bias_f16 != NULL &&
+           block->mlp_fc2_weight_f16 != NULL && block->mlp_fc2_bias_f16 != NULL;
+}
+
+static void metal_copy_error_detail(char *detail, size_t detail_size, const char *error) {
+    if (detail == NULL || detail_size == 0u) {
+        return;
+    }
+    (void)snprintf(detail, detail_size, "%s", (error != NULL && error[0] != '\0') ? error : "unknown error");
+}
+
+static int metal_clip_transformer_activation_bytes(uint32_t token_count,
+                                                   uint64_t *value_count,
+                                                   uint64_t *f16_bytes,
+                                                   char *error,
+                                                   size_t error_size) {
+    uint64_t values = 0u;
+    uint64_t bytes = 0u;
+    if (!checked_mul_u64((uint64_t)token_count, (uint64_t)UOCR_CLIP_HIDDEN_SIZE, &values) ||
+        !checked_mul_u64(values, 2u, &bytes) || values > (uint64_t)UINT32_MAX || bytes > (uint64_t)SIZE_MAX) {
+        return metal_fail(error, error_size, "Metal CLIP transformer byte-size overflow");
+    }
+    if (value_count != NULL) {
+        *value_count = values;
+    }
+    if (f16_bytes != NULL) {
+        *f16_bytes = bytes;
+    }
+    return 1;
+}
+
+int uocr_metal_context_clip_transformer_block_f16(uocr_metal_context *ctx,
+                                                  const uint16_t *input_f16,
+                                                  const uocr_metal_clip_transformer_block_f16 *block,
+                                                  uint32_t token_count,
+                                                  uocr_metal_dense_output_type output_type,
+                                                  void *out,
+                                                  char *error,
+                                                  size_t error_size) {
+    metal_clear_error(error, error_size);
+    if (ctx == NULL || input_f16 == NULL || !metal_clip_transformer_block_has_weights(block) || out == NULL) {
+        return metal_fail(error, error_size, "invalid Metal CLIP transformer block request");
+    }
+    if (token_count != UOCR_CLIP_GLOBAL_TOKENS && token_count != UOCR_CLIP_LOCAL_TOKENS) {
+        return metal_fail(error, error_size, "invalid Metal CLIP transformer block token count %u", token_count);
+    }
+    if (output_type != UOCR_METAL_DENSE_OUTPUT_F16 && output_type != UOCR_METAL_DENSE_OUTPUT_F32) {
+        return metal_fail(error, error_size, "unsupported Metal CLIP transformer block output type %d", (int)output_type);
+    }
+    if (UOCR_CLIP_HIDDEN_SIZE != 1024u || UOCR_CLIP_BLOCKS != 24u || UOCR_CLIP_ATTENTION_HEADS != 16u ||
+        UOCR_CLIP_HEAD_DIM != 64u || UOCR_CLIP_QKV_SIZE != 3072u || UOCR_CLIP_MLP_INTERMEDIATE != 4096u ||
+        UOCR_CLIP_GLOBAL_TOKENS != 257u || UOCR_CLIP_LOCAL_TOKENS != 101u) {
+        return metal_fail(error, error_size, "Metal CLIP transformer block constants are inconsistent");
+    }
+
+    uint64_t hidden_values = 0u;
+    uint64_t hidden_bytes = 0u;
+    if (!metal_clip_transformer_activation_bytes(token_count, &hidden_values, &hidden_bytes, error, error_size)) {
+        return 0;
+    }
+    (void)hidden_values;
+
+    int result = 0;
+    uint16_t *norm1_f16 = (uint16_t *)malloc((size_t)hidden_bytes);
+    uint16_t *q_f16 = (uint16_t *)malloc((size_t)hidden_bytes);
+    uint16_t *k_f16 = (uint16_t *)malloc((size_t)hidden_bytes);
+    uint16_t *v_f16 = (uint16_t *)malloc((size_t)hidden_bytes);
+    uint16_t *attention_f16 = (uint16_t *)malloc((size_t)hidden_bytes);
+    uint16_t *projected_f16 = (uint16_t *)malloc((size_t)hidden_bytes);
+    uint16_t *residual1_f16 = (uint16_t *)malloc((size_t)hidden_bytes);
+    uint16_t *norm2_f16 = (uint16_t *)malloc((size_t)hidden_bytes);
+    uint16_t *mlp_f16 = (uint16_t *)malloc((size_t)hidden_bytes);
+    if (norm1_f16 == NULL || q_f16 == NULL || k_f16 == NULL || v_f16 == NULL || attention_f16 == NULL ||
+        projected_f16 == NULL || residual1_f16 == NULL || norm2_f16 == NULL || mlp_f16 == NULL) {
+        result = metal_fail(error, error_size, "failed to allocate Metal CLIP transformer block scratch buffers");
+        goto cleanup_clip_transformer_block;
+    }
+
+#define RUN_CLIP_BLOCK_STEP(step_name, call_expr)                                                        \
+    do {                                                                                                \
+        if (!(call_expr)) {                                                                             \
+            char detail[512];                                                                           \
+            metal_copy_error_detail(detail, sizeof(detail), error);                                      \
+            result = metal_fail(error, error_size, "failed to compute Metal CLIP transformer block %s: %s", step_name, detail); \
+            goto cleanup_clip_transformer_block;                                                        \
+        }                                                                                               \
+    } while (0)
+
+    RUN_CLIP_BLOCK_STEP("LayerNorm1",
+                        uocr_metal_context_clip_layernorm_f16(ctx,
+                                                              input_f16,
+                                                              block->ln1_weight_f16,
+                                                              block->ln1_bias_f16,
+                                                              token_count,
+                                                              UOCR_METAL_LAYERNORM_OUTPUT_F16,
+                                                              norm1_f16,
+                                                              error,
+                                                              error_size));
+    RUN_CLIP_BLOCK_STEP("QKV",
+                        uocr_metal_context_clip_qkv_f16(ctx,
+                                                         norm1_f16,
+                                                         block->qkv_weight_f16,
+                                                         block->qkv_bias_f16,
+                                                         token_count,
+                                                         UOCR_METAL_DENSE_OUTPUT_F16,
+                                                         q_f16,
+                                                         k_f16,
+                                                         v_f16,
+                                                         error,
+                                                         error_size));
+    RUN_CLIP_BLOCK_STEP("attention",
+                        uocr_metal_context_clip_attention_f16(ctx,
+                                                              q_f16,
+                                                              k_f16,
+                                                              v_f16,
+                                                              token_count,
+                                                              UOCR_METAL_DENSE_OUTPUT_F16,
+                                                              attention_f16,
+                                                              error,
+                                                              error_size));
+    RUN_CLIP_BLOCK_STEP("output projection",
+                        uocr_metal_context_clip_output_projection_f16(ctx,
+                                                                      attention_f16,
+                                                                      block->out_proj_weight_f16,
+                                                                      block->out_proj_bias_f16,
+                                                                      token_count,
+                                                                      UOCR_METAL_DENSE_OUTPUT_F16,
+                                                                      projected_f16,
+                                                                      error,
+                                                                      error_size));
+    RUN_CLIP_BLOCK_STEP("attention residual",
+                        uocr_metal_context_clip_residual_add_f16(ctx,
+                                                                 input_f16,
+                                                                 projected_f16,
+                                                                 token_count,
+                                                                 UOCR_METAL_DENSE_OUTPUT_F16,
+                                                                 residual1_f16,
+                                                                 error,
+                                                                 error_size));
+    RUN_CLIP_BLOCK_STEP("LayerNorm2",
+                        uocr_metal_context_clip_layernorm_f16(ctx,
+                                                              residual1_f16,
+                                                              block->ln2_weight_f16,
+                                                              block->ln2_bias_f16,
+                                                              token_count,
+                                                              UOCR_METAL_LAYERNORM_OUTPUT_F16,
+                                                              norm2_f16,
+                                                              error,
+                                                              error_size));
+    RUN_CLIP_BLOCK_STEP("MLP",
+                        uocr_metal_context_clip_mlp_f16(ctx,
+                                                        norm2_f16,
+                                                        block->mlp_fc1_weight_f16,
+                                                        block->mlp_fc1_bias_f16,
+                                                        block->mlp_fc2_weight_f16,
+                                                        block->mlp_fc2_bias_f16,
+                                                        token_count,
+                                                        UOCR_METAL_DENSE_OUTPUT_F16,
+                                                        mlp_f16,
+                                                        error,
+                                                        error_size));
+    RUN_CLIP_BLOCK_STEP("MLP residual",
+                        uocr_metal_context_clip_residual_add_f16(ctx,
+                                                                 residual1_f16,
+                                                                 mlp_f16,
+                                                                 token_count,
+                                                                 output_type,
+                                                                 out,
+                                                                 error,
+                                                                 error_size));
+
+#undef RUN_CLIP_BLOCK_STEP
+
+    result = 1;
+
+cleanup_clip_transformer_block:
+    free(mlp_f16);
+    free(norm2_f16);
+    free(residual1_f16);
+    free(projected_f16);
+    free(attention_f16);
+    free(v_f16);
+    free(k_f16);
+    free(q_f16);
+    free(norm1_f16);
+    if (result) {
+        metal_clear_error(error, error_size);
+    }
+    return result;
+}
+
+int uocr_metal_context_clip_transformer_f16(uocr_metal_context *ctx,
+                                            const uint16_t *input_f16,
+                                            const uocr_metal_clip_transformer_block_f16 *blocks,
+                                            uint32_t block_count,
+                                            uint32_t token_count,
+                                            uocr_metal_dense_output_type output_type,
+                                            void *out,
+                                            char *error,
+                                            size_t error_size) {
+    metal_clear_error(error, error_size);
+    if (ctx == NULL || input_f16 == NULL || blocks == NULL || out == NULL) {
+        return metal_fail(error, error_size, "invalid Metal CLIP transformer request");
+    }
+    if (block_count != UOCR_CLIP_BLOCKS) {
+        return metal_fail(error, error_size, "invalid Metal CLIP transformer block count %u", block_count);
+    }
+    if (token_count != UOCR_CLIP_GLOBAL_TOKENS && token_count != UOCR_CLIP_LOCAL_TOKENS) {
+        return metal_fail(error, error_size, "invalid Metal CLIP transformer token count %u", token_count);
+    }
+    if (output_type != UOCR_METAL_DENSE_OUTPUT_F16 && output_type != UOCR_METAL_DENSE_OUTPUT_F32) {
+        return metal_fail(error, error_size, "unsupported Metal CLIP transformer output type %d", (int)output_type);
+    }
+    for (uint32_t block_index = 0u; block_index < block_count; ++block_index) {
+        if (!metal_clip_transformer_block_has_weights(&blocks[block_index])) {
+            return metal_fail(error, error_size, "invalid Metal CLIP transformer block %u weights", block_index);
+        }
+    }
+
+    uint64_t hidden_bytes = 0u;
+    if (!metal_clip_transformer_activation_bytes(token_count, NULL, &hidden_bytes, error, error_size)) {
+        return 0;
+    }
+
+    int result = 0;
+    uint16_t *state_a_f16 = (uint16_t *)malloc((size_t)hidden_bytes);
+    uint16_t *state_b_f16 = (uint16_t *)malloc((size_t)hidden_bytes);
+    if (state_a_f16 == NULL || state_b_f16 == NULL) {
+        result = metal_fail(error, error_size, "failed to allocate Metal CLIP transformer state buffers");
+        goto cleanup_clip_transformer;
+    }
+
+    const uint16_t *current_f16 = input_f16;
+    uint16_t *next_f16 = state_a_f16;
+    for (uint32_t block_index = 0u; block_index < block_count; ++block_index) {
+        const int is_last = block_index + 1u == block_count;
+        const uocr_metal_dense_output_type block_output_type = is_last ? output_type : UOCR_METAL_DENSE_OUTPUT_F16;
+        void *block_out = is_last ? out : (void *)next_f16;
+        if (!uocr_metal_context_clip_transformer_block_f16(ctx,
+                                                           current_f16,
+                                                           &blocks[block_index],
+                                                           token_count,
+                                                           block_output_type,
+                                                           block_out,
+                                                           error,
+                                                           error_size)) {
+            char detail[512];
+            metal_copy_error_detail(detail, sizeof(detail), error);
+            result = metal_fail(error,
+                                error_size,
+                                "failed to compute Metal CLIP transformer block %u: %s",
+                                block_index,
+                                detail);
+            goto cleanup_clip_transformer;
+        }
+        if (!is_last) {
+            current_f16 = next_f16;
+            next_f16 = next_f16 == state_a_f16 ? state_b_f16 : state_a_f16;
+        }
+    }
+
+    result = 1;
+
+cleanup_clip_transformer:
+    free(state_b_f16);
+    free(state_a_f16);
+    if (result) {
+        metal_clear_error(error, error_size);
+    }
+    return result;
+}
+
 static int metal_context_sam_attention_f16(uocr_metal_context *ctx,
                                            const uint16_t *q_f16,
                                            const uint16_t *k_f16,

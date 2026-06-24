@@ -431,6 +431,21 @@ int uocr_metal_context_sam_net3_conv3x3_stride2_f16(uocr_metal_context *ctx,
                                                     char *error,
                                                     size_t error_size);
 
+typedef struct uocr_metal_clip_transformer_block_f16 {
+    const uint16_t *ln1_weight_f16;
+    const uint16_t *ln1_bias_f16;
+    const uint16_t *qkv_weight_f16;
+    const uint16_t *qkv_bias_f16;
+    const uint16_t *out_proj_weight_f16;
+    const uint16_t *out_proj_bias_f16;
+    const uint16_t *ln2_weight_f16;
+    const uint16_t *ln2_bias_f16;
+    const uint16_t *mlp_fc1_weight_f16;
+    const uint16_t *mlp_fc1_bias_f16;
+    const uint16_t *mlp_fc2_weight_f16;
+    const uint16_t *mlp_fc2_bias_f16;
+} uocr_metal_clip_transformer_block_f16;
+
 /* Diagnostic CLIP embedding helper for the SAM-output path. Consumes SAM net
  * output in NCHW fp16 layout [1024,grid_h,grid_w], flattens spatial features
  * in row-major order, prepends the fp16 CLIP class embedding [1024], and emits
@@ -578,6 +593,32 @@ int uocr_metal_context_clip_residual_add_f16(uocr_metal_context *ctx,
                                              void *out,
                                              char *error,
                                              size_t error_size);
+
+/* Diagnostic CLIP transformer block helper. Runs the upstream pre-norm block:
+ * x = x + out_proj(attention(qkv(layer_norm1(x))));
+ * x = x + mlp(layer_norm2(x)). Internal block activations are kept fp16.
+ */
+int uocr_metal_context_clip_transformer_block_f16(uocr_metal_context *ctx,
+                                                  const uint16_t *input_f16,
+                                                  const uocr_metal_clip_transformer_block_f16 *block,
+                                                  uint32_t token_count,
+                                                  uocr_metal_dense_output_type output_type,
+                                                  void *out,
+                                                  char *error,
+                                                  size_t error_size);
+
+/* Diagnostic 24-block CLIP transformer helper for the SAM-output vision path.
+ * The blocks array must contain UOCR_CLIP_BLOCKS entries in layer order.
+ */
+int uocr_metal_context_clip_transformer_f16(uocr_metal_context *ctx,
+                                            const uint16_t *input_f16,
+                                            const uocr_metal_clip_transformer_block_f16 *blocks,
+                                            uint32_t block_count,
+                                            uint32_t token_count,
+                                            uocr_metal_dense_output_type output_type,
+                                            void *out,
+                                            char *error,
+                                            size_t error_size);
 
 /* Diagnostic SAM window-attention helper for non-global transformer blocks.
  * Q/K/V are fp16 tensors laid out as [n_windows,14*14,12,64] (equivalent to

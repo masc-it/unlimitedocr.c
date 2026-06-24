@@ -774,7 +774,7 @@ Do not begin this section until sections 14.5 and 15.1 pass for fp16 single-requ
   - [x] `257` for `16x16 + CLS`
   - [x] `101` for `10x10 + CLS`
 - [x] Implement pre-LayerNorm eps `1e-5`.
-- [ ] Implement 24 CLIP transformer blocks:
+- [x] Implement 24 CLIP transformer blocks:
   - [x] LayerNorm eps `1e-5`
   - [x] QKV projection `[3072,1024]` with bias
   - [x] full attention, 16 heads, head dim `64`
