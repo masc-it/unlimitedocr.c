@@ -255,9 +255,22 @@ int uocr_metal_context_argmax_f32(uocr_metal_context *ctx,
                                   char *error,
                                   size_t error_size);
 
-/* Decode-time greedy selection helper for the initial correctness path. It
- * applies CPU no-repeat-ngram bans in-place to readback fp32 logits, then runs
- * the Metal argmax kernel. no_repeat_or_null==NULL disables banning.
+/* Apply no-repeat-ngram bans on Metal to a row-major fp32 logits buffer and
+ * copy the mutated logits back to the caller. configs_or_null==NULL disables
+ * banning. This mirrors uocr_no_repeat_ngram_apply_batch() semantics for the
+ * decode path (no whitelist), while moving the scan/mutation to the GPU.
+ */
+int uocr_metal_context_apply_no_repeat_ngram_f32(uocr_metal_context *ctx,
+                                                 float *logits_f32,
+                                                 uint32_t n_rows,
+                                                 uint32_t vocab_size,
+                                                 const uocr_no_repeat_ngram_config *configs_or_null,
+                                                 char *error,
+                                                 size_t error_size);
+
+/* Decode-time greedy selection helper. It applies no-repeat-ngram bans on
+ * Metal, preserving the caller-visible in-place logits mutation, then runs the
+ * Metal argmax kernel. no_repeat_or_null==NULL disables banning.
  */
 int uocr_metal_context_select_greedy_f32(uocr_metal_context *ctx,
                                          float *logits_f32,

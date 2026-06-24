@@ -664,6 +664,80 @@ static int test_metal_argmax_f32(void) {
     return 0;
 }
 
+static int test_metal_no_repeat_ngram_gpu_f32(void) {
+    if (!uocr_metal_is_available()) {
+        return 0;
+    }
+
+    enum { ROWS = 4, VOCAB = 16 };
+    float logits[ROWS * VOCAB];
+    float expected[ROWS * VOCAB];
+    for (uint32_t i = 0u; i < (uint32_t)(ROWS * VOCAB); ++i) {
+        logits[i] = (float)i * 0.125f;
+        expected[i] = logits[i];
+    }
+
+    const int32_t sequence0[] = {1, 2, 3, 1, 2};       /* current prefix [1,2] bans 3 */
+    const int32_t sequence1[] = {5, 6, 7, 5, 6, 8, 5, 6}; /* full window bans 7 and 8 */
+    const int32_t sequence2[] = {2, 4, 2, 5};          /* ngram=1, window=2 bans 2 and 5 */
+    const uocr_no_repeat_ngram_config configs[ROWS] = {
+        {sequence0, 5u, 3u, 0u},
+        {sequence1, 8u, 3u, 0u},
+        {sequence2, 4u, 1u, 2u},
+        {NULL, 0u, 0u, 0u},
+    };
+    CHECK(uocr_no_repeat_ngram_apply_batch(expected, ROWS, VOCAB, configs) == UOCR_OK);
+
+    char error[1024];
+    memset(error, 0, sizeof(error));
+    uocr_metal_context *ctx = uocr_metal_context_create(UOCR_TEST_METAL_RESOURCE_PATH, error, sizeof(error));
+    CHECK(ctx != NULL);
+
+    CHECK(uocr_metal_context_apply_no_repeat_ngram_f32(ctx,
+                                                       logits,
+                                                       ROWS,
+                                                       VOCAB,
+                                                       configs,
+                                                       error,
+                                                       sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    for (uint32_t i = 0u; i < (uint32_t)(ROWS * VOCAB); ++i) {
+        if (isinf(expected[i])) {
+            CHECK(isinf(logits[i]) && logits[i] < 0.0f);
+        } else {
+            CHECK(logits[i] == expected[i]);
+        }
+    }
+
+    float unchanged[VOCAB];
+    for (uint32_t i = 0u; i < (uint32_t)VOCAB; ++i) {
+        unchanged[i] = (float)i;
+    }
+    CHECK(uocr_metal_context_apply_no_repeat_ngram_f32(ctx,
+                                                       unchanged,
+                                                       1u,
+                                                       VOCAB,
+                                                       NULL,
+                                                       error,
+                                                       sizeof(error)) == 1);
+    for (uint32_t i = 0u; i < (uint32_t)VOCAB; ++i) {
+        CHECK(unchanged[i] == (float)i);
+    }
+
+    const uocr_no_repeat_ngram_config invalid[1] = {{NULL, 5u, 3u, 0u}};
+    CHECK(uocr_metal_context_apply_no_repeat_ngram_f32(ctx,
+                                                       unchanged,
+                                                       1u,
+                                                       VOCAB,
+                                                       invalid,
+                                                       error,
+                                                       sizeof(error)) == 0);
+    CHECK(strstr(error, "failed to validate no-repeat-ngram row") != NULL);
+
+    uocr_metal_context_destroy(ctx);
+    return 0;
+}
+
 static int test_metal_select_greedy_with_no_repeat_f32(void) {
     if (!uocr_metal_is_available()) {
         return 0;
@@ -3721,6 +3795,7 @@ int main(void) {
     if (test_metal_final_rmsnorm_f16() != 0) return 1;
     if (test_metal_lm_head_f16() != 0) return 1;
     if (test_metal_argmax_f32() != 0) return 1;
+    if (test_metal_no_repeat_ngram_gpu_f32() != 0) return 1;
     if (test_metal_select_greedy_with_no_repeat_f32() != 0) return 1;
     if (test_metal_eos_stop_after_greedy_selection() != 0) return 1;
     if (test_metal_dense_f16() != 0) return 1;

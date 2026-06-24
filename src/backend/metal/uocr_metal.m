@@ -291,6 +291,24 @@ typedef struct uocr_metal_argmax_params {
     uint32_t reserved1;
 } uocr_metal_argmax_params;
 
+typedef struct uocr_metal_no_repeat_ngram_params {
+    uint32_t rows;
+    uint32_t vocab_size;
+    uint32_t max_candidates;
+    uint32_t reserved0;
+} uocr_metal_no_repeat_ngram_params;
+
+typedef struct uocr_metal_no_repeat_ngram_pack {
+    int32_t *sequences;
+    uint32_t *row_offsets;
+    uint32_t *sequence_lengths;
+    uint32_t *ngram_sizes;
+    uint32_t *windows;
+    uint32_t total_sequence_tokens;
+    uint32_t max_candidates;
+    int has_work;
+} uocr_metal_no_repeat_ngram_pack;
+
 typedef struct uocr_metal_attention_projection_params {
     uint32_t n_tokens;
     uint32_t hidden_size;
@@ -2445,6 +2463,305 @@ int uocr_metal_context_lm_head_f16(uocr_metal_context *ctx,
     return 1;
 }
 
+static uint32_t metal_no_repeat_candidate_count(uint32_t sequence_len, uint32_t ngram_size, uint32_t window) {
+    if (ngram_size == 0u || sequence_len < ngram_size) {
+        return 0u;
+    }
+    const uint32_t effective_window = window == 0u || window > sequence_len ? sequence_len : window;
+    const uint32_t search_start = sequence_len - effective_window;
+    const uint32_t search_end = sequence_len - ngram_size + 1u;
+    return search_end > search_start ? search_end - search_start : 0u;
+}
+
+static void metal_no_repeat_pack_free(uocr_metal_no_repeat_ngram_pack *pack) {
+    if (pack == NULL) {
+        return;
+    }
+    free(pack->sequences);
+    free(pack->row_offsets);
+    free(pack->sequence_lengths);
+    free(pack->ngram_sizes);
+    free(pack->windows);
+    memset(pack, 0, sizeof(*pack));
+}
+
+static int metal_no_repeat_pack_configs(const uocr_no_repeat_ngram_config *configs,
+                                        uint32_t n_rows,
+                                        uint32_t vocab_size,
+                                        uocr_metal_no_repeat_ngram_pack *out_pack,
+                                        char *error,
+                                        size_t error_size) {
+    if (out_pack == NULL) {
+        return metal_fail(error, error_size, "invalid Metal no-repeat-ngram pack output");
+    }
+    memset(out_pack, 0, sizeof(*out_pack));
+    if (configs == NULL || n_rows == 0u) {
+        return 1;
+    }
+
+    uint64_t total_sequence_tokens = 0u;
+    uint32_t max_candidates = 0u;
+    for (uint32_t row = 0u; row < n_rows; ++row) {
+        const uocr_no_repeat_ngram_config *config = &configs[row];
+        if (config->ngram_size == 0u) {
+            continue;
+        }
+
+        uint32_t banned_count = 0u;
+        const int status = uocr_no_repeat_ngram_collect_banned(config->sequence,
+                                                               config->sequence_len,
+                                                               vocab_size,
+                                                               config->ngram_size,
+                                                               config->window,
+                                                               NULL,
+                                                               0u,
+                                                               NULL,
+                                                               0u,
+                                                               &banned_count);
+        if (status != UOCR_OK && status != UOCR_ERROR_OUT_OF_MEMORY) {
+            return metal_fail(error, error_size, "failed to validate no-repeat-ngram row %u: status %d", row, status);
+        }
+
+        const uint32_t candidates = metal_no_repeat_candidate_count(config->sequence_len, config->ngram_size, config->window);
+        if (candidates == 0u) {
+            continue;
+        }
+        if (!checked_add_u64(total_sequence_tokens, (uint64_t)config->sequence_len, &total_sequence_tokens)) {
+            return metal_fail(error, error_size, "Metal no-repeat-ngram sequence metadata overflow");
+        }
+        if (candidates > max_candidates) {
+            max_candidates = candidates;
+        }
+    }
+
+    if (max_candidates == 0u) {
+        return 1;
+    }
+    if (total_sequence_tokens > (uint64_t)UINT32_MAX) {
+        return metal_fail(error, error_size, "Metal no-repeat-ngram packed sequence is too large");
+    }
+
+    uint64_t row_bytes = 0u;
+    uint64_t sequence_bytes = 0u;
+    if (!checked_mul_u64((uint64_t)n_rows, (uint64_t)sizeof(uint32_t), &row_bytes) ||
+        !checked_mul_u64(total_sequence_tokens, (uint64_t)sizeof(int32_t), &sequence_bytes) ||
+        row_bytes > (uint64_t)SIZE_MAX || sequence_bytes > (uint64_t)SIZE_MAX) {
+        return metal_fail(error, error_size, "Metal no-repeat-ngram pack byte-size overflow");
+    }
+
+    out_pack->row_offsets = (uint32_t *)calloc((size_t)n_rows, sizeof(uint32_t));
+    out_pack->sequence_lengths = (uint32_t *)calloc((size_t)n_rows, sizeof(uint32_t));
+    out_pack->ngram_sizes = (uint32_t *)calloc((size_t)n_rows, sizeof(uint32_t));
+    out_pack->windows = (uint32_t *)calloc((size_t)n_rows, sizeof(uint32_t));
+    out_pack->sequences = (int32_t *)malloc((size_t)sequence_bytes);
+    if (out_pack->row_offsets == NULL || out_pack->sequence_lengths == NULL || out_pack->ngram_sizes == NULL ||
+        out_pack->windows == NULL || out_pack->sequences == NULL) {
+        metal_no_repeat_pack_free(out_pack);
+        return metal_fail(error, error_size, "failed to allocate Metal no-repeat-ngram pack");
+    }
+
+    uint32_t cursor = 0u;
+    for (uint32_t row = 0u; row < n_rows; ++row) {
+        const uocr_no_repeat_ngram_config *config = &configs[row];
+        const uint32_t candidates = metal_no_repeat_candidate_count(config->sequence_len, config->ngram_size, config->window);
+        if (config->ngram_size == 0u || candidates == 0u) {
+            continue;
+        }
+        out_pack->row_offsets[row] = cursor;
+        out_pack->sequence_lengths[row] = config->sequence_len;
+        out_pack->ngram_sizes[row] = config->ngram_size;
+        out_pack->windows[row] = config->window;
+        memcpy(out_pack->sequences + cursor, config->sequence, (size_t)config->sequence_len * sizeof(int32_t));
+        cursor += config->sequence_len;
+    }
+
+    out_pack->total_sequence_tokens = (uint32_t)total_sequence_tokens;
+    out_pack->max_candidates = max_candidates;
+    out_pack->has_work = 1;
+    return 1;
+}
+
+int uocr_metal_context_apply_no_repeat_ngram_f32(uocr_metal_context *ctx,
+                                                 float *logits_f32,
+                                                 uint32_t n_rows,
+                                                 uint32_t vocab_size,
+                                                 const uocr_no_repeat_ngram_config *configs_or_null,
+                                                 char *error,
+                                                 size_t error_size) {
+    metal_clear_error(error, error_size);
+    if (ctx == NULL || vocab_size == 0u) {
+        return metal_fail(error, error_size, "invalid Metal no-repeat-ngram request");
+    }
+    if (n_rows == 0u || configs_or_null == NULL) {
+        return 1;
+    }
+    if (logits_f32 == NULL) {
+        return metal_fail(error, error_size, "invalid Metal no-repeat-ngram logits buffer");
+    }
+
+    uocr_metal_no_repeat_ngram_pack pack;
+    if (!metal_no_repeat_pack_configs(configs_or_null, n_rows, vocab_size, &pack, error, error_size)) {
+        return 0;
+    }
+    if (!pack.has_work) {
+        metal_no_repeat_pack_free(&pack);
+        return 1;
+    }
+
+    uint64_t logits_values = 0u;
+    uint64_t logits_bytes = 0u;
+    uint64_t sequence_bytes = 0u;
+    uint64_t row_bytes = 0u;
+    if (!checked_mul_u64((uint64_t)n_rows, (uint64_t)vocab_size, &logits_values) ||
+        !checked_mul_u64(logits_values, (uint64_t)sizeof(float), &logits_bytes) ||
+        !checked_mul_u64((uint64_t)pack.total_sequence_tokens, (uint64_t)sizeof(int32_t), &sequence_bytes) ||
+        !checked_mul_u64((uint64_t)n_rows, (uint64_t)sizeof(uint32_t), &row_bytes) ||
+        logits_bytes > (uint64_t)SIZE_MAX || sequence_bytes > (uint64_t)SIZE_MAX || row_bytes > (uint64_t)SIZE_MAX) {
+        metal_no_repeat_pack_free(&pack);
+        return metal_fail(error, error_size, "Metal no-repeat-ngram byte-size overflow");
+    }
+    if (logits_bytes > (uint64_t)ctx->device.maxBufferLength || sequence_bytes > (uint64_t)ctx->device.maxBufferLength ||
+        row_bytes > (uint64_t)ctx->device.maxBufferLength) {
+        metal_no_repeat_pack_free(&pack);
+        return metal_fail(error,
+                          error_size,
+                          "Metal no-repeat-ngram buffers exceed maxBufferLength %llu",
+                          (unsigned long long)ctx->device.maxBufferLength);
+    }
+
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, "uocr_no_repeat_ngram_f32", error, error_size);
+        if (pipeline == nil) {
+            metal_no_repeat_pack_free(&pack);
+            return 0;
+        }
+
+        id<MTLBuffer> logits = [ctx->device newBufferWithBytes:logits_f32
+                                                        length:(NSUInteger)logits_bytes
+                                                       options:MTLResourceStorageModeShared];
+        id<MTLBuffer> sequences = [ctx->device newBufferWithBytes:pack.sequences
+                                                           length:(NSUInteger)sequence_bytes
+                                                          options:MTLResourceStorageModeShared];
+        id<MTLBuffer> row_offsets = [ctx->device newBufferWithBytes:pack.row_offsets
+                                                             length:(NSUInteger)row_bytes
+                                                            options:MTLResourceStorageModeShared];
+        id<MTLBuffer> sequence_lengths = [ctx->device newBufferWithBytes:pack.sequence_lengths
+                                                                  length:(NSUInteger)row_bytes
+                                                                 options:MTLResourceStorageModeShared];
+        id<MTLBuffer> ngram_sizes = [ctx->device newBufferWithBytes:pack.ngram_sizes
+                                                             length:(NSUInteger)row_bytes
+                                                            options:MTLResourceStorageModeShared];
+        id<MTLBuffer> windows = [ctx->device newBufferWithBytes:pack.windows
+                                                        length:(NSUInteger)row_bytes
+                                                       options:MTLResourceStorageModeShared];
+        if (logits == nil || sequences == nil || row_offsets == nil || sequence_lengths == nil || ngram_sizes == nil || windows == nil) {
+            [windows release];
+            [ngram_sizes release];
+            [sequence_lengths release];
+            [row_offsets release];
+            [sequences release];
+            [logits release];
+            metal_no_repeat_pack_free(&pack);
+            return metal_fail(error, error_size, "failed to allocate Metal no-repeat-ngram buffers");
+        }
+        logits.label = @"uocr_no_repeat_logits_f32";
+        sequences.label = @"uocr_no_repeat_sequences";
+        row_offsets.label = @"uocr_no_repeat_row_offsets";
+        sequence_lengths.label = @"uocr_no_repeat_sequence_lengths";
+        ngram_sizes.label = @"uocr_no_repeat_ngram_sizes";
+        windows.label = @"uocr_no_repeat_windows";
+
+        id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
+        if (cb == nil) {
+            [windows release];
+            [ngram_sizes release];
+            [sequence_lengths release];
+            [row_offsets release];
+            [sequences release];
+            [logits release];
+            metal_no_repeat_pack_free(&pack);
+            return metal_fail(error, error_size, "failed to create Metal no-repeat-ngram command buffer");
+        }
+        cb.label = @"uocr_no_repeat_ngram_command_buffer";
+
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        if (enc == nil) {
+            [windows release];
+            [ngram_sizes release];
+            [sequence_lengths release];
+            [row_offsets release];
+            [sequences release];
+            [logits release];
+            metal_no_repeat_pack_free(&pack);
+            return metal_fail(error, error_size, "failed to create Metal no-repeat-ngram command encoder");
+        }
+
+        uocr_metal_no_repeat_ngram_params params;
+        params.rows = n_rows;
+        params.vocab_size = vocab_size;
+        params.max_candidates = pack.max_candidates;
+        params.reserved0 = 0u;
+
+        NSUInteger threads_x = (NSUInteger)pack.max_candidates;
+        if (threads_x > 64u) {
+            threads_x = 64u;
+        }
+        if (threads_x > pipeline.maxTotalThreadsPerThreadgroup) {
+            threads_x = pipeline.maxTotalThreadsPerThreadgroup;
+        }
+        if (threads_x == 0u) {
+            [enc endEncoding];
+            [windows release];
+            [ngram_sizes release];
+            [sequence_lengths release];
+            [row_offsets release];
+            [sequences release];
+            [logits release];
+            metal_no_repeat_pack_free(&pack);
+            return metal_fail(error, error_size, "Metal no-repeat-ngram pipeline has no available threads");
+        }
+        const NSUInteger groups_x = ((NSUInteger)pack.max_candidates + threads_x - 1u) / threads_x;
+
+        [enc setComputePipelineState:pipeline];
+        [enc setBuffer:logits offset:0u atIndex:0u];
+        [enc setBuffer:sequences offset:0u atIndex:1u];
+        [enc setBuffer:row_offsets offset:0u atIndex:2u];
+        [enc setBuffer:sequence_lengths offset:0u atIndex:3u];
+        [enc setBuffer:ngram_sizes offset:0u atIndex:4u];
+        [enc setBuffer:windows offset:0u atIndex:5u];
+        [enc setBytes:&params length:sizeof(params) atIndex:6u];
+        [enc dispatchThreadgroups:MTLSizeMake(groups_x, (NSUInteger)n_rows, 1u)
+             threadsPerThreadgroup:MTLSizeMake(threads_x, 1u, 1u)];
+        [enc endEncoding];
+
+        [cb commit];
+        [cb waitUntilCompleted];
+        if (cb.status == MTLCommandBufferStatusError) {
+            NSString *description = cb.error != nil ? [cb.error localizedDescription] : @"unknown command-buffer error";
+            [windows release];
+            [ngram_sizes release];
+            [sequence_lengths release];
+            [row_offsets release];
+            [sequences release];
+            [logits release];
+            metal_no_repeat_pack_free(&pack);
+            return metal_fail(error, error_size, "Metal no-repeat-ngram command failed: %s", [description UTF8String]);
+        }
+
+        memcpy(logits_f32, [logits contents], (size_t)logits_bytes);
+        [windows release];
+        [ngram_sizes release];
+        [sequence_lengths release];
+        [row_offsets release];
+        [sequences release];
+        [logits release];
+    }
+
+    metal_no_repeat_pack_free(&pack);
+    metal_clear_error(error, error_size);
+    return 1;
+}
+
 int uocr_metal_context_argmax_f32(uocr_metal_context *ctx,
                                   const float *logits_f32,
                                   uint32_t n_rows,
@@ -2587,15 +2904,17 @@ int uocr_metal_context_select_greedy_f32(uocr_metal_context *ctx,
         return metal_fail(error, error_size, "invalid Metal greedy selection request");
     }
 
-    const int no_repeat_status = uocr_no_repeat_ngram_apply_batch(logits_f32,
-                                                                  n_rows,
-                                                                  vocab_size,
-                                                                  no_repeat_or_null);
-    if (no_repeat_status != UOCR_OK) {
-        return metal_fail(error,
-                          error_size,
-                          "failed to apply no-repeat-ngram bans before argmax: status %d",
-                          no_repeat_status);
+    if (no_repeat_or_null != NULL &&
+        !uocr_metal_context_apply_no_repeat_ngram_f32(ctx,
+                                                      logits_f32,
+                                                      n_rows,
+                                                      vocab_size,
+                                                      no_repeat_or_null,
+                                                      error,
+                                                      error_size)) {
+        char detail[512];
+        (void)snprintf(detail, sizeof(detail), "%s", (error != NULL && error[0] != '\0') ? error : "unknown error");
+        return metal_fail(error, error_size, "failed to apply no-repeat-ngram bans before argmax: %s", detail);
     }
 
     return uocr_metal_context_argmax_f32(ctx,

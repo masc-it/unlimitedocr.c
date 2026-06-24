@@ -292,6 +292,61 @@ struct UocrArgmaxParams {
     uint reserved1;
 };
 
+struct UocrNoRepeatNgramParams {
+    uint rows;
+    uint vocab_size;
+    uint max_candidates;
+    uint reserved0;
+};
+
+kernel void uocr_no_repeat_ngram_f32(device float *logits [[buffer(0)]],
+                                     device const int *sequences [[buffer(1)]],
+                                     device const uint *row_offsets [[buffer(2)]],
+                                     device const uint *sequence_lengths [[buffer(3)]],
+                                     device const uint *ngram_sizes [[buffer(4)]],
+                                     device const uint *windows [[buffer(5)]],
+                                     constant UocrNoRepeatNgramParams &params [[buffer(6)]],
+                                     uint2 gid [[thread_position_in_grid]]) {
+    const uint candidate_offset = gid.x;
+    const uint row = gid.y;
+    if (row >= params.rows || candidate_offset >= params.max_candidates) {
+        return;
+    }
+
+    const uint ngram_size = ngram_sizes[row];
+    const uint sequence_len = sequence_lengths[row];
+    if (ngram_size == 0u || sequence_len < ngram_size) {
+        return;
+    }
+
+    const uint window = windows[row];
+    const uint effective_window = (window == 0u || window > sequence_len) ? sequence_len : window;
+    const uint search_start = sequence_len - effective_window;
+    const uint search_end = sequence_len - ngram_size + 1u;
+    if (search_end <= search_start) {
+        return;
+    }
+
+    const uint candidate_count = search_end - search_start;
+    if (candidate_offset >= candidate_count) {
+        return;
+    }
+
+    const uint idx = search_start + candidate_offset;
+    const uint current_prefix_start = ngram_size > 1u ? sequence_len - (ngram_size - 1u) : sequence_len;
+    const uint row_offset = row_offsets[row];
+    for (uint j = 0u; j + 1u < ngram_size; ++j) {
+        if (sequences[row_offset + idx + j] != sequences[row_offset + current_prefix_start + j]) {
+            return;
+        }
+    }
+
+    const int token_id = sequences[row_offset + idx + ngram_size - 1u];
+    if (token_id >= 0 && uint(token_id) < params.vocab_size) {
+        logits[ulong(row) * ulong(params.vocab_size) + ulong(uint(token_id))] = -INFINITY;
+    }
+}
+
 static inline bool uocr_argmax_better(float score, uint id, float best_score, uint best_id) {
     if (isnan(score)) {
         return false;
