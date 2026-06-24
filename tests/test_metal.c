@@ -93,6 +93,10 @@ static size_t sam_mlp_lin2_weight_index(uint32_t out_col, uint32_t in_col) {
     return (size_t)out_col * UOCR_SAM_MLP_INTERMEDIATE + in_col;
 }
 
+static size_t sam_attention_proj_weight_index(uint32_t out_col, uint32_t in_col) {
+    return (size_t)out_col * UOCR_SAM_HIDDEN_SIZE + in_col;
+}
+
 static float sam_cubic_weight(float x) {
     const float a = -0.75f;
     const float ax = fabsf(x);
@@ -778,6 +782,21 @@ static float sam_mlp_expected(const uint16_t *input,
         }
         const float gelu_f16 = f16_bits_to_f32(f32_to_f16_bits(sam_mlp_gelu_expected(projected)));
         value += gelu_f16 * f16_bits_to_f32(lin2_weight[sam_mlp_lin2_weight_index(out_col, hidden)]);
+    }
+    return value;
+}
+
+static float sam_attention_project_residual_expected(const uint16_t *context,
+                                                     const uint16_t *weight,
+                                                     const uint16_t *bias,
+                                                     const uint16_t *residual,
+                                                     uint32_t row,
+                                                     uint32_t out_col) {
+    float value = f16_bits_to_f32(bias[out_col]) +
+                  f16_bits_to_f32(residual[(size_t)row * UOCR_SAM_HIDDEN_SIZE + out_col]);
+    for (uint32_t col = 0u; col < UOCR_SAM_HIDDEN_SIZE; ++col) {
+        value += f16_bits_to_f32(context[(size_t)row * UOCR_SAM_HIDDEN_SIZE + col]) *
+                 f16_bits_to_f32(weight[sam_attention_proj_weight_index(out_col, col)]);
     }
     return value;
 }
@@ -1497,6 +1516,172 @@ static int test_metal_sam_mlp_f16(void) {
     free(lin1_bias);
     free(lin1_weight);
     free(input);
+    return 0;
+}
+
+static int test_metal_sam_residuals_f16(void) {
+    if (!uocr_metal_is_available()) {
+        return 0;
+    }
+
+    enum { ROWS = 3u, HIDDEN = UOCR_SAM_HIDDEN_SIZE };
+    uint16_t *context = (uint16_t *)calloc((size_t)ROWS * HIDDEN, sizeof(uint16_t));
+    uint16_t *residual = (uint16_t *)calloc((size_t)ROWS * HIDDEN, sizeof(uint16_t));
+    uint16_t *update = (uint16_t *)calloc((size_t)ROWS * HIDDEN, sizeof(uint16_t));
+    uint16_t *weight = (uint16_t *)calloc((size_t)HIDDEN * HIDDEN, sizeof(uint16_t));
+    uint16_t *bias = (uint16_t *)calloc(HIDDEN, sizeof(uint16_t));
+    float *out_f32 = (float *)calloc((size_t)ROWS * HIDDEN, sizeof(float));
+    uint16_t *out_f16 = (uint16_t *)calloc((size_t)ROWS * HIDDEN, sizeof(uint16_t));
+    CHECK(context != NULL);
+    CHECK(residual != NULL);
+    CHECK(update != NULL);
+    CHECK(weight != NULL);
+    CHECK(bias != NULL);
+    CHECK(out_f32 != NULL);
+    CHECK(out_f16 != NULL);
+
+    for (uint32_t row = 0u; row < ROWS; ++row) {
+        for (uint32_t col = 0u; col < HIDDEN; ++col) {
+            const size_t idx = (size_t)row * HIDDEN + col;
+            context[idx] = f32_to_f16_bits(((int)((row * 11u + col * 5u) % 29u) - 14) * 0.0075f);
+            residual[idx] = f32_to_f16_bits(((int)((row * 7u + col * 3u) % 31u) - 15) * 0.011f);
+            update[idx] = f32_to_f16_bits(((int)((row * 13u + col * 2u) % 23u) - 11) * 0.009f);
+        }
+    }
+
+    const uint32_t active_out[] = {0u, 17u, 101u, HIDDEN - 1u};
+    for (size_t i = 0u; i < sizeof(active_out) / sizeof(active_out[0]); ++i) {
+        const uint32_t out_col = active_out[i];
+        bias[out_col] = f32_to_f16_bits(((int)i - 1) * 0.025f);
+        weight[sam_attention_proj_weight_index(out_col, (uint32_t)(2u + i))] =
+            f32_to_f16_bits(0.12f - 0.01f * (float)i);
+        weight[sam_attention_proj_weight_index(out_col, (uint32_t)(37u + 5u * i))] =
+            f32_to_f16_bits(-0.075f + 0.015f * (float)i);
+        weight[sam_attention_proj_weight_index(out_col, HIDDEN - 1u - (uint32_t)i)] =
+            f32_to_f16_bits(0.02f * (float)(i + 1u));
+    }
+
+    char error[1024];
+    memset(error, 0, sizeof(error));
+    uocr_metal_context *ctx = uocr_metal_context_create(UOCR_TEST_METAL_RESOURCE_PATH, error, sizeof(error));
+    CHECK(ctx != NULL);
+
+    CHECK(uocr_metal_context_sam_attention_project_residual_f16(ctx,
+                                                                 context,
+                                                                 weight,
+                                                                 bias,
+                                                                 residual,
+                                                                 ROWS,
+                                                                 UOCR_METAL_DENSE_OUTPUT_F32,
+                                                                 out_f32,
+                                                                 error,
+                                                                 sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+
+    struct residual_sample {
+        uint32_t row;
+        uint32_t col;
+    } samples[] = {
+        {0u, 0u},
+        {1u, 17u},
+        {2u, 101u},
+        {2u, HIDDEN - 1u},
+        {1u, 23u},
+    };
+    for (size_t i = 0u; i < sizeof(samples) / sizeof(samples[0]); ++i) {
+        const size_t idx = (size_t)samples[i].row * HIDDEN + samples[i].col;
+        const float expected = sam_attention_project_residual_expected(context,
+                                                                       weight,
+                                                                       bias,
+                                                                       residual,
+                                                                       samples[i].row,
+                                                                       samples[i].col);
+        CHECK(isfinite(expected));
+        CHECK(fabsf(out_f32[idx] - expected) <= 2.0e-5f);
+    }
+
+    CHECK(uocr_metal_context_sam_attention_project_residual_f16(ctx,
+                                                                 context,
+                                                                 weight,
+                                                                 bias,
+                                                                 residual,
+                                                                 ROWS,
+                                                                 UOCR_METAL_DENSE_OUTPUT_F16,
+                                                                 out_f16,
+                                                                 error,
+                                                                 sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    for (size_t i = 0u; i < sizeof(samples) / sizeof(samples[0]); ++i) {
+        const size_t idx = (size_t)samples[i].row * HIDDEN + samples[i].col;
+        const float expected = sam_attention_project_residual_expected(context,
+                                                                       weight,
+                                                                       bias,
+                                                                       residual,
+                                                                       samples[i].row,
+                                                                       samples[i].col);
+        CHECK(fabsf(f16_bits_to_f32(out_f16[idx]) - expected) <= 1.5e-3f);
+    }
+
+    CHECK(uocr_metal_context_sam_residual_add_f16(ctx,
+                                                   residual,
+                                                   update,
+                                                   ROWS,
+                                                   UOCR_METAL_DENSE_OUTPUT_F32,
+                                                   out_f32,
+                                                   error,
+                                                   sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    for (size_t i = 0u; i < sizeof(samples) / sizeof(samples[0]); ++i) {
+        const size_t idx = (size_t)samples[i].row * HIDDEN + samples[i].col;
+        const float expected = f16_bits_to_f32(residual[idx]) + f16_bits_to_f32(update[idx]);
+        CHECK(fabsf(out_f32[idx] - expected) <= 1.0e-7f);
+    }
+
+    CHECK(uocr_metal_context_sam_residual_add_f16(ctx,
+                                                   residual,
+                                                   update,
+                                                   ROWS,
+                                                   UOCR_METAL_DENSE_OUTPUT_F16,
+                                                   out_f16,
+                                                   error,
+                                                   sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    for (size_t i = 0u; i < sizeof(samples) / sizeof(samples[0]); ++i) {
+        const size_t idx = (size_t)samples[i].row * HIDDEN + samples[i].col;
+        const float expected = f16_bits_to_f32(residual[idx]) + f16_bits_to_f32(update[idx]);
+        CHECK(fabsf(f16_bits_to_f32(out_f16[idx]) - expected) <= 8.0e-4f);
+    }
+
+    CHECK(uocr_metal_context_sam_residual_add_f16(ctx,
+                                                   residual,
+                                                   NULL,
+                                                   ROWS,
+                                                   UOCR_METAL_DENSE_OUTPUT_F32,
+                                                   out_f32,
+                                                   error,
+                                                   sizeof(error)) == 0);
+    CHECK(strstr(error, "invalid Metal SAM residual") != NULL);
+
+    CHECK(uocr_metal_context_sam_attention_project_residual_f16(ctx,
+                                                                 context,
+                                                                 weight,
+                                                                 bias,
+                                                                 NULL,
+                                                                 ROWS,
+                                                                 UOCR_METAL_DENSE_OUTPUT_F32,
+                                                                 out_f32,
+                                                                 error,
+                                                                 sizeof(error)) == 0);
+    CHECK(strstr(error, "invalid Metal SAM attention residual") != NULL);
+
+    uocr_metal_context_destroy(ctx);
+    free(out_f16);
+    free(out_f32);
+    free(bias);
+    free(weight);
+    free(update);
+    free(residual);
+    free(context);
     return 0;
 }
 
@@ -10246,6 +10431,7 @@ int main(void) {
     if (test_metal_sam_global_attention_f16() != 0) return 1;
     if (test_metal_sam_rel_pos_attention_f16() != 0) return 1;
     if (test_metal_sam_mlp_f16() != 0) return 1;
+    if (test_metal_sam_residuals_f16() != 0) return 1;
     if (test_metal_get_rows_f16() != 0) return 1;
     if (test_metal_prompt_assembly_f16() != 0) return 1;
     if (test_metal_prompt_assembly_from_mapped_model_f16() != 0) return 1;

@@ -961,6 +961,109 @@ kernel void uocr_sam_rel_pos_attention_f16_to_f32(device const half *q_src [[buf
     }
 }
 
+struct UocrSamResidualParams {
+    uint n_rows;
+    uint hidden_size;
+    uint reserved0;
+    uint reserved1;
+};
+
+kernel void uocr_sam_residual_add_f16_to_f16(device const half *base [[buffer(0)]],
+                                             device const half *update [[buffer(1)]],
+                                             device half *dst [[buffer(2)]],
+                                             constant UocrSamResidualParams &params [[buffer(3)]],
+                                             uint gid [[thread_position_in_grid]]) {
+    const uint values = params.n_rows * params.hidden_size;
+    if (gid >= values) {
+        return;
+    }
+    dst[gid] = half(float(base[gid]) + float(update[gid]));
+}
+
+kernel void uocr_sam_residual_add_f16_to_f32(device const half *base [[buffer(0)]],
+                                             device const half *update [[buffer(1)]],
+                                             device float *dst [[buffer(2)]],
+                                             constant UocrSamResidualParams &params [[buffer(3)]],
+                                             uint gid [[thread_position_in_grid]]) {
+    const uint values = params.n_rows * params.hidden_size;
+    if (gid >= values) {
+        return;
+    }
+    dst[gid] = float(base[gid]) + float(update[gid]);
+}
+
+static inline float uocr_sam_attention_project_dot_f16(device const half *src,
+                                                       device const half *weight,
+                                                       constant UocrSamResidualParams &params,
+                                                       uint row,
+                                                       uint out_col,
+                                                       uint tid,
+                                                       uint ntg,
+                                                       threadgroup float *partials) {
+    float sum = 0.0f;
+    const uint src_base = row * params.hidden_size;
+    const uint weight_base = out_col * params.hidden_size;
+    for (uint k = tid; k < params.hidden_size; k += ntg) {
+        sum += float(src[src_base + k]) * float(weight[weight_base + k]);
+    }
+    partials[tid] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = ntg >> 1; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            partials[tid] += partials[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    return partials[0];
+}
+
+kernel void uocr_sam_attention_project_residual_f16_to_f16(device const half *src [[buffer(0)]],
+                                                           device const half *weight [[buffer(1)]],
+                                                           device const half *bias [[buffer(2)]],
+                                                           device const half *residual [[buffer(3)]],
+                                                           device half *dst [[buffer(4)]],
+                                                           constant UocrSamResidualParams &params [[buffer(5)]],
+                                                           threadgroup float *partials [[threadgroup(0)]],
+                                                           uint output_index [[threadgroup_position_in_grid]],
+                                                           uint tid [[thread_index_in_threadgroup]],
+                                                           uint ntg [[threads_per_threadgroup]]) {
+    const uint row = output_index / params.hidden_size;
+    const uint out_col = output_index - row * params.hidden_size;
+    if (row >= params.n_rows || out_col >= params.hidden_size) {
+        return;
+    }
+
+    float value = uocr_sam_attention_project_dot_f16(src, weight, params, row, out_col, tid, ntg, partials);
+    if (tid == 0u) {
+        const uint dst_index = row * params.hidden_size + out_col;
+        dst[dst_index] = half(value + float(bias[out_col]) + float(residual[dst_index]));
+    }
+}
+
+kernel void uocr_sam_attention_project_residual_f16_to_f32(device const half *src [[buffer(0)]],
+                                                           device const half *weight [[buffer(1)]],
+                                                           device const half *bias [[buffer(2)]],
+                                                           device const half *residual [[buffer(3)]],
+                                                           device float *dst [[buffer(4)]],
+                                                           constant UocrSamResidualParams &params [[buffer(5)]],
+                                                           threadgroup float *partials [[threadgroup(0)]],
+                                                           uint output_index [[threadgroup_position_in_grid]],
+                                                           uint tid [[thread_index_in_threadgroup]],
+                                                           uint ntg [[threads_per_threadgroup]]) {
+    const uint row = output_index / params.hidden_size;
+    const uint out_col = output_index - row * params.hidden_size;
+    if (row >= params.n_rows || out_col >= params.hidden_size) {
+        return;
+    }
+
+    float value = uocr_sam_attention_project_dot_f16(src, weight, params, row, out_col, tid, ntg, partials);
+    if (tid == 0u) {
+        const uint dst_index = row * params.hidden_size + out_col;
+        dst[dst_index] = value + float(bias[out_col]) + float(residual[dst_index]);
+    }
+}
+
 struct UocrSamMlpParams {
     uint n_rows;
     uint hidden_size;

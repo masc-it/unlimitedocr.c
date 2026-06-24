@@ -352,6 +352,13 @@ typedef struct uocr_metal_sam_rel_pos_attention_params {
     uint32_t reserved2;
 } uocr_metal_sam_rel_pos_attention_params;
 
+typedef struct uocr_metal_sam_residual_params {
+    uint32_t n_rows;
+    uint32_t hidden_size;
+    uint32_t reserved0;
+    uint32_t reserved1;
+} uocr_metal_sam_residual_params;
+
 typedef struct uocr_metal_sam_mlp_params {
     uint32_t n_rows;
     uint32_t hidden_size;
@@ -363,6 +370,8 @@ _Static_assert(sizeof(uocr_metal_sam_window_attention_params) == 32u,
                "uocr_metal_sam_window_attention_params ABI mismatch");
 _Static_assert(sizeof(uocr_metal_sam_rel_pos_attention_params) == 48u,
                "uocr_metal_sam_rel_pos_attention_params ABI mismatch");
+_Static_assert(sizeof(uocr_metal_sam_residual_params) == 16u,
+               "uocr_metal_sam_residual_params ABI mismatch");
 _Static_assert(sizeof(uocr_metal_sam_mlp_params) == 16u,
                "uocr_metal_sam_mlp_params ABI mismatch");
 
@@ -6374,6 +6383,306 @@ int uocr_metal_context_sam_rel_pos_attention_f16(uocr_metal_context *ctx,
 
     metal_clear_error(error, error_size);
     return 1;
+}
+
+int uocr_metal_context_sam_residual_add_f16(uocr_metal_context *ctx,
+                                            const uint16_t *base_f16,
+                                            const uint16_t *update_f16,
+                                            uint32_t n_rows,
+                                            uocr_metal_dense_output_type output_type,
+                                            void *out,
+                                            char *error,
+                                            size_t error_size) {
+    metal_clear_error(error, error_size);
+    if (ctx == NULL || base_f16 == NULL || update_f16 == NULL || out == NULL || n_rows == 0u) {
+        return metal_fail(error, error_size, "invalid Metal SAM residual request");
+    }
+    if (output_type != UOCR_METAL_DENSE_OUTPUT_F16 && output_type != UOCR_METAL_DENSE_OUTPUT_F32) {
+        return metal_fail(error, error_size, "unsupported Metal SAM residual output type %d", (int)output_type);
+    }
+
+    uint64_t value_count = 0u;
+    uint64_t input_bytes = 0u;
+    uint64_t output_bytes = 0u;
+    const uint64_t output_element_bytes = output_type == UOCR_METAL_DENSE_OUTPUT_F16 ? 2u : (uint64_t)sizeof(float);
+    if (!checked_mul_u64((uint64_t)n_rows, (uint64_t)UOCR_SAM_HIDDEN_SIZE, &value_count) ||
+        !checked_mul_u64(value_count, 2u, &input_bytes) ||
+        !checked_mul_u64(value_count, output_element_bytes, &output_bytes) || value_count > (uint64_t)UINT32_MAX ||
+        input_bytes > (uint64_t)SIZE_MAX || output_bytes > (uint64_t)SIZE_MAX) {
+        return metal_fail(error, error_size, "Metal SAM residual byte-size overflow");
+    }
+
+    const uint64_t max_buffer_length = metal_device_max_buffer_length(ctx->device);
+    if (input_bytes > max_buffer_length || output_bytes > max_buffer_length) {
+        return metal_fail(error,
+                          error_size,
+                          "Metal SAM residual buffers exceed maxBufferLength %llu",
+                          (unsigned long long)max_buffer_length);
+    }
+
+    int result = 0;
+    @autoreleasepool {
+        const char *function_name = output_type == UOCR_METAL_DENSE_OUTPUT_F16 ?
+                                        "uocr_sam_residual_add_f16_to_f16" :
+                                        "uocr_sam_residual_add_f16_to_f32";
+        id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, function_name, error, error_size);
+        if (pipeline == nil) {
+            return 0;
+        }
+
+        id<MTLBuffer> base = nil;
+        id<MTLBuffer> update = nil;
+        id<MTLBuffer> dst = nil;
+        id<MTLCommandBuffer> cb = nil;
+        id<MTLComputeCommandEncoder> enc = nil;
+
+        base = [ctx->device newBufferWithBytes:base_f16
+                                        length:(NSUInteger)input_bytes
+                                       options:MTLResourceStorageModeShared];
+        if (base == nil) {
+            result = metal_fail(error, error_size, "failed to allocate Metal SAM residual base buffer");
+            goto cleanup_residual_add;
+        }
+        base.label = @"uocr_sam_residual_base_f16";
+
+        update = [ctx->device newBufferWithBytes:update_f16
+                                          length:(NSUInteger)input_bytes
+                                         options:MTLResourceStorageModeShared];
+        if (update == nil) {
+            result = metal_fail(error, error_size, "failed to allocate Metal SAM residual update buffer");
+            goto cleanup_residual_add;
+        }
+        update.label = @"uocr_sam_residual_update_f16";
+
+        dst = [ctx->device newBufferWithLength:(NSUInteger)output_bytes options:MTLResourceStorageModeShared];
+        if (dst == nil) {
+            result = metal_fail(error, error_size, "failed to allocate Metal SAM residual output buffer");
+            goto cleanup_residual_add;
+        }
+        dst.label = @"uocr_sam_residual_output";
+        memset([dst contents], 0, (size_t)output_bytes);
+
+        cb = [ctx->queue commandBuffer];
+        if (cb == nil) {
+            result = metal_fail(error, error_size, "failed to create Metal SAM residual command buffer");
+            goto cleanup_residual_add;
+        }
+        cb.label = @"uocr_sam_residual_command_buffer";
+
+        enc = [cb computeCommandEncoder];
+        if (enc == nil) {
+            result = metal_fail(error, error_size, "failed to create Metal SAM residual command encoder");
+            goto cleanup_residual_add;
+        }
+
+        uocr_metal_sam_residual_params params;
+        params.n_rows = n_rows;
+        params.hidden_size = UOCR_SAM_HIDDEN_SIZE;
+        params.reserved0 = 0u;
+        params.reserved1 = 0u;
+
+        const NSUInteger threads_per_group = metal_power2_threadgroup_width(256u, pipeline.maxTotalThreadsPerThreadgroup);
+        [enc setComputePipelineState:pipeline];
+        [enc setBuffer:base offset:0u atIndex:0u];
+        [enc setBuffer:update offset:0u atIndex:1u];
+        [enc setBuffer:dst offset:0u atIndex:2u];
+        [enc setBytes:&params length:sizeof(params) atIndex:3u];
+        [enc dispatchThreads:MTLSizeMake((NSUInteger)value_count, 1u, 1u)
+             threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1u, 1u)];
+        [enc endEncoding];
+
+        [cb commit];
+        [cb waitUntilCompleted];
+        if (cb.status == MTLCommandBufferStatusError) {
+            NSString *description = cb.error != nil ? [cb.error localizedDescription] : @"unknown command-buffer error";
+            result = metal_fail(error, error_size, "Metal SAM residual command failed: %s", [description UTF8String]);
+            goto cleanup_residual_add;
+        }
+
+        memcpy(out, [dst contents], (size_t)output_bytes);
+        result = 1;
+
+    cleanup_residual_add:
+        [dst release];
+        [update release];
+        [base release];
+    }
+
+    if (result) {
+        metal_clear_error(error, error_size);
+    }
+    return result;
+}
+
+int uocr_metal_context_sam_attention_project_residual_f16(uocr_metal_context *ctx,
+                                                          const uint16_t *attention_context_f16,
+                                                          const uint16_t *proj_weight_f16,
+                                                          const uint16_t *proj_bias_f16,
+                                                          const uint16_t *residual_f16,
+                                                          uint32_t n_rows,
+                                                          uocr_metal_dense_output_type output_type,
+                                                          void *out,
+                                                          char *error,
+                                                          size_t error_size) {
+    metal_clear_error(error, error_size);
+    if (ctx == NULL || attention_context_f16 == NULL || proj_weight_f16 == NULL || proj_bias_f16 == NULL ||
+        residual_f16 == NULL || out == NULL || n_rows == 0u) {
+        return metal_fail(error, error_size, "invalid Metal SAM attention residual request");
+    }
+    if (output_type != UOCR_METAL_DENSE_OUTPUT_F16 && output_type != UOCR_METAL_DENSE_OUTPUT_F32) {
+        return metal_fail(error, error_size, "unsupported Metal SAM attention residual output type %d", (int)output_type);
+    }
+    if (UOCR_SAM_ATTENTION_HEADS * UOCR_SAM_HEAD_DIM != UOCR_SAM_HIDDEN_SIZE) {
+        return metal_fail(error, error_size, "Metal SAM attention residual constants are inconsistent");
+    }
+
+    uint64_t activation_values = 0u;
+    uint64_t activation_bytes = 0u;
+    uint64_t weight_values = 0u;
+    uint64_t weight_bytes = 0u;
+    uint64_t bias_bytes = 0u;
+    uint64_t output_bytes = 0u;
+    const uint64_t output_element_bytes = output_type == UOCR_METAL_DENSE_OUTPUT_F16 ? 2u : (uint64_t)sizeof(float);
+    if (!checked_mul_u64((uint64_t)n_rows, (uint64_t)UOCR_SAM_HIDDEN_SIZE, &activation_values) ||
+        !checked_mul_u64(activation_values, 2u, &activation_bytes) ||
+        !checked_mul_u64((uint64_t)UOCR_SAM_HIDDEN_SIZE, (uint64_t)UOCR_SAM_HIDDEN_SIZE, &weight_values) ||
+        !checked_mul_u64(weight_values, 2u, &weight_bytes) ||
+        !checked_mul_u64((uint64_t)UOCR_SAM_HIDDEN_SIZE, 2u, &bias_bytes) ||
+        !checked_mul_u64(activation_values, output_element_bytes, &output_bytes) ||
+        activation_values > (uint64_t)UINT32_MAX || activation_bytes > (uint64_t)SIZE_MAX ||
+        weight_bytes > (uint64_t)SIZE_MAX || bias_bytes > (uint64_t)SIZE_MAX || output_bytes > (uint64_t)SIZE_MAX) {
+        return metal_fail(error, error_size, "Metal SAM attention residual byte-size overflow");
+    }
+
+    const uint64_t max_buffer_length = metal_device_max_buffer_length(ctx->device);
+    if (activation_bytes > max_buffer_length || weight_bytes > max_buffer_length || bias_bytes > max_buffer_length ||
+        output_bytes > max_buffer_length) {
+        return metal_fail(error,
+                          error_size,
+                          "Metal SAM attention residual buffers exceed maxBufferLength %llu",
+                          (unsigned long long)max_buffer_length);
+    }
+
+    int result = 0;
+    @autoreleasepool {
+        const char *function_name = output_type == UOCR_METAL_DENSE_OUTPUT_F16 ?
+                                        "uocr_sam_attention_project_residual_f16_to_f16" :
+                                        "uocr_sam_attention_project_residual_f16_to_f32";
+        id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, function_name, error, error_size);
+        if (pipeline == nil) {
+            return 0;
+        }
+
+        id<MTLBuffer> src = nil;
+        id<MTLBuffer> weight = nil;
+        id<MTLBuffer> bias = nil;
+        id<MTLBuffer> residual = nil;
+        id<MTLBuffer> dst = nil;
+        id<MTLCommandBuffer> cb = nil;
+        id<MTLComputeCommandEncoder> enc = nil;
+
+        src = [ctx->device newBufferWithBytes:attention_context_f16
+                                       length:(NSUInteger)activation_bytes
+                                      options:MTLResourceStorageModeShared];
+        if (src == nil) {
+            result = metal_fail(error, error_size, "failed to allocate Metal SAM attention residual context buffer");
+            goto cleanup_attention_residual;
+        }
+        src.label = @"uocr_sam_attention_project_context_f16";
+
+        weight = [ctx->device newBufferWithBytes:proj_weight_f16
+                                          length:(NSUInteger)weight_bytes
+                                         options:MTLResourceStorageModeShared];
+        if (weight == nil) {
+            result = metal_fail(error, error_size, "failed to allocate Metal SAM attention residual weight buffer");
+            goto cleanup_attention_residual;
+        }
+        weight.label = @"uocr_sam_attention_project_weight_f16";
+
+        bias = [ctx->device newBufferWithBytes:proj_bias_f16
+                                        length:(NSUInteger)bias_bytes
+                                       options:MTLResourceStorageModeShared];
+        if (bias == nil) {
+            result = metal_fail(error, error_size, "failed to allocate Metal SAM attention residual bias buffer");
+            goto cleanup_attention_residual;
+        }
+        bias.label = @"uocr_sam_attention_project_bias_f16";
+
+        residual = [ctx->device newBufferWithBytes:residual_f16
+                                            length:(NSUInteger)activation_bytes
+                                           options:MTLResourceStorageModeShared];
+        if (residual == nil) {
+            result = metal_fail(error, error_size, "failed to allocate Metal SAM attention residual shortcut buffer");
+            goto cleanup_attention_residual;
+        }
+        residual.label = @"uocr_sam_attention_project_residual_f16";
+
+        dst = [ctx->device newBufferWithLength:(NSUInteger)output_bytes options:MTLResourceStorageModeShared];
+        if (dst == nil) {
+            result = metal_fail(error, error_size, "failed to allocate Metal SAM attention residual output buffer");
+            goto cleanup_attention_residual;
+        }
+        dst.label = @"uocr_sam_attention_project_residual_output";
+        memset([dst contents], 0, (size_t)output_bytes);
+
+        cb = [ctx->queue commandBuffer];
+        if (cb == nil) {
+            result = metal_fail(error, error_size, "failed to create Metal SAM attention residual command buffer");
+            goto cleanup_attention_residual;
+        }
+        cb.label = @"uocr_sam_attention_project_residual_command_buffer";
+
+        enc = [cb computeCommandEncoder];
+        if (enc == nil) {
+            result = metal_fail(error, error_size, "failed to create Metal SAM attention residual command encoder");
+            goto cleanup_attention_residual;
+        }
+
+        uocr_metal_sam_residual_params params;
+        params.n_rows = n_rows;
+        params.hidden_size = UOCR_SAM_HIDDEN_SIZE;
+        params.reserved0 = 0u;
+        params.reserved1 = 0u;
+
+        const NSUInteger threads_per_group = metal_power2_threadgroup_width(256u, pipeline.maxTotalThreadsPerThreadgroup);
+        [enc setComputePipelineState:pipeline];
+        [enc setBuffer:src offset:0u atIndex:0u];
+        [enc setBuffer:weight offset:0u atIndex:1u];
+        [enc setBuffer:bias offset:0u atIndex:2u];
+        [enc setBuffer:residual offset:0u atIndex:3u];
+        [enc setBuffer:dst offset:0u atIndex:4u];
+        [enc setBytes:&params length:sizeof(params) atIndex:5u];
+        [enc setThreadgroupMemoryLength:threads_per_group * sizeof(float) atIndex:0u];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)activation_values, 1u, 1u)
+             threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1u, 1u)];
+        [enc endEncoding];
+
+        [cb commit];
+        [cb waitUntilCompleted];
+        if (cb.status == MTLCommandBufferStatusError) {
+            NSString *description = cb.error != nil ? [cb.error localizedDescription] : @"unknown command-buffer error";
+            result = metal_fail(error,
+                                error_size,
+                                "Metal SAM attention residual command failed: %s",
+                                [description UTF8String]);
+            goto cleanup_attention_residual;
+        }
+
+        memcpy(out, [dst contents], (size_t)output_bytes);
+        result = 1;
+
+    cleanup_attention_residual:
+        [dst release];
+        [residual release];
+        [bias release];
+        [weight release];
+        [src release];
+    }
+
+    if (result) {
+        metal_clear_error(error, error_size);
+    }
+    return result;
 }
 
 int uocr_metal_context_sam_mlp_f16(uocr_metal_context *ctx,

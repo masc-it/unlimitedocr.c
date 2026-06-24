@@ -388,6 +388,36 @@ int uocr_metal_context_sam_rel_pos_attention_f16(uocr_metal_context *ctx,
                                                  char *error,
                                                  size_t error_size);
 
+/* Diagnostic SAM residual helper for transformer block wiring. Adds two fp16
+ * BHWC-flattened row tensors [n_rows,768] with fp32 arithmetic before casting
+ * to the requested output type. Use this for shortcut + attention update after
+ * window unpartition and for the final x + MLP(norm2(x)) residual.
+ */
+int uocr_metal_context_sam_residual_add_f16(uocr_metal_context *ctx,
+                                            const uint16_t *base_f16,
+                                            const uint16_t *update_f16,
+                                            uint32_t n_rows,
+                                            uocr_metal_dense_output_type output_type,
+                                            void *out,
+                                            char *error,
+                                            size_t error_size);
+
+/* Diagnostic SAM attention-output residual helper. Computes
+ * residual + (attention_context @ proj_weight.T + proj_bias) for rows shaped
+ * [n_rows,768]. This matches the SAM Attention.proj step plus the first block
+ * shortcut residual when the caller supplies tensors in the same row order.
+ */
+int uocr_metal_context_sam_attention_project_residual_f16(uocr_metal_context *ctx,
+                                                          const uint16_t *attention_context_f16,
+                                                          const uint16_t *proj_weight_f16,
+                                                          const uint16_t *proj_bias_f16,
+                                                          const uint16_t *residual_f16,
+                                                          uint32_t n_rows,
+                                                          uocr_metal_dense_output_type output_type,
+                                                          void *out,
+                                                          char *error,
+                                                          size_t error_size);
+
 /* Diagnostic SAM transformer MLP helper. Computes
  * lin2(GELU(lin1(input))) with input [n_rows,768], lin1 weight/bias
  * [3072,768]/[3072], lin2 weight/bias [768,3072]/[768]. GELU uses PyTorch's
