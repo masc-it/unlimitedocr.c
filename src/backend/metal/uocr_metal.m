@@ -1747,6 +1747,138 @@ int uocr_metal_kv_cache_token_for_attention_index(uint32_t prompt_length,
     return uocr_metal_kv_cache_decode_attention_index_to_token(&plan, attention_index, out_cache_token);
 }
 
+static void metal_decoder_result_reset(uocr_metal_decoder_result_f16 *result) {
+    if (result == NULL) {
+        return;
+    }
+    result->generated_count = 0u;
+    result->stopped_on_eos = 0u;
+    result->last_token_id = UINT32_MAX;
+    result->last_score_f32 = 0.0f;
+    result->reserved0 = 0u;
+}
+
+static int metal_decoder_runtime_arenas_ready(const uocr_metal_context *ctx) {
+    if (ctx == NULL || !ctx->has_kv_cache_layout) {
+        return 0;
+    }
+    return ctx->runtime_arenas[UOCR_METAL_ARENA_KV_CACHE].buffer != nil &&
+           ctx->runtime_arenas[UOCR_METAL_ARENA_PROMPT_EMBEDDINGS].buffer != nil &&
+           ctx->runtime_arenas[UOCR_METAL_ARENA_HIDDEN_PINGPONG].buffer != nil &&
+           ctx->runtime_arenas[UOCR_METAL_ARENA_ROUTER_TOPK].buffer != nil &&
+           ctx->runtime_arenas[UOCR_METAL_ARENA_MOE_INTERMEDIATE].buffer != nil &&
+           ctx->runtime_arenas[UOCR_METAL_ARENA_LOGITS_READBACK].buffer != nil;
+}
+
+int uocr_metal_context_generate_f16(uocr_metal_context *ctx,
+                                    const uocr_metal_decoder_request_f16 *request,
+                                    uocr_metal_decoder_result_f16 *result,
+                                    char *error,
+                                    size_t error_size) {
+    metal_clear_error(error, error_size);
+    if (ctx == NULL || request == NULL || result == NULL) {
+        return metal_fail(error, error_size, "invalid Metal integrated decoder request");
+    }
+    metal_decoder_result_reset(result);
+
+    if (!metal_decoder_runtime_arenas_ready(ctx)) {
+        return metal_fail(error, error_size, "Metal integrated decoder requires allocated runtime arenas");
+    }
+    if (request->input_ids == NULL || request->image_mask == NULL || request->n_tokens == 0u) {
+        return metal_fail(error, error_size, "Metal integrated decoder requires input ids, image mask, and prompt tokens");
+    }
+    if (request->slot >= ctx->kv_cache_layout.batch_slots) {
+        return metal_fail(error,
+                          error_size,
+                          "Metal integrated decoder slot %u exceeds allocated batch slots %u",
+                          request->slot,
+                          ctx->kv_cache_layout.batch_slots);
+    }
+    if (request->n_tokens > ctx->kv_cache_layout.prompt_token_capacity) {
+        return metal_fail(error,
+                          error_size,
+                          "Metal integrated decoder prompt length %u exceeds prompt arena capacity %u",
+                          request->n_tokens,
+                          ctx->kv_cache_layout.prompt_token_capacity);
+    }
+    if (request->n_tokens > UOCR_MAX_POSITIONS || request->max_new_tokens > UOCR_MAX_POSITIONS - request->n_tokens) {
+        return metal_fail(error, error_size, "Metal integrated decoder sequence length exceeds max positions");
+    }
+    if (request->no_repeat_ngram_size == 0u && request->no_repeat_window != 0u) {
+        return metal_fail(error, error_size, "Metal integrated decoder no_repeat_window is set but no_repeat_ngram_size is zero");
+    }
+    if (request->no_repeat_ngram_size > UOCR_MAX_POSITIONS || request->no_repeat_window > UOCR_MAX_POSITIONS) {
+        return metal_fail(error, error_size, "Metal integrated decoder no-repeat configuration exceeds max positions");
+    }
+    if (request->max_new_tokens > 0u &&
+        (result->generated_ids == NULL || result->generated_capacity < request->max_new_tokens)) {
+        return metal_fail(error,
+                          error_size,
+                          "Metal integrated decoder generated-token output capacity %u is smaller than requested %u",
+                          result->generated_capacity,
+                          request->max_new_tokens);
+    }
+
+    uint32_t image_mask_count = 0u;
+    for (uint32_t i = 0u; i < request->n_tokens; ++i) {
+        if (request->input_ids[i] < 0 || (uint32_t)request->input_ids[i] >= UOCR_VOCAB_SIZE) {
+            return metal_fail(error,
+                              error_size,
+                              "Metal integrated decoder token id %d at position %u is outside vocab %u",
+                              request->input_ids[i],
+                              i,
+                              UOCR_VOCAB_SIZE);
+        }
+        if (request->image_mask[i] > 1u) {
+            return metal_fail(error,
+                              error_size,
+                              "Metal integrated decoder image mask value %u at position %u is not 0/1",
+                              (unsigned)request->image_mask[i],
+                              i);
+        }
+        image_mask_count += request->image_mask[i] != 0u ? 1u : 0u;
+    }
+
+    if (request->image_span_length == 0u) {
+        if (request->image_span_start != UINT32_MAX || request->image_features_f16 != NULL || image_mask_count != 0u) {
+            return metal_fail(error,
+                              error_size,
+                              "Metal integrated decoder text-only requests must use UINT32_MAX image span, no image features, and an empty image mask");
+        }
+    } else {
+        if (request->image_features_f16 == NULL || request->image_span_start == UINT32_MAX ||
+            request->image_span_start > request->n_tokens ||
+            request->image_span_length > request->n_tokens - request->image_span_start) {
+            return metal_fail(error, error_size, "Metal integrated decoder image span/features are invalid");
+        }
+        if (image_mask_count != request->image_span_length) {
+            return metal_fail(error,
+                              error_size,
+                              "Metal integrated decoder image mask count %u does not match image span length %u",
+                              image_mask_count,
+                              request->image_span_length);
+        }
+        for (uint32_t i = 0u; i < request->image_span_length; ++i) {
+            const uint32_t pos = request->image_span_start + i;
+            if (request->image_mask[pos] == 0u) {
+                return metal_fail(error,
+                                  error_size,
+                                  "Metal integrated decoder image span position %u is not marked in image mask",
+                                  pos);
+            }
+        }
+    }
+
+    if (request->max_new_tokens == 0u) {
+        metal_clear_error(error, error_size);
+        return 1;
+    }
+
+    return metal_fail(error,
+                      error_size,
+                      "integrated Metal fp16 decoder prefill/decode loop is not implemented yet");
+}
+
 int uocr_metal_context_get_rows_f16(uocr_metal_context *ctx,
                                     const uint16_t *table_f16,
                                     uint32_t table_rows,

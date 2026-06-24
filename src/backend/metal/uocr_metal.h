@@ -93,6 +93,31 @@ typedef struct uocr_metal_decode_attention_plan {
     uint32_t reserved1;
 } uocr_metal_decode_attention_plan;
 
+typedef struct uocr_metal_decoder_request_f16 {
+    const int32_t *input_ids;
+    const uint8_t *image_mask;
+    const uint16_t *image_features_f16; /* optional; image_span_start is UINT32_MAX when absent */
+    uint32_t n_tokens;
+    uint32_t max_new_tokens;
+    uint32_t slot;
+    uint32_t image_span_start;
+    uint32_t image_span_length;
+    uint32_t no_repeat_ngram_size;
+    uint32_t no_repeat_window;
+    uint32_t reserved0;
+} uocr_metal_decoder_request_f16;
+
+typedef struct uocr_metal_decoder_result_f16 {
+    int32_t *generated_ids;
+    float *generated_scores_f32_or_null;
+    uint32_t generated_capacity;
+    uint32_t generated_count;
+    uint32_t stopped_on_eos;
+    uint32_t last_token_id;
+    float last_score_f32;
+    uint32_t reserved0;
+} uocr_metal_decoder_result_f16;
+
 int uocr_metal_is_available(void);
 const char *uocr_metal_backend_name(void);
 uint64_t uocr_metal_recommended_working_set_size(void);
@@ -171,6 +196,19 @@ int uocr_metal_kv_cache_token_for_attention_index(uint32_t prompt_length,
                                                   uint32_t generated_count,
                                                   uint32_t attention_index,
                                                   uint32_t *out_cache_token);
+
+/* Integrated fp16 decoder orchestration boundary. The request/result structs
+ * are internal to the Metal backend and intentionally narrower than the public
+ * prepared-request ABI: frontend validation and sequence construction remain
+ * in shared C, while this entry point owns prompt assembly, prefill, decode,
+ * logits processing, and token handoff as those stages are wired. Existing
+ * per-op functions below remain diagnostic/parity helpers.
+ */
+int uocr_metal_context_generate_f16(uocr_metal_context *ctx,
+                                    const uocr_metal_decoder_request_f16 *request,
+                                    uocr_metal_decoder_result_f16 *result,
+                                    char *error,
+                                    size_t error_size);
 
 /* Diagnostic get-rows entry point used by synthetic tests. Runtime prompt
  * assembly should bind mmap-backed model buffers directly and reuse the same

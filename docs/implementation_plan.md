@@ -33,7 +33,7 @@ First implementation slice, in order:
 
 Current priority slice, in order. The coding agent should take the first unchecked item here before starting vision, quantization, batching, CUDA, or high-level OCR API work:
 
-- [ ] Define internal integrated Metal decoder request/result structs and one orchestration entry point; keep existing per-op Metal functions as diagnostic/parity helpers.
+- [x] Define internal integrated Metal decoder request/result structs and one orchestration entry point; keep existing per-op Metal functions as diagnostic/parity helpers.
 - [ ] Validate and cache all decoder-required mapped tensor bindings (`TOK_EMBED`, `FINAL_NORM`, `LM_HEAD`, layer norms, attention, dense MLP, MoE router/shared/expert weights) before running the integrated decoder.
 - [ ] Implement single-request, slot-0, text-only prompt prefill orchestration over all 12 layers using persistent arenas and KV cache; no image features and no batching yet.
 - [ ] Implement single-token decode-step orchestration using the existing KV ring helpers, prompt+generated-ring attention, final norm, LM head, no-repeat banning, greedy argmax, and EOS handling.
@@ -685,7 +685,7 @@ Current priority slice, in order. The coding agent should take the first uncheck
 
 These tasks turn the fp16 decoder primitives/parity helpers into the first real `uocr_generate_prepared()` generation path. Keep the scope narrow: Metal only, fp16 only, single request, text-only, no vision, no batching.
 
-- [ ] Define an internal decoder orchestration boundary, e.g. `uocr_metal_context_generate_text_f16()` or equivalent, that owns prefill/decode scheduling instead of exposing another per-op diagnostic helper.
+- [x] Define an internal decoder orchestration boundary, e.g. `uocr_metal_context_generate_text_f16()` or equivalent, that owns prefill/decode scheduling instead of exposing another per-op diagnostic helper.
 - [ ] Build and validate a decoder tensor-binding table from stable tensor ids once per mapped model; fail early if any text decoder tensor is missing, not fp16, or has an unexpected shape.
 - [ ] Assemble text-only prompt embeddings into the persistent prompt arena for slot `0`.
 - [ ] Run full-prompt prefill through all 12 decoder layers, writing prompt K/V for every layer and carrying hidden-state ping-pong buffers in Metal arenas.

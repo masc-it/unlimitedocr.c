@@ -7638,6 +7638,61 @@ static int test_metal_runtime_arenas(void) {
     return 0;
 }
 
+static int test_metal_integrated_decoder_boundary(void) {
+    if (!uocr_metal_is_available()) {
+        return 0;
+    }
+
+    char error[1024];
+    memset(error, 0, sizeof(error));
+    uocr_metal_context *ctx = uocr_metal_context_create(UOCR_TEST_METAL_RESOURCE_PATH, error, sizeof(error));
+    CHECK(ctx != NULL);
+
+    const int32_t input_ids[3] = {UOCR_TOKEN_BOS, 42, 77};
+    const uint8_t image_mask[3] = {0u, 0u, 0u};
+    uocr_metal_decoder_request_f16 request;
+    memset(&request, 0, sizeof(request));
+    request.input_ids = input_ids;
+    request.image_mask = image_mask;
+    request.n_tokens = 3u;
+    request.max_new_tokens = 0u;
+    request.slot = 0u;
+    request.image_span_start = UINT32_MAX;
+    request.image_span_length = 0u;
+
+    uocr_metal_decoder_result_f16 result;
+    memset(&result, 0, sizeof(result));
+    CHECK(uocr_metal_context_generate_f16(ctx, &request, &result, error, sizeof(error)) == 0);
+    CHECK(strstr(error, "requires allocated runtime arenas") != NULL);
+
+    CHECK(uocr_metal_context_allocate_runtime_arenas(ctx, 1u, 8u, error, sizeof(error)) == 1);
+    memset(error, 0, sizeof(error));
+    CHECK(uocr_metal_context_generate_f16(ctx, &request, &result, error, sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    CHECK(result.generated_count == 0u);
+    CHECK(result.stopped_on_eos == 0u);
+    CHECK(result.last_token_id == UINT32_MAX);
+
+    int32_t generated[1] = {0};
+    request.max_new_tokens = 1u;
+    result.generated_ids = generated;
+    result.generated_capacity = 1u;
+    memset(error, 0, sizeof(error));
+    CHECK(uocr_metal_context_generate_f16(ctx, &request, &result, error, sizeof(error)) == 0);
+    CHECK(strstr(error, "prefill/decode loop is not implemented yet") != NULL);
+    CHECK(result.generated_count == 0u);
+    CHECK(result.last_token_id == UINT32_MAX);
+
+    request.max_new_tokens = 0u;
+    request.image_span_start = 1u;
+    memset(error, 0, sizeof(error));
+    CHECK(uocr_metal_context_generate_f16(ctx, &request, &result, error, sizeof(error)) == 0);
+    CHECK(strstr(error, "text-only requests") != NULL);
+
+    uocr_metal_context_destroy(ctx);
+    return 0;
+}
+
 static int test_metal_model_mapping(void) {
     if (!uocr_metal_is_available()) {
         return 0;
@@ -7784,6 +7839,7 @@ int main(void) {
     if (test_metal_decode_attention_f16() != 0) return 1;
     if (test_metal_recent_decoder_primitives_stress() != 0) return 1;
     if (test_metal_runtime_arenas() != 0) return 1;
+    if (test_metal_integrated_decoder_boundary() != 0) return 1;
     if (test_metal_model_mapping() != 0) return 1;
     if (test_public_engine_open_initializes_metal() != 0) return 1;
     return 0;
