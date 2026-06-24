@@ -310,6 +310,23 @@ int uocr_metal_context_sam_layernorm_f16(uocr_metal_context *ctx,
                                          char *error,
                                          size_t error_size);
 
+/* Diagnostic SAM transformer QKV helper. Computes the biased qkv linear
+ * projection with input [n_rows,768], weight [2304,768], bias [2304], and
+ * writes separate Q/K/V tensors laid out [n_rows,12,64]. Dot products are
+ * accumulated in fp32 before casting to the requested output type.
+ */
+int uocr_metal_context_sam_qkv_f16(uocr_metal_context *ctx,
+                                   const uint16_t *input_f16,
+                                   const uint16_t *qkv_weight_f16,
+                                   const uint16_t *qkv_bias_f16,
+                                   uint32_t n_rows,
+                                   uocr_metal_dense_output_type output_type,
+                                   void *q_out,
+                                   void *k_out,
+                                   void *v_out,
+                                   char *error,
+                                   size_t error_size);
+
 /* Runtime prompt assembly into the persistent Metal prompt-embedding arena.
  * The arena must have been allocated with uocr_metal_context_allocate_runtime_arenas().
  * slot selects the batch slot. Tests can inspect the private arena with the

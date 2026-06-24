@@ -59,6 +59,18 @@ static size_t sam_abs_pos_index(uint32_t grid, uint32_t y, uint32_t x, uint32_t 
     return ((size_t)y * grid + x) * UOCR_SAM_HIDDEN_SIZE + channel;
 }
 
+static size_t sam_qkv_packed_col(uint32_t projection, uint32_t head, uint32_t dim) {
+    return (size_t)projection * UOCR_SAM_HIDDEN_SIZE + (size_t)head * UOCR_SAM_HEAD_DIM + dim;
+}
+
+static size_t sam_qkv_weight_index(uint32_t projection, uint32_t head, uint32_t dim, uint32_t input_col) {
+    return sam_qkv_packed_col(projection, head, dim) * UOCR_SAM_HIDDEN_SIZE + input_col;
+}
+
+static size_t sam_qkv_out_index(uint32_t row, uint32_t head, uint32_t dim) {
+    return (size_t)row * UOCR_SAM_HIDDEN_SIZE + (size_t)head * UOCR_SAM_HEAD_DIM + dim;
+}
+
 static float sam_cubic_weight(float x) {
     const float a = -0.75f;
     const float ax = fabsf(x);
@@ -571,6 +583,131 @@ static int test_metal_sam_layernorm_f16(void) {
     free(expected);
     free(out_f16);
     free(out_f32);
+    free(bias);
+    free(weight);
+    free(input);
+    return 0;
+}
+
+static int test_metal_sam_qkv_f16(void) {
+    if (!uocr_metal_is_available()) {
+        return 0;
+    }
+
+    enum { ROWS = 3u, HIDDEN = UOCR_SAM_HIDDEN_SIZE, QKV = UOCR_SAM_QKV_SIZE };
+    uint16_t *input = (uint16_t *)calloc((size_t)ROWS * HIDDEN, sizeof(uint16_t));
+    uint16_t *weight = (uint16_t *)calloc((size_t)QKV * HIDDEN, sizeof(uint16_t));
+    uint16_t *bias = (uint16_t *)calloc(QKV, sizeof(uint16_t));
+    float *q_f32 = (float *)calloc((size_t)ROWS * HIDDEN, sizeof(float));
+    float *k_f32 = (float *)calloc((size_t)ROWS * HIDDEN, sizeof(float));
+    float *v_f32 = (float *)calloc((size_t)ROWS * HIDDEN, sizeof(float));
+    uint16_t *q_f16 = (uint16_t *)calloc((size_t)ROWS * HIDDEN, sizeof(uint16_t));
+    uint16_t *k_f16 = (uint16_t *)calloc((size_t)ROWS * HIDDEN, sizeof(uint16_t));
+    uint16_t *v_f16 = (uint16_t *)calloc((size_t)ROWS * HIDDEN, sizeof(uint16_t));
+    CHECK(input != NULL);
+    CHECK(weight != NULL);
+    CHECK(bias != NULL);
+    CHECK(q_f32 != NULL);
+    CHECK(k_f32 != NULL);
+    CHECK(v_f32 != NULL);
+    CHECK(q_f16 != NULL);
+    CHECK(k_f16 != NULL);
+    CHECK(v_f16 != NULL);
+
+    for (uint32_t row = 0u; row < ROWS; ++row) {
+        for (uint32_t col = 0u; col < HIDDEN; ++col) {
+            input[(size_t)row * HIDDEN + col] = f32_to_f16_bits((float)(row * 100u + col) * 0.01f);
+        }
+    }
+
+    /* Q head 0 dim 0 = input[0] + 0.5 */
+    weight[sam_qkv_weight_index(0u, 0u, 0u, 0u)] = f32_to_f16_bits(1.0f);
+    bias[sam_qkv_packed_col(0u, 0u, 0u)] = f32_to_f16_bits(0.5f);
+    /* Q head 3 dim 4 is bias-only. */
+    bias[sam_qkv_packed_col(0u, 3u, 4u)] = f32_to_f16_bits(3.0f);
+    /* K head 2 dim 3 = 2 * input[5] - 1. */
+    weight[sam_qkv_weight_index(1u, 2u, 3u, 5u)] = f32_to_f16_bits(2.0f);
+    bias[sam_qkv_packed_col(1u, 2u, 3u)] = f32_to_f16_bits(-1.0f);
+    /* V head 11 dim 63 = input[7] - input[9] + 0.25. */
+    weight[sam_qkv_weight_index(2u, 11u, 63u, 7u)] = f32_to_f16_bits(1.0f);
+    weight[sam_qkv_weight_index(2u, 11u, 63u, 9u)] = f32_to_f16_bits(-1.0f);
+    bias[sam_qkv_packed_col(2u, 11u, 63u)] = f32_to_f16_bits(0.25f);
+
+    char error[1024];
+    memset(error, 0, sizeof(error));
+    uocr_metal_context *ctx = uocr_metal_context_create(UOCR_TEST_METAL_RESOURCE_PATH, error, sizeof(error));
+    CHECK(ctx != NULL);
+
+    CHECK(uocr_metal_context_sam_qkv_f16(ctx,
+                                         input,
+                                         weight,
+                                         bias,
+                                         ROWS,
+                                         UOCR_METAL_DENSE_OUTPUT_F32,
+                                         q_f32,
+                                         k_f32,
+                                         v_f32,
+                                         error,
+                                         sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+
+    for (uint32_t row = 0u; row < ROWS; ++row) {
+        const float x0 = f16_bits_to_f32(input[(size_t)row * HIDDEN + 0u]);
+        const float x5 = f16_bits_to_f32(input[(size_t)row * HIDDEN + 5u]);
+        const float x7 = f16_bits_to_f32(input[(size_t)row * HIDDEN + 7u]);
+        const float x9 = f16_bits_to_f32(input[(size_t)row * HIDDEN + 9u]);
+        CHECK(fabsf(q_f32[sam_qkv_out_index(row, 0u, 0u)] - (x0 + 0.5f)) <= 1.0e-5f);
+        CHECK(fabsf(q_f32[sam_qkv_out_index(row, 3u, 4u)] - 3.0f) <= 1.0e-5f);
+        CHECK(fabsf(k_f32[sam_qkv_out_index(row, 2u, 3u)] - (2.0f * x5 - 1.0f)) <= 1.0e-5f);
+        CHECK(fabsf(v_f32[sam_qkv_out_index(row, 11u, 63u)] - (x7 - x9 + 0.25f)) <= 1.0e-5f);
+        CHECK(fabsf(q_f32[sam_qkv_out_index(row, 5u, 5u)]) <= 1.0e-5f);
+        CHECK(fabsf(k_f32[sam_qkv_out_index(row, 5u, 5u)]) <= 1.0e-5f);
+        CHECK(fabsf(v_f32[sam_qkv_out_index(row, 5u, 5u)]) <= 1.0e-5f);
+    }
+
+    CHECK(uocr_metal_context_sam_qkv_f16(ctx,
+                                         input,
+                                         weight,
+                                         bias,
+                                         ROWS,
+                                         UOCR_METAL_DENSE_OUTPUT_F16,
+                                         q_f16,
+                                         k_f16,
+                                         v_f16,
+                                         error,
+                                         sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    for (uint32_t row = 0u; row < ROWS; ++row) {
+        const float x0 = f16_bits_to_f32(input[(size_t)row * HIDDEN + 0u]);
+        const float x5 = f16_bits_to_f32(input[(size_t)row * HIDDEN + 5u]);
+        const float x7 = f16_bits_to_f32(input[(size_t)row * HIDDEN + 7u]);
+        const float x9 = f16_bits_to_f32(input[(size_t)row * HIDDEN + 9u]);
+        CHECK(q_f16[sam_qkv_out_index(row, 0u, 0u)] == f32_to_f16_bits(x0 + 0.5f));
+        CHECK(q_f16[sam_qkv_out_index(row, 3u, 4u)] == f32_to_f16_bits(3.0f));
+        CHECK(k_f16[sam_qkv_out_index(row, 2u, 3u)] == f32_to_f16_bits(2.0f * x5 - 1.0f));
+        CHECK(v_f16[sam_qkv_out_index(row, 11u, 63u)] == f32_to_f16_bits(x7 - x9 + 0.25f));
+    }
+
+    CHECK(uocr_metal_context_sam_qkv_f16(ctx,
+                                         input,
+                                         weight,
+                                         bias,
+                                         0u,
+                                         UOCR_METAL_DENSE_OUTPUT_F32,
+                                         q_f32,
+                                         k_f32,
+                                         v_f32,
+                                         error,
+                                         sizeof(error)) == 0);
+    CHECK(strstr(error, "invalid Metal SAM QKV") != NULL);
+
+    uocr_metal_context_destroy(ctx);
+    free(v_f16);
+    free(k_f16);
+    free(q_f16);
+    free(v_f32);
+    free(k_f32);
+    free(q_f32);
     free(bias);
     free(weight);
     free(input);
@@ -9318,6 +9455,7 @@ int main(void) {
     if (test_metal_sam_patch_embed_f16() != 0) return 1;
     if (test_metal_sam_abs_pos_f16() != 0) return 1;
     if (test_metal_sam_layernorm_f16() != 0) return 1;
+    if (test_metal_sam_qkv_f16() != 0) return 1;
     if (test_metal_get_rows_f16() != 0) return 1;
     if (test_metal_prompt_assembly_f16() != 0) return 1;
     if (test_metal_prompt_assembly_from_mapped_model_f16() != 0) return 1;

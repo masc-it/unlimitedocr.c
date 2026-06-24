@@ -748,7 +748,7 @@ Do not begin this section until sections 14.5 and 15.1 pass for fp16 single-requ
   - [x] precompute/store common `64x64` and `40x40` tables in converter if practical (not practical for the current v1 `.uocr` writer; runtime Metal interpolation is used until derived tensors are added)
 - [ ] Implement SAM transformer blocks `0..11`:
   - [x] LayerNorm eps `1e-6`
-  - [ ] QKV linear with bias
+  - [x] QKV linear with bias
   - [ ] window attention size `14` for non-global blocks
   - [ ] global attention for blocks `[2,5,8,11]`
   - [ ] decomposed relative position bias from `rel_pos_h` and `rel_pos_w`

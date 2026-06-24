@@ -5634,6 +5634,199 @@ int uocr_metal_context_sam_layernorm_f16(uocr_metal_context *ctx,
     }
 }
 
+int uocr_metal_context_sam_qkv_f16(uocr_metal_context *ctx,
+                                   const uint16_t *input_f16,
+                                   const uint16_t *qkv_weight_f16,
+                                   const uint16_t *qkv_bias_f16,
+                                   uint32_t n_rows,
+                                   uocr_metal_dense_output_type output_type,
+                                   void *q_out,
+                                   void *k_out,
+                                   void *v_out,
+                                   char *error,
+                                   size_t error_size) {
+    metal_clear_error(error, error_size);
+    if (ctx == NULL || input_f16 == NULL || qkv_weight_f16 == NULL || qkv_bias_f16 == NULL ||
+        q_out == NULL || k_out == NULL || v_out == NULL || n_rows == 0u) {
+        return metal_fail(error, error_size, "invalid Metal SAM QKV request");
+    }
+    if (output_type != UOCR_METAL_DENSE_OUTPUT_F16 && output_type != UOCR_METAL_DENSE_OUTPUT_F32) {
+        return metal_fail(error, error_size, "unsupported Metal SAM QKV output type %d", (int)output_type);
+    }
+    if (UOCR_SAM_ATTENTION_HEADS * UOCR_SAM_HEAD_DIM != UOCR_SAM_HIDDEN_SIZE ||
+        UOCR_SAM_QKV_SIZE != 3u * UOCR_SAM_HIDDEN_SIZE) {
+        return metal_fail(error, error_size, "Metal SAM QKV constants are inconsistent");
+    }
+
+    uint64_t input_values = 0u;
+    uint64_t input_bytes = 0u;
+    uint64_t weight_values = 0u;
+    uint64_t weight_bytes = 0u;
+    uint64_t bias_bytes = 0u;
+    uint64_t output_values_per_projection = 0u;
+    uint64_t output_values = 0u;
+    uint64_t output_bytes = 0u;
+    const uint64_t output_element_bytes = output_type == UOCR_METAL_DENSE_OUTPUT_F16 ? 2u : (uint64_t)sizeof(float);
+    if (!checked_mul_u64((uint64_t)n_rows, (uint64_t)UOCR_SAM_HIDDEN_SIZE, &input_values) ||
+        !checked_mul_u64(input_values, 2u, &input_bytes) ||
+        !checked_mul_u64((uint64_t)UOCR_SAM_QKV_SIZE, (uint64_t)UOCR_SAM_HIDDEN_SIZE, &weight_values) ||
+        !checked_mul_u64(weight_values, 2u, &weight_bytes) ||
+        !checked_mul_u64((uint64_t)UOCR_SAM_QKV_SIZE, 2u, &bias_bytes) ||
+        !checked_mul_u64((uint64_t)n_rows, (uint64_t)UOCR_SAM_HIDDEN_SIZE, &output_values_per_projection) ||
+        !checked_mul_u64(output_values_per_projection, 3u, &output_values) ||
+        !checked_mul_u64(output_values_per_projection, output_element_bytes, &output_bytes) ||
+        input_bytes > (uint64_t)SIZE_MAX || weight_bytes > (uint64_t)SIZE_MAX ||
+        bias_bytes > (uint64_t)SIZE_MAX || output_bytes > (uint64_t)SIZE_MAX ||
+        output_values > (uint64_t)UINT32_MAX) {
+        return metal_fail(error, error_size, "Metal SAM QKV byte-size overflow");
+    }
+
+    const uint64_t max_buffer_length = metal_device_max_buffer_length(ctx->device);
+    if (input_bytes > max_buffer_length || weight_bytes > max_buffer_length || bias_bytes > max_buffer_length ||
+        output_bytes > max_buffer_length) {
+        return metal_fail(error,
+                          error_size,
+                          "Metal SAM QKV buffers exceed maxBufferLength %llu",
+                          (unsigned long long)max_buffer_length);
+    }
+
+    @autoreleasepool {
+        const char *function_name = output_type == UOCR_METAL_DENSE_OUTPUT_F16 ?
+                                        "uocr_sam_qkv_f16_to_f16" :
+                                        "uocr_sam_qkv_f16_to_f32";
+        id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, function_name, error, error_size);
+        if (pipeline == nil) {
+            return 0;
+        }
+
+        id<MTLBuffer> src = [ctx->device newBufferWithBytes:input_f16
+                                                     length:(NSUInteger)input_bytes
+                                                    options:MTLResourceStorageModeShared];
+        if (src == nil) {
+            return metal_fail(error, error_size, "failed to allocate Metal SAM QKV input buffer");
+        }
+        src.label = @"uocr_sam_qkv_input_f16";
+
+        id<MTLBuffer> weight = [ctx->device newBufferWithBytes:qkv_weight_f16
+                                                        length:(NSUInteger)weight_bytes
+                                                       options:MTLResourceStorageModeShared];
+        if (weight == nil) {
+            [src release];
+            return metal_fail(error, error_size, "failed to allocate Metal SAM QKV weight buffer");
+        }
+        weight.label = @"uocr_sam_qkv_weight_f16";
+
+        id<MTLBuffer> bias = [ctx->device newBufferWithBytes:qkv_bias_f16
+                                                      length:(NSUInteger)bias_bytes
+                                                     options:MTLResourceStorageModeShared];
+        if (bias == nil) {
+            [weight release];
+            [src release];
+            return metal_fail(error, error_size, "failed to allocate Metal SAM QKV bias buffer");
+        }
+        bias.label = @"uocr_sam_qkv_bias_f16";
+
+        id<MTLBuffer> q_dst = [ctx->device newBufferWithLength:(NSUInteger)output_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> k_dst = [ctx->device newBufferWithLength:(NSUInteger)output_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> v_dst = [ctx->device newBufferWithLength:(NSUInteger)output_bytes options:MTLResourceStorageModeShared];
+        if (q_dst == nil || k_dst == nil || v_dst == nil) {
+            [v_dst release];
+            [k_dst release];
+            [q_dst release];
+            [bias release];
+            [weight release];
+            [src release];
+            return metal_fail(error, error_size, "failed to allocate Metal SAM QKV output buffers");
+        }
+        q_dst.label = @"uocr_sam_q_f16";
+        k_dst.label = @"uocr_sam_k_f16";
+        v_dst.label = @"uocr_sam_v_f16";
+        memset([q_dst contents], 0, (size_t)output_bytes);
+        memset([k_dst contents], 0, (size_t)output_bytes);
+        memset([v_dst contents], 0, (size_t)output_bytes);
+
+        id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
+        if (cb == nil) {
+            [v_dst release];
+            [k_dst release];
+            [q_dst release];
+            [bias release];
+            [weight release];
+            [src release];
+            return metal_fail(error, error_size, "failed to create Metal SAM QKV command buffer");
+        }
+        cb.label = @"uocr_sam_qkv_command_buffer";
+
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        if (enc == nil) {
+            [v_dst release];
+            [k_dst release];
+            [q_dst release];
+            [bias release];
+            [weight release];
+            [src release];
+            return metal_fail(error, error_size, "failed to create Metal SAM QKV command encoder");
+        }
+
+        uocr_metal_dense_params params;
+        params.input_rows = n_rows;
+        params.in_features = UOCR_SAM_HIDDEN_SIZE;
+        params.out_features = UOCR_SAM_HIDDEN_SIZE;
+        params.has_bias = 1u;
+
+        const NSUInteger threads_per_group = metal_power2_threadgroup_width(256u, pipeline.maxTotalThreadsPerThreadgroup);
+        const uint64_t threadgroup_bytes = (uint64_t)threads_per_group * (uint64_t)sizeof(float);
+        if (threadgroup_bytes > (uint64_t)ctx->device.maxThreadgroupMemoryLength) {
+            [v_dst release];
+            [k_dst release];
+            [q_dst release];
+            [bias release];
+            [weight release];
+            [src release];
+            return metal_fail(error, error_size, "Metal SAM QKV threadgroup memory exceeds device limit");
+        }
+
+        [enc setComputePipelineState:pipeline];
+        [enc setBuffer:src offset:0u atIndex:0u];
+        [enc setBuffer:weight offset:0u atIndex:1u];
+        [enc setBuffer:bias offset:0u atIndex:2u];
+        [enc setBuffer:q_dst offset:0u atIndex:3u];
+        [enc setBuffer:k_dst offset:0u atIndex:4u];
+        [enc setBuffer:v_dst offset:0u atIndex:5u];
+        [enc setBytes:&params length:sizeof(params) atIndex:6u];
+        [enc setThreadgroupMemoryLength:threads_per_group * sizeof(float) atIndex:0u];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)output_values, 1u, 1u)
+             threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1u, 1u)];
+        [enc endEncoding];
+
+        [cb commit];
+        [cb waitUntilCompleted];
+        if (cb.status == MTLCommandBufferStatusError) {
+            NSString *description = cb.error != nil ? [cb.error localizedDescription] : @"unknown command-buffer error";
+            [v_dst release];
+            [k_dst release];
+            [q_dst release];
+            [bias release];
+            [weight release];
+            [src release];
+            return metal_fail(error, error_size, "Metal SAM QKV command failed: %s", [description UTF8String]);
+        }
+
+        memcpy(q_out, [q_dst contents], (size_t)output_bytes);
+        memcpy(k_out, [k_dst contents], (size_t)output_bytes);
+        memcpy(v_out, [v_dst contents], (size_t)output_bytes);
+        [v_dst release];
+        [k_dst release];
+        [q_dst release];
+        [bias release];
+        [weight release];
+        [src release];
+    }
+
+    metal_clear_error(error, error_size);
+    return 1;
+}
+
 int uocr_metal_context_final_rmsnorm_f16(uocr_metal_context *ctx,
                                          const uint16_t *input_f16,
                                          uint32_t n_rows,

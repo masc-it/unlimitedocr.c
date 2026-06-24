@@ -532,6 +532,64 @@ kernel void uocr_dense_f16_to_f32(device const half *src [[buffer(0)]],
     }
 }
 
+kernel void uocr_sam_qkv_f16_to_f16(device const half *src [[buffer(0)]],
+                                    device const half *weight [[buffer(1)]],
+                                    device const half *bias [[buffer(2)]],
+                                    device half *q_dst [[buffer(3)]],
+                                    device half *k_dst [[buffer(4)]],
+                                    device half *v_dst [[buffer(5)]],
+                                    constant UocrDenseParams &params [[buffer(6)]],
+                                    threadgroup float *partials [[threadgroup(0)]],
+                                    uint output_index [[threadgroup_position_in_grid]],
+                                    uint tid [[thread_index_in_threadgroup]],
+                                    uint ntg [[threads_per_threadgroup]]) {
+    const uint values_per_projection = params.input_rows * params.out_features;
+    const uint projection = output_index / values_per_projection;
+    const uint element = output_index - projection * values_per_projection;
+    const uint row = element / params.out_features;
+    const uint out_col = element - row * params.out_features;
+    if (projection >= 3u || row >= params.input_rows || out_col >= params.out_features) {
+        return;
+    }
+
+    const uint packed_col = projection * params.out_features + out_col;
+    float value = uocr_dense_dot_f16(src, weight, params, row, packed_col, tid, ntg, partials);
+    if (tid == 0) {
+        value += float(bias[packed_col]);
+        device half *dst = projection == 0u ? q_dst : (projection == 1u ? k_dst : v_dst);
+        dst[row * params.out_features + out_col] = half(value);
+    }
+}
+
+kernel void uocr_sam_qkv_f16_to_f32(device const half *src [[buffer(0)]],
+                                    device const half *weight [[buffer(1)]],
+                                    device const half *bias [[buffer(2)]],
+                                    device float *q_dst [[buffer(3)]],
+                                    device float *k_dst [[buffer(4)]],
+                                    device float *v_dst [[buffer(5)]],
+                                    constant UocrDenseParams &params [[buffer(6)]],
+                                    threadgroup float *partials [[threadgroup(0)]],
+                                    uint output_index [[threadgroup_position_in_grid]],
+                                    uint tid [[thread_index_in_threadgroup]],
+                                    uint ntg [[threads_per_threadgroup]]) {
+    const uint values_per_projection = params.input_rows * params.out_features;
+    const uint projection = output_index / values_per_projection;
+    const uint element = output_index - projection * values_per_projection;
+    const uint row = element / params.out_features;
+    const uint out_col = element - row * params.out_features;
+    if (projection >= 3u || row >= params.input_rows || out_col >= params.out_features) {
+        return;
+    }
+
+    const uint packed_col = projection * params.out_features + out_col;
+    float value = uocr_dense_dot_f16(src, weight, params, row, packed_col, tid, ntg, partials);
+    if (tid == 0) {
+        value += float(bias[packed_col]);
+        device float *dst = projection == 0u ? q_dst : (projection == 1u ? k_dst : v_dst);
+        dst[row * params.out_features + out_col] = value;
+    }
+}
+
 struct UocrArgmaxParams {
     uint rows;
     uint vocab_size;
