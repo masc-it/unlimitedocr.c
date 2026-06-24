@@ -756,7 +756,7 @@ Do not begin this section until sections 14.5 and 15.1 pass for fp16 single-requ
   - [x] residual connections
 - [x] Implement window partition/unpartition with padding exactly like upstream.
 - [ ] Implement SAM neck/net:
-  - [ ] `1x1` conv `768 -> 256`, no bias
+  - [x] `1x1` conv `768 -> 256`, no bias
   - [ ] `LayerNorm2d(256, eps=1e-6)`
   - [ ] `3x3` conv `256 -> 256`, padding `1`, no bias
   - [ ] `LayerNorm2d(256, eps=1e-6)`

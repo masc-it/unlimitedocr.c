@@ -1023,6 +1023,81 @@ kernel void uocr_sam_window_unpartition_f16(device const half *src [[buffer(0)]]
     dst[gid] = src[(window * params.window_size * params.window_size + token_in_window) * params.hidden_size + channel];
 }
 
+struct UocrSamNeckConv1x1Params {
+    uint grid_width;
+    uint grid_height;
+    uint in_channels;
+    uint out_channels;
+};
+
+static inline float uocr_sam_neck_conv1x1_dot_f16(device const half *src_bhwc,
+                                                  device const half *weight,
+                                                  constant UocrSamNeckConv1x1Params &params,
+                                                  uint spatial,
+                                                  uint out_channel,
+                                                  uint tid,
+                                                  uint ntg,
+                                                  threadgroup float *partials) {
+    float sum = 0.0f;
+    const uint src_base = spatial * params.in_channels;
+    const uint weight_base = out_channel * params.in_channels;
+    for (uint c = tid; c < params.in_channels; c += ntg) {
+        sum += float(src_bhwc[src_base + c]) * float(weight[weight_base + c]);
+    }
+    partials[tid] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = ntg >> 1; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            partials[tid] += partials[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    return partials[0];
+}
+
+kernel void uocr_sam_neck_conv1x1_f16_to_f16(device const half *src_bhwc [[buffer(0)]],
+                                             device const half *weight [[buffer(1)]],
+                                             device half *dst_nchw [[buffer(2)]],
+                                             constant UocrSamNeckConv1x1Params &params [[buffer(3)]],
+                                             threadgroup float *partials [[threadgroup(0)]],
+                                             uint output_index [[threadgroup_position_in_grid]],
+                                             uint tid [[thread_index_in_threadgroup]],
+                                             uint ntg [[threads_per_threadgroup]]) {
+    const uint spatial_size = params.grid_width * params.grid_height;
+    const uint out_channel = output_index / spatial_size;
+    const uint spatial = output_index - out_channel * spatial_size;
+    if (out_channel >= params.out_channels || spatial >= spatial_size) {
+        return;
+    }
+
+    const float value = uocr_sam_neck_conv1x1_dot_f16(src_bhwc, weight, params, spatial, out_channel, tid, ntg, partials);
+    if (tid == 0u) {
+        dst_nchw[output_index] = half(value);
+    }
+}
+
+kernel void uocr_sam_neck_conv1x1_f16_to_f32(device const half *src_bhwc [[buffer(0)]],
+                                             device const half *weight [[buffer(1)]],
+                                             device float *dst_nchw [[buffer(2)]],
+                                             constant UocrSamNeckConv1x1Params &params [[buffer(3)]],
+                                             threadgroup float *partials [[threadgroup(0)]],
+                                             uint output_index [[threadgroup_position_in_grid]],
+                                             uint tid [[thread_index_in_threadgroup]],
+                                             uint ntg [[threads_per_threadgroup]]) {
+    const uint spatial_size = params.grid_width * params.grid_height;
+    const uint out_channel = output_index / spatial_size;
+    const uint spatial = output_index - out_channel * spatial_size;
+    if (out_channel >= params.out_channels || spatial >= spatial_size) {
+        return;
+    }
+
+    const float value = uocr_sam_neck_conv1x1_dot_f16(src_bhwc, weight, params, spatial, out_channel, tid, ntg, partials);
+    if (tid == 0u) {
+        dst_nchw[output_index] = value;
+    }
+}
+
 struct UocrSamResidualParams {
     uint n_rows;
     uint hidden_size;

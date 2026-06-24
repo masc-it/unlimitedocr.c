@@ -356,6 +356,21 @@ int uocr_metal_context_sam_window_unpartition_f16(uocr_metal_context *ctx,
                                                   char *error,
                                                   size_t error_size);
 
+/* Diagnostic SAM neck 1x1 convolution helper. Consumes transformer output in
+ * BHWC fp16 layout [grid_h,grid_w,768], applies the first neck Conv2d weight
+ * [256,768,1,1] with no bias, accumulates in fp32, and writes NCHW output
+ * [256,grid_h,grid_w] for the following LayerNorm2d/3x3 neck stages.
+ */
+int uocr_metal_context_sam_neck_conv1x1_f16(uocr_metal_context *ctx,
+                                            const uint16_t *input_bhwc_f16,
+                                            const uint16_t *weight_f16,
+                                            uint32_t grid_w,
+                                            uint32_t grid_h,
+                                            uocr_metal_dense_output_type output_type,
+                                            void *out_nchw,
+                                            char *error,
+                                            size_t error_size);
+
 /* Diagnostic SAM window-attention helper for non-global transformer blocks.
  * Q/K/V are fp16 tensors laid out as [n_windows,14*14,12,64] (equivalent to
  * window-major rows with flattened [head,dim] channels). The helper computes

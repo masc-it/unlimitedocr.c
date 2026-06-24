@@ -85,6 +85,21 @@ static size_t sam_window_partition_index(uint32_t window, uint32_t token, uint32
     return ((size_t)window * UOCR_SAM_WINDOW_TOKENS + token) * UOCR_SAM_HIDDEN_SIZE + channel;
 }
 
+static size_t sam_neck_conv1x1_weight_index(uint32_t out_channel, uint32_t in_channel) {
+    return (size_t)out_channel * UOCR_SAM_HIDDEN_SIZE + in_channel;
+}
+
+static size_t sam_neck_nchw_index(uint32_t grid_w, uint32_t grid_h, uint32_t out_channel, uint32_t y, uint32_t x) {
+    return ((size_t)out_channel * grid_h + y) * grid_w + x;
+}
+
+static float sam_neck_conv1x1_expected(const uint16_t *input,
+                                       const uint16_t *weight,
+                                       uint32_t grid_w,
+                                       uint32_t y,
+                                       uint32_t x,
+                                       uint32_t out_channel);
+
 static size_t sam_global_attention_index(uint32_t token, uint32_t head, uint32_t dim) {
     return ((size_t)token * UOCR_SAM_ATTENTION_HEADS + head) * UOCR_SAM_HEAD_DIM + dim;
 }
@@ -623,6 +638,135 @@ static int test_metal_sam_layernorm_f16(void) {
     return 0;
 }
 
+static int test_metal_sam_neck_conv1x1_f16(void) {
+    if (!uocr_metal_is_available()) {
+        return 0;
+    }
+
+    enum { GRID_W = 3u, GRID_H = 2u, IN = UOCR_SAM_HIDDEN_SIZE, OUT = UOCR_SAM_NECK_CHANNELS };
+    const size_t input_values = (size_t)GRID_W * GRID_H * IN;
+    const size_t weight_values = (size_t)OUT * IN;
+    const size_t output_values = (size_t)OUT * GRID_H * GRID_W;
+    uint16_t *input = (uint16_t *)calloc(input_values, sizeof(uint16_t));
+    uint16_t *weight = (uint16_t *)calloc(weight_values, sizeof(uint16_t));
+    float *out_f32 = (float *)calloc(output_values, sizeof(float));
+    uint16_t *out_f16 = (uint16_t *)calloc(output_values, sizeof(uint16_t));
+    CHECK(input != NULL);
+    CHECK(weight != NULL);
+    CHECK(out_f32 != NULL);
+    CHECK(out_f16 != NULL);
+    CHECK(UOCR_SAM_NECK_CHANNELS == 256u);
+
+    for (uint32_t y = 0u; y < GRID_H; ++y) {
+        for (uint32_t x = 0u; x < GRID_W; ++x) {
+            for (uint32_t c = 0u; c < IN; ++c) {
+                const int mod = (int)((y * 19u + x * 11u + c * 5u) % 43u) - 21;
+                input[sam_bhwc_index(GRID_W, y, x, c)] = f32_to_f16_bits((float)mod * 0.01f);
+            }
+        }
+    }
+
+    const uint32_t active_out[] = {0u, 7u, 111u, OUT - 1u};
+    for (size_t i = 0u; i < sizeof(active_out) / sizeof(active_out[0]); ++i) {
+        const uint32_t out_channel = active_out[i];
+        weight[sam_neck_conv1x1_weight_index(out_channel, (uint32_t)(1u + i))] =
+            f32_to_f16_bits(0.125f - 0.0125f * (float)i);
+        weight[sam_neck_conv1x1_weight_index(out_channel, (uint32_t)(33u + 7u * i))] =
+            f32_to_f16_bits(-0.08f + 0.01f * (float)i);
+        weight[sam_neck_conv1x1_weight_index(out_channel, IN - 1u - (uint32_t)i)] =
+            f32_to_f16_bits(0.03125f * (float)(i + 1u));
+    }
+
+    char error[1024];
+    memset(error, 0, sizeof(error));
+    uocr_metal_context *ctx = uocr_metal_context_create(UOCR_TEST_METAL_RESOURCE_PATH, error, sizeof(error));
+    CHECK(ctx != NULL);
+
+    CHECK(uocr_metal_context_sam_neck_conv1x1_f16(ctx,
+                                                   input,
+                                                   weight,
+                                                   GRID_W,
+                                                   GRID_H,
+                                                   UOCR_METAL_DENSE_OUTPUT_F32,
+                                                   out_f32,
+                                                   error,
+                                                   sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+
+    struct neck_sample {
+        uint32_t y;
+        uint32_t x;
+        uint32_t out_channel;
+    } samples[] = {
+        {0u, 0u, 0u},
+        {0u, 2u, 7u},
+        {1u, 1u, 111u},
+        {1u, 2u, OUT - 1u},
+        {1u, 0u, 3u},
+    };
+    for (size_t i = 0u; i < sizeof(samples) / sizeof(samples[0]); ++i) {
+        const size_t idx = sam_neck_nchw_index(GRID_W, GRID_H, samples[i].out_channel, samples[i].y, samples[i].x);
+        const float expected = sam_neck_conv1x1_expected(input,
+                                                         weight,
+                                                         GRID_W,
+                                                         samples[i].y,
+                                                         samples[i].x,
+                                                         samples[i].out_channel);
+        CHECK(isfinite(expected));
+        CHECK(fabsf(out_f32[idx] - expected) <= 2.0e-5f);
+    }
+
+    CHECK(uocr_metal_context_sam_neck_conv1x1_f16(ctx,
+                                                   input,
+                                                   weight,
+                                                   GRID_W,
+                                                   GRID_H,
+                                                   UOCR_METAL_DENSE_OUTPUT_F16,
+                                                   out_f16,
+                                                   error,
+                                                   sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    for (size_t i = 0u; i < sizeof(samples) / sizeof(samples[0]); ++i) {
+        const size_t idx = sam_neck_nchw_index(GRID_W, GRID_H, samples[i].out_channel, samples[i].y, samples[i].x);
+        const float expected = sam_neck_conv1x1_expected(input,
+                                                         weight,
+                                                         GRID_W,
+                                                         samples[i].y,
+                                                         samples[i].x,
+                                                         samples[i].out_channel);
+        CHECK(fabsf(f16_bits_to_f32(out_f16[idx]) - expected) <= 8.0e-4f);
+    }
+
+    CHECK(uocr_metal_context_sam_neck_conv1x1_f16(ctx,
+                                                   input,
+                                                   NULL,
+                                                   GRID_W,
+                                                   GRID_H,
+                                                   UOCR_METAL_DENSE_OUTPUT_F32,
+                                                   out_f32,
+                                                   error,
+                                                   sizeof(error)) == 0);
+    CHECK(strstr(error, "invalid Metal SAM neck 1x1") != NULL);
+
+    CHECK(uocr_metal_context_sam_neck_conv1x1_f16(ctx,
+                                                   input,
+                                                   weight,
+                                                   UOCR_SAM_MAX_GRID_SIZE + 1u,
+                                                   GRID_H,
+                                                   UOCR_METAL_DENSE_OUTPUT_F32,
+                                                   out_f32,
+                                                   error,
+                                                   sizeof(error)) == 0);
+    CHECK(strstr(error, "invalid Metal SAM neck 1x1 grid") != NULL);
+
+    uocr_metal_context_destroy(ctx);
+    free(out_f16);
+    free(out_f32);
+    free(weight);
+    free(input);
+    return 0;
+}
+
 static int test_metal_sam_window_partition_f16(void) {
     if (!uocr_metal_is_available()) {
         return 0;
@@ -921,6 +1065,20 @@ static float sam_attention_project_residual_expected(const uint16_t *context,
     for (uint32_t col = 0u; col < UOCR_SAM_HIDDEN_SIZE; ++col) {
         value += f16_bits_to_f32(context[(size_t)row * UOCR_SAM_HIDDEN_SIZE + col]) *
                  f16_bits_to_f32(weight[sam_attention_proj_weight_index(out_col, col)]);
+    }
+    return value;
+}
+
+static float sam_neck_conv1x1_expected(const uint16_t *input,
+                                       const uint16_t *weight,
+                                       uint32_t grid_w,
+                                       uint32_t y,
+                                       uint32_t x,
+                                       uint32_t out_channel) {
+    float value = 0.0f;
+    for (uint32_t in_channel = 0u; in_channel < UOCR_SAM_HIDDEN_SIZE; ++in_channel) {
+        value += f16_bits_to_f32(input[sam_bhwc_index(grid_w, y, x, in_channel)]) *
+                 f16_bits_to_f32(weight[sam_neck_conv1x1_weight_index(out_channel, in_channel)]);
     }
     return value;
 }
@@ -10551,6 +10709,7 @@ int main(void) {
     if (test_metal_sam_abs_pos_f16() != 0) return 1;
     if (test_metal_sam_layernorm_f16() != 0) return 1;
     if (test_metal_sam_qkv_f16() != 0) return 1;
+    if (test_metal_sam_neck_conv1x1_f16() != 0) return 1;
     if (test_metal_sam_window_partition_f16() != 0) return 1;
     if (test_metal_sam_window_attention_f16() != 0) return 1;
     if (test_metal_sam_global_attention_f16() != 0) return 1;
