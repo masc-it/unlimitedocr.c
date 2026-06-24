@@ -655,7 +655,7 @@ First implementation slice, in order:
 - [x] Implement no-repeat-ngram banning before argmax:
   - [x] CPU version first using logits readback if needed
   - [ ] later GPU version for speed
-- [ ] Stop on EOS id `1` or max new tokens.
+- [x] Stop on EOS id `1` or max new tokens.
 - [ ] Return generated token ids to C result and Python wrapper.
 - [ ] Add text-only fp16 parity test:
   - [ ] prompt embeddings

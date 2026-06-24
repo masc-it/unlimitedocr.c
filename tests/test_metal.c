@@ -2,6 +2,7 @@
 #include "model/uocr_constants.h"
 #include "model/uocr_model_file.h"
 #include "runtime/uocr_memory.h"
+#include "runtime/uocr_sequence.h"
 #include "unlimitedocr.h"
 
 #include "uocr_test_model_file.h"
@@ -732,6 +733,60 @@ static int test_metal_select_greedy_with_no_repeat_f32(void) {
                                                error,
                                                sizeof(error)) == 0);
     CHECK(strstr(error, "failed to apply no-repeat-ngram bans") != NULL);
+
+    uocr_metal_context_destroy(ctx);
+    free(logits);
+    return 0;
+}
+
+static int test_metal_eos_stop_after_greedy_selection(void) {
+    if (!uocr_metal_is_available()) {
+        return 0;
+    }
+
+    float *logits = (float *)malloc((size_t)UOCR_VOCAB_SIZE * sizeof(float));
+    CHECK(logits != NULL);
+    for (uint32_t i = 0u; i < UOCR_VOCAB_SIZE; ++i) {
+        logits[i] = -1000.0f;
+    }
+    logits[(uint32_t)UOCR_TOKEN_EOS] = 5.0f;
+    logits[42u] = 4.0f;
+
+    char error[1024];
+    memset(error, 0, sizeof(error));
+    uocr_metal_context *ctx = uocr_metal_context_create(UOCR_TEST_METAL_RESOURCE_PATH, error, sizeof(error));
+    CHECK(ctx != NULL);
+
+    uint32_t next_token = UINT32_MAX;
+    CHECK(uocr_metal_context_select_greedy_f32(ctx,
+                                               logits,
+                                               1u,
+                                               UOCR_VOCAB_SIZE,
+                                               NULL,
+                                               &next_token,
+                                               NULL,
+                                               error,
+                                               sizeof(error)) == 1);
+    CHECK(next_token == (uint32_t)UOCR_TOKEN_EOS);
+
+    const int32_t input_ids[] = {UOCR_TOKEN_BOS, 42};
+    const uint8_t image_mask[] = {0, 0};
+    uocr_prepared_request request;
+    memset(&request, 0, sizeof(request));
+    request.input_ids = input_ids;
+    request.image_mask = image_mask;
+    request.n_tokens = 2u;
+    request.max_new_tokens = 4u;
+
+    uocr_sequence_state state;
+    char sequence_error[128];
+    CHECK(uocr_build_sequence_state(&request, &state, sequence_error, sizeof(sequence_error)) == UOCR_OK);
+    int32_t generated[4] = {0};
+    CHECK(uocr_sequence_accept_generated_token(&state, (int32_t)next_token, generated, 4u) == UOCR_OK);
+    CHECK(generated[0] == UOCR_TOKEN_EOS);
+    CHECK(state.generated_count == 1u);
+    CHECK(state.eos == 1);
+    CHECK(uocr_sequence_generation_done(&state) == 1);
 
     uocr_metal_context_destroy(ctx);
     free(logits);
@@ -3667,6 +3722,7 @@ int main(void) {
     if (test_metal_lm_head_f16() != 0) return 1;
     if (test_metal_argmax_f32() != 0) return 1;
     if (test_metal_select_greedy_with_no_repeat_f32() != 0) return 1;
+    if (test_metal_eos_stop_after_greedy_selection() != 0) return 1;
     if (test_metal_dense_f16() != 0) return 1;
     if (test_metal_attention_qkvo_f16() != 0) return 1;
     if (test_metal_attention_output_residual_f16() != 0) return 1;

@@ -1,5 +1,8 @@
 #include "runtime/uocr_sequence.h"
 
+#include "model/uocr_constants.h"
+
+#include <limits.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
@@ -13,6 +16,10 @@ static int fail(char *error, size_t error_size, const char *fmt, ...) {
         error[error_size - 1u] = '\0';
     }
     return UOCR_ERROR_INVALID_ARGUMENT;
+}
+
+static int sequence_token_id_valid(int32_t token_id) {
+    return token_id >= 0 && (uint32_t)token_id < UOCR_VOCAB_SIZE;
 }
 
 int uocr_build_sequence_state(const uocr_prepared_request *request,
@@ -81,5 +88,41 @@ int uocr_build_sequence_state(const uocr_prepared_request *request,
     state.text_suffix_start = last_image + 1u;
     state.text_suffix_length = request->n_tokens - state.text_suffix_start;
     *out_state = state;
+    return UOCR_OK;
+}
+
+int uocr_sequence_generation_done(const uocr_sequence_state *state) {
+    if (state == NULL) {
+        return 1;
+    }
+    return state->eos || state->generated_count >= state->max_new_tokens;
+}
+
+int uocr_sequence_accept_generated_token(uocr_sequence_state *state,
+                                         int32_t token_id,
+                                         int32_t *generated_tokens,
+                                         uint32_t generated_capacity) {
+    if (state == NULL || generated_tokens == NULL) {
+        return UOCR_ERROR_INVALID_ARGUMENT;
+    }
+    if (!sequence_token_id_valid(token_id)) {
+        return UOCR_ERROR_INVALID_ARGUMENT;
+    }
+    if (uocr_sequence_generation_done(state)) {
+        return UOCR_ERROR_INVALID_ARGUMENT;
+    }
+    if (state->generated_count >= generated_capacity) {
+        return UOCR_ERROR_OUT_OF_MEMORY;
+    }
+    if (state->position == UINT32_MAX) {
+        return UOCR_ERROR_INVALID_ARGUMENT;
+    }
+
+    generated_tokens[state->generated_count] = token_id;
+    ++state->generated_count;
+    ++state->position;
+    if (token_id == UOCR_TOKEN_EOS) {
+        state->eos = 1;
+    }
     return UOCR_OK;
 }
