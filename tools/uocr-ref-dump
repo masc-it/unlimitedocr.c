@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Emit Python prepared-request and optional golden prompt-embedding fixtures."""
+"""Emit Python prepared-request and optional golden decoder fixtures."""
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ from unlimitedocr_c.frontend import (
     prepare_text,
     save_prepared_request,
 )
-from unlimitedocr_c.golden import dump_prompt_embedding_fixture
+from unlimitedocr_c.golden import dump_prompt_embedding_fixture, dump_text_layer0_fixture
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -41,6 +41,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--dump-prompt-embeddings",
         action="store_true",
         help="also dump text-only prompt embeddings from model.embed_tokens.weight for C/Metal parity",
+    )
+    parser.add_argument(
+        "--dump-text-layer0",
+        action="store_true",
+        help="also dump text-only prompt embeddings and decoder layer-0 fp16 output for Metal parity",
     )
     return parser.parse_args(argv)
 
@@ -82,7 +87,11 @@ def main(argv: list[str] | None = None) -> int:
             dtype=dtype,
         )
 
-    if args.dump_prompt_embeddings:
+    if args.dump_text_layer0:
+        if args.hf_dir is None:
+            raise SystemExit("--dump-text-layer0 requires --hf-dir")
+        dump_text_layer0_fixture(request, args.out, args.hf_dir)
+    elif args.dump_prompt_embeddings:
         if args.hf_dir is None:
             raise SystemExit("--dump-prompt-embeddings requires --hf-dir")
         dump_prompt_embedding_fixture(request, args.out, args.hf_dir)

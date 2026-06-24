@@ -11,10 +11,14 @@ from .convert import (
 from .tensor_registry import TensorFamily, TensorProjection
 from .golden import (
     PromptEmbeddingDump,
+    TextLayer0Dump,
     bf16_words_to_f16_bits,
     dump_prompt_embedding_fixture,
+    dump_text_layer0_fixture,
     load_prompt_embedding_dump,
+    load_text_layer0_dump,
     read_bf16_rows_as_f16_bits,
+    read_bf16_tensor_as_f16_bits,
 )
 from .ffi import (
     Engine,
@@ -58,10 +62,14 @@ __all__ = [
     "TensorFamily",
     "TensorProjection",
     "PromptEmbeddingDump",
+    "TextLayer0Dump",
     "bf16_words_to_f16_bits",
     "dump_prompt_embedding_fixture",
+    "dump_text_layer0_fixture",
     "load_prompt_embedding_dump",
+    "load_text_layer0_dump",
     "read_bf16_rows_as_f16_bits",
+    "read_bf16_tensor_as_f16_bits",
     "Engine",
     "EngineOptions",
     "MemoryReport",

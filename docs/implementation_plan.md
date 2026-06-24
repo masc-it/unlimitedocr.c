@@ -662,7 +662,8 @@ First implementation slice, in order:
 - [x] Wire final RMSNorm, LM head, no-repeat bans, greedy argmax, and EOS handoff in a Metal next-token selection helper.
 - [ ] Add text-only fp16 parity test:
   - [x] prompt embeddings
-  - [ ] layer outputs
+  - [x] layer-0 dense decoder output
+  - [ ] remaining MoE layer outputs
   - [ ] logits top-k
   - [ ] generated token ids
 

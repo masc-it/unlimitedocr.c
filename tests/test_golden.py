@@ -10,6 +10,7 @@ from unlimitedocr_c.golden import (
     dump_prompt_embedding_fixture,
     load_prompt_embedding_dump,
     read_bf16_rows_as_f16_bits,
+    read_bf16_tensor_as_f16_bits,
 )
 
 
@@ -59,6 +60,29 @@ def _tiny_text_request(input_ids: np.ndarray) -> PreparedRequest:
         tokenizer_path="synthetic-tokenizer.json",
         model_vocab_size=6,
     )
+
+
+def test_read_bf16_tensor_as_f16_bits(tmp_path) -> None:
+    values = np.array([[0.0, 1.0, -1.0], [2.0, -3.0, 0.25]], dtype=np.float32)
+    payload = _bf16_payload(values)
+    header = {
+        "__metadata__": {"format": "pt"},
+        "custom.weight": {
+            "dtype": "BF16",
+            "shape": list(values.shape),
+            "data_offsets": [0, len(payload)],
+        },
+    }
+    header_bytes = json.dumps(header, separators=(",", ":")).encode("utf-8")
+    with (tmp_path / "model.safetensors").open("wb") as f:
+        f.write(struct.pack("<Q", len(header_bytes)))
+        f.write(header_bytes)
+        f.write(payload)
+
+    actual = read_bf16_tensor_as_f16_bits(tmp_path, "custom.weight", expected_shape=(2, 3))
+    expected = _expected_f16_bits_from_bf16_trunc(values)
+
+    np.testing.assert_array_equal(actual, expected)
 
 
 def test_read_bf16_rows_as_f16_bits(tmp_path) -> None:

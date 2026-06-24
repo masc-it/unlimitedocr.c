@@ -1,10 +1,10 @@
 """Small Python golden-tensor dump helpers for C/Metal parity tests.
 
 The full HF reference dumper will eventually hook model forward passes.  This
-module starts with the narrow text-only prompt-embedding dump needed by the
-Metal decoder bring-up: read selected BF16 token-embedding rows from the local
-HF safetensors file, convert them to fp16 exactly as the `.uocr` converter does,
-and write a compact fixture that native tests can consume without parsing
+module starts with the narrow text-only dumps needed by Metal decoder bring-up:
+read selected BF16 token-embedding rows and layer-0 weights from the local HF
+safetensors file, convert them to fp16 exactly as the `.uocr` converter does,
+and write compact fixtures that native tests can consume without parsing
 `.npy`.
 """
 
@@ -26,8 +26,27 @@ HIDDEN_SIZE = 1280
 
 TOK_EMBED_TENSOR_NAME = "model.embed_tokens.weight"
 PROMPT_EMBEDDINGS_BIN = "prompt_embeddings_f16.bin"
+TEXT_LAYER0_HIDDEN_BIN = "layer_0_hidden_f16.bin"
 INPUT_IDS_BIN = "input_ids_i32.bin"
 IMAGE_MASK_BIN = "image_mask_u8.bin"
+
+ATTENTION_HEADS = 10
+HEAD_DIM = 128
+DENSE_LAYER0_INTERMEDIATE = 6848
+ROPE_THETA = 10000.0
+RMS_NORM_EPS = 1.0e-6
+
+LAYER0_TENSOR_SHAPES: dict[str, tuple[int, ...]] = {
+    "model.layers.0.input_layernorm.weight": (HIDDEN_SIZE,),
+    "model.layers.0.self_attn.q_proj.weight": (HIDDEN_SIZE, HIDDEN_SIZE),
+    "model.layers.0.self_attn.k_proj.weight": (HIDDEN_SIZE, HIDDEN_SIZE),
+    "model.layers.0.self_attn.v_proj.weight": (HIDDEN_SIZE, HIDDEN_SIZE),
+    "model.layers.0.self_attn.o_proj.weight": (HIDDEN_SIZE, HIDDEN_SIZE),
+    "model.layers.0.post_attention_layernorm.weight": (HIDDEN_SIZE,),
+    "model.layers.0.mlp.gate_proj.weight": (DENSE_LAYER0_INTERMEDIATE, HIDDEN_SIZE),
+    "model.layers.0.mlp.up_proj.weight": (DENSE_LAYER0_INTERMEDIATE, HIDDEN_SIZE),
+    "model.layers.0.mlp.down_proj.weight": (HIDDEN_SIZE, DENSE_LAYER0_INTERMEDIATE),
+}
 
 
 @dataclass(frozen=True)
@@ -50,6 +69,11 @@ class PromptEmbeddingDump:
     input_ids: NDArray[np.int32]
     image_mask: NDArray[np.uint8]
     prompt_embeddings_f16_bits: NDArray[np.uint16]
+
+
+@dataclass(frozen=True)
+class TextLayer0Dump(PromptEmbeddingDump):
+    layer0_hidden_f16_bits: NDArray[np.uint16]
 
 
 def _read_json_if_exists(path: Path) -> dict[str, Any] | None:
@@ -145,6 +169,36 @@ def bf16_words_to_f16_bits(words: NDArray[np.uint16]) -> NDArray[np.uint16]:
     return fp32.astype(np.dtype("<f2")).view(np.dtype("<u2"))
 
 
+def read_bf16_tensor_as_f16_bits(
+    hf_dir: str | Path,
+    tensor_name: str,
+    *,
+    expected_shape: tuple[int, ...],
+) -> NDArray[np.uint16]:
+    """Read a full BF16 safetensors tensor as fp16 bit patterns."""
+
+    tensor = find_safetensors_tensor(hf_dir, tensor_name)
+    if tensor.dtype != "BF16":
+        raise ValueError(f"{tensor_name} must be BF16, got {tensor.dtype}")
+    if tensor.shape != expected_shape:
+        raise ValueError(f"{tensor_name} shape mismatch: expected {expected_shape}, got {tensor.shape}")
+
+    value_count = int(np.prod(np.asarray(expected_shape, dtype=np.int64)))
+    expected_bytes = value_count * 2
+    if tensor.tensor_end - tensor.tensor_start != expected_bytes:
+        raise ValueError(
+            f"{tensor_name} byte-size mismatch: expected {expected_bytes}, got {tensor.tensor_end - tensor.tensor_start}"
+        )
+
+    with tensor.path.open("rb") as f:
+        f.seek(tensor.data_start + tensor.tensor_start)
+        raw = f.read(expected_bytes)
+    if len(raw) != expected_bytes:
+        raise ValueError(f"failed to read {tensor_name} from {tensor.path}")
+    bf16_words = np.frombuffer(raw, dtype=np.dtype("<u2"), count=value_count)
+    return bf16_words_to_f16_bits(bf16_words).reshape(expected_shape)
+
+
 def read_bf16_rows_as_f16_bits(
     hf_dir: str | Path,
     row_ids: Sequence[int] | NDArray[np.integer[Any]],
@@ -189,13 +243,159 @@ def read_bf16_rows_as_f16_bits(
     return out
 
 
+def _f16_to_f32(bits: NDArray[np.uint16]) -> NDArray[np.float32]:
+    return np.asarray(bits, dtype=np.dtype("<u2")).view(np.dtype("<f2")).astype(np.float32)
+
+
+def _f32_to_f16_bits(values: NDArray[np.floating[Any]]) -> NDArray[np.uint16]:
+    return np.asarray(values, dtype=np.float32).astype(np.dtype("<f2")).view(np.dtype("<u2"))
+
+
 def _f16_stats(bits: NDArray[np.uint16]) -> dict[str, float]:
-    values = np.asarray(bits, dtype=np.dtype("<u2")).view(np.dtype("<f2")).astype(np.float32)
+    values = _f16_to_f32(bits)
     return {
         "min": float(np.min(values)),
         "max": float(np.max(values)),
         "mean": float(np.mean(values)),
     }
+
+
+def _rmsnorm_f16_bits(src_bits: NDArray[np.uint16], weight_bits: NDArray[np.uint16]) -> NDArray[np.uint16]:
+    src = _f16_to_f32(src_bits)
+    weight = _f16_to_f32(weight_bits)
+    variance = np.sum(src * src, axis=1, keepdims=True, dtype=np.float32) / np.float32(src.shape[1])
+    scale = (np.float32(1.0) / np.sqrt(variance + np.float32(RMS_NORM_EPS))).astype(np.float32)
+    return _f32_to_f16_bits(src * scale * weight.reshape((1, -1)))
+
+
+def _dense_f16_bits(src_bits: NDArray[np.uint16], weight_bits: NDArray[np.uint16]) -> NDArray[np.uint16]:
+    src = _f16_to_f32(src_bits)
+    weight = _f16_to_f32(weight_bits)
+    out = np.matmul(src, weight.T).astype(np.float32, copy=False)
+    return _f32_to_f16_bits(out)
+
+
+def _rope_qk_f16_bits(
+    q_bits: NDArray[np.uint16],
+    k_bits: NDArray[np.uint16],
+    *,
+    position_start: int = 0,
+) -> tuple[NDArray[np.uint16], NDArray[np.uint16]]:
+    n_tokens = int(q_bits.shape[0])
+    q = _f16_to_f32(q_bits).reshape((n_tokens, ATTENTION_HEADS, HEAD_DIM))
+    k = _f16_to_f32(k_bits).reshape((n_tokens, ATTENTION_HEADS, HEAD_DIM))
+    q_out = q.copy()
+    k_out = k.copy()
+    half_dim = HEAD_DIM // 2
+    pairs = np.arange(half_dim, dtype=np.float32)
+    freq_scale = np.float32(-2.0) * np.float32(np.log2(np.float32(ROPE_THETA))) / np.float32(HEAD_DIM)
+    inv_freq = np.exp2(pairs * freq_scale).astype(np.float32)
+    for token in range(n_tokens):
+        angles = (np.float32(position_start + token) * inv_freq).astype(np.float32)
+        c = np.cos(angles).astype(np.float32)
+        s = np.sin(angles).astype(np.float32)
+        q0 = q[token, :, :half_dim]
+        q1 = q[token, :, half_dim:]
+        k0 = k[token, :, :half_dim]
+        k1 = k[token, :, half_dim:]
+        q_out[token, :, :half_dim] = q0 * c.reshape((1, half_dim)) - q1 * s.reshape((1, half_dim))
+        q_out[token, :, half_dim:] = q0 * s.reshape((1, half_dim)) + q1 * c.reshape((1, half_dim))
+        k_out[token, :, :half_dim] = k0 * c.reshape((1, half_dim)) - k1 * s.reshape((1, half_dim))
+        k_out[token, :, half_dim:] = k0 * s.reshape((1, half_dim)) + k1 * c.reshape((1, half_dim))
+    return _f32_to_f16_bits(q_out.reshape((n_tokens, HIDDEN_SIZE))), _f32_to_f16_bits(
+        k_out.reshape((n_tokens, HIDDEN_SIZE))
+    )
+
+
+def _prefill_attention_f16_bits(
+    q_bits: NDArray[np.uint16],
+    k_bits: NDArray[np.uint16],
+    v_bits: NDArray[np.uint16],
+) -> NDArray[np.uint16]:
+    n_tokens = int(q_bits.shape[0])
+    q = _f16_to_f32(q_bits).reshape((n_tokens, ATTENTION_HEADS, HEAD_DIM))
+    k = _f16_to_f32(k_bits).reshape((n_tokens, ATTENTION_HEADS, HEAD_DIM))
+    v = _f16_to_f32(v_bits).reshape((n_tokens, ATTENTION_HEADS, HEAD_DIM))
+    out = np.empty_like(q, dtype=np.float32)
+    scale = np.float32(1.0 / np.sqrt(float(HEAD_DIM)))
+    for token in range(n_tokens):
+        for head in range(ATTENTION_HEADS):
+            scores = np.empty((token + 1,), dtype=np.float32)
+            for key in range(token + 1):
+                scores[key] = np.sum(q[token, head, :] * k[key, head, :], dtype=np.float32) * scale
+            scores -= np.max(scores)
+            weights = np.exp(scores).astype(np.float32)
+            weights /= np.sum(weights, dtype=np.float32)
+            out[token, head, :] = np.sum(weights.reshape((-1, 1)) * v[: token + 1, head, :], axis=0, dtype=np.float32)
+    return _f32_to_f16_bits(out.reshape((n_tokens, HIDDEN_SIZE)))
+
+
+def _attention_output_residual_f16_bits(
+    context_bits: NDArray[np.uint16],
+    o_weight_bits: NDArray[np.uint16],
+    residual_bits: NDArray[np.uint16],
+) -> NDArray[np.uint16]:
+    context = _f16_to_f32(context_bits)
+    o_weight = _f16_to_f32(o_weight_bits)
+    projected = np.matmul(context, o_weight.T).astype(np.float32, copy=False)
+    residual = _f16_to_f32(residual_bits)
+    return _f32_to_f16_bits(projected + residual)
+
+
+def _dense_swiglu_residual_f16_bits(
+    src_bits: NDArray[np.uint16],
+    gate_weight_bits: NDArray[np.uint16],
+    up_weight_bits: NDArray[np.uint16],
+    down_weight_bits: NDArray[np.uint16],
+    residual_bits: NDArray[np.uint16],
+) -> NDArray[np.uint16]:
+    src = _f16_to_f32(src_bits)
+    gate_weight = _f16_to_f32(gate_weight_bits)
+    up_weight = _f16_to_f32(up_weight_bits)
+    gate = np.matmul(src, gate_weight.T).astype(np.float32, copy=False)
+    up = np.matmul(src, up_weight.T).astype(np.float32, copy=False)
+    silu = gate / (np.float32(1.0) + np.exp(-gate).astype(np.float32))
+    mid_bits = _f32_to_f16_bits(silu * up)
+    mid = _f16_to_f32(mid_bits)
+    down_weight = _f16_to_f32(down_weight_bits)
+    down = np.matmul(mid, down_weight.T).astype(np.float32, copy=False)
+    residual = _f16_to_f32(residual_bits)
+    return _f32_to_f16_bits(down + residual)
+
+
+def compute_text_layer0_hidden_f16_bits(
+    prompt_embeddings_f16_bits: NDArray[np.uint16],
+    hf_dir: str | Path,
+) -> NDArray[np.uint16]:
+    """Run the fp16 text-only decoder layer 0 reference used by Metal parity tests."""
+
+    prompt = np.asarray(prompt_embeddings_f16_bits, dtype=np.dtype("<u2"))
+    if prompt.ndim != 2 or prompt.shape[1] != HIDDEN_SIZE or prompt.shape[0] <= 0:
+        raise ValueError(f"prompt embeddings must have shape [n,{HIDDEN_SIZE}], got {prompt.shape}")
+
+    weights = {
+        name: read_bf16_tensor_as_f16_bits(hf_dir, name, expected_shape=shape)
+        for name, shape in LAYER0_TENSOR_SHAPES.items()
+    }
+    normed = _rmsnorm_f16_bits(prompt, weights["model.layers.0.input_layernorm.weight"])
+    q = _dense_f16_bits(normed, weights["model.layers.0.self_attn.q_proj.weight"])
+    k = _dense_f16_bits(normed, weights["model.layers.0.self_attn.k_proj.weight"])
+    v = _dense_f16_bits(normed, weights["model.layers.0.self_attn.v_proj.weight"])
+    q, k = _rope_qk_f16_bits(q, k)
+    context = _prefill_attention_f16_bits(q, k, v)
+    attn_hidden = _attention_output_residual_f16_bits(
+        context,
+        weights["model.layers.0.self_attn.o_proj.weight"],
+        prompt,
+    )
+    mlp_input = _rmsnorm_f16_bits(attn_hidden, weights["model.layers.0.post_attention_layernorm.weight"])
+    return _dense_swiglu_residual_f16_bits(
+        mlp_input,
+        weights["model.layers.0.mlp.gate_proj.weight"],
+        weights["model.layers.0.mlp.up_proj.weight"],
+        weights["model.layers.0.mlp.down_proj.weight"],
+        attn_hidden,
+    )
 
 
 def dump_prompt_embedding_fixture(
@@ -248,6 +448,34 @@ def dump_prompt_embedding_fixture(
     return out
 
 
+def dump_text_layer0_fixture(request: PreparedRequest, out_dir: str | Path, hf_dir: str | Path) -> Path:
+    """Write prompt embeddings plus the fp16 output of decoder layer 0.
+
+    This is intentionally text-only and fp16-specific. It gives the Metal
+    decoder bring-up a compact layer-output target without requiring the full HF
+    model object or vision stack in native tests.
+    """
+
+    out = dump_prompt_embedding_fixture(request, out_dir, hf_dir)
+    prompt_dump = load_prompt_embedding_dump(out)
+    layer0 = compute_text_layer0_hidden_f16_bits(prompt_dump.prompt_embeddings_f16_bits, hf_dir)
+    (out / TEXT_LAYER0_HIDDEN_BIN).write_bytes(np.asarray(layer0, dtype=np.dtype("<u2")).tobytes())
+
+    manifest_path = out / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest.setdefault("golden_tensors", {})["layer_0_hidden"] = {
+        "file": TEXT_LAYER0_HIDDEN_BIN,
+        "dtype": "float16",
+        "storage": "uint16_le",
+        "shape": [int(prompt_dump.input_ids.size), HIDDEN_SIZE],
+        "source": "fp16 numpy reference over BF16 safetensors converted to FP16",
+        "reference_dtype_mode": "FP16 weights/activations with FP32 reductions; layer 0 text-only prefill",
+        "stats": _f16_stats(layer0),
+    }
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return out
+
+
 def load_prompt_embedding_dump(fixture_dir: str | Path) -> PromptEmbeddingDump:
     root = Path(fixture_dir)
     manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
@@ -276,4 +504,28 @@ def load_prompt_embedding_dump(fixture_dir: str | Path) -> PromptEmbeddingDump:
         input_ids=input_ids,
         image_mask=image_mask,
         prompt_embeddings_f16_bits=embeddings.reshape((n_tokens, hidden_size)),
+    )
+
+
+def load_text_layer0_dump(fixture_dir: str | Path) -> TextLayer0Dump:
+    prompt = load_prompt_embedding_dump(fixture_dir)
+    root = Path(fixture_dir)
+    golden = prompt.manifest.get("golden_tensors", {}).get("layer_0_hidden", {})
+    shape = golden.get("shape", [int(prompt.input_ids.size), HIDDEN_SIZE]) if isinstance(golden, dict) else []
+    if not isinstance(shape, list) or len(shape) != 2:
+        raise ValueError(f"invalid layer_0_hidden shape metadata in {root}")
+    n_tokens = int(shape[0])
+    hidden_size = int(shape[1])
+    if n_tokens != int(prompt.input_ids.size) or hidden_size != HIDDEN_SIZE:
+        raise ValueError(f"layer_0_hidden shape {shape} does not match prompt shape")
+    layer0 = np.fromfile(root / TEXT_LAYER0_HIDDEN_BIN, dtype=np.dtype("<u2"))
+    expected_values = n_tokens * hidden_size
+    if layer0.size != expected_values:
+        raise ValueError(f"layer_0_hidden size mismatch: expected {expected_values} f16 values, got {layer0.size}")
+    return TextLayer0Dump(
+        manifest=prompt.manifest,
+        input_ids=prompt.input_ids,
+        image_mask=prompt.image_mask,
+        prompt_embeddings_f16_bits=prompt.prompt_embeddings_f16_bits,
+        layer0_hidden_f16_bits=layer0.reshape((n_tokens, hidden_size)),
     )
