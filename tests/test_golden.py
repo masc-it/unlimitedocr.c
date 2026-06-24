@@ -11,6 +11,7 @@ from unlimitedocr_c.golden import (
     dump_prompt_embedding_fixture,
     load_image_decoder_layers_dump,
     load_image_logits_topk_dump,
+    load_image_generated_ids_dump,
     load_image_prompt_embedding_dump,
     load_prompt_embedding_dump,
     load_text_decoder_layers_dump,
@@ -212,6 +213,10 @@ def test_load_image_decoder_layers_dump_reads_native_hidden_files(tmp_path) -> N
     logits_scores = np.array([5.0, 4.5, -0.25], dtype=np.dtype("<f4"))
     logits_ids.tofile(out / "logits_topk_ids_i32.bin")
     logits_scores.tofile(out / "logits_topk_scores_f32.bin")
+    generated = np.array([42], dtype=np.dtype("<i4"))
+    generated_text = "generated text"
+    generated.tofile(out / "generated_ids_i32.bin")
+    (out / "generated_text.txt").write_text(generated_text, encoding="utf-8")
     manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
     manifest["image_decoder_layer_count"] = 2
     manifest["image_embedding_fixture"] = {
@@ -226,6 +231,8 @@ def test_load_image_decoder_layers_dump_reads_native_hidden_files(tmp_path) -> N
         "layer_0_hidden": {"file": "layer_0_hidden_f16.bin", "shape": [3, 1280]},
         "layer_1_hidden": {"file": "layer_1_hidden_f16.bin", "shape": [3, 1280]},
         "logits_topk": {"ids_file": "logits_topk_ids_i32.bin", "scores_file": "logits_topk_scores_f32.bin", "shape": [3]},
+        "generated_ids": {"file": "generated_ids_i32.bin", "shape": [1]},
+        "generated_text": {"file": "generated_text.txt"},
     }
     manifest["router_topk"] = {
         "layer_1": {
@@ -253,6 +260,10 @@ def test_load_image_decoder_layers_dump_reads_native_hidden_files(tmp_path) -> N
     np.testing.assert_array_equal(loaded_logits.logits_topk_ids, logits_ids)
     np.testing.assert_array_equal(loaded_logits.logits_topk_scores_f32, logits_scores)
     assert loaded_logits.image_span_length == loaded.image_span_length
+    loaded_generated = load_image_generated_ids_dump(out)
+    np.testing.assert_array_equal(loaded_generated.generated_ids, generated)
+    assert loaded_generated.generated_text == generated_text
+    assert loaded_generated.image_span_length == loaded.image_span_length
 
 
 def test_load_text_layer1_dump_reads_native_hidden_files(tmp_path) -> None:

@@ -2683,6 +2683,153 @@ static int test_metal_image_logits_topk_python_dump_parity(void) {
     return 0;
 }
 
+static int test_metal_image_generated_ids_python_dump_parity(void) {
+    if (!uocr_metal_is_available()) {
+        return 0;
+    }
+    if (!env_flag_enabled("UOCR_RUN_LARGE_TESTS")) {
+        return 0;
+    }
+
+    const char *model_path = getenv("UOCR_MODEL_PATH");
+    const char *dump_dir = getenv("UOCR_IMAGE_EMBED_DUMP_DIR");
+    if (model_path == NULL || model_path[0] == '\0' || dump_dir == NULL || dump_dir[0] == '\0') {
+        printf("UOCR_RUN_LARGE_TESTS=1 but UOCR_MODEL_PATH/UOCR_IMAGE_EMBED_DUMP_DIR are not both set; skipping image generated-id/text parity\n");
+        return 0;
+    }
+    if (!fixture_binary_exists(dump_dir, "generated_ids_i32.bin") ||
+        !fixture_binary_exists(dump_dir, "generated_text.txt")) {
+        printf("UOCR_IMAGE_EMBED_DUMP_DIR has no generated id/text files; skipping image generated-id/text parity\n");
+        return 0;
+    }
+    if (!fixture_binary_exists(dump_dir, "layer_11_hidden_f16.bin")) {
+        printf("UOCR_IMAGE_EMBED_DUMP_DIR has no layer_11_hidden_f16.bin; skipping image generated-id/text parity\n");
+        return 0;
+    }
+
+    char error[1024];
+    memset(error, 0, sizeof(error));
+    int32_t *input_ids = NULL;
+    uint8_t *image_mask = NULL;
+    uint32_t n_tokens = 0u;
+    uint16_t *visual_features = NULL;
+    uint32_t image_span_start = UOCR_SEQUENCE_NO_IMAGE_SPAN;
+    uint32_t image_span_length = 0u;
+    uint16_t *prompt = NULL;
+    uint16_t *layer11 = NULL;
+    int32_t *expected_ids = NULL;
+    uint32_t n_generated = 0u;
+    CHECK(read_image_prompt_embedding_python_dump(dump_dir,
+                                                  &input_ids,
+                                                  &image_mask,
+                                                  &n_tokens,
+                                                  &visual_features,
+                                                  &image_span_start,
+                                                  &image_span_length,
+                                                  &prompt,
+                                                  error,
+                                                  sizeof(error)) == 1);
+    CHECK(n_tokens > 0u);
+    (void)image_span_start;
+    (void)image_span_length;
+
+    const uint32_t max_decoder_tokens = env_u32_or_default("UOCR_IMAGE_DECODER_MAX_TOKENS", 32u);
+    if (n_tokens > max_decoder_tokens) {
+        printf("UOCR_IMAGE_EMBED_DUMP_DIR has %u tokens; set UOCR_IMAGE_DECODER_MAX_TOKENS=%u or higher to run image generated-id/text parity\n",
+               n_tokens,
+               n_tokens);
+        free(prompt);
+        free(visual_features);
+        free(image_mask);
+        free(input_ids);
+        return 0;
+    }
+
+    CHECK(read_layer_hidden_python_dump(dump_dir,
+                                        "layer_11_hidden_f16.bin",
+                                        n_tokens,
+                                        &layer11,
+                                        error,
+                                        sizeof(error)) == 1);
+    CHECK(read_text_generated_ids_python_dump(dump_dir,
+                                              &expected_ids,
+                                              &n_generated,
+                                              error,
+                                              sizeof(error)) == 1);
+    CHECK(n_generated == 1u);
+
+    uocr_model_file model;
+    CHECK(uocr_model_file_open(model_path, &model, error, sizeof(error)) == 0);
+    uocr_metal_context *ctx = uocr_metal_context_create(UOCR_TEST_METAL_RESOURCE_PATH, error, sizeof(error));
+    CHECK(ctx != NULL);
+    CHECK(uocr_metal_context_map_model(ctx, &model, error, sizeof(error)) == 1);
+
+    uint16_t *normed = (uint16_t *)calloc((size_t)UOCR_HIDDEN_SIZE, sizeof(uint16_t));
+    float *logits = (float *)malloc((size_t)UOCR_VOCAB_SIZE * sizeof(float));
+    uint32_t actual_token = UINT32_MAX;
+    float actual_score = 0.0f;
+    CHECK(normed != NULL);
+    CHECK(logits != NULL);
+
+    const uint16_t *last_hidden = layer11 + (size_t)(n_tokens - 1u) * UOCR_HIDDEN_SIZE;
+    CHECK(uocr_metal_context_select_next_token_f16(ctx,
+                                                   last_hidden,
+                                                   1u,
+                                                   NULL,
+                                                   normed,
+                                                   logits,
+                                                   &actual_token,
+                                                   &actual_score,
+                                                   error,
+                                                   sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    if ((int32_t)actual_token != expected_ids[0]) {
+        fprintf(stderr,
+                "image generated-id mismatch: actual=%u expected=%d score=%g\n",
+                actual_token,
+                expected_ids[0],
+                (double)actual_score);
+        free(logits);
+        free(normed);
+        uocr_metal_context_destroy(ctx);
+        uocr_model_file_close(&model);
+        free(expected_ids);
+        free(layer11);
+        free(prompt);
+        free(visual_features);
+        free(image_mask);
+        free(input_ids);
+        return 1;
+    }
+
+    uocr_prepared_request request;
+    memset(&request, 0, sizeof(request));
+    request.input_ids = input_ids;
+    request.image_mask = image_mask;
+    request.n_tokens = n_tokens;
+    request.max_new_tokens = n_generated;
+    uocr_sequence_state state;
+    memset(&state, 0, sizeof(state));
+    CHECK(uocr_build_sequence_state(&request, &state, error, sizeof(error)) == UOCR_OK);
+    int32_t generated[1] = {0};
+    CHECK(uocr_sequence_accept_generated_token(&state, (int32_t)actual_token, generated, 1u) == UOCR_OK);
+    CHECK(generated[0] == expected_ids[0]);
+    CHECK(state.generated_count == 1u);
+    CHECK(uocr_sequence_generation_done(&state) == 1);
+
+    free(logits);
+    free(normed);
+    uocr_metal_context_destroy(ctx);
+    uocr_model_file_close(&model);
+    free(expected_ids);
+    free(layer11);
+    free(prompt);
+    free(visual_features);
+    free(image_mask);
+    free(input_ids);
+    return 0;
+}
+
 static int test_metal_text_prompt_embedding_full_model_parity(void) {
     if (!uocr_metal_is_available()) {
         return 0;
@@ -7606,6 +7753,7 @@ int main(void) {
     if (test_metal_image_decoder_layers_python_dump_parity() != 0) return 1;
     if (test_metal_image_router_topk_python_dump_parity() != 0) return 1;
     if (test_metal_image_logits_topk_python_dump_parity() != 0) return 1;
+    if (test_metal_image_generated_ids_python_dump_parity() != 0) return 1;
     if (test_metal_text_layer0_python_dump_parity() != 0) return 1;
     if (test_metal_text_layer1_python_dump_parity() != 0) return 1;
     if (test_metal_text_remaining_layers_python_dump_parity() != 0) return 1;

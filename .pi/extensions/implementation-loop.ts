@@ -24,6 +24,7 @@ QA checkpoint: stress test the codebase to ensure the last 5 implementation chec
 write good code.`;
 
 type PromptKind = "implementation" | "qa";
+type CompactionContinuation = () => void | Promise<void>;
 
 interface MessageLike {
 	role?: string;
@@ -39,6 +40,7 @@ export default function (pi: ExtensionAPI) {
 	let iteration = 0;
 	let runId = 0;
 	let retryCount = 0;
+	let compactionRetryCount = 0;
 	let qaDue = false;
 	let lastPromptKind: PromptKind = "implementation";
 
@@ -59,6 +61,7 @@ export default function (pi: ExtensionAPI) {
 		compacting = false;
 		sending = false;
 		retryCount = 0;
+		compactionRetryCount = 0;
 		qaDue = false;
 		lastPromptKind = "implementation";
 		runId += 1;
@@ -118,20 +121,40 @@ export default function (pi: ExtensionAPI) {
 		queuePrompt(ctx, lastPromptKind, true);
 	}
 
-	function retryCompaction(ctx: ExtensionContext, expectedRunId: number, percent: number, reason: string) {
+	function retryCompaction(
+		ctx: ExtensionContext,
+		expectedRunId: number,
+		percent: number,
+		reason: string,
+		onCompacted?: CompactionContinuation,
+	) {
 		if (!running || expectedRunId !== runId) return;
-		if (retryCount >= MAX_RETRIES) {
+		if (compactionRetryCount >= MAX_RETRIES) {
 			stopLoop(ctx, `/${COMMAND} stopped: compaction failed after ${MAX_RETRIES} retries (${reason}).`, "error");
 			return;
 		}
 
-		retryCount += 1;
-		setStatus(ctx, `implementation-loop compaction retry ${retryCount}/${MAX_RETRIES}`);
-		notify(ctx, `/${COMMAND}: compaction failed (${reason}); retrying ${retryCount}/${MAX_RETRIES}.`, "warning");
-		void Promise.resolve().then(() => startCompaction(ctx, expectedRunId, percent));
+		compactionRetryCount += 1;
+		setStatus(ctx, `implementation-loop compaction retry ${compactionRetryCount}/${MAX_RETRIES}`);
+		notify(ctx, `/${COMMAND}: compaction failed (${reason}); retrying ${compactionRetryCount}/${MAX_RETRIES}.`, "warning");
+		void Promise.resolve().then(() => startCompaction(ctx, expectedRunId, percent, onCompacted));
 	}
 
-	function startCompaction(ctx: ExtensionContext, expectedRunId: number, percent: number) {
+	function runCompactionContinuation(ctx: ExtensionContext, continuation: CompactionContinuation) {
+		void Promise.resolve()
+			.then(continuation)
+			.catch((error) => {
+				const message = error instanceof Error ? error.message : String(error);
+				retryPrompt(ctx, `post-compaction continuation error (${message})`);
+			});
+	}
+
+	function startCompaction(
+		ctx: ExtensionContext,
+		expectedRunId: number,
+		percent: number,
+		onCompacted?: CompactionContinuation,
+	) {
 		if (!running || compacting || expectedRunId !== runId) return;
 
 		compacting = true;
@@ -149,19 +172,23 @@ export default function (pi: ExtensionAPI) {
 						return;
 					}
 
-					retryCount = 0;
+					compactionRetryCount = 0;
 					notify(ctx, `/${COMMAND}: compaction completed; continuing.`, "info");
+					if (onCompacted) {
+						runCompactionContinuation(ctx, onCompacted);
+						return;
+					}
 					void continueLoop(ctx, expectedRunId, false);
 				},
 				onError: (error) => {
 					compacting = false;
-					retryCompaction(ctx, expectedRunId, percent, error.message);
+					retryCompaction(ctx, expectedRunId, percent, error.message, onCompacted);
 				},
 			});
 		} catch (error) {
 			compacting = false;
 			const message = error instanceof Error ? error.message : String(error);
-			retryCompaction(ctx, expectedRunId, percent, message);
+			retryCompaction(ctx, expectedRunId, percent, message, onCompacted);
 		}
 	}
 
@@ -171,7 +198,7 @@ export default function (pi: ExtensionAPI) {
 
 		try {
 			const percent = contextPercent(ctx);
-			if (allowCompaction && percent !== null && percent > CONTEXT_THRESHOLD_PERCENT) {
+			if (allowCompaction && percent !== null && percent >= CONTEXT_THRESHOLD_PERCENT) {
 				startCompaction(ctx, expectedRunId, percent);
 				return;
 			}
@@ -234,14 +261,29 @@ export default function (pi: ExtensionAPI) {
 		if (!running || compacting) return;
 
 		try {
+			const expectedRunId = runId;
 			const agentError = findAgentError(event.messages as readonly MessageLike[]);
+			if (!agentError) {
+				retryCount = 0;
+			}
+
+			const percent = contextPercent(ctx);
+			if (percent !== null && percent >= CONTEXT_THRESHOLD_PERCENT) {
+				startCompaction(
+					ctx,
+					expectedRunId,
+					percent,
+					agentError ? () => retryPrompt(ctx, `agent error: ${agentError}`) : undefined,
+				);
+				return;
+			}
+
 			if (agentError) {
 				retryPrompt(ctx, `agent error: ${agentError}`);
 				return;
 			}
 
-			retryCount = 0;
-			await continueLoop(ctx, runId, true);
+			await continueLoop(ctx, expectedRunId, false);
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
 			retryPrompt(ctx, `agent_end handler error (${message})`);
@@ -261,6 +303,7 @@ export default function (pi: ExtensionAPI) {
 			sending = false;
 			iteration = 0;
 			retryCount = 0;
+			compactionRetryCount = 0;
 			qaDue = false;
 			lastPromptKind = "implementation";
 			runId += 1;

@@ -15,8 +15,8 @@ The plan is intentionally model-specific. The converter absorbs Hugging Face nam
 
 - [ ] **Gate A: frontend fixtures are exact.** Python prepared-request fixtures must match upstream for prompt text, token ids, image mask, crop grid, and preprocessed pixels before C inference work depends on them.
 - [ ] **Gate B: fp16 `.uocr` is structurally exact.** The converter/loader must account for all `2710` safetensors tensors from the current header, either as runtime tensors or explicitly marked unused/provenance-only.
-- [ ] **Gate C: decoder works without vision.** Metal fp16 text-only decoder must match Python layer/logit dumps before image paths are introduced.
-- [ ] **Gate D: decoder works with dumped image embeddings.** Direct prompt assembly with Python-dumped visual embeddings must match Python before implementing the Metal vision stack.
+- [ ] **Gate C: integrated decoder works without vision.** The public Metal fp16 text-only generation path in `uocr_generate_prepared()` must match Python layer/logit/generated-id dumps before image paths are introduced.
+- [ ] **Gate D: integrated decoder works with dumped image embeddings.** The same generation loop, fed with Python-dumped visual embeddings, must match Python prompt/layer/router/logit/generated-id dumps before implementing the Metal vision stack.
 - [ ] **Gate E: vision works in fp16.** SAM -> CLIP -> projector -> newline/separator formatting must match Python visual-feature dumps for `1024` global and `640` local views.
 - [ ] **Gate F: q8 works before q4.** `dyn-q8` converter/kernels must pass layer/logit/generation parity before enabling any q4 policy.
 - [ ] **Gate G: q4 is calibrated, not global.** `dyn-q4` may only ship as a mixed profile with monotonic promotions and explicit reasons.
@@ -30,6 +30,18 @@ First implementation slice, in order:
 - [x] Land C prepared-request validator and Python `ctypes` smoke test.
 - [x] Land Metal backend init/source-compile/no-copy-mmap smoke test.
 - [x] Land fp16 converter dry-run against cached safetensors header/index before requiring the full weight file.
+
+Current priority slice, in order. The coding agent should take the first unchecked item here before starting vision, quantization, batching, CUDA, or high-level OCR API work:
+
+- [ ] Define internal integrated Metal decoder request/result structs and one orchestration entry point; keep existing per-op Metal functions as diagnostic/parity helpers.
+- [ ] Validate and cache all decoder-required mapped tensor bindings (`TOK_EMBED`, `FINAL_NORM`, `LM_HEAD`, layer norms, attention, dense MLP, MoE router/shared/expert weights) before running the integrated decoder.
+- [ ] Implement single-request, slot-0, text-only prompt prefill orchestration over all 12 layers using persistent arenas and KV cache; no image features and no batching yet.
+- [ ] Implement single-token decode-step orchestration using the existing KV ring helpers, prompt+generated-ring attention, final norm, LM head, no-repeat banning, greedy argmax, and EOS handling.
+- [ ] Wire the Metal backend path in `uocr_generate_prepared()` for `n_requests=1`, `views=0`, `fp16` model, and `max_new_tokens>0`; return generated ids with `uocr_result_create_from_generated()` instead of `UOCR_ERROR_NOT_IMPLEMENTED` for that narrow case.
+- [ ] Add an opt-in full-model public API parity test for text-only generated ids (`UOCR_RUN_LARGE_TESTS=1`, `UOCR_MODEL_PATH`, `UOCR_LAYER_DUMP_DIR` or equivalent fixture).
+- [ ] Promote the Python-dumped visual-embedding path from direct Metal tests into the same integrated decoder runner via an internal/test-only fixture adapter, without changing the stable v1 prepared-request image API.
+- [ ] Add opt-in generated-id/text parity for the integrated dumped-visual-embedding path.
+- [ ] Start section 16 Metal vision only after the integrated dumped-visual-embedding generation path passes.
 
 ## 1. Critical facts to encode as asserts
 
@@ -75,6 +87,7 @@ First implementation slice, in order:
 - [ ] Do not allocate in the token loop; preallocate KV/cache/scratch and add debug allocation guards.
 - [ ] Do not eagerly copy the whole `.uocr` model into RAM/GPU private buffers; keep model weights mmap-backed and wrap model ranges as Metal no-copy buffers.
 - [ ] Preserve correctness before speed; no fast path is accepted with unexplained attention, KV, router, or logits drift.
+- [ ] Do not implement the Metal vision encoder, q8/q4, batching, CUDA, or high-level OCR API until the fp16 single-request integrated decoder works first for text-only and then for dumped visual embeddings.
 
 ## 3. Repository and build bootstrap
 
@@ -658,7 +671,7 @@ First implementation slice, in order:
   - [x] CPU version first using logits readback if needed
   - [x] later GPU version for speed
 - [x] Stop on EOS id `1` or max new tokens.
-- [x] Return generated token ids to C result and Python wrapper.
+- [x] Return generated token ids from the diagnostic/parity selection helper.
 - [x] Wire final RMSNorm, LM head, no-repeat bans, greedy argmax, and EOS handoff in a Metal next-token selection helper.
 - [x] Add text-only fp16 parity test:
   - [x] prompt embeddings
@@ -667,6 +680,20 @@ First implementation slice, in order:
   - [x] remaining layers 2..11 MoE outputs
   - [x] logits top-k
   - [x] generated token ids
+
+### 14.5 Integrated public text decoder path
+
+These tasks turn the fp16 decoder primitives/parity helpers into the first real `uocr_generate_prepared()` generation path. Keep the scope narrow: Metal only, fp16 only, single request, text-only, no vision, no batching.
+
+- [ ] Define an internal decoder orchestration boundary, e.g. `uocr_metal_context_generate_text_f16()` or equivalent, that owns prefill/decode scheduling instead of exposing another per-op diagnostic helper.
+- [ ] Build and validate a decoder tensor-binding table from stable tensor ids once per mapped model; fail early if any text decoder tensor is missing, not fp16, or has an unexpected shape.
+- [ ] Assemble text-only prompt embeddings into the persistent prompt arena for slot `0`.
+- [ ] Run full-prompt prefill through all 12 decoder layers, writing prompt K/V for every layer and carrying hidden-state ping-pong buffers in Metal arenas.
+- [ ] Run decode steps from the last accepted token, writing generated K/V into the 128-token ring and attending to all prompt tokens plus live generated ring tokens.
+- [ ] Maintain a preallocated generated-token buffer and prompt+generated no-repeat state; no allocation is allowed inside the per-token loop after initial bring-up.
+- [ ] Stop on EOS id `1` or `max_new_tokens` and return generated ids through `uocr_result_create_from_generated()`.
+- [ ] Wire only this narrow path into `uocr_generate_prepared()`; keep CPU-ref and unsupported Metal cases returning clear `UOCR_ERROR_NOT_IMPLEMENTED` messages.
+- [ ] Add opt-in full-model text-only generated-id parity against Python fixtures.
 
 ## 15. Decoder with Python-dumped image embeddings
 
@@ -686,7 +713,21 @@ First implementation slice, in order:
   - [ ] generated ids/text
 - [ ] Keep this mode available permanently as a parity/debug path even after Metal vision exists.
 
+### 15.1 Integrated dumped-embedding generation path
+
+Do this immediately after section 14.5 and before porting SAM/CLIP. The goal is to prove the real decoder/generation loop works for image prompts while vision is still bypassed.
+
+- [ ] Add an internal/test-only request adapter that supplies preformatted fp16 visual feature rows `[image_tokens,1280]` alongside a normal prepared image request.
+- [ ] Reuse the integrated text decoder runner after prompt assembly; do not maintain a separate image-specific decoder loop.
+- [ ] Assemble text tokens plus dumped visual rows into the same prompt arena layout that future Metal vision will produce.
+- [ ] Validate image span length equals dumped visual feature rows and that the prepared request's view/crop metadata still passes normal validation.
+- [ ] Run prefill/decode/generation through the integrated decoder for dumped image embeddings.
+- [ ] Compare generated ids/text against Python dumped-image fixtures; logits/top-k and router checks remain mandatory diagnostics when generated ids drift.
+- [ ] Keep this path as a permanent opt-in parity mode after Metal vision lands.
+
 ## 16. Metal fp16 vision encoder
+
+Do not begin this section until sections 14.5 and 15.1 pass for fp16 single-request generation. Vision should replace dumped visual embeddings, not introduce a second decoder/generation path.
 
 ### 16.1 Vision scheduling and memory
 
@@ -870,7 +911,9 @@ First implementation slice, in order:
 
 ## 20. Python end-to-end API
 
-- [ ] Implement `python/unlimitedocr_c/engine.py` with an `Engine` class around the C ABI.
+Do not start the high-level OCR API until `uocr_generate_prepared()` can return generated ids for the fp16 single-request Metal path. A thin `ctypes` `Engine` already exists in `src/unlimitedocr_c/ffi.py`; this section is about stable user-facing ergonomics after the native pipeline works.
+
+- [ ] Decide whether to keep the existing `src/unlimitedocr_c/ffi.py::Engine` as the public engine or move/wrap it in `python/unlimitedocr_c/engine.py` during packaging cleanup.
 - [ ] Implement `generate_prepared()` returning generated token ids.
 - [ ] Implement high-level `ocr.generate(image, prompt, preset=...)`:
   - [ ] build prepared request
@@ -926,6 +969,11 @@ First implementation slice, in order:
   - [x] `UOCR_MODEL_PATH`
   - [x] `UOCR_HF_DIR`
   - [x] `UOCR_RUN_LARGE_TESTS=1`
+- [ ] Add opt-in integrated fp16 generation tests:
+  - [ ] public `uocr_generate_prepared()` text-only generated ids match Python fixture
+  - [ ] integrated dumped-visual-embedding generated ids/text match Python fixture
+  - [ ] unsupported public paths still return clear `UOCR_ERROR_NOT_IMPLEMENTED` messages
+  - [ ] no-allocation guard passes around the decode token loop
 - [ ] Define fp16 parity thresholds per stage:
   - [ ] prompt embeddings: near exact within dtype tolerance
   - [ ] vision projected features: small absolute/relative tolerance after fp16 conversion

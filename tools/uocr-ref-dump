@@ -22,6 +22,7 @@ from unlimitedocr_c.golden import (
     HIDDEN_SIZE,
     dump_image_decoder_layers_fixture,
     dump_image_logits_topk_fixture,
+    dump_image_generated_ids_fixture,
     dump_image_prompt_embedding_fixture,
     dump_prompt_embedding_fixture,
     dump_text_decoder_layers_fixture,
@@ -67,6 +68,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--dump-image-logits-topk",
         action="store_true",
         help="also dump image decoder layers plus next-token LM-head top-k logits for Metal parity",
+    )
+    parser.add_argument(
+        "--dump-image-generated-ids",
+        action="store_true",
+        help="also dump image decoder layers, logits top-k, first greedy generated token id, and decoded text",
     )
     parser.add_argument(
         "--visual-features-f16",
@@ -144,8 +150,10 @@ def main(argv: list[str] | None = None) -> int:
         if args.hf_dir is None:
             raise SystemExit("--dump-text-generated-ids requires --hf-dir")
         dump_text_generated_ids_fixture(request, args.out, args.hf_dir, top_k=args.logits_top_k)
-    elif args.dump_image_logits_topk or args.dump_image_decoder_layers or args.dump_image_prompt_embeddings:
-        if args.dump_image_logits_topk:
+    elif args.dump_image_generated_ids or args.dump_image_logits_topk or args.dump_image_decoder_layers or args.dump_image_prompt_embeddings:
+        if args.dump_image_generated_ids:
+            mode_name = "--dump-image-generated-ids"
+        elif args.dump_image_logits_topk:
             mode_name = "--dump-image-logits-topk"
         elif args.dump_image_decoder_layers:
             mode_name = "--dump-image-decoder-layers"
@@ -165,7 +173,9 @@ def main(argv: list[str] | None = None) -> int:
                 f"--visual-features-f16 size mismatch: expected {expected_values} fp16 values for {image_tokens} image tokens, got {visual.size}"
             )
         visual = visual.reshape((image_tokens, HIDDEN_SIZE))
-        if args.dump_image_logits_topk:
+        if args.dump_image_generated_ids:
+            dump_image_generated_ids_fixture(request, args.out, args.hf_dir, visual, top_k=args.logits_top_k)
+        elif args.dump_image_logits_topk:
             dump_image_logits_topk_fixture(request, args.out, args.hf_dir, visual, top_k=args.logits_top_k)
         elif args.dump_image_decoder_layers:
             dump_image_decoder_layers_fixture(request, args.out, args.hf_dir, visual)
