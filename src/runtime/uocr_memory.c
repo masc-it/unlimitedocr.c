@@ -147,17 +147,29 @@ int uocr_estimate_prompt_embedding_bytes(uint32_t batch_slots, uint32_t prompt_t
     return UOCR_OK;
 }
 
-int uocr_estimate_vision_scratch_bytes(uint64_t *out_bytes) {
+int uocr_estimate_vision_scratch_bytes_for_rows(uint32_t final_visual_rows,
+                                                uint32_t max_chunk_projected_rows,
+                                                uint64_t *out_bytes) {
     if (out_bytes == NULL) {
+        return UOCR_ERROR_INVALID_ARGUMENT;
+    }
+    if (final_visual_rows == 0u && max_chunk_projected_rows == 0u) {
+        *out_bytes = 0u;
+        return UOCR_OK;
+    }
+    if (final_visual_rows == 0u || max_chunk_projected_rows == 0u) {
         return UOCR_ERROR_INVALID_ARGUMENT;
     }
 
     /*
-     * One-view chunk estimate for the fp16 vision bring-up path.  Crop mode can
-     * process local views in chunks, so capacity is based on the largest global
-     * 1024x1024 view plus the major SAM/CLIP/projector activation buffers that
-     * must coexist during a view pass.  Attention internals should use tiled
-     * kernels and named scratch arenas rather than materializing full matrices.
+     * Chunked fp16 vision capacity for the Metal bring-up path.
+     *
+     * SAM/CLIP scratch is sized for one largest 1024x1024 view and reused while
+     * local/global views are processed chunk-by-chunk.  The caller supplies the
+     * maximum projector-output rows held for a chunk and the final formatted
+     * visual-feature rows that must coexist before prompt embedding assembly.
+     * Attention internals should use tiled kernels and named scratch arenas
+     * rather than materializing full matrices.
      */
     const uint64_t global_patches =
         ((uint64_t)UOCR_GLOBAL_VIEW_SIZE / (uint64_t)UOCR_VISION_PATCH_SIZE) *
@@ -165,30 +177,54 @@ int uocr_estimate_vision_scratch_bytes(uint64_t *out_bytes) {
     const uint64_t global_queries = (uint64_t)UOCR_GLOBAL_GRID_QUERIES * (uint64_t)UOCR_GLOBAL_GRID_QUERIES;
     const uint64_t global_clip_tokens = global_queries + 1u; /* CLS */
 
+    uint64_t input_values = 0u;
     uint64_t input_bytes = 0u;
+    uint64_t sam_patch_values = 0u;
     uint64_t sam_patch_bytes = 0u;
+    uint64_t sam_feature_values = 0u;
     uint64_t sam_feature_bytes = 0u;
+    uint64_t clip_hidden_values = 0u;
     uint64_t clip_hidden_bytes = 0u;
+    uint64_t concat_values = 0u;
     uint64_t concat_bytes = 0u;
-    uint64_t projected_bytes = 0u;
+    uint64_t projected_values = 0u;
+    uint64_t projected_chunk_bytes = 0u;
+    uint64_t final_visual_values = 0u;
+    uint64_t final_visual_bytes = 0u;
     uint64_t total = 0u;
-    if (!checked_mul_u64(3ull * (uint64_t)UOCR_GLOBAL_VIEW_SIZE * (uint64_t)UOCR_GLOBAL_VIEW_SIZE, 2u, &input_bytes) ||
-        !checked_mul_u64(global_patches * (uint64_t)UOCR_SAM_HIDDEN_SIZE, 2u, &sam_patch_bytes) ||
-        !checked_mul_u64(global_queries * (uint64_t)UOCR_SAM_FEATURE_CHANNELS, 2u, &sam_feature_bytes) ||
-        !checked_mul_u64(global_clip_tokens * (uint64_t)UOCR_CLIP_HIDDEN_SIZE, 2u, &clip_hidden_bytes) ||
-        !checked_mul_u64(global_queries * (uint64_t)UOCR_PROJECTOR_IN_SIZE, 2u, &concat_bytes) ||
-        !checked_mul_u64((uint64_t)UOCR_GLOBAL_VISUAL_TOKENS * (uint64_t)UOCR_HIDDEN_SIZE, 2u, &projected_bytes) ||
+    if (!checked_mul_u64(3ull, (uint64_t)UOCR_GLOBAL_VIEW_SIZE, &input_values) ||
+        !checked_mul_u64(input_values, (uint64_t)UOCR_GLOBAL_VIEW_SIZE, &input_values) ||
+        !checked_mul_u64(input_values, 2u, &input_bytes) ||
+        !checked_mul_u64(global_patches, (uint64_t)UOCR_SAM_HIDDEN_SIZE, &sam_patch_values) ||
+        !checked_mul_u64(sam_patch_values, 2u, &sam_patch_bytes) ||
+        !checked_mul_u64(global_queries, (uint64_t)UOCR_SAM_FEATURE_CHANNELS, &sam_feature_values) ||
+        !checked_mul_u64(sam_feature_values, 2u, &sam_feature_bytes) ||
+        !checked_mul_u64(global_clip_tokens, (uint64_t)UOCR_CLIP_HIDDEN_SIZE, &clip_hidden_values) ||
+        !checked_mul_u64(clip_hidden_values, 2u, &clip_hidden_bytes) ||
+        !checked_mul_u64((uint64_t)max_chunk_projected_rows, (uint64_t)UOCR_PROJECTOR_IN_SIZE, &concat_values) ||
+        !checked_mul_u64(concat_values, 2u, &concat_bytes) ||
+        !checked_mul_u64((uint64_t)max_chunk_projected_rows, (uint64_t)UOCR_HIDDEN_SIZE, &projected_values) ||
+        !checked_mul_u64(projected_values, 2u, &projected_chunk_bytes) ||
+        !checked_mul_u64((uint64_t)final_visual_rows, (uint64_t)UOCR_HIDDEN_SIZE, &final_visual_values) ||
+        !checked_mul_u64(final_visual_values, 2u, &final_visual_bytes) ||
         !checked_add_to_total(&total, input_bytes) ||
         !checked_add_to_total(&total, sam_patch_bytes) ||
         !checked_add_to_total(&total, sam_feature_bytes) ||
         !checked_add_to_total(&total, clip_hidden_bytes) ||
         !checked_add_to_total(&total, concat_bytes) ||
-        !checked_add_to_total(&total, projected_bytes)) {
+        !checked_add_to_total(&total, projected_chunk_bytes) ||
+        !checked_add_to_total(&total, final_visual_bytes)) {
         return UOCR_ERROR_OUT_OF_MEMORY;
     }
 
     *out_bytes = total;
     return UOCR_OK;
+}
+
+int uocr_estimate_vision_scratch_bytes(uint64_t *out_bytes) {
+    return uocr_estimate_vision_scratch_bytes_for_rows(UOCR_GLOBAL_VISUAL_TOKENS,
+                                                       UOCR_GLOBAL_GRID_QUERIES * UOCR_GLOBAL_GRID_QUERIES,
+                                                       out_bytes);
 }
 
 int uocr_estimate_decoder_scratch_bytes(uint32_t batch_slots, uint32_t prompt_token_capacity, uint64_t *out_bytes) {
@@ -306,11 +342,14 @@ int uocr_estimate_safety_margin_bytes(uint64_t subtotal_bytes, uint64_t *out_byt
     return UOCR_OK;
 }
 
-int uocr_estimate_minimal_runtime_memory(uint32_t batch_slots,
-                                         uint32_t prompt_token_capacity,
-                                         uint64_t model_view_bytes,
-                                         uocr_runtime_memory_estimate *out_estimate) {
-    if (out_estimate == NULL || batch_slots == 0u || prompt_token_capacity == 0u) {
+int uocr_estimate_runtime_memory_with_vision(uint32_t batch_slots,
+                                             uint32_t prompt_token_capacity,
+                                             uint64_t model_view_bytes,
+                                             uint32_t final_visual_token_capacity,
+                                             uint32_t max_chunk_projected_rows,
+                                             uocr_runtime_memory_estimate *out_estimate) {
+    if (out_estimate == NULL || batch_slots == 0u || prompt_token_capacity == 0u ||
+        final_visual_token_capacity > prompt_token_capacity) {
         return UOCR_ERROR_INVALID_ARGUMENT;
     }
 
@@ -326,7 +365,9 @@ int uocr_estimate_minimal_runtime_memory(uint32_t batch_slots,
     if (status != UOCR_OK) {
         return status;
     }
-    status = uocr_estimate_vision_scratch_bytes(&estimate.vision_scratch_bytes);
+    status = uocr_estimate_vision_scratch_bytes_for_rows(final_visual_token_capacity,
+                                                         max_chunk_projected_rows,
+                                                         &estimate.vision_scratch_bytes);
     if (status != UOCR_OK) {
         return status;
     }
@@ -364,4 +405,16 @@ int uocr_estimate_minimal_runtime_memory(uint32_t batch_slots,
     estimate.total_bytes = total;
     *out_estimate = estimate;
     return UOCR_OK;
+}
+
+int uocr_estimate_minimal_runtime_memory(uint32_t batch_slots,
+                                         uint32_t prompt_token_capacity,
+                                         uint64_t model_view_bytes,
+                                         uocr_runtime_memory_estimate *out_estimate) {
+    return uocr_estimate_runtime_memory_with_vision(batch_slots,
+                                                   prompt_token_capacity,
+                                                   model_view_bytes,
+                                                   prompt_token_capacity,
+                                                   UOCR_GLOBAL_GRID_QUERIES * UOCR_GLOBAL_GRID_QUERIES,
+                                                   out_estimate);
 }

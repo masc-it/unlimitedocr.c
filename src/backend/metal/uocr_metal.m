@@ -1902,7 +1902,9 @@ static int runtime_arena_capacities(uint32_t batch_slots,
     if (status != UOCR_OK) {
         return status;
     }
-    status = uocr_estimate_vision_scratch_bytes(&capacities[UOCR_METAL_ARENA_VISION_SCRATCH]);
+    status = uocr_estimate_vision_scratch_bytes_for_rows(prompt_token_capacity,
+                                                         UOCR_GLOBAL_GRID_QUERIES * UOCR_GLOBAL_GRID_QUERIES,
+                                                         &capacities[UOCR_METAL_ARENA_VISION_SCRATCH]);
     if (status != UOCR_OK) {
         return status;
     }

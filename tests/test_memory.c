@@ -59,6 +59,32 @@ static int test_kv_formula(void) {
     return 0;
 }
 
+static int test_vision_scratch_rows_formula(void) {
+    uint64_t text_only = 123u;
+    CHECK(uocr_estimate_vision_scratch_bytes_for_rows(0u, 0u, &text_only) == UOCR_OK);
+    CHECK(text_only == 0u);
+    CHECK(uocr_estimate_vision_scratch_bytes_for_rows(1u, 0u, &text_only) == UOCR_ERROR_INVALID_ARGUMENT);
+    CHECK(uocr_estimate_vision_scratch_bytes_for_rows(0u, 1u, &text_only) == UOCR_ERROR_INVALID_ARGUMENT);
+
+    uint64_t global_default = 0u;
+    uint64_t explicit_global = 0u;
+    CHECK(uocr_estimate_vision_scratch_bytes(&global_default) == UOCR_OK);
+    CHECK(uocr_estimate_vision_scratch_bytes_for_rows(UOCR_GLOBAL_VISUAL_TOKENS,
+                                                       UOCR_GLOBAL_GRID_QUERIES * UOCR_GLOBAL_GRID_QUERIES,
+                                                       &explicit_global) == UOCR_OK);
+    CHECK(global_default == explicit_global);
+
+    const uint32_t crop_visual = uocr_local_visual_token_count(3u, 2u) + UOCR_GLOBAL_VISUAL_TOKENS;
+    uint64_t crop_estimate = 0u;
+    CHECK(uocr_estimate_vision_scratch_bytes_for_rows(crop_visual,
+                                                       UOCR_GLOBAL_GRID_QUERIES * UOCR_GLOBAL_GRID_QUERIES,
+                                                       &crop_estimate) == UOCR_OK);
+    CHECK(crop_estimate > global_default);
+    CHECK(crop_estimate - global_default ==
+          (uint64_t)(crop_visual - UOCR_GLOBAL_VISUAL_TOKENS) * (uint64_t)UOCR_HIDDEN_SIZE * 2u);
+    return 0;
+}
+
 static int test_minimal_runtime_estimate(void) {
     const uint32_t batch = 2u;
     const uint32_t prompt_tokens = 4096u;
@@ -75,7 +101,9 @@ static int test_minimal_runtime_estimate(void) {
     uint64_t expected_logits = 0u;
     CHECK(uocr_estimate_kv_cache_bytes(batch, prompt_tokens, &expected_kv) == UOCR_OK);
     CHECK(uocr_estimate_prompt_embedding_bytes(batch, prompt_tokens, &expected_prompt) == UOCR_OK);
-    CHECK(uocr_estimate_vision_scratch_bytes(&expected_vision) == UOCR_OK);
+    CHECK(uocr_estimate_vision_scratch_bytes_for_rows(prompt_tokens,
+                                                       UOCR_GLOBAL_GRID_QUERIES * UOCR_GLOBAL_GRID_QUERIES,
+                                                       &expected_vision) == UOCR_OK);
     CHECK(uocr_estimate_decoder_scratch_bytes(batch, prompt_tokens, &expected_decoder) == UOCR_OK);
     CHECK(uocr_estimate_moe_scratch_bytes(batch, prompt_tokens, &expected_moe) == UOCR_OK);
     uint64_t expected_moe_router_topk = 0u;
@@ -105,6 +133,7 @@ int main(void) {
     int status = 0;
     if ((status = test_tracker_live_and_peak_counters()) != 0) return status;
     if ((status = test_kv_formula()) != 0) return status;
+    if ((status = test_vision_scratch_rows_formula()) != 0) return status;
     if ((status = test_minimal_runtime_estimate()) != 0) return status;
     return 0;
 }

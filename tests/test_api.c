@@ -1,6 +1,8 @@
 #include "unlimitedocr.h"
 
 #include "model/uocr_format.h"
+#include "runtime/uocr_memory.h"
+#include "runtime/uocr_vision.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -482,6 +484,31 @@ static int test_crop_image_request_validation(void) {
     int status = uocr_generate_prepared(engine, &req, 1, &result);
     CHECK(status == UOCR_OK);
     CHECK(result != NULL);
+
+    uocr_vision_schedule schedule;
+    char schedule_error[256];
+    memset(&schedule, 0, sizeof(schedule));
+    memset(schedule_error, 0, sizeof(schedule_error));
+    CHECK(uocr_plan_vision_schedule(&req,
+                                    1u,
+                                    NULL,
+                                    0u,
+                                    &schedule,
+                                    schedule_error,
+                                    sizeof(schedule_error)) == UOCR_OK);
+    uint64_t expected_vision = 0u;
+    CHECK(uocr_estimate_vision_scratch_bytes_for_rows(schedule.final_visual_tokens,
+                                                       schedule.max_chunk_projected_tokens,
+                                                       &expected_vision) == UOCR_OK);
+    uocr_memory_report report;
+    memset(&report, 0, sizeof(report));
+    CHECK(uocr_engine_memory_report(engine, &report) == UOCR_OK);
+    CHECK(report.estimated_vision_scratch_bytes == expected_vision);
+    CHECK(report.estimated_vision_scratch_bytes > 0u);
+    uint64_t global_vision = 0u;
+    CHECK(uocr_estimate_vision_scratch_bytes(&global_vision) == UOCR_OK);
+    CHECK(report.estimated_vision_scratch_bytes > global_vision);
+
     uocr_result_free(result);
     free(input_ids);
     free(image_mask);

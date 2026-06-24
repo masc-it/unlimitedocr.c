@@ -11,6 +11,7 @@
 #include "runtime/uocr_memory.h"
 #include "runtime/uocr_request_validation.h"
 #include "runtime/uocr_sequence.h"
+#include "runtime/uocr_vision.h"
 
 #if UOCR_HAVE_METAL
 #include "backend/metal/uocr_metal.h"
@@ -517,6 +518,8 @@ int uocr_generate_prepared(uocr_engine *engine,
 
     const uocr_request_limits limits = {engine->max_prompt_tokens, engine->max_gen_tokens};
     uint32_t max_prompt_tokens_in_batch = 0u;
+    uint32_t max_visual_tokens_in_batch = 0u;
+    uint32_t max_vision_chunk_projected_rows = 0u;
     int any_generation_requested = 0;
     for (uint32_t i = 0u; i < n_requests; ++i) {
         char validation_error[512];
@@ -530,6 +533,24 @@ int uocr_generate_prepared(uocr_engine *engine,
             return set_engine_errorf(engine, state_status, "request %u state build failed: %s", i, validation_error);
         }
         (void)sequence_state; /* retained here to exercise state construction before inference kernels land */
+        uocr_vision_schedule vision_schedule;
+        memset(&vision_schedule, 0, sizeof(vision_schedule));
+        const int vision_status = uocr_plan_vision_schedule(&requests[i],
+                                                            1u,
+                                                            NULL,
+                                                            0u,
+                                                            &vision_schedule,
+                                                            validation_error,
+                                                            sizeof(validation_error));
+        if (vision_status != UOCR_OK) {
+            return set_engine_errorf(engine, vision_status, "request %u vision scheduling failed: %s", i, validation_error);
+        }
+        if (vision_schedule.final_visual_tokens > max_visual_tokens_in_batch) {
+            max_visual_tokens_in_batch = vision_schedule.final_visual_tokens;
+        }
+        if (vision_schedule.max_chunk_projected_tokens > max_vision_chunk_projected_rows) {
+            max_vision_chunk_projected_rows = vision_schedule.max_chunk_projected_tokens;
+        }
         if (requests[i].n_tokens > max_prompt_tokens_in_batch) {
             max_prompt_tokens_in_batch = requests[i].n_tokens;
         }
@@ -539,10 +560,12 @@ int uocr_generate_prepared(uocr_engine *engine,
     }
 
     uocr_runtime_memory_estimate request_estimate;
-    const int estimate_status = uocr_estimate_minimal_runtime_memory(n_requests,
-                                                                     max_prompt_tokens_in_batch,
-                                                                     engine->model_view_bytes,
-                                                                     &request_estimate);
+    const int estimate_status = uocr_estimate_runtime_memory_with_vision(n_requests,
+                                                                         max_prompt_tokens_in_batch,
+                                                                         engine->model_view_bytes,
+                                                                         max_visual_tokens_in_batch,
+                                                                         max_vision_chunk_projected_rows,
+                                                                         &request_estimate);
     if (estimate_status != UOCR_OK) {
         return set_engine_errorf(engine, estimate_status, "failed to estimate request memory requirements");
     }

@@ -41,6 +41,9 @@ void uocr_memory_tracker_reset_peaks(uocr_memory_tracker *tracker);
 uint64_t uocr_kv_cache_bytes_per_token(void);
 int uocr_estimate_kv_cache_bytes(uint32_t batch_slots, uint32_t prompt_token_capacity, uint64_t *out_bytes);
 int uocr_estimate_prompt_embedding_bytes(uint32_t batch_slots, uint32_t prompt_token_capacity, uint64_t *out_bytes);
+int uocr_estimate_vision_scratch_bytes_for_rows(uint32_t final_visual_rows,
+                                                uint32_t max_chunk_projected_rows,
+                                                uint64_t *out_bytes);
 int uocr_estimate_vision_scratch_bytes(uint64_t *out_bytes);
 int uocr_estimate_decoder_scratch_bytes(uint32_t batch_slots, uint32_t prompt_token_capacity, uint64_t *out_bytes);
 int uocr_estimate_moe_router_topk_bytes(uint32_t batch_slots, uint32_t prompt_token_capacity, uint64_t *out_bytes);
@@ -48,6 +51,12 @@ int uocr_estimate_moe_intermediate_bytes(uint32_t batch_slots, uint32_t prompt_t
 int uocr_estimate_moe_scratch_bytes(uint32_t batch_slots, uint32_t prompt_token_capacity, uint64_t *out_bytes);
 int uocr_estimate_logits_readback_bytes(uint32_t batch_slots, uint64_t *out_bytes);
 int uocr_estimate_safety_margin_bytes(uint64_t subtotal_bytes, uint64_t *out_bytes);
+int uocr_estimate_runtime_memory_with_vision(uint32_t batch_slots,
+                                             uint32_t prompt_token_capacity,
+                                             uint64_t model_view_bytes,
+                                             uint32_t final_visual_token_capacity,
+                                             uint32_t max_chunk_projected_rows,
+                                             uocr_runtime_memory_estimate *out_estimate);
 int uocr_estimate_minimal_runtime_memory(uint32_t batch_slots,
                                          uint32_t prompt_token_capacity,
                                          uint64_t model_view_bytes,
