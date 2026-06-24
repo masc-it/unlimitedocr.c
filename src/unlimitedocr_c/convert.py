@@ -619,6 +619,50 @@ def _dyn_q8_quant_reason(name: str, shape: tuple[int, ...], registry_entry: Tens
     return None
 
 
+def _dyn_q4_mandatory_fp16_reason(name: str, registry_entry: TensorRegistryEntry) -> str | None:
+    q8_reason = _dyn_q8_mandatory_fp16_reason(name, registry_entry)
+    if q8_reason is None:
+        return None
+    return q8_reason.replace("dyn-q8", "dyn-q4", 1)
+
+
+def _dyn_q4_quant_choice(
+    name: str, shape: tuple[int, ...], registry_entry: TensorRegistryEntry
+) -> tuple[str, str] | None:
+    keep_reason = _dyn_q4_mandatory_fp16_reason(name, registry_entry)
+    if keep_reason is not None or len(shape) < 2:
+        return None
+    if name == "lm_head.weight":
+        return "UOCR_TENSOR_Q8_0", "dyn-q4 policy: LM head stays Q8_0 until generation parity permits q4"
+    if name == "model.embed_tokens.weight":
+        return "UOCR_TENSOR_Q8_0", "dyn-q4 policy: token embedding stays Q8_0 until embedding parity permits q4"
+    if not name.endswith(".weight"):
+        return None
+
+    projection = registry_entry.projection
+    if registry_entry.family == TensorFamily.LAYER_ATTN:
+        return "UOCR_TENSOR_Q4_K", "dyn-q4 policy: attention projection inner dim 1280 -> Q4_K candidate"
+    if registry_entry.family == TensorFamily.MOE_EXPERT:
+        if projection in {TensorProjection.GATE, TensorProjection.UP}:
+            return "UOCR_TENSOR_Q4_K", "dyn-q4 policy: routed expert gate/up inner dim 1280 -> Q4_K candidate"
+        if projection == TensorProjection.DOWN:
+            return "UOCR_TENSOR_Q8_0", "dyn-q4 policy: routed expert down inner dim 896 is unaligned for Q4_K -> Q8_0"
+    if registry_entry.family == TensorFamily.LAYER_DENSE_MLP:
+        if projection in {TensorProjection.GATE, TensorProjection.UP}:
+            return "UOCR_TENSOR_Q4_K", "dyn-q4 policy: dense layer-0 gate/up inner dim 1280 -> Q4_K candidate"
+        if projection == TensorProjection.DOWN:
+            return "UOCR_TENSOR_Q8_0", "dyn-q4 policy: dense layer-0 down inner dim 6848 is unaligned for Q4_K -> Q8_0"
+    if registry_entry.family == TensorFamily.MOE_SHARED:
+        if projection == TensorProjection.DOWN:
+            return "UOCR_TENSOR_Q4_K", "dyn-q4 policy: shared expert down inner dim 1792 -> Q4_K candidate after q8 parity"
+        return "UOCR_TENSOR_Q8_0", "dyn-q4 policy: shared expert gate/up stays Q8_0 until calibration permits q4"
+    if registry_entry.family in {TensorFamily.VISION_SAM, TensorFamily.VISION_CLIP}:
+        return "UOCR_TENSOR_Q8_0", "dyn-q4 policy: vision weights stay Q8_0 initially; selective q4 is deferred"
+    if registry_entry.family == TensorFamily.PROJECTOR:
+        return "UOCR_TENSOR_Q8_0", "dyn-q4 policy: visual projector stays Q8_0 initially for OCR-sensitive features"
+    return None
+
+
 def _projection_for_plan(registry_entry: TensorRegistryEntry) -> tuple[str, int]:
     projection = registry_entry.projection
     if projection == TensorProjection.NONE:
@@ -627,8 +671,6 @@ def _projection_for_plan(registry_entry: TensorRegistryEntry) -> tuple[str, int]
 
 
 def _make_tensor_plan(name: str, entry: Mapping[str, Any], qprofile: str, registry_entry: TensorRegistryEntry) -> TensorPlan:
-    if qprofile == "dyn-q4":
-        raise NotImplementedError("dyn-q4 planning is not implemented until the conservative q4 policy is defined")
     shape = tuple(int(dim) for dim in entry["shape"])
     offsets = (int(entry["data_offsets"][0]), int(entry["data_offsets"][1]))
     source_bytes = offsets[1] - offsets[0]
@@ -662,6 +704,42 @@ def _make_tensor_plan(name: str, entry: Mapping[str, Any], qprofile: str, regist
             reason = (
                 _dyn_q8_mandatory_fp16_reason(name, registry_entry)
                 or "dyn-q8 fp16 keep-list: non-weight or small tensor"
+            )
+    elif qprofile == "dyn-q4":
+        quant_choice = _dyn_q4_quant_choice(name, shape, registry_entry)
+        if quant_choice is not None:
+            qtype_name, quant_reason = quant_choice
+            try:
+                (
+                    logical_shape,
+                    physical_shape,
+                    output_bytes,
+                    block_size,
+                    row_size,
+                    qtype_id,
+                    output_dtype,
+                ) = _quantized_tensor_metadata(shape, qtype_name)
+                qtype = qtype_name
+                reason = quant_reason
+            except ValueError as exc:
+                if qtype_name != "UOCR_TENSOR_Q4_K":
+                    reason = f"dyn-q4 fp16 fallback: {quant_reason}; {exc}"
+                else:
+                    (
+                        logical_shape,
+                        physical_shape,
+                        output_bytes,
+                        block_size,
+                        row_size,
+                        qtype_id,
+                        output_dtype,
+                    ) = _quantized_tensor_metadata(shape, "UOCR_TENSOR_Q8_0")
+                    qtype = "UOCR_TENSOR_Q8_0"
+                    reason = f"dyn-q4 Q8_0 fallback for unaligned Q4_K candidate: {quant_reason}; {exc}"
+        else:
+            reason = (
+                _dyn_q4_mandatory_fp16_reason(name, registry_entry)
+                or "dyn-q4 fp16 keep-list: non-weight or small tensor"
             )
     elif qprofile != "fp16":
         raise ValueError(f"unknown qprofile {qprofile!r}")
@@ -746,8 +824,6 @@ def build_dry_run_plan(
     hf_dir = Path(hf_dir)
     if qprofile not in QPROFILE_IDS:
         raise ValueError(f"unknown qprofile {qprofile!r}")
-    if qprofile == "dyn-q4":
-        raise NotImplementedError("--qprofile dyn-q4 is deferred until the conservative q4 policy is implemented")
 
     validate_config(hf_dir)
 
@@ -1236,7 +1312,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.out is None and not args.dry_run:
         parser.error("either --dry-run or --out is required")
     if args.out is not None and args.qprofile == "dyn-q4":
-        parser.error("dyn-q4 .uocr writing is not implemented yet; use --dry-run after q4 planning lands")
+        parser.error("dyn-q4 .uocr writing is not implemented yet; use --dry-run for q4 planning")
 
     plan = build_dry_run_plan(
         args.hf_dir,

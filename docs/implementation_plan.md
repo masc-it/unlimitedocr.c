@@ -829,14 +829,14 @@ Do not begin this section until sections 14.5 and 15.1 pass for fp16 single-requ
 
 ### 17.3 `dyn-q4` profile
 
-- [ ] Implement conservative q4 policy:
-  - [ ] attention projections `1280` inner dim -> `Q4_K` candidates
-  - [ ] routed expert `gate_proj/up_proj` inner dim `1280` -> `Q4_K` candidates
-  - [ ] routed expert `down_proj` inner dim `896` -> keep `Q8_0` initially
-  - [ ] dense layer-0 `down_proj` inner dim `6848` -> keep `Q8_0` initially
-  - [ ] shared expert down inner dim `1792` -> `Q4_K` candidate after q8 parity
-  - [ ] LM head -> keep `Q8_0` initially
-  - [ ] vision -> keep `Q8_0` initially, selective q4 later
+- [x] Implement conservative q4 policy:
+  - [x] attention projections `1280` inner dim -> `Q4_K` candidates
+  - [x] routed expert `gate_proj/up_proj` inner dim `1280` -> `Q4_K` candidates
+  - [x] routed expert `down_proj` inner dim `896` -> keep `Q8_0` initially
+  - [x] dense layer-0 `down_proj` inner dim `6848` -> keep `Q8_0` initially
+  - [x] shared expert down inner dim `1792` -> `Q4_K` candidate after q8 parity
+  - [x] LM head -> keep `Q8_0` initially
+  - [x] vision -> keep `Q8_0` initially, selective q4 later
 - [ ] Add `PADDED_Q4_K` design but do not enable by default:
   - [ ] physical width rounded to multiple of `256`
   - [ ] activation zero-fill/padding in kernels

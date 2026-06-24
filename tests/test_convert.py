@@ -11,12 +11,15 @@ from unlimitedocr_c.convert import (
     EXPECTED_TOTAL_BYTES,
     PRESERVED_UNUSED_NORMAL_OCR_PREFIXES,
     UOCR_FILE_HEADER_SIZE,
+    UOCR_Q4_K_BLOCK_SIZE,
+    UOCR_Q4_K_TYPE_SIZE,
     UOCR_Q8_0_BLOCK_SIZE,
     UOCR_Q8_0_TYPE_SIZE,
     UOCR_QPROFILE_DYN_Q8,
     UOCR_SECTION_TENSOR_DATA,
     UOCR_TENSOR_DATA_ALIGNMENT,
     UOCR_TENSOR_PAYLOAD_ALIGNMENT,
+    UOCR_TENSOR_Q4_K,
     UOCR_TENSOR_Q8_0,
     _TENSOR_DIRECTORY_HEADER_STRUCT,
     _TENSOR_ENTRY_STRUCT,
@@ -223,6 +226,67 @@ def test_dyn_q8_converter_dry_run_records_quant_metadata() -> None:
     assert entry[8] == 2
     assert entry[9:13] == (768, 768, 0, 0)
     assert entry[13:17] == (768, 768, 0, 0)
+
+
+def test_dyn_q4_converter_dry_run_uses_conservative_policy() -> None:
+    plan = build_dry_run_plan(project_root() / "data/context", qprofile="dyn-q4")
+    q8_plan = build_dry_run_plan(project_root() / "data/context", qprofile="dyn-q8")
+
+    assert plan.tensor_count == EXPECTED_TENSOR_COUNT
+    assert plan.total_source_bytes == EXPECTED_TOTAL_BYTES
+    assert 0 < plan.total_output_bytes < q8_plan.total_output_bytes
+    assert plan.qtype_histogram["UOCR_TENSOR_Q4_K"] > 0
+    assert plan.qtype_histogram["UOCR_TENSOR_Q8_0"] > 0
+    assert plan.qtype_histogram["UOCR_TENSOR_F16"] > 0
+
+    attn_q = plan.tensor_by_name("model.layers.3.self_attn.q_proj.weight")
+    assert attn_q.qtype == "UOCR_TENSOR_Q4_K"
+    assert attn_q.qtype_id == UOCR_TENSOR_Q4_K
+    assert attn_q.logical_shape == (1280, 1280)
+    assert attn_q.physical_shape == (1280, 1280)
+    assert attn_q.block_size == UOCR_Q4_K_BLOCK_SIZE
+    assert attn_q.row_size == (1280 // UOCR_Q4_K_BLOCK_SIZE) * UOCR_Q4_K_TYPE_SIZE
+    assert "attention projection" in attn_q.reason
+
+    expert_gate = plan.tensor_by_name("model.layers.1.mlp.experts.7.gate_proj.weight")
+    assert expert_gate.qtype == "UOCR_TENSOR_Q4_K"
+    assert expert_gate.logical_shape == (896, 1280)
+    assert expert_gate.physical_shape == (896, 1280)
+    assert "routed expert gate/up" in expert_gate.reason
+
+    expert_down = plan.tensor_by_name("model.layers.1.mlp.experts.7.down_proj.weight")
+    assert expert_down.qtype == "UOCR_TENSOR_Q8_0"
+    assert expert_down.logical_shape == (1280, 896)
+    assert expert_down.physical_shape == (1280, 896)
+    assert expert_down.row_size == (896 // UOCR_Q8_0_BLOCK_SIZE) * UOCR_Q8_0_TYPE_SIZE
+    assert "routed expert down" in expert_down.reason
+    assert "Q8_0" in expert_down.reason
+
+    dense_down = plan.tensor_by_name("model.layers.0.mlp.down_proj.weight")
+    assert dense_down.qtype == "UOCR_TENSOR_Q8_0"
+    assert dense_down.logical_shape == (1280, 6848)
+    assert dense_down.physical_shape == (1280, 6848)
+    assert dense_down.row_size == (6848 // UOCR_Q8_0_BLOCK_SIZE) * UOCR_Q8_0_TYPE_SIZE
+    assert "dense layer-0 down" in dense_down.reason
+
+    shared_down = plan.tensor_by_name("model.layers.1.mlp.shared_experts.down_proj.weight")
+    assert shared_down.qtype == "UOCR_TENSOR_Q4_K"
+    assert shared_down.logical_shape == (1280, 1792)
+    assert shared_down.physical_shape == (1280, 1792)
+    assert shared_down.row_size == (1792 // UOCR_Q4_K_BLOCK_SIZE) * UOCR_Q4_K_TYPE_SIZE
+    assert "shared expert down" in shared_down.reason
+
+    lm_head = plan.tensor_by_name("lm_head.weight")
+    assert lm_head.qtype == "UOCR_TENSOR_Q8_0"
+    assert "LM head" in lm_head.reason
+
+    sam_patch = plan.tensor_by_name("model.sam_model.patch_embed.proj.weight")
+    assert sam_patch.qtype == "UOCR_TENSOR_Q8_0"
+    assert "vision weights" in sam_patch.reason
+
+    router = plan.tensor_by_name("model.layers.1.mlp.gate.weight")
+    assert router.qtype == "UOCR_TENSOR_F16"
+    assert "router" in router.reason.lower()
 
 
 def test_filter_plan_tensors_relayouts_single_tensor(tmp_path) -> None:
