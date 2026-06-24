@@ -59,6 +59,14 @@ static size_t sam_abs_pos_index(uint32_t grid, uint32_t y, uint32_t x, uint32_t 
     return ((size_t)y * grid + x) * UOCR_SAM_HIDDEN_SIZE + channel;
 }
 
+static size_t clip_token_index(uint32_t token, uint32_t channel) {
+    return (size_t)token * UOCR_CLIP_HIDDEN_SIZE + channel;
+}
+
+static size_t clip_pos_spatial_index(uint32_t source_grid, uint32_t y, uint32_t x, uint32_t channel) {
+    return clip_token_index(1u + y * source_grid + x, channel);
+}
+
 static size_t sam_qkv_packed_col(uint32_t projection, uint32_t head, uint32_t dim) {
     return (size_t)projection * UOCR_SAM_HIDDEN_SIZE + (size_t)head * UOCR_SAM_HEAD_DIM + dim;
 }
@@ -210,6 +218,48 @@ static float sam_abs_pos_reference(const uint16_t *pos,
             const float wx = sam_cubic_weight(((float)ix - center_x) / filter_scale);
             const float w = wy * wx;
             acc += f16_bits_to_f32(pos[sam_abs_pos_index(src_grid, (uint32_t)iy, (uint32_t)ix, channel)]) * w;
+            weight_sum += w;
+        }
+    }
+    return weight_sum != 0.0f ? acc / weight_sum : 0.0f;
+}
+
+static float clip_abs_pos_reference(const uint16_t *pos,
+                                    uint32_t target_grid,
+                                    uint32_t token,
+                                    uint32_t channel) {
+    if (token == 0u) {
+        return f16_bits_to_f32(pos[clip_token_index(0u, channel)]);
+    }
+    const uint32_t src_grid = UOCR_CLIP_POSITION_GRID;
+    const uint32_t spatial = token - 1u;
+    const uint32_t out_y = spatial / target_grid;
+    const uint32_t out_x = spatial - out_y * target_grid;
+    if (src_grid == target_grid) {
+        return f16_bits_to_f32(pos[clip_token_index(token, channel)]);
+    }
+    const float scale = (float)src_grid / (float)target_grid;
+    const float filter_scale = fmaxf(scale, 1.0f);
+    const float support = 2.0f * filter_scale;
+    const float center_y = ((float)out_y + 0.5f) * scale - 0.5f;
+    const float center_x = ((float)out_x + 0.5f) * scale - 0.5f;
+    int y0 = (int)floorf(center_y - support);
+    int y1 = (int)ceilf(center_y + support);
+    int x0 = (int)floorf(center_x - support);
+    int x1 = (int)ceilf(center_x + support);
+    if (y0 < 0) y0 = 0;
+    if (x0 < 0) x0 = 0;
+    if (y1 >= (int)src_grid) y1 = (int)src_grid - 1;
+    if (x1 >= (int)src_grid) x1 = (int)src_grid - 1;
+
+    float acc = 0.0f;
+    float weight_sum = 0.0f;
+    for (int iy = y0; iy <= y1; ++iy) {
+        const float wy = sam_cubic_weight(((float)iy - center_y) / filter_scale);
+        for (int ix = x0; ix <= x1; ++ix) {
+            const float wx = sam_cubic_weight(((float)ix - center_x) / filter_scale);
+            const float w = wy * wx;
+            acc += f16_bits_to_f32(pos[clip_pos_spatial_index(src_grid, (uint32_t)iy, (uint32_t)ix, channel)]) * w;
             weight_sum += w;
         }
     }
@@ -1586,6 +1636,133 @@ static int test_metal_clip_embed_sam_f16(void) {
 
     uocr_metal_context_destroy(ctx);
     free(class_embedding);
+    return 0;
+}
+
+static int test_metal_clip_abs_pos_f16(void) {
+    if (!uocr_metal_is_available()) {
+        return 0;
+    }
+
+    CHECK(UOCR_CLIP_HIDDEN_SIZE == 1024u);
+    CHECK(UOCR_CLIP_CLASS_TOKENS == 1u);
+    CHECK(UOCR_CLIP_POSITION_GRID == 16u);
+    CHECK(UOCR_CLIP_GLOBAL_TOKENS == 257u);
+    CHECK(UOCR_CLIP_LOCAL_TOKENS == 101u);
+    CHECK(UOCR_CLIP_MAX_TOKENS == UOCR_CLIP_GLOBAL_TOKENS);
+
+    const size_t pos_values = (size_t)UOCR_CLIP_GLOBAL_TOKENS * UOCR_CLIP_HIDDEN_SIZE;
+    uint16_t *pos = (uint16_t *)calloc(pos_values, sizeof(uint16_t));
+    CHECK(pos != NULL);
+    for (uint32_t token = 0u; token < UOCR_CLIP_GLOBAL_TOKENS; ++token) {
+        for (uint32_t c = 0u; c < UOCR_CLIP_HIDDEN_SIZE; ++c) {
+            const int mod = (int)((token * 19u + c * 7u) % 113u) - 56;
+            pos[clip_token_index(token, c)] = f32_to_f16_bits((float)mod * 0.0012f);
+        }
+    }
+
+    char error[1024];
+    memset(error, 0, sizeof(error));
+    uocr_metal_context *ctx = uocr_metal_context_create(UOCR_TEST_METAL_RESOURCE_PATH, error, sizeof(error));
+    CHECK(ctx != NULL);
+
+    const uint32_t grids[] = {UOCR_GLOBAL_GRID_QUERIES, UOCR_LOCAL_GRID_QUERIES};
+    for (size_t case_index = 0u; case_index < sizeof(grids) / sizeof(grids[0]); ++case_index) {
+        const uint32_t grid = grids[case_index];
+        const uint32_t tokens = UOCR_CLIP_CLASS_TOKENS + grid * grid;
+        CHECK(tokens == UOCR_CLIP_GLOBAL_TOKENS || tokens == UOCR_CLIP_LOCAL_TOKENS);
+        const size_t values = (size_t)tokens * UOCR_CLIP_HIDDEN_SIZE;
+        uint16_t *input = (uint16_t *)calloc(values, sizeof(uint16_t));
+        float *out_f32 = (float *)calloc(values, sizeof(float));
+        uint16_t *out_f16 = (uint16_t *)calloc(values, sizeof(uint16_t));
+        CHECK(input != NULL);
+        CHECK(out_f32 != NULL);
+        CHECK(out_f16 != NULL);
+
+        for (uint32_t token = 0u; token < tokens; ++token) {
+            for (uint32_t c = 0u; c < UOCR_CLIP_HIDDEN_SIZE; ++c) {
+                const int mod = (int)((token * 11u + c * 5u + grid * 3u) % 97u) - 48;
+                input[clip_token_index(token, c)] = f32_to_f16_bits((float)mod * 0.0015f);
+            }
+        }
+
+        CHECK(uocr_metal_context_clip_add_abs_pos_f16(ctx,
+                                                       input,
+                                                       pos,
+                                                       grid,
+                                                       grid,
+                                                       UOCR_METAL_DENSE_OUTPUT_F32,
+                                                       out_f32,
+                                                       error,
+                                                       sizeof(error)) == 1);
+        CHECK(error[0] == '\0');
+
+        struct clip_abs_sample {
+            uint32_t token;
+            uint32_t channel;
+        } samples[] = {
+            {0u, 0u},
+            {0u, UOCR_CLIP_HIDDEN_SIZE - 1u},
+            {1u, 5u},
+            {1u + grid * (grid / 2u) + grid / 3u, 77u},
+            {tokens - 1u, UOCR_CLIP_HIDDEN_SIZE - 1u},
+        };
+        for (size_t i = 0u; i < sizeof(samples) / sizeof(samples[0]); ++i) {
+            const size_t idx = clip_token_index(samples[i].token, samples[i].channel);
+            const float expected = f16_bits_to_f32(input[idx]) +
+                                   clip_abs_pos_reference(pos, grid, samples[i].token, samples[i].channel);
+            CHECK(isfinite(expected));
+            CHECK(fabsf(out_f32[idx] - expected) <= 5.0e-4f);
+        }
+
+        CHECK(uocr_metal_context_clip_add_abs_pos_f16(ctx,
+                                                       input,
+                                                       pos,
+                                                       grid,
+                                                       grid,
+                                                       UOCR_METAL_DENSE_OUTPUT_F16,
+                                                       out_f16,
+                                                       error,
+                                                       sizeof(error)) == 1);
+        CHECK(error[0] == '\0');
+        for (size_t i = 0u; i < sizeof(samples) / sizeof(samples[0]); ++i) {
+            const size_t idx = clip_token_index(samples[i].token, samples[i].channel);
+            const float expected = f16_bits_to_f32(input[idx]) +
+                                   clip_abs_pos_reference(pos, grid, samples[i].token, samples[i].channel);
+            CHECK(fabsf(f16_bits_to_f32(out_f16[idx]) - expected) <= 1.5e-3f);
+        }
+
+        free(out_f16);
+        free(out_f32);
+        free(input);
+    }
+
+    uint16_t one_value = f32_to_f16_bits(0.0f);
+    float one_out = 0.0f;
+    CHECK(uocr_metal_context_clip_add_abs_pos_f16(ctx,
+                                                   &one_value,
+                                                   NULL,
+                                                   UOCR_LOCAL_GRID_QUERIES,
+                                                   UOCR_LOCAL_GRID_QUERIES,
+                                                   UOCR_METAL_DENSE_OUTPUT_F32,
+                                                   &one_out,
+                                                   error,
+                                                   sizeof(error)) == 0);
+    CHECK(strstr(error, "invalid Metal CLIP abs pos") != NULL);
+
+    CHECK(uocr_metal_context_clip_add_abs_pos_f16(ctx,
+                                                   &one_value,
+                                                   pos,
+                                                   UOCR_LOCAL_GRID_QUERIES + 1u,
+                                                   UOCR_LOCAL_GRID_QUERIES,
+                                                   UOCR_METAL_DENSE_OUTPUT_F32,
+                                                   &one_out,
+                                                   error,
+                                                   sizeof(error)) == 0);
+    CHECK(strstr(error, "unsupported Metal CLIP abs pos grid") != NULL);
+
+    uocr_metal_context_destroy(ctx);
+    free(pos);
     return 0;
 }
 
@@ -11630,6 +11807,7 @@ int main(void) {
     if (test_metal_sam_net2_conv3x3_stride2_f16() != 0) return 1;
     if (test_metal_sam_net3_conv3x3_stride2_f16() != 0) return 1;
     if (test_metal_clip_embed_sam_f16() != 0) return 1;
+    if (test_metal_clip_abs_pos_f16() != 0) return 1;
     if (test_metal_sam_window_partition_f16() != 0) return 1;
     if (test_metal_sam_window_attention_f16() != 0) return 1;
     if (test_metal_sam_global_attention_f16() != 0) return 1;

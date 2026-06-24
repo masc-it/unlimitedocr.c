@@ -1355,6 +1355,89 @@ kernel void uocr_clip_embed_sam_f16_to_f32(device const half *sam_nchw [[buffer(
         uocr_clip_embedding_from_sam_value(sam_nchw, class_embedding, params, token, channel);
 }
 
+struct UocrClipAbsPosParams {
+    uint source_grid;
+    uint target_width;
+    uint target_height;
+    uint hidden_size;
+};
+
+static float uocr_clip_abs_pos_bicubic_antialias(device const half *pos_embed,
+                                                 constant UocrClipAbsPosParams &params,
+                                                 uint token,
+                                                 uint channel) {
+    if (token == 0u) {
+        return float(pos_embed[channel]);
+    }
+    const uint spatial = token - 1u;
+    const uint out_y = spatial / params.target_width;
+    const uint out_x = spatial - out_y * params.target_width;
+    if (params.target_width == params.source_grid && params.target_height == params.source_grid) {
+        return float(pos_embed[(token * params.hidden_size) + channel]);
+    }
+
+    const float scale_y = float(params.source_grid) / float(params.target_height);
+    const float scale_x = float(params.source_grid) / float(params.target_width);
+    const float filter_scale_y = max(scale_y, 1.0f);
+    const float filter_scale_x = max(scale_x, 1.0f);
+    const float support_y = 2.0f * filter_scale_y;
+    const float support_x = 2.0f * filter_scale_x;
+    const float center_y = (float(out_y) + 0.5f) * scale_y - 0.5f;
+    const float center_x = (float(out_x) + 0.5f) * scale_x - 0.5f;
+
+    const int src_grid = int(params.source_grid);
+    const int y0 = max(0, int(floor(center_y - support_y)));
+    const int y1 = min(src_grid - 1, int(ceil(center_y + support_y)));
+    const int x0 = max(0, int(floor(center_x - support_x)));
+    const int x1 = min(src_grid - 1, int(ceil(center_x + support_x)));
+
+    float acc = 0.0f;
+    float weight_sum = 0.0f;
+    for (int iy = y0; iy <= y1; ++iy) {
+        const float wy = uocr_sam_abs_pos_axis_weight(iy, center_y, filter_scale_y);
+        for (int ix = x0; ix <= x1; ++ix) {
+            const float wx = uocr_sam_abs_pos_axis_weight(ix, center_x, filter_scale_x);
+            const float w = wy * wx;
+            const ulong source_token = 1ul + ulong(uint(iy)) * ulong(params.source_grid) + ulong(uint(ix));
+            acc += float(pos_embed[source_token * ulong(params.hidden_size) + ulong(channel)]) * w;
+            weight_sum += w;
+        }
+    }
+    return weight_sum != 0.0f ? acc / weight_sum : 0.0f;
+}
+
+kernel void uocr_clip_add_abs_pos_f16_to_f16(device const half *tokens [[buffer(0)]],
+                                             device const half *pos_embed [[buffer(1)]],
+                                             device half *dst_tokens [[buffer(2)]],
+                                             constant UocrClipAbsPosParams &params [[buffer(3)]],
+                                             uint gid [[thread_position_in_grid]]) {
+    const uint token_count = 1u + params.target_width * params.target_height;
+    const uint total = token_count * params.hidden_size;
+    if (gid >= total) {
+        return;
+    }
+    const uint channel = gid % params.hidden_size;
+    const uint token = gid / params.hidden_size;
+    const float pos = uocr_clip_abs_pos_bicubic_antialias(pos_embed, params, token, channel);
+    dst_tokens[gid] = half(float(tokens[gid]) + pos);
+}
+
+kernel void uocr_clip_add_abs_pos_f16_to_f32(device const half *tokens [[buffer(0)]],
+                                             device const half *pos_embed [[buffer(1)]],
+                                             device float *dst_tokens [[buffer(2)]],
+                                             constant UocrClipAbsPosParams &params [[buffer(3)]],
+                                             uint gid [[thread_position_in_grid]]) {
+    const uint token_count = 1u + params.target_width * params.target_height;
+    const uint total = token_count * params.hidden_size;
+    if (gid >= total) {
+        return;
+    }
+    const uint channel = gid % params.hidden_size;
+    const uint token = gid / params.hidden_size;
+    const float pos = uocr_clip_abs_pos_bicubic_antialias(pos_embed, params, token, channel);
+    dst_tokens[gid] = float(tokens[gid]) + pos;
+}
+
 struct UocrSamLayerNorm2dParams {
     uint grid_width;
     uint grid_height;

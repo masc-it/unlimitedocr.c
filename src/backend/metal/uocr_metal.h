@@ -447,6 +447,22 @@ int uocr_metal_context_clip_embed_sam_f16(uocr_metal_context *ctx,
                                           char *error,
                                           size_t error_size);
 
+/* Diagnostic CLIP absolute-position helper. Adds position_embedding.weight
+ * [257,1024] to token-major CLIP embeddings [1+grid_h*grid_w,1024]. The CLS
+ * position is copied directly; spatial positions are resized from the 16x16
+ * source grid with upstream bicubic interpolation, antialias=true, and
+ * align_corners=false semantics when the target grid is 10x10.
+ */
+int uocr_metal_context_clip_add_abs_pos_f16(uocr_metal_context *ctx,
+                                            const uint16_t *tokens_f16,
+                                            const uint16_t *pos_embed_f16,
+                                            uint32_t grid_w,
+                                            uint32_t grid_h,
+                                            uocr_metal_dense_output_type output_type,
+                                            void *out_tokens,
+                                            char *error,
+                                            size_t error_size);
+
 /* Diagnostic SAM window-attention helper for non-global transformer blocks.
  * Q/K/V are fp16 tensors laid out as [n_windows,14*14,12,64] (equivalent to
  * window-major rows with flattened [head,dim] channels). The helper computes

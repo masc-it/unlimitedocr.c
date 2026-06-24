@@ -380,6 +380,13 @@ typedef struct uocr_metal_clip_embed_sam_params {
     uint32_t token_count;
 } uocr_metal_clip_embed_sam_params;
 
+typedef struct uocr_metal_clip_abs_pos_params {
+    uint32_t source_grid;
+    uint32_t target_width;
+    uint32_t target_height;
+    uint32_t hidden_size;
+} uocr_metal_clip_abs_pos_params;
+
 typedef struct uocr_metal_sam_layernorm2d_params {
     uint32_t grid_width;
     uint32_t grid_height;
@@ -428,6 +435,8 @@ _Static_assert(sizeof(uocr_metal_sam_conv3x3_stride2_params) == 32u,
                "uocr_metal_sam_conv3x3_stride2_params ABI mismatch");
 _Static_assert(sizeof(uocr_metal_clip_embed_sam_params) == 16u,
                "uocr_metal_clip_embed_sam_params ABI mismatch");
+_Static_assert(sizeof(uocr_metal_clip_abs_pos_params) == 16u,
+               "uocr_metal_clip_abs_pos_params ABI mismatch");
 _Static_assert(sizeof(uocr_metal_sam_layernorm2d_params) == 16u,
                "uocr_metal_sam_layernorm2d_params ABI mismatch");
 _Static_assert(sizeof(uocr_metal_sam_rel_pos_attention_params) == 48u,
@@ -7104,6 +7113,153 @@ int uocr_metal_context_clip_embed_sam_f16(uocr_metal_context *ctx,
         [dst release];
         [cls release];
         [src release];
+    }
+
+    if (result) {
+        metal_clear_error(error, error_size);
+    }
+    return result;
+}
+
+int uocr_metal_context_clip_add_abs_pos_f16(uocr_metal_context *ctx,
+                                            const uint16_t *tokens_f16,
+                                            const uint16_t *pos_embed_f16,
+                                            uint32_t grid_w,
+                                            uint32_t grid_h,
+                                            uocr_metal_dense_output_type output_type,
+                                            void *out_tokens,
+                                            char *error,
+                                            size_t error_size) {
+    metal_clear_error(error, error_size);
+    if (ctx == NULL || tokens_f16 == NULL || pos_embed_f16 == NULL || out_tokens == NULL) {
+        return metal_fail(error, error_size, "invalid Metal CLIP abs pos request");
+    }
+    if (output_type != UOCR_METAL_DENSE_OUTPUT_F16 && output_type != UOCR_METAL_DENSE_OUTPUT_F32) {
+        return metal_fail(error, error_size, "unsupported Metal CLIP abs pos output type %d", (int)output_type);
+    }
+    if (grid_w == 0u || grid_h == 0u || grid_w != grid_h ||
+        (grid_w != UOCR_GLOBAL_GRID_QUERIES && grid_w != UOCR_LOCAL_GRID_QUERIES)) {
+        return metal_fail(error, error_size, "unsupported Metal CLIP abs pos grid %ux%u", grid_w, grid_h);
+    }
+    if (UOCR_CLIP_HIDDEN_SIZE != 1024u || UOCR_CLIP_CLASS_TOKENS != 1u ||
+        UOCR_CLIP_POSITION_GRID != UOCR_GLOBAL_GRID_QUERIES || UOCR_CLIP_GLOBAL_TOKENS != 257u ||
+        UOCR_CLIP_LOCAL_TOKENS != 101u || UOCR_CLIP_MAX_TOKENS != UOCR_CLIP_GLOBAL_TOKENS) {
+        return metal_fail(error, error_size, "Metal CLIP abs pos constants are inconsistent");
+    }
+
+    uint64_t spatial = 0u;
+    uint64_t token_count = 0u;
+    uint64_t token_values = 0u;
+    uint64_t token_bytes = 0u;
+    uint64_t pos_values = 0u;
+    uint64_t pos_bytes = 0u;
+    uint64_t output_bytes = 0u;
+    const uint64_t output_element_bytes = output_type == UOCR_METAL_DENSE_OUTPUT_F16 ? 2u : (uint64_t)sizeof(float);
+    if (!checked_mul_u64((uint64_t)grid_w, (uint64_t)grid_h, &spatial) ||
+        !checked_add_u64(spatial, (uint64_t)UOCR_CLIP_CLASS_TOKENS, &token_count) ||
+        !checked_mul_u64(token_count, (uint64_t)UOCR_CLIP_HIDDEN_SIZE, &token_values) ||
+        !checked_mul_u64(token_values, 2u, &token_bytes) ||
+        !checked_mul_u64((uint64_t)UOCR_CLIP_GLOBAL_TOKENS, (uint64_t)UOCR_CLIP_HIDDEN_SIZE, &pos_values) ||
+        !checked_mul_u64(pos_values, 2u, &pos_bytes) ||
+        !checked_mul_u64(token_values, output_element_bytes, &output_bytes) ||
+        token_count > (uint64_t)UINT32_MAX || token_count > (uint64_t)UOCR_CLIP_MAX_TOKENS ||
+        token_bytes > (uint64_t)SIZE_MAX || pos_bytes > (uint64_t)SIZE_MAX || output_bytes > (uint64_t)SIZE_MAX) {
+        return metal_fail(error, error_size, "Metal CLIP abs pos byte-size overflow");
+    }
+
+    const uint64_t max_buffer_length = metal_device_max_buffer_length(ctx->device);
+    if (token_bytes > max_buffer_length || pos_bytes > max_buffer_length || output_bytes > max_buffer_length) {
+        return metal_fail(error,
+                          error_size,
+                          "Metal CLIP abs pos buffers exceed maxBufferLength %llu",
+                          (unsigned long long)max_buffer_length);
+    }
+
+    int result = 0;
+    @autoreleasepool {
+        const char *function_name = output_type == UOCR_METAL_DENSE_OUTPUT_F16 ?
+                                        "uocr_clip_add_abs_pos_f16_to_f16" :
+                                        "uocr_clip_add_abs_pos_f16_to_f32";
+        id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, function_name, error, error_size);
+        if (pipeline == nil) {
+            return 0;
+        }
+
+        id<MTLBuffer> tokens = [ctx->device newBufferWithBytes:tokens_f16
+                                                        length:(NSUInteger)token_bytes
+                                                       options:MTLResourceStorageModeShared];
+        if (tokens == nil) {
+            return metal_fail(error, error_size, "failed to allocate Metal CLIP abs pos token buffer");
+        }
+        tokens.label = @"uocr_clip_abs_pos_tokens_f16";
+
+        id<MTLBuffer> pos = [ctx->device newBufferWithBytes:pos_embed_f16
+                                                     length:(NSUInteger)pos_bytes
+                                                    options:MTLResourceStorageModeShared];
+        if (pos == nil) {
+            [tokens release];
+            return metal_fail(error, error_size, "failed to allocate Metal CLIP abs pos table buffer");
+        }
+        pos.label = @"uocr_clip_abs_pos_table_f16";
+
+        id<MTLBuffer> dst = [ctx->device newBufferWithLength:(NSUInteger)output_bytes options:MTLResourceStorageModeShared];
+        if (dst == nil) {
+            [pos release];
+            [tokens release];
+            return metal_fail(error, error_size, "failed to allocate Metal CLIP abs pos output buffer");
+        }
+        dst.label = @"uocr_clip_abs_pos_output_tokens";
+        memset([dst contents], 0, (size_t)output_bytes);
+
+        id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
+        if (cb == nil) {
+            [dst release];
+            [pos release];
+            [tokens release];
+            return metal_fail(error, error_size, "failed to create Metal CLIP abs pos command buffer");
+        }
+        cb.label = @"uocr_clip_abs_pos_command_buffer";
+
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        if (enc == nil) {
+            [dst release];
+            [pos release];
+            [tokens release];
+            return metal_fail(error, error_size, "failed to create Metal CLIP abs pos command encoder");
+        }
+
+        uocr_metal_clip_abs_pos_params params;
+        params.source_grid = UOCR_CLIP_POSITION_GRID;
+        params.target_width = grid_w;
+        params.target_height = grid_h;
+        params.hidden_size = UOCR_CLIP_HIDDEN_SIZE;
+
+        const NSUInteger threads_per_group = metal_power2_threadgroup_width(256u, pipeline.maxTotalThreadsPerThreadgroup);
+        [enc setComputePipelineState:pipeline];
+        [enc setBuffer:tokens offset:0u atIndex:0u];
+        [enc setBuffer:pos offset:0u atIndex:1u];
+        [enc setBuffer:dst offset:0u atIndex:2u];
+        [enc setBytes:&params length:sizeof(params) atIndex:3u];
+        [enc dispatchThreads:MTLSizeMake((NSUInteger)token_values, 1u, 1u)
+       threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1u, 1u)];
+        [enc endEncoding];
+
+        [cb commit];
+        [cb waitUntilCompleted];
+        if (cb.status == MTLCommandBufferStatusError) {
+            NSString *description = cb.error != nil ? [cb.error localizedDescription] : @"unknown command-buffer error";
+            result = metal_fail(error,
+                                error_size,
+                                "Metal CLIP abs pos command failed: %s",
+                                [description UTF8String]);
+        } else {
+            memcpy(out_tokens, [dst contents], (size_t)output_bytes);
+            result = 1;
+        }
+
+        [dst release];
+        [pos release];
+        [tokens release];
     }
 
     if (result) {

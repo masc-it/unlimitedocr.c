@@ -769,10 +769,10 @@ Do not begin this section until sections 14.5 and 15.1 pass for fp16 single-requ
 - [x] Implement CLIP embeddings using SAM output as `patch_embeds`; do not use raw-pixel patch embedding in the normal path.
 - [x] Treat `vision_model.embeddings.patch_embedding.*` as unused in normal OCR inference unless a later parity test proves an alternate path needs it.
 - [x] Flatten SAM features to token sequence and prepend class embedding.
-- [ ] Add CLIP absolute position embedding using upstream bicubic interpolation with antialias and `align_corners=False`.
-- [ ] Support token lengths:
-  - [ ] `257` for `16x16 + CLS`
-  - [ ] `101` for `10x10 + CLS`
+- [x] Add CLIP absolute position embedding using upstream bicubic interpolation with antialias and `align_corners=False`.
+- [x] Support token lengths:
+  - [x] `257` for `16x16 + CLS`
+  - [x] `101` for `10x10 + CLS`
 - [ ] Implement pre-LayerNorm eps `1e-5`.
 - [ ] Implement 24 CLIP transformer blocks:
   - [ ] LayerNorm eps `1e-5`
