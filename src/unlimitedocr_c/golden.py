@@ -27,22 +27,35 @@ HIDDEN_SIZE = 1280
 TOK_EMBED_TENSOR_NAME = "model.embed_tokens.weight"
 PROMPT_EMBEDDINGS_BIN = "prompt_embeddings_f16.bin"
 TEXT_LAYER0_HIDDEN_BIN = "layer_0_hidden_f16.bin"
+TEXT_LAYER1_HIDDEN_BIN = "layer_1_hidden_f16.bin"
 INPUT_IDS_BIN = "input_ids_i32.bin"
 IMAGE_MASK_BIN = "image_mask_u8.bin"
 
 ATTENTION_HEADS = 10
 HEAD_DIM = 128
 DENSE_LAYER0_INTERMEDIATE = 6848
+MOE_EXPERTS = 64
+MOE_TOP_K = 6
+MOE_EXPERT_INTERMEDIATE = 896
+MOE_SHARED_INTERMEDIATE = 1792
 ROPE_THETA = 10000.0
 RMS_NORM_EPS = 1.0e-6
 
+
+def _attention_tensor_shapes(layer: int) -> dict[str, tuple[int, ...]]:
+    prefix = f"model.layers.{layer}"
+    return {
+        f"{prefix}.input_layernorm.weight": (HIDDEN_SIZE,),
+        f"{prefix}.self_attn.q_proj.weight": (HIDDEN_SIZE, HIDDEN_SIZE),
+        f"{prefix}.self_attn.k_proj.weight": (HIDDEN_SIZE, HIDDEN_SIZE),
+        f"{prefix}.self_attn.v_proj.weight": (HIDDEN_SIZE, HIDDEN_SIZE),
+        f"{prefix}.self_attn.o_proj.weight": (HIDDEN_SIZE, HIDDEN_SIZE),
+        f"{prefix}.post_attention_layernorm.weight": (HIDDEN_SIZE,),
+    }
+
+
 LAYER0_TENSOR_SHAPES: dict[str, tuple[int, ...]] = {
-    "model.layers.0.input_layernorm.weight": (HIDDEN_SIZE,),
-    "model.layers.0.self_attn.q_proj.weight": (HIDDEN_SIZE, HIDDEN_SIZE),
-    "model.layers.0.self_attn.k_proj.weight": (HIDDEN_SIZE, HIDDEN_SIZE),
-    "model.layers.0.self_attn.v_proj.weight": (HIDDEN_SIZE, HIDDEN_SIZE),
-    "model.layers.0.self_attn.o_proj.weight": (HIDDEN_SIZE, HIDDEN_SIZE),
-    "model.layers.0.post_attention_layernorm.weight": (HIDDEN_SIZE,),
+    **_attention_tensor_shapes(0),
     "model.layers.0.mlp.gate_proj.weight": (DENSE_LAYER0_INTERMEDIATE, HIDDEN_SIZE),
     "model.layers.0.mlp.up_proj.weight": (DENSE_LAYER0_INTERMEDIATE, HIDDEN_SIZE),
     "model.layers.0.mlp.down_proj.weight": (HIDDEN_SIZE, DENSE_LAYER0_INTERMEDIATE),
@@ -74,6 +87,11 @@ class PromptEmbeddingDump:
 @dataclass(frozen=True)
 class TextLayer0Dump(PromptEmbeddingDump):
     layer0_hidden_f16_bits: NDArray[np.uint16]
+
+
+@dataclass(frozen=True)
+class TextLayer1Dump(TextLayer0Dump):
+    layer1_hidden_f16_bits: NDArray[np.uint16]
 
 
 def _read_json_if_exists(path: Path) -> dict[str, Any] | None:
@@ -363,32 +381,57 @@ def _dense_swiglu_residual_f16_bits(
     return _f32_to_f16_bits(down + residual)
 
 
+def _validate_hidden_bits(name: str, hidden_bits: NDArray[np.uint16]) -> NDArray[np.uint16]:
+    hidden = np.asarray(hidden_bits, dtype=np.dtype("<u2"))
+    if hidden.ndim != 2 or hidden.shape[1] != HIDDEN_SIZE or hidden.shape[0] <= 0:
+        raise ValueError(f"{name} must have shape [n,{HIDDEN_SIZE}], got {hidden.shape}")
+    return hidden
+
+
+def _read_named_tensors(hf_dir: str | Path, shapes: dict[str, tuple[int, ...]]) -> dict[str, NDArray[np.uint16]]:
+    return {name: read_bf16_tensor_as_f16_bits(hf_dir, name, expected_shape=shape) for name, shape in shapes.items()}
+
+
+def _attention_block_f16_bits(
+    hidden_bits: NDArray[np.uint16],
+    hf_dir: str | Path,
+    *,
+    layer: int,
+) -> tuple[NDArray[np.uint16], NDArray[np.uint16]]:
+    hidden = _validate_hidden_bits("attention input", hidden_bits)
+    weights = _read_named_tensors(hf_dir, _attention_tensor_shapes(layer))
+    prefix = f"model.layers.{layer}"
+    normed = _rmsnorm_f16_bits(hidden, weights[f"{prefix}.input_layernorm.weight"])
+    q = _dense_f16_bits(normed, weights[f"{prefix}.self_attn.q_proj.weight"])
+    k = _dense_f16_bits(normed, weights[f"{prefix}.self_attn.k_proj.weight"])
+    v = _dense_f16_bits(normed, weights[f"{prefix}.self_attn.v_proj.weight"])
+    q, k = _rope_qk_f16_bits(q, k)
+    context = _prefill_attention_f16_bits(q, k, v)
+    attn_hidden = _attention_output_residual_f16_bits(
+        context,
+        weights[f"{prefix}.self_attn.o_proj.weight"],
+        hidden,
+    )
+    mlp_input = _rmsnorm_f16_bits(attn_hidden, weights[f"{prefix}.post_attention_layernorm.weight"])
+    return attn_hidden, mlp_input
+
+
 def compute_text_layer0_hidden_f16_bits(
     prompt_embeddings_f16_bits: NDArray[np.uint16],
     hf_dir: str | Path,
 ) -> NDArray[np.uint16]:
     """Run the fp16 text-only decoder layer 0 reference used by Metal parity tests."""
 
-    prompt = np.asarray(prompt_embeddings_f16_bits, dtype=np.dtype("<u2"))
-    if prompt.ndim != 2 or prompt.shape[1] != HIDDEN_SIZE or prompt.shape[0] <= 0:
-        raise ValueError(f"prompt embeddings must have shape [n,{HIDDEN_SIZE}], got {prompt.shape}")
-
-    weights = {
-        name: read_bf16_tensor_as_f16_bits(hf_dir, name, expected_shape=shape)
-        for name, shape in LAYER0_TENSOR_SHAPES.items()
-    }
-    normed = _rmsnorm_f16_bits(prompt, weights["model.layers.0.input_layernorm.weight"])
-    q = _dense_f16_bits(normed, weights["model.layers.0.self_attn.q_proj.weight"])
-    k = _dense_f16_bits(normed, weights["model.layers.0.self_attn.k_proj.weight"])
-    v = _dense_f16_bits(normed, weights["model.layers.0.self_attn.v_proj.weight"])
-    q, k = _rope_qk_f16_bits(q, k)
-    context = _prefill_attention_f16_bits(q, k, v)
-    attn_hidden = _attention_output_residual_f16_bits(
-        context,
-        weights["model.layers.0.self_attn.o_proj.weight"],
-        prompt,
+    prompt = _validate_hidden_bits("prompt embeddings", prompt_embeddings_f16_bits)
+    attn_hidden, mlp_input = _attention_block_f16_bits(prompt, hf_dir, layer=0)
+    weights = _read_named_tensors(
+        hf_dir,
+        {
+            name: shape
+            for name, shape in LAYER0_TENSOR_SHAPES.items()
+            if ".mlp." in name
+        },
     )
-    mlp_input = _rmsnorm_f16_bits(attn_hidden, weights["model.layers.0.post_attention_layernorm.weight"])
     return _dense_swiglu_residual_f16_bits(
         mlp_input,
         weights["model.layers.0.mlp.gate_proj.weight"],
@@ -396,6 +439,142 @@ def compute_text_layer0_hidden_f16_bits(
         weights["model.layers.0.mlp.down_proj.weight"],
         attn_hidden,
     )
+
+
+def _moe_router_f16(
+    hidden_bits: NDArray[np.uint16],
+    router_weight_bits: NDArray[np.uint16],
+) -> tuple[NDArray[np.float32], NDArray[np.uint32], NDArray[np.float32]]:
+    hidden = _f16_to_f32(hidden_bits)
+    router_weight = _f16_to_f32(router_weight_bits)
+    logits = np.matmul(hidden, router_weight.T).astype(np.float32, copy=False)
+    shifted = logits - np.max(logits, axis=1, keepdims=True)
+    exp_scores = np.exp(shifted).astype(np.float32)
+    probs = exp_scores / np.sum(exp_scores, axis=1, keepdims=True, dtype=np.float32)
+    top_ids = np.empty((hidden.shape[0], MOE_TOP_K), dtype=np.uint32)
+    top_weights = np.empty((hidden.shape[0], MOE_TOP_K), dtype=np.float32)
+    expert_ids = np.arange(MOE_EXPERTS, dtype=np.uint32)
+    for token in range(hidden.shape[0]):
+        order = np.lexsort((expert_ids, -probs[token]))
+        chosen = order[:MOE_TOP_K].astype(np.uint32, copy=False)
+        top_ids[token, :] = chosen
+        top_weights[token, :] = probs[token, chosen]
+    return probs, top_ids, top_weights
+
+
+def _expert_weight_names(layer: int, expert: int) -> tuple[str, str, str]:
+    prefix = f"model.layers.{layer}.mlp.experts.{expert}"
+    return (
+        f"{prefix}.gate_proj.weight",
+        f"{prefix}.up_proj.weight",
+        f"{prefix}.down_proj.weight",
+    )
+
+
+def _read_expert_weights(
+    hf_dir: str | Path,
+    layer: int,
+    expert: int,
+) -> tuple[NDArray[np.uint16], NDArray[np.uint16], NDArray[np.uint16]]:
+    gate_name, up_name, down_name = _expert_weight_names(layer, expert)
+    gate = read_bf16_tensor_as_f16_bits(
+        hf_dir,
+        gate_name,
+        expected_shape=(MOE_EXPERT_INTERMEDIATE, HIDDEN_SIZE),
+    )
+    up = read_bf16_tensor_as_f16_bits(
+        hf_dir,
+        up_name,
+        expected_shape=(MOE_EXPERT_INTERMEDIATE, HIDDEN_SIZE),
+    )
+    down = read_bf16_tensor_as_f16_bits(
+        hf_dir,
+        down_name,
+        expected_shape=(HIDDEN_SIZE, MOE_EXPERT_INTERMEDIATE),
+    )
+    return gate, up, down
+
+
+def _moe_selected_routed_f16_bits(
+    hidden_bits: NDArray[np.uint16],
+    top_ids: NDArray[np.uint32],
+    top_weights: NDArray[np.float32],
+    hf_dir: str | Path,
+    *,
+    layer: int,
+) -> NDArray[np.uint16]:
+    hidden = _validate_hidden_bits("MoE input", hidden_bits)
+    hidden_f32 = _f16_to_f32(hidden)
+    routed = np.zeros((hidden.shape[0], HIDDEN_SIZE), dtype=np.float32)
+    weight_cache: dict[int, tuple[NDArray[np.uint16], NDArray[np.uint16], NDArray[np.uint16]]] = {}
+    for token in range(hidden.shape[0]):
+        token_src = hidden_f32[token : token + 1]
+        for rank in range(MOE_TOP_K):
+            expert = int(top_ids[token, rank])
+            weights = weight_cache.get(expert)
+            if weights is None:
+                weights = _read_expert_weights(hf_dir, layer, expert)
+                weight_cache[expert] = weights
+            gate_bits, up_bits, down_bits = weights
+            gate = np.matmul(token_src, _f16_to_f32(gate_bits).T).astype(np.float32, copy=False)
+            up = np.matmul(token_src, _f16_to_f32(up_bits).T).astype(np.float32, copy=False)
+            silu = gate / (np.float32(1.0) + np.exp(-gate).astype(np.float32))
+            mid_bits = _f32_to_f16_bits(silu * up)
+            mid = _f16_to_f32(mid_bits)
+            down = np.matmul(mid, _f16_to_f32(down_bits).T).astype(np.float32, copy=False)
+            routed[token, :] += down[0, :] * np.float32(top_weights[token, rank])
+    return _f32_to_f16_bits(routed)
+
+
+def _moe_shared_f16_bits(hidden_bits: NDArray[np.uint16], hf_dir: str | Path, *, layer: int) -> NDArray[np.uint16]:
+    prefix = f"model.layers.{layer}.mlp.shared_experts"
+    weights = _read_named_tensors(
+        hf_dir,
+        {
+            f"{prefix}.gate_proj.weight": (MOE_SHARED_INTERMEDIATE, HIDDEN_SIZE),
+            f"{prefix}.up_proj.weight": (MOE_SHARED_INTERMEDIATE, HIDDEN_SIZE),
+            f"{prefix}.down_proj.weight": (HIDDEN_SIZE, MOE_SHARED_INTERMEDIATE),
+        },
+    )
+    zeros = np.zeros_like(_validate_hidden_bits("shared expert input", hidden_bits), dtype=np.dtype("<u2"))
+    return _dense_swiglu_residual_f16_bits(
+        hidden_bits,
+        weights[f"{prefix}.gate_proj.weight"],
+        weights[f"{prefix}.up_proj.weight"],
+        weights[f"{prefix}.down_proj.weight"],
+        zeros,
+    )
+
+
+def _moe_layer_f16_bits(
+    mlp_input_bits: NDArray[np.uint16],
+    residual_bits: NDArray[np.uint16],
+    hf_dir: str | Path,
+    *,
+    layer: int,
+) -> NDArray[np.uint16]:
+    prefix = f"model.layers.{layer}.mlp"
+    router_weight = read_bf16_tensor_as_f16_bits(
+        hf_dir,
+        f"{prefix}.gate.weight",
+        expected_shape=(MOE_EXPERTS, HIDDEN_SIZE),
+    )
+    _, top_ids, top_weights = _moe_router_f16(mlp_input_bits, router_weight)
+    routed = _moe_selected_routed_f16_bits(mlp_input_bits, top_ids, top_weights, hf_dir, layer=layer)
+    shared = _moe_shared_f16_bits(mlp_input_bits, hf_dir, layer=layer)
+    combined = _f16_to_f32(routed) + _f16_to_f32(shared) + _f16_to_f32(residual_bits)
+    return _f32_to_f16_bits(combined)
+
+
+def compute_text_layer1_hidden_f16_bits(
+    layer0_hidden_f16_bits: NDArray[np.uint16],
+    hf_dir: str | Path,
+) -> NDArray[np.uint16]:
+    """Run the fp16 text-only decoder layer 1 MoE reference used by Metal parity tests."""
+
+    layer0 = _validate_hidden_bits("layer0 hidden", layer0_hidden_f16_bits)
+    attn_hidden, mlp_input = _attention_block_f16_bits(layer0, hf_dir, layer=1)
+    return _moe_layer_f16_bits(mlp_input, attn_hidden, hf_dir, layer=1)
 
 
 def dump_prompt_embedding_fixture(
@@ -448,6 +627,25 @@ def dump_prompt_embedding_fixture(
     return out
 
 
+def _add_hidden_tensor_manifest(
+    manifest: dict[str, Any],
+    key: str,
+    filename: str,
+    n_tokens: int,
+    stats_bits: NDArray[np.uint16],
+    reference_dtype_mode: str,
+) -> None:
+    manifest.setdefault("golden_tensors", {})[key] = {
+        "file": filename,
+        "dtype": "float16",
+        "storage": "uint16_le",
+        "shape": [int(n_tokens), HIDDEN_SIZE],
+        "source": "fp16 numpy reference over BF16 safetensors converted to FP16",
+        "reference_dtype_mode": reference_dtype_mode,
+        "stats": _f16_stats(stats_bits),
+    }
+
+
 def dump_text_layer0_fixture(request: PreparedRequest, out_dir: str | Path, hf_dir: str | Path) -> Path:
     """Write prompt embeddings plus the fp16 output of decoder layer 0.
 
@@ -463,15 +661,36 @@ def dump_text_layer0_fixture(request: PreparedRequest, out_dir: str | Path, hf_d
 
     manifest_path = out / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    manifest.setdefault("golden_tensors", {})["layer_0_hidden"] = {
-        "file": TEXT_LAYER0_HIDDEN_BIN,
-        "dtype": "float16",
-        "storage": "uint16_le",
-        "shape": [int(prompt_dump.input_ids.size), HIDDEN_SIZE],
-        "source": "fp16 numpy reference over BF16 safetensors converted to FP16",
-        "reference_dtype_mode": "FP16 weights/activations with FP32 reductions; layer 0 text-only prefill",
-        "stats": _f16_stats(layer0),
-    }
+    _add_hidden_tensor_manifest(
+        manifest,
+        "layer_0_hidden",
+        TEXT_LAYER0_HIDDEN_BIN,
+        int(prompt_dump.input_ids.size),
+        layer0,
+        "FP16 weights/activations with FP32 reductions; layer 0 text-only prefill",
+    )
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return out
+
+
+def dump_text_layer1_fixture(request: PreparedRequest, out_dir: str | Path, hf_dir: str | Path) -> Path:
+    """Write prompt embeddings plus layer-0 and layer-1 fp16 decoder outputs."""
+
+    out = dump_text_layer0_fixture(request, out_dir, hf_dir)
+    layer0_dump = load_text_layer0_dump(out)
+    layer1 = compute_text_layer1_hidden_f16_bits(layer0_dump.layer0_hidden_f16_bits, hf_dir)
+    (out / TEXT_LAYER1_HIDDEN_BIN).write_bytes(np.asarray(layer1, dtype=np.dtype("<u2")).tobytes())
+
+    manifest_path = out / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    _add_hidden_tensor_manifest(
+        manifest,
+        "layer_1_hidden",
+        TEXT_LAYER1_HIDDEN_BIN,
+        int(layer0_dump.input_ids.size),
+        layer1,
+        "FP16 weights/activations with FP32 reductions; layer 1 text-only MoE prefill",
+    )
     manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return out
 
@@ -507,25 +726,62 @@ def load_prompt_embedding_dump(fixture_dir: str | Path) -> PromptEmbeddingDump:
     )
 
 
+def _load_hidden_tensor_bits(
+    root: Path,
+    manifest: dict[str, Any],
+    key: str,
+    filename: str,
+    n_prompt_tokens: int,
+) -> NDArray[np.uint16]:
+    golden = manifest.get("golden_tensors", {}).get(key, {})
+    shape = golden.get("shape", [int(n_prompt_tokens), HIDDEN_SIZE]) if isinstance(golden, dict) else []
+    if not isinstance(shape, list) or len(shape) != 2:
+        raise ValueError(f"invalid {key} shape metadata in {root}")
+    n_tokens = int(shape[0])
+    hidden_size = int(shape[1])
+    if n_tokens != int(n_prompt_tokens) or hidden_size != HIDDEN_SIZE:
+        raise ValueError(f"{key} shape {shape} does not match prompt shape")
+    bits = np.fromfile(root / filename, dtype=np.dtype("<u2"))
+    expected_values = n_tokens * hidden_size
+    if bits.size != expected_values:
+        raise ValueError(f"{key} size mismatch: expected {expected_values} f16 values, got {bits.size}")
+    return bits.reshape((n_tokens, hidden_size))
+
+
 def load_text_layer0_dump(fixture_dir: str | Path) -> TextLayer0Dump:
     prompt = load_prompt_embedding_dump(fixture_dir)
     root = Path(fixture_dir)
-    golden = prompt.manifest.get("golden_tensors", {}).get("layer_0_hidden", {})
-    shape = golden.get("shape", [int(prompt.input_ids.size), HIDDEN_SIZE]) if isinstance(golden, dict) else []
-    if not isinstance(shape, list) or len(shape) != 2:
-        raise ValueError(f"invalid layer_0_hidden shape metadata in {root}")
-    n_tokens = int(shape[0])
-    hidden_size = int(shape[1])
-    if n_tokens != int(prompt.input_ids.size) or hidden_size != HIDDEN_SIZE:
-        raise ValueError(f"layer_0_hidden shape {shape} does not match prompt shape")
-    layer0 = np.fromfile(root / TEXT_LAYER0_HIDDEN_BIN, dtype=np.dtype("<u2"))
-    expected_values = n_tokens * hidden_size
-    if layer0.size != expected_values:
-        raise ValueError(f"layer_0_hidden size mismatch: expected {expected_values} f16 values, got {layer0.size}")
+    layer0 = _load_hidden_tensor_bits(
+        root,
+        prompt.manifest,
+        "layer_0_hidden",
+        TEXT_LAYER0_HIDDEN_BIN,
+        int(prompt.input_ids.size),
+    )
     return TextLayer0Dump(
         manifest=prompt.manifest,
         input_ids=prompt.input_ids,
         image_mask=prompt.image_mask,
         prompt_embeddings_f16_bits=prompt.prompt_embeddings_f16_bits,
-        layer0_hidden_f16_bits=layer0.reshape((n_tokens, hidden_size)),
+        layer0_hidden_f16_bits=layer0,
+    )
+
+
+def load_text_layer1_dump(fixture_dir: str | Path) -> TextLayer1Dump:
+    layer0 = load_text_layer0_dump(fixture_dir)
+    root = Path(fixture_dir)
+    layer1 = _load_hidden_tensor_bits(
+        root,
+        layer0.manifest,
+        "layer_1_hidden",
+        TEXT_LAYER1_HIDDEN_BIN,
+        int(layer0.input_ids.size),
+    )
+    return TextLayer1Dump(
+        manifest=layer0.manifest,
+        input_ids=layer0.input_ids,
+        image_mask=layer0.image_mask,
+        prompt_embeddings_f16_bits=layer0.prompt_embeddings_f16_bits,
+        layer0_hidden_f16_bits=layer0.layer0_hidden_f16_bits,
+        layer1_hidden_f16_bits=layer1,
     )

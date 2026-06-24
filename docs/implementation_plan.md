@@ -663,7 +663,8 @@ First implementation slice, in order:
 - [ ] Add text-only fp16 parity test:
   - [x] prompt embeddings
   - [x] layer-0 dense decoder output
-  - [ ] remaining MoE layer outputs
+  - [x] layer-1 MoE decoder output
+  - [ ] remaining layers 2..11 MoE outputs
   - [ ] logits top-k
   - [ ] generated token ids
 
