@@ -66,6 +66,20 @@ UOCR_TENSOR_USAGE_RUNTIME = 1
 UOCR_TENSOR_USAGE_PRESERVED_UNUSED = 2
 UOCR_TENSOR_USAGE_OMITTED_WITH_REASON = 3
 
+UOCR_QTYPE_REASON_UNKNOWN = 0
+UOCR_QTYPE_REASON_FP16_BASELINE = 1
+UOCR_QTYPE_REASON_POLICY = 2
+UOCR_QTYPE_REASON_SENSITIVE = 3
+UOCR_QTYPE_REASON_UNALIGNED = 4
+UOCR_QTYPE_REASON_CALIBRATION_DRIFT = 5
+UOCR_QTYPE_REASON_MANUAL_OVERRIDE = 6
+
+UOCR_PROMOTION_NONE = 0
+UOCR_PROMOTION_SENSITIVE = 1
+UOCR_PROMOTION_UNALIGNED = 2
+UOCR_PROMOTION_CALIBRATION_DRIFT = 3
+UOCR_PROMOTION_MANUAL_OVERRIDE = 4
+
 UOCR_TENSOR_F16 = 1
 UOCR_TENSOR_F32 = 2
 UOCR_TENSOR_Q8_0 = 10
@@ -94,6 +108,24 @@ QPROFILE_IDS: Mapping[str, int] = {
     "fp16": UOCR_QPROFILE_FP16,
     "dyn-q8": UOCR_QPROFILE_DYN_Q8,
     "dyn-q4": UOCR_QPROFILE_DYN_Q4,
+}
+
+QTYPE_REASON_NAMES: Mapping[int, str] = {
+    UOCR_QTYPE_REASON_UNKNOWN: "unknown",
+    UOCR_QTYPE_REASON_FP16_BASELINE: "fp16-baseline",
+    UOCR_QTYPE_REASON_POLICY: "policy",
+    UOCR_QTYPE_REASON_SENSITIVE: "sensitive",
+    UOCR_QTYPE_REASON_UNALIGNED: "unaligned",
+    UOCR_QTYPE_REASON_CALIBRATION_DRIFT: "calibration-drift",
+    UOCR_QTYPE_REASON_MANUAL_OVERRIDE: "manual-override",
+}
+
+PROMOTION_REASON_NAMES: Mapping[int, str] = {
+    UOCR_PROMOTION_NONE: "none",
+    UOCR_PROMOTION_SENSITIVE: "sensitive",
+    UOCR_PROMOTION_UNALIGNED: "unaligned",
+    UOCR_PROMOTION_CALIBRATION_DRIFT: "calibration-drift",
+    UOCR_PROMOTION_MANUAL_OVERRIDE: "manual-override",
 }
 
 SECTION_NAMES: Mapping[int, str] = {
@@ -252,6 +284,10 @@ class TensorPlan:
     usage: str
     usage_id: int
     reason: str
+    qtype_reason: str
+    qtype_reason_id: int
+    promotion_reason: str
+    promotion_reason_id: int
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -280,6 +316,10 @@ class TensorPlan:
             "usage": self.usage,
             "usage_id": self.usage_id,
             "reason": self.reason,
+            "qtype_reason": self.qtype_reason,
+            "qtype_reason_id": self.qtype_reason_id,
+            "promotion_reason": self.promotion_reason,
+            "promotion_reason_id": self.promotion_reason_id,
         }
 
 
@@ -312,6 +352,8 @@ class DryRunPlan:
     metadata_bytes: int
     sections: tuple[SectionPlan, ...]
     qtype_histogram: Mapping[str, int]
+    qtype_reason_histogram: Mapping[str, int]
+    promotion_reason_histogram: Mapping[str, int]
     usage_histogram: Mapping[str, int]
     family_histogram: Mapping[str, int]
 
@@ -341,6 +383,8 @@ class DryRunPlan:
             "metadata_bytes": self.metadata_bytes,
             "sections": [section.as_dict() for section in self.sections],
             "qtype_histogram": dict(self.qtype_histogram),
+            "qtype_reason_histogram": dict(self.qtype_reason_histogram),
+            "promotion_reason_histogram": dict(self.promotion_reason_histogram),
             "usage_histogram": dict(self.usage_histogram),
             "family_histogram": dict(self.family_histogram),
         }
@@ -461,6 +505,14 @@ def _usage_histogram(tensors: Iterable[TensorPlan]) -> dict[str, int]:
 
 def _qtype_histogram(tensors: Iterable[TensorPlan]) -> dict[str, int]:
     return dict(Counter(t.qtype for t in tensors))
+
+
+def _qtype_reason_histogram(tensors: Iterable[TensorPlan]) -> dict[str, int]:
+    return dict(Counter(t.qtype_reason for t in tensors))
+
+
+def _promotion_reason_histogram(tensors: Iterable[TensorPlan]) -> dict[str, int]:
+    return dict(Counter(t.promotion_reason for t in tensors))
 
 
 def _family_histogram(tensors: Iterable[TensorPlan]) -> dict[str, int]:
@@ -737,6 +789,29 @@ def _dyn_q4_quant_choice(
     return None
 
 
+def _reason_name(reason_names: Mapping[int, str], reason_id: int) -> str:
+    return reason_names.get(reason_id, "unknown")
+
+
+def _qtype_metadata_for_selection(
+    qprofile: str, qtype: str, reason: str
+) -> tuple[int, int]:
+    if qprofile == "fp16":
+        return UOCR_QTYPE_REASON_FP16_BASELINE, UOCR_PROMOTION_NONE
+    lowered = reason.lower()
+    if "manual override" in lowered or "manual-override" in lowered:
+        return UOCR_QTYPE_REASON_MANUAL_OVERRIDE, UOCR_PROMOTION_MANUAL_OVERRIDE
+    if "calibration drift" in lowered or "calibration-drift" in lowered:
+        return UOCR_QTYPE_REASON_CALIBRATION_DRIFT, UOCR_PROMOTION_CALIBRATION_DRIFT
+    if "unaligned" in lowered:
+        return UOCR_QTYPE_REASON_UNALIGNED, UOCR_PROMOTION_UNALIGNED
+    if qtype == "UOCR_TENSOR_F16":
+        return UOCR_QTYPE_REASON_SENSITIVE, UOCR_PROMOTION_SENSITIVE
+    if qprofile == "dyn-q4" and qtype == "UOCR_TENSOR_Q8_0":
+        return UOCR_QTYPE_REASON_SENSITIVE, UOCR_PROMOTION_SENSITIVE
+    return UOCR_QTYPE_REASON_POLICY, UOCR_PROMOTION_NONE
+
+
 def _projection_for_plan(registry_entry: TensorRegistryEntry) -> tuple[str, int]:
     projection = registry_entry.projection
     if projection == TensorProjection.NONE:
@@ -818,6 +893,8 @@ def _make_tensor_plan(name: str, entry: Mapping[str, Any], qprofile: str, regist
     elif qprofile != "fp16":
         raise ValueError(f"unknown qprofile {qprofile!r}")
 
+    qtype_reason_id, promotion_reason_id = _qtype_metadata_for_selection(qprofile, qtype, reason)
+
     return TensorPlan(
         name=name,
         source_dtype=str(entry["dtype"]),
@@ -844,6 +921,10 @@ def _make_tensor_plan(name: str, entry: Mapping[str, Any], qprofile: str, regist
         usage=usage,
         usage_id=usage_id,
         reason=reason,
+        qtype_reason=_reason_name(QTYPE_REASON_NAMES, qtype_reason_id),
+        qtype_reason_id=qtype_reason_id,
+        promotion_reason=_reason_name(PROMOTION_REASON_NAMES, promotion_reason_id),
+        promotion_reason_id=promotion_reason_id,
     )
 
 
@@ -859,6 +940,8 @@ def _relayout_plan(plan: DryRunPlan, tensors: Iterable[TensorPlan]) -> DryRunPla
         metadata_bytes=metadata_bytes,
         sections=sections,
         qtype_histogram=_qtype_histogram(laid_out),
+        qtype_reason_histogram=_qtype_reason_histogram(laid_out),
+        promotion_reason_histogram=_promotion_reason_histogram(laid_out),
         usage_histogram=_usage_histogram(laid_out),
         family_histogram=_family_histogram(laid_out),
     )
@@ -957,6 +1040,8 @@ def build_dry_run_plan(
         metadata_bytes=metadata_bytes,
         sections=sections,
         qtype_histogram=_qtype_histogram(tensors),
+        qtype_reason_histogram=_qtype_reason_histogram(tensors),
+        promotion_reason_histogram=_promotion_reason_histogram(tensors),
         usage_histogram=_usage_histogram(tensors),
         family_histogram=_family_histogram(tensors),
     )
@@ -1093,8 +1178,8 @@ def _tensor_directory_bytes(plan: DryRunPlan) -> bytes:
             0,
             0,
             0,
-            1,
-            0,
+            tensor.qtype_reason_id,
+            tensor.promotion_reason_id,
             0,
             0,
         )
@@ -1348,6 +1433,8 @@ def _print_summary(plan: DryRunPlan, *, dry_run: bool) -> None:
     if tensor_data is not None:
         print(f"tensor data: offset={tensor_data.offset} size={tensor_data.size} alignment={tensor_data.alignment}")
     print(f"qtypes: {dict(plan.qtype_histogram)}")
+    print(f"qtype reasons: {dict(plan.qtype_reason_histogram)}")
+    print(f"promotion reasons: {dict(plan.promotion_reason_histogram)}")
     print(f"usage: {dict(plan.usage_histogram)}")
     print("families:")
     for family, count in sorted(plan.family_histogram.items()):

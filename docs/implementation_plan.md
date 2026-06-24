@@ -841,7 +841,7 @@ Do not begin this section until sections 14.5 and 15.1 pass for fp16 single-requ
   - [x] physical width rounded to multiple of `256`
   - [x] activation zero-fill/padding in kernels
   - [x] logical width retained for output correctness
-- [ ] Add promotion metadata with reasons: sensitive, unaligned, calibration drift, manual override.
+- [x] Add promotion metadata with reasons: sensitive, unaligned, calibration drift, manual override.
 
 ### 17.4 Metal quantized kernels
 

@@ -11,12 +11,19 @@ from unlimitedocr_c.convert import (
     EXPECTED_TOTAL_BYTES,
     PADDED_Q4_K_KERNEL_CONTRACT,
     PRESERVED_UNUSED_NORMAL_OCR_PREFIXES,
+    UOCR_PROMOTION_NONE,
+    UOCR_PROMOTION_SENSITIVE,
+    UOCR_PROMOTION_UNALIGNED,
     UOCR_FILE_HEADER_SIZE,
     UOCR_Q4_K_BLOCK_SIZE,
     UOCR_Q4_K_TYPE_SIZE,
     UOCR_Q8_0_BLOCK_SIZE,
     UOCR_Q8_0_TYPE_SIZE,
     UOCR_QPROFILE_DYN_Q8,
+    UOCR_QTYPE_REASON_FP16_BASELINE,
+    UOCR_QTYPE_REASON_POLICY,
+    UOCR_QTYPE_REASON_SENSITIVE,
+    UOCR_QTYPE_REASON_UNALIGNED,
     UOCR_SECTION_TENSOR_DATA,
     UOCR_TENSOR_DATA_ALIGNMENT,
     UOCR_TENSOR_PAYLOAD_ALIGNMENT,
@@ -122,6 +129,8 @@ def test_fp16_converter_dry_run_against_cached_header() -> None:
     assert plan.total_source_bytes == EXPECTED_TOTAL_BYTES
     assert plan.total_output_bytes == EXPECTED_TOTAL_BYTES
     assert plan.qtype_histogram == {"UOCR_TENSOR_F16": EXPECTED_TENSOR_COUNT}
+    assert plan.qtype_reason_histogram == {"fp16-baseline": EXPECTED_TENSOR_COUNT}
+    assert plan.promotion_reason_histogram == {"none": EXPECTED_TENSOR_COUNT}
     assert plan.usage_histogram == {"runtime": EXPECTED_TENSOR_COUNT - 1, "preserved-unused": 1}
 
     preserved_unused = [tensor for tensor in plan.tensors if tensor.usage == "preserved-unused"]
@@ -152,6 +161,10 @@ def test_fp16_converter_dry_run_against_cached_header() -> None:
     assert lm_head.shape == (129_280, 1280)
     assert lm_head.source_dtype == "BF16"
     assert lm_head.output_dtype == "F16"
+    assert lm_head.qtype_reason == "fp16-baseline"
+    assert lm_head.qtype_reason_id == UOCR_QTYPE_REASON_FP16_BASELINE
+    assert lm_head.promotion_reason == "none"
+    assert lm_head.promotion_reason_id == UOCR_PROMOTION_NONE
 
     attn_q = plan.tensor_by_name("model.layers.3.self_attn.q_proj.weight")
     assert attn_q.tensor_id == tensor_id_layer_attn(3, TensorProjection.Q)
@@ -186,6 +199,10 @@ def test_dyn_q8_converter_dry_run_records_quant_metadata() -> None:
     assert 0 < plan.summary_dict()["compression_ratio"] < 1
     assert plan.qtype_histogram["UOCR_TENSOR_Q8_0"] > 0
     assert plan.qtype_histogram["UOCR_TENSOR_F16"] > 0
+    assert plan.qtype_reason_histogram["policy"] == plan.qtype_histogram["UOCR_TENSOR_Q8_0"]
+    assert plan.qtype_reason_histogram["sensitive"] == plan.qtype_histogram["UOCR_TENSOR_F16"]
+    assert plan.promotion_reason_histogram["none"] == plan.qtype_histogram["UOCR_TENSOR_Q8_0"]
+    assert plan.promotion_reason_histogram["sensitive"] == plan.qtype_histogram["UOCR_TENSOR_F16"]
 
     lm_head = plan.tensor_by_name("lm_head.weight")
     assert lm_head.qtype == "UOCR_TENSOR_Q8_0"
@@ -196,6 +213,10 @@ def test_dyn_q8_converter_dry_run_records_quant_metadata() -> None:
     assert lm_head.block_size == UOCR_Q8_0_BLOCK_SIZE
     assert lm_head.row_size == (1280 // UOCR_Q8_0_BLOCK_SIZE) * UOCR_Q8_0_TYPE_SIZE
     assert lm_head.output_bytes == 129_280 * lm_head.row_size
+    assert lm_head.qtype_reason == "policy"
+    assert lm_head.qtype_reason_id == UOCR_QTYPE_REASON_POLICY
+    assert lm_head.promotion_reason == "none"
+    assert lm_head.promotion_reason_id == UOCR_PROMOTION_NONE
 
     sam_patch = plan.tensor_by_name("model.sam_model.patch_embed.proj.weight")
     assert sam_patch.qtype == "UOCR_TENSOR_Q8_0"
@@ -208,6 +229,10 @@ def test_dyn_q8_converter_dry_run_records_quant_metadata() -> None:
     assert router.qtype == "UOCR_TENSOR_F16"
     assert router.logical_shape == router.shape
     assert "router" in router.reason.lower()
+    assert router.qtype_reason == "sensitive"
+    assert router.qtype_reason_id == UOCR_QTYPE_REASON_SENSITIVE
+    assert router.promotion_reason == "sensitive"
+    assert router.promotion_reason_id == UOCR_PROMOTION_SENSITIVE
 
     pos_embed = plan.tensor_by_name("model.sam_model.pos_embed")
     assert pos_embed.qtype == "UOCR_TENSOR_F16"
@@ -229,6 +254,8 @@ def test_dyn_q8_converter_dry_run_records_quant_metadata() -> None:
     assert entry[8] == 2
     assert entry[9:13] == (768, 768, 0, 0)
     assert entry[13:17] == (768, 768, 0, 0)
+    assert entry[25] == UOCR_QTYPE_REASON_POLICY
+    assert entry[26] == UOCR_PROMOTION_NONE
 
 
 def test_dyn_q4_converter_dry_run_uses_conservative_policy() -> None:
@@ -241,6 +268,12 @@ def test_dyn_q4_converter_dry_run_uses_conservative_policy() -> None:
     assert plan.qtype_histogram["UOCR_TENSOR_Q4_K"] > 0
     assert plan.qtype_histogram["UOCR_TENSOR_Q8_0"] > 0
     assert plan.qtype_histogram["UOCR_TENSOR_F16"] > 0
+    assert plan.qtype_reason_histogram["policy"] == plan.qtype_histogram["UOCR_TENSOR_Q4_K"]
+    assert plan.qtype_reason_histogram["unaligned"] > 0
+    assert plan.qtype_reason_histogram["sensitive"] > 0
+    assert plan.promotion_reason_histogram["none"] == plan.qtype_histogram["UOCR_TENSOR_Q4_K"]
+    assert plan.promotion_reason_histogram["unaligned"] > 0
+    assert plan.promotion_reason_histogram["sensitive"] > 0
 
     attn_q = plan.tensor_by_name("model.layers.3.self_attn.q_proj.weight")
     assert attn_q.qtype == "UOCR_TENSOR_Q4_K"
@@ -250,6 +283,10 @@ def test_dyn_q4_converter_dry_run_uses_conservative_policy() -> None:
     assert attn_q.block_size == UOCR_Q4_K_BLOCK_SIZE
     assert attn_q.row_size == (1280 // UOCR_Q4_K_BLOCK_SIZE) * UOCR_Q4_K_TYPE_SIZE
     assert "attention projection" in attn_q.reason
+    assert attn_q.qtype_reason == "policy"
+    assert attn_q.qtype_reason_id == UOCR_QTYPE_REASON_POLICY
+    assert attn_q.promotion_reason == "none"
+    assert attn_q.promotion_reason_id == UOCR_PROMOTION_NONE
 
     expert_gate = plan.tensor_by_name("model.layers.1.mlp.experts.7.gate_proj.weight")
     assert expert_gate.qtype == "UOCR_TENSOR_Q4_K"
@@ -264,6 +301,10 @@ def test_dyn_q4_converter_dry_run_uses_conservative_policy() -> None:
     assert expert_down.row_size == (896 // UOCR_Q8_0_BLOCK_SIZE) * UOCR_Q8_0_TYPE_SIZE
     assert "routed expert down" in expert_down.reason
     assert "Q8_0" in expert_down.reason
+    assert expert_down.qtype_reason == "unaligned"
+    assert expert_down.qtype_reason_id == UOCR_QTYPE_REASON_UNALIGNED
+    assert expert_down.promotion_reason == "unaligned"
+    assert expert_down.promotion_reason_id == UOCR_PROMOTION_UNALIGNED
 
     dense_down = plan.tensor_by_name("model.layers.0.mlp.down_proj.weight")
     assert dense_down.qtype == "UOCR_TENSOR_Q8_0"
@@ -282,6 +323,10 @@ def test_dyn_q4_converter_dry_run_uses_conservative_policy() -> None:
     lm_head = plan.tensor_by_name("lm_head.weight")
     assert lm_head.qtype == "UOCR_TENSOR_Q8_0"
     assert "LM head" in lm_head.reason
+    assert lm_head.qtype_reason == "sensitive"
+    assert lm_head.qtype_reason_id == UOCR_QTYPE_REASON_SENSITIVE
+    assert lm_head.promotion_reason == "sensitive"
+    assert lm_head.promotion_reason_id == UOCR_PROMOTION_SENSITIVE
 
     sam_patch = plan.tensor_by_name("model.sam_model.patch_embed.proj.weight")
     assert sam_patch.qtype == "UOCR_TENSOR_Q8_0"
@@ -290,6 +335,10 @@ def test_dyn_q4_converter_dry_run_uses_conservative_policy() -> None:
     router = plan.tensor_by_name("model.layers.1.mlp.gate.weight")
     assert router.qtype == "UOCR_TENSOR_F16"
     assert "router" in router.reason.lower()
+    assert router.qtype_reason == "sensitive"
+    assert router.qtype_reason_id == UOCR_QTYPE_REASON_SENSITIVE
+    assert router.promotion_reason == "sensitive"
+    assert router.promotion_reason_id == UOCR_PROMOTION_SENSITIVE
 
 
 def test_padded_q4_k_design_is_explicit_and_disabled_by_default() -> None:

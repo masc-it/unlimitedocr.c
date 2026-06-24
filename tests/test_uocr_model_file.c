@@ -376,6 +376,14 @@ static int test_valid_tensor_directory(void) {
     CHECK(uocr_model_file_find_tensor(&model, UOCR_TENSOR_ID_TOK_EMBED) == &model.tensors[0]);
     CHECK(uocr_model_file_find_tensor(&model, 999999u) == NULL);
     CHECK(strcmp(uocr_tensor_qtype_name(model.tensors[0].qtype), "f16") == 0);
+    CHECK(strcmp(uocr_tensor_qtype_reason_name(UOCR_TENSOR_QTYPE_REASON_SENSITIVE), "sensitive") == 0);
+    CHECK(strcmp(uocr_tensor_qtype_reason_name(UOCR_TENSOR_QTYPE_REASON_UNALIGNED), "unaligned") == 0);
+    CHECK(strcmp(uocr_tensor_qtype_reason_name(UOCR_TENSOR_QTYPE_REASON_CALIBRATION_DRIFT), "calibration-drift") == 0);
+    CHECK(strcmp(uocr_tensor_qtype_reason_name(UOCR_TENSOR_QTYPE_REASON_MANUAL_OVERRIDE), "manual-override") == 0);
+    CHECK(strcmp(uocr_tensor_promotion_reason_name(UOCR_TENSOR_PROMOTION_SENSITIVE), "sensitive") == 0);
+    CHECK(strcmp(uocr_tensor_promotion_reason_name(UOCR_TENSOR_PROMOTION_UNALIGNED), "unaligned") == 0);
+    CHECK(strcmp(uocr_tensor_promotion_reason_name(UOCR_TENSOR_PROMOTION_CALIBRATION_DRIFT), "calibration-drift") == 0);
+    CHECK(strcmp(uocr_tensor_promotion_reason_name(UOCR_TENSOR_PROMOTION_MANUAL_OVERRIDE), "manual-override") == 0);
     CHECK(strcmp(uocr_tensor_usage_name(model.tensors[1].usage), "preserved-unused") == 0);
     CHECK(strcmp(uocr_tensor_family_name(model.tensors[1].family), "VISION_CLIP") == 0);
     uocr_model_file_close(&model);

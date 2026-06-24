@@ -111,6 +111,44 @@ const char *uocr_tensor_qtype_name(uint32_t qtype) {
     }
 }
 
+const char *uocr_tensor_qtype_reason_name(uint32_t reason) {
+    switch (reason) {
+        case UOCR_TENSOR_QTYPE_REASON_UNKNOWN:
+            return "unknown";
+        case UOCR_TENSOR_QTYPE_REASON_FP16_BASELINE:
+            return "fp16-baseline";
+        case UOCR_TENSOR_QTYPE_REASON_POLICY:
+            return "policy";
+        case UOCR_TENSOR_QTYPE_REASON_SENSITIVE:
+            return "sensitive";
+        case UOCR_TENSOR_QTYPE_REASON_UNALIGNED:
+            return "unaligned";
+        case UOCR_TENSOR_QTYPE_REASON_CALIBRATION_DRIFT:
+            return "calibration-drift";
+        case UOCR_TENSOR_QTYPE_REASON_MANUAL_OVERRIDE:
+            return "manual-override";
+        default:
+            return "unknown";
+    }
+}
+
+const char *uocr_tensor_promotion_reason_name(uint32_t reason) {
+    switch (reason) {
+        case UOCR_TENSOR_PROMOTION_NONE:
+            return "none";
+        case UOCR_TENSOR_PROMOTION_SENSITIVE:
+            return "sensitive";
+        case UOCR_TENSOR_PROMOTION_UNALIGNED:
+            return "unaligned";
+        case UOCR_TENSOR_PROMOTION_CALIBRATION_DRIFT:
+            return "calibration-drift";
+        case UOCR_TENSOR_PROMOTION_MANUAL_OVERRIDE:
+            return "manual-override";
+        default:
+            return "unknown";
+    }
+}
+
 const char *uocr_tensor_usage_name(uint32_t usage) {
     switch (usage) {
         case UOCR_TENSOR_USAGE_RUNTIME:

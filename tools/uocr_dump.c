@@ -121,6 +121,8 @@ int main(int argc, char **argv) {
         enum { TOP_TENSORS = 5 };
         uint32_t qtype_counts[64] = {0};
         uint64_t qtype_bytes[64] = {0};
+        uint32_t qtype_reason_counts[16] = {0};
+        uint32_t promotion_reason_counts[16] = {0};
         uint32_t usage_runtime = 0u;
         uint32_t usage_preserved = 0u;
         uint32_t usage_omitted = 0u;
@@ -139,6 +141,8 @@ int main(int argc, char **argv) {
                 qtype_counts[tensor->qtype]++;
                 qtype_bytes[tensor->qtype] += tensor->payload_size;
             }
+            if (tensor->qtype_reason < 16u) qtype_reason_counts[tensor->qtype_reason]++;
+            if (tensor->promotion_reason < 16u) promotion_reason_counts[tensor->promotion_reason]++;
             if (tensor->usage == UOCR_TENSOR_USAGE_RUNTIME) usage_runtime++;
             if (tensor->usage == UOCR_TENSOR_USAGE_PRESERVED_UNUSED) usage_preserved++;
             if (tensor->usage == UOCR_TENSOR_USAGE_OMITTED_WITH_REASON) usage_omitted++;
@@ -206,14 +210,28 @@ int main(int argc, char **argv) {
             printf(" %s=%llu", uocr_tensor_qtype_name(i), (unsigned long long)qtype_bytes[i]);
         }
         printf("\n");
+        printf("  qtype_reasons:");
+        for (uint32_t i = 0u; i < 16u; ++i) {
+            if (qtype_reason_counts[i] == 0u) continue;
+            printf(" %s=%u", uocr_tensor_qtype_reason_name(i), qtype_reason_counts[i]);
+        }
+        printf("\n");
+        printf("  promotion_reasons:");
+        for (uint32_t i = 0u; i < 16u; ++i) {
+            if (promotion_reason_counts[i] == 0u) continue;
+            printf(" %s=%u", uocr_tensor_promotion_reason_name(i), promotion_reason_counts[i]);
+        }
+        printf("\n");
         printf("  largest_tensors:\n");
         for (uint32_t i = 0u; i < top_count; ++i) {
             const uocr_tensor_entry *tensor = &model.tensors[top[i]];
-            printf("    [%u] id=%u family=%s qtype=%s offset=%llu size=%llu offset_alignment=%llu\n",
+            printf("    [%u] id=%u family=%s qtype=%s qtype_reason=%s promotion=%s offset=%llu size=%llu offset_alignment=%llu\n",
                    i,
                    tensor->id,
                    uocr_tensor_family_name(tensor->family),
                    uocr_tensor_qtype_name(tensor->qtype),
+                   uocr_tensor_qtype_reason_name(tensor->qtype_reason),
+                   uocr_tensor_promotion_reason_name(tensor->promotion_reason),
                    (unsigned long long)tensor->payload_offset,
                    (unsigned long long)tensor->payload_size,
                    (unsigned long long)natural_alignment(tensor->payload_offset));

@@ -36,6 +36,8 @@ const uocr_tensor_entry *uocr_model_file_find_tensor(const uocr_model_file *file
 const char *uocr_section_type_name(uint32_t section_type);
 const char *uocr_qprofile_name(uint32_t qprofile);
 const char *uocr_tensor_qtype_name(uint32_t qtype);
+const char *uocr_tensor_qtype_reason_name(uint32_t reason);
+const char *uocr_tensor_promotion_reason_name(uint32_t reason);
 const char *uocr_tensor_usage_name(uint32_t usage);
 const char *uocr_tensor_family_name(uint32_t family);
 
