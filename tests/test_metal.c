@@ -31,6 +31,13 @@
     } while (0)
 
 static float f16_bits_to_f32(uint16_t h);
+static float clip_attention_expected(const uint16_t *q,
+                                     const uint16_t *k,
+                                     const uint16_t *v,
+                                     uint32_t tokens,
+                                     uint32_t token,
+                                     uint32_t head,
+                                     uint32_t dim);
 
 static int test_metal_smoke(void) {
     if (!uocr_metal_is_available()) {
@@ -2220,6 +2227,142 @@ static int test_metal_clip_qkv_f16(void) {
     return 0;
 }
 
+static int test_metal_clip_attention_f16(void) {
+    if (!uocr_metal_is_available()) {
+        return 0;
+    }
+
+    CHECK(UOCR_CLIP_ATTENTION_HEADS == 16u);
+    CHECK(UOCR_CLIP_HEAD_DIM == 64u);
+    CHECK(UOCR_CLIP_ATTENTION_HEADS * UOCR_CLIP_HEAD_DIM == UOCR_CLIP_HIDDEN_SIZE);
+    CHECK(UOCR_CLIP_GLOBAL_TOKENS == 257u);
+    CHECK(UOCR_CLIP_LOCAL_TOKENS == 101u);
+
+    char error[1024];
+    memset(error, 0, sizeof(error));
+    uocr_metal_context *ctx = uocr_metal_context_create(UOCR_TEST_METAL_RESOURCE_PATH, error, sizeof(error));
+    CHECK(ctx != NULL);
+
+    const uint32_t token_counts[] = {UOCR_CLIP_GLOBAL_TOKENS, UOCR_CLIP_LOCAL_TOKENS};
+    for (size_t case_index = 0u; case_index < sizeof(token_counts) / sizeof(token_counts[0]); ++case_index) {
+        const uint32_t tokens = token_counts[case_index];
+        const size_t values = (size_t)tokens * UOCR_CLIP_HIDDEN_SIZE;
+        uint16_t *q = (uint16_t *)calloc(values, sizeof(uint16_t));
+        uint16_t *k = (uint16_t *)calloc(values, sizeof(uint16_t));
+        uint16_t *v = (uint16_t *)calloc(values, sizeof(uint16_t));
+        float *out_f32 = (float *)calloc(values, sizeof(float));
+        uint16_t *out_f16 = (uint16_t *)calloc(values, sizeof(uint16_t));
+        CHECK(q != NULL);
+        CHECK(k != NULL);
+        CHECK(v != NULL);
+        CHECK(out_f32 != NULL);
+        CHECK(out_f16 != NULL);
+
+        for (uint32_t token = 0u; token < tokens; ++token) {
+            for (uint32_t head = 0u; head < UOCR_CLIP_ATTENTION_HEADS; ++head) {
+                for (uint32_t dim = 0u; dim < UOCR_CLIP_HEAD_DIM; ++dim) {
+                    const int q_mod = (int)((token * 5u + head * 7u + dim * 11u + tokens) % 31u) - 15;
+                    const int k_mod = (int)((token * 13u + head * 3u + dim * 17u + tokens) % 29u) - 14;
+                    const int v_mod = (int)((token * 19u + head * 23u + dim * 2u + tokens) % 37u) - 18;
+                    const size_t idx = clip_qkv_out_index(token, head, dim);
+                    q[idx] = f32_to_f16_bits((float)q_mod * 0.003f);
+                    k[idx] = f32_to_f16_bits((float)k_mod * 0.004f);
+                    v[idx] = f32_to_f16_bits((float)v_mod * 0.005f);
+                }
+            }
+        }
+
+        CHECK(uocr_metal_context_clip_attention_f16(ctx,
+                                                     q,
+                                                     k,
+                                                     v,
+                                                     tokens,
+                                                     UOCR_METAL_DENSE_OUTPUT_F32,
+                                                     out_f32,
+                                                     error,
+                                                     sizeof(error)) == 1);
+        CHECK(error[0] == '\0');
+
+        struct clip_attention_sample {
+            uint32_t token;
+            uint32_t head;
+            uint32_t dim;
+        } samples[] = {
+            {0u, 0u, 0u},
+            {tokens / 3u, 7u, 19u},
+            {tokens / 2u, 15u, 63u},
+            {tokens - 1u, 3u, 5u},
+        };
+        for (size_t i = 0u; i < sizeof(samples) / sizeof(samples[0]); ++i) {
+            const size_t idx = clip_qkv_out_index(samples[i].token, samples[i].head, samples[i].dim);
+            const float expected = clip_attention_expected(q,
+                                                           k,
+                                                           v,
+                                                           tokens,
+                                                           samples[i].token,
+                                                           samples[i].head,
+                                                           samples[i].dim);
+            CHECK(isfinite(expected));
+            CHECK(fabsf(out_f32[idx] - expected) <= 1.2e-4f);
+        }
+
+        CHECK(uocr_metal_context_clip_attention_f16(ctx,
+                                                     q,
+                                                     k,
+                                                     v,
+                                                     tokens,
+                                                     UOCR_METAL_DENSE_OUTPUT_F16,
+                                                     out_f16,
+                                                     error,
+                                                     sizeof(error)) == 1);
+        CHECK(error[0] == '\0');
+        for (size_t i = 0u; i < sizeof(samples) / sizeof(samples[0]); ++i) {
+            const size_t idx = clip_qkv_out_index(samples[i].token, samples[i].head, samples[i].dim);
+            const float expected = clip_attention_expected(q,
+                                                           k,
+                                                           v,
+                                                           tokens,
+                                                           samples[i].token,
+                                                           samples[i].head,
+                                                           samples[i].dim);
+            CHECK(fabsf(f16_bits_to_f32(out_f16[idx]) - expected) <= 1.5e-3f);
+        }
+
+        free(out_f16);
+        free(out_f32);
+        free(v);
+        free(k);
+        free(q);
+    }
+
+    uint16_t one_value = f32_to_f16_bits(0.0f);
+    float one_out = 0.0f;
+    CHECK(uocr_metal_context_clip_attention_f16(ctx,
+                                                 &one_value,
+                                                 NULL,
+                                                 &one_value,
+                                                 UOCR_CLIP_LOCAL_TOKENS,
+                                                 UOCR_METAL_DENSE_OUTPUT_F32,
+                                                 &one_out,
+                                                 error,
+                                                 sizeof(error)) == 0);
+    CHECK(strstr(error, "invalid Metal CLIP attention") != NULL);
+
+    CHECK(uocr_metal_context_clip_attention_f16(ctx,
+                                                 &one_value,
+                                                 &one_value,
+                                                 &one_value,
+                                                 UOCR_CLIP_LOCAL_TOKENS - 1u,
+                                                 UOCR_METAL_DENSE_OUTPUT_F32,
+                                                 &one_out,
+                                                 error,
+                                                 sizeof(error)) == 0);
+    CHECK(strstr(error, "invalid Metal CLIP attention token count") != NULL);
+
+    uocr_metal_context_destroy(ctx);
+    return 0;
+}
+
 static int test_metal_sam_window_partition_f16(void) {
     if (!uocr_metal_is_available()) {
         return 0;
@@ -2365,6 +2508,42 @@ static float sam_window_attention_expected(const uint16_t *q,
         const float weight = expf(scores[key] - max_score);
         denominator += weight;
         value += weight * f16_bits_to_f32(v[sam_window_attention_index(window, key, head, dim)]);
+    }
+    return denominator > 0.0f ? value / denominator : 0.0f;
+}
+
+static float clip_attention_expected(const uint16_t *q,
+                                     const uint16_t *k,
+                                     const uint16_t *v,
+                                     uint32_t tokens,
+                                     uint32_t token,
+                                     uint32_t head,
+                                     uint32_t dim) {
+    float scores[UOCR_CLIP_MAX_TOKENS];
+    if (tokens > UOCR_CLIP_MAX_TOKENS) {
+        return NAN;
+    }
+    float max_score = -INFINITY;
+    const float scale = 1.0f / sqrtf((float)UOCR_CLIP_HEAD_DIM);
+    for (uint32_t key = 0u; key < tokens; ++key) {
+        float score = 0.0f;
+        for (uint32_t d = 0u; d < UOCR_CLIP_HEAD_DIM; ++d) {
+            score += f16_bits_to_f32(q[clip_qkv_out_index(token, head, d)]) *
+                     f16_bits_to_f32(k[clip_qkv_out_index(key, head, d)]);
+        }
+        score *= scale;
+        scores[key] = score;
+        if (score > max_score) {
+            max_score = score;
+        }
+    }
+
+    float denominator = 0.0f;
+    float value = 0.0f;
+    for (uint32_t key = 0u; key < tokens; ++key) {
+        const float weight = expf(scores[key] - max_score);
+        denominator += weight;
+        value += weight * f16_bits_to_f32(v[clip_qkv_out_index(key, head, dim)]);
     }
     return denominator > 0.0f ? value / denominator : 0.0f;
 }
@@ -12265,6 +12444,7 @@ int main(void) {
     if (test_metal_clip_pre_layernorm_f16() != 0) return 1;
     if (test_metal_clip_layernorm_f16() != 0) return 1;
     if (test_metal_clip_qkv_f16() != 0) return 1;
+    if (test_metal_clip_attention_f16() != 0) return 1;
     if (test_metal_sam_window_partition_f16() != 0) return 1;
     if (test_metal_sam_window_attention_f16() != 0) return 1;
     if (test_metal_sam_global_attention_f16() != 0) return 1;

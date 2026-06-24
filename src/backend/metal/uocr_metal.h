@@ -509,6 +509,20 @@ int uocr_metal_context_clip_qkv_f16(uocr_metal_context *ctx,
                                     char *error,
                                     size_t error_size);
 
+/* Diagnostic CLIP full self-attention helper. Q/K/V are fp16 tensors laid out
+ * [tokens,16,64]. The helper computes unmasked scaled dot-product attention
+ * over all 257 or 101 tokens and writes [tokens,1024].
+ */
+int uocr_metal_context_clip_attention_f16(uocr_metal_context *ctx,
+                                          const uint16_t *q_f16,
+                                          const uint16_t *k_f16,
+                                          const uint16_t *v_f16,
+                                          uint32_t token_count,
+                                          uocr_metal_dense_output_type output_type,
+                                          void *out,
+                                          char *error,
+                                          size_t error_size);
+
 /* Diagnostic SAM window-attention helper for non-global transformer blocks.
  * Q/K/V are fp16 tensors laid out as [n_windows,14*14,12,64] (equivalent to
  * window-major rows with flattened [head,dim] channels). The helper computes

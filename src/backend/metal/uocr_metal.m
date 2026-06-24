@@ -7580,6 +7580,171 @@ int uocr_metal_context_clip_qkv_f16(uocr_metal_context *ctx,
     return result;
 }
 
+int uocr_metal_context_clip_attention_f16(uocr_metal_context *ctx,
+                                          const uint16_t *q_f16,
+                                          const uint16_t *k_f16,
+                                          const uint16_t *v_f16,
+                                          uint32_t token_count,
+                                          uocr_metal_dense_output_type output_type,
+                                          void *out,
+                                          char *error,
+                                          size_t error_size) {
+    metal_clear_error(error, error_size);
+    if (ctx == NULL || q_f16 == NULL || k_f16 == NULL || v_f16 == NULL || out == NULL) {
+        return metal_fail(error, error_size, "invalid Metal CLIP attention request");
+    }
+    if (token_count != UOCR_CLIP_GLOBAL_TOKENS && token_count != UOCR_CLIP_LOCAL_TOKENS) {
+        return metal_fail(error, error_size, "invalid Metal CLIP attention token count %u", token_count);
+    }
+    if (output_type != UOCR_METAL_DENSE_OUTPUT_F16 && output_type != UOCR_METAL_DENSE_OUTPUT_F32) {
+        return metal_fail(error, error_size, "unsupported Metal CLIP attention output type %d", (int)output_type);
+    }
+    if (UOCR_CLIP_HIDDEN_SIZE != 1024u || UOCR_CLIP_ATTENTION_HEADS != 16u || UOCR_CLIP_HEAD_DIM != 64u ||
+        UOCR_CLIP_ATTENTION_HEADS * UOCR_CLIP_HEAD_DIM != UOCR_CLIP_HIDDEN_SIZE ||
+        UOCR_CLIP_GLOBAL_TOKENS != 257u || UOCR_CLIP_LOCAL_TOKENS != 101u) {
+        return metal_fail(error, error_size, "Metal CLIP attention constants are inconsistent");
+    }
+
+    uint64_t attention_values = 0u;
+    uint64_t input_bytes = 0u;
+    uint64_t output_bytes = 0u;
+    uint64_t group_count = 0u;
+    const uint64_t output_element_bytes = output_type == UOCR_METAL_DENSE_OUTPUT_F16 ? 2u : (uint64_t)sizeof(float);
+    if (!checked_mul_u64((uint64_t)token_count, (uint64_t)UOCR_CLIP_HIDDEN_SIZE, &attention_values) ||
+        !checked_mul_u64(attention_values, 2u, &input_bytes) ||
+        !checked_mul_u64(attention_values, output_element_bytes, &output_bytes) ||
+        !checked_mul_u64((uint64_t)token_count, (uint64_t)UOCR_CLIP_ATTENTION_HEADS, &group_count) ||
+        attention_values > (uint64_t)UINT32_MAX || group_count > (uint64_t)UINT32_MAX ||
+        input_bytes > (uint64_t)SIZE_MAX || output_bytes > (uint64_t)SIZE_MAX) {
+        return metal_fail(error, error_size, "Metal CLIP attention byte-size overflow");
+    }
+
+    const uint64_t max_buffer_length = metal_device_max_buffer_length(ctx->device);
+    if (input_bytes > max_buffer_length || output_bytes > max_buffer_length) {
+        return metal_fail(error,
+                          error_size,
+                          "Metal CLIP attention buffers exceed maxBufferLength %llu",
+                          (unsigned long long)max_buffer_length);
+    }
+
+    int result = 0;
+    @autoreleasepool {
+        /* The SAM window-attention shader is an all-to-all attention primitive
+         * parameterized by token count, head count, and head dim. CLIP full
+         * attention is represented as one window spanning the whole token set.
+         */
+        const char *function_name = output_type == UOCR_METAL_DENSE_OUTPUT_F16 ?
+                                        "uocr_sam_window_attention_f16_to_f16" :
+                                        "uocr_sam_window_attention_f16_to_f32";
+        id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, function_name, error, error_size);
+        if (pipeline == nil) {
+            return 0;
+        }
+
+        id<MTLBuffer> q_src = nil;
+        id<MTLBuffer> k_src = nil;
+        id<MTLBuffer> v_src = nil;
+        id<MTLBuffer> dst = nil;
+
+        q_src = [ctx->device newBufferWithBytes:q_f16 length:(NSUInteger)input_bytes options:MTLResourceStorageModeShared];
+        if (q_src == nil) {
+            result = metal_fail(error, error_size, "failed to allocate Metal CLIP attention Q buffer");
+            goto cleanup_clip_attention;
+        }
+        q_src.label = @"uocr_clip_attention_q_f16";
+
+        k_src = [ctx->device newBufferWithBytes:k_f16 length:(NSUInteger)input_bytes options:MTLResourceStorageModeShared];
+        if (k_src == nil) {
+            result = metal_fail(error, error_size, "failed to allocate Metal CLIP attention K buffer");
+            goto cleanup_clip_attention;
+        }
+        k_src.label = @"uocr_clip_attention_k_f16";
+
+        v_src = [ctx->device newBufferWithBytes:v_f16 length:(NSUInteger)input_bytes options:MTLResourceStorageModeShared];
+        if (v_src == nil) {
+            result = metal_fail(error, error_size, "failed to allocate Metal CLIP attention V buffer");
+            goto cleanup_clip_attention;
+        }
+        v_src.label = @"uocr_clip_attention_v_f16";
+
+        dst = [ctx->device newBufferWithLength:(NSUInteger)output_bytes options:MTLResourceStorageModeShared];
+        if (dst == nil) {
+            result = metal_fail(error, error_size, "failed to allocate Metal CLIP attention output buffer");
+            goto cleanup_clip_attention;
+        }
+        dst.label = @"uocr_clip_attention_output";
+        memset([dst contents], 0, (size_t)output_bytes);
+
+        uocr_metal_sam_window_attention_params params;
+        params.windows = 1u;
+        params.tokens_per_window = token_count;
+        params.heads = UOCR_CLIP_ATTENTION_HEADS;
+        params.head_dim = UOCR_CLIP_HEAD_DIM;
+        params.scale = 1.0f / sqrtf((float)UOCR_CLIP_HEAD_DIM);
+        params.reserved0 = 0u;
+        params.reserved1 = 0u;
+        params.reserved2 = 0u;
+
+        const NSUInteger threads_per_group = metal_power2_threadgroup_width((NSUInteger)UOCR_CLIP_HEAD_DIM,
+                                                                            pipeline.maxTotalThreadsPerThreadgroup);
+        if (threads_per_group < (NSUInteger)UOCR_CLIP_HEAD_DIM) {
+            result = metal_fail(error, error_size, "Metal CLIP attention needs at least %u threads", UOCR_CLIP_HEAD_DIM);
+            goto cleanup_clip_attention;
+        }
+        const uint64_t threadgroup_bytes = (uint64_t)threads_per_group * (uint64_t)sizeof(float);
+        if (threadgroup_bytes > (uint64_t)ctx->device.maxThreadgroupMemoryLength) {
+            result = metal_fail(error, error_size, "Metal CLIP attention threadgroup memory exceeds device limit");
+            goto cleanup_clip_attention;
+        }
+
+        id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
+        if (cb == nil) {
+            result = metal_fail(error, error_size, "failed to create Metal CLIP attention command buffer");
+            goto cleanup_clip_attention;
+        }
+        cb.label = @"uocr_clip_attention_command_buffer";
+
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        if (enc == nil) {
+            result = metal_fail(error, error_size, "failed to create Metal CLIP attention command encoder");
+            goto cleanup_clip_attention;
+        }
+
+        [enc setComputePipelineState:pipeline];
+        [enc setBuffer:q_src offset:0u atIndex:0u];
+        [enc setBuffer:k_src offset:0u atIndex:1u];
+        [enc setBuffer:v_src offset:0u atIndex:2u];
+        [enc setBuffer:dst offset:0u atIndex:3u];
+        [enc setBytes:&params length:sizeof(params) atIndex:4u];
+        [enc setThreadgroupMemoryLength:threads_per_group * sizeof(float) atIndex:0u];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)group_count, 1u, 1u)
+             threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1u, 1u)];
+        [enc endEncoding];
+
+        [cb commit];
+        [cb waitUntilCompleted];
+        if (cb.status == MTLCommandBufferStatusError) {
+            NSString *description = cb.error != nil ? [cb.error localizedDescription] : @"unknown command-buffer error";
+            result = metal_fail(error, error_size, "Metal CLIP attention command failed: %s", [description UTF8String]);
+            goto cleanup_clip_attention;
+        }
+
+        memcpy(out, [dst contents], (size_t)output_bytes);
+        result = 1;
+
+    cleanup_clip_attention:
+        [dst release];
+        [v_src release];
+        [k_src release];
+        [q_src release];
+    }
+
+    if (result) {
+        metal_clear_error(error, error_size);
+    }
+    return result;
+}
+
 static int metal_context_sam_attention_f16(uocr_metal_context *ctx,
                                            const uint16_t *q_f16,
                                            const uint16_t *k_f16,
