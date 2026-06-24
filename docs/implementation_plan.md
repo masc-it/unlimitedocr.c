@@ -47,7 +47,7 @@ Current priority slice, in order. The coding agent should take the first uncheck
 
 - [x] Define and validate a production fp16 vision tensor-binding cache for all tensors needed by SAM, CLIP, projector, `IMAGE_NEWLINE`, and `VIEW_SEPARATOR`; fail model open/generation early if anything required is missing, non-fp16, or shape-mismatched.
 - [x] Add a production Metal vision runner that consumes validated public `uocr_prepared_request` views and writes one formatted fp16 visual-feature buffer `[image_tokens,1280]` using the existing view scheduler, SAM/CLIP/projector kernels, and newline/separator formatter.
-- [ ] Wire the public Metal path in `uocr_generate_prepared()` for `n_requests=1`, fp16 model, `max_new_tokens>0`, and image requests; find/validate the contiguous image span, run vision, then call the existing integrated decoder with `image_features_f16` instead of returning `UOCR_ERROR_NOT_IMPLEMENTED`.
+- [x] Wire the public Metal path in `uocr_generate_prepared()` for `n_requests=1`, fp16 model, `max_new_tokens>0`, and image requests; find/validate the contiguous image span, run vision, then call the existing integrated decoder with `image_features_f16` instead of returning `UOCR_ERROR_NOT_IMPLEMENTED`.
 - [ ] Add an opt-in full-model public image smoke test: Python `prepare_image(..., max_new_tokens=1)` -> C `uocr_generate_prepared()` -> at least one valid generated id; decode the id in Python for developer visibility.
 - [ ] Add image e2e parity fixtures/tests for formatted visual features and first generated ids/text against the Python/HF path, starting with one base/global `1024` image, then gundam `[1,1]`, then real multi-crop.
 - [ ] Add only the thinnest Python convenience wrapper/decoder needed to call the working public path; defer stable `ocr_image`/PDF/postprocess ergonomics until after the native fp16 image path works.
@@ -737,7 +737,7 @@ Do this immediately after section 14.5 and before porting SAM/CLIP. The goal is 
 
 ## 16. Metal fp16 vision encoder
 
-Status note: this section contains many checked **kernel/helper** items, but Gate E2E-0 is still open. The public path still rejects image requests, so the next work is production integration, not more isolated kernels.
+Status note: this section contains many checked **kernel/helper** items, but Gate E2E-0 is still open until public image smoke/parity tests prove generated ids from real pixels. The public Metal path is now wired through vision and the integrated decoder; next work is opt-in full-model smoke and parity coverage, not more isolated kernels.
 
 Do not resume quantization, batching, CUDA, or high-level OCR/PDF/postprocess API work until section 16.0 passes. Vision must replace dumped visual embeddings in the same integrated decoder path, not introduce a second decoder/generation loop.
 
@@ -747,8 +747,8 @@ Do not resume quantization, batching, CUDA, or high-level OCR/PDF/postprocess AP
 - [x] Add a narrow Metal vision runner API, e.g. `uocr_metal_context_encode_visual_features_f16()`, that takes a validated `uocr_prepared_request`, a chunk limit, and a preallocated output buffer.
 - [x] Feed public `uocr_image_view` pixels (`F16_NCHW` and `F32_NCHW`) through SAM -> CLIP -> projector chunk-by-chunk, reusing vision scratch and avoiding full-model or full-view persistent copies.
 - [x] Call `uocr_process_vision_chunks_f16()` or equivalent formatting to produce final visual features in the required order: local rows first, then global rows/newlines, then separator.
-- [ ] Compute the contiguous image span from `image_mask`; validate span length equals formatted visual-feature rows before decoder prefill.
-- [ ] Wire public `uocr_generate_prepared()` Metal fp16 image case for `n_requests=1`, `max_new_tokens>0`, and fp16 `.uocr`; pass `image_span_start`, `image_span_length`, and `image_features_f16` into the existing integrated decoder.
+- [x] Compute the contiguous image span from `image_mask`; validate span length equals formatted visual-feature rows before decoder prefill.
+- [x] Wire public `uocr_generate_prepared()` Metal fp16 image case for `n_requests=1`, `max_new_tokens>0`, and fp16 `.uocr`; pass `image_span_start`, `image_span_length`, and `image_features_f16` into the existing integrated decoder.
 - [ ] Add opt-in full-model public image smoke test that returns valid generated ids from real image pixels.
 - [ ] Add parity tests for final visual features and first generated ids/text against Python/HF dumps.
 - [ ] Extend the public image smoke from one base/global image to gundam `[1,1]`, gundam real multi-crop, and multi-page base mode.

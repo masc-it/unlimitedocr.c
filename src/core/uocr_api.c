@@ -209,6 +209,175 @@ static int generate_metal_text_fp16(uocr_engine *engine,
     clear_engine_error(engine);
     return UOCR_OK;
 }
+
+static int generate_metal_image_fp16(uocr_engine *engine,
+                                     const uocr_prepared_request *request,
+                                     uocr_result **out_result) {
+    if (engine == NULL || request == NULL || out_result == NULL) {
+        return set_engine_errorf(engine, UOCR_ERROR_INVALID_ARGUMENT, "invalid Metal image generation request");
+    }
+    if (engine->metal == NULL) {
+        return set_engine_errorf(engine, UOCR_ERROR_INTERNAL, "Metal backend context is not initialized");
+    }
+    if (!engine->has_model_file || engine->model_file.header == NULL) {
+        return set_engine_errorf(engine,
+                                 UOCR_ERROR_NOT_IMPLEMENTED,
+                                 "Metal fp16 image generation requires a mapped fp16 .uocr model");
+    }
+    if (engine->model_file.header->qprofile != UOCR_QPROFILE_FP16) {
+        return set_engine_errorf(engine,
+                                 UOCR_ERROR_NOT_IMPLEMENTED,
+                                 "Metal image generation currently supports only fp16 .uocr models, got %s",
+                                 uocr_qprofile_name(engine->model_file.header->qprofile));
+    }
+    if (!uocr_metal_context_decoder_bindings_ready(engine->metal)) {
+        return set_engine_errorf(engine,
+                                 UOCR_ERROR_NOT_IMPLEMENTED,
+                                 "Metal fp16 image generation requires complete validated decoder tensor bindings");
+    }
+    if (!uocr_metal_context_vision_bindings_ready(engine->metal)) {
+        return set_engine_errorf(engine,
+                                 UOCR_ERROR_NOT_IMPLEMENTED,
+                                 "Metal fp16 image generation requires complete validated vision tensor bindings: %s",
+                                 uocr_metal_context_vision_binding_error(engine->metal));
+    }
+
+    char validation_error[512];
+    memset(validation_error, 0, sizeof(validation_error));
+    uocr_sequence_state sequence_state;
+    memset(&sequence_state, 0, sizeof(sequence_state));
+    int status = uocr_build_sequence_state(request, &sequence_state, validation_error, sizeof(validation_error));
+    if (status != UOCR_OK) {
+        return set_engine_errorf(engine,
+                                 status,
+                                 "Metal fp16 image generation requires one contiguous image span: %s",
+                                 validation_error[0] != '\0' ? validation_error : "unknown error");
+    }
+    if (sequence_state.image_span_start == UOCR_SEQUENCE_NO_IMAGE_SPAN || sequence_state.image_span_length == 0u) {
+        return set_engine_errorf(engine,
+                                 UOCR_ERROR_INVALID_ARGUMENT,
+                                 "Metal fp16 image generation requires at least one image placeholder");
+    }
+
+    uocr_vision_schedule vision_schedule;
+    memset(&vision_schedule, 0, sizeof(vision_schedule));
+    status = uocr_plan_vision_schedule(request,
+                                       1u,
+                                       NULL,
+                                       0u,
+                                       &vision_schedule,
+                                       validation_error,
+                                       sizeof(validation_error));
+    if (status != UOCR_OK) {
+        return set_engine_errorf(engine,
+                                 status,
+                                 "Metal fp16 image generation vision schedule failed: %s",
+                                 validation_error[0] != '\0' ? validation_error : "unknown error");
+    }
+    if (vision_schedule.final_visual_tokens == 0u) {
+        return set_engine_errorf(engine,
+                                 UOCR_ERROR_INVALID_ARGUMENT,
+                                 "Metal fp16 image generation requires image views that produce visual features");
+    }
+    if (sequence_state.image_span_length != vision_schedule.final_visual_tokens) {
+        return set_engine_errorf(engine,
+                                 UOCR_ERROR_INVALID_ARGUMENT,
+                                 "Metal fp16 image generation image span length %u does not match formatted visual rows %u",
+                                 sequence_state.image_span_length,
+                                 vision_schedule.final_visual_tokens);
+    }
+
+    uint64_t visual_values = 0u;
+    uint64_t visual_bytes = 0u;
+    if ((uint64_t)vision_schedule.final_visual_tokens > UINT64_MAX / (uint64_t)UOCR_HIDDEN_SIZE) {
+        return set_engine_errorf(engine, UOCR_ERROR_OUT_OF_MEMORY, "visual-feature buffer size overflow");
+    }
+    visual_values = (uint64_t)vision_schedule.final_visual_tokens * (uint64_t)UOCR_HIDDEN_SIZE;
+    if (visual_values > UINT64_MAX / (uint64_t)sizeof(uint16_t) ||
+        visual_values * (uint64_t)sizeof(uint16_t) > (uint64_t)SIZE_MAX) {
+        return set_engine_errorf(engine, UOCR_ERROR_OUT_OF_MEMORY, "visual-feature buffer size overflow");
+    }
+    visual_bytes = visual_values * (uint64_t)sizeof(uint16_t);
+
+    uint16_t *visual_features_f16 = (uint16_t *)uocr_malloc((size_t)visual_bytes);
+    if (visual_features_f16 == NULL) {
+        return set_engine_errorf(engine,
+                                 UOCR_ERROR_OUT_OF_MEMORY,
+                                 "failed to allocate Metal visual-feature buffer (%llu bytes)",
+                                 (unsigned long long)visual_bytes);
+    }
+
+    char metal_error[1024];
+    memset(metal_error, 0, sizeof(metal_error));
+    if (!uocr_metal_context_encode_visual_features_f16(engine->metal,
+                                                       request,
+                                                       1u,
+                                                       visual_features_f16,
+                                                       vision_schedule.final_visual_tokens,
+                                                       metal_error,
+                                                       sizeof(metal_error))) {
+        uocr_free(visual_features_f16);
+        return set_engine_errorf(engine,
+                                 UOCR_ERROR_INTERNAL,
+                                 "Metal fp16 image vision encoding failed: %s",
+                                 metal_error[0] != '\0' ? metal_error : "unknown error");
+    }
+
+    if ((uint64_t)request->max_new_tokens > (uint64_t)SIZE_MAX / sizeof(int32_t)) {
+        uocr_free(visual_features_f16);
+        return set_engine_errorf(engine, UOCR_ERROR_OUT_OF_MEMORY, "generated-token buffer size overflow");
+    }
+    const uint64_t generated_bytes = (uint64_t)request->max_new_tokens * (uint64_t)sizeof(int32_t);
+    int32_t *generated = (int32_t *)uocr_malloc((size_t)generated_bytes);
+    if (generated == NULL) {
+        uocr_free(visual_features_f16);
+        return set_engine_errorf(engine, UOCR_ERROR_OUT_OF_MEMORY, "failed to allocate generated-token buffer");
+    }
+
+    uocr_metal_decoder_request_f16 metal_request;
+    memset(&metal_request, 0, sizeof(metal_request));
+    metal_request.input_ids = request->input_ids;
+    metal_request.image_mask = request->image_mask;
+    metal_request.image_features_f16 = visual_features_f16;
+    metal_request.n_tokens = request->n_tokens;
+    metal_request.max_new_tokens = request->max_new_tokens;
+    metal_request.slot = 0u;
+    metal_request.image_span_start = sequence_state.image_span_start;
+    metal_request.image_span_length = sequence_state.image_span_length;
+    metal_request.no_repeat_ngram_size = request->no_repeat_ngram_size;
+    metal_request.no_repeat_window = request->no_repeat_window;
+
+    uocr_metal_decoder_result_f16 metal_result;
+    memset(&metal_result, 0, sizeof(metal_result));
+    metal_result.generated_ids = generated;
+    metal_result.generated_capacity = request->max_new_tokens;
+
+    memset(metal_error, 0, sizeof(metal_error));
+    if (!uocr_metal_context_generate_f16(engine->metal,
+                                         &metal_request,
+                                         &metal_result,
+                                         metal_error,
+                                         sizeof(metal_error))) {
+        uocr_free(generated);
+        uocr_free(visual_features_f16);
+        return set_engine_errorf(engine,
+                                 UOCR_ERROR_INTERNAL,
+                                 "Metal fp16 image generation failed: %s",
+                                 metal_error[0] != '\0' ? metal_error : "unknown error");
+    }
+
+    const int32_t *generated_lists[1] = {generated};
+    const uint32_t generated_counts[1] = {metal_result.generated_count};
+    status = uocr_result_create_from_generated(1u, generated_lists, generated_counts, out_result);
+    uocr_free(generated);
+    uocr_free(visual_features_f16);
+    if (status != UOCR_OK) {
+        return set_engine_errorf(engine, status, "failed to allocate generated-token result");
+    }
+
+    clear_engine_error(engine);
+    return UOCR_OK;
+}
 #endif
 
 static void fill_memory_report(const uocr_engine *engine, uocr_memory_report *report) {
@@ -603,31 +772,7 @@ int uocr_generate_prepared(uocr_engine *engine,
             }
             const uint32_t image_placeholders = uocr_count_image_placeholders(request);
             if (request->n_views != 0u || image_placeholders != 0u) {
-                if (!engine->has_model_file || engine->model_file.header == NULL) {
-                    return set_engine_errorf(engine,
-                                             UOCR_ERROR_NOT_IMPLEMENTED,
-                                             "Metal fp16 image generation requires a mapped fp16 .uocr model");
-                }
-                if (engine->model_file.header->qprofile != UOCR_QPROFILE_FP16) {
-                    return set_engine_errorf(engine,
-                                             UOCR_ERROR_NOT_IMPLEMENTED,
-                                             "Metal image generation currently supports only fp16 .uocr models, got %s",
-                                             uocr_qprofile_name(engine->model_file.header->qprofile));
-                }
-                if (!uocr_metal_context_decoder_bindings_ready(engine->metal)) {
-                    return set_engine_errorf(engine,
-                                             UOCR_ERROR_NOT_IMPLEMENTED,
-                                             "Metal fp16 image generation requires complete validated decoder tensor bindings");
-                }
-                if (!uocr_metal_context_vision_bindings_ready(engine->metal)) {
-                    return set_engine_errorf(engine,
-                                             UOCR_ERROR_NOT_IMPLEMENTED,
-                                             "Metal fp16 image generation requires complete validated vision tensor bindings: %s",
-                                             uocr_metal_context_vision_binding_error(engine->metal));
-                }
-                return set_engine_errorf(engine,
-                                         UOCR_ERROR_NOT_IMPLEMENTED,
-                                         "Metal fp16 image generation has validated tensor bindings but the production vision runner is not wired yet");
+                return generate_metal_image_fp16(engine, request, out_result);
             }
             return generate_metal_text_fp16(engine, request, out_result);
         }
