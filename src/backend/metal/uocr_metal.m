@@ -2310,6 +2310,134 @@ int uocr_metal_context_final_rmsnorm_f16(uocr_metal_context *ctx,
                                                         error_size);
 }
 
+int uocr_metal_context_lm_head_f16(uocr_metal_context *ctx,
+                                   const uint16_t *input_f16,
+                                   uint32_t n_rows,
+                                   float *logits_out_f32,
+                                   char *error,
+                                   size_t error_size) {
+    metal_clear_error(error, error_size);
+    if (ctx == NULL || input_f16 == NULL || logits_out_f32 == NULL || n_rows == 0u) {
+        return metal_fail(error, error_size, "invalid Metal LM-head request");
+    }
+
+    uint64_t input_values = 0u;
+    uint64_t input_bytes = 0u;
+    uint64_t weight_values = 0u;
+    uint64_t weight_bytes = 0u;
+    uint64_t output_values = 0u;
+    uint64_t output_bytes = 0u;
+    if (!checked_mul_u64((uint64_t)n_rows, (uint64_t)UOCR_HIDDEN_SIZE, &input_values) ||
+        !checked_mul_u64(input_values, 2u, &input_bytes) ||
+        !checked_mul_u64((uint64_t)UOCR_VOCAB_SIZE, (uint64_t)UOCR_HIDDEN_SIZE, &weight_values) ||
+        !checked_mul_u64(weight_values, 2u, &weight_bytes) ||
+        !checked_mul_u64((uint64_t)n_rows, (uint64_t)UOCR_VOCAB_SIZE, &output_values) ||
+        !checked_mul_u64(output_values, (uint64_t)sizeof(float), &output_bytes)) {
+        return metal_fail(error, error_size, "Metal LM-head byte-size overflow");
+    }
+
+    const uint64_t max_buffer_length = metal_device_max_buffer_length(ctx->device);
+    if (input_bytes > max_buffer_length || output_bytes > max_buffer_length ||
+        input_bytes > (uint64_t)SIZE_MAX || output_bytes > (uint64_t)SIZE_MAX ||
+        output_values > (uint64_t)UINT32_MAX) {
+        return metal_fail(error,
+                          error_size,
+                          "Metal LM-head buffers exceed maxBufferLength %llu",
+                          (unsigned long long)max_buffer_length);
+    }
+
+    id<MTLBuffer> lm_head_weight = nil;
+    NSUInteger lm_head_offset = 0u;
+    if (!metal_get_mapped_tensor_buffer(ctx,
+                                        UOCR_TENSOR_ID_LM_HEAD,
+                                        weight_bytes,
+                                        &lm_head_weight,
+                                        &lm_head_offset,
+                                        error,
+                                        error_size)) {
+        return 0;
+    }
+
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, "uocr_dense_f16_to_f32", error, error_size);
+        if (pipeline == nil) {
+            return 0;
+        }
+
+        id<MTLBuffer> src = [ctx->device newBufferWithBytes:input_f16
+                                                     length:(NSUInteger)input_bytes
+                                                    options:MTLResourceStorageModeShared];
+        if (src == nil) {
+            return metal_fail(error, error_size, "failed to allocate Metal LM-head input buffer");
+        }
+        src.label = @"uocr_lm_head_input_f16";
+
+        id<MTLBuffer> dst = [ctx->device newBufferWithLength:(NSUInteger)output_bytes options:MTLResourceStorageModeShared];
+        if (dst == nil) {
+            [src release];
+            return metal_fail(error, error_size, "failed to allocate Metal LM-head logits buffer");
+        }
+        dst.label = @"uocr_lm_head_logits_f32";
+        memset([dst contents], 0, (size_t)output_bytes);
+
+        id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
+        if (cb == nil) {
+            [dst release];
+            [src release];
+            return metal_fail(error, error_size, "failed to create Metal LM-head command buffer");
+        }
+        cb.label = @"uocr_lm_head_command_buffer";
+
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        if (enc == nil) {
+            [dst release];
+            [src release];
+            return metal_fail(error, error_size, "failed to create Metal LM-head command encoder");
+        }
+
+        uocr_metal_dense_params params;
+        params.input_rows = n_rows;
+        params.in_features = UOCR_HIDDEN_SIZE;
+        params.out_features = UOCR_VOCAB_SIZE;
+        params.has_bias = 0u;
+
+        const NSUInteger threads_per_group = metal_power2_threadgroup_width(256u, pipeline.maxTotalThreadsPerThreadgroup);
+        const uint64_t threadgroup_bytes = (uint64_t)threads_per_group * (uint64_t)sizeof(float);
+        if (threadgroup_bytes > (uint64_t)ctx->device.maxThreadgroupMemoryLength) {
+            [dst release];
+            [src release];
+            return metal_fail(error, error_size, "Metal LM-head threadgroup memory exceeds device limit");
+        }
+
+        [enc setComputePipelineState:pipeline];
+        [enc setBuffer:src offset:0u atIndex:0u];
+        [enc setBuffer:lm_head_weight offset:lm_head_offset atIndex:1u];
+        [enc setBuffer:lm_head_weight offset:lm_head_offset atIndex:2u];
+        [enc setBuffer:dst offset:0u atIndex:3u];
+        [enc setBytes:&params length:sizeof(params) atIndex:4u];
+        [enc setThreadgroupMemoryLength:threads_per_group * sizeof(float) atIndex:0u];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)output_values, 1u, 1u)
+             threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1u, 1u)];
+        [enc endEncoding];
+
+        [cb commit];
+        [cb waitUntilCompleted];
+        if (cb.status == MTLCommandBufferStatusError) {
+            NSString *description = cb.error != nil ? [cb.error localizedDescription] : @"unknown command-buffer error";
+            [dst release];
+            [src release];
+            return metal_fail(error, error_size, "Metal LM-head command failed: %s", [description UTF8String]);
+        }
+
+        memcpy(logits_out_f32, [dst contents], (size_t)output_bytes);
+        [dst release];
+        [src release];
+    }
+
+    metal_clear_error(error, error_size);
+    return 1;
+}
+
 int uocr_metal_context_dense_f16(uocr_metal_context *ctx,
                                  const uint16_t *input_f16,
                                  const uint16_t *weight_f16,

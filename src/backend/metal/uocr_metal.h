@@ -229,6 +229,18 @@ int uocr_metal_context_final_rmsnorm_f16(uocr_metal_context *ctx,
                                          char *error,
                                          size_t error_size);
 
+/* LM-head helper for decode/generation. Binds the mmap-backed LM_HEAD tensor
+ * [129280,1280] from mapped .uocr model views and computes fp32 logits for
+ * one or more normalized hidden rows. The initial synchronous helper reads
+ * logits back to host for correctness and CPU logits processors.
+ */
+int uocr_metal_context_lm_head_f16(uocr_metal_context *ctx,
+                                   const uint16_t *input_f16,
+                                   uint32_t n_rows,
+                                   float *logits_out_f32,
+                                   char *error,
+                                   size_t error_size);
+
 /* Diagnostic fp16 dense helper for synthetic tests. Computes
  * out[row, out_col] = dot(input[row, :], weight[out_col, :]) + optional bias,
  * where weights are row-major [out_features, in_features]. Dot products are

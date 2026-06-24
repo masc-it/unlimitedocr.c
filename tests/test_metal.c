@@ -529,6 +529,66 @@ static int test_metal_final_rmsnorm_f16(void) {
     return 0;
 }
 
+static int test_metal_lm_head_f16(void) {
+    if (!uocr_metal_is_available()) {
+        return 0;
+    }
+
+    enum { ROW_COUNT = 4, HIDDEN = UOCR_HIDDEN_SIZE };
+    const uint32_t rows[ROW_COUNT] = {0u, 1u, UOCR_TOKEN_IMAGE, UOCR_VOCAB_SIZE - 1u};
+    uint16_t input[HIDDEN];
+    uint16_t row_weights[ROW_COUNT * HIDDEN];
+    for (uint32_t col = 0u; col < (uint32_t)HIDDEN; ++col) {
+        const int centered = (int)((col * 7u) % 13u) - 6;
+        input[col] = f32_to_f16_bits((float)centered * 0.03125f);
+    }
+    for (uint32_t row = 0u; row < (uint32_t)ROW_COUNT; ++row) {
+        for (uint32_t col = 0u; col < (uint32_t)HIDDEN; ++col) {
+            const int centered = (int)(((row + 3u) * 11u + col * 5u) % 17u) - 8;
+            row_weights[row * (uint32_t)HIDDEN + col] = f32_to_f16_bits((float)centered * 0.015625f);
+        }
+    }
+
+    float expected[ROW_COUNT];
+    for (uint32_t row = 0u; row < (uint32_t)ROW_COUNT; ++row) {
+        float sum = 0.0f;
+        for (uint32_t col = 0u; col < (uint32_t)HIDDEN; ++col) {
+            sum += f16_bits_to_f32(input[col]) * f16_bits_to_f32(row_weights[row * (uint32_t)HIDDEN + col]);
+        }
+        expected[row] = sum;
+    }
+
+    char path[128];
+    CHECK(uocr_test_make_temp_path(path, sizeof(path)) == 0);
+    CHECK(uocr_test_write_sparse_lm_head_uocr_model(path, rows, row_weights, ROW_COUNT) == 0);
+
+    char error[1024];
+    memset(error, 0, sizeof(error));
+    uocr_model_file model;
+    CHECK(uocr_model_file_open(path, &model, error, sizeof(error)) == 0);
+
+    uocr_metal_context *ctx = uocr_metal_context_create(UOCR_TEST_METAL_RESOURCE_PATH, error, sizeof(error));
+    CHECK(ctx != NULL);
+    CHECK(uocr_metal_context_map_model(ctx, &model, error, sizeof(error)) == 1);
+
+    float *logits = (float *)malloc((size_t)UOCR_VOCAB_SIZE * sizeof(float));
+    CHECK(logits != NULL);
+    memset(logits, 0x7f, (size_t)UOCR_VOCAB_SIZE * sizeof(float));
+    CHECK(uocr_metal_context_lm_head_f16(ctx, input, 1u, logits, error, sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    for (uint32_t row = 0u; row < (uint32_t)ROW_COUNT; ++row) {
+        CHECK(fabsf(logits[rows[row]] - expected[row]) < 2.0e-4f);
+    }
+    CHECK(fabsf(logits[UOCR_TOKEN_PAD]) < 1.0e-7f);
+    CHECK(fabsf(logits[42u]) < 1.0e-7f);
+
+    free(logits);
+    uocr_metal_context_destroy(ctx);
+    uocr_model_file_close(&model);
+    unlink(path);
+    return 0;
+}
+
 static int test_metal_dense_f16(void) {
     if (!uocr_metal_is_available()) {
         return 0;
@@ -3455,6 +3515,7 @@ int main(void) {
     if (test_metal_prompt_assembly_f16() != 0) return 1;
     if (test_metal_rmsnorm_f16() != 0) return 1;
     if (test_metal_final_rmsnorm_f16() != 0) return 1;
+    if (test_metal_lm_head_f16() != 0) return 1;
     if (test_metal_dense_f16() != 0) return 1;
     if (test_metal_attention_qkvo_f16() != 0) return 1;
     if (test_metal_attention_output_residual_f16() != 0) return 1;
