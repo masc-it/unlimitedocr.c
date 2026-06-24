@@ -738,11 +738,11 @@ Do not begin this section until sections 14.5 and 15.1 pass for fp16 single-requ
 
 ### 16.2 SAM-like encoder
 
-- [ ] Implement SAM patch embed conv:
-  - [ ] weight shape `[768,3,16,16]`
-  - [ ] stride `16`
-  - [ ] output grid `64x64` for `1024`, `40x40` for `640`
-  - [ ] layout conversion to BHWC as upstream does
+- [x] Implement SAM patch embed conv:
+  - [x] weight shape `[768,3,16,16]`
+  - [x] stride `16`
+  - [x] output grid `64x64` for `1024`, `40x40` for `640`
+  - [x] layout conversion to BHWC as upstream does
 - [ ] Add SAM absolute position embedding:
   - [ ] use `get_abs_pos_sam` bicubic interpolation semantics
   - [ ] precompute/store common `64x64` and `40x40` tables in converter if practical

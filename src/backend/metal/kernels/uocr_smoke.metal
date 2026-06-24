@@ -125,6 +125,85 @@ kernel void uocr_assemble_prompt_with_image_f16(device const half *embedding_tab
     dst[token * params.hidden_size + col] = embedding_table[(uint)row * params.hidden_size + col];
 }
 
+struct UocrSamPatchEmbedParams {
+    uint width;
+    uint height;
+    uint out_width;
+    uint out_height;
+    uint has_bias;
+    uint reserved0;
+    uint reserved1;
+    uint reserved2;
+};
+
+static inline uint uocr_sam_patch_weight_index(uint out_channel, uint in_channel, uint ky, uint kx) {
+    return (((out_channel * 3u + in_channel) * 16u + ky) * 16u + kx);
+}
+
+kernel void uocr_sam_patch_embed_f16_input(device const half *pixels [[buffer(0)]],
+                                           device const half *weight [[buffer(1)]],
+                                           device const half *bias [[buffer(2)]],
+                                           device half *dst_bhwc [[buffer(3)]],
+                                           constant UocrSamPatchEmbedParams &params [[buffer(4)]],
+                                           uint2 gid [[thread_position_in_grid]]) {
+    const uint out_channel = gid.x;
+    const uint patch_index = gid.y;
+    if (out_channel >= 768u || patch_index >= params.out_width * params.out_height) {
+        return;
+    }
+
+    const uint patch_y = patch_index / params.out_width;
+    const uint patch_x = patch_index - patch_y * params.out_width;
+    const uint input_y0 = patch_y * 16u;
+    const uint input_x0 = patch_x * 16u;
+
+    float acc = params.has_bias != 0u ? float(bias[out_channel]) : 0.0f;
+    for (uint c = 0u; c < 3u; ++c) {
+        const uint channel_base = c * params.height * params.width;
+        for (uint ky = 0u; ky < 16u; ++ky) {
+            const uint input_row = channel_base + (input_y0 + ky) * params.width + input_x0;
+            for (uint kx = 0u; kx < 16u; ++kx) {
+                const float x = float(pixels[input_row + kx]);
+                const float w = float(weight[uocr_sam_patch_weight_index(out_channel, c, ky, kx)]);
+                acc += x * w;
+            }
+        }
+    }
+    dst_bhwc[patch_index * 768u + out_channel] = half(acc);
+}
+
+kernel void uocr_sam_patch_embed_f32_input(device const float *pixels [[buffer(0)]],
+                                           device const half *weight [[buffer(1)]],
+                                           device const half *bias [[buffer(2)]],
+                                           device half *dst_bhwc [[buffer(3)]],
+                                           constant UocrSamPatchEmbedParams &params [[buffer(4)]],
+                                           uint2 gid [[thread_position_in_grid]]) {
+    const uint out_channel = gid.x;
+    const uint patch_index = gid.y;
+    if (out_channel >= 768u || patch_index >= params.out_width * params.out_height) {
+        return;
+    }
+
+    const uint patch_y = patch_index / params.out_width;
+    const uint patch_x = patch_index - patch_y * params.out_width;
+    const uint input_y0 = patch_y * 16u;
+    const uint input_x0 = patch_x * 16u;
+
+    float acc = params.has_bias != 0u ? float(bias[out_channel]) : 0.0f;
+    for (uint c = 0u; c < 3u; ++c) {
+        const uint channel_base = c * params.height * params.width;
+        for (uint ky = 0u; ky < 16u; ++ky) {
+            const uint input_row = channel_base + (input_y0 + ky) * params.width + input_x0;
+            for (uint kx = 0u; kx < 16u; ++kx) {
+                const float x = pixels[input_row + kx];
+                const float w = float(weight[uocr_sam_patch_weight_index(out_channel, c, ky, kx)]);
+                acc += x * w;
+            }
+        }
+    }
+    dst_bhwc[patch_index * 768u + out_channel] = half(acc);
+}
+
 struct UocrRmsNormParams {
     uint n_rows;
     uint hidden_size;

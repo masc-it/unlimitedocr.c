@@ -49,6 +49,10 @@ static int test_metal_smoke(void) {
     return 0;
 }
 
+static size_t sam_patch_weight_index(uint32_t out_channel, uint32_t in_channel, uint32_t ky, uint32_t kx) {
+    return (size_t)((((out_channel * 3u + in_channel) * UOCR_VISION_PATCH_SIZE + ky) * UOCR_VISION_PATCH_SIZE + kx));
+}
+
 static int test_metal_named_scratch_buffers(void) {
     if (!uocr_metal_is_available()) {
         return 0;
@@ -162,6 +166,125 @@ static uint16_t f32_to_f16_bits(float value) {
         }
     }
     return (uint16_t)(sign | ((uint32_t)half_exponent << 10u) | rounded_mantissa);
+}
+
+static int test_metal_sam_patch_embed_f16(void) {
+    if (!uocr_metal_is_available()) {
+        return 0;
+    }
+
+    char error[1024];
+    memset(error, 0, sizeof(error));
+    uocr_metal_context *ctx = uocr_metal_context_create(UOCR_TEST_METAL_RESOURCE_PATH, error, sizeof(error));
+    CHECK(ctx != NULL);
+
+    enum { WIDTH = 32u, HEIGHT = 32u, GRID = 2u, PATCH = UOCR_VISION_PATCH_SIZE };
+    float *pixels_f32 = (float *)calloc(3u * WIDTH * HEIGHT, sizeof(float));
+    uint16_t *weights = (uint16_t *)calloc((size_t)UOCR_SAM_HIDDEN_SIZE * 3u * PATCH * PATCH, sizeof(uint16_t));
+    uint16_t *bias = (uint16_t *)calloc(UOCR_SAM_HIDDEN_SIZE, sizeof(uint16_t));
+    uint16_t *out = (uint16_t *)calloc(GRID * GRID * UOCR_SAM_HIDDEN_SIZE, sizeof(uint16_t));
+    CHECK(pixels_f32 != NULL);
+    CHECK(weights != NULL);
+    CHECK(bias != NULL);
+    CHECK(out != NULL);
+
+    for (uint32_t c = 0u; c < 3u; ++c) {
+        for (uint32_t y = 0u; y < HEIGHT; ++y) {
+            for (uint32_t x = 0u; x < WIDTH; ++x) {
+                pixels_f32[(c * HEIGHT + y) * WIDTH + x] = (float)(c * 100u + y + x);
+            }
+        }
+    }
+    weights[sam_patch_weight_index(0u, 0u, 0u, 0u)] = f32_to_f16_bits(1.0f);
+    weights[sam_patch_weight_index(1u, 1u, 15u, 15u)] = f32_to_f16_bits(1.0f);
+    weights[sam_patch_weight_index(2u, 0u, 0u, 0u)] = f32_to_f16_bits(1.0f);
+    weights[sam_patch_weight_index(2u, 2u, 1u, 2u)] = f32_to_f16_bits(1.0f);
+    bias[2u] = f32_to_f16_bits(3.0f);
+    bias[7u] = f32_to_f16_bits(42.0f);
+
+    uint32_t grid_w = 0u;
+    uint32_t grid_h = 0u;
+    CHECK(uocr_metal_context_sam_patch_embed_f16(ctx,
+                                                 pixels_f32,
+                                                 UOCR_PIXEL_F32_NCHW,
+                                                 WIDTH,
+                                                 HEIGHT,
+                                                 weights,
+                                                 bias,
+                                                 out,
+                                                 &grid_w,
+                                                 &grid_h,
+                                                 error,
+                                                 sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    CHECK(grid_w == GRID);
+    CHECK(grid_h == GRID);
+
+    for (uint32_t py = 0u; py < GRID; ++py) {
+        for (uint32_t px = 0u; px < GRID; ++px) {
+            const uint32_t patch_index = py * GRID + px;
+            const uint32_t base = patch_index * UOCR_SAM_HIDDEN_SIZE;
+            const float expected0 = (float)(py * 16u + px * 16u);
+            const float expected1 = (float)(100u + py * 16u + 15u + px * 16u + 15u);
+            const float expected2 = expected0 + (float)(200u + py * 16u + 1u + px * 16u + 2u) + 3.0f;
+            CHECK(out[base + 0u] == f32_to_f16_bits(expected0));
+            CHECK(out[base + 1u] == f32_to_f16_bits(expected1));
+            CHECK(out[base + 2u] == f32_to_f16_bits(expected2));
+            CHECK(out[base + 7u] == f32_to_f16_bits(42.0f));
+            CHECK(out[base + 9u] == f32_to_f16_bits(0.0f));
+        }
+    }
+
+    uint16_t *pixels_f16 = (uint16_t *)calloc(3u * PATCH * PATCH, sizeof(uint16_t));
+    CHECK(pixels_f16 != NULL);
+    memset(weights, 0, (size_t)UOCR_SAM_HIDDEN_SIZE * 3u * PATCH * PATCH * sizeof(uint16_t));
+    memset(out, 0, GRID * GRID * UOCR_SAM_HIDDEN_SIZE * sizeof(uint16_t));
+    for (uint32_t c = 0u; c < 3u; ++c) {
+        for (uint32_t y = 0u; y < PATCH; ++y) {
+            for (uint32_t x = 0u; x < PATCH; ++x) {
+                pixels_f16[(c * PATCH + y) * PATCH + x] = f32_to_f16_bits((float)(c * 100u + y + x));
+            }
+        }
+    }
+    weights[sam_patch_weight_index(5u, 2u, 3u, 4u)] = f32_to_f16_bits(1.0f);
+    CHECK(uocr_metal_context_sam_patch_embed_f16(ctx,
+                                                 pixels_f16,
+                                                 UOCR_PIXEL_F16_NCHW,
+                                                 PATCH,
+                                                 PATCH,
+                                                 weights,
+                                                 NULL,
+                                                 out,
+                                                 &grid_w,
+                                                 &grid_h,
+                                                 error,
+                                                 sizeof(error)) == 1);
+    CHECK(grid_w == 1u);
+    CHECK(grid_h == 1u);
+    CHECK(out[5u] == f32_to_f16_bits(207.0f));
+    CHECK(out[7u] == f32_to_f16_bits(0.0f));
+
+    CHECK(uocr_metal_context_sam_patch_embed_f16(ctx,
+                                                 pixels_f32,
+                                                 UOCR_PIXEL_F32_NCHW,
+                                                 17u,
+                                                 HEIGHT,
+                                                 weights,
+                                                 bias,
+                                                 out,
+                                                 &grid_w,
+                                                 &grid_h,
+                                                 error,
+                                                 sizeof(error)) == 0);
+    CHECK(strstr(error, "divisible") != NULL);
+
+    free(pixels_f16);
+    free(out);
+    free(bias);
+    free(weights);
+    free(pixels_f32);
+    uocr_metal_context_destroy(ctx);
+    return 0;
 }
 
 static int env_flag_enabled(const char *name) {
@@ -8902,6 +9025,7 @@ int main(void) {
     CHECK(strcmp(uocr_metal_backend_name(), "metal") == 0);
     if (test_metal_smoke() != 0) return 1;
     if (test_metal_named_scratch_buffers() != 0) return 1;
+    if (test_metal_sam_patch_embed_f16() != 0) return 1;
     if (test_metal_get_rows_f16() != 0) return 1;
     if (test_metal_prompt_assembly_f16() != 0) return 1;
     if (test_metal_prompt_assembly_from_mapped_model_f16() != 0) return 1;

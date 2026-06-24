@@ -308,6 +308,17 @@ typedef struct uocr_metal_dense_params {
     uint32_t has_bias;
 } uocr_metal_dense_params;
 
+typedef struct uocr_metal_sam_patch_embed_params {
+    uint32_t width;
+    uint32_t height;
+    uint32_t out_width;
+    uint32_t out_height;
+    uint32_t has_bias;
+    uint32_t reserved0;
+    uint32_t reserved1;
+    uint32_t reserved2;
+} uocr_metal_sam_patch_embed_params;
+
 typedef struct uocr_metal_argmax_params {
     uint32_t rows;
     uint32_t vocab_size;
@@ -4712,6 +4723,192 @@ int uocr_metal_context_assemble_prompt_from_model_f16(uocr_metal_context *ctx,
                                                                "Metal mapped prompt assembly",
                                                                error,
                                                                error_size);
+}
+
+int uocr_metal_context_sam_patch_embed_f16(uocr_metal_context *ctx,
+                                           const void *pixels,
+                                           uocr_pixel_format pixel_format,
+                                           uint32_t width,
+                                           uint32_t height,
+                                           const uint16_t *patch_weight_f16,
+                                           const uint16_t *patch_bias_f16_or_null,
+                                           uint16_t *out_bhwc_f16,
+                                           uint32_t *out_grid_w,
+                                           uint32_t *out_grid_h,
+                                           char *error,
+                                           size_t error_size) {
+    metal_clear_error(error, error_size);
+    if (ctx == NULL || pixels == NULL || patch_weight_f16 == NULL || out_bhwc_f16 == NULL) {
+        return metal_fail(error, error_size, "invalid Metal SAM patch-embed request");
+    }
+    if (pixel_format != UOCR_PIXEL_F16_NCHW && pixel_format != UOCR_PIXEL_F32_NCHW) {
+        return metal_fail(error, error_size, "unsupported Metal SAM patch-embed pixel format %d", (int)pixel_format);
+    }
+    if (width == 0u || height == 0u || (width % UOCR_VISION_PATCH_SIZE) != 0u || (height % UOCR_VISION_PATCH_SIZE) != 0u) {
+        return metal_fail(error,
+                          error_size,
+                          "Metal SAM patch-embed input must be non-empty and divisible by %u, got %ux%u",
+                          UOCR_VISION_PATCH_SIZE,
+                          width,
+                          height);
+    }
+
+    const uint32_t grid_w = width / UOCR_VISION_PATCH_SIZE;
+    const uint32_t grid_h = height / UOCR_VISION_PATCH_SIZE;
+    if (grid_w == 0u || grid_h == 0u || grid_w > UOCR_GLOBAL_VIEW_SIZE / UOCR_VISION_PATCH_SIZE ||
+        grid_h > UOCR_GLOBAL_VIEW_SIZE / UOCR_VISION_PATCH_SIZE) {
+        return metal_fail(error, error_size, "Metal SAM patch-embed grid %ux%u is out of range", grid_w, grid_h);
+    }
+
+    uint64_t pixel_values = 0u;
+    uint64_t pixel_bytes = 0u;
+    uint64_t weight_values = 0u;
+    uint64_t weight_bytes = 0u;
+    uint64_t output_patches = 0u;
+    uint64_t output_values = 0u;
+    uint64_t output_bytes = 0u;
+    const uint64_t max_buffer_length = metal_device_max_buffer_length(ctx->device);
+    const uint64_t pixel_element_size = pixel_format == UOCR_PIXEL_F16_NCHW ? 2u : 4u;
+    if (!checked_mul_u64(3u, (uint64_t)width, &pixel_values) ||
+        !checked_mul_u64(pixel_values, (uint64_t)height, &pixel_values) ||
+        !checked_mul_u64(pixel_values, pixel_element_size, &pixel_bytes) ||
+        !checked_mul_u64((uint64_t)UOCR_SAM_HIDDEN_SIZE, 3u * UOCR_VISION_PATCH_SIZE * UOCR_VISION_PATCH_SIZE, &weight_values) ||
+        !checked_mul_u64(weight_values, 2u, &weight_bytes) ||
+        !checked_mul_u64((uint64_t)grid_w, (uint64_t)grid_h, &output_patches) ||
+        !checked_mul_u64(output_patches, (uint64_t)UOCR_SAM_HIDDEN_SIZE, &output_values) ||
+        !checked_mul_u64(output_values, 2u, &output_bytes) || pixel_bytes > (uint64_t)SIZE_MAX ||
+        weight_bytes > (uint64_t)SIZE_MAX || output_bytes > (uint64_t)SIZE_MAX || pixel_bytes > max_buffer_length ||
+        weight_bytes > max_buffer_length || output_bytes > max_buffer_length) {
+        return metal_fail(error, error_size, "Metal SAM patch-embed byte-size overflow");
+    }
+
+    uint16_t zero_bias[UOCR_SAM_HIDDEN_SIZE];
+    const uint16_t *bias_source = patch_bias_f16_or_null;
+    if (bias_source == NULL) {
+        memset(zero_bias, 0, sizeof(zero_bias));
+        bias_source = zero_bias;
+    }
+
+    @autoreleasepool {
+        id<MTLBuffer> pixel_buffer = [ctx->device newBufferWithBytes:pixels
+                                                              length:(NSUInteger)pixel_bytes
+                                                             options:MTLResourceStorageModeShared];
+        if (pixel_buffer == nil) {
+            return metal_fail(error, error_size, "failed to allocate Metal SAM patch-embed pixel buffer");
+        }
+        pixel_buffer.label = @"uocr_sam_patch_pixels";
+
+        id<MTLBuffer> weight_buffer = [ctx->device newBufferWithBytes:patch_weight_f16
+                                                               length:(NSUInteger)weight_bytes
+                                                              options:MTLResourceStorageModeShared];
+        if (weight_buffer == nil) {
+            [pixel_buffer release];
+            return metal_fail(error, error_size, "failed to allocate Metal SAM patch-embed weight buffer");
+        }
+        weight_buffer.label = @"uocr_sam_patch_weight_f16";
+
+        id<MTLBuffer> bias_buffer = [ctx->device newBufferWithBytes:bias_source
+                                                             length:(NSUInteger)UOCR_SAM_HIDDEN_SIZE * sizeof(uint16_t)
+                                                            options:MTLResourceStorageModeShared];
+        if (bias_buffer == nil) {
+            [weight_buffer release];
+            [pixel_buffer release];
+            return metal_fail(error, error_size, "failed to allocate Metal SAM patch-embed bias buffer");
+        }
+        bias_buffer.label = @"uocr_sam_patch_bias_f16";
+
+        id<MTLBuffer> output_buffer = [ctx->device newBufferWithLength:(NSUInteger)output_bytes
+                                                                options:MTLResourceStorageModeShared];
+        if (output_buffer == nil) {
+            [bias_buffer release];
+            [weight_buffer release];
+            [pixel_buffer release];
+            return metal_fail(error, error_size, "failed to allocate Metal SAM patch-embed output buffer");
+        }
+        output_buffer.label = @"uocr_sam_patch_output_bhwc_f16";
+
+        const char *function_name = pixel_format == UOCR_PIXEL_F16_NCHW ?
+                                        "uocr_sam_patch_embed_f16_input" :
+                                        "uocr_sam_patch_embed_f32_input";
+        id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, function_name, error, error_size);
+        if (pipeline == nil) {
+            [output_buffer release];
+            [bias_buffer release];
+            [weight_buffer release];
+            [pixel_buffer release];
+            return 0;
+        }
+
+        id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
+        if (cb == nil) {
+            [output_buffer release];
+            [bias_buffer release];
+            [weight_buffer release];
+            [pixel_buffer release];
+            return metal_fail(error, error_size, "failed to create Metal SAM patch-embed command buffer");
+        }
+        cb.label = @"uocr_sam_patch_embed_command_buffer";
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        if (enc == nil) {
+            [output_buffer release];
+            [bias_buffer release];
+            [weight_buffer release];
+            [pixel_buffer release];
+            return metal_fail(error, error_size, "failed to create Metal SAM patch-embed encoder");
+        }
+
+        uocr_metal_sam_patch_embed_params params;
+        memset(&params, 0, sizeof(params));
+        params.width = width;
+        params.height = height;
+        params.out_width = grid_w;
+        params.out_height = grid_h;
+        params.has_bias = patch_bias_f16_or_null != NULL ? 1u : 0u;
+
+        [enc setComputePipelineState:pipeline];
+        [enc setBuffer:pixel_buffer offset:0u atIndex:0u];
+        [enc setBuffer:weight_buffer offset:0u atIndex:1u];
+        [enc setBuffer:bias_buffer offset:0u atIndex:2u];
+        [enc setBuffer:output_buffer offset:0u atIndex:3u];
+        [enc setBytes:&params length:sizeof(params) atIndex:4u];
+
+        NSUInteger threads_x = pipeline.threadExecutionWidth;
+        if (threads_x == 0u || threads_x > (NSUInteger)UOCR_SAM_HIDDEN_SIZE) {
+            threads_x = 32u;
+        }
+        if (threads_x > pipeline.maxTotalThreadsPerThreadgroup) {
+            threads_x = pipeline.maxTotalThreadsPerThreadgroup;
+        }
+        if (threads_x == 0u) {
+            threads_x = 1u;
+        }
+        [enc dispatchThreads:MTLSizeMake((NSUInteger)UOCR_SAM_HIDDEN_SIZE, (NSUInteger)output_patches, 1u)
+       threadsPerThreadgroup:MTLSizeMake(threads_x, 1u, 1u)];
+        [enc endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+
+        int ok = 1;
+        if (cb.status == MTLCommandBufferStatusError) {
+            NSString *description = cb.error != nil ? [cb.error localizedDescription] : @"unknown command-buffer error";
+            ok = metal_fail(error, error_size, "Metal SAM patch-embed command failed: %s", [description UTF8String]);
+        } else {
+            memcpy(out_bhwc_f16, [output_buffer contents], (size_t)output_bytes);
+            if (out_grid_w != NULL) {
+                *out_grid_w = grid_w;
+            }
+            if (out_grid_h != NULL) {
+                *out_grid_h = grid_h;
+            }
+            metal_clear_error(error, error_size);
+        }
+
+        [output_buffer release];
+        [bias_buffer release];
+        [weight_buffer release];
+        [pixel_buffer release];
+        return ok;
+    }
 }
 
 static int metal_prompt_arena_slot_offset(const uocr_metal_context *ctx,

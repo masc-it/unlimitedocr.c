@@ -6,6 +6,7 @@
 
 #include "model/uocr_model_file.h"
 #include "runtime/uocr_logits_processor.h"
+#include "unlimitedocr.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -257,6 +258,24 @@ int uocr_metal_context_assemble_prompt_from_model_f16(uocr_metal_context *ctx,
                                                       uint16_t *out_prompt_f16,
                                                       char *error,
                                                       size_t error_size);
+
+/* Diagnostic SAM patch-embedding helper for the Metal vision bring-up path.
+ * Computes Conv2d weight [768,3,16,16], optional bias [768], stride 16, and
+ * writes BHWC fp16 output [height/16,width/16,768], matching upstream
+ * PatchEmbed.forward()'s NCHW -> BHWC layout conversion.
+ */
+int uocr_metal_context_sam_patch_embed_f16(uocr_metal_context *ctx,
+                                           const void *pixels,
+                                           uocr_pixel_format pixel_format,
+                                           uint32_t width,
+                                           uint32_t height,
+                                           const uint16_t *patch_weight_f16,
+                                           const uint16_t *patch_bias_f16_or_null,
+                                           uint16_t *out_bhwc_f16,
+                                           uint32_t *out_grid_w,
+                                           uint32_t *out_grid_h,
+                                           char *error,
+                                           size_t error_size);
 
 /* Runtime prompt assembly into the persistent Metal prompt-embedding arena.
  * The arena must have been allocated with uocr_metal_context_allocate_runtime_arenas().
