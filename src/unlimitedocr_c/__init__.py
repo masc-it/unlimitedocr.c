@@ -99,6 +99,13 @@ from .frontend import (
     save_prepared_request,
     validate_tokenizer,
 )
+from .ocr import (
+    GenerationResult,
+    decode_generated_ids,
+    default_resource_path,
+    generate,
+    generate_prepared,
+)
 
 __all__ = [
     "CalibrationCandidateReport",
@@ -189,4 +196,9 @@ __all__ = [
     "render_prompt",
     "save_prepared_request",
     "validate_tokenizer",
+    "GenerationResult",
+    "decode_generated_ids",
+    "default_resource_path",
+    "generate",
+    "generate_prepared",
 ]
