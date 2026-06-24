@@ -77,6 +77,14 @@ static size_t sam_window_attention_index(uint32_t window, uint32_t token, uint32
            dim;
 }
 
+static size_t sam_bhwc_index(uint32_t grid_w, uint32_t y, uint32_t x, uint32_t channel) {
+    return ((size_t)y * grid_w + x) * UOCR_SAM_HIDDEN_SIZE + channel;
+}
+
+static size_t sam_window_partition_index(uint32_t window, uint32_t token, uint32_t channel) {
+    return ((size_t)window * UOCR_SAM_WINDOW_TOKENS + token) * UOCR_SAM_HIDDEN_SIZE + channel;
+}
+
 static size_t sam_global_attention_index(uint32_t token, uint32_t head, uint32_t dim) {
     return ((size_t)token * UOCR_SAM_ATTENTION_HEADS + head) * UOCR_SAM_HEAD_DIM + dim;
 }
@@ -611,6 +619,122 @@ static int test_metal_sam_layernorm_f16(void) {
     free(out_f32);
     free(bias);
     free(weight);
+    free(input);
+    return 0;
+}
+
+static int test_metal_sam_window_partition_f16(void) {
+    if (!uocr_metal_is_available()) {
+        return 0;
+    }
+
+    enum { GRID_W = 17u, GRID_H = 15u, PADDED_W = 28u, PADDED_H = 28u, WINDOWS = 4u };
+    const size_t input_values = (size_t)GRID_W * GRID_H * UOCR_SAM_HIDDEN_SIZE;
+    const size_t window_values = (size_t)WINDOWS * UOCR_SAM_WINDOW_TOKENS * UOCR_SAM_HIDDEN_SIZE;
+    uint16_t *input = (uint16_t *)calloc(input_values, sizeof(uint16_t));
+    uint16_t *windows = (uint16_t *)calloc(window_values, sizeof(uint16_t));
+    uint16_t *roundtrip = (uint16_t *)calloc(input_values, sizeof(uint16_t));
+    CHECK(input != NULL);
+    CHECK(windows != NULL);
+    CHECK(roundtrip != NULL);
+    CHECK(UOCR_SAM_WINDOW_SIZE == 14u);
+    CHECK(UOCR_SAM_WINDOW_TOKENS == 196u);
+
+    for (uint32_t y = 0u; y < GRID_H; ++y) {
+        for (uint32_t x = 0u; x < GRID_W; ++x) {
+            for (uint32_t c = 0u; c < UOCR_SAM_HIDDEN_SIZE; ++c) {
+                const int mod = (int)((y * 31u + x * 17u + c * 3u) % 97u) - 48;
+                input[sam_bhwc_index(GRID_W, y, x, c)] = f32_to_f16_bits((float)mod * 0.004f);
+            }
+        }
+    }
+
+    char error[1024];
+    memset(error, 0, sizeof(error));
+    uocr_metal_context *ctx = uocr_metal_context_create(UOCR_TEST_METAL_RESOURCE_PATH, error, sizeof(error));
+    CHECK(ctx != NULL);
+
+    uint32_t n_windows = 0u;
+    uint32_t padded_w = 0u;
+    uint32_t padded_h = 0u;
+    CHECK(uocr_metal_context_sam_window_partition_f16(ctx,
+                                                       input,
+                                                       GRID_W,
+                                                       GRID_H,
+                                                       windows,
+                                                       &n_windows,
+                                                       &padded_w,
+                                                       &padded_h,
+                                                       error,
+                                                       sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    CHECK(n_windows == WINDOWS);
+    CHECK(padded_w == PADDED_W);
+    CHECK(padded_h == PADDED_H);
+
+    struct partition_sample {
+        uint32_t window;
+        uint32_t local_y;
+        uint32_t local_x;
+        uint32_t channel;
+        uint32_t src_y;
+        uint32_t src_x;
+        int valid;
+    } samples[] = {
+        {0u, 0u, 0u, 0u, 0u, 0u, 1},
+        {0u, 13u, 13u, UOCR_SAM_HIDDEN_SIZE - 1u, 13u, 13u, 1},
+        {1u, 0u, 0u, 7u, 0u, 14u, 1},
+        {1u, 0u, 3u, 11u, 0u, 17u, 0},
+        {2u, 0u, 0u, 19u, 14u, 0u, 1},
+        {2u, 1u, 0u, 23u, 15u, 0u, 0},
+        {3u, 0u, 2u, 29u, 14u, 16u, 1},
+        {3u, 1u, 0u, 31u, 15u, 14u, 0},
+    };
+    for (size_t i = 0u; i < sizeof(samples) / sizeof(samples[0]); ++i) {
+        const uint32_t token = samples[i].local_y * UOCR_SAM_WINDOW_SIZE + samples[i].local_x;
+        const size_t dst_idx = sam_window_partition_index(samples[i].window, token, samples[i].channel);
+        const uint16_t expected = samples[i].valid ?
+                                      input[sam_bhwc_index(GRID_W, samples[i].src_y, samples[i].src_x, samples[i].channel)] :
+                                      f32_to_f16_bits(0.0f);
+        CHECK(windows[dst_idx] == expected);
+    }
+
+    CHECK(uocr_metal_context_sam_window_unpartition_f16(ctx,
+                                                         windows,
+                                                         GRID_W,
+                                                         GRID_H,
+                                                         roundtrip,
+                                                         error,
+                                                         sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    for (size_t i = 0u; i < input_values; ++i) {
+        CHECK(roundtrip[i] == input[i]);
+    }
+
+    CHECK(uocr_metal_context_sam_window_partition_f16(ctx,
+                                                       input,
+                                                       0u,
+                                                       GRID_H,
+                                                       windows,
+                                                       &n_windows,
+                                                       &padded_w,
+                                                       &padded_h,
+                                                       error,
+                                                       sizeof(error)) == 0);
+    CHECK(strstr(error, "invalid Metal SAM window partition") != NULL);
+
+    CHECK(uocr_metal_context_sam_window_unpartition_f16(ctx,
+                                                         NULL,
+                                                         GRID_W,
+                                                         GRID_H,
+                                                         roundtrip,
+                                                         error,
+                                                         sizeof(error)) == 0);
+    CHECK(strstr(error, "invalid Metal SAM window unpartition") != NULL);
+
+    uocr_metal_context_destroy(ctx);
+    free(roundtrip);
+    free(windows);
     free(input);
     return 0;
 }
@@ -10427,6 +10551,7 @@ int main(void) {
     if (test_metal_sam_abs_pos_f16() != 0) return 1;
     if (test_metal_sam_layernorm_f16() != 0) return 1;
     if (test_metal_sam_qkv_f16() != 0) return 1;
+    if (test_metal_sam_window_partition_f16() != 0) return 1;
     if (test_metal_sam_window_attention_f16() != 0) return 1;
     if (test_metal_sam_global_attention_f16() != 0) return 1;
     if (test_metal_sam_rel_pos_attention_f16() != 0) return 1;

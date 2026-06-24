@@ -337,6 +337,17 @@ typedef struct uocr_metal_sam_window_attention_params {
     uint32_t reserved2;
 } uocr_metal_sam_window_attention_params;
 
+typedef struct uocr_metal_sam_window_partition_params {
+    uint32_t grid_width;
+    uint32_t grid_height;
+    uint32_t padded_width;
+    uint32_t padded_height;
+    uint32_t windows_per_row;
+    uint32_t windows_per_col;
+    uint32_t window_size;
+    uint32_t hidden_size;
+} uocr_metal_sam_window_partition_params;
+
 typedef struct uocr_metal_sam_rel_pos_attention_params {
     uint32_t windows;
     uint32_t grid_width;
@@ -368,6 +379,8 @@ typedef struct uocr_metal_sam_mlp_params {
 
 _Static_assert(sizeof(uocr_metal_sam_window_attention_params) == 32u,
                "uocr_metal_sam_window_attention_params ABI mismatch");
+_Static_assert(sizeof(uocr_metal_sam_window_partition_params) == 32u,
+               "uocr_metal_sam_window_partition_params ABI mismatch");
 _Static_assert(sizeof(uocr_metal_sam_rel_pos_attention_params) == 48u,
                "uocr_metal_sam_rel_pos_attention_params ABI mismatch");
 _Static_assert(sizeof(uocr_metal_sam_residual_params) == 16u,
@@ -5874,6 +5887,334 @@ int uocr_metal_context_sam_qkv_f16(uocr_metal_context *ctx,
 
     metal_clear_error(error, error_size);
     return 1;
+}
+
+static int sam_window_partition_geometry(uint32_t grid_w,
+                                         uint32_t grid_h,
+                                         uint32_t *out_padded_w,
+                                         uint32_t *out_padded_h,
+                                         uint32_t *out_windows_per_row,
+                                         uint32_t *out_windows_per_col,
+                                         uint32_t *out_n_windows) {
+    if (grid_w == 0u || grid_h == 0u || grid_w > UOCR_SAM_MAX_GRID_SIZE || grid_h > UOCR_SAM_MAX_GRID_SIZE ||
+        out_padded_w == NULL || out_padded_h == NULL || out_windows_per_row == NULL ||
+        out_windows_per_col == NULL || out_n_windows == NULL) {
+        return 0;
+    }
+    const uint32_t window_size = UOCR_SAM_WINDOW_SIZE;
+    const uint32_t pad_w = (window_size - (grid_w % window_size)) % window_size;
+    const uint32_t pad_h = (window_size - (grid_h % window_size)) % window_size;
+    const uint32_t padded_w = grid_w + pad_w;
+    const uint32_t padded_h = grid_h + pad_h;
+    const uint32_t windows_per_row = padded_w / window_size;
+    const uint32_t windows_per_col = padded_h / window_size;
+    uint64_t n_windows = 0u;
+    if (!checked_mul_u64((uint64_t)windows_per_row, (uint64_t)windows_per_col, &n_windows) ||
+        n_windows == 0u || n_windows > (uint64_t)UINT32_MAX) {
+        return 0;
+    }
+    *out_padded_w = padded_w;
+    *out_padded_h = padded_h;
+    *out_windows_per_row = windows_per_row;
+    *out_windows_per_col = windows_per_col;
+    *out_n_windows = (uint32_t)n_windows;
+    return 1;
+}
+
+int uocr_metal_context_sam_window_partition_f16(uocr_metal_context *ctx,
+                                                const uint16_t *input_bhwc_f16,
+                                                uint32_t grid_w,
+                                                uint32_t grid_h,
+                                                uint16_t *out_windows_f16,
+                                                uint32_t *out_n_windows,
+                                                uint32_t *out_padded_w,
+                                                uint32_t *out_padded_h,
+                                                char *error,
+                                                size_t error_size) {
+    metal_clear_error(error, error_size);
+    if (ctx == NULL || input_bhwc_f16 == NULL || out_windows_f16 == NULL || out_n_windows == NULL ||
+        out_padded_w == NULL || out_padded_h == NULL) {
+        return metal_fail(error, error_size, "invalid Metal SAM window partition request");
+    }
+    if (UOCR_SAM_WINDOW_TOKENS != UOCR_SAM_WINDOW_SIZE * UOCR_SAM_WINDOW_SIZE ||
+        UOCR_SAM_ATTENTION_HEADS * UOCR_SAM_HEAD_DIM != UOCR_SAM_HIDDEN_SIZE) {
+        return metal_fail(error, error_size, "Metal SAM window partition constants are inconsistent");
+    }
+
+    uint32_t padded_w = 0u;
+    uint32_t padded_h = 0u;
+    uint32_t windows_per_row = 0u;
+    uint32_t windows_per_col = 0u;
+    uint32_t n_windows = 0u;
+    if (!sam_window_partition_geometry(grid_w,
+                                       grid_h,
+                                       &padded_w,
+                                       &padded_h,
+                                       &windows_per_row,
+                                       &windows_per_col,
+                                       &n_windows)) {
+        return metal_fail(error,
+                          error_size,
+                          "invalid Metal SAM window partition grid %ux%u",
+                          grid_w,
+                          grid_h);
+    }
+
+    uint64_t input_values = 0u;
+    uint64_t window_tokens = 0u;
+    uint64_t window_values = 0u;
+    uint64_t input_bytes = 0u;
+    uint64_t window_bytes = 0u;
+    if (!checked_mul_u64((uint64_t)grid_w, (uint64_t)grid_h, &input_values) ||
+        !checked_mul_u64(input_values, (uint64_t)UOCR_SAM_HIDDEN_SIZE, &input_values) ||
+        !checked_mul_u64((uint64_t)n_windows, (uint64_t)UOCR_SAM_WINDOW_TOKENS, &window_tokens) ||
+        !checked_mul_u64(window_tokens, (uint64_t)UOCR_SAM_HIDDEN_SIZE, &window_values) ||
+        !checked_mul_u64(input_values, 2u, &input_bytes) || !checked_mul_u64(window_values, 2u, &window_bytes) ||
+        input_bytes > (uint64_t)SIZE_MAX || window_bytes > (uint64_t)SIZE_MAX || window_values > (uint64_t)UINT32_MAX) {
+        return metal_fail(error, error_size, "Metal SAM window partition byte-size overflow");
+    }
+
+    const uint64_t max_buffer_length = metal_device_max_buffer_length(ctx->device);
+    if (input_bytes > max_buffer_length || window_bytes > max_buffer_length) {
+        return metal_fail(error,
+                          error_size,
+                          "Metal SAM window partition buffers exceed maxBufferLength %llu",
+                          (unsigned long long)max_buffer_length);
+    }
+
+    int result = 0;
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx,
+                                                                  "uocr_sam_window_partition_f16",
+                                                                  error,
+                                                                  error_size);
+        if (pipeline == nil) {
+            return 0;
+        }
+
+        id<MTLBuffer> src = nil;
+        id<MTLBuffer> dst = nil;
+        id<MTLCommandBuffer> cb = nil;
+        id<MTLComputeCommandEncoder> enc = nil;
+
+        src = [ctx->device newBufferWithBytes:input_bhwc_f16
+                                       length:(NSUInteger)input_bytes
+                                      options:MTLResourceStorageModeShared];
+        if (src == nil) {
+            result = metal_fail(error, error_size, "failed to allocate Metal SAM window partition input buffer");
+            goto cleanup_window_partition;
+        }
+        src.label = @"uocr_sam_window_partition_input_bhwc_f16";
+
+        dst = [ctx->device newBufferWithLength:(NSUInteger)window_bytes options:MTLResourceStorageModeShared];
+        if (dst == nil) {
+            result = metal_fail(error, error_size, "failed to allocate Metal SAM window partition output buffer");
+            goto cleanup_window_partition;
+        }
+        dst.label = @"uocr_sam_window_partition_output_f16";
+        memset([dst contents], 0, (size_t)window_bytes);
+
+        cb = [ctx->queue commandBuffer];
+        if (cb == nil) {
+            result = metal_fail(error, error_size, "failed to create Metal SAM window partition command buffer");
+            goto cleanup_window_partition;
+        }
+        cb.label = @"uocr_sam_window_partition_command_buffer";
+
+        enc = [cb computeCommandEncoder];
+        if (enc == nil) {
+            result = metal_fail(error, error_size, "failed to create Metal SAM window partition command encoder");
+            goto cleanup_window_partition;
+        }
+
+        uocr_metal_sam_window_partition_params params;
+        params.grid_width = grid_w;
+        params.grid_height = grid_h;
+        params.padded_width = padded_w;
+        params.padded_height = padded_h;
+        params.windows_per_row = windows_per_row;
+        params.windows_per_col = windows_per_col;
+        params.window_size = UOCR_SAM_WINDOW_SIZE;
+        params.hidden_size = UOCR_SAM_HIDDEN_SIZE;
+
+        const NSUInteger threads_per_group = metal_power2_threadgroup_width(256u, pipeline.maxTotalThreadsPerThreadgroup);
+        [enc setComputePipelineState:pipeline];
+        [enc setBuffer:src offset:0u atIndex:0u];
+        [enc setBuffer:dst offset:0u atIndex:1u];
+        [enc setBytes:&params length:sizeof(params) atIndex:2u];
+        [enc dispatchThreads:MTLSizeMake((NSUInteger)window_values, 1u, 1u)
+             threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1u, 1u)];
+        [enc endEncoding];
+
+        [cb commit];
+        [cb waitUntilCompleted];
+        if (cb.status == MTLCommandBufferStatusError) {
+            NSString *description = cb.error != nil ? [cb.error localizedDescription] : @"unknown command-buffer error";
+            result = metal_fail(error, error_size, "Metal SAM window partition command failed: %s", [description UTF8String]);
+            goto cleanup_window_partition;
+        }
+
+        memcpy(out_windows_f16, [dst contents], (size_t)window_bytes);
+        *out_n_windows = n_windows;
+        *out_padded_w = padded_w;
+        *out_padded_h = padded_h;
+        result = 1;
+
+    cleanup_window_partition:
+        [dst release];
+        [src release];
+    }
+
+    if (result) {
+        metal_clear_error(error, error_size);
+    }
+    return result;
+}
+
+int uocr_metal_context_sam_window_unpartition_f16(uocr_metal_context *ctx,
+                                                  const uint16_t *windows_f16,
+                                                  uint32_t grid_w,
+                                                  uint32_t grid_h,
+                                                  uint16_t *out_bhwc_f16,
+                                                  char *error,
+                                                  size_t error_size) {
+    metal_clear_error(error, error_size);
+    if (ctx == NULL || windows_f16 == NULL || out_bhwc_f16 == NULL) {
+        return metal_fail(error, error_size, "invalid Metal SAM window unpartition request");
+    }
+    if (UOCR_SAM_WINDOW_TOKENS != UOCR_SAM_WINDOW_SIZE * UOCR_SAM_WINDOW_SIZE ||
+        UOCR_SAM_ATTENTION_HEADS * UOCR_SAM_HEAD_DIM != UOCR_SAM_HIDDEN_SIZE) {
+        return metal_fail(error, error_size, "Metal SAM window unpartition constants are inconsistent");
+    }
+
+    uint32_t padded_w = 0u;
+    uint32_t padded_h = 0u;
+    uint32_t windows_per_row = 0u;
+    uint32_t windows_per_col = 0u;
+    uint32_t n_windows = 0u;
+    if (!sam_window_partition_geometry(grid_w,
+                                       grid_h,
+                                       &padded_w,
+                                       &padded_h,
+                                       &windows_per_row,
+                                       &windows_per_col,
+                                       &n_windows)) {
+        return metal_fail(error,
+                          error_size,
+                          "invalid Metal SAM window unpartition grid %ux%u",
+                          grid_w,
+                          grid_h);
+    }
+
+    uint64_t output_values = 0u;
+    uint64_t window_tokens = 0u;
+    uint64_t window_values = 0u;
+    uint64_t output_bytes = 0u;
+    uint64_t window_bytes = 0u;
+    if (!checked_mul_u64((uint64_t)grid_w, (uint64_t)grid_h, &output_values) ||
+        !checked_mul_u64(output_values, (uint64_t)UOCR_SAM_HIDDEN_SIZE, &output_values) ||
+        !checked_mul_u64((uint64_t)n_windows, (uint64_t)UOCR_SAM_WINDOW_TOKENS, &window_tokens) ||
+        !checked_mul_u64(window_tokens, (uint64_t)UOCR_SAM_HIDDEN_SIZE, &window_values) ||
+        !checked_mul_u64(output_values, 2u, &output_bytes) || !checked_mul_u64(window_values, 2u, &window_bytes) ||
+        output_bytes > (uint64_t)SIZE_MAX || window_bytes > (uint64_t)SIZE_MAX || output_values > (uint64_t)UINT32_MAX) {
+        return metal_fail(error, error_size, "Metal SAM window unpartition byte-size overflow");
+    }
+
+    const uint64_t max_buffer_length = metal_device_max_buffer_length(ctx->device);
+    if (output_bytes > max_buffer_length || window_bytes > max_buffer_length) {
+        return metal_fail(error,
+                          error_size,
+                          "Metal SAM window unpartition buffers exceed maxBufferLength %llu",
+                          (unsigned long long)max_buffer_length);
+    }
+
+    int result = 0;
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx,
+                                                                  "uocr_sam_window_unpartition_f16",
+                                                                  error,
+                                                                  error_size);
+        if (pipeline == nil) {
+            return 0;
+        }
+
+        id<MTLBuffer> src = nil;
+        id<MTLBuffer> dst = nil;
+        id<MTLCommandBuffer> cb = nil;
+        id<MTLComputeCommandEncoder> enc = nil;
+
+        src = [ctx->device newBufferWithBytes:windows_f16
+                                       length:(NSUInteger)window_bytes
+                                      options:MTLResourceStorageModeShared];
+        if (src == nil) {
+            result = metal_fail(error, error_size, "failed to allocate Metal SAM window unpartition input buffer");
+            goto cleanup_window_unpartition;
+        }
+        src.label = @"uocr_sam_window_unpartition_input_f16";
+
+        dst = [ctx->device newBufferWithLength:(NSUInteger)output_bytes options:MTLResourceStorageModeShared];
+        if (dst == nil) {
+            result = metal_fail(error, error_size, "failed to allocate Metal SAM window unpartition output buffer");
+            goto cleanup_window_unpartition;
+        }
+        dst.label = @"uocr_sam_window_unpartition_output_bhwc_f16";
+        memset([dst contents], 0, (size_t)output_bytes);
+
+        cb = [ctx->queue commandBuffer];
+        if (cb == nil) {
+            result = metal_fail(error, error_size, "failed to create Metal SAM window unpartition command buffer");
+            goto cleanup_window_unpartition;
+        }
+        cb.label = @"uocr_sam_window_unpartition_command_buffer";
+
+        enc = [cb computeCommandEncoder];
+        if (enc == nil) {
+            result = metal_fail(error, error_size, "failed to create Metal SAM window unpartition command encoder");
+            goto cleanup_window_unpartition;
+        }
+
+        uocr_metal_sam_window_partition_params params;
+        params.grid_width = grid_w;
+        params.grid_height = grid_h;
+        params.padded_width = padded_w;
+        params.padded_height = padded_h;
+        params.windows_per_row = windows_per_row;
+        params.windows_per_col = windows_per_col;
+        params.window_size = UOCR_SAM_WINDOW_SIZE;
+        params.hidden_size = UOCR_SAM_HIDDEN_SIZE;
+
+        const NSUInteger threads_per_group = metal_power2_threadgroup_width(256u, pipeline.maxTotalThreadsPerThreadgroup);
+        [enc setComputePipelineState:pipeline];
+        [enc setBuffer:src offset:0u atIndex:0u];
+        [enc setBuffer:dst offset:0u atIndex:1u];
+        [enc setBytes:&params length:sizeof(params) atIndex:2u];
+        [enc dispatchThreads:MTLSizeMake((NSUInteger)output_values, 1u, 1u)
+             threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1u, 1u)];
+        [enc endEncoding];
+
+        [cb commit];
+        [cb waitUntilCompleted];
+        if (cb.status == MTLCommandBufferStatusError) {
+            NSString *description = cb.error != nil ? [cb.error localizedDescription] : @"unknown command-buffer error";
+            result = metal_fail(error,
+                                error_size,
+                                "Metal SAM window unpartition command failed: %s",
+                                [description UTF8String]);
+            goto cleanup_window_unpartition;
+        }
+
+        memcpy(out_bhwc_f16, [dst contents], (size_t)output_bytes);
+        result = 1;
+
+    cleanup_window_unpartition:
+        [dst release];
+        [src release];
+    }
+
+    if (result) {
+        metal_clear_error(error, error_size);
+    }
+    return result;
 }
 
 static int metal_context_sam_attention_f16(uocr_metal_context *ctx,

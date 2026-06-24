@@ -754,7 +754,7 @@ Do not begin this section until sections 14.5 and 15.1 pass for fp16 single-requ
   - [x] decomposed relative position bias from `rel_pos_h` and `rel_pos_w`
   - [x] GELU MLP with `mlp_ratio=4`
   - [x] residual connections
-- [ ] Implement window partition/unpartition with padding exactly like upstream.
+- [x] Implement window partition/unpartition with padding exactly like upstream.
 - [ ] Implement SAM neck/net:
   - [ ] `1x1` conv `768 -> 256`, no bias
   - [ ] `LayerNorm2d(256, eps=1e-6)`

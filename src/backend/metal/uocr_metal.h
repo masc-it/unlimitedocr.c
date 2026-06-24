@@ -327,6 +327,35 @@ int uocr_metal_context_sam_qkv_f16(uocr_metal_context *ctx,
                                    char *error,
                                    size_t error_size);
 
+/* Diagnostic SAM window partition helper. Converts BHWC fp16 patch grids
+ * [grid_h,grid_w,768] into upstream window_partition() order
+ * [n_windows,14,14,768], padding only the bottom/right edges with zeros when
+ * grid_h/grid_w are not multiples of 14. The padded dimensions and window
+ * count are returned for block wiring and parity checks.
+ */
+int uocr_metal_context_sam_window_partition_f16(uocr_metal_context *ctx,
+                                                const uint16_t *input_bhwc_f16,
+                                                uint32_t grid_w,
+                                                uint32_t grid_h,
+                                                uint16_t *out_windows_f16,
+                                                uint32_t *out_n_windows,
+                                                uint32_t *out_padded_w,
+                                                uint32_t *out_padded_h,
+                                                char *error,
+                                                size_t error_size);
+
+/* Diagnostic SAM window unpartition helper. Reverses the partition layout above
+ * using upstream window_unpartition() semantics and crops away bottom/right
+ * padding, returning BHWC fp16 [grid_h,grid_w,768].
+ */
+int uocr_metal_context_sam_window_unpartition_f16(uocr_metal_context *ctx,
+                                                  const uint16_t *windows_f16,
+                                                  uint32_t grid_w,
+                                                  uint32_t grid_h,
+                                                  uint16_t *out_bhwc_f16,
+                                                  char *error,
+                                                  size_t error_size);
+
 /* Diagnostic SAM window-attention helper for non-global transformer blocks.
  * Q/K/V are fp16 tensors laid out as [n_windows,14*14,12,64] (equivalent to
  * window-major rows with flattened [head,dim] channels). The helper computes
