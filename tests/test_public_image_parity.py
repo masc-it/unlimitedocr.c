@@ -42,6 +42,7 @@ from unlimitedocr_c.golden import (
     load_clip_features_dump,
     load_projected_features_dump,
     load_sam_features_dump,
+    load_visual_features_dump,
 )
 
 
@@ -244,11 +245,11 @@ def _prepared_request_from_fixture(root: Path, *, max_new_tokens: int) -> Prepar
 
 
 def _load_visual_features(root: Path, expected_rows: int) -> np.ndarray:
-    visual = np.fromfile(root / VISUAL_FEATURES_BIN, dtype=np.dtype("<u2"))
-    expected_values = expected_rows * HIDDEN_SIZE
-    if visual.size != expected_values:
-        pytest.fail(f"{VISUAL_FEATURES_BIN} has {visual.size} values, expected {expected_values}")
-    return np.ascontiguousarray(visual.reshape((expected_rows, HIDDEN_SIZE)), dtype=np.dtype("<u2"))
+    try:
+        visual = load_visual_features_dump(root, row_count=expected_rows)
+    except ValueError as exc:
+        pytest.fail(str(exc))
+    return np.ascontiguousarray(visual, dtype=np.dtype("<u2"))
 
 
 def _load_first_generated_id(root: Path) -> np.ndarray:
@@ -265,7 +266,13 @@ def _load_reference_text(root: Path) -> str | None:
     return path.read_text(encoding="utf-8")
 
 
-def _encode_metal_visual_features(model_path: str, resource_path: str, request: PreparedRequest) -> np.ndarray:
+def _encode_metal_visual_features(
+    model_path: str,
+    resource_path: str,
+    request: PreparedRequest,
+    *,
+    max_views_per_chunk: int = 1,
+) -> np.ndarray:
     lib = load_library()
     _bind_internal_metal_symbols(lib)
     if lib.uocr_metal_is_available() == 0:
@@ -291,7 +298,7 @@ def _encode_metal_visual_features(model_path: str, resource_path: str, request: 
         ok = lib.uocr_metal_context_encode_visual_features_f16(
             ctx,
             ct.byref(keepalive.c_request),
-            ct.c_uint32(1),
+            ct.c_uint32(max_views_per_chunk),
             out.ctypes.data_as(ct.POINTER(ct.c_uint16)),
             ct.c_uint32(rows),
             error,
@@ -570,6 +577,41 @@ def _run_public_generation(model_path: str, resource_path: str, request: Prepare
     return np.ascontiguousarray(outputs[0], dtype=np.int32)
 
 
+def _run_final_visual_parity_case(
+    label: str,
+    root: Path,
+    *,
+    require_single_global: bool = False,
+    require_local_crop: bool = False,
+) -> None:
+    model_path, resource_path = _require_large_metal_inputs()
+    missing = [name for name in ("manifest.json", "views.npz", VISUAL_FEATURES_BIN) if not (root / name).exists()]
+    if missing:
+        pytest.fail(f"final visual fixture {root} is missing required files: {', '.join(missing)}")
+    request = _prepared_request_from_fixture(root, max_new_tokens=1)
+    if request.expected_visual_tokens <= 0:
+        pytest.fail(f"{label} fixture must contain visual tokens")
+    if require_single_global:
+        if len(request.views) != 1 or request.views[0].kind != "global" or request.expected_visual_tokens != GLOBAL_VISUAL_TOKENS:
+            pytest.fail(f"{label} fixture must be one global 1024 view with {GLOBAL_VISUAL_TOKENS} visual tokens")
+    if require_local_crop:
+        has_local = any(view.kind == "local" for view in request.views)
+        if not has_local or len(request.views) < 2 or request.views[-1].kind != "global":
+            pytest.fail(f"{label} fixture must contain one or more local 640 views followed by a global view")
+        if request.expected_visual_tokens <= GLOBAL_VISUAL_TOKENS:
+            pytest.fail(f"{label} fixture must include local-crop visual rows, got {request.expected_visual_tokens}")
+
+    expected_visual = _load_visual_features(root, request.expected_visual_tokens)
+    actual_visual = _encode_metal_visual_features(model_path, resource_path, request, max_views_per_chunk=1)
+    _assert_visual_features_close(actual_visual, expected_visual, label=label)
+
+    if len(request.views) > 1:
+        chunked_visual = _encode_metal_visual_features(model_path, resource_path, request, max_views_per_chunk=2)
+        np.testing.assert_array_equal(chunked_visual, actual_visual)
+        _assert_visual_features_close(chunked_visual, expected_visual, label=f"{label} chunked")
+    print(f"{label} final visual parity matched shape={actual_visual.shape} views={len(request.views)}")
+
+
 def _run_image_parity_case(label: str, root: Path) -> None:
     model_path, resource_path = _require_large_metal_inputs()
     _require_fixture_files(root)
@@ -589,6 +631,31 @@ def _run_image_parity_case(label: str, root: Path) -> None:
     if reference_text is not None:
         assert actual_text == reference_text
     print(f"{label} image parity generated ids={actual_ids.tolist()} decoded={actual_text!r}")
+
+
+def test_public_metal_final_visual_base_global_parity_fixture() -> None:
+    root = _fixture_dir_from_env(
+        "final visual base/global",
+        (
+            "UOCR_FINAL_VISUAL_PARITY_BASE_DIR",
+            "UOCR_IMAGE_PARITY_BASE_DIR",
+            "UOCR_IMAGE_PARITY_DIR",
+            "UOCR_LAYER_DUMP_DIR",
+        ),
+    )
+    _run_final_visual_parity_case("final visual base/global", root, require_single_global=True)
+
+
+def test_public_metal_final_visual_local_crop_parity_fixture() -> None:
+    root = _fixture_dir_from_env(
+        "final visual local crop",
+        (
+            "UOCR_FINAL_VISUAL_PARITY_640_DIR",
+            "UOCR_FINAL_VISUAL_PARITY_CROP_DIR",
+            "UOCR_IMAGE_PARITY_GUNDAM_MULTICROP_DIR",
+        ),
+    )
+    _run_final_visual_parity_case("final visual local crop", root, require_local_crop=True)
 
 
 def test_public_metal_image_base_global_parity_fixture() -> None:

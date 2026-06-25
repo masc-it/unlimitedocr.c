@@ -14,6 +14,7 @@ from unlimitedocr_c.golden import (
     PROJECTED_FEATURES_BIN,
     PROJECTED_GLOBAL_ROWS,
     PROJECTED_LOCAL_ROWS,
+    VISUAL_FEATURES_BIN,
     SAM_FEATURES_BIN,
     SAM_FEATURE_CHANNELS,
     clip_features_filename,
@@ -26,6 +27,7 @@ from unlimitedocr_c.golden import (
     load_image_prompt_embedding_dump,
     load_projected_features_dump,
     load_prompt_embedding_dump,
+    load_visual_features_dump,
     load_sam_features_dump,
     load_text_decoder_layers_dump,
     load_text_generated_ids_dump,
@@ -196,6 +198,29 @@ def test_dump_image_prompt_embedding_fixture_splices_visual_features(tmp_path) -
     assert loaded.image_span_start == 1
     assert loaded.image_span_length == 2
     assert loaded.manifest["image_embedding_fixture"]["bypasses_c_vision_encoder"] is True
+
+
+def test_load_visual_features_dump_reads_shape_metadata_and_manifest_fallback(tmp_path) -> None:
+    manifest = {
+        "image_mask_count": 4,
+        "golden_tensors": {
+            "visual_features": {"file": VISUAL_FEATURES_BIN, "shape": [1, 3, 1280]}
+        },
+    }
+    (tmp_path / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    bits = np.arange(3 * 1280, dtype=np.dtype("<u2")).reshape((3, 1280))
+    bits.tofile(tmp_path / VISUAL_FEATURES_BIN)
+
+    np.testing.assert_array_equal(load_visual_features_dump(tmp_path, row_count=3), bits)
+
+    fallback = tmp_path / "fallback"
+    fallback.mkdir()
+    fallback_manifest = {"image_mask_count": 4}
+    (fallback / "manifest.json").write_text(json.dumps(fallback_manifest), encoding="utf-8")
+    fallback_bits = np.arange(4 * 1280, dtype=np.dtype("<u2")).reshape((4, 1280))
+    fallback_bits.tofile(fallback / VISUAL_FEATURES_BIN)
+
+    np.testing.assert_array_equal(load_visual_features_dump(fallback, row_count=4), fallback_bits)
 
 
 def test_load_sam_features_dump_reads_single_and_per_view_files(tmp_path) -> None:

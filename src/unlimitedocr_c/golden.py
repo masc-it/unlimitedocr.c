@@ -1326,6 +1326,74 @@ def dump_text_generated_ids_fixture(
     return out
 
 
+def _visual_feature_meta(manifest: dict[str, Any]) -> dict[str, Any]:
+    golden = manifest.get("golden_tensors", {}).get("visual_features", {}) if isinstance(manifest, dict) else {}
+    return golden if isinstance(golden, dict) else {}
+
+
+def _infer_visual_rows_from_manifest(manifest: dict[str, Any]) -> int | None:
+    if not isinstance(manifest, dict):
+        return None
+    for key in ("image_mask_count", "expected_visual_tokens", "visual_token_count"):
+        value = manifest.get(key)
+        if value is not None:
+            rows = int(value)
+            if rows > 0:
+                return rows
+    return None
+
+
+def load_visual_features_dump(
+    fixture_dir: str | Path,
+    *,
+    row_count: int | None = None,
+) -> NDArray[np.uint16]:
+    """Load a Python/HF final formatted visual-feature fixture.
+
+    The tensor contract is the final source buffer consumed by masked_scatter /
+    C prompt splicing: ``[image_tokens, 1280]`` fp16 bits after per-view
+    projection, local-crop stitching, image-newline insertion, and final
+    view-separator insertion. Shape metadata may also use upstream
+    ``[1,image_tokens,1280]``.
+    """
+
+    root = Path(fixture_dir)
+    manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+    if not isinstance(manifest, dict):
+        raise ValueError(f"expected manifest object in {root}")
+    meta = _visual_feature_meta(manifest)
+    filename = meta.get("file") if isinstance(meta, dict) else None
+    if not isinstance(filename, str):
+        filename = VISUAL_FEATURES_BIN
+
+    shape = meta.get("shape") if isinstance(meta, dict) else None
+    if isinstance(shape, list) and len(shape) == 2:
+        rows = int(shape[0])
+        hidden_size = int(shape[1])
+    elif isinstance(shape, list) and len(shape) == 3:
+        batch = int(shape[0])
+        if batch != 1:
+            raise ValueError(f"visual_features batch dimension must be 1, got {batch} in {root}")
+        rows = int(shape[1])
+        hidden_size = int(shape[2])
+    else:
+        inferred = row_count if row_count is not None else _infer_visual_rows_from_manifest(manifest)
+        if inferred is None:
+            raise ValueError(f"missing visual_features shape metadata in {root}")
+        rows = int(inferred)
+        hidden_size = HIDDEN_SIZE
+
+    if rows <= 0 or hidden_size != HIDDEN_SIZE:
+        raise ValueError(f"invalid visual_features shape [{rows}, {hidden_size}] in {root}")
+    if row_count is not None and rows != int(row_count):
+        raise ValueError(f"visual_features row count {rows} does not match expected {row_count}")
+    bits = np.fromfile(root / filename, dtype=np.dtype("<u2"))
+    expected_values = rows * hidden_size
+    if bits.size != expected_values:
+        raise ValueError(f"visual_features size mismatch: expected {expected_values} f16 values, got {bits.size}")
+    return bits.reshape((rows, hidden_size))
+
+
 def _infer_sam_grid_from_manifest(manifest: dict[str, Any], view_index: int) -> int | None:
     views = manifest.get("views") if isinstance(manifest, dict) else None
     if not isinstance(views, list) or view_index < 0 or view_index >= len(views):

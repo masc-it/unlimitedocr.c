@@ -823,7 +823,7 @@ Do not resume quantization, batching, CUDA, or high-level OCR/PDF/postprocess AP
   - [x] append newline after each stitched local row
 - [x] Crop-mode final feature order must be local features first, then global row/newline features, then separator.
 - [x] Non-crop/multi-page final feature order must be per-image global row/newline features plus separator.
-- [ ] Validate final visual feature buffer length and values against Python dumps.
+- [x] Validate final visual feature buffer length and values against Python dumps.
 
 ## 17. Dynamic q8/q4 converter and kernels
 
