@@ -5956,6 +5956,7 @@ static int metal_select_next_token_from_hidden_slice_f16(uocr_metal_context *ctx
         const uint64_t sequence_copy_start_ns = uocr_profile_now_ns();
         memcpy((uint8_t *)sequence_base + (size_t)selection_slices.sequence.offset, sequence, (size_t)sequence_bytes);
         metal_profile_add_event_now(ctx, "metal.no_repeat_sequence_copy", sequence_copy_start_ns);
+        metal_profile_add_event_now(ctx, "metal.decode.no_repeat_sequence_copy", sequence_copy_start_ns);
     }
 
     const uint64_t final_norm_start_ns = uocr_profile_now_ns();
@@ -5970,6 +5971,7 @@ static int metal_select_next_token_from_hidden_slice_f16(uocr_metal_context *ctx
         return 0;
     }
     metal_profile_add_event_now(ctx, "metal.final_norm", final_norm_start_ns);
+    metal_profile_add_event_now(ctx, "metal.decode.final_norm", final_norm_start_ns);
 
     const uint64_t no_repeat_start_ns = uocr_profile_now_ns();
     if (!metal_run_no_repeat_collect_ban_flags_to_slice(ctx,
@@ -5984,6 +5986,7 @@ static int metal_select_next_token_from_hidden_slice_f16(uocr_metal_context *ctx
         return 0;
     }
     metal_profile_add_event_now(ctx, "metal.no_repeat", no_repeat_start_ns);
+    metal_profile_add_event_now(ctx, "metal.decode.no_repeat_collect", no_repeat_start_ns);
 
     const uint64_t lm_head_start_ns = uocr_profile_now_ns();
     if (!metal_run_lm_head_argmax_f16(ctx,
@@ -5998,6 +6001,7 @@ static int metal_select_next_token_from_hidden_slice_f16(uocr_metal_context *ctx
         return 0;
     }
     metal_profile_add_event_now(ctx, "metal.lm_head_selection", lm_head_start_ns);
+    metal_profile_add_event_now(ctx, "metal.decode.lm_head_selection", lm_head_start_ns);
 
     const uint64_t final_argmax_start_ns = uocr_profile_now_ns();
     if (!metal_run_argmax_pairs_to_token(ctx,
@@ -6011,11 +6015,16 @@ static int metal_select_next_token_from_hidden_slice_f16(uocr_metal_context *ctx
         return 0;
     }
     metal_profile_add_event_now(ctx, "metal.lm_head_final_argmax", final_argmax_start_ns);
-    if (metal_command_batch_active(ctx) &&
-        !metal_command_batch_commit_and_wait(ctx, "integrated next-token selection", error, error_size)) {
-        return 0;
+    metal_profile_add_event_now(ctx, "metal.decode.lm_head_final_argmax", final_argmax_start_ns);
+    if (metal_command_batch_active(ctx)) {
+        const uint64_t command_wait_start_ns = uocr_profile_now_ns();
+        if (!metal_command_batch_commit_and_wait(ctx, "integrated next-token selection", error, error_size)) {
+            return 0;
+        }
+        metal_profile_add_event_now(ctx, "metal.decode.command_wait", command_wait_start_ns);
     }
 
+    const uint64_t token_readback_start_ns = uocr_profile_now_ns();
     int32_t *token_ptr = metal_token_slice_cpu_ptr(token_slot);
     float *score_ptr = metal_score_slice_cpu_ptr(selection_slices.score);
     if (token_ptr == NULL || score_ptr == NULL) {
@@ -6026,6 +6035,7 @@ static int metal_select_next_token_from_hidden_slice_f16(uocr_metal_context *ctx
     }
     *token_id_out = (uint32_t)*token_ptr;
     *score_out = *score_ptr;
+    metal_profile_add_event_now(ctx, "metal.decode.token_readback", token_readback_start_ns);
     return 1;
 }
 
@@ -6847,6 +6857,15 @@ static int metal_run_decoder_decode_one_f16(uocr_metal_context *ctx,
         }
     }
 
+#define RUN_DECODE_TIMED(bucket_name, call_expr)                     \
+    do {                                                            \
+        const uint64_t decode_bucket_start_ns__ = uocr_profile_now_ns(); \
+        if (!(call_expr)) {                                         \
+            return 0;                                               \
+        }                                                           \
+        metal_profile_add_event_now(ctx, (bucket_name), decode_bucket_start_ns__); \
+    } while (0)
+
     uocr_metal_buffer_slice current = scratch[0];
     uint32_t current_segment = 0u;
     for (uint32_t layer = 0u; layer < UOCR_DECODER_LAYERS; ++layer) {
@@ -6906,15 +6925,68 @@ static int metal_run_decoder_decode_one_f16(uocr_metal_context *ctx,
             return 0;
         }
 
-        if (!metal_run_rmsnorm_buffer_f16(ctx, current, input_norm, 1u, norm, "integrated decode input RMSNorm", error, error_size) ||
-            !metal_run_attention_qkv_buffer_f16(ctx, norm, q_weight, k_weight, v_weight, 1u, q, k, v, error, error_size) ||
-            !metal_run_rope_qk_buffer_f16(ctx, q, k, 1u, position, error, error_size) ||
-            !metal_run_kv_write_buffer_f16(ctx, k, v, 1u, layer, slot, prompt_length, position, error, error_size) ||
-            !metal_run_decode_attention_buffer_f16(ctx, q, layer, slot, prompt_length, generated_count_after_write, norm, error, error_size) ||
-            !metal_run_attention_output_residual_buffer_f16(ctx, norm, o_weight, current, 1u, q, error, error_size) ||
-            !metal_run_rmsnorm_buffer_f16(ctx, q, post_norm, 1u, norm, "integrated decode post-attention RMSNorm", error, error_size)) {
-            return 0;
-        }
+        RUN_DECODE_TIMED("metal.decode.attention_norm",
+                         metal_run_rmsnorm_buffer_f16(ctx,
+                                                      current,
+                                                      input_norm,
+                                                      1u,
+                                                      norm,
+                                                      "integrated decode input RMSNorm",
+                                                      error,
+                                                      error_size));
+        RUN_DECODE_TIMED("metal.decode.attention_projections",
+                         metal_run_attention_qkv_buffer_f16(ctx,
+                                                            norm,
+                                                            q_weight,
+                                                            k_weight,
+                                                            v_weight,
+                                                            1u,
+                                                            q,
+                                                            k,
+                                                            v,
+                                                            error,
+                                                            error_size));
+        RUN_DECODE_TIMED("metal.decode.rope",
+                         metal_run_rope_qk_buffer_f16(ctx, q, k, 1u, position, error, error_size));
+        RUN_DECODE_TIMED("metal.decode.kv_write",
+                         metal_run_kv_write_buffer_f16(ctx,
+                                                       k,
+                                                       v,
+                                                       1u,
+                                                       layer,
+                                                       slot,
+                                                       prompt_length,
+                                                       position,
+                                                       error,
+                                                       error_size));
+        RUN_DECODE_TIMED("metal.decode.attention",
+                         metal_run_decode_attention_buffer_f16(ctx,
+                                                               q,
+                                                               layer,
+                                                               slot,
+                                                               prompt_length,
+                                                               generated_count_after_write,
+                                                               norm,
+                                                               error,
+                                                               error_size));
+        RUN_DECODE_TIMED("metal.decode.attention_projections",
+                         metal_run_attention_output_residual_buffer_f16(ctx,
+                                                                        norm,
+                                                                        o_weight,
+                                                                        current,
+                                                                        1u,
+                                                                        q,
+                                                                        error,
+                                                                        error_size));
+        RUN_DECODE_TIMED("metal.decode.post_attention_norm",
+                         metal_run_rmsnorm_buffer_f16(ctx,
+                                                      q,
+                                                      post_norm,
+                                                      1u,
+                                                      norm,
+                                                      "integrated decode post-attention RMSNorm",
+                                                      error,
+                                                      error_size));
 
         if (layer == 0u) {
             const uocr_metal_decoder_binding *gate = metal_require_decoder_binding(ctx,
@@ -6934,24 +7006,27 @@ static int metal_run_decoder_decode_one_f16(uocr_metal_context *ctx,
                                                                                    error_size);
             const uint64_t mid_bytes = (uint64_t)UOCR_DENSE_LAYER0_INTERMEDIATE * 2u;
             uocr_metal_buffer_slice mid;
-            if (gate == NULL || up == NULL || down == NULL ||
-                !metal_moe_intermediate_slice(ctx, slot, mid_bytes, &mid) ||
-                !metal_run_dense_swiglu_buffer_f16(ctx,
-                                                   norm,
-                                                   gate,
-                                                   up,
-                                                   down,
-                                                   q,
-                                                   1,
-                                                   1u,
-                                                   UOCR_DENSE_LAYER0_INTERMEDIATE,
-                                                   mid,
-                                                   output,
-                                                   "integrated decode layer0 dense SwiGLU",
-                                                   error,
-                                                   error_size)) {
+            if (gate == NULL || up == NULL || down == NULL) {
                 return 0;
             }
+            if (!metal_moe_intermediate_slice(ctx, slot, mid_bytes, &mid)) {
+                return metal_fail(error, error_size, "integrated decode layer0 dense MLP intermediate slice is invalid");
+            }
+            RUN_DECODE_TIMED("metal.decode.dense_mlp",
+                             metal_run_dense_swiglu_buffer_f16(ctx,
+                                                               norm,
+                                                               gate,
+                                                               up,
+                                                               down,
+                                                               q,
+                                                               1,
+                                                               1u,
+                                                               UOCR_DENSE_LAYER0_INTERMEDIATE,
+                                                               mid,
+                                                               output,
+                                                               "integrated decode layer0 dense SwiGLU",
+                                                               error,
+                                                               error_size));
         } else {
             const uocr_metal_decoder_binding *router = metal_require_decoder_binding(ctx,
                                                                                      uocr_tensor_id_moe_router(layer),
@@ -6979,39 +7054,56 @@ static int metal_run_decoder_decode_one_f16(uocr_metal_context *ctx,
             const uint64_t shared_mid_bytes = (uint64_t)UOCR_MOE_SHARED_INTERMEDIATE * 2u;
             const uint64_t routed_mid_bytes = (uint64_t)UOCR_MOE_TOP_K * (uint64_t)UOCR_MOE_EXPERT_INTERMEDIATE * 2u;
             uocr_metal_buffer_slice mid;
-            if (router == NULL || shared_gate == NULL || shared_up == NULL || shared_down == NULL ||
-                !metal_run_moe_router_buffer_f16(ctx, norm, router, slot, 1u, &top_ids, &top_weights, error, error_size) ||
-                !metal_moe_intermediate_slice(ctx, slot, shared_mid_bytes, &mid) ||
-                !metal_run_dense_swiglu_buffer_f16(ctx,
-                                                   norm,
-                                                   shared_gate,
-                                                   shared_up,
-                                                   shared_down,
-                                                   q,
-                                                   0,
-                                                   1u,
-                                                   UOCR_MOE_SHARED_INTERMEDIATE,
-                                                   mid,
-                                                   v,
-                                                   "integrated decode MoE shared experts",
-                                                   error,
-                                                   error_size) ||
-                !metal_expert_interleaved_slab_for_layer(ctx, layer, &expert_slab, error, error_size) ||
-                !metal_moe_intermediate_slice(ctx, slot, routed_mid_bytes, &mid) ||
-                !metal_run_moe_interleaved_buffer_f16(ctx,
-                                                      norm,
-                                                      top_ids,
-                                                      top_weights,
-                                                      expert_slab,
-                                                      slot,
-                                                      1u,
-                                                      mid,
-                                                      current,
-                                                      error,
-                                                      error_size) ||
-                !metal_run_moe_combine_buffer_f16(ctx, current, v, q, 1u, output, error, error_size)) {
+            if (router == NULL || shared_gate == NULL || shared_up == NULL || shared_down == NULL) {
                 return 0;
             }
+            RUN_DECODE_TIMED("metal.decode.moe_router",
+                             metal_run_moe_router_buffer_f16(ctx,
+                                                             norm,
+                                                             router,
+                                                             slot,
+                                                             1u,
+                                                             &top_ids,
+                                                             &top_weights,
+                                                             error,
+                                                             error_size));
+            if (!metal_moe_intermediate_slice(ctx, slot, shared_mid_bytes, &mid)) {
+                return metal_fail(error, error_size, "integrated decode MoE shared intermediate slice is invalid");
+            }
+            RUN_DECODE_TIMED("metal.decode.moe_shared_experts",
+                             metal_run_dense_swiglu_buffer_f16(ctx,
+                                                               norm,
+                                                               shared_gate,
+                                                               shared_up,
+                                                               shared_down,
+                                                               q,
+                                                               0,
+                                                               1u,
+                                                               UOCR_MOE_SHARED_INTERMEDIATE,
+                                                               mid,
+                                                               v,
+                                                               "integrated decode MoE shared experts",
+                                                               error,
+                                                               error_size));
+            RUN_DECODE_TIMED("metal.decode.moe_expert_slab",
+                             metal_expert_interleaved_slab_for_layer(ctx, layer, &expert_slab, error, error_size));
+            if (!metal_moe_intermediate_slice(ctx, slot, routed_mid_bytes, &mid)) {
+                return metal_fail(error, error_size, "integrated decode MoE routed intermediate slice is invalid");
+            }
+            RUN_DECODE_TIMED("metal.decode.moe_routed_experts",
+                             metal_run_moe_interleaved_buffer_f16(ctx,
+                                                                  norm,
+                                                                  top_ids,
+                                                                  top_weights,
+                                                                  expert_slab,
+                                                                  slot,
+                                                                  1u,
+                                                                  mid,
+                                                                  current,
+                                                                  error,
+                                                                  error_size));
+            RUN_DECODE_TIMED("metal.decode.moe_combine",
+                             metal_run_moe_combine_buffer_f16(ctx, current, v, q, 1u, output, error, error_size));
         }
 
         current = output;
@@ -7021,10 +7113,16 @@ static int metal_run_decoder_decode_one_f16(uocr_metal_context *ctx,
     }
 
     if (current_segment != 0u) {
-        if (!metal_copy_slice(ctx, current, scratch[0], hidden_bytes, "integrated decode final-hidden copy", error, error_size)) {
-            return 0;
-        }
+        RUN_DECODE_TIMED("metal.decode.final_hidden_copy",
+                         metal_copy_slice(ctx,
+                                          current,
+                                          scratch[0],
+                                          hidden_bytes,
+                                          "integrated decode final-hidden copy",
+                                          error,
+                                          error_size));
     }
+#undef RUN_DECODE_TIMED
     return 1;
 }
 
@@ -7508,11 +7606,13 @@ static int metal_context_generate_f16(uocr_metal_context *ctx,
 
     while (!uocr_sequence_generation_done(&sequence_state)) {
         const uint64_t decode_iteration_start_ns = uocr_profile_now_ns();
+        const uint64_t selection_command_encoding_start_ns = uocr_profile_now_ns();
         if (!metal_command_batch_begin(ctx, error, error_size)) {
             char detail[512];
             (void)snprintf(detail, sizeof(detail), "%s", (error != NULL && error[0] != '\0') ? error : "unknown error");
             UOCR_METAL_DECODE_LOOP_FAIL("integrated Metal fp16 decode command batch begin failed: %s", detail);
         }
+        metal_profile_add_event_now(ctx, "metal.decode.command_encoding", selection_command_encoding_start_ns);
         uint32_t token_id = UINT32_MAX;
         float score = 0.0f;
         uocr_no_repeat_ngram_config no_repeat_config;
@@ -7523,6 +7623,7 @@ static int metal_context_generate_f16(uocr_metal_context *ctx,
                                         uocr_status_string(no_repeat_status));
         }
         metal_profile_add_event_now(ctx, "metal.no_repeat_state", no_repeat_state_start_ns);
+        metal_profile_add_event_now(ctx, "metal.decode.no_repeat_state", no_repeat_state_start_ns);
         const uint64_t token_selection_start_ns = uocr_profile_now_ns();
         if (!metal_select_next_token_from_hidden_slice_f16(ctx,
                                                            hidden_for_selection,
@@ -7549,6 +7650,7 @@ static int metal_context_generate_f16(uocr_metal_context *ctx,
             UOCR_METAL_DECODE_LOOP_FAIL("integrated Metal fp16 selected invalid token id %u", token_id);
         }
 
+        const uint64_t cpu_sequence_update_start_ns = uocr_profile_now_ns();
         const uint32_t generated_index = sequence_state.generated_count;
         const int accept_status = uocr_sequence_accept_generated_token(&sequence_state, (int32_t)token_id, NULL, 0u);
         if (accept_status != UOCR_OK) {
@@ -7561,6 +7663,7 @@ static int metal_context_generate_f16(uocr_metal_context *ctx,
         result->generated_count = sequence_state.generated_count;
         result->last_token_id = token_id;
         result->last_score_f32 = score;
+        metal_profile_add_event_now(ctx, "metal.decode.cpu_sequence_update", cpu_sequence_update_start_ns);
         if (sequence_state.eos) {
             result->stopped_on_eos = 1u;
             break;
@@ -7575,21 +7678,27 @@ static int metal_context_generate_f16(uocr_metal_context *ctx,
             UOCR_METAL_DECODE_LOOP_FAIL("integrated Metal fp16 token-id arena is not CPU-visible");
         }
         *token_ptr = (int32_t)token_id;
+        const uint64_t decode_command_encoding_start_ns = uocr_profile_now_ns();
         if (!metal_command_batch_begin(ctx, error, error_size)) {
             char detail[512];
             (void)snprintf(detail, sizeof(detail), "%s", (error != NULL && error[0] != '\0') ? error : "unknown error");
             UOCR_METAL_DECODE_LOOP_FAIL("integrated Metal fp16 decode command batch begin failed: %s", detail);
         }
+        metal_profile_add_event_now(ctx, "metal.decode.command_encoding", decode_command_encoding_start_ns);
         const uint64_t decode_step_start_ns = uocr_profile_now_ns();
         uocr_metal_buffer_slice decode_input;
         uint64_t decode_input_bytes = 0u;
         if (!metal_hidden_arena_segment_slice(ctx, request->slot, 0u, 1u, &decode_input, &decode_input_bytes) ||
-            decode_input_bytes != (uint64_t)UOCR_HIDDEN_SIZE * 2u ||
-            !metal_run_token_embedding_from_token_slot_f16(ctx, token_slot, decode_input, error, error_size)) {
+            decode_input_bytes != (uint64_t)UOCR_HIDDEN_SIZE * 2u) {
+            UOCR_METAL_DECODE_LOOP_FAIL("integrated Metal fp16 generated-token embedding slice is invalid");
+        }
+        const uint64_t token_embedding_start_ns = uocr_profile_now_ns();
+        if (!metal_run_token_embedding_from_token_slot_f16(ctx, token_slot, decode_input, error, error_size)) {
             char detail[512];
             (void)snprintf(detail, sizeof(detail), "%s", (error != NULL && error[0] != '\0') ? error : "unknown error");
             UOCR_METAL_DECODE_LOOP_FAIL("integrated Metal fp16 generated-token embedding failed: %s", detail);
         }
+        metal_profile_add_event_now(ctx, "metal.decode.token_embedding", token_embedding_start_ns);
         if (!metal_run_decoder_decode_one_f16(ctx,
                                               request->slot,
                                               request->n_tokens,

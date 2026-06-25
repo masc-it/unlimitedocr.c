@@ -133,7 +133,7 @@ kernels and reducing launches is required for best tokens/sec.
 
 Implementation status:
 
-- [ ] Add per-token timing buckets for final norm/LM selection, attention projections, attention, dense layer-0 MLP, MoE router, shared experts, routed experts, combine, and command encoding.
+- [x] Add per-token timing buckets for final norm/LM selection, attention projections, attention, dense layer-0 MLP, MoE router, shared experts, routed experts, combine, and command encoding.
 - [ ] Replace scalar one-output/threadgroup matvec reductions with tiled/simdgroup kernels using vectorized loads and better data reuse.
 - [ ] Benchmark custom decode matvec kernels against MPS/GEMV for `n_tokens=1`; keep only the confirmed faster production path per operation shape.
 - [ ] Fuse decode-layer epilogues where possible: norm+projection setup, projection+bias, output+residual, MoE combine+residual.
@@ -155,7 +155,7 @@ not add fallback paths.
 
 Implementation status:
 
-- [ ] Time final RMSNorm, no-repeat ban collection, fused LM-head partial reduction, final argmax, token readback, and CPU sequence update separately.
+- [x] Time final RMSNorm, no-repeat ban collection, fused LM-head partial reduction, final argmax, token readback, and CPU sequence update separately.
 - [ ] Tune `uocr_lm_head_argmax_f16` tile size, lanes per token, threadgroup memory usage, and weight access pattern.
 - [ ] Add top-k only if a measured feature needs it; otherwise keep top-1 greedy minimal.
 - [ ] Move no-repeat history to a reusable GPU sequence buffer to avoid copying the CPU sequence into scratch every token.
