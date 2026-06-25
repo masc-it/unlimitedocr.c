@@ -4432,6 +4432,15 @@ static int metal_run_mps_matmul_nt_f16(uocr_metal_context *ctx,
             [y_array release];
             return 0;
         }
+        id<MTLBlitCommandEncoder> fill = [cb blitCommandEncoder];
+        if (fill == nil) {
+            [x_array release];
+            [w_array release];
+            [y_array release];
+            return metal_fail(error, error_size, "failed to create %s MPS destination fill encoder", op_name != NULL ? op_name : "Metal");
+        }
+        [fill fillBuffer:dst.buffer range:NSMakeRange(dst.offset, (NSUInteger)dst_bytes) value:0u];
+        [fill endEncoding];
         id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
         if (enc == nil) {
             [x_array release];

@@ -25,7 +25,7 @@ sequence.
 - [x] Manual multi-token public image generation has produced a raw decoded model sequence on a synthetic image.
 - [x] `docs/test.png` runs through `ocr_image(..., model_path="dist/unlimitedocr-fp16.uocr")` and returns a raw decoded sequence.
 - [x] Generation continues until EOS or the request's max length / max-new-token budget.
-- [ ] The same reusable `Engine` instance processes multiple image requests sequentially.
+- [x] The same reusable `Engine` instance processes multiple image requests sequentially.
 - [ ] Each request resets or overwrites all per-request Metal state: KV cache metadata, prompt state, image feature state, generated-token state, and error state.
 - [ ] Failure modes produce clear actionable errors: pass a pre-converted `.uocr`, use fp16 qprofile, build/find `libunlimitedocr`, provide Metal resources, reduce `max_length` when memory is insufficient, or use a Metal-capable machine.
 
