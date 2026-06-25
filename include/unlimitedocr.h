@@ -60,7 +60,7 @@ typedef enum uocr_memory_category {
 } uocr_memory_category;
 
 #define UOCR_PROFILE_EVENT_NAME_SIZE 64u
-#define UOCR_PROFILE_MAX_EVENTS 128u
+#define UOCR_PROFILE_MAX_EVENTS 256u
 
 typedef struct uocr_profile_event {
     char name[UOCR_PROFILE_EVENT_NAME_SIZE];

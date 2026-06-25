@@ -176,6 +176,12 @@ static void metal_profile_add_event_now_f(const uocr_metal_context *ctx, uint64_
     uocr_profile_add_event_now(ctx->profile, name, start_ns);
 }
 
+static void metal_profile_add_event_ms(const uocr_metal_context *ctx, const char *name, double elapsed_ms) {
+    if (metal_profile_enabled(ctx)) {
+        uocr_profile_add_event_ms(ctx->profile, name, elapsed_ms);
+    }
+}
+
 static void metal_profile_count_buffer(const uocr_metal_context *ctx, uint64_t bytes) {
     if (metal_profile_enabled(ctx)) {
         uocr_profile_add_metal_buffer_allocation(ctx->profile, bytes);
@@ -2715,6 +2721,7 @@ typedef struct uocr_metal_vision_project_context {
     const uocr_prepared_request *request;
     const uocr_metal_vision_weights_f16 *weights;
     uocr_metal_vision_host_scratch *scratch;
+    double chunk_encode_ms;
 } uocr_metal_vision_project_context;
 
 static int metal_encode_one_view_sam_features_f16(uocr_metal_vision_project_context *project,
@@ -2747,6 +2754,7 @@ static int metal_encode_one_view_sam_features_f16(uocr_metal_vision_project_cont
 
     uint32_t patch_grid_w = 0u;
     uint32_t patch_grid_h = 0u;
+    const uint64_t sam_patch_start_ns = uocr_profile_now_ns();
     RUN_VISION_STEP("SAM patch embedding",
                     uocr_metal_context_sam_patch_embed_f16(ctx,
                                                             view->pixels,
@@ -2760,6 +2768,7 @@ static int metal_encode_one_view_sam_features_f16(uocr_metal_vision_project_cont
                                                             &patch_grid_h,
                                                             error,
                                                             error_size));
+    metal_profile_add_event_now(ctx, "metal.vision.sam_patch", sam_patch_start_ns);
     if (patch_grid_w != expected_patch_grid || patch_grid_h != expected_patch_grid) {
         return metal_fail(error,
                           error_size,
@@ -2790,6 +2799,7 @@ static int metal_encode_one_view_sam_features_f16(uocr_metal_vision_project_cont
                                                             scratch->sam_transformer_bhwc_f16,
                                                             error,
                                                             error_size));
+    const uint64_t sam_neck_start_ns = uocr_profile_now_ns();
     RUN_VISION_STEP("SAM neck 1x1 convolution",
                     uocr_metal_context_sam_neck_conv1x1_f16(ctx,
                                                              scratch->sam_transformer_bhwc_f16,
@@ -2854,6 +2864,7 @@ static int metal_encode_one_view_sam_features_f16(uocr_metal_vision_project_cont
                                                                      out_sam_nchw_f16,
                                                                      error,
                                                                      error_size));
+    metal_profile_add_event_now(ctx, "metal.vision.sam_neck", sam_neck_start_ns);
     const uint32_t sam_grid_w = (net2_grid_w + 1u) / 2u;
     const uint32_t sam_grid_h = (net2_grid_h + 1u) / 2u;
     if (sam_grid_w != expected_sam_grid || sam_grid_h != expected_sam_grid) {
@@ -3010,6 +3021,7 @@ static int metal_encode_one_view_projected_f16(uocr_metal_vision_project_context
         metal_profile_add_event_now_f(ctx, vision_step_start_ns__, "metal.vision.%s", step_name);    \
     } while (0)
 
+    const uint64_t concat_start_ns = uocr_profile_now_ns();
     RUN_VISION_STEP("CLIP/SAM concat",
                     uocr_metal_context_clip_sam_concat_f16(ctx,
                                                             scratch->clip_final_f16,
@@ -3020,6 +3032,8 @@ static int metal_encode_one_view_projected_f16(uocr_metal_vision_project_context
                                                             scratch->concat_f16,
                                                             error,
                                                             error_size));
+    metal_profile_add_event_now(ctx, "metal.vision.concat", concat_start_ns);
+    const uint64_t projector_start_ns = uocr_profile_now_ns();
     RUN_VISION_STEP("visual projector",
                     uocr_metal_context_visual_projector_f16(ctx,
                                                              scratch->concat_f16,
@@ -3030,6 +3044,7 @@ static int metal_encode_one_view_projected_f16(uocr_metal_vision_project_context
                                                              out_projected_rows_f16,
                                                              error,
                                                              error_size));
+    metal_profile_add_event_now(ctx, "metal.vision.projector", projector_start_ns);
 
 #undef RUN_VISION_STEP
 
@@ -3062,6 +3077,7 @@ static int metal_project_vision_chunk_f16(const uocr_vision_chunk *chunk,
         return UOCR_ERROR_INVALID_ARGUMENT;
     }
 
+    const uint64_t chunk_encode_start_ns = uocr_profile_now_ns();
     for (uint32_t view_index = 0u; view_index < chunk->view_count; ++view_index) {
         const uocr_image_view *view = &project->request->views[chunk->first_view + view_index];
         uint16_t *projected_out = &projected_scratch_f16[(size_t)view_index * (size_t)chunk->projected_tokens_per_view * (size_t)UOCR_HIDDEN_SIZE];
@@ -3069,6 +3085,9 @@ static int metal_project_vision_chunk_f16(const uocr_vision_chunk *chunk,
             return UOCR_ERROR_INTERNAL;
         }
     }
+    const uint64_t chunk_encode_end_ns = uocr_profile_now_ns();
+    project->chunk_encode_ms += uocr_profile_elapsed_ms(chunk_encode_start_ns, chunk_encode_end_ns);
+    metal_profile_add_event_now(project->ctx, "metal.vision.chunk_encode", chunk_encode_start_ns);
 
     return UOCR_OK;
 }
@@ -3147,6 +3166,7 @@ int uocr_metal_context_encode_visual_features_f16(uocr_metal_context *ctx,
     project.weights = &weights;
     project.scratch = &scratch;
 
+    const uint64_t chunk_processing_start_ns = uocr_profile_now_ns();
     const int process_status = uocr_process_vision_chunks_f16(request,
                                                               max_views_per_chunk,
                                                               metal_project_vision_chunk_f16,
@@ -3160,6 +3180,12 @@ int uocr_metal_context_encode_visual_features_f16(uocr_metal_context *ctx,
                                                               NULL,
                                                               error,
                                                               error_size);
+    const double chunk_processing_ms = uocr_profile_elapsed_ms(chunk_processing_start_ns, uocr_profile_now_ns());
+    if (process_status == UOCR_OK) {
+        metal_profile_add_event_ms(ctx, "metal.vision.chunk_processing", chunk_processing_ms);
+        const double formatter_ms = chunk_processing_ms > project.chunk_encode_ms ? chunk_processing_ms - project.chunk_encode_ms : 0.0;
+        metal_profile_add_event_ms(ctx, "metal.vision.formatter", formatter_ms);
+    }
     free(projected_scratch_f16);
     metal_vision_host_scratch_free(&scratch);
     if (process_status != UOCR_OK) {
@@ -11517,6 +11543,7 @@ int uocr_metal_context_clip_transformer_f16(uocr_metal_context *ctx,
 
     const uint16_t *current_f16 = input_f16;
     uint16_t *next_f16 = state_a_f16;
+    const uint64_t clip_blocks_start_ns = uocr_profile_now_ns();
     for (uint32_t block_index = 0u; block_index < block_count; ++block_index) {
         const uint64_t block_start_ns = uocr_profile_now_ns();
         const int is_last = block_index + 1u == block_count;
@@ -11546,6 +11573,7 @@ int uocr_metal_context_clip_transformer_f16(uocr_metal_context *ctx,
         metal_profile_add_event_now(ctx, "metal.vision.clip_block", block_start_ns);
         metal_profile_add_event_now_f(ctx, block_start_ns, "metal.vision.clip_block.%02u", block_index);
     }
+    metal_profile_add_event_now(ctx, "metal.vision.clip_blocks", clip_blocks_start_ns);
 
     result = 1;
 
@@ -12113,6 +12141,7 @@ int uocr_metal_context_sam_transformer_f16(uocr_metal_context *ctx,
 
     const uint16_t *current_f16 = input_bhwc_f16;
     uint16_t *next_f16 = state_a_f16;
+    const uint64_t sam_blocks_start_ns = uocr_profile_now_ns();
     for (uint32_t block_index = 0u; block_index < block_count; ++block_index) {
         const uint64_t block_start_ns = uocr_profile_now_ns();
         const int is_last = block_index + 1u == block_count;
@@ -12144,6 +12173,7 @@ int uocr_metal_context_sam_transformer_f16(uocr_metal_context *ctx,
         metal_profile_add_event_now(ctx, "metal.vision.sam_block", block_start_ns);
         metal_profile_add_event_now_f(ctx, block_start_ns, "metal.vision.sam_block.%02u", block_index);
     }
+    metal_profile_add_event_now(ctx, "metal.vision.sam_blocks", sam_blocks_start_ns);
 
     result = 1;
 
