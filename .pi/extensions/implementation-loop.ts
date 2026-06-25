@@ -11,18 +11,22 @@ const QA_CHECKPOINT_INTERVAL = 5;
 const IMPLEMENTATION_PROMPT = `read the context in @docs/implementation_plan.md @docs/architecture.md
 @docs/foundations.md and proceed with the next implementation item.
 
-when you pick up the item, explain what it is about and what is needed for.
+when you pick up the item, first explain what it is about and what is needed for.
 
 when you're done and the code works as intended, check of the item checkbox in the plan doc and commit with a short message.
 
-as a reminder, we're focusing on Metal backend (this pc has 8GB free, m1 pro), so skip CUDA-related items.
+Notes:
+- we're focusing on Metal backend (this pc has 8GB free, m1 pro), so skip CUDA-related items.
+- focus on implementation. Don't write unit tests, we do periodic extensive QA testing with temporary probes.
+- if there is not further item to work on, return "WORK DONE".
 
 write good code.`;
 
 const QA_PROMPT = `read the context in @docs/implementation_plan.md @docs/architecture.md
 @docs/foundations.md.
 
-QA checkpoint: stress test the codebase to ensure the last 5 implementation checkboxes are properly working as expected. Run targeted and broader tests as needed. If anything fails or behaves incorrectly, find the root cause and fix it.
+QA checkpoint: stress test the code to ensure the last 5 implementation checkboxes are properly working as expected. Write temporary probes under data.tmp/probes and delete them at the end of turn.
+If anything fails or behaves incorrectly, find the root cause and fix it.
 
 write good code.`;
 
@@ -304,6 +308,12 @@ export default function (pi: ExtensionAPI) {
 		return undefined;
 	}
 
+	function hasWorkDoneMessage(messages: readonly MessageLike[]): boolean {
+		return messages.some(
+			(message) => message.role === "assistant" && getTextContent(message.content).toUpperCase().includes("WORK DONE"),
+		);
+	}
+
 	pi.on("session_start", (_event, ctx) => {
 		setStatus(ctx, running ? (qaDue ? `implementation-loop QA after #${iteration}` : `implementation-loop #${iteration}`) : undefined);
 	});
@@ -318,7 +328,13 @@ export default function (pi: ExtensionAPI) {
 
 		try {
 			const expectedRunId = runId;
-			const agentError = findAgentError(event.messages as readonly MessageLike[]);
+			const messages = event.messages as readonly MessageLike[];
+			if (hasWorkDoneMessage(messages)) {
+				stopLoop(ctx, `/${COMMAND} stopped: WORK DONE.`, "info");
+				return;
+			}
+
+			const agentError = findAgentError(messages);
 			if (!agentError) {
 				retryCount = 0;
 				clearRetryTimeout();
