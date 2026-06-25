@@ -160,8 +160,8 @@ Implementation status:
 - [ ] Use MPSNDArray matrix multiplication for decoder prefill QKV, O projection, dense layer-0 MLP, shared experts, routed experts, and LM head prefill-size GEMMs.
 - [x] Add f32 MPSNDArray matmul support for decoder prefill router logits and row-batched LM-head logits.
 - [ ] Use custom tiled single-token kernels for decode QKV, O projection, dense layer-0 MLP, router, shared experts, routed experts, combine, and LM-head argmax.
-- [ ] Store no-repeat history in a reusable GPU sequence buffer.
-- [ ] Use the GPU-written token slot directly for generated-token embedding.
+- [x] Store no-repeat history in a reusable GPU sequence buffer.
+- [x] Use the GPU-written token slot directly for generated-token embedding.
 - [ ] Fuse decode epilogues into fixed kernels: projection bias, residual add, MoE combine, and final hidden copy.
 - [x] Add detailed timing for token gather, image-span blit, prefill command encoding, prefill wait, decode layer kernels, and token readback.
 - [ ] Validate fixed-prompt generated ids and `docs/test.png` text before deleting old kernels.
