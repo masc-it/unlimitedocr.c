@@ -74,6 +74,30 @@ static int add_chunk(uocr_vision_chunk *chunks,
     return 1;
 }
 
+uint32_t uocr_default_vision_max_views_per_chunk(const uocr_prepared_request *request) {
+    if (request == NULL || request->n_views == 0u || request->views == NULL) {
+        return 1u;
+    }
+
+    uint32_t local_views = 0u;
+    uint32_t global_views = 0u;
+    for (uint32_t i = 0u; i < request->n_views; ++i) {
+        if (request->views[i].kind == UOCR_VIEW_LOCAL) {
+            ++local_views;
+        } else if (request->views[i].kind == UOCR_VIEW_GLOBAL) {
+            ++global_views;
+        }
+    }
+
+    if (local_views != 0u) {
+        return local_views;
+    }
+    if (global_views != 0u) {
+        return global_views;
+    }
+    return 1u;
+}
+
 int uocr_plan_vision_schedule(const uocr_prepared_request *request,
                               uint32_t max_views_per_chunk,
                               uocr_vision_chunk *chunks,

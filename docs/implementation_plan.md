@@ -75,7 +75,7 @@ vision graph per shape group.
 Current finding:
 
 - [x] Public image generation enters `uocr_metal_context_generate_image_f16()`.
-- [x] `src/core/uocr_api.c` hardcodes `max_views_per_chunk = 1u` in both schedule planning and Metal dispatch.
+- [x] `src/core/uocr_api.c` now computes a same-shape chunk limit for both schedule planning and Metal dispatch.
 - [x] `metal_project_vision_chunk_f16()` loops over views and calls `metal_encode_one_view_projected_f16()` serially.
 - [x] `max_views_per_chunk` is currently scheduling metadata only; it does not create true batched SAM/CLIP execution.
 - [x] Production vision has reusable top-level workspace slices, but helpers still retain pointer-oriented inputs/outputs and wait per operation.
@@ -83,7 +83,7 @@ Current finding:
 
 Implementation status:
 
-- [ ] Change public image generation to pass the full same-shape batch size into `uocr_plan_vision_schedule()` and `uocr_metal_context_generate_image_f16()`.
+- [x] Change public image generation to pass the full same-shape batch size into `uocr_plan_vision_schedule()` and `uocr_metal_context_generate_image_f16()`.
 - [ ] Partition each request into exactly two shape groups: all local `640x640` views, then all global `1024x1024` views.
 - [ ] Add a batch dimension to SAM patch, SAM transformer, SAM neck, CLIP embedding, CLIP transformer, concat, projector, and formatter dispatch.
 - [ ] Encode the entire local shape group in one command buffer.

@@ -45,6 +45,14 @@ typedef int (*uocr_vision_project_chunk_f16_fn)(const uocr_vision_chunk *chunk,
                                                 size_t error_size);
 
 /*
+ * Return the production chunk limit for the fixed same-shape batching policy:
+ * all local 640x640 views in one chunk, and all global 1024x1024 views in one
+ * chunk for global-only requests. Invalid requests still return a safe non-zero
+ * default; validation errors are reported by uocr_plan_vision_schedule().
+ */
+uint32_t uocr_default_vision_max_views_per_chunk(const uocr_prepared_request *request);
+
+/*
  * Build the view-processing schedule used by the Metal vision bring-up path.
  *
  * The prepared request is validated with unbounded token/generation limits before
