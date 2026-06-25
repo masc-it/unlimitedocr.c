@@ -2210,7 +2210,6 @@ static int metal_decoder_binding_cache_build_direct(uocr_metal_context *ctx,
         return 0;
     }
 
-    const uint64_t slab_validation_start_ns = uocr_profile_now_ns();
     for (uint32_t layer = 1u; layer < UOCR_DECODER_LAYERS; ++layer) {
         uocr_metal_decoder_layer_binding_cache *layer_cache = &cache->layers[layer];
         if (!metal_decoder_binding_cache_require_index(cache,
@@ -2236,16 +2235,21 @@ static int metal_decoder_binding_cache_build_direct(uocr_metal_context *ctx,
                                                        "MoE shared down",
                                                        &layer_cache->moe_shared_down,
                                                        error,
-                                                       error_size) ||
-            !metal_decoder_binding_cache_validate_expert_slab(cache,
+                                                       error_size)) {
+            return 0;
+        }
+        const uint64_t expert_slab_validation_start_ns = uocr_profile_now_ns();
+        if (!metal_decoder_binding_cache_validate_expert_slab(cache,
                                                               layer,
                                                               &layer_cache->expert_slab,
                                                               error,
                                                               error_size)) {
             return 0;
         }
+        metal_profile_add_event_now(ctx,
+                                    "metal.decoder_binding_cache.expert_slab_validation",
+                                    expert_slab_validation_start_ns);
     }
-    metal_profile_add_event_now(ctx, "metal.decoder_binding_cache.expert_slab_validation", slab_validation_start_ns);
     return 1;
 }
 
@@ -5891,6 +5895,8 @@ static const uocr_metal_decoder_binding *metal_require_decoder_binding_index(con
                                                                              const char *label,
                                                                              char *error,
                                                                              size_t error_size) {
+    const int profile_on = metal_profile_enabled(ctx);
+    const uint64_t lookup_start_ns = profile_on ? uocr_profile_now_ns() : 0u;
     if (ctx == NULL || !ctx->decoder_bindings.valid || binding_index >= ctx->decoder_bindings.count) {
         (void)metal_fail(error, error_size, "missing cached decoder tensor for %s", label != NULL ? label : "binding");
         return NULL;
@@ -5903,6 +5909,9 @@ static const uocr_metal_decoder_binding *metal_require_decoder_binding_index(con
                          label != NULL ? label : "binding",
                          binding->tensor_id);
         return NULL;
+    }
+    if (profile_on) {
+        metal_profile_add_event_now(ctx, "metal.decoder_binding_cache.direct_lookup", lookup_start_ns);
     }
     return binding;
 }

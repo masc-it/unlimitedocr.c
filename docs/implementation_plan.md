@@ -179,7 +179,7 @@ Implementation status:
 - [x] Build direct decoder binding structs at model map time: per-layer norms, Q/K/V/O, layer-0 MLP, each MoE router/shared, and each routed expert slab.
 - [x] Validate MoE expert contiguity once during binding, cache one slab slice per MoE layer, and remove per-token expert-slab scans.
 - [x] Replace linear tensor-id lookup in hot decode/prefill with direct cached pointers/slices.
-- [ ] Add profiling counters for binding lookup and expert-slab validation before removal.
+- [x] Add profiling counters for binding lookup and expert-slab validation before removal.
 - [x] Delete the old hot-path lookup path after cached bindings are validated.
 
 ## 6. Convert vision weights to direct Metal slices
