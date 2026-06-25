@@ -5,6 +5,8 @@ import pytest
 
 from unlimitedocr_c.parity_thresholds import (
     CLIP_FEATURE_FP16,
+    DYN_Q4_PARITY,
+    DYN_Q8_PARITY,
     FINAL_VISUAL_FEATURE_FP16,
     GENERATED_IDS_FP16,
     LOGITS_TOPK_FP16,
@@ -12,11 +14,15 @@ from unlimitedocr_c.parity_thresholds import (
     PROMPT_EMBEDDING_FP16,
     ROUTER_TOPK_FP16,
     SAM_FEATURE_FP16,
+    character_error_rate,
     compare_f16_feature_bits,
+    infer_quant_thresholds_from_label,
+    quant_thresholds_for_profile,
     require_exact_generated_ids,
     require_exact_text,
     require_f16_feature_close,
     require_logits_topk_close,
+    require_quant_generated_text_stable,
     require_router_topk_close,
 )
 
@@ -101,6 +107,64 @@ def test_router_and_logits_threshold_helpers_enforce_exact_ids_and_score_bounds(
         require_logits_topk_close(logit_ids, logit_ids + np.int32(1), scores, scores)
     with pytest.raises(AssertionError, match="logits_topk score mismatch"):
         require_logits_topk_close(logit_ids, logit_ids, scores + np.float32(0.1), scores)
+
+
+def test_quant_threshold_profiles_cover_router_logits_and_generated_text() -> None:
+    assert DYN_Q8_PARITY.profile == "dyn-q8"
+    assert DYN_Q4_PARITY.profile == "dyn-q4"
+    assert DYN_Q8_PARITY.router.min_mean_set_overlap > DYN_Q4_PARITY.router.min_mean_set_overlap
+    assert DYN_Q8_PARITY.generated.require_exact_ids is True
+    assert DYN_Q4_PARITY.generated.require_exact_ids is False
+    assert DYN_Q4_PARITY.generated.max_char_error_rate is not None
+    assert quant_thresholds_for_profile("DYN-Q8") is DYN_Q8_PARITY
+    assert infer_quant_thresholds_from_label("metal-dyn-q4-candidate") is DYN_Q4_PARITY
+    assert infer_quant_thresholds_from_label("metal-q8_0-candidate") is DYN_Q8_PARITY
+    assert infer_quant_thresholds_from_label("fp16") is None
+    with pytest.raises(ValueError, match="unknown quant parity profile"):
+        quant_thresholds_for_profile("q2")
+
+
+def test_quant_threshold_profiles_report_router_logits_and_text_failures() -> None:
+    router_failures = DYN_Q8_PARITY.router.failures(
+        mean_set_overlap=0.50,
+        ordered_id_agreement=0.25,
+        row_exact_agreement=0.0,
+        weight_rmse=0.1,
+        weight_max_abs=0.2,
+        label="router",
+    )
+    assert any("mean_set_overlap" in failure for failure in router_failures)
+    assert any("weight_max_abs" in failure for failure in router_failures)
+
+    logits_failures = DYN_Q4_PARITY.logits.failures(
+        set_overlap=0.25,
+        ordered_id_agreement=0.0,
+        top1_match=False,
+        score_rmse=1.0,
+        score_max_abs=2.0,
+        truncated_kl=1.0,
+        label="logits",
+    )
+    assert any("top1 token changed" in failure for failure in logits_failures)
+    assert any("truncated_kl" in failure for failure in logits_failures)
+
+    stable_text = "<|det|>invoice total<|/det|>"
+    require_quant_generated_text_stable(stable_text, stable_text, DYN_Q4_PARITY.generated)
+    assert character_error_rate("abcd", "abxd") == pytest.approx(0.25)
+
+    text_failures = DYN_Q4_PARITY.generated.failures(
+        reference_length=100,
+        candidate_length=120,
+        exact_match=False,
+        longest_common_prefix=10,
+        reference_text="<|det|>invoice total<|/det|>",
+        candidate_text="invoice t0tal",
+        label="generated",
+    )
+    assert any("longest_common_prefix_ratio" in failure for failure in text_failures)
+    assert any("layout marker" in failure for failure in text_failures)
+    with pytest.raises(AssertionError, match="layout marker"):
+        require_quant_generated_text_stable("<|det|>abc<|/det|>", "abc", DYN_Q4_PARITY.generated)
 
 
 def test_generated_id_and_text_thresholds_are_exact() -> None:

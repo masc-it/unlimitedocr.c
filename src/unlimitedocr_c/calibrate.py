@@ -20,6 +20,12 @@ import numpy as np
 from numpy.typing import NDArray
 
 from .drift import CandidateDriftReport, compare_candidate_layer_drift
+from .parity_thresholds import (
+    QUANT_PARITY_THRESHOLDS,
+    QuantParityThresholds,
+    infer_quant_thresholds_from_label,
+    quant_thresholds_for_profile,
+)
 from .golden import (
     GENERATED_IDS_BIN,
     GENERATED_TEXT_TXT,
@@ -646,6 +652,12 @@ def _format_summary(report: CalibrationReport) -> str:
     return "\n".join(lines)
 
 
+def _resolve_quant_thresholds(profile: str, candidate_label: str) -> QuantParityThresholds | None:
+    if profile == "auto":
+        return infer_quant_thresholds_from_label(candidate_label)
+    return quant_thresholds_for_profile(profile)
+
+
 def _threshold_failures(
     report: CalibrationReport,
     *,
@@ -655,6 +667,7 @@ def _threshold_failures(
     min_router_set_overlap: float | None,
     min_logits_set_overlap: float | None,
     require_generated_match: bool,
+    quant_threshold_profile: str | None,
 ) -> list[str]:
     failures: list[str] = []
     for case in report.cases:
@@ -693,6 +706,54 @@ def _threshold_failures(
                         f"{prefix}: generated ids differ at lcp "
                         f"{candidate.generated_ids.longest_common_prefix}/{candidate.generated_ids.reference_length}"
                     )
+            if quant_threshold_profile is not None:
+                thresholds = _resolve_quant_thresholds(quant_threshold_profile, candidate.label)
+                if thresholds is None:
+                    failures.append(f"{prefix}: cannot infer q8/q4 threshold profile from label {candidate.label!r}")
+                    continue
+                if not candidate.layer_drift.router_metrics:
+                    failures.append(f"{prefix}:{thresholds.profile}: missing router top-k metrics")
+                for router in candidate.layer_drift.router_metrics:
+                    failures.extend(
+                        thresholds.router.failures(
+                            mean_set_overlap=router.mean_set_overlap,
+                            ordered_id_agreement=router.ordered_id_agreement,
+                            row_exact_agreement=router.row_exact_agreement,
+                            weight_rmse=router.weight_rmse,
+                            weight_max_abs=router.weight_max_abs,
+                            label=f"{prefix}:{thresholds.profile}:layer_{router.layer}_router_topk",
+                        )
+                    )
+                if candidate.logits_topk is None:
+                    failures.append(f"{prefix}:{thresholds.profile}: missing logits_topk metrics")
+                else:
+                    logits = candidate.logits_topk
+                    failures.extend(
+                        thresholds.logits.failures(
+                            set_overlap=logits.set_overlap,
+                            ordered_id_agreement=logits.ordered_id_agreement,
+                            top1_match=logits.top1_match,
+                            score_rmse=logits.score_rmse_by_rank,
+                            score_max_abs=logits.score_max_abs_by_rank,
+                            truncated_kl=logits.truncated_kl_ref_to_candidate,
+                            label=f"{prefix}:{thresholds.profile}:logits_topk",
+                        )
+                    )
+                if candidate.generated_ids is None:
+                    failures.append(f"{prefix}:{thresholds.profile}: missing generated_ids metrics")
+                else:
+                    generated = candidate.generated_ids
+                    failures.extend(
+                        thresholds.generated.failures(
+                            reference_length=generated.reference_length,
+                            candidate_length=generated.candidate_length,
+                            exact_match=generated.exact_match,
+                            longest_common_prefix=generated.longest_common_prefix,
+                            reference_text=generated.reference_text,
+                            candidate_text=generated.candidate_text,
+                            label=f"{prefix}:{thresholds.profile}:generated_ocr",
+                        )
+                    )
     return failures
 
 
@@ -719,6 +780,12 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument("--min-router-set-overlap", type=float, default=None)
     parser.add_argument("--min-logits-set-overlap", type=float, default=None)
     parser.add_argument("--require-generated-match", action="store_true")
+    parser.add_argument(
+        "--threshold-profile",
+        choices=("auto", *sorted(QUANT_PARITY_THRESHOLDS)),
+        default=None,
+        help="apply the shared q8/q4 parity gate to each candidate; 'auto' infers from candidate labels",
+    )
     return parser.parse_args(list(argv))
 
 
@@ -766,6 +833,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         min_router_set_overlap=args.min_router_set_overlap,
         min_logits_set_overlap=args.min_logits_set_overlap,
         require_generated_match=args.require_generated_match,
+        quant_threshold_profile=args.threshold_profile,
     )
     if failures:
         for failure in failures:

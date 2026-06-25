@@ -165,6 +165,44 @@ def test_load_corpus_manifest_resolves_relative_paths(tmp_path) -> None:
     assert cases[0].candidates["dyn-q8"] == str(tmp_path / "dyn-q8" / "case")
 
 
+def test_calibration_cli_applies_named_quant_threshold_profile(tmp_path, capsys) -> None:
+    ref_layers = [np.zeros((1, 4), dtype=np.float32), np.ones((1, 4), dtype=np.float32)]
+    ref = tmp_path / "fp16"
+    good = tmp_path / "dyn-q8-good"
+    bad = tmp_path / "dyn-q8-bad"
+    _write_calibration_fixture(
+        ref,
+        ref_layers,
+        logits_ids=[1, 2, 3, 4],
+        logits_scores=[4.0, 3.0, 2.0, 1.0],
+        generated_ids=[1, 2, 3],
+        generated_text="<|det|>invoice<|/det|>",
+    )
+    _write_calibration_fixture(
+        good,
+        ref_layers,
+        logits_ids=[1, 2, 3, 4],
+        logits_scores=[4.0, 3.0, 2.0, 1.0],
+        generated_ids=[1, 2, 3],
+        generated_text="<|det|>invoice<|/det|>",
+    )
+    _write_calibration_fixture(
+        bad,
+        ref_layers,
+        logits_ids=[1, 3, 2, 5],
+        logits_scores=[3.5, 2.5, 2.0, 1.0],
+        generated_ids=[1, 2, 99],
+        generated_text="invoice",
+        router_variant="candidate",
+    )
+
+    assert main(["--fp16-dir", str(ref), "--candidate", f"dyn-q8={good}", "--threshold-profile", "dyn-q8"]) == 0
+    assert main(["--fp16-dir", str(ref), "--candidate", f"dyn-q8={bad}", "--threshold-profile", "auto"]) == 2
+    captured = capsys.readouterr()
+    assert "dyn-q8:layer_1_router_topk" in captured.err
+    assert "dyn-q8:generated_ocr" in captured.err
+
+
 def test_calibration_cli_writes_json_and_enforces_thresholds(tmp_path, capsys) -> None:
     ref = tmp_path / "fp16"
     cand = tmp_path / "dyn-q8"

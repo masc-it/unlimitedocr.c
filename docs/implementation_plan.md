@@ -1008,10 +1008,10 @@ Do not start the stable high-level OCR/PDF API until Gate E2E-0 passes: public f
   - [x] router top-6: exact ids for fp16 baseline
   - [x] logits: top-k agreement and bounded max error
   - [x] generated ids: exact for deterministic greedy smoke fixtures where possible
-- [ ] Define q8/q4 parity thresholds separately:
-  - [ ] router top-6 agreement must remain high because router itself is fp16
-  - [ ] logits top-k/KL within calibrated thresholds
-  - [ ] generated OCR text/layout stable on calibration set
+- [x] Define q8/q4 parity thresholds separately:
+  - [x] router top-6 agreement must remain high because router itself is fp16
+  - [x] logits top-k/KL within calibrated thresholds
+  - [x] generated OCR text/layout stable on calibration set
 - [ ] Add perf smoke tests:
   - [ ] model open time
   - [ ] first-token latency after warmup

@@ -1,17 +1,18 @@
-"""Shared fp16 parity thresholds for Metal-vs-Python fixture checks.
+"""Shared parity thresholds for Metal-vs-Python fixture checks.
 
-These values define the v1 acceptance policy for fp16 parity.  They are kept in
-one place so stage tests do not silently drift apart.  Tests may still relax or
-tighten numeric feature tolerances with the documented ``<ENV_PREFIX>_*``
-environment variables when investigating a new fixture, but exact-id contracts
-(router ids and generated ids) are intentionally not relaxed by default.
+These values define the v1 acceptance policy for fp16 parity and the first
+quantized parity gates.  They are kept in one place so stage tests do not
+silently drift apart.  Tests may still relax or tighten numeric fp16 feature
+tolerances with the documented ``<ENV_PREFIX>_*`` environment variables when
+investigating a new fixture, but exact-id fp16 contracts are intentionally not
+relaxed by default.
 """
 
 from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import Mapping
+from typing import Mapping, Sequence
 
 import numpy as np
 from numpy.typing import NDArray
@@ -96,6 +97,183 @@ class GeneratedIdsThreshold:
     require_text_exact: bool = True
 
 
+OCR_LAYOUT_MARKERS = ("<|ref|>", "<|/ref|>", "<|det|>", "<|/det|>", "<|grounding|>")
+
+
+@dataclass(frozen=True)
+class QuantRouterTopKThreshold:
+    """Acceptance policy for quantized router top-k drift.
+
+    Router weights stay fp16 in q8/q4 profiles, so top-k drift mainly indicates
+    hidden-state drift from earlier quantized projections.  We allow rare order
+    changes but require very high set overlap because routed experts dominate
+    downstream behavior.
+    """
+
+    profile: str
+    stage: str = "router_top6"
+    min_mean_set_overlap: float = 1.0
+    min_ordered_id_agreement: float = 1.0
+    min_row_exact_agreement: float = 1.0
+    max_weight_rmse: float = 0.0
+    max_weight_abs: float = 0.0
+
+    def failures(
+        self,
+        *,
+        mean_set_overlap: float,
+        ordered_id_agreement: float,
+        row_exact_agreement: float,
+        weight_rmse: float,
+        weight_max_abs: float,
+        label: str | None = None,
+    ) -> tuple[str, ...]:
+        prefix = label or f"{self.profile}:{self.stage}"
+        failures: list[str] = []
+        if mean_set_overlap < self.min_mean_set_overlap:
+            failures.append(
+                f"{prefix} mean_set_overlap {mean_set_overlap:.6g} < {self.min_mean_set_overlap:.6g}"
+            )
+        if ordered_id_agreement < self.min_ordered_id_agreement:
+            failures.append(
+                f"{prefix} ordered_id_agreement {ordered_id_agreement:.6g} < "
+                f"{self.min_ordered_id_agreement:.6g}"
+            )
+        if row_exact_agreement < self.min_row_exact_agreement:
+            failures.append(
+                f"{prefix} row_exact_agreement {row_exact_agreement:.6g} < {self.min_row_exact_agreement:.6g}"
+            )
+        if weight_rmse > self.max_weight_rmse:
+            failures.append(f"{prefix} weight_rmse {weight_rmse:.6g} > {self.max_weight_rmse:.6g}")
+        if weight_max_abs > self.max_weight_abs:
+            failures.append(f"{prefix} weight_max_abs {weight_max_abs:.6g} > {self.max_weight_abs:.6g}")
+        return tuple(failures)
+
+
+@dataclass(frozen=True)
+class QuantLogitsTopKThreshold:
+    """Acceptance policy for compact top-k next-token logit dumps."""
+
+    profile: str
+    stage: str = "logits_topk"
+    min_set_overlap: float = 1.0
+    min_ordered_id_agreement: float = 1.0
+    require_top1_match: bool = True
+    max_score_rmse: float = 0.0
+    max_score_abs: float = 0.0
+    max_truncated_kl: float = 0.0
+
+    def failures(
+        self,
+        *,
+        set_overlap: float,
+        ordered_id_agreement: float,
+        top1_match: bool,
+        score_rmse: float,
+        score_max_abs: float,
+        truncated_kl: float,
+        label: str | None = None,
+    ) -> tuple[str, ...]:
+        prefix = label or f"{self.profile}:{self.stage}"
+        failures: list[str] = []
+        if set_overlap < self.min_set_overlap:
+            failures.append(f"{prefix} set_overlap {set_overlap:.6g} < {self.min_set_overlap:.6g}")
+        if ordered_id_agreement < self.min_ordered_id_agreement:
+            failures.append(
+                f"{prefix} ordered_id_agreement {ordered_id_agreement:.6g} < "
+                f"{self.min_ordered_id_agreement:.6g}"
+            )
+        if self.require_top1_match and not top1_match:
+            failures.append(f"{prefix} top1 token changed")
+        if score_rmse > self.max_score_rmse:
+            failures.append(f"{prefix} score_rmse {score_rmse:.6g} > {self.max_score_rmse:.6g}")
+        if score_max_abs > self.max_score_abs:
+            failures.append(f"{prefix} score_max_abs {score_max_abs:.6g} > {self.max_score_abs:.6g}")
+        if truncated_kl > self.max_truncated_kl:
+            failures.append(f"{prefix} truncated_kl {truncated_kl:.6g} > {self.max_truncated_kl:.6g}")
+        return tuple(failures)
+
+
+@dataclass(frozen=True)
+class QuantGeneratedTextThreshold:
+    """Acceptance policy for generated ids and decoded OCR text on a corpus."""
+
+    profile: str
+    stage: str = "generated_ocr"
+    require_exact_ids: bool = False
+    min_longest_common_prefix_ratio: float = 1.0
+    max_length_delta: int = 0
+    require_text_exact: bool = False
+    max_char_error_rate: float | None = None
+    require_layout_marker_counts: bool = True
+    layout_markers: tuple[str, ...] = OCR_LAYOUT_MARKERS
+
+    def failures(
+        self,
+        *,
+        reference_length: int,
+        candidate_length: int,
+        exact_match: bool,
+        longest_common_prefix: int,
+        reference_text: str | None = None,
+        candidate_text: str | None = None,
+        label: str | None = None,
+    ) -> tuple[str, ...]:
+        prefix = label or f"{self.profile}:{self.stage}"
+        failures: list[str] = []
+        if self.require_exact_ids and not exact_match:
+            failures.append(f"{prefix} generated ids are not exact")
+        ref_len = int(reference_length)
+        cand_len = int(candidate_length)
+        lcp = int(longest_common_prefix)
+        if ref_len < 0 or cand_len < 0 or lcp < 0:
+            failures.append(f"{prefix} generated length metrics are invalid")
+            return tuple(failures)
+        lcp_ratio = 1.0 if ref_len == 0 and cand_len == 0 else (float(lcp) / float(max(1, ref_len)))
+        if lcp_ratio < self.min_longest_common_prefix_ratio:
+            failures.append(
+                f"{prefix} longest_common_prefix_ratio {lcp_ratio:.6g} < "
+                f"{self.min_longest_common_prefix_ratio:.6g}"
+            )
+        length_delta = abs(ref_len - cand_len)
+        if length_delta > self.max_length_delta:
+            failures.append(f"{prefix} length_delta {length_delta} > {self.max_length_delta}")
+
+        has_text = reference_text is not None or candidate_text is not None
+        if not has_text:
+            return tuple(failures)
+        if reference_text is None or candidate_text is None:
+            failures.append(f"{prefix} generated text is present for only one side")
+            return tuple(failures)
+        if self.require_text_exact and reference_text != candidate_text:
+            failures.append(f"{prefix} generated text is not exact")
+        if self.max_char_error_rate is not None:
+            cer = character_error_rate(reference_text, candidate_text)
+            if cer > self.max_char_error_rate:
+                failures.append(f"{prefix} char_error_rate {cer:.6g} > {self.max_char_error_rate:.6g}")
+        if self.require_layout_marker_counts:
+            for marker in self.layout_markers:
+                expected_count = reference_text.count(marker)
+                if expected_count == 0:
+                    continue
+                actual_count = candidate_text.count(marker)
+                if actual_count != expected_count:
+                    failures.append(
+                        f"{prefix} layout marker {marker!r} count {actual_count} != {expected_count}"
+                    )
+        return tuple(failures)
+
+
+@dataclass(frozen=True)
+class QuantParityThresholds:
+    """Named acceptance profile for q8/q4 Metal parity runs."""
+
+    profile: str
+    router: QuantRouterTopKThreshold
+    logits: QuantLogitsTopKThreshold
+    generated: QuantGeneratedTextThreshold
+
+
 # Feature thresholds currently exercised by Python/Metal parity tests.  Env var
 # names intentionally match the pre-existing public image parity overrides.
 PROMPT_EMBEDDING_FP16 = FeatureTolerance("prompt_embeddings", "UOCR_PROMPT_EMBED", 0.02, 0.005, 0.001, 0.02)
@@ -108,6 +286,74 @@ ROUTER_TOPK_FP16 = RouterTopKThreshold()
 LOGITS_TOPK_FP16 = LogitsTopKThreshold()
 GENERATED_IDS_FP16 = GeneratedIdsThreshold()
 
+# Initial quantized parity gates.  These are deliberately separate from the
+# fp16 exactness contract: q8 should be almost lossless and preserve deterministic
+# greedy text on smoke/calibration cases, while q4 is only accepted as a
+# calibrated mixed profile with high router/logit agreement and stable OCR text
+# structure.
+DYN_Q8_PARITY = QuantParityThresholds(
+    profile="dyn-q8",
+    router=QuantRouterTopKThreshold(
+        profile="dyn-q8",
+        min_mean_set_overlap=0.995,
+        min_ordered_id_agreement=0.98,
+        min_row_exact_agreement=0.95,
+        max_weight_rmse=2.0e-3,
+        max_weight_abs=2.5e-2,
+    ),
+    logits=QuantLogitsTopKThreshold(
+        profile="dyn-q8",
+        min_set_overlap=0.95,
+        min_ordered_id_agreement=0.80,
+        require_top1_match=True,
+        max_score_rmse=0.12,
+        max_score_abs=0.35,
+        max_truncated_kl=3.0e-2,
+    ),
+    generated=QuantGeneratedTextThreshold(
+        profile="dyn-q8",
+        require_exact_ids=True,
+        min_longest_common_prefix_ratio=1.0,
+        max_length_delta=0,
+        require_text_exact=True,
+        max_char_error_rate=0.0,
+    ),
+)
+
+DYN_Q4_PARITY = QuantParityThresholds(
+    profile="dyn-q4",
+    router=QuantRouterTopKThreshold(
+        profile="dyn-q4",
+        min_mean_set_overlap=0.97,
+        min_ordered_id_agreement=0.90,
+        min_row_exact_agreement=0.75,
+        max_weight_rmse=1.0e-2,
+        max_weight_abs=8.0e-2,
+    ),
+    logits=QuantLogitsTopKThreshold(
+        profile="dyn-q4",
+        min_set_overlap=0.90,
+        min_ordered_id_agreement=0.60,
+        require_top1_match=True,
+        max_score_rmse=0.25,
+        max_score_abs=0.75,
+        max_truncated_kl=1.0e-1,
+    ),
+    generated=QuantGeneratedTextThreshold(
+        profile="dyn-q4",
+        require_exact_ids=False,
+        min_longest_common_prefix_ratio=0.90,
+        max_length_delta=8,
+        require_text_exact=False,
+        max_char_error_rate=2.0e-2,
+    ),
+)
+
+QUANT_PARITY_THRESHOLDS: dict[str, QuantParityThresholds] = {
+    DYN_Q8_PARITY.profile: DYN_Q8_PARITY,
+    DYN_Q4_PARITY.profile: DYN_Q4_PARITY,
+}
+
 FP16_FEATURE_THRESHOLDS: dict[str, FeatureTolerance] = {
     PROMPT_EMBEDDING_FP16.stage: PROMPT_EMBEDDING_FP16,
     SAM_FEATURE_FP16.stage: SAM_FEATURE_FP16,
@@ -115,6 +361,84 @@ FP16_FEATURE_THRESHOLDS: dict[str, FeatureTolerance] = {
     PROJECTED_FEATURE_FP16.stage: PROJECTED_FEATURE_FP16,
     FINAL_VISUAL_FEATURE_FP16.stage: FINAL_VISUAL_FEATURE_FP16,
 }
+
+
+def quant_thresholds_for_profile(profile: str) -> QuantParityThresholds:
+    """Return the named quantized parity threshold profile."""
+
+    normalized = profile.strip().lower()
+    try:
+        return QUANT_PARITY_THRESHOLDS[normalized]
+    except KeyError as exc:
+        known = ", ".join(sorted(QUANT_PARITY_THRESHOLDS))
+        raise ValueError(f"unknown quant parity profile {profile!r}; expected one of: {known}") from exc
+
+
+def infer_quant_thresholds_from_label(label: str) -> QuantParityThresholds | None:
+    """Infer a q8/q4 threshold profile from a candidate label, if possible."""
+
+    normalized = label.strip().lower().replace("_", "-")
+    if "q4" in normalized or "int4" in normalized:
+        return DYN_Q4_PARITY
+    if "q8" in normalized or "int8" in normalized or "q8-0" in normalized:
+        return DYN_Q8_PARITY
+    return None
+
+
+def levenshtein_distance(left: str, right: str) -> int:
+    """Compute edit distance without optional dependencies."""
+
+    if left == right:
+        return 0
+    if len(left) < len(right):
+        left, right = right, left
+    previous = list(range(len(right) + 1))
+    for row, left_char in enumerate(left, start=1):
+        current = [row]
+        for col, right_char in enumerate(right, start=1):
+            insert = current[col - 1] + 1
+            delete = previous[col] + 1
+            replace = previous[col - 1] + (0 if left_char == right_char else 1)
+            current.append(min(insert, delete, replace))
+        previous = current
+    return previous[-1]
+
+
+def character_error_rate(reference: str, candidate: str) -> float:
+    """Return Levenshtein CER normalized by reference length."""
+
+    if reference == candidate:
+        return 0.0
+    return float(levenshtein_distance(reference, candidate)) / float(max(1, len(reference)))
+
+
+def require_quant_generated_text_stable(
+    reference_text: str,
+    candidate_text: str,
+    threshold: QuantGeneratedTextThreshold,
+    *,
+    label: str | None = None,
+) -> None:
+    failures = threshold.failures(
+        reference_length=len(reference_text),
+        candidate_length=len(candidate_text),
+        exact_match=reference_text == candidate_text,
+        longest_common_prefix=_common_prefix_length(reference_text, candidate_text),
+        reference_text=reference_text,
+        candidate_text=candidate_text,
+        label=label,
+    )
+    if failures:
+        raise AssertionError("; ".join(failures))
+
+
+def _common_prefix_length(left: Sequence[object], right: Sequence[object]) -> int:
+    prefix = 0
+    for left_value, right_value in zip(left, right, strict=False):
+        if left_value != right_value:
+            break
+        prefix += 1
+    return prefix
 
 
 def compare_f16_feature_bits(
