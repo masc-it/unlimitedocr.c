@@ -437,6 +437,13 @@ typedef struct uocr_metal_dense_params {
     uint32_t has_bias;
 } uocr_metal_dense_params;
 
+typedef struct uocr_metal_bias_add_params {
+    uint32_t rows;
+    uint32_t cols;
+    uint32_t reserved0;
+    uint32_t reserved1;
+} uocr_metal_bias_add_params;
+
 typedef struct uocr_metal_dense_q8_params {
     uint32_t input_rows;
     uint32_t logical_in_features;
@@ -4803,6 +4810,134 @@ static int metal_run_residual_add_f16(uocr_metal_context *ctx,
     }
 }
 
+static int metal_run_bias_add_f16_inplace(uocr_metal_context *ctx,
+                                           uocr_metal_buffer_slice dst,
+                                           uocr_metal_buffer_slice bias,
+                                           uint32_t rows,
+                                           uint32_t cols,
+                                           const char *op_name,
+                                           char *error,
+                                           size_t error_size) {
+    uint64_t value_count = 0u;
+    uint64_t dst_bytes = 0u;
+    uint64_t bias_bytes = 0u;
+    if (ctx == NULL || rows == 0u || cols == 0u ||
+        !checked_mul_u64((uint64_t)rows, (uint64_t)cols, &value_count) ||
+        !checked_mul_u64(value_count, 2u, &dst_bytes) ||
+        !checked_mul_u64((uint64_t)cols, 2u, &bias_bytes) ||
+        value_count > (uint64_t)UINT32_MAX || !metal_slice_valid(dst, dst_bytes) ||
+        !metal_slice_valid(bias, bias_bytes)) {
+        return metal_fail(error, error_size, "invalid %s bias-add request", op_name != NULL ? op_name : "Metal");
+    }
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, "uocr_bias_add_f16_inplace", error, error_size);
+        if (pipeline == nil) {
+            return 0;
+        }
+        int owned_command_buffer = 0;
+        id<MTLCommandBuffer> cb = metal_command_buffer_for_op(ctx, &owned_command_buffer, op_name != NULL ? op_name : "bias add", error, error_size);
+        if (cb == nil) {
+            return 0;
+        }
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        if (enc == nil) {
+            return metal_fail(error, error_size, "failed to create %s bias-add command encoder", op_name != NULL ? op_name : "Metal");
+        }
+        uocr_metal_bias_add_params params;
+        params.rows = rows;
+        params.cols = cols;
+        params.reserved0 = 0u;
+        params.reserved1 = 0u;
+        NSUInteger threads = pipeline.threadExecutionWidth;
+        if (threads == 0u) threads = 1u;
+        if (threads > 256u) threads = 256u;
+        [enc setComputePipelineState:pipeline];
+        [enc setBuffer:dst.buffer offset:dst.offset atIndex:0u];
+        [enc setBuffer:bias.buffer offset:bias.offset atIndex:1u];
+        [enc setBytes:&params length:sizeof(params) atIndex:2u];
+        [enc dispatchThreads:MTLSizeMake((NSUInteger)value_count, 1u, 1u)
+       threadsPerThreadgroup:MTLSizeMake(threads, 1u, 1u)];
+        [enc endEncoding];
+        return metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, op_name != NULL ? op_name : "bias add", error, error_size);
+    }
+}
+
+static int metal_run_packed_qkv_mps_f16(uocr_metal_context *ctx,
+                                         uocr_metal_buffer_slice src,
+                                         uocr_metal_buffer_slice packed_weight,
+                                         uocr_metal_buffer_slice packed_bias,
+                                         uocr_metal_buffer_slice q_dst,
+                                         uocr_metal_buffer_slice k_dst,
+                                         uocr_metal_buffer_slice v_dst,
+                                         uint32_t rows,
+                                         uint32_t hidden_size,
+                                         const char *op_name,
+                                         char *error,
+                                         size_t error_size) {
+    uint64_t projection_values = 0u;
+    uint64_t projection_bytes = 0u;
+    uint64_t hidden_bytes = 0u;
+    if (ctx == NULL || rows == 0u || hidden_size == 0u ||
+        !checked_mul_u64((uint64_t)hidden_size, (uint64_t)hidden_size, &projection_values) ||
+        !checked_mul_u64(projection_values, 2u, &projection_bytes) ||
+        !checked_mul_u64((uint64_t)hidden_size, 2u, &hidden_bytes) ||
+        projection_bytes > (uint64_t)NSUIntegerMax || hidden_bytes > (uint64_t)NSUIntegerMax) {
+        return metal_fail(error, error_size, "invalid %s MPS QKV request", op_name != NULL ? op_name : "Metal");
+    }
+    const int had_active_batch = metal_command_batch_active(ctx);
+    if (!metal_command_batch_begin(ctx, error, error_size)) {
+        return 0;
+    }
+    int ok = 1;
+    for (uint32_t projection = 0u; projection < 3u && ok; ++projection) {
+        uint64_t weight_offset = 0u;
+        uint64_t bias_offset = 0u;
+        if (!checked_mul_u64((uint64_t)projection, projection_bytes, &weight_offset) ||
+            !checked_mul_u64((uint64_t)projection, hidden_bytes, &bias_offset)) {
+            ok = metal_fail(error, error_size, "%s MPS QKV offset overflow", op_name != NULL ? op_name : "Metal");
+            break;
+        }
+        uocr_metal_buffer_slice weight_slice = packed_weight;
+        uocr_metal_buffer_slice bias_slice = packed_bias;
+        if ((uint64_t)weight_slice.offset > (uint64_t)NSUIntegerMax - weight_offset ||
+            (uint64_t)bias_slice.offset > (uint64_t)NSUIntegerMax - bias_offset) {
+            ok = metal_fail(error, error_size, "%s MPS QKV offset exceeds NSUIntegerMax", op_name != NULL ? op_name : "Metal");
+            break;
+        }
+        weight_slice.offset += (NSUInteger)weight_offset;
+        bias_slice.offset += (NSUInteger)bias_offset;
+        uocr_metal_buffer_slice dst = projection == 0u ? q_dst : (projection == 1u ? k_dst : v_dst);
+        ok = metal_run_mps_matmul_nt_f16(ctx,
+                                         src,
+                                         weight_slice,
+                                         dst,
+                                         rows,
+                                         hidden_size,
+                                         hidden_size,
+                                         op_name,
+                                         error,
+                                         error_size) &&
+             metal_run_bias_add_f16_inplace(ctx,
+                                            dst,
+                                            bias_slice,
+                                            rows,
+                                            hidden_size,
+                                            op_name,
+                                            error,
+                                            error_size);
+    }
+    if (!ok) {
+        if (!had_active_batch) {
+            metal_command_batch_abort(ctx);
+        }
+        return 0;
+    }
+    if (!had_active_batch && !metal_command_batch_commit_and_wait(ctx, op_name != NULL ? op_name : "MPS QKV", error, error_size)) {
+        return 0;
+    }
+    return 1;
+}
+
 static const uocr_metal_decoder_binding *metal_require_decoder_binding(const uocr_metal_context *ctx,
                                                                        uint32_t tensor_id,
                                                                        const char *label,
@@ -8342,6 +8477,47 @@ int uocr_metal_context_sam_qkv_f16(uocr_metal_context *ctx,
         memset([k_dst contents], 0, (size_t)output_bytes);
         memset([v_dst contents], 0, (size_t)output_bytes);
 
+        if (output_type == UOCR_METAL_DENSE_OUTPUT_F16 &&
+            metal_mps_matmul_nt_f16_should_use(n_rows, UOCR_SAM_HIDDEN_SIZE, UOCR_SAM_HIDDEN_SIZE)) {
+            uocr_metal_buffer_slice src_slice = { src, 0u };
+            uocr_metal_buffer_slice weight_slice = { weight, 0u };
+            uocr_metal_buffer_slice bias_slice = { bias, 0u };
+            uocr_metal_buffer_slice q_slice = { q_dst, 0u };
+            uocr_metal_buffer_slice k_slice = { k_dst, 0u };
+            uocr_metal_buffer_slice v_slice = { v_dst, 0u };
+            if (!metal_run_packed_qkv_mps_f16(ctx,
+                                              src_slice,
+                                              weight_slice,
+                                              bias_slice,
+                                              q_slice,
+                                              k_slice,
+                                              v_slice,
+                                              n_rows,
+                                              UOCR_SAM_HIDDEN_SIZE,
+                                              "Metal SAM QKV MPS matmul",
+                                              error,
+                                              error_size)) {
+                [v_dst release];
+                [k_dst release];
+                [q_dst release];
+                [bias release];
+                [weight release];
+                [src release];
+                return 0;
+            }
+            memcpy(q_out, [q_dst contents], (size_t)output_bytes);
+            memcpy(k_out, [k_dst contents], (size_t)output_bytes);
+            memcpy(v_out, [v_dst contents], (size_t)output_bytes);
+            [v_dst release];
+            [k_dst release];
+            [q_dst release];
+            [bias release];
+            [weight release];
+            [src release];
+            metal_clear_error(error, error_size);
+            return 1;
+        }
+
         id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
         if (cb == nil) {
             [v_dst release];
@@ -9989,6 +10165,36 @@ int uocr_metal_context_clip_qkv_f16(uocr_metal_context *ctx,
         memset([q_dst contents], 0, (size_t)output_bytes);
         memset([k_dst contents], 0, (size_t)output_bytes);
         memset([v_dst contents], 0, (size_t)output_bytes);
+
+        if (output_type == UOCR_METAL_DENSE_OUTPUT_F16 &&
+            metal_mps_matmul_nt_f16_should_use(token_count, UOCR_CLIP_HIDDEN_SIZE, UOCR_CLIP_HIDDEN_SIZE)) {
+            uocr_metal_buffer_slice src_slice = { src, 0u };
+            uocr_metal_buffer_slice weight_slice = { weight, 0u };
+            uocr_metal_buffer_slice bias_slice = { bias, 0u };
+            uocr_metal_buffer_slice q_slice = { q_dst, 0u };
+            uocr_metal_buffer_slice k_slice = { k_dst, 0u };
+            uocr_metal_buffer_slice v_slice = { v_dst, 0u };
+            if (!metal_run_packed_qkv_mps_f16(ctx,
+                                              src_slice,
+                                              weight_slice,
+                                              bias_slice,
+                                              q_slice,
+                                              k_slice,
+                                              v_slice,
+                                              token_count,
+                                              UOCR_CLIP_HIDDEN_SIZE,
+                                              "Metal CLIP QKV MPS matmul",
+                                              error,
+                                              error_size)) {
+                result = 0;
+                goto cleanup_clip_qkv;
+            }
+            memcpy(q_out, [q_dst contents], (size_t)output_bytes);
+            memcpy(k_out, [k_dst contents], (size_t)output_bytes);
+            memcpy(v_out, [v_dst contents], (size_t)output_bytes);
+            result = 1;
+            goto cleanup_clip_qkv;
+        }
 
         uocr_metal_dense_params params;
         params.input_rows = token_count;
@@ -13386,6 +13592,43 @@ int uocr_metal_context_dense_f16(uocr_metal_context *ctx,
         }
         dst.label = @"uocr_dense_output";
         memset([dst contents], 0, (size_t)output_bytes);
+
+        if (output_type == UOCR_METAL_DENSE_OUTPUT_F16 &&
+            metal_mps_matmul_nt_f16_should_use(input_rows, in_features, out_features)) {
+            uocr_metal_buffer_slice src_slice = { src, 0u };
+            uocr_metal_buffer_slice weight_slice = { weight, 0u };
+            uocr_metal_buffer_slice dst_slice = { dst, 0u };
+            int ok = metal_run_mps_matmul_nt_f16(ctx,
+                                                 src_slice,
+                                                 weight_slice,
+                                                 dst_slice,
+                                                 input_rows,
+                                                 in_features,
+                                                 out_features,
+                                                 "Metal dense MPS matmul",
+                                                 error,
+                                                 error_size);
+            if (ok && bias_f16_or_null != NULL) {
+                uocr_metal_buffer_slice bias_slice = { bias, 0u };
+                ok = metal_run_bias_add_f16_inplace(ctx,
+                                                    dst_slice,
+                                                    bias_slice,
+                                                    input_rows,
+                                                    out_features,
+                                                    "Metal dense MPS bias add",
+                                                    error,
+                                                    error_size);
+            }
+            if (ok) {
+                memcpy(out, [dst contents], (size_t)output_bytes);
+                metal_clear_error(error, error_size);
+            }
+            [dst release];
+            [bias release];
+            [weight release];
+            [src release];
+            return ok;
+        }
 
         id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
         if (cb == nil) {

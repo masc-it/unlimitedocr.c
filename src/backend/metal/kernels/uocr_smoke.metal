@@ -648,6 +648,25 @@ kernel void uocr_dense_f16_to_f32(device const half *src [[buffer(0)]],
     }
 }
 
+struct UocrBiasAddParams {
+    uint rows;
+    uint cols;
+    uint reserved0;
+    uint reserved1;
+};
+
+kernel void uocr_bias_add_f16_inplace(device half *dst [[buffer(0)]],
+                                      device const half *bias [[buffer(1)]],
+                                      constant UocrBiasAddParams &params [[buffer(2)]],
+                                      uint gid [[thread_position_in_grid]]) {
+    const uint value_count = params.rows * params.cols;
+    if (gid >= value_count) {
+        return;
+    }
+    const uint col = gid - (gid / params.cols) * params.cols;
+    dst[gid] = half(float(dst[gid]) + float(bias[col]));
+}
+
 static inline float uocr_dense_dot_q8_0(device const half *src,
                                         device const uchar *weight,
                                         constant UocrDenseQ8Params &params,
