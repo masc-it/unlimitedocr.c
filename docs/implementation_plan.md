@@ -610,7 +610,7 @@ Current priority slice, in order. The coding agent should take the first uncheck
   - [x] shared expert added after routed sum
 - [x] Implement no-repeat-ngram processor matching upstream `SlidingWindowNoRepeatNgramProcessor`.
 - [ ] Copy/adapt DS4 CPU quant dot helpers for `Q8_0` and `Q4_K` once quantization starts.
-- [ ] Add CPU reference tests against Python dumped tiny tensors.
+- [x] Add CPU reference tests against Python dumped tiny tensors.
 
 ## 14. Metal fp16 decoder bring-up
 

@@ -5,6 +5,8 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "fixtures/cpu_ref_tiny_golden.h"
+
 #define CHECK(cond)                                                                    \
     do {                                                                               \
         if (!(cond)) {                                                                 \
@@ -15,6 +17,20 @@
 
 static int nearly_equal(float actual, float expected, float tol) {
     return fabsf(actual - expected) <= tol;
+}
+
+static int check_f32_array_close(const float *actual, const float *expected, uint32_t count, float tol) {
+    for (uint32_t index = 0u; index < count; ++index) {
+        CHECK(nearly_equal(actual[index], expected[index], tol));
+    }
+    return 0;
+}
+
+static int check_u32_array_equal(const uint32_t *actual, const uint32_t *expected, uint32_t count) {
+    for (uint32_t index = 0u; index < count; ++index) {
+        CHECK(actual[index] == expected[index]);
+    }
+    return 0;
 }
 
 static int test_dtype_conversions(void) {
@@ -490,6 +506,106 @@ static int test_moe_router_and_swiglu(void) {
     return 0;
 }
 
+static int test_python_dumped_tiny_tensors(void) {
+    float rms_out[UOCR_TINY_RMS_COUNT] = {0.0f};
+    CHECK(uocr_cpu_ref_rmsnorm_f32(UOCR_TINY_RMS_INPUT,
+                                   UOCR_TINY_RMS_WEIGHT,
+                                   UOCR_TINY_RMS_ROWS,
+                                   UOCR_TINY_RMS_COLS,
+                                   UOCR_TINY_RMS_EPS,
+                                   rms_out) == 1);
+    CHECK(check_f32_array_close(rms_out, UOCR_TINY_RMS_EXPECTED, UOCR_TINY_RMS_COUNT, 1.0e-5f) == 0);
+
+    float rope_q_out[UOCR_TINY_ROPE_COUNT] = {0.0f};
+    float rope_k_out[UOCR_TINY_ROPE_COUNT] = {0.0f};
+    CHECK(uocr_cpu_ref_rope_split_half_f32(UOCR_TINY_ROPE_Q,
+                                           UOCR_TINY_ROPE_K,
+                                           UOCR_TINY_ROPE_TOKENS,
+                                           UOCR_TINY_ROPE_HEADS,
+                                           UOCR_TINY_ROPE_HEAD_DIM,
+                                           UOCR_TINY_ROPE_START,
+                                           UOCR_TINY_ROPE_THETA,
+                                           rope_q_out,
+                                           rope_k_out) == 1);
+    CHECK(check_f32_array_close(rope_q_out, UOCR_TINY_ROPE_EXPECTED_Q, UOCR_TINY_ROPE_COUNT, 2.0e-5f) == 0);
+    CHECK(check_f32_array_close(rope_k_out, UOCR_TINY_ROPE_EXPECTED_K, UOCR_TINY_ROPE_COUNT, 2.0e-5f) == 0);
+
+    float sdpa_out[UOCR_TINY_SDPA_COUNT] = {0.0f};
+    CHECK(uocr_cpu_ref_causal_sdpa_f32(UOCR_TINY_SDPA_Q,
+                                       UOCR_TINY_SDPA_K,
+                                       UOCR_TINY_SDPA_V,
+                                       UOCR_TINY_SDPA_TOKENS,
+                                       UOCR_TINY_SDPA_HEADS,
+                                       UOCR_TINY_SDPA_HEAD_DIM,
+                                       UOCR_TINY_SDPA_SCALE,
+                                       sdpa_out) == 1);
+    CHECK(check_f32_array_close(sdpa_out, UOCR_TINY_SDPA_EXPECTED, UOCR_TINY_SDPA_COUNT, 2.0e-5f) == 0);
+
+    float swiglu_workspace[UOCR_TINY_SWIGLU_WORKSPACE_COUNT] = {0.0f};
+    float swiglu_out[UOCR_TINY_SWIGLU_INPUT_COUNT] = {0.0f};
+    CHECK(uocr_cpu_ref_dense_swiglu_f32(UOCR_TINY_SWIGLU_INPUT,
+                                        UOCR_TINY_SWIGLU_GATE,
+                                        UOCR_TINY_SWIGLU_UP,
+                                        UOCR_TINY_SWIGLU_DOWN,
+                                        UOCR_TINY_SWIGLU_ROWS,
+                                        UOCR_TINY_SWIGLU_HIDDEN,
+                                        UOCR_TINY_SWIGLU_INTERMEDIATE,
+                                        swiglu_workspace,
+                                        swiglu_out) == 1);
+    CHECK(check_f32_array_close(swiglu_workspace,
+                                UOCR_TINY_SWIGLU_EXPECTED_WORKSPACE,
+                                UOCR_TINY_SWIGLU_WORKSPACE_COUNT,
+                                2.0e-5f) == 0);
+    CHECK(check_f32_array_close(swiglu_out, UOCR_TINY_SWIGLU_EXPECTED, UOCR_TINY_SWIGLU_INPUT_COUNT, 2.0e-5f) == 0);
+
+    float moe_logits[UOCR_TINY_MOE_LOGITS_COUNT] = {0.0f};
+    float moe_probs[UOCR_TINY_MOE_LOGITS_COUNT] = {0.0f};
+    uint32_t moe_top_ids[UOCR_TINY_MOE_TOPK_COUNT] = {0u};
+    float moe_top_weights[UOCR_TINY_MOE_TOPK_COUNT] = {0.0f};
+    float moe_expert_workspace[UOCR_TINY_MOE_EXPERT_WORKSPACE_COUNT] = {0.0f};
+    float moe_shared_workspace[UOCR_TINY_MOE_SHARED_WORKSPACE_COUNT] = {0.0f};
+    float moe_out[UOCR_TINY_MOE_INPUT_COUNT] = {0.0f};
+    CHECK(uocr_cpu_ref_moe_swiglu_f32(UOCR_TINY_MOE_INPUT,
+                                      UOCR_TINY_MOE_ROUTER,
+                                      UOCR_TINY_MOE_EXPERT_GATE,
+                                      UOCR_TINY_MOE_EXPERT_UP,
+                                      UOCR_TINY_MOE_EXPERT_DOWN,
+                                      UOCR_TINY_MOE_SHARED_GATE,
+                                      UOCR_TINY_MOE_SHARED_UP,
+                                      UOCR_TINY_MOE_SHARED_DOWN,
+                                      UOCR_TINY_MOE_ROWS,
+                                      UOCR_TINY_MOE_HIDDEN,
+                                      UOCR_TINY_MOE_EXPERTS,
+                                      UOCR_TINY_MOE_TOPK,
+                                      UOCR_TINY_MOE_EXPERT_INTERMEDIATE,
+                                      UOCR_TINY_MOE_SHARED_INTERMEDIATE,
+                                      UOCR_TINY_MOE_SCALING,
+                                      moe_logits,
+                                      moe_probs,
+                                      moe_top_ids,
+                                      moe_top_weights,
+                                      moe_expert_workspace,
+                                      moe_shared_workspace,
+                                      moe_out) == 1);
+    CHECK(check_f32_array_close(moe_logits, UOCR_TINY_MOE_EXPECTED_LOGITS, UOCR_TINY_MOE_LOGITS_COUNT, 2.0e-5f) == 0);
+    CHECK(check_f32_array_close(moe_probs, UOCR_TINY_MOE_EXPECTED_PROBS, UOCR_TINY_MOE_LOGITS_COUNT, 2.0e-5f) == 0);
+    CHECK(check_u32_array_equal(moe_top_ids, UOCR_TINY_MOE_EXPECTED_TOP_IDS, UOCR_TINY_MOE_TOPK_COUNT) == 0);
+    CHECK(check_f32_array_close(moe_top_weights,
+                                UOCR_TINY_MOE_EXPECTED_TOP_WEIGHTS,
+                                UOCR_TINY_MOE_TOPK_COUNT,
+                                2.0e-5f) == 0);
+    CHECK(check_f32_array_close(moe_expert_workspace,
+                                UOCR_TINY_MOE_EXPECTED_EXPERT_WORKSPACE,
+                                UOCR_TINY_MOE_EXPERT_WORKSPACE_COUNT,
+                                3.0e-5f) == 0);
+    CHECK(check_f32_array_close(moe_shared_workspace,
+                                UOCR_TINY_MOE_EXPECTED_SHARED_WORKSPACE,
+                                UOCR_TINY_MOE_SHARED_WORKSPACE_COUNT,
+                                3.0e-5f) == 0);
+    CHECK(check_f32_array_close(moe_out, UOCR_TINY_MOE_EXPECTED, UOCR_TINY_MOE_INPUT_COUNT, 3.0e-5f) == 0);
+    return 0;
+}
+
 static void fill_kv_token(float *k, float *v, uint32_t value, uint32_t stride) {
     for (uint32_t index = 0u; index < stride; ++index) {
         k[index] = (float)(value * 100u + index);
@@ -598,6 +714,7 @@ int main(void) {
     if (test_causal_sdpa() != 0) return 1;
     if (test_dense_swiglu() != 0) return 1;
     if (test_moe_router_and_swiglu() != 0) return 1;
+    if (test_python_dumped_tiny_tensors() != 0) return 1;
     if (test_kv_cache_ring() != 0) return 1;
     return 0;
 }
