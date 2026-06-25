@@ -36,8 +36,8 @@ opportunities than scratch aliasing alone.
 
 Implementation status:
 
-- [x] Public image generation calls `uocr_metal_context_encode_visual_features_f16()` into a host `visual_features_f16` buffer, then calls `uocr_metal_context_generate_f16()` (`src/core/uocr_api.c:346`, `src/core/uocr_api.c:390`).
-- [x] The production vision path allocates host scratch with `metal_vision_host_scratch_init()` and many per-block host buffers (`src/backend/metal/uocr_metal.m:2621`, `:11186`, `:11663`).
+- [x] Public image generation now calls `uocr_metal_context_generate_image_f16()`, which encodes formatted visual rows into a reusable Metal vision workspace and passes that slice into prompt assembly without a host visual-feature allocation.
+- [x] The production vision path uses reusable top-level Metal workspace slices for SAM/CLIP/concat/projector/final rows; many per-block host buffers still remain inside transformer helpers (`src/backend/metal/uocr_metal.m`).
 - [x] Many vision helpers allocate `newBufferWithBytes` / `newBufferWithLength`, commit, wait, and `memcpy` back to host for each stage.
 - [x] `UOCR_METAL_ARENA_VISION_SCRATCH` is allocated from stale estimates but is not used by the current production vision path except for allocation/accounting (`src/backend/metal/uocr_metal.m:3770`; estimator `src/runtime/uocr_memory.c:150`).
 - [x] Integrated decode already uses a fused GPU LM-head argmax kernel (`uocr_lm_head_argmax_f16`) for the public `uocr_metal_context_generate_f16()` path (`src/backend/metal/uocr_metal.m:5222`, `src/backend/metal/kernels/uocr_smoke.metal:2024`).
@@ -74,10 +74,10 @@ Implementation status:
 
 Current finding:
 
-- [x] `uocr_metal_context_encode_visual_features_f16()` builds a host-side `uocr_metal_vision_host_scratch` and a host `projected_scratch_f16` (`src/backend/metal/uocr_metal.m:3071`, `:3077`).
-- [x] CLIP/SAM transformer block functions allocate temporary host buffers inside every block (`src/backend/metal/uocr_metal.m:11222`, `:11705`).
-- [x] Vision stage helpers repeatedly create Metal buffers from host pointers and wait for completion before copying outputs back.
-- [x] Prompt assembly then copies final host visual features back into a Metal buffer (`src/backend/metal/uocr_metal.m:7515`).
+- [x] `uocr_metal_context_encode_visual_features_f16()` now reuses a Metal vision workspace for top-level SAM/CLIP/concat/projected/final rows; the diagnostic host-output API copies the final slice out only for callers that request it.
+- [x] CLIP/SAM transformer block functions still allocate temporary host buffers inside every block (`src/backend/metal/uocr_metal.m`).
+- [x] Vision stage helpers still repeatedly create Metal buffers from host pointers and wait for completion before copying outputs back.
+- [x] Public image generation now splices the final Metal visual-feature slice into the prompt arena without creating a temporary host visual-feature upload.
 
 Impact: this is likely the largest first-token and image-encoding bottleneck in
 the current public path. The engine is paying CPU allocation cost, shared-buffer
@@ -87,9 +87,9 @@ through prompt arena assembly.
 
 Implementation status:
 
-- [ ] Replace host vision scratch with reusable Metal slices for SAM, CLIP, concat, projector, and final formatted rows.
+- [x] Replace host vision scratch with reusable Metal slices for SAM, CLIP, concat, projector, and final formatted rows.
 - [ ] Encode the complete vision graph into Metal buffers without per-stage readback.
-- [ ] Write final formatted visual rows directly into a Metal visual-feature slice or directly into the prompt arena.
+- [x] Write final formatted visual rows directly into a Metal visual-feature slice or directly into the prompt arena.
 - [ ] Keep only one production vision path after timing confirms the GPU-resident implementation; delete the host-scratch production path.
 - [ ] Preserve diagnostic parity entrypoints only if they are clearly out of the production path and do not keep slow fallback code alive.
 - [ ] Capture before/after timings for total vision, per SAM/CLIP/projector stage, command-buffer wait time, and CPU allocation count.
@@ -328,8 +328,8 @@ Implementation status:
 
 Current finding:
 
-- [x] Visual formatting is currently host-side in `uocr_process_vision_chunks_f16()` (`src/runtime/uocr_vision.c:249`).
-- [x] Prompt assembly copies host visual features into a temporary Metal buffer before splicing (`src/backend/metal/uocr_metal.m:7515`).
+- [x] Visual formatting is still host-side in `uocr_process_vision_chunks_f16()` (`src/runtime/uocr_vision.c:249`), but public image generation writes those rows into a reusable Metal visual-feature slice.
+- [x] Public prompt assembly now binds the Metal visual-feature slice directly; diagnostic host-pointer prompt assembly still supports temporary uploads.
 
 Impact: formatting and prompt splice are smaller than SAM/CLIP/decoder compute,
 but they currently force host residency. Once vision is GPU-resident, keeping
@@ -339,7 +339,7 @@ Implementation status:
 
 - [ ] Add a Metal formatter that writes newline/separator rows and crop/global order directly.
 - [ ] Prefer projector output directly into final visual layout when shape/order allows.
-- [ ] Splice GPU visual rows into prompt arena without host copy.
+- [x] Splice GPU visual rows into prompt arena without host copy.
 - [ ] Validate byte-for-byte final visual rows against the current formatter.
 - [ ] Remove host formatting from the production path after the GPU formatter is confirmed.
 

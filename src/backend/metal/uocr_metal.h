@@ -286,6 +286,19 @@ int uocr_metal_context_generate_f16(uocr_metal_context *ctx,
                                     char *error,
                                     size_t error_size);
 
+/* Production public-image fp16 orchestration. Encodes vision rows into the
+ * reusable Metal vision workspace, then splices that Metal slice directly into
+ * the prompt arena before decoder prefill/decode. This avoids the old public
+ * image path's host visual-feature allocation and prompt re-upload.
+ */
+int uocr_metal_context_generate_image_f16(uocr_metal_context *ctx,
+                                          const uocr_prepared_request *request,
+                                          uint32_t max_views_per_chunk,
+                                          uint32_t slot,
+                                          uocr_metal_decoder_result_f16 *result,
+                                          char *error,
+                                          size_t error_size);
+
 /* Diagnostic get-rows entry point used by synthetic tests. Runtime prompt
  * assembly should bind mmap-backed model buffers directly and reuse the same
  * kernels without uploading the embedding table through this helper.

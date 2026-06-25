@@ -357,113 +357,47 @@ static int generate_metal_image_fp16(uocr_engine *engine,
                                  vision_schedule.final_visual_tokens);
     }
 
-    uint64_t visual_values = 0u;
-    uint64_t visual_bytes = 0u;
-    if ((uint64_t)vision_schedule.final_visual_tokens > UINT64_MAX / (uint64_t)UOCR_HIDDEN_SIZE) {
-        return set_engine_errorf(engine, UOCR_ERROR_OUT_OF_MEMORY, "visual-feature buffer size overflow");
-    }
-    visual_values = (uint64_t)vision_schedule.final_visual_tokens * (uint64_t)UOCR_HIDDEN_SIZE;
-    if (visual_values > UINT64_MAX / (uint64_t)sizeof(uint16_t) ||
-        visual_values * (uint64_t)sizeof(uint16_t) > (uint64_t)SIZE_MAX) {
-        return set_engine_errorf(engine, UOCR_ERROR_OUT_OF_MEMORY, "visual-feature buffer size overflow");
-    }
-    visual_bytes = visual_values * (uint64_t)sizeof(uint16_t);
-
-    uint16_t *visual_features_f16 = (uint16_t *)uocr_malloc((size_t)visual_bytes);
-    if (visual_features_f16 == NULL) {
-        return set_engine_errorf(engine,
-                                 UOCR_ERROR_OUT_OF_MEMORY,
-                                 "failed to allocate Metal visual-feature buffer (%llu bytes)",
-                                 (unsigned long long)visual_bytes);
-    }
-    status = track_engine_memory(engine, UOCR_MEMORY_VISION_SCRATCH, visual_bytes, "host visual-feature rows");
-    if (status != UOCR_OK) {
-        uocr_free(visual_features_f16);
-        return status;
-    }
-
-    char metal_error[1024];
-    memset(metal_error, 0, sizeof(metal_error));
-    const uint64_t vision_start_ns = uocr_profile_now_ns();
-    if (!uocr_metal_context_encode_visual_features_f16(engine->metal,
-                                                       request,
-                                                       1u,
-                                                       visual_features_f16,
-                                                       vision_schedule.final_visual_tokens,
-                                                       metal_error,
-                                                       sizeof(metal_error))) {
-        uocr_free(visual_features_f16);
-        untrack_engine_memory(engine, UOCR_MEMORY_VISION_SCRATCH, visual_bytes);
-        return set_engine_errorf(engine,
-                                 UOCR_ERROR_INTERNAL,
-                                 "Metal fp16 image vision encoding failed: %s",
-                                 metal_error[0] != '\0' ? metal_error : "unknown error");
-    }
-    uocr_profile_add_event_now(&engine->profile, "metal.vision", vision_start_ns);
-
     if ((uint64_t)request->max_new_tokens > (uint64_t)SIZE_MAX / sizeof(int32_t)) {
-        uocr_free(visual_features_f16);
-        untrack_engine_memory(engine, UOCR_MEMORY_VISION_SCRATCH, visual_bytes);
         return set_engine_errorf(engine, UOCR_ERROR_OUT_OF_MEMORY, "generated-token buffer size overflow");
     }
     const uint64_t generated_bytes = (uint64_t)request->max_new_tokens * (uint64_t)sizeof(int32_t);
     int32_t *generated = (int32_t *)uocr_malloc((size_t)generated_bytes);
     if (generated == NULL) {
-        uocr_free(visual_features_f16);
-        untrack_engine_memory(engine, UOCR_MEMORY_VISION_SCRATCH, visual_bytes);
         return set_engine_errorf(engine, UOCR_ERROR_OUT_OF_MEMORY, "failed to allocate generated-token buffer");
     }
     status = track_engine_memory(engine, UOCR_MEMORY_TRANSIENT_BUFFERS, generated_bytes, "generated-token transient buffer");
     if (status != UOCR_OK) {
         uocr_free(generated);
-        uocr_free(visual_features_f16);
-        untrack_engine_memory(engine, UOCR_MEMORY_VISION_SCRATCH, visual_bytes);
         return status;
     }
-
-    uocr_metal_decoder_request_f16 metal_request;
-    memset(&metal_request, 0, sizeof(metal_request));
-    metal_request.input_ids = request->input_ids;
-    metal_request.image_mask = request->image_mask;
-    metal_request.image_features_f16 = visual_features_f16;
-    metal_request.n_tokens = request->n_tokens;
-    metal_request.max_new_tokens = request->max_new_tokens;
-    metal_request.slot = 0u;
-    metal_request.image_span_start = sequence_state.image_span_start;
-    metal_request.image_span_length = sequence_state.image_span_length;
-    metal_request.no_repeat_ngram_size = request->no_repeat_ngram_size;
-    metal_request.no_repeat_window = request->no_repeat_window;
 
     uocr_metal_decoder_result_f16 metal_result;
     memset(&metal_result, 0, sizeof(metal_result));
     metal_result.generated_ids = generated;
     metal_result.generated_capacity = request->max_new_tokens;
 
+    char metal_error[1024];
     memset(metal_error, 0, sizeof(metal_error));
-    const uint64_t generate_start_ns = uocr_profile_now_ns();
-    if (!uocr_metal_context_generate_f16(engine->metal,
-                                         &metal_request,
-                                         &metal_result,
-                                         metal_error,
-                                         sizeof(metal_error))) {
+    if (!uocr_metal_context_generate_image_f16(engine->metal,
+                                               request,
+                                               1u,
+                                               0u,
+                                               &metal_result,
+                                               metal_error,
+                                               sizeof(metal_error))) {
         uocr_free(generated);
-        uocr_free(visual_features_f16);
         untrack_engine_memory(engine, UOCR_MEMORY_TRANSIENT_BUFFERS, generated_bytes);
-        untrack_engine_memory(engine, UOCR_MEMORY_VISION_SCRATCH, visual_bytes);
         return set_engine_errorf(engine,
                                  UOCR_ERROR_INTERNAL,
                                  "Metal fp16 image generation failed: %s",
                                  metal_error[0] != '\0' ? metal_error : "unknown error");
     }
-    uocr_profile_add_event_now(&engine->profile, "metal.image_generate", generate_start_ns);
 
     const int32_t *generated_lists[1] = {generated};
     const uint32_t generated_counts[1] = {metal_result.generated_count};
     status = uocr_result_create_from_generated(1u, generated_lists, generated_counts, out_result);
     uocr_free(generated);
-    uocr_free(visual_features_f16);
     untrack_engine_memory(engine, UOCR_MEMORY_TRANSIENT_BUFFERS, generated_bytes);
-    untrack_engine_memory(engine, UOCR_MEMORY_VISION_SCRATCH, visual_bytes);
     if (status != UOCR_OK) {
         return set_engine_errorf(engine, status, "failed to allocate generated-token result");
     }
