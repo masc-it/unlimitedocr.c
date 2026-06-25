@@ -76,7 +76,8 @@ typedef enum synthetic_tensor_corruption {
     SYNTHETIC_CORRUPT_TENSOR_ORDER = 2,
     SYNTHETIC_CORRUPT_TENSOR_DATA_ALIGNMENT = 3,
     SYNTHETIC_CORRUPT_TOKENIZER = 4,
-    SYNTHETIC_CORRUPT_PROVENANCE = 5
+    SYNTHETIC_CORRUPT_PROVENANCE = 5,
+    SYNTHETIC_CORRUPT_TENSOR_TRANSPOSE_FLAG = 6
 } synthetic_tensor_corruption;
 
 static int write_synthetic_uocr_with_tensors(const char *path, synthetic_tensor_corruption corruption) {
@@ -184,6 +185,9 @@ static int write_synthetic_uocr_with_tensors(const char *path, synthetic_tensor_
     tensors[0].projection = UOCR_TENSOR_PROJ_WEIGHT;
     tensors[0].usage = UOCR_TENSOR_USAGE_RUNTIME;
     tensors[0].qtype = UOCR_TENSOR_F16;
+    tensors[0].flags = corruption == SYNTHETIC_CORRUPT_TENSOR_TRANSPOSE_FLAG
+                           ? UOCR_TENSOR_FLAG_TRANSPOSED
+                           : UOCR_TENSOR_FLAG_ROW_MAJOR;
     tensors[0].rank = 2u;
     tensors[0].logical_shape[0] = 2u;
     tensors[0].logical_shape[1] = 4u;
@@ -199,6 +203,7 @@ static int write_synthetic_uocr_with_tensors(const char *path, synthetic_tensor_
     tensors[1].projection = UOCR_TENSOR_PROJ_WEIGHT;
     tensors[1].usage = UOCR_TENSOR_USAGE_PRESERVED_UNUSED;
     tensors[1].qtype = UOCR_TENSOR_F16;
+    tensors[1].flags = UOCR_TENSOR_FLAG_ROW_MAJOR;
     tensors[1].rank = 1u;
     tensors[1].logical_shape[0] = 8u;
     tensors[1].physical_shape[0] = 8u;
@@ -287,6 +292,7 @@ static int write_synthetic_quant_uocr(const char *path, int corrupt_row_size, in
     tensor->projection = UOCR_TENSOR_PROJ_WEIGHT;
     tensor->usage = UOCR_TENSOR_USAGE_RUNTIME;
     tensor->qtype = UOCR_TENSOR_Q8_0;
+    tensor->flags = UOCR_TENSOR_FLAG_ROW_MAJOR;
     tensor->rank = 2u;
     tensor->logical_shape[0] = 2u;
     tensor->logical_shape[1] = logical_cols;
@@ -372,6 +378,7 @@ static int test_valid_tensor_directory(void) {
     CHECK(model.tensor_count == 2u);
     CHECK(model.tensors[0].id == UOCR_TENSOR_ID_TOK_EMBED);
     CHECK(model.tensors[0].family == UOCR_TENSOR_FAMILY_TOK_EMBED);
+    CHECK(model.tensors[0].flags == UOCR_TENSOR_FLAG_ROW_MAJOR);
     CHECK(model.tensors[0].payload_size == 16u);
     CHECK(uocr_model_file_find_tensor(&model, UOCR_TENSOR_ID_TOK_EMBED) == &model.tensors[0]);
     CHECK(uocr_model_file_find_tensor(&model, 999999u) == NULL);
@@ -400,6 +407,19 @@ static int test_rejects_tensor_payload_out_of_range(void) {
     uocr_model_file model;
     CHECK(uocr_model_file_open(path, &model, error, sizeof(error)) != 0);
     CHECK(strstr(error, "payload is out of range") != NULL);
+    unlink(path);
+    return 0;
+}
+
+static int test_rejects_transposed_tensor_layout(void) {
+    char path[128];
+    CHECK(make_temp_path(path, sizeof(path)) == 0);
+    CHECK(write_synthetic_uocr_with_tensors(path, SYNTHETIC_CORRUPT_TENSOR_TRANSPOSE_FLAG) == 0);
+
+    char error[512];
+    uocr_model_file model;
+    CHECK(uocr_model_file_open(path, &model, error, sizeof(error)) != 0);
+    CHECK(strstr(error, "unsupported transposed layout") != NULL);
     unlink(path);
     return 0;
 }
@@ -526,6 +546,7 @@ int main(void) {
     if (test_valid_synthetic_file() != 0) return 1;
     if (test_valid_tensor_directory() != 0) return 1;
     if (test_rejects_tensor_payload_out_of_range() != 0) return 1;
+    if (test_rejects_transposed_tensor_layout() != 0) return 1;
     if (test_rejects_bad_tensor_data_alignment() != 0) return 1;
     if (test_valid_quantized_tensor_directory() != 0) return 1;
     if (test_rejects_bad_quantized_row_size() != 0) return 1;

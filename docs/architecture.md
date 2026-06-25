@@ -314,6 +314,8 @@ Initial policy keeps unaligned down projections in `Q8_0`, unless the converter 
 3. Map HF names to tensor registry ids.
 4. Convert BF16 -> fp16/f32 temporary rows.
 5. Pack tensors into runtime layout:
+   - preserve safetensors row-major order for rank-2 `[out,in]` matrices used by Metal kernels
+   - record tensor layout flags and transform metadata; v1 rejects transposed payloads unless a future kernel explicitly requires one
    - routed expert slabs
    - optional gate/up paired layout
    - contiguous vision/decoder arenas

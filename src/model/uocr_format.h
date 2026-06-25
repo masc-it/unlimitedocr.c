@@ -52,6 +52,12 @@ typedef enum uocr_tensor_usage {
     UOCR_TENSOR_USAGE_OMITTED_WITH_REASON = 3
 } uocr_tensor_usage;
 
+typedef enum uocr_tensor_flags {
+    UOCR_TENSOR_FLAG_ROW_MAJOR = 1u << 0,
+    UOCR_TENSOR_FLAG_TRANSPOSED = 1u << 1,
+    UOCR_TENSOR_FLAG_FLATTENED_LEADING_DIM = 1u << 2
+} uocr_tensor_flags;
+
 typedef enum uocr_tensor_qtype_reason {
     UOCR_TENSOR_QTYPE_REASON_UNKNOWN = 0,
     UOCR_TENSOR_QTYPE_REASON_FP16_BASELINE = 1,

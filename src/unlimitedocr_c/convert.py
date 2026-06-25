@@ -94,6 +94,18 @@ UOCR_TENSOR_USAGE_RUNTIME = 1
 UOCR_TENSOR_USAGE_PRESERVED_UNUSED = 2
 UOCR_TENSOR_USAGE_OMITTED_WITH_REASON = 3
 
+UOCR_TENSOR_FLAG_ROW_MAJOR = 1 << 0
+UOCR_TENSOR_FLAG_TRANSPOSED = 1 << 1
+UOCR_TENSOR_FLAG_FLATTENED_LEADING_DIM = 1 << 2
+
+UOCR_LAYOUT_TRANSFORM_IDENTITY = 0
+UOCR_LAYOUT_TRANSFORM_FLATTEN_LEADING_DIM = 1
+UOCR_LAYOUT_TRANSFORM_TRANSPOSE = 2
+ROW_MAJOR_LAYOUT_CONTRACT = (
+    "Runtime tensor payloads preserve safetensors row-major order. Rank-2 weights remain [out,in]; "
+    "quantized rank>2 weights may be flattened to [shape[0], product(shape[1:])] without transposition."
+)
+
 UOCR_QTYPE_REASON_UNKNOWN = 0
 UOCR_QTYPE_REASON_FP16_BASELINE = 1
 UOCR_QTYPE_REASON_POLICY = 2
@@ -172,6 +184,12 @@ Q4_UNALIGNED_HAZARD_DESCRIPTIONS: Mapping[int, str] = {
 Q4_UNALIGNED_HAZARD_EXPECTED_COUNTS: Mapping[int, int] = {
     Q4_HAZARD_ROUTED_EXPERT_DOWN: Q4_HAZARD_ROUTED_EXPERT_DOWN_COUNT,
     Q4_HAZARD_DENSE_LAYER0_DOWN: Q4_HAZARD_DENSE_LAYER0_DOWN_COUNT,
+}
+
+LAYOUT_TRANSFORM_NAMES: Mapping[int, str] = {
+    UOCR_LAYOUT_TRANSFORM_IDENTITY: "identity-row-major",
+    UOCR_LAYOUT_TRANSFORM_FLATTEN_LEADING_DIM: "flatten-leading-dim-row-major",
+    UOCR_LAYOUT_TRANSFORM_TRANSPOSE: "transpose",
 }
 
 SECTION_NAMES: Mapping[int, str] = {
@@ -389,6 +407,13 @@ class TensorPlan:
     q4_hazard_logical_input_width: int
     q4_hazard_required_physical_input_width: int
     q4_hazard_padding_width: int
+    source_layout: str
+    runtime_layout: str
+    layout_transform: str
+    layout_transform_id: int
+    layout_flags: int
+    transposed: bool
+    layout_reason: str
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -429,6 +454,13 @@ class TensorPlan:
             "q4_hazard_logical_input_width": self.q4_hazard_logical_input_width,
             "q4_hazard_required_physical_input_width": self.q4_hazard_required_physical_input_width,
             "q4_hazard_padding_width": self.q4_hazard_padding_width,
+            "source_layout": self.source_layout,
+            "runtime_layout": self.runtime_layout,
+            "layout_transform": self.layout_transform,
+            "layout_transform_id": self.layout_transform_id,
+            "layout_flags": self.layout_flags,
+            "transposed": self.transposed,
+            "layout_reason": self.layout_reason,
         }
 
 
@@ -603,6 +635,7 @@ class DryRunPlan:
             "family_histogram": dict(self.family_histogram),
             "quantized_input_widths": quantized_input_width_summary(self.tensors),
             "q4_unaligned_hazards": q4_unaligned_hazard_summary(self.tensors),
+            "layout_transforms": layout_transform_summary(self.tensors),
             "moe_expert_packing": {
                 "layout": MOE_EXPERT_PACKING_LAYOUT,
                 "contract": MOE_EXPERT_PACKING_CONTRACT,
@@ -828,6 +861,65 @@ def quantized_input_width_summary(tensors: Iterable[TensorPlan]) -> dict[str, An
         "padded_tensor_count": len(padded),
         "max_padding_width": max_padding,
     }
+
+
+def _layout_metadata_for_tensor(
+    shape: tuple[int, ...], qtype_id: int
+) -> tuple[str, str, int, int, bool, str]:
+    if _is_quantized_qtype(qtype_id) and len(shape) > 2:
+        transform_id = UOCR_LAYOUT_TRANSFORM_FLATTEN_LEADING_DIM
+        flags = UOCR_TENSOR_FLAG_ROW_MAJOR | UOCR_TENSOR_FLAG_FLATTENED_LEADING_DIM
+        runtime_layout = "row-major-2d-flattened"
+        reason = (
+            "quantized rank>2 tensor is flattened as [shape[0], product(shape[1:])] "
+            "while preserving source row-major order"
+        )
+    else:
+        transform_id = UOCR_LAYOUT_TRANSFORM_IDENTITY
+        flags = UOCR_TENSOR_FLAG_ROW_MAJOR
+        runtime_layout = "row-major"
+        reason = "source payload order is preserved; no transpose is applied"
+    return "row-major", runtime_layout, transform_id, flags, False, reason
+
+
+def layout_transform_summary(tensors: Iterable[TensorPlan]) -> dict[str, Any]:
+    tensors_tuple = tuple(tensors)
+    return {
+        "contract": ROW_MAJOR_LAYOUT_CONTRACT,
+        "row_major_count": sum(1 for tensor in tensors_tuple if tensor.layout_flags & UOCR_TENSOR_FLAG_ROW_MAJOR),
+        "transposed_count": sum(1 for tensor in tensors_tuple if tensor.transposed),
+        "by_transform": dict(Counter(tensor.layout_transform for tensor in tensors_tuple)),
+    }
+
+
+def _validate_layout_transform_contract(tensors: Iterable[TensorPlan]) -> None:
+    for tensor in tensors:
+        expected_source_layout, expected_runtime_layout, expected_transform_id, expected_flags, transposed, _reason = (
+            _layout_metadata_for_tensor(tensor.shape, tensor.qtype_id)
+        )
+        if tensor.source_layout != expected_source_layout:
+            raise ValueError(f"tensor {tensor.name} source layout mismatch: {tensor.source_layout}")
+        if tensor.runtime_layout != expected_runtime_layout:
+            raise ValueError(f"tensor {tensor.name} runtime layout mismatch: {tensor.runtime_layout}")
+        if tensor.layout_transform_id != expected_transform_id:
+            raise ValueError(f"tensor {tensor.name} layout transform id mismatch: {tensor.layout_transform_id}")
+        if tensor.layout_transform != LAYOUT_TRANSFORM_NAMES[expected_transform_id]:
+            raise ValueError(f"tensor {tensor.name} layout transform name mismatch: {tensor.layout_transform}")
+        if tensor.layout_flags != expected_flags:
+            raise ValueError(f"tensor {tensor.name} layout flags mismatch: {tensor.layout_flags:#x}")
+        if tensor.transposed != transposed or (tensor.layout_flags & UOCR_TENSOR_FLAG_TRANSPOSED):
+            raise ValueError(f"tensor {tensor.name} unexpectedly requests a transpose")
+        if not (tensor.layout_flags & UOCR_TENSOR_FLAG_ROW_MAJOR):
+            raise ValueError(f"tensor {tensor.name} is missing the row-major layout flag")
+        if _is_quantized_qtype(tensor.qtype_id):
+            expected_logical = _flatten_weight_shape_for_quantization(tensor.shape)
+            if tensor.logical_shape != expected_logical:
+                raise ValueError(
+                    f"quantized tensor {tensor.name} logical layout mismatch: "
+                    f"got {tensor.logical_shape}, expected {expected_logical}"
+                )
+        elif tensor.logical_shape != tensor.shape or tensor.physical_shape != tensor.shape:
+            raise ValueError(f"fp tensor {tensor.name} must preserve source shape without layout conversion")
 
 
 def _q4_unaligned_hazard_for_tensor(
@@ -1666,6 +1758,14 @@ def _make_tensor_plan(name: str, entry: Mapping[str, Any], qprofile: str, regist
         q4_hazard_required_physical_input_width,
         q4_hazard_padding_width,
     ) = _q4_unaligned_hazard_for_tensor(shape, registry_entry)
+    (
+        source_layout,
+        runtime_layout,
+        layout_transform_id,
+        layout_flags,
+        transposed,
+        layout_reason,
+    ) = _layout_metadata_for_tensor(shape, qtype_id)
 
     return TensorPlan(
         name=name,
@@ -1705,6 +1805,13 @@ def _make_tensor_plan(name: str, entry: Mapping[str, Any], qprofile: str, regist
         q4_hazard_logical_input_width=q4_hazard_logical_input_width,
         q4_hazard_required_physical_input_width=q4_hazard_required_physical_input_width,
         q4_hazard_padding_width=q4_hazard_padding_width,
+        source_layout=source_layout,
+        runtime_layout=runtime_layout,
+        layout_transform=LAYOUT_TRANSFORM_NAMES[layout_transform_id],
+        layout_transform_id=layout_transform_id,
+        layout_flags=layout_flags,
+        transposed=transposed,
+        layout_reason=layout_reason,
     )
 
 
@@ -1712,6 +1819,7 @@ def _relayout_plan(plan: DryRunPlan, tensors: Iterable[TensorPlan]) -> DryRunPla
     ordered = tuple(sorted(tensors, key=lambda tensor: tensor.tensor_id))
     sections, laid_out, planned_file_size, metadata_bytes = _layout_dry_run_file(ordered)
     _validate_quantized_input_width_contract(laid_out)
+    _validate_layout_transform_contract(laid_out)
     _validate_q4_unaligned_hazard_contract(laid_out, qprofile=plan.qprofile, require_complete=False)
     return replace(
         plan,
@@ -1788,6 +1896,7 @@ def build_dry_run_plan(
     )
     sections, tensors, planned_file_size, metadata_bytes = _layout_dry_run_file(tensors)
     _validate_quantized_input_width_contract(tensors)
+    _validate_layout_transform_contract(tensors)
     _validate_q4_unaligned_hazard_contract(tensors, qprofile=qprofile, require_complete=strict)
     _validate_moe_expert_interleaved_layout(tensors, require_complete=strict)
     total_source_bytes = sum(t.source_bytes for t in tensors)
@@ -1958,7 +2067,7 @@ def _tensor_directory_bytes(plan: DryRunPlan) -> bytes:
             tensor.projection_id,
             tensor.usage_id,
             tensor.qtype_id,
-            0,
+            tensor.layout_flags,
             len(tensor.logical_shape),
             *logical_shape,
             *physical_shape,

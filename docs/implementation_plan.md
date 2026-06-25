@@ -406,8 +406,8 @@ Current priority slice, in order. The coding agent should take the first uncheck
   - [x] never allocate a second full-model-sized temporary buffer
 - [x] Implement BF16 -> fp16 conversion using bounded NumPy chunk conversion for the Python converter writer.
 - [x] Record conversion statistics per tensor: source dtype, output dtype/qtype, min/max if cheap, NaN/Inf count, and exact byte count.
-- [ ] Preserve row-major matrix layout where runtime kernels expect `[out, in]`.
-- [ ] Transpose only where an explicit runtime kernel requires it; record the decision in tensor metadata.
+- [x] Preserve row-major matrix layout where runtime kernels expect `[out, in]`.
+- [x] Transpose only where an explicit runtime kernel requires it; record the decision in tensor metadata.
 - [x] Emit pure fp16 `.uocr` first when the safetensors payload is present; always-on tests use tiny synthetic safetensors payloads.
 - [x] Add converter flags:
   - [x] `--hf-dir PATH`

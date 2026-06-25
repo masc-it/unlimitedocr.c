@@ -500,6 +500,14 @@ static int validate_tensor_directory(const uint8_t *bytes,
         if (tensor->rank > UOCR_TENSOR_MAX_DIMS) {
             return fail(error, error_size, "tensor entry %u rank %u exceeds limit", i, tensor->rank);
         }
+        const uint32_t known_tensor_flags = UOCR_TENSOR_FLAG_ROW_MAJOR | UOCR_TENSOR_FLAG_TRANSPOSED |
+                                            UOCR_TENSOR_FLAG_FLATTENED_LEADING_DIM;
+        if ((tensor->flags & ~known_tensor_flags) != 0u) {
+            return fail(error, error_size, "tensor entry %u has unknown flags 0x%x", i, tensor->flags);
+        }
+        if ((tensor->flags & UOCR_TENSOR_FLAG_TRANSPOSED) != 0u) {
+            return fail(error, error_size, "tensor entry %u requests unsupported transposed layout", i);
+        }
         if (tensor->usage == UOCR_TENSOR_USAGE_OMITTED_WITH_REASON) {
             if (tensor->payload_offset != 0u || tensor->payload_size != 0u) {
                 return fail(error, error_size, "omitted tensor entry %u has payload bytes", i);

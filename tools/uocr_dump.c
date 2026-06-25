@@ -229,13 +229,14 @@ int main(int argc, char **argv) {
             uint32_t logical_input_width = 0u;
             uint32_t physical_input_width = 0u;
             const int has_input_widths = uocr_quant_tensor_input_widths(tensor, &logical_input_width, &physical_input_width);
-            printf("    [%u] id=%u family=%s qtype=%s qtype_reason=%s promotion=%s offset=%llu size=%llu offset_alignment=%llu",
+            printf("    [%u] id=%u family=%s qtype=%s qtype_reason=%s promotion=%s flags=0x%x offset=%llu size=%llu offset_alignment=%llu",
                    i,
                    tensor->id,
                    uocr_tensor_family_name(tensor->family),
                    uocr_tensor_qtype_name(tensor->qtype),
                    uocr_tensor_qtype_reason_name(tensor->qtype_reason),
                    uocr_tensor_promotion_reason_name(tensor->promotion_reason),
+                   tensor->flags,
                    (unsigned long long)tensor->payload_offset,
                    (unsigned long long)tensor->payload_size,
                    (unsigned long long)natural_alignment(tensor->payload_offset));

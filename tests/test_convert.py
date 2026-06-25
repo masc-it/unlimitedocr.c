@@ -24,6 +24,9 @@ from unlimitedocr_c.convert import (
     Q4_HAZARD_ROUTED_EXPERT_DOWN_COUNT,
     Q4_HAZARD_ROUTED_EXPERT_DOWN_NAME,
     Q4_UNALIGNED_HAZARD_CONTRACT,
+    ROW_MAJOR_LAYOUT_CONTRACT,
+    UOCR_LAYOUT_TRANSFORM_FLATTEN_LEADING_DIM,
+    UOCR_LAYOUT_TRANSFORM_IDENTITY,
     UOCR_PROMOTION_NONE,
     UOCR_PROMOTION_SENSITIVE,
     UOCR_PROMOTION_UNALIGNED,
@@ -39,6 +42,9 @@ from unlimitedocr_c.convert import (
     UOCR_QTYPE_REASON_UNALIGNED,
     UOCR_SECTION_TENSOR_DATA,
     UOCR_TENSOR_DATA_ALIGNMENT,
+    UOCR_TENSOR_FLAG_FLATTENED_LEADING_DIM,
+    UOCR_TENSOR_FLAG_ROW_MAJOR,
+    UOCR_TENSOR_FLAG_TRANSPOSED,
     UOCR_TENSOR_PAYLOAD_ALIGNMENT,
     UOCR_TENSOR_Q4_K,
     UOCR_TENSOR_PADDED_Q4_K,
@@ -244,6 +250,12 @@ def test_fp16_converter_dry_run_against_cached_header() -> None:
     assert source_metadata["safetensors"]["source_files"] == ["model-00001-of-000001.safetensors"]
     assert all(len(value) == 64 for value in source_metadata["hashes"].values())
 
+    layout_summary = plan.summary_dict()["layout_transforms"]
+    assert layout_summary["contract"] == ROW_MAJOR_LAYOUT_CONTRACT
+    assert layout_summary["row_major_count"] == EXPECTED_TENSOR_COUNT
+    assert layout_summary["transposed_count"] == 0
+    assert layout_summary["by_transform"] == {"identity-row-major": EXPECTED_TENSOR_COUNT}
+
     preserved_unused = [tensor for tensor in plan.tensors if tensor.usage == "preserved-unused"]
     assert [tensor.name for tensor in preserved_unused] == ["model.vision_model.embeddings.patch_embedding.weight"]
     assert all(is_preserved_unused_in_normal_ocr(tensor.name) for tensor in preserved_unused)
@@ -276,6 +288,13 @@ def test_fp16_converter_dry_run_against_cached_header() -> None:
     assert lm_head.qtype_reason_id == UOCR_QTYPE_REASON_FP16_BASELINE
     assert lm_head.promotion_reason == "none"
     assert lm_head.promotion_reason_id == UOCR_PROMOTION_NONE
+    assert lm_head.source_layout == "row-major"
+    assert lm_head.runtime_layout == "row-major"
+    assert lm_head.layout_transform == "identity-row-major"
+    assert lm_head.layout_transform_id == UOCR_LAYOUT_TRANSFORM_IDENTITY
+    assert lm_head.layout_flags == UOCR_TENSOR_FLAG_ROW_MAJOR
+    assert lm_head.transposed is False
+    assert "no transpose" in lm_head.layout_reason
 
     attn_q = plan.tensor_by_name("model.layers.3.self_attn.q_proj.weight")
     assert attn_q.tensor_id == tensor_id_layer_attn(3, TensorProjection.Q)
@@ -355,6 +374,12 @@ def test_dyn_q8_converter_dry_run_records_quant_metadata() -> None:
     assert width_summary["padded_tensor_count"] > 0
     assert width_summary["max_padding_width"] > 0
     assert "logical_input_width" in width_summary["contract"]
+    layout_summary = plan.summary_dict()["layout_transforms"]
+    assert layout_summary["contract"] == ROW_MAJOR_LAYOUT_CONTRACT
+    assert layout_summary["row_major_count"] == EXPECTED_TENSOR_COUNT
+    assert layout_summary["transposed_count"] == 0
+    assert layout_summary["by_transform"]["identity-row-major"] > 0
+    assert layout_summary["by_transform"]["flatten-leading-dim-row-major"] > 0
     assert plan.qtype_reason_histogram["policy"] == plan.qtype_histogram["UOCR_TENSOR_Q8_0"]
     assert plan.qtype_reason_histogram["sensitive"] == plan.qtype_histogram["UOCR_TENSOR_F16"]
     assert plan.promotion_reason_histogram["none"] == plan.qtype_histogram["UOCR_TENSOR_Q8_0"]
@@ -385,6 +410,11 @@ def test_dyn_q8_converter_dry_run_records_quant_metadata() -> None:
     assert sam_patch.logical_input_width == 768
     assert sam_patch.physical_input_width == 768
     assert sam_patch.input_padding_width == 0
+    assert sam_patch.layout_transform == "flatten-leading-dim-row-major"
+    assert sam_patch.layout_transform_id == UOCR_LAYOUT_TRANSFORM_FLATTEN_LEADING_DIM
+    assert sam_patch.layout_flags == UOCR_TENSOR_FLAG_ROW_MAJOR | UOCR_TENSOR_FLAG_FLATTENED_LEADING_DIM
+    assert sam_patch.transposed is False
+    assert "flattened" in sam_patch.layout_reason
     assert sam_patch.output_bytes == 768 * ((768 // UOCR_Q8_0_BLOCK_SIZE) * UOCR_Q8_0_TYPE_SIZE)
 
     router = plan.tensor_by_name("model.layers.1.mlp.gate.weight")
@@ -423,6 +453,8 @@ def test_dyn_q8_converter_dry_run_records_quant_metadata() -> None:
     header_size = _TENSOR_DIRECTORY_HEADER_STRUCT.size
     entry = _TENSOR_ENTRY_STRUCT.unpack_from(payload, header_size)
     assert entry[6] == UOCR_TENSOR_Q8_0
+    assert entry[7] == (UOCR_TENSOR_FLAG_ROW_MAJOR | UOCR_TENSOR_FLAG_FLATTENED_LEADING_DIM)
+    assert (entry[7] & UOCR_TENSOR_FLAG_TRANSPOSED) == 0
     assert entry[8] == 2
     assert entry[9:13] == (768, 768, 0, 0)
     assert entry[13:17] == (768, 768, 0, 0)
@@ -482,6 +514,10 @@ def test_dyn_q4_converter_dry_run_uses_conservative_policy() -> None:
     assert attn_q.input_padding_width == 0
     assert attn_q.q4_hazard == "none"
     assert attn_q.q4_hazard_id == 0
+    assert attn_q.layout_transform == "identity-row-major"
+    assert attn_q.layout_transform_id == UOCR_LAYOUT_TRANSFORM_IDENTITY
+    assert attn_q.layout_flags == UOCR_TENSOR_FLAG_ROW_MAJOR
+    assert attn_q.transposed is False
     assert attn_q.block_size == UOCR_Q4_K_BLOCK_SIZE
     assert attn_q.row_size == (1280 // UOCR_Q4_K_BLOCK_SIZE) * UOCR_Q4_K_TYPE_SIZE
     assert "attention projection" in attn_q.reason

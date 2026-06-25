@@ -92,6 +92,14 @@ static int test_tokenizer_and_visual_constants(void) {
     return 0;
 }
 
+static int test_tensor_layout_flags(void) {
+    CHECK(UOCR_TENSOR_FLAG_ROW_MAJOR == (1u << 0));
+    CHECK(UOCR_TENSOR_FLAG_TRANSPOSED == (1u << 1));
+    CHECK(UOCR_TENSOR_FLAG_FLATTENED_LEADING_DIM == (1u << 2));
+    CHECK((UOCR_TENSOR_FLAG_ROW_MAJOR & UOCR_TENSOR_FLAG_TRANSPOSED) == 0u);
+    return 0;
+}
+
 static int test_default_config_record_matches_constants(void) {
     const uocr_config_record cfg = uocr_default_config_record();
 
@@ -128,6 +136,7 @@ static int test_default_config_record_matches_constants(void) {
 int main(void) {
     if (test_language_model_constants() != 0) return 1;
     if (test_tokenizer_and_visual_constants() != 0) return 1;
+    if (test_tensor_layout_flags() != 0) return 1;
     if (test_default_config_record_matches_constants() != 0) return 1;
     return 0;
 }
