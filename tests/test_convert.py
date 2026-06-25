@@ -150,6 +150,26 @@ def _write_tiny_safetensors(hf_dir) -> tuple[dict[str, bytes], dict[str, tuple[i
     return payloads, {name: shape for name, (_values, shape) in tensors.items()}
 
 
+def _write_stats_safetensors(hf_dir) -> tuple[bytes, np.ndarray]:
+    values = np.array([1.0, -2.5, np.nan, np.inf, -np.inf], dtype=np.float32)
+    payload = _bf16_payload(values)
+    header = {
+        "__metadata__": {"format": "pt"},
+        "model.image_newline": {"dtype": "BF16", "shape": [5], "data_offsets": [0, len(payload)]},
+    }
+    header_bytes = json.dumps(header, separators=(",", ":")).encode("utf-8")
+    with (hf_dir / "model.safetensors").open("wb") as f:
+        f.write(struct.pack("<Q", len(header_bytes)))
+        f.write(header_bytes)
+        f.write(payload)
+    index = {
+        "metadata": {"total_size": len(payload)},
+        "weight_map": {"model.image_newline": "model.safetensors"},
+    }
+    (hf_dir / "model.safetensors.index.json").write_text(json.dumps(index), encoding="utf-8")
+    return payload, values
+
+
 def test_cached_safetensors_header_current_checkpoint_facts() -> None:
     context_dir = project_root() / "data/context"
     header = _read_length_prefixed_safetensors_header(context_dir / "model.safetensors.header")
@@ -627,12 +647,51 @@ def test_write_uocr_model_streams_bf16_to_fp16_payload(tmp_path) -> None:
         assert actual == _f16_from_bf16_payload(payloads[tensor.name])
 
 
+def test_write_uocr_model_records_conversion_stats(tmp_path) -> None:
+    payload, _values = _write_stats_safetensors(tmp_path)
+    plan = build_dry_run_plan(tmp_path, qprofile="fp16", strict=False)
+    out = tmp_path / "stats.uocr"
+    stats_path = tmp_path / "stats.json"
+
+    write_uocr_model(plan, out, stats_path=stats_path)
+
+    report = json.loads(stats_path.read_text(encoding="utf-8"))
+    tensor = report["tensors"][0]
+    assert report["version"] == 1
+    assert report["model_path"] == str(out)
+    assert report["qprofile"] == "fp16"
+    assert report["tensor_count"] == 1
+    assert report["source_bytes"] == len(payload)
+    assert report["output_bytes"] == len(payload)
+    assert report["output_bytes_written"] == len(payload)
+    assert report["value_count"] == 5
+    assert report["finite_count"] == 2
+    assert report["source_nan_count"] == 1
+    assert report["source_posinf_count"] == 1
+    assert report["source_neginf_count"] == 1
+    assert report["source_nonfinite_count"] == 3
+    assert tensor["name"] == "model.image_newline"
+    assert tensor["source_dtype"] == "BF16"
+    assert tensor["output_dtype"] == "F16"
+    assert tensor["qtype"] == "UOCR_TENSOR_F16"
+    assert tensor["source_bytes"] == len(payload)
+    assert tensor["output_bytes"] == len(payload)
+    assert tensor["output_bytes_written"] == len(payload)
+    assert tensor["source_min"] == -2.5
+    assert tensor["source_max"] == 1.0
+    assert tensor["source_nan_count"] == 1
+    assert tensor["source_posinf_count"] == 1
+    assert tensor["source_neginf_count"] == 1
+    assert tensor["source_nonfinite_count"] == 3
+
+
 def test_write_uocr_model_streams_dyn_q8_payload(tmp_path) -> None:
     payloads, _shapes = _write_tiny_safetensors(tmp_path)
     plan = build_dry_run_plan(tmp_path, qprofile="dyn-q8", strict=False)
     out = tmp_path / "tiny-q8.uocr"
+    stats_path = tmp_path / "tiny-q8.stats.json"
 
-    written = write_uocr_model(plan, out)
+    written = write_uocr_model(plan, out, stats_path=stats_path)
 
     assert written == out
     raw = out.read_bytes()
@@ -659,6 +718,17 @@ def test_write_uocr_model_streams_dyn_q8_payload(tmp_path) -> None:
 
     directory = _tensor_directory_bytes(plan)
     assert directory in raw
+
+    stats = json.loads(stats_path.read_text(encoding="utf-8"))
+    assert stats["qprofile"] == "dyn-q8"
+    assert stats["tensor_count"] == 2
+    q8_stats = {tensor["name"]: tensor for tensor in stats["tensors"]}[q8_tensor.name]
+    assert q8_stats["qtype"] == "UOCR_TENSOR_Q8_0"
+    assert q8_stats["source_min"] == -2.0
+    assert q8_stats["source_max"] == 3.5
+    assert q8_stats["source_nonfinite_count"] == 0
+    assert q8_stats["source_bytes"] == len(payloads[q8_tensor.name])
+    assert q8_stats["output_bytes_written"] == q8_tensor.output_bytes
 
 
 def test_write_uocr_model_requires_overwrite_for_existing_output(tmp_path) -> None:

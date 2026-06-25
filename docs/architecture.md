@@ -325,7 +325,7 @@ Initial policy keeps unaligned down projections in `Q8_0`, unless the converter 
    - SAM absolute pos for `64x64` and `40x40`
    - CLIP absolute pos for `16x16` and `10x10`
    - SAM relative-pos helpers for `40x40` if useful
-8. Emit `.uocr` with provenance and qtype decisions.
+8. Emit `.uocr` with provenance and qtype decisions. When writing from a real safetensors payload, `--conversion-stats` can emit a JSON sidecar with per-tensor source/output dtype, qtype, exact byte counts, finite min/max, and NaN/Inf counts gathered during bounded streaming conversion.
 
 Useful DS4 converter features to copy:
 

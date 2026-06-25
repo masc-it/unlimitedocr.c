@@ -468,6 +468,91 @@ class SourceMetadata:
         }
 
 
+@dataclass
+class _StreamingValueStats:
+    value_count: int = 0
+    finite_count: int = 0
+    nan_count: int = 0
+    posinf_count: int = 0
+    neginf_count: int = 0
+    min_value: float | None = None
+    max_value: float | None = None
+
+    @property
+    def nonfinite_count(self) -> int:
+        return self.nan_count + self.posinf_count + self.neginf_count
+
+    def update(self, values: np.ndarray) -> None:
+        flat = np.asarray(values, dtype=np.float32).reshape(-1)
+        self.value_count += int(flat.size)
+        if flat.size == 0:
+            return
+        nan_mask = np.isnan(flat)
+        posinf_mask = np.isposinf(flat)
+        neginf_mask = np.isneginf(flat)
+        self.nan_count += int(np.count_nonzero(nan_mask))
+        self.posinf_count += int(np.count_nonzero(posinf_mask))
+        self.neginf_count += int(np.count_nonzero(neginf_mask))
+        finite_values = flat[np.isfinite(flat)]
+        self.finite_count += int(finite_values.size)
+        if finite_values.size == 0:
+            return
+        chunk_min = float(np.min(finite_values))
+        chunk_max = float(np.max(finite_values))
+        self.min_value = chunk_min if self.min_value is None else min(self.min_value, chunk_min)
+        self.max_value = chunk_max if self.max_value is None else max(self.max_value, chunk_max)
+
+
+@dataclass(frozen=True)
+class TensorConversionStats:
+    name: str
+    tensor_id: int
+    source_dtype: str
+    output_dtype: str
+    qtype: str
+    qtype_id: int
+    shape: tuple[int, ...]
+    logical_shape: tuple[int, ...]
+    physical_shape: tuple[int, ...]
+    source_bytes: int
+    output_bytes: int
+    output_bytes_written: int
+    payload_offset: int
+    value_count: int
+    finite_count: int
+    source_min: float | None
+    source_max: float | None
+    source_nan_count: int
+    source_posinf_count: int
+    source_neginf_count: int
+    source_nonfinite_count: int
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "tensor_id": self.tensor_id,
+            "source_dtype": self.source_dtype,
+            "output_dtype": self.output_dtype,
+            "qtype": self.qtype,
+            "qtype_id": self.qtype_id,
+            "shape": list(self.shape),
+            "logical_shape": list(self.logical_shape),
+            "physical_shape": list(self.physical_shape),
+            "source_bytes": self.source_bytes,
+            "output_bytes": self.output_bytes,
+            "output_bytes_written": self.output_bytes_written,
+            "payload_offset": self.payload_offset,
+            "value_count": self.value_count,
+            "finite_count": self.finite_count,
+            "source_min": self.source_min,
+            "source_max": self.source_max,
+            "source_nan_count": self.source_nan_count,
+            "source_posinf_count": self.source_posinf_count,
+            "source_neginf_count": self.source_neginf_count,
+            "source_nonfinite_count": self.source_nonfinite_count,
+        }
+
+
 @dataclass(frozen=True)
 class DryRunPlan:
     hf_dir: Path
@@ -1941,18 +2026,101 @@ def _bf16_bytes_to_f32(raw: bytes) -> np.ndarray:
     return fp32_bits.view(np.dtype("<f4"))
 
 
-def _stream_bf16_to_f16(src: BinaryIO, dst: BinaryIO, *, source_bytes: int, chunk_bytes: int = 32 * 1024 * 1024) -> None:
+def _tensor_conversion_stats(
+    tensor: TensorPlan,
+    value_stats: _StreamingValueStats,
+    *,
+    output_bytes_written: int,
+) -> TensorConversionStats:
+    return TensorConversionStats(
+        name=tensor.name,
+        tensor_id=tensor.tensor_id,
+        source_dtype=tensor.source_dtype,
+        output_dtype=tensor.output_dtype,
+        qtype=tensor.qtype,
+        qtype_id=tensor.qtype_id,
+        shape=tensor.shape,
+        logical_shape=tensor.logical_shape,
+        physical_shape=tensor.physical_shape,
+        source_bytes=tensor.source_bytes,
+        output_bytes=tensor.output_bytes,
+        output_bytes_written=output_bytes_written,
+        payload_offset=tensor.payload_offset,
+        value_count=value_stats.value_count,
+        finite_count=value_stats.finite_count,
+        source_min=value_stats.min_value,
+        source_max=value_stats.max_value,
+        source_nan_count=value_stats.nan_count,
+        source_posinf_count=value_stats.posinf_count,
+        source_neginf_count=value_stats.neginf_count,
+        source_nonfinite_count=value_stats.nonfinite_count,
+    )
+
+
+def _conversion_stats_report(
+    plan: DryRunPlan,
+    out_path: Path,
+    stats: Iterable[TensorConversionStats],
+) -> dict[str, Any]:
+    tensors = tuple(stats)
+    return {
+        "version": 1,
+        "model_path": str(out_path),
+        "hf_dir": str(plan.hf_dir),
+        "qprofile": plan.qprofile,
+        "tensor_count": len(tensors),
+        "source_bytes": sum(tensor.source_bytes for tensor in tensors),
+        "output_bytes": sum(tensor.output_bytes for tensor in tensors),
+        "output_bytes_written": sum(tensor.output_bytes_written for tensor in tensors),
+        "value_count": sum(tensor.value_count for tensor in tensors),
+        "finite_count": sum(tensor.finite_count for tensor in tensors),
+        "source_nan_count": sum(tensor.source_nan_count for tensor in tensors),
+        "source_posinf_count": sum(tensor.source_posinf_count for tensor in tensors),
+        "source_neginf_count": sum(tensor.source_neginf_count for tensor in tensors),
+        "source_nonfinite_count": sum(tensor.source_nonfinite_count for tensor in tensors),
+        "tensors": [tensor.as_dict() for tensor in tensors],
+    }
+
+
+def _write_conversion_stats_report(
+    plan: DryRunPlan,
+    out_path: Path,
+    stats: Iterable[TensorConversionStats],
+    stats_path: str | Path,
+) -> None:
+    path = Path(stats_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(_conversion_stats_report(plan, out_path, stats), indent=2, sort_keys=True)
+    tmp = path.with_name(f".{path.name}.tmp")
+    tmp.write_text(payload + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _stream_bf16_to_f16(
+    src: BinaryIO,
+    dst: BinaryIO,
+    *,
+    source_bytes: int,
+    stats: _StreamingValueStats | None = None,
+    chunk_bytes: int = 32 * 1024 * 1024,
+) -> int:
     if source_bytes % 2 != 0:
         raise ValueError(f"BF16 tensor byte count must be even, got {source_bytes}")
     remaining = source_bytes
+    bytes_written = 0
     chunk_bytes = max(2, chunk_bytes - (chunk_bytes % 2))
     while remaining:
         raw = src.read(min(remaining, chunk_bytes))
         if not raw:
             raise EOFError("unexpected end of safetensors payload while streaming tensor")
-        fp16 = _bf16_bytes_to_f32(raw).astype(np.dtype("<f2"), copy=False)
-        dst.write(fp16.tobytes())
+        values = _bf16_bytes_to_f32(raw)
+        if stats is not None:
+            stats.update(values)
+        payload = values.astype(np.dtype("<f2"), copy=False).tobytes()
+        dst.write(payload)
+        bytes_written += len(payload)
         remaining -= len(raw)
+    return bytes_written
 
 
 def _round_away_from_zero(values: np.ndarray) -> np.ndarray:
@@ -1985,8 +2153,9 @@ def _stream_bf16_to_q8_0(
     dst: BinaryIO,
     *,
     tensor: TensorPlan,
+    stats: _StreamingValueStats | None = None,
     chunk_source_bytes: int = 8 * 1024 * 1024,
-) -> None:
+) -> int:
     if tensor.qtype_id != UOCR_TENSOR_Q8_0:
         raise ValueError(f"tensor {tensor.name} is not Q8_0")
     if len(tensor.logical_shape) != 2 or len(tensor.physical_shape) != 2:
@@ -2011,6 +2180,8 @@ def _stream_bf16_to_q8_0(
         if len(raw) != batch_rows * source_row_bytes:
             raise EOFError(f"unexpected end of safetensors payload while streaming {tensor.name}")
         values = _bf16_bytes_to_f32(raw).reshape(batch_rows, logical_inner)
+        if stats is not None:
+            stats.update(values)
         if physical_inner != logical_inner:
             padded = np.zeros((batch_rows, physical_inner), dtype=np.float32)
             padded[:, :logical_inner] = values
@@ -2021,6 +2192,7 @@ def _stream_bf16_to_q8_0(
         rows_done += batch_rows
     if bytes_written != tensor.output_bytes:
         raise IOError(f"tensor {tensor.name} wrote {bytes_written} bytes, expected {tensor.output_bytes}")
+    return bytes_written
 
 
 def write_uocr_model(
@@ -2029,13 +2201,16 @@ def write_uocr_model(
     *,
     safetensors_path: str | Path | None = None,
     overwrite: bool = False,
+    stats_path: str | Path | None = None,
 ) -> Path:
     """Stream a planned `.uocr` file to disk.
 
     The writer supports the fp16 baseline and the first dynamic q8 profile.  It
     converts each BF16 safetensors range to its planned runtime qtype in bounded
     chunks and writes directly into the mmap-friendly layout produced by
-    :func:`build_dry_run_plan`.
+    :func:`build_dry_run_plan`.  When ``stats_path`` is supplied, the same chunks
+    are also summarized into per-tensor conversion statistics without creating a
+    full-model temporary array.
     """
 
     if plan.qprofile not in {"fp16", "dyn-q8"}:
@@ -2060,6 +2235,7 @@ def write_uocr_model(
     tmp = out.with_name(f".{out.name}.tmp")
     if tmp.exists():
         tmp.unlink()
+    conversion_stats: list[TensorConversionStats] | None = [] if stats_path is not None else None
     try:
         with source.open("rb") as src, tmp.open("w+b") as dst:
             header = _FILE_HEADER_STRUCT.pack(
@@ -2104,17 +2280,29 @@ def write_uocr_model(
                 src.seek(data_start + tensor.source_offsets[0])
                 dst.seek(tensor.payload_offset)
                 before = dst.tell()
+                value_stats = _StreamingValueStats() if conversion_stats is not None else None
                 if tensor.qtype_id == UOCR_TENSOR_F16:
-                    _stream_bf16_to_f16(src, dst, source_bytes=tensor.source_bytes)
+                    output_bytes_written = _stream_bf16_to_f16(
+                        src, dst, source_bytes=tensor.source_bytes, stats=value_stats
+                    )
                 elif tensor.qtype_id == UOCR_TENSOR_Q8_0:
-                    _stream_bf16_to_q8_0(src, dst, tensor=tensor)
+                    output_bytes_written = _stream_bf16_to_q8_0(src, dst, tensor=tensor, stats=value_stats)
                 else:
                     raise NotImplementedError(f"writing qtype {tensor.qtype} is not implemented")
                 written = dst.tell() - before
-                if written != tensor.output_bytes:
-                    raise IOError(f"tensor {tensor.name} wrote {written} bytes, expected {tensor.output_bytes}")
+                if written != tensor.output_bytes or output_bytes_written != tensor.output_bytes:
+                    raise IOError(
+                        f"tensor {tensor.name} wrote {written}/{output_bytes_written} bytes, "
+                        f"expected {tensor.output_bytes}"
+                    )
+                if conversion_stats is not None and value_stats is not None:
+                    conversion_stats.append(
+                        _tensor_conversion_stats(tensor, value_stats, output_bytes_written=output_bytes_written)
+                    )
             dst.truncate(plan.planned_file_size)
         os.replace(tmp, out)
+        if stats_path is not None:
+            _write_conversion_stats_report(plan, out, conversion_stats or (), stats_path)
     except Exception:
         try:
             tmp.unlink()
@@ -2180,6 +2368,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--out", type=Path, default=None, help="write an fp16 or dyn-q8 .uocr file to this path")
     parser.add_argument("--tensor", default=None, help="optional single tensor source name or stable tensor id")
     parser.add_argument("--overwrite", action="store_true", help="replace an existing --out file")
+    parser.add_argument(
+        "--conversion-stats",
+        type=Path,
+        default=None,
+        help="write per-tensor conversion statistics JSON while writing --out",
+    )
     parser.add_argument("--dump-plan", nargs="?", const="-", default=None, help="write full JSON plan to path or stdout")
     parser.add_argument(
         "--relaxed-validation",
@@ -2190,6 +2384,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.out is None and not args.dry_run:
         parser.error("either --dry-run or --out is required")
+    if args.conversion_stats is not None and args.out is None:
+        parser.error("--conversion-stats requires --out")
     if args.out is not None and args.qprofile == "dyn-q4":
         parser.error("dyn-q4 .uocr writing is not implemented yet; use --dry-run for q4 planning")
 
@@ -2205,8 +2401,16 @@ def main(argv: list[str] | None = None) -> int:
     if args.dump_plan is not None:
         _write_dump(plan, args.dump_plan)
     if args.out is not None:
-        written = write_uocr_model(plan, args.out, safetensors_path=args.safetensors, overwrite=args.overwrite)
+        written = write_uocr_model(
+            plan,
+            args.out,
+            safetensors_path=args.safetensors,
+            overwrite=args.overwrite,
+            stats_path=args.conversion_stats,
+        )
         print(f"wrote: {written}")
+        if args.conversion_stats is not None:
+            print(f"conversion stats: {args.conversion_stats}")
     return 0
 
 

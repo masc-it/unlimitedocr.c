@@ -397,7 +397,7 @@ Current priority slice, in order. The coding agent should take the first uncheck
 - [x] Implement `tools/uocr-convert` dry-run CLI (Python first; native conversion can follow once layout is stable).
 - [x] Read `config.json`, `processor_config.json`, tokenizer metadata, and safetensors metadata.
 - [x] Support the current one-file safetensors layout `model-00001-of-000001.safetensors`; keep multi-file safetensors support possible through the index file.
-- [ ] Parse safetensors without loading all weights at once:
+- [x] Parse safetensors without loading all weights at once:
   - [x] read header length
   - [x] parse JSON header
   - [x] validate that current source tensors are BF16 unless explicitly exempted by a future checkpoint
@@ -405,7 +405,7 @@ Current priority slice, in order. The coding agent should take the first uncheck
   - [x] convert BF16 rows to fp16 payload rows
   - [x] never allocate a second full-model-sized temporary buffer
 - [x] Implement BF16 -> fp16 conversion using bounded NumPy chunk conversion for the Python converter writer.
-- [ ] Record conversion statistics per tensor: source dtype, output dtype/qtype, min/max if cheap, NaN/Inf count, and exact byte count.
+- [x] Record conversion statistics per tensor: source dtype, output dtype/qtype, min/max if cheap, NaN/Inf count, and exact byte count.
 - [ ] Preserve row-major matrix layout where runtime kernels expect `[out, in]`.
 - [ ] Transpose only where an explicit runtime kernel requires it; record the decision in tensor metadata.
 - [x] Emit pure fp16 `.uocr` first when the safetensors payload is present; always-on tests use tiny synthetic safetensors payloads.
