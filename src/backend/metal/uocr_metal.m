@@ -3585,16 +3585,513 @@ static int metal_context_clip_transformer_workspace_f16(uocr_metal_context *ctx,
                                                         uocr_metal_vision_workspace *scratch,
                                                         char *error,
                                                         size_t error_size);
+static int metal_sam_transformer_activation_bytes(uint32_t grid_w,
+                                                  uint32_t grid_h,
+                                                  uint64_t *row_count,
+                                                  uint64_t *hidden_bytes,
+                                                  char *error,
+                                                  size_t error_size);
+
+static int metal_vision_require_workspace_slice_f16(uocr_metal_vision_workspace_slice slice,
+                                                    uint64_t byte_length,
+                                                    const char *label,
+                                                    char *error,
+                                                    size_t error_size) {
+    if (slice.buffer == nil || slice.f16 == NULL || byte_length == 0u || byte_length > slice.bytes ||
+        !metal_slice_valid((uocr_metal_buffer_slice){slice.buffer, slice.offset}, byte_length)) {
+        return metal_fail(error, error_size, "invalid Metal vision %s slice", label != NULL ? label : "workspace");
+    }
+    return 1;
+}
+
+static int metal_vision_require_tensor_slice_f16(uocr_metal_vision_tensor_f16 tensor,
+                                                 uint64_t byte_length,
+                                                 const char *label,
+                                                 char *error,
+                                                 size_t error_size) {
+    if (tensor.slice.buffer == nil || tensor.host_f16 == NULL || byte_length == 0u || byte_length > tensor.byte_length ||
+        !metal_slice_valid(tensor.slice, byte_length)) {
+        return metal_fail(error, error_size, "invalid Metal vision %s tensor slice", label != NULL ? label : "weight");
+    }
+    return 1;
+}
+
+static int metal_vision_f16_bytes(uint64_t value_count, uint64_t *out_bytes) {
+    return checked_mul_u64(value_count, 2u, out_bytes) && *out_bytes <= (uint64_t)SIZE_MAX;
+}
+
+static int metal_vision_square_grid_values(uint32_t grid_w,
+                                           uint32_t grid_h,
+                                           uint32_t channels,
+                                           uint64_t *out_values) {
+    uint64_t spatial = 0u;
+    return checked_mul_u64((uint64_t)grid_w, (uint64_t)grid_h, &spatial) &&
+           checked_mul_u64(spatial, (uint64_t)channels, out_values);
+}
+
+static int metal_context_sam_patch_embed_f16_to_slice(uocr_metal_context *ctx,
+                                                      const uocr_image_view *view,
+                                                      uocr_metal_vision_tensor_f16 patch_weight,
+                                                      uocr_metal_vision_tensor_f16 patch_bias,
+                                                      uocr_metal_vision_workspace_slice out_bhwc,
+                                                      uint32_t *out_grid_w,
+                                                      uint32_t *out_grid_h,
+                                                      char *error,
+                                                      size_t error_size) {
+    if (view == NULL || out_grid_w == NULL || out_grid_h == NULL) {
+        return metal_fail(error, error_size, "invalid Metal SAM patch slice request");
+    }
+    const uint32_t grid_w = view->width / UOCR_VISION_PATCH_SIZE;
+    const uint32_t grid_h = view->height / UOCR_VISION_PATCH_SIZE;
+    uint64_t output_values = 0u;
+    uint64_t output_bytes = 0u;
+    uint64_t weight_values = 0u;
+    uint64_t weight_bytes = 0u;
+    const uint64_t bias_bytes = (uint64_t)UOCR_SAM_HIDDEN_SIZE * 2u;
+    if (!metal_vision_square_grid_values(grid_w, grid_h, UOCR_SAM_HIDDEN_SIZE, &output_values) ||
+        !metal_vision_f16_bytes(output_values, &output_bytes) ||
+        !checked_mul_u64((uint64_t)UOCR_SAM_HIDDEN_SIZE,
+                         3u * (uint64_t)UOCR_VISION_PATCH_SIZE * (uint64_t)UOCR_VISION_PATCH_SIZE,
+                         &weight_values) ||
+        !metal_vision_f16_bytes(weight_values, &weight_bytes) ||
+        !metal_vision_require_workspace_slice_f16(out_bhwc, output_bytes, "SAM patch output", error, error_size) ||
+        !metal_vision_require_tensor_slice_f16(patch_weight, weight_bytes, "SAM patch weight", error, error_size) ||
+        !metal_vision_require_tensor_slice_f16(patch_bias, bias_bytes, "SAM patch bias", error, error_size)) {
+        return 0;
+    }
+    return uocr_metal_context_sam_patch_embed_f16(ctx,
+                                                  view->pixels,
+                                                  view->format,
+                                                  view->width,
+                                                  view->height,
+                                                  patch_weight.host_f16,
+                                                  patch_bias.host_f16,
+                                                  out_bhwc.f16,
+                                                  out_grid_w,
+                                                  out_grid_h,
+                                                  error,
+                                                  error_size);
+}
+
+static int metal_context_sam_add_abs_pos_f16_to_slice(uocr_metal_context *ctx,
+                                                       uocr_metal_vision_workspace_slice patch_bhwc,
+                                                       uocr_metal_vision_tensor_f16 pos_embed,
+                                                       uint32_t grid_w,
+                                                       uint32_t grid_h,
+                                                       uocr_metal_vision_workspace_slice out_bhwc,
+                                                       char *error,
+                                                       size_t error_size) {
+    uint64_t target_values = 0u;
+    uint64_t target_bytes = 0u;
+    uint64_t pos_values = 0u;
+    uint64_t pos_bytes = 0u;
+    const uint32_t source_grid = UOCR_GLOBAL_VIEW_SIZE / UOCR_VISION_PATCH_SIZE;
+    if (!metal_vision_square_grid_values(grid_w, grid_h, UOCR_SAM_HIDDEN_SIZE, &target_values) ||
+        !metal_vision_f16_bytes(target_values, &target_bytes) ||
+        !metal_vision_square_grid_values(source_grid, source_grid, UOCR_SAM_HIDDEN_SIZE, &pos_values) ||
+        !metal_vision_f16_bytes(pos_values, &pos_bytes) ||
+        !metal_vision_require_workspace_slice_f16(patch_bhwc, target_bytes, "SAM abs-pos input", error, error_size) ||
+        !metal_vision_require_workspace_slice_f16(out_bhwc, target_bytes, "SAM abs-pos output", error, error_size) ||
+        !metal_vision_require_tensor_slice_f16(pos_embed, pos_bytes, "SAM abs-pos table", error, error_size)) {
+        return 0;
+    }
+    return uocr_metal_context_sam_add_abs_pos_f16(ctx,
+                                                  patch_bhwc.f16,
+                                                  pos_embed.host_f16,
+                                                  grid_w,
+                                                  grid_h,
+                                                  out_bhwc.f16,
+                                                  error,
+                                                  error_size);
+}
+
+static int metal_context_sam_transformer_workspace_f16_to_slice(uocr_metal_context *ctx,
+                                                                uocr_metal_vision_workspace_slice input_bhwc,
+                                                                const uocr_metal_sam_transformer_block_f16 *blocks,
+                                                                uint32_t block_count,
+                                                                uint32_t grid_w,
+                                                                uint32_t grid_h,
+                                                                uocr_metal_vision_workspace_slice out_bhwc,
+                                                                uocr_metal_vision_workspace *scratch,
+                                                                char *error,
+                                                                size_t error_size) {
+    uint64_t hidden_bytes = 0u;
+    if (!metal_sam_transformer_activation_bytes(grid_w, grid_h, NULL, &hidden_bytes, error, error_size) ||
+        !metal_vision_require_workspace_slice_f16(input_bhwc, hidden_bytes, "SAM transformer input", error, error_size) ||
+        !metal_vision_require_workspace_slice_f16(out_bhwc, hidden_bytes, "SAM transformer output", error, error_size)) {
+        return 0;
+    }
+    return metal_context_sam_transformer_workspace_f16(ctx,
+                                                       input_bhwc.f16,
+                                                       blocks,
+                                                       block_count,
+                                                       grid_w,
+                                                       grid_h,
+                                                       UOCR_METAL_DENSE_OUTPUT_F16,
+                                                       out_bhwc.f16,
+                                                       scratch,
+                                                       error,
+                                                       error_size);
+}
+
+static int metal_context_sam_neck_conv1x1_f16_to_slice(uocr_metal_context *ctx,
+                                                       uocr_metal_vision_workspace_slice input_bhwc,
+                                                       uocr_metal_vision_tensor_f16 weight,
+                                                       uint32_t grid_w,
+                                                       uint32_t grid_h,
+                                                       uocr_metal_vision_workspace_slice out_nchw,
+                                                       char *error,
+                                                       size_t error_size) {
+    uint64_t input_values = 0u;
+    uint64_t input_bytes = 0u;
+    uint64_t output_values = 0u;
+    uint64_t output_bytes = 0u;
+    const uint64_t weight_bytes = (uint64_t)UOCR_SAM_NECK_CHANNELS * (uint64_t)UOCR_SAM_HIDDEN_SIZE * 2u;
+    if (!metal_vision_square_grid_values(grid_w, grid_h, UOCR_SAM_HIDDEN_SIZE, &input_values) ||
+        !metal_vision_f16_bytes(input_values, &input_bytes) ||
+        !metal_vision_square_grid_values(grid_w, grid_h, UOCR_SAM_NECK_CHANNELS, &output_values) ||
+        !metal_vision_f16_bytes(output_values, &output_bytes) ||
+        !metal_vision_require_workspace_slice_f16(input_bhwc, input_bytes, "SAM neck 1x1 input", error, error_size) ||
+        !metal_vision_require_workspace_slice_f16(out_nchw, output_bytes, "SAM neck 1x1 output", error, error_size) ||
+        !metal_vision_require_tensor_slice_f16(weight, weight_bytes, "SAM neck 1x1 weight", error, error_size)) {
+        return 0;
+    }
+    return uocr_metal_context_sam_neck_conv1x1_f16(ctx,
+                                                   input_bhwc.f16,
+                                                   weight.host_f16,
+                                                   grid_w,
+                                                   grid_h,
+                                                   UOCR_METAL_DENSE_OUTPUT_F16,
+                                                   out_nchw.f16,
+                                                   error,
+                                                   error_size);
+}
+
+static int metal_context_sam_layernorm2d_f16_to_slice(uocr_metal_context *ctx,
+                                                      uocr_metal_vision_workspace_slice input_nchw,
+                                                      uocr_metal_vision_tensor_f16 weight,
+                                                      uocr_metal_vision_tensor_f16 bias,
+                                                      uint32_t grid_w,
+                                                      uint32_t grid_h,
+                                                      uocr_metal_vision_workspace_slice out_nchw,
+                                                      char *error,
+                                                      size_t error_size) {
+    uint64_t values = 0u;
+    uint64_t bytes = 0u;
+    const uint64_t parameter_bytes = (uint64_t)UOCR_SAM_NECK_CHANNELS * 2u;
+    if (!metal_vision_square_grid_values(grid_w, grid_h, UOCR_SAM_NECK_CHANNELS, &values) ||
+        !metal_vision_f16_bytes(values, &bytes) ||
+        !metal_vision_require_workspace_slice_f16(input_nchw, bytes, "SAM LayerNorm2d input", error, error_size) ||
+        !metal_vision_require_workspace_slice_f16(out_nchw, bytes, "SAM LayerNorm2d output", error, error_size) ||
+        !metal_vision_require_tensor_slice_f16(weight, parameter_bytes, "SAM LayerNorm2d weight", error, error_size) ||
+        !metal_vision_require_tensor_slice_f16(bias, parameter_bytes, "SAM LayerNorm2d bias", error, error_size)) {
+        return 0;
+    }
+    return uocr_metal_context_sam_layernorm2d_f16(ctx,
+                                                  input_nchw.f16,
+                                                  weight.host_f16,
+                                                  bias.host_f16,
+                                                  grid_w,
+                                                  grid_h,
+                                                  UOCR_METAL_DENSE_OUTPUT_F16,
+                                                  out_nchw.f16,
+                                                  error,
+                                                  error_size);
+}
+
+static int metal_context_sam_neck_conv3x3_f16_to_slice(uocr_metal_context *ctx,
+                                                       uocr_metal_vision_workspace_slice input_nchw,
+                                                       uocr_metal_vision_tensor_f16 weight,
+                                                       uint32_t grid_w,
+                                                       uint32_t grid_h,
+                                                       uocr_metal_vision_workspace_slice out_nchw,
+                                                       char *error,
+                                                       size_t error_size) {
+    uint64_t values = 0u;
+    uint64_t bytes = 0u;
+    const uint64_t weight_bytes = (uint64_t)UOCR_SAM_NECK_CHANNELS * (uint64_t)UOCR_SAM_NECK_CHANNELS *
+                                  (uint64_t)UOCR_SAM_NECK_KERNEL_SIZE * (uint64_t)UOCR_SAM_NECK_KERNEL_SIZE * 2u;
+    if (!metal_vision_square_grid_values(grid_w, grid_h, UOCR_SAM_NECK_CHANNELS, &values) ||
+        !metal_vision_f16_bytes(values, &bytes) ||
+        !metal_vision_require_workspace_slice_f16(input_nchw, bytes, "SAM neck 3x3 input", error, error_size) ||
+        !metal_vision_require_workspace_slice_f16(out_nchw, bytes, "SAM neck 3x3 output", error, error_size) ||
+        !metal_vision_require_tensor_slice_f16(weight, weight_bytes, "SAM neck 3x3 weight", error, error_size)) {
+        return 0;
+    }
+    return uocr_metal_context_sam_neck_conv3x3_f16(ctx,
+                                                   input_nchw.f16,
+                                                   weight.host_f16,
+                                                   grid_w,
+                                                   grid_h,
+                                                   UOCR_METAL_DENSE_OUTPUT_F16,
+                                                   out_nchw.f16,
+                                                   error,
+                                                   error_size);
+}
+
+static int metal_context_sam_stride2_conv_f16_to_slice(uocr_metal_context *ctx,
+                                                       uocr_metal_vision_workspace_slice input_nchw,
+                                                       uocr_metal_vision_tensor_f16 weight,
+                                                       uint32_t grid_w,
+                                                       uint32_t grid_h,
+                                                       uint32_t in_channels,
+                                                       uint32_t out_channels,
+                                                       uocr_metal_vision_workspace_slice out_nchw,
+                                                       int net3,
+                                                       char *error,
+                                                       size_t error_size) {
+    const uint32_t out_w = (grid_w + UOCR_SAM_NET_STRIDE - 1u) / UOCR_SAM_NET_STRIDE;
+    const uint32_t out_h = (grid_h + UOCR_SAM_NET_STRIDE - 1u) / UOCR_SAM_NET_STRIDE;
+    uint64_t input_values = 0u;
+    uint64_t input_bytes = 0u;
+    uint64_t output_values = 0u;
+    uint64_t output_bytes = 0u;
+    const uint64_t weight_bytes = (uint64_t)out_channels * (uint64_t)in_channels *
+                                  (uint64_t)UOCR_SAM_NECK_KERNEL_SIZE * (uint64_t)UOCR_SAM_NECK_KERNEL_SIZE * 2u;
+    if (!metal_vision_square_grid_values(grid_w, grid_h, in_channels, &input_values) ||
+        !metal_vision_f16_bytes(input_values, &input_bytes) ||
+        !metal_vision_square_grid_values(out_w, out_h, out_channels, &output_values) ||
+        !metal_vision_f16_bytes(output_values, &output_bytes) ||
+        !metal_vision_require_workspace_slice_f16(input_nchw, input_bytes, "SAM stride-2 input", error, error_size) ||
+        !metal_vision_require_workspace_slice_f16(out_nchw, output_bytes, "SAM stride-2 output", error, error_size) ||
+        !metal_vision_require_tensor_slice_f16(weight, weight_bytes, "SAM stride-2 weight", error, error_size)) {
+        return 0;
+    }
+    if (net3) {
+        return uocr_metal_context_sam_net3_conv3x3_stride2_f16(ctx,
+                                                               input_nchw.f16,
+                                                               weight.host_f16,
+                                                               grid_w,
+                                                               grid_h,
+                                                               UOCR_METAL_DENSE_OUTPUT_F16,
+                                                               out_nchw.f16,
+                                                               error,
+                                                               error_size);
+    }
+    return uocr_metal_context_sam_net2_conv3x3_stride2_f16(ctx,
+                                                           input_nchw.f16,
+                                                           weight.host_f16,
+                                                           grid_w,
+                                                           grid_h,
+                                                           UOCR_METAL_DENSE_OUTPUT_F16,
+                                                           out_nchw.f16,
+                                                           error,
+                                                           error_size);
+}
+
+static int metal_context_clip_embed_sam_f16_to_slice(uocr_metal_context *ctx,
+                                                     uocr_metal_vision_workspace_slice sam_nchw,
+                                                     uocr_metal_vision_tensor_f16 class_embedding,
+                                                     uint32_t grid_w,
+                                                     uint32_t grid_h,
+                                                     uocr_metal_vision_workspace_slice out_tokens,
+                                                     char *error,
+                                                     size_t error_size) {
+    uint64_t spatial = 0u;
+    uint64_t input_values = 0u;
+    uint64_t input_bytes = 0u;
+    uint64_t output_tokens = 0u;
+    uint64_t output_values = 0u;
+    uint64_t output_bytes = 0u;
+    const uint64_t class_bytes = (uint64_t)UOCR_CLIP_HIDDEN_SIZE * 2u;
+    if (!checked_mul_u64((uint64_t)grid_w, (uint64_t)grid_h, &spatial) ||
+        !checked_mul_u64(spatial, (uint64_t)UOCR_SAM_FEATURE_CHANNELS, &input_values) ||
+        !metal_vision_f16_bytes(input_values, &input_bytes) ||
+        !checked_add_u64(spatial, (uint64_t)UOCR_CLIP_CLASS_TOKENS, &output_tokens) ||
+        !checked_mul_u64(output_tokens, (uint64_t)UOCR_CLIP_HIDDEN_SIZE, &output_values) ||
+        !metal_vision_f16_bytes(output_values, &output_bytes) ||
+        !metal_vision_require_workspace_slice_f16(sam_nchw, input_bytes, "CLIP SAM embedding input", error, error_size) ||
+        !metal_vision_require_workspace_slice_f16(out_tokens, output_bytes, "CLIP SAM embedding output", error, error_size) ||
+        !metal_vision_require_tensor_slice_f16(class_embedding, class_bytes, "CLIP class embedding", error, error_size)) {
+        return 0;
+    }
+    return uocr_metal_context_clip_embed_sam_f16(ctx,
+                                                 sam_nchw.f16,
+                                                 class_embedding.host_f16,
+                                                 grid_w,
+                                                 grid_h,
+                                                 UOCR_METAL_DENSE_OUTPUT_F16,
+                                                 out_tokens.f16,
+                                                 error,
+                                                 error_size);
+}
+
+static int metal_context_clip_add_abs_pos_f16_to_slice(uocr_metal_context *ctx,
+                                                        uocr_metal_vision_workspace_slice tokens,
+                                                        uocr_metal_vision_tensor_f16 pos_embed,
+                                                        uint32_t grid_w,
+                                                        uint32_t grid_h,
+                                                        uocr_metal_vision_workspace_slice out_tokens,
+                                                        char *error,
+                                                        size_t error_size) {
+    uint64_t spatial = 0u;
+    uint64_t token_count = 0u;
+    uint64_t token_values = 0u;
+    uint64_t token_bytes = 0u;
+    const uint64_t pos_bytes = (uint64_t)UOCR_CLIP_GLOBAL_TOKENS * (uint64_t)UOCR_CLIP_HIDDEN_SIZE * 2u;
+    if (!checked_mul_u64((uint64_t)grid_w, (uint64_t)grid_h, &spatial) ||
+        !checked_add_u64(spatial, (uint64_t)UOCR_CLIP_CLASS_TOKENS, &token_count) ||
+        !checked_mul_u64(token_count, (uint64_t)UOCR_CLIP_HIDDEN_SIZE, &token_values) ||
+        !metal_vision_f16_bytes(token_values, &token_bytes) ||
+        !metal_vision_require_workspace_slice_f16(tokens, token_bytes, "CLIP abs-pos input", error, error_size) ||
+        !metal_vision_require_workspace_slice_f16(out_tokens, token_bytes, "CLIP abs-pos output", error, error_size) ||
+        !metal_vision_require_tensor_slice_f16(pos_embed, pos_bytes, "CLIP abs-pos table", error, error_size)) {
+        return 0;
+    }
+    return uocr_metal_context_clip_add_abs_pos_f16(ctx,
+                                                   tokens.f16,
+                                                   pos_embed.host_f16,
+                                                   grid_w,
+                                                   grid_h,
+                                                   UOCR_METAL_DENSE_OUTPUT_F16,
+                                                   out_tokens.f16,
+                                                   error,
+                                                   error_size);
+}
+
+static int metal_context_clip_pre_layernorm_f16_to_slice(uocr_metal_context *ctx,
+                                                         uocr_metal_vision_workspace_slice input_tokens,
+                                                         uocr_metal_vision_tensor_f16 weight,
+                                                         uocr_metal_vision_tensor_f16 bias,
+                                                         uint32_t token_count,
+                                                         uocr_metal_vision_workspace_slice out_tokens,
+                                                         char *error,
+                                                         size_t error_size) {
+    uint64_t values = 0u;
+    uint64_t bytes = 0u;
+    const uint64_t parameter_bytes = (uint64_t)UOCR_CLIP_HIDDEN_SIZE * 2u;
+    if (!checked_mul_u64((uint64_t)token_count, (uint64_t)UOCR_CLIP_HIDDEN_SIZE, &values) ||
+        !metal_vision_f16_bytes(values, &bytes) ||
+        !metal_vision_require_workspace_slice_f16(input_tokens, bytes, "CLIP pre-LayerNorm input", error, error_size) ||
+        !metal_vision_require_workspace_slice_f16(out_tokens, bytes, "CLIP pre-LayerNorm output", error, error_size) ||
+        !metal_vision_require_tensor_slice_f16(weight, parameter_bytes, "CLIP pre-LayerNorm weight", error, error_size) ||
+        !metal_vision_require_tensor_slice_f16(bias, parameter_bytes, "CLIP pre-LayerNorm bias", error, error_size)) {
+        return 0;
+    }
+    return uocr_metal_context_clip_pre_layernorm_f16(ctx,
+                                                     input_tokens.f16,
+                                                     weight.host_f16,
+                                                     bias.host_f16,
+                                                     token_count,
+                                                     UOCR_METAL_LAYERNORM_OUTPUT_F16,
+                                                     out_tokens.f16,
+                                                     error,
+                                                     error_size);
+}
+
+static int metal_context_clip_transformer_workspace_f16_to_slice(uocr_metal_context *ctx,
+                                                                 uocr_metal_vision_workspace_slice input_tokens,
+                                                                 const uocr_metal_clip_transformer_block_f16 *blocks,
+                                                                 uint32_t block_count,
+                                                                 uint32_t token_count,
+                                                                 uocr_metal_vision_workspace_slice out_tokens,
+                                                                 uocr_metal_vision_workspace *scratch,
+                                                                 char *error,
+                                                                 size_t error_size) {
+    uint64_t values = 0u;
+    uint64_t bytes = 0u;
+    if (!checked_mul_u64((uint64_t)token_count, (uint64_t)UOCR_CLIP_HIDDEN_SIZE, &values) ||
+        !metal_vision_f16_bytes(values, &bytes) ||
+        !metal_vision_require_workspace_slice_f16(input_tokens, bytes, "CLIP transformer input", error, error_size) ||
+        !metal_vision_require_workspace_slice_f16(out_tokens, bytes, "CLIP transformer output", error, error_size)) {
+        return 0;
+    }
+    return metal_context_clip_transformer_workspace_f16(ctx,
+                                                        input_tokens.f16,
+                                                        blocks,
+                                                        block_count,
+                                                        token_count,
+                                                        UOCR_METAL_DENSE_OUTPUT_F16,
+                                                        out_tokens.f16,
+                                                        scratch,
+                                                        error,
+                                                        error_size);
+}
+
+static int metal_context_clip_sam_concat_f16_to_slice(uocr_metal_context *ctx,
+                                                      uocr_metal_vision_workspace_slice clip_tokens,
+                                                      uocr_metal_vision_workspace_slice sam_nchw,
+                                                      uint32_t grid_w,
+                                                      uint32_t grid_h,
+                                                      uocr_metal_vision_workspace_slice out_concat,
+                                                      char *error,
+                                                      size_t error_size) {
+    uint64_t spatial = 0u;
+    uint64_t clip_token_count = 0u;
+    uint64_t clip_values = 0u;
+    uint64_t sam_values = 0u;
+    uint64_t output_values = 0u;
+    uint64_t clip_bytes = 0u;
+    uint64_t sam_bytes = 0u;
+    uint64_t output_bytes = 0u;
+    if (!checked_mul_u64((uint64_t)grid_w, (uint64_t)grid_h, &spatial) ||
+        !checked_add_u64(spatial, (uint64_t)UOCR_CLIP_CLASS_TOKENS, &clip_token_count) ||
+        !checked_mul_u64(clip_token_count, (uint64_t)UOCR_CLIP_HIDDEN_SIZE, &clip_values) ||
+        !checked_mul_u64(spatial, (uint64_t)UOCR_SAM_FEATURE_CHANNELS, &sam_values) ||
+        !checked_mul_u64(spatial, (uint64_t)UOCR_PROJECTOR_IN_SIZE, &output_values) ||
+        !metal_vision_f16_bytes(clip_values, &clip_bytes) ||
+        !metal_vision_f16_bytes(sam_values, &sam_bytes) ||
+        !metal_vision_f16_bytes(output_values, &output_bytes) ||
+        !metal_vision_require_workspace_slice_f16(clip_tokens, clip_bytes, "CLIP/SAM concat CLIP input", error, error_size) ||
+        !metal_vision_require_workspace_slice_f16(sam_nchw, sam_bytes, "CLIP/SAM concat SAM input", error, error_size) ||
+        !metal_vision_require_workspace_slice_f16(out_concat, output_bytes, "CLIP/SAM concat output", error, error_size)) {
+        return 0;
+    }
+    return uocr_metal_context_clip_sam_concat_f16(ctx,
+                                                  clip_tokens.f16,
+                                                  sam_nchw.f16,
+                                                  grid_w,
+                                                  grid_h,
+                                                  UOCR_METAL_DENSE_OUTPUT_F16,
+                                                  out_concat.f16,
+                                                  error,
+                                                  error_size);
+}
+
+static int metal_context_visual_projector_f16_to_slice(uocr_metal_context *ctx,
+                                                       uocr_metal_vision_workspace_slice input,
+                                                       uocr_metal_vision_tensor_f16 weight,
+                                                       uocr_metal_vision_tensor_f16 bias,
+                                                       uint32_t n_rows,
+                                                       uocr_metal_vision_workspace_slice out_rows,
+                                                       char *error,
+                                                       size_t error_size) {
+    uint64_t input_values = 0u;
+    uint64_t input_bytes = 0u;
+    uint64_t output_values = 0u;
+    uint64_t output_bytes = 0u;
+    const uint64_t weight_bytes = (uint64_t)UOCR_HIDDEN_SIZE * (uint64_t)UOCR_PROJECTOR_IN_SIZE * 2u;
+    const uint64_t bias_bytes = (uint64_t)UOCR_HIDDEN_SIZE * 2u;
+    if (!checked_mul_u64((uint64_t)n_rows, (uint64_t)UOCR_PROJECTOR_IN_SIZE, &input_values) ||
+        !checked_mul_u64((uint64_t)n_rows, (uint64_t)UOCR_HIDDEN_SIZE, &output_values) ||
+        !metal_vision_f16_bytes(input_values, &input_bytes) ||
+        !metal_vision_f16_bytes(output_values, &output_bytes) ||
+        !metal_vision_require_workspace_slice_f16(input, input_bytes, "visual projector input", error, error_size) ||
+        !metal_vision_require_workspace_slice_f16(out_rows, output_bytes, "visual projector output", error, error_size) ||
+        !metal_vision_require_tensor_slice_f16(weight, weight_bytes, "visual projector weight", error, error_size) ||
+        !metal_vision_require_tensor_slice_f16(bias, bias_bytes, "visual projector bias", error, error_size)) {
+        return 0;
+    }
+    return uocr_metal_context_visual_projector_f16(ctx,
+                                                   input.f16,
+                                                   weight.host_f16,
+                                                   bias.host_f16,
+                                                   n_rows,
+                                                   UOCR_METAL_DENSE_OUTPUT_F16,
+                                                   out_rows.f16,
+                                                   error,
+                                                   error_size);
+}
 
 static int metal_encode_one_view_sam_features_f16(uocr_metal_vision_project_context *project,
                                                   const uocr_image_view *view,
-                                                  uint16_t *out_sam_nchw_f16,
+                                                  uocr_metal_vision_workspace_slice out_sam_nchw,
                                                   uint32_t *out_grid_w,
                                                   uint32_t *out_grid_h,
                                                   char *error,
                                                   size_t error_size) {
     if (project == NULL || project->ctx == NULL || project->weights == NULL || project->scratch == NULL ||
-        view == NULL || out_sam_nchw_f16 == NULL || out_grid_w == NULL || out_grid_h == NULL) {
+        view == NULL || out_sam_nchw.buffer == nil || out_grid_w == NULL || out_grid_h == NULL) {
         return metal_fail(error, error_size, "invalid Metal SAM view-encoding request");
     }
     const uint32_t expected_patch_grid = view->width / UOCR_VISION_PATCH_SIZE;
@@ -3618,18 +4115,15 @@ static int metal_encode_one_view_sam_features_f16(uocr_metal_vision_project_cont
     uint32_t patch_grid_h = 0u;
     const uint64_t sam_patch_start_ns = uocr_profile_now_ns();
     RUN_VISION_STEP("SAM patch embedding",
-                    uocr_metal_context_sam_patch_embed_f16(ctx,
-                                                            view->pixels,
-                                                            view->format,
-                                                            view->width,
-                                                            view->height,
-                                                            weights->sam_patch_weight.host_f16,
-                                                            weights->sam_patch_bias.host_f16,
-                                                            scratch->sam_patch_bhwc.f16,
-                                                            &patch_grid_w,
-                                                            &patch_grid_h,
-                                                            error,
-                                                            error_size));
+                    metal_context_sam_patch_embed_f16_to_slice(ctx,
+                                                                view,
+                                                                weights->sam_patch_weight,
+                                                                weights->sam_patch_bias,
+                                                                scratch->sam_patch_bhwc,
+                                                                &patch_grid_w,
+                                                                &patch_grid_h,
+                                                                error,
+                                                                error_size));
     metal_profile_add_event_now(ctx, "metal.vision.sam_patch", sam_patch_start_ns);
     if (patch_grid_w != expected_patch_grid || patch_grid_h != expected_patch_grid) {
         return metal_fail(error,
@@ -3642,91 +4136,90 @@ static int metal_encode_one_view_sam_features_f16(uocr_metal_vision_project_cont
     }
 
     RUN_VISION_STEP("SAM absolute position add",
-                    uocr_metal_context_sam_add_abs_pos_f16(ctx,
-                                                            scratch->sam_patch_bhwc.f16,
-                                                            weights->sam_pos_embed.host_f16,
-                                                            patch_grid_w,
-                                                            patch_grid_h,
-                                                            scratch->sam_pos_bhwc.f16,
-                                                            error,
-                                                            error_size));
-    RUN_VISION_STEP("SAM transformer",
-                    metal_context_sam_transformer_workspace_f16(ctx,
-                                                                scratch->sam_pos_bhwc.f16,
-                                                                weights->sam_blocks,
-                                                                UOCR_SAM_BLOCKS,
+                    metal_context_sam_add_abs_pos_f16_to_slice(ctx,
+                                                                scratch->sam_patch_bhwc,
+                                                                weights->sam_pos_embed,
                                                                 patch_grid_w,
                                                                 patch_grid_h,
-                                                                UOCR_METAL_DENSE_OUTPUT_F16,
-                                                                scratch->sam_transformer_bhwc.f16,
-                                                                scratch,
+                                                                scratch->sam_pos_bhwc,
                                                                 error,
                                                                 error_size));
+    RUN_VISION_STEP("SAM transformer",
+                    metal_context_sam_transformer_workspace_f16_to_slice(ctx,
+                                                                         scratch->sam_pos_bhwc,
+                                                                         weights->sam_blocks,
+                                                                         UOCR_SAM_BLOCKS,
+                                                                         patch_grid_w,
+                                                                         patch_grid_h,
+                                                                         scratch->sam_transformer_bhwc,
+                                                                         scratch,
+                                                                         error,
+                                                                         error_size));
     const uint64_t sam_neck_start_ns = uocr_profile_now_ns();
     RUN_VISION_STEP("SAM neck 1x1 convolution",
-                    uocr_metal_context_sam_neck_conv1x1_f16(ctx,
-                                                             scratch->sam_transformer_bhwc.f16,
-                                                             weights->sam_neck_conv1x1_weight.host_f16,
-                                                             patch_grid_w,
-                                                             patch_grid_h,
-                                                             UOCR_METAL_DENSE_OUTPUT_F16,
-                                                             scratch->sam_neck_a_nchw.f16,
-                                                             error,
-                                                             error_size));
+                    metal_context_sam_neck_conv1x1_f16_to_slice(ctx,
+                                                                 scratch->sam_transformer_bhwc,
+                                                                 weights->sam_neck_conv1x1_weight,
+                                                                 patch_grid_w,
+                                                                 patch_grid_h,
+                                                                 scratch->sam_neck_a_nchw,
+                                                                 error,
+                                                                 error_size));
     RUN_VISION_STEP("SAM neck LayerNorm2d-1",
-                    uocr_metal_context_sam_layernorm2d_f16(ctx,
-                                                            scratch->sam_neck_a_nchw.f16,
-                                                            weights->sam_neck_norm1_weight.host_f16,
-                                                            weights->sam_neck_norm1_bias.host_f16,
-                                                            patch_grid_w,
-                                                            patch_grid_h,
-                                                            UOCR_METAL_DENSE_OUTPUT_F16,
-                                                            scratch->sam_neck_b_nchw.f16,
-                                                            error,
-                                                            error_size));
+                    metal_context_sam_layernorm2d_f16_to_slice(ctx,
+                                                               scratch->sam_neck_a_nchw,
+                                                               weights->sam_neck_norm1_weight,
+                                                               weights->sam_neck_norm1_bias,
+                                                               patch_grid_w,
+                                                               patch_grid_h,
+                                                               scratch->sam_neck_b_nchw,
+                                                               error,
+                                                               error_size));
     RUN_VISION_STEP("SAM neck 3x3 convolution",
-                    uocr_metal_context_sam_neck_conv3x3_f16(ctx,
-                                                             scratch->sam_neck_b_nchw.f16,
-                                                             weights->sam_neck_conv3x3_weight.host_f16,
-                                                             patch_grid_w,
-                                                             patch_grid_h,
-                                                             UOCR_METAL_DENSE_OUTPUT_F16,
-                                                             scratch->sam_neck_a_nchw.f16,
-                                                             error,
-                                                             error_size));
+                    metal_context_sam_neck_conv3x3_f16_to_slice(ctx,
+                                                                 scratch->sam_neck_b_nchw,
+                                                                 weights->sam_neck_conv3x3_weight,
+                                                                 patch_grid_w,
+                                                                 patch_grid_h,
+                                                                 scratch->sam_neck_a_nchw,
+                                                                 error,
+                                                                 error_size));
     RUN_VISION_STEP("SAM neck LayerNorm2d-2",
-                    uocr_metal_context_sam_layernorm2d_f16(ctx,
-                                                            scratch->sam_neck_a_nchw.f16,
-                                                            weights->sam_neck_norm2_weight.host_f16,
-                                                            weights->sam_neck_norm2_bias.host_f16,
-                                                            patch_grid_w,
-                                                            patch_grid_h,
-                                                            UOCR_METAL_DENSE_OUTPUT_F16,
-                                                            scratch->sam_neck_b_nchw.f16,
-                                                            error,
-                                                            error_size));
+                    metal_context_sam_layernorm2d_f16_to_slice(ctx,
+                                                               scratch->sam_neck_a_nchw,
+                                                               weights->sam_neck_norm2_weight,
+                                                               weights->sam_neck_norm2_bias,
+                                                               patch_grid_w,
+                                                               patch_grid_h,
+                                                               scratch->sam_neck_b_nchw,
+                                                               error,
+                                                               error_size));
     RUN_VISION_STEP("SAM net_2 convolution",
-                    uocr_metal_context_sam_net2_conv3x3_stride2_f16(ctx,
-                                                                     scratch->sam_neck_b_nchw.f16,
-                                                                     weights->sam_net2_weight.host_f16,
-                                                                     patch_grid_w,
-                                                                     patch_grid_h,
-                                                                     UOCR_METAL_DENSE_OUTPUT_F16,
-                                                                     scratch->sam_net2_nchw.f16,
-                                                                     error,
-                                                                     error_size));
+                    metal_context_sam_stride2_conv_f16_to_slice(ctx,
+                                                                scratch->sam_neck_b_nchw,
+                                                                weights->sam_net2_weight,
+                                                                patch_grid_w,
+                                                                patch_grid_h,
+                                                                UOCR_SAM_NECK_CHANNELS,
+                                                                UOCR_SAM_NET2_CHANNELS,
+                                                                scratch->sam_net2_nchw,
+                                                                0,
+                                                                error,
+                                                                error_size));
     const uint32_t net2_grid_w = (patch_grid_w + 1u) / 2u;
     const uint32_t net2_grid_h = (patch_grid_h + 1u) / 2u;
     RUN_VISION_STEP("SAM net_3 convolution",
-                    uocr_metal_context_sam_net3_conv3x3_stride2_f16(ctx,
-                                                                     scratch->sam_net2_nchw.f16,
-                                                                     weights->sam_net3_weight.host_f16,
-                                                                     net2_grid_w,
-                                                                     net2_grid_h,
-                                                                     UOCR_METAL_DENSE_OUTPUT_F16,
-                                                                     out_sam_nchw_f16,
-                                                                     error,
-                                                                     error_size));
+                    metal_context_sam_stride2_conv_f16_to_slice(ctx,
+                                                                scratch->sam_net2_nchw,
+                                                                weights->sam_net3_weight,
+                                                                net2_grid_w,
+                                                                net2_grid_h,
+                                                                UOCR_SAM_NET2_CHANNELS,
+                                                                UOCR_SAM_NET3_CHANNELS,
+                                                                out_sam_nchw,
+                                                                1,
+                                                                error,
+                                                                error_size));
     metal_profile_add_event_now(ctx, "metal.vision.sam_neck", sam_neck_start_ns);
     const uint32_t sam_grid_w = (net2_grid_w + 1u) / 2u;
     const uint32_t sam_grid_h = (net2_grid_h + 1u) / 2u;
@@ -3749,14 +4242,14 @@ static int metal_encode_one_view_sam_features_f16(uocr_metal_vision_project_cont
 
 static int metal_encode_one_view_clip_features_f16(uocr_metal_vision_project_context *project,
                                                     const uocr_image_view *view,
-                                                    uint16_t *out_clip_tokens_f16,
+                                                    uocr_metal_vision_workspace_slice out_clip_tokens,
                                                     uint32_t *out_token_count,
                                                     uint32_t *out_grid_w,
                                                     uint32_t *out_grid_h,
                                                     char *error,
                                                     size_t error_size) {
     if (project == NULL || project->ctx == NULL || project->weights == NULL || project->scratch == NULL ||
-        view == NULL || out_clip_tokens_f16 == NULL || out_token_count == NULL || out_grid_w == NULL || out_grid_h == NULL) {
+        view == NULL || out_clip_tokens.buffer == nil || out_token_count == NULL || out_grid_w == NULL || out_grid_h == NULL) {
         return metal_fail(error, error_size, "invalid Metal CLIP view-encoding request");
     }
     const uint32_t expected_projected_grid = view->kind == UOCR_VIEW_LOCAL ? UOCR_LOCAL_GRID_QUERIES : UOCR_GLOBAL_GRID_QUERIES;
@@ -3769,7 +4262,7 @@ static int metal_encode_one_view_clip_features_f16(uocr_metal_vision_project_con
 
     if (!metal_encode_one_view_sam_features_f16(project,
                                                 view,
-                                                scratch->sam_net3_nchw.f16,
+                                                scratch->sam_net3_nchw,
                                                 &sam_grid_w,
                                                 &sam_grid_h,
                                                 error,
@@ -3789,46 +4282,42 @@ static int metal_encode_one_view_clip_features_f16(uocr_metal_vision_project_con
     } while (0)
 
     RUN_VISION_STEP("CLIP SAM embedding",
-                    uocr_metal_context_clip_embed_sam_f16(ctx,
-                                                           scratch->sam_net3_nchw.f16,
-                                                           weights->clip_class_embedding.host_f16,
-                                                           sam_grid_w,
-                                                           sam_grid_h,
-                                                           UOCR_METAL_DENSE_OUTPUT_F16,
-                                                           scratch->clip_a.f16,
-                                                           error,
-                                                           error_size));
+                    metal_context_clip_embed_sam_f16_to_slice(ctx,
+                                                              scratch->sam_net3_nchw,
+                                                              weights->clip_class_embedding,
+                                                              sam_grid_w,
+                                                              sam_grid_h,
+                                                              scratch->clip_a,
+                                                              error,
+                                                              error_size));
     RUN_VISION_STEP("CLIP absolute position add",
-                    uocr_metal_context_clip_add_abs_pos_f16(ctx,
-                                                             scratch->clip_a.f16,
-                                                             weights->clip_pos_embed.host_f16,
-                                                             sam_grid_w,
-                                                             sam_grid_h,
-                                                             UOCR_METAL_DENSE_OUTPUT_F16,
-                                                             scratch->clip_b.f16,
-                                                             error,
-                                                             error_size));
+                    metal_context_clip_add_abs_pos_f16_to_slice(ctx,
+                                                                scratch->clip_a,
+                                                                weights->clip_pos_embed,
+                                                                sam_grid_w,
+                                                                sam_grid_h,
+                                                                scratch->clip_b,
+                                                                error,
+                                                                error_size));
     RUN_VISION_STEP("CLIP pre-LayerNorm",
-                    uocr_metal_context_clip_pre_layernorm_f16(ctx,
-                                                               scratch->clip_b.f16,
-                                                               weights->clip_pre_ln_weight.host_f16,
-                                                               weights->clip_pre_ln_bias.host_f16,
-                                                               expected_clip_tokens,
-                                                               UOCR_METAL_LAYERNORM_OUTPUT_F16,
-                                                               scratch->clip_a.f16,
-                                                               error,
-                                                               error_size));
+                    metal_context_clip_pre_layernorm_f16_to_slice(ctx,
+                                                                  scratch->clip_b,
+                                                                  weights->clip_pre_ln_weight,
+                                                                  weights->clip_pre_ln_bias,
+                                                                  expected_clip_tokens,
+                                                                  scratch->clip_a,
+                                                                  error,
+                                                                  error_size));
     RUN_VISION_STEP("CLIP transformer",
-                    metal_context_clip_transformer_workspace_f16(ctx,
-                                                                 scratch->clip_a.f16,
-                                                                 weights->clip_blocks,
-                                                                 UOCR_CLIP_BLOCKS,
-                                                                 expected_clip_tokens,
-                                                                 UOCR_METAL_DENSE_OUTPUT_F16,
-                                                                 out_clip_tokens_f16,
-                                                                 scratch,
-                                                                 error,
-                                                                 error_size));
+                    metal_context_clip_transformer_workspace_f16_to_slice(ctx,
+                                                                         scratch->clip_a,
+                                                                         weights->clip_blocks,
+                                                                         UOCR_CLIP_BLOCKS,
+                                                                         expected_clip_tokens,
+                                                                         out_clip_tokens,
+                                                                         scratch,
+                                                                         error,
+                                                                         error_size));
 
 #undef RUN_VISION_STEP
 
@@ -3899,7 +4388,7 @@ static int metal_encode_one_view_projected_f16(uocr_metal_vision_project_context
 
     if (!metal_encode_one_view_clip_features_f16(project,
                                                  view,
-                                                 scratch->clip_final.f16,
+                                                 scratch->clip_final,
                                                  &clip_token_count,
                                                  &sam_grid_w,
                                                  &sam_grid_h,
@@ -3928,27 +4417,25 @@ static int metal_encode_one_view_projected_f16(uocr_metal_vision_project_context
 
     const uint64_t concat_start_ns = uocr_profile_now_ns();
     RUN_VISION_STEP("CLIP/SAM concat",
-                    uocr_metal_context_clip_sam_concat_f16(ctx,
-                                                            scratch->clip_final.f16,
-                                                            scratch->sam_net3_nchw.f16,
-                                                            sam_grid_w,
-                                                            sam_grid_h,
-                                                            UOCR_METAL_DENSE_OUTPUT_F16,
-                                                            scratch->concat.f16,
-                                                            error,
-                                                            error_size));
+                    metal_context_clip_sam_concat_f16_to_slice(ctx,
+                                                              scratch->clip_final,
+                                                              scratch->sam_net3_nchw,
+                                                              sam_grid_w,
+                                                              sam_grid_h,
+                                                              scratch->concat,
+                                                              error,
+                                                              error_size));
     metal_profile_add_event_now(ctx, "metal.vision.concat", concat_start_ns);
     const uint64_t projector_start_ns = uocr_profile_now_ns();
     RUN_VISION_STEP("visual projector",
-                    uocr_metal_context_visual_projector_f16(ctx,
-                                                             scratch->concat.f16,
-                                                             weights->projector_weight.host_f16,
-                                                             weights->projector_bias.host_f16,
-                                                             sam_grid_w * sam_grid_h,
-                                                             UOCR_METAL_DENSE_OUTPUT_F16,
-                                                             out_projected_rows.f16,
-                                                             error,
-                                                             error_size));
+                    metal_context_visual_projector_f16_to_slice(ctx,
+                                                               scratch->concat,
+                                                               weights->projector_weight,
+                                                               weights->projector_bias,
+                                                               sam_grid_w * sam_grid_h,
+                                                               out_projected_rows,
+                                                               error,
+                                                               error_size));
     metal_profile_add_event_now(ctx, "metal.vision.projector", projector_start_ns);
 
 #undef RUN_VISION_STEP
@@ -4531,11 +5018,14 @@ int uocr_metal_context_encode_sam_features_f16(uocr_metal_context *ctx,
     uint32_t actual_grid_h = 0u;
     const int ok = metal_encode_one_view_sam_features_f16(&project,
                                                           view,
-                                                          out_sam_features_f16,
+                                                          scratch.sam_net3_nchw,
                                                           &actual_grid_w,
                                                           &actual_grid_h,
                                                           error,
                                                           error_size);
+    if (ok) {
+        memcpy(out_sam_features_f16, scratch.sam_net3_nchw.f16, (size_t)scratch.sam_net3_nchw.bytes);
+    }
     metal_vision_workspace_reset(&scratch);
     if (!ok) {
         return 0;
@@ -4616,12 +5106,15 @@ int uocr_metal_context_encode_clip_features_f16(uocr_metal_context *ctx,
     uint32_t actual_grid_h = 0u;
     const int ok = metal_encode_one_view_clip_features_f16(&project,
                                                            view,
-                                                           out_clip_features_f16,
+                                                           scratch.clip_final,
                                                            &actual_tokens,
                                                            &actual_grid_w,
                                                            &actual_grid_h,
                                                            error,
                                                            error_size);
+    if (ok) {
+        memcpy(out_clip_features_f16, scratch.clip_final.f16, (size_t)scratch.clip_final.bytes);
+    }
     metal_vision_workspace_reset(&scratch);
     if (!ok) {
         return 0;

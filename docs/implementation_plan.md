@@ -88,7 +88,7 @@ Implementation status:
 - [ ] Add a batch dimension to SAM patch, SAM transformer, SAM neck, CLIP embedding, CLIP transformer, concat, projector, and formatter dispatch.
 - [x] Encode the entire local shape group in one command buffer.
 - [x] Encode the entire global shape group in one command buffer.
-- [ ] Make production vision helpers accept `uocr_metal_buffer_slice` inputs and outputs, not host pointers.
+- [x] Make production vision helpers accept `uocr_metal_buffer_slice` inputs and outputs, not host pointers.
 - [x] Route production per-view projected-row output through Metal workspace slices so chunk formatting consumes the reusable workspace slice directly.
 - [ ] Allocate vision intermediates from GPU-private workspace slices.
 - [ ] Keep only input pixels and final generated-token readback CPU-visible.
