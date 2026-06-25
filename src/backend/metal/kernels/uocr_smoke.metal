@@ -219,6 +219,98 @@ kernel void uocr_assemble_prompt_with_image_f16(device const half *embedding_tab
     dst[token * params.hidden_size + col] = embedding_table[(uint)row * params.hidden_size + col];
 }
 
+struct UocrVisualFormatGlobalParams {
+    uint hidden_size;
+    uint grid_size;
+    uint visual_tokens_per_view;
+    uint view_count;
+    uint dst_token_base;
+    uint reserved0;
+    uint reserved1;
+    uint reserved2;
+};
+
+kernel void uocr_format_global_visual_rows_f16(device const half *projected_rows [[buffer(0)]],
+                                               device const half *image_newline [[buffer(1)]],
+                                               device const half *view_separator [[buffer(2)]],
+                                               device half *dst_rows [[buffer(3)]],
+                                               constant UocrVisualFormatGlobalParams &params [[buffer(4)]],
+                                               uint2 gid [[thread_position_in_grid]]) {
+    const uint col = gid.x;
+    const uint visual_row_linear = gid.y;
+    if (col >= params.hidden_size || visual_row_linear >= params.view_count * params.visual_tokens_per_view) {
+        return;
+    }
+    const uint grid = params.grid_size;
+    const uint grid_tokens = grid * grid;
+    const uint view_index = visual_row_linear / params.visual_tokens_per_view;
+    const uint visual_row = visual_row_linear - view_index * params.visual_tokens_per_view;
+    half value;
+    if (visual_row == grid * (grid + 1u)) {
+        value = view_separator[col];
+    } else {
+        const uint row_in_view = visual_row / (grid + 1u);
+        const uint col_in_view = visual_row - row_in_view * (grid + 1u);
+        if (col_in_view == grid) {
+            value = image_newline[col];
+        } else {
+            const uint src_row = view_index * grid_tokens + row_in_view * grid + col_in_view;
+            value = projected_rows[src_row * params.hidden_size + col];
+        }
+    }
+    const uint dst_row = params.dst_token_base + visual_row_linear;
+    dst_rows[dst_row * params.hidden_size + col] = value;
+}
+
+struct UocrVisualFormatLocalParams {
+    uint hidden_size;
+    uint grid_size;
+    uint crop_grid_w;
+    uint chunk_first_view;
+    uint chunk_view_count;
+    uint reserved0;
+    uint reserved1;
+    uint reserved2;
+};
+
+kernel void uocr_fill_local_visual_newlines_f16(device const half *image_newline [[buffer(0)]],
+                                                device half *dst_rows [[buffer(1)]],
+                                                constant UocrVisualFormatLocalParams &params [[buffer(2)]],
+                                                uint2 gid [[thread_position_in_grid]]) {
+    const uint col = gid.x;
+    const uint local_row = gid.y;
+    if (col >= params.hidden_size || params.crop_grid_w == 0u || local_row >= params.chunk_view_count * params.grid_size) {
+        return;
+    }
+    const uint stitched_row_stride = params.crop_grid_w * params.grid_size + 1u;
+    const uint dst_row = local_row * stitched_row_stride + params.crop_grid_w * params.grid_size;
+    dst_rows[dst_row * params.hidden_size + col] = image_newline[col];
+}
+
+kernel void uocr_format_local_visual_rows_f16(device const half *projected_rows [[buffer(0)]],
+                                              device half *dst_rows [[buffer(1)]],
+                                              constant UocrVisualFormatLocalParams &params [[buffer(2)]],
+                                              uint2 gid [[thread_position_in_grid]]) {
+    const uint col = gid.x;
+    const uint src_row = gid.y;
+    const uint grid = params.grid_size;
+    const uint tokens_per_view = grid * grid;
+    if (col >= params.hidden_size || tokens_per_view == 0u || src_row >= params.chunk_view_count * tokens_per_view ||
+        params.crop_grid_w == 0u) {
+        return;
+    }
+    const uint chunk_view_index = src_row / tokens_per_view;
+    const uint token_in_view = src_row - chunk_view_index * tokens_per_view;
+    const uint local_view = params.chunk_first_view + chunk_view_index;
+    const uint crop_y = local_view / params.crop_grid_w;
+    const uint crop_x = local_view - crop_y * params.crop_grid_w;
+    const uint row_in_view = token_in_view / grid;
+    const uint col_in_view = token_in_view - row_in_view * grid;
+    const uint stitched_row_stride = params.crop_grid_w * grid + 1u;
+    const uint dst_row = (crop_y * grid + row_in_view) * stitched_row_stride + crop_x * grid + col_in_view;
+    dst_rows[dst_row * params.hidden_size + col] = projected_rows[src_row * params.hidden_size + col];
+}
+
 struct UocrSamPatchEmbedParams {
     uint width;
     uint height;

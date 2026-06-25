@@ -197,8 +197,8 @@ Implementation status:
 
 - [x] Change vision weight structs to store `uocr_metal_buffer_slice` directly.
 - [x] Build all vision slices once during model binding validation.
-- [ ] Update SAM, CLIP, projector, newline, and separator code to consume slices, not host pointers.
-- [ ] Remove hot-path weight `newBufferWithBytes` creation.
+- [x] Update SAM, CLIP, projector, newline, and separator code to consume slices, not host pointers.
+- [x] Remove hot-path weight `newBufferWithBytes` creation.
 - [ ] Cache any required packed/reordered vision weights at engine open only if timing proves the packed form is faster.
 - [ ] Delete the host-pointer production path after GPU-resident vision is confirmed.
 
@@ -337,7 +337,7 @@ formatting and prompt assembly on GPU avoids a final round-trip.
 
 Implementation status:
 
-- [ ] Add a Metal formatter that writes newline/separator rows and crop/global order directly.
+- [x] Add a Metal formatter that writes newline/separator rows and crop/global order directly.
 - [ ] Prefer projector output directly into final visual layout when shape/order allows.
 - [x] Splice GPU visual rows into prompt arena without host copy.
 - [ ] Validate byte-for-byte final visual rows against the current formatter.
