@@ -216,7 +216,7 @@ confirmed per-shape implementations, not runtime fallback paths.
 
 Implementation status:
 
-- [ ] Add MPS allocation/object counters and per-call timings.
+- [x] Add MPS allocation/object counters and per-call timings.
 - [ ] Cache stable descriptors and long-lived weight NDArrays by shape/layout/transpose.
 - [ ] Reuse input/output NDArray wrappers where buffer lifetimes allow.
 - [ ] Measure whether destination zero-fill blits are required; remove them if confirmed unnecessary.

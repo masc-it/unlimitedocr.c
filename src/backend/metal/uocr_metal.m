@@ -5918,8 +5918,10 @@ static id metal_mps_matrix_array_from_slice(uocr_metal_context *ctx,
     if (!classes->available || slice.buffer == nil || rows == 0u || cols == 0u) {
         return nil;
     }
+    const uint64_t descriptor_start_ns = uocr_profile_now_ns();
     id desc = [classes->descriptor_class descriptorWithDataType:UOCR_METAL_MPS_DATA_TYPE_FLOAT16
                                                           shape:@[ @((NSUInteger)rows), @((NSUInteger)cols) ]];
+    metal_profile_add_event_now(ctx, "metal.mps.ndarray_descriptor", descriptor_start_ns);
     if (desc == nil) {
         return nil;
     }
@@ -5931,7 +5933,9 @@ static id metal_mps_matrix_array_from_slice(uocr_metal_context *ctx,
     if (transpose) {
         [desc transposeDimension:0u withDimension:1u];
     }
+    const uint64_t ndarray_start_ns = uocr_profile_now_ns();
     id array = [[classes->array_class alloc] initWithBuffer:slice.buffer offset:slice.offset descriptor:desc];
+    metal_profile_add_event_now(ctx, "metal.mps.ndarray_create", ndarray_start_ns);
     if (array != nil && metal_profile_enabled(ctx)) {
         uocr_profile_add_metal_mps_ndarray(ctx->profile);
     }
@@ -5983,6 +5987,8 @@ static int metal_run_mps_matmul_nt_f16(uocr_metal_context *ctx,
         return metal_fail(error, error_size, "invalid %s MPS matmul request", op_name != NULL ? op_name : "Metal");
     }
     @autoreleasepool {
+        const uint64_t mps_call_start_ns = uocr_profile_now_ns();
+        const uint64_t setup_start_ns = uocr_profile_now_ns();
         id kernel = metal_ensure_mps_matmul_kernel(ctx, error, error_size);
         if (kernel == nil) {
             return 0;
@@ -6004,6 +6010,7 @@ static int metal_run_mps_matmul_nt_f16(uocr_metal_context *ctx,
             [y_array release];
             return 0;
         }
+        const uint64_t fill_start_ns = uocr_profile_now_ns();
         id<MTLBlitCommandEncoder> fill = metal_blit_command_encoder(ctx, cb);
         if (fill == nil) {
             [x_array release];
@@ -6013,6 +6020,8 @@ static int metal_run_mps_matmul_nt_f16(uocr_metal_context *ctx,
         }
         [fill fillBuffer:dst.buffer range:NSMakeRange(dst.offset, (NSUInteger)dst_bytes) value:0u];
         [fill endEncoding];
+        metal_profile_add_event_now(ctx, "metal.mps.matmul.fill", fill_start_ns);
+        const uint64_t encode_start_ns = uocr_profile_now_ns();
         id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
         if (enc == nil) {
             [x_array release];
@@ -6026,6 +6035,7 @@ static int metal_run_mps_matmul_nt_f16(uocr_metal_context *ctx,
             uocr_profile_add_metal_nsarray(ctx->profile);
             uocr_profile_add_metal_nsarray(ctx->profile);
         }
+        metal_profile_add_event_now(ctx, "metal.mps.matmul.setup", setup_start_ns);
         if (sources == nil || retained_arrays == nil) {
             [sources release];
             [retained_arrays release];
@@ -6039,8 +6049,11 @@ static int metal_run_mps_matmul_nt_f16(uocr_metal_context *ctx,
                            sourceArrays:sources
                        destinationArray:y_array];
         [enc endEncoding];
+        metal_profile_add_event_now(ctx, "metal.mps.matmul.encode", encode_start_ns);
         [sources release];
+        const uint64_t retain_start_ns = uocr_profile_now_ns();
         const int retained = metal_retain_transient_until_completed(ctx, cb, retained_arrays, error, error_size);
+        metal_profile_add_event_now(ctx, "metal.mps.matmul.retain", retain_start_ns);
         [retained_arrays release];
         [x_array release];
         [w_array release];
@@ -6048,7 +6061,15 @@ static int metal_run_mps_matmul_nt_f16(uocr_metal_context *ctx,
         if (!retained) {
             return 0;
         }
-        return metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, op_name != NULL ? op_name : "MPS matmul", error, error_size);
+        const uint64_t finish_start_ns = uocr_profile_now_ns();
+        const int ok = metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, op_name != NULL ? op_name : "MPS matmul", error, error_size);
+        if (owned_command_buffer) {
+            metal_profile_add_event_now(ctx, "metal.mps.matmul.wait", finish_start_ns);
+        } else {
+            metal_profile_add_event_ms(ctx, "metal.mps.matmul.batched", 0.0);
+        }
+        metal_profile_add_event_now(ctx, "metal.mps.matmul", mps_call_start_ns);
+        return ok;
     }
 }
 
