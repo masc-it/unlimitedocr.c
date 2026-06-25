@@ -7,13 +7,19 @@ import numpy as np
 
 from unlimitedocr_c.frontend import PreparedRequest, save_prepared_request
 from unlimitedocr_c.golden import (
+    CLIP_FEATURES_BIN,
+    CLIP_GLOBAL_TOKENS,
+    CLIP_HIDDEN_SIZE,
+    CLIP_LOCAL_TOKENS,
     SAM_FEATURES_BIN,
     SAM_FEATURE_CHANNELS,
+    clip_features_filename,
     dump_image_prompt_embedding_fixture,
     dump_prompt_embedding_fixture,
     load_image_decoder_layers_dump,
     load_image_logits_topk_dump,
     load_image_generated_ids_dump,
+    load_clip_features_dump,
     load_image_prompt_embedding_dump,
     load_prompt_embedding_dump,
     load_sam_features_dump,
@@ -210,6 +216,35 @@ def test_load_sam_features_dump_reads_single_and_per_view_files(tmp_path) -> Non
 
     np.testing.assert_array_equal(load_sam_features_dump(tmp_path, view_index=0, grid_size=16), global_bits)
     np.testing.assert_array_equal(load_sam_features_dump(tmp_path, view_index=1, grid_size=10), local_bits)
+
+
+def test_load_clip_features_dump_reads_single_and_per_view_files(tmp_path) -> None:
+    manifest = {
+        "views": [
+            {"name": "global", "kind": "global", "width": 1024, "height": 1024},
+            {"name": "local", "kind": "local", "width": 640, "height": 640},
+        ],
+        "golden_tensors": {
+            "clip_features": {
+                "views": [
+                    {"file": CLIP_FEATURES_BIN, "shape": [1, CLIP_GLOBAL_TOKENS, CLIP_HIDDEN_SIZE]},
+                    {"file": clip_features_filename(1), "shape": [CLIP_LOCAL_TOKENS, CLIP_HIDDEN_SIZE]},
+                ]
+            }
+        },
+    }
+    (tmp_path / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    global_bits = np.arange(CLIP_GLOBAL_TOKENS * CLIP_HIDDEN_SIZE, dtype=np.dtype("<u2")).reshape(
+        (CLIP_GLOBAL_TOKENS, CLIP_HIDDEN_SIZE)
+    )
+    local_bits = np.arange(CLIP_LOCAL_TOKENS * CLIP_HIDDEN_SIZE, dtype=np.dtype("<u2")).reshape(
+        (CLIP_LOCAL_TOKENS, CLIP_HIDDEN_SIZE)
+    )
+    global_bits.tofile(tmp_path / CLIP_FEATURES_BIN)
+    local_bits.tofile(tmp_path / clip_features_filename(1))
+
+    np.testing.assert_array_equal(load_clip_features_dump(tmp_path, view_index=0, token_count=CLIP_GLOBAL_TOKENS), global_bits)
+    np.testing.assert_array_equal(load_clip_features_dump(tmp_path, view_index=1, token_count=CLIP_LOCAL_TOKENS), local_bits)
 
 
 def test_load_image_decoder_layers_dump_reads_native_hidden_files(tmp_path) -> None:

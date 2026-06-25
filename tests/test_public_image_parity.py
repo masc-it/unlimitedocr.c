@@ -26,6 +26,9 @@ from unlimitedocr_c.frontend import (
     project_root,
 )
 from unlimitedocr_c.golden import (
+    CLIP_GLOBAL_TOKENS,
+    CLIP_HIDDEN_SIZE,
+    CLIP_LOCAL_TOKENS,
     GENERATED_IDS_BIN,
     GENERATED_TEXT_TXT,
     HIDDEN_SIZE,
@@ -34,6 +37,7 @@ from unlimitedocr_c.golden import (
     SAM_LOCAL_GRID,
     VISUAL_FEATURES_BIN,
     decode_generated_text,
+    load_clip_features_dump,
     load_sam_features_dump,
 )
 
@@ -85,6 +89,7 @@ def _bind_internal_metal_symbols(lib: ct.CDLL) -> None:
         lib.uocr_metal_context_map_model
         lib.uocr_metal_context_encode_visual_features_f16
         lib.uocr_metal_context_encode_sam_features_f16
+        lib.uocr_metal_context_encode_clip_features_f16
     except AttributeError as exc:
         pytest.skip(f"Metal/internal model-file symbols are unavailable in this build: {exc}")
 
@@ -120,6 +125,15 @@ def _bind_internal_metal_symbols(lib: ct.CDLL) -> None:
         ct.c_size_t,
     ]
     lib.uocr_metal_context_encode_sam_features_f16.restype = ct.c_int
+    lib.uocr_metal_context_encode_clip_features_f16.argtypes = [
+        ct.c_void_p,
+        ct.POINTER(CImageView),
+        ct.POINTER(ct.c_uint16),
+        ct.c_uint32,
+        ct.c_char_p,
+        ct.c_size_t,
+    ]
+    lib.uocr_metal_context_encode_clip_features_f16.restype = ct.c_int
 
 
 def _require_large_metal_inputs() -> tuple[str, str]:
@@ -335,6 +349,58 @@ def _encode_metal_sam_features(
         lib.uocr_model_file_close(ct.byref(model))
 
 
+def _encode_metal_clip_features(
+    model_path: str,
+    resource_path: str,
+    request: PreparedRequest,
+    *,
+    view_index: int,
+    token_count: int,
+) -> np.ndarray:
+    lib = load_library()
+    _bind_internal_metal_symbols(lib)
+    if lib.uocr_metal_is_available() == 0:
+        pytest.skip("Metal device is not available")
+
+    error = ct.create_string_buffer(2048)
+    model = CModelFile()
+    status = lib.uocr_model_file_open(model_path.encode("utf-8"), ct.byref(model), error, len(error))
+    if status != UOCR_OK:
+        pytest.fail(f"uocr_model_file_open failed ({status}): {error.value.decode('utf-8', errors='replace')}")
+
+    ctx = None
+    try:
+        ctx = lib.uocr_metal_context_create(resource_path.encode("utf-8"), error, len(error))
+        if not ctx:
+            pytest.fail(f"uocr_metal_context_create failed: {error.value.decode('utf-8', errors='replace')}")
+        if lib.uocr_metal_context_map_model(ctx, ct.byref(model), error, len(error)) != 1:
+            pytest.fail(f"uocr_metal_context_map_model failed: {error.value.decode('utf-8', errors='replace')}")
+
+        if view_index < 0 or view_index >= len(request.views):
+            pytest.fail(f"view_index {view_index} is outside request views")
+        out = np.empty((token_count, CLIP_HIDDEN_SIZE), dtype=np.dtype("<u2"))
+        keepalive = as_c_request(request)
+        assert keepalive.c_views is not None
+        ok = lib.uocr_metal_context_encode_clip_features_f16(
+            ctx,
+            ct.byref(keepalive.c_views[view_index]),
+            out.ctypes.data_as(ct.POINTER(ct.c_uint16)),
+            ct.c_uint32(token_count),
+            error,
+            len(error),
+        )
+        if ok != 1:
+            pytest.fail(
+                "uocr_metal_context_encode_clip_features_f16 failed: "
+                + error.value.decode("utf-8", errors="replace")
+            )
+        return out
+    finally:
+        if ctx:
+            lib.uocr_metal_context_destroy(ctx)
+        lib.uocr_model_file_close(ct.byref(model))
+
+
 def _assert_feature_bits_close(
     actual_bits: np.ndarray,
     expected_bits: np.ndarray,
@@ -349,7 +415,7 @@ def _assert_feature_bits_close(
     actual = actual_bits.view(np.float16).astype(np.float32)
     expected = expected_bits.view(np.float16).astype(np.float32)
     if not np.all(np.isfinite(actual)) or not np.all(np.isfinite(expected)):
-        pytest.fail(f"{label} visual features contain non-finite values")
+        pytest.fail(f"{label} features contain non-finite values")
     diff = np.abs(actual - expected)
     ref_scale = np.maximum(np.abs(expected), np.float32(1.0e-3))
     rel = diff / ref_scale
@@ -393,6 +459,19 @@ def _assert_sam_features_close(actual_bits: np.ndarray, expected_bits: np.ndarra
         default_p99_atol=0.02,
         default_mean_atol=0.004,
         default_rtol=0.08,
+    )
+
+
+def _assert_clip_features_close(actual_bits: np.ndarray, expected_bits: np.ndarray, *, label: str) -> None:
+    _assert_feature_bits_close(
+        actual_bits,
+        expected_bits,
+        label=label,
+        env_prefix="UOCR_CLIP_FEATURE",
+        default_atol=0.12,
+        default_p99_atol=0.03,
+        default_mean_atol=0.006,
+        default_rtol=0.10,
     )
 
 
@@ -523,4 +602,60 @@ def test_public_metal_sam_local_640_parity_fixture() -> None:
         view_index=view_index,
         expected_kind="local",
         expected_grid=SAM_LOCAL_GRID,
+    )
+
+
+def _run_clip_parity_case(
+    label: str,
+    root: Path,
+    *,
+    view_index: int,
+    expected_kind: str,
+    expected_tokens: int,
+) -> None:
+    model_path, resource_path = _require_large_metal_inputs()
+    request = _prepared_request_from_fixture(root, max_new_tokens=1)
+    if view_index < 0 or view_index >= len(request.views):
+        pytest.fail(f"{label} CLIP parity view index {view_index} is outside fixture views")
+    view = request.views[view_index]
+    if view.kind != expected_kind:
+        pytest.fail(f"{label} CLIP parity requires a {expected_kind} view, got {view.kind!r} at index {view_index}")
+    expected_size = 640 if expected_kind == "local" else 1024
+    if view.width != expected_size or view.height != expected_size:
+        pytest.fail(f"{label} CLIP parity view must be {expected_size}x{expected_size}, got {view.width}x{view.height}")
+
+    expected = load_clip_features_dump(root, view_index=view_index, token_count=expected_tokens)
+    actual = _encode_metal_clip_features(
+        model_path,
+        resource_path,
+        request,
+        view_index=view_index,
+        token_count=expected_tokens,
+    )
+    _assert_clip_features_close(actual, expected, label=label)
+    print(f"{label} CLIP parity matched shape={actual.shape} view_index={view_index}")
+
+
+def test_public_metal_clip_global_1024_parity_fixture() -> None:
+    root = _fixture_dir_from_env("CLIP global 1024", ("UOCR_CLIP_PARITY_1024_DIR",))
+    view_index = int(os.environ.get("UOCR_CLIP_PARITY_1024_VIEW_INDEX", "0"))
+    _run_clip_parity_case(
+        "CLIP global 1024",
+        root,
+        view_index=view_index,
+        expected_kind="global",
+        expected_tokens=CLIP_GLOBAL_TOKENS,
+    )
+
+
+def test_public_metal_clip_local_640_parity_fixture() -> None:
+    root = _fixture_dir_from_env("CLIP local 640", ("UOCR_CLIP_PARITY_640_DIR",))
+    request = _prepared_request_from_fixture(root, max_new_tokens=1)
+    view_index = int(os.environ["UOCR_CLIP_PARITY_640_VIEW_INDEX"]) if os.environ.get("UOCR_CLIP_PARITY_640_VIEW_INDEX") else _first_view_index_with_kind(request, "local")
+    _run_clip_parity_case(
+        "CLIP local 640",
+        root,
+        view_index=view_index,
+        expected_kind="local",
+        expected_tokens=CLIP_LOCAL_TOKENS,
     )

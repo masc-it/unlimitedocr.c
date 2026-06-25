@@ -2751,14 +2751,17 @@ static int metal_encode_one_view_sam_features_f16(uocr_metal_vision_project_cont
     return 1;
 }
 
-static int metal_encode_one_view_projected_f16(uocr_metal_vision_project_context *project,
-                                               const uocr_image_view *view,
-                                               uint16_t *out_projected_rows_f16,
-                                               char *error,
-                                               size_t error_size) {
+static int metal_encode_one_view_clip_features_f16(uocr_metal_vision_project_context *project,
+                                                    const uocr_image_view *view,
+                                                    uint16_t *out_clip_tokens_f16,
+                                                    uint32_t *out_token_count,
+                                                    uint32_t *out_grid_w,
+                                                    uint32_t *out_grid_h,
+                                                    char *error,
+                                                    size_t error_size) {
     if (project == NULL || project->ctx == NULL || project->weights == NULL || project->scratch == NULL ||
-        view == NULL || out_projected_rows_f16 == NULL) {
-        return metal_fail(error, error_size, "invalid Metal vision view-encoding request");
+        view == NULL || out_clip_tokens_f16 == NULL || out_token_count == NULL || out_grid_w == NULL || out_grid_h == NULL) {
+        return metal_fail(error, error_size, "invalid Metal CLIP view-encoding request");
     }
     const uint32_t expected_projected_grid = view->kind == UOCR_VIEW_LOCAL ? UOCR_LOCAL_GRID_QUERIES : UOCR_GLOBAL_GRID_QUERIES;
     const uint32_t expected_clip_tokens = UOCR_CLIP_CLASS_TOKENS + expected_projected_grid * expected_projected_grid;
@@ -2824,9 +2827,63 @@ static int metal_encode_one_view_projected_f16(uocr_metal_vision_project_context
                                                              UOCR_CLIP_BLOCKS,
                                                              expected_clip_tokens,
                                                              UOCR_METAL_DENSE_OUTPUT_F16,
-                                                             scratch->clip_final_f16,
+                                                             out_clip_tokens_f16,
                                                              error,
                                                              error_size));
+
+#undef RUN_VISION_STEP
+
+    *out_token_count = expected_clip_tokens;
+    *out_grid_w = sam_grid_w;
+    *out_grid_h = sam_grid_h;
+    return 1;
+}
+
+static int metal_encode_one_view_projected_f16(uocr_metal_vision_project_context *project,
+                                               const uocr_image_view *view,
+                                               uint16_t *out_projected_rows_f16,
+                                               char *error,
+                                               size_t error_size) {
+    if (project == NULL || project->ctx == NULL || project->weights == NULL || project->scratch == NULL ||
+        view == NULL || out_projected_rows_f16 == NULL) {
+        return metal_fail(error, error_size, "invalid Metal vision view-encoding request");
+    }
+    const uint32_t expected_projected_grid = view->kind == UOCR_VIEW_LOCAL ? UOCR_LOCAL_GRID_QUERIES : UOCR_GLOBAL_GRID_QUERIES;
+    const uint32_t expected_clip_tokens = UOCR_CLIP_CLASS_TOKENS + expected_projected_grid * expected_projected_grid;
+    const uocr_metal_vision_weights_f16 *weights = project->weights;
+    uocr_metal_vision_host_scratch *scratch = project->scratch;
+    uocr_metal_context *ctx = project->ctx;
+    uint32_t clip_token_count = 0u;
+    uint32_t sam_grid_w = 0u;
+    uint32_t sam_grid_h = 0u;
+
+    if (!metal_encode_one_view_clip_features_f16(project,
+                                                 view,
+                                                 scratch->clip_final_f16,
+                                                 &clip_token_count,
+                                                 &sam_grid_w,
+                                                 &sam_grid_h,
+                                                 error,
+                                                 error_size)) {
+        return 0;
+    }
+    if (clip_token_count != expected_clip_tokens) {
+        return metal_fail(error,
+                          error_size,
+                          "CLIP output token count %u, expected %u",
+                          clip_token_count,
+                          expected_clip_tokens);
+    }
+
+#define RUN_VISION_STEP(step_name, call_expr)                                                        \
+    do {                                                                                             \
+        if (!(call_expr)) {                                                                          \
+            char detail[512];                                                                        \
+            metal_copy_error_detail(detail, sizeof(detail), error);                                   \
+            return metal_fail(error, error_size, "failed to compute Metal vision %s: %s", step_name, detail); \
+        }                                                                                            \
+    } while (0)
+
     RUN_VISION_STEP("CLIP/SAM concat",
                     uocr_metal_context_clip_sam_concat_f16(ctx,
                                                             scratch->clip_final_f16,
@@ -3068,6 +3125,93 @@ int uocr_metal_context_encode_sam_features_f16(uocr_metal_context *ctx,
                           actual_grid_h,
                           out_grid_w,
                           out_grid_h);
+    }
+
+    metal_clear_error(error, error_size);
+    return 1;
+}
+
+int uocr_metal_context_encode_clip_features_f16(uocr_metal_context *ctx,
+                                                const uocr_image_view *view,
+                                                uint16_t *out_clip_features_f16,
+                                                uint32_t out_token_count,
+                                                char *error,
+                                                size_t error_size) {
+    metal_clear_error(error, error_size);
+    if (ctx == NULL || view == NULL || out_clip_features_f16 == NULL) {
+        return metal_fail(error, error_size, "Metal CLIP encoding requires a context, view, and output buffer");
+    }
+    if (!uocr_metal_context_vision_bindings_ready(ctx)) {
+        return metal_fail(error,
+                          error_size,
+                          "Metal CLIP encoding requires validated fp16 vision tensor bindings: %s",
+                          uocr_metal_context_vision_binding_error(ctx));
+    }
+    if (view->kind != UOCR_VIEW_LOCAL && view->kind != UOCR_VIEW_GLOBAL) {
+        return metal_fail(error, error_size, "Metal CLIP encoding has invalid view kind %d", (int)view->kind);
+    }
+    const uint32_t expected_grid = view->kind == UOCR_VIEW_LOCAL ? UOCR_LOCAL_GRID_QUERIES : UOCR_GLOBAL_GRID_QUERIES;
+    const uint32_t expected_size = view->kind == UOCR_VIEW_LOCAL ? UOCR_LOCAL_VIEW_SIZE : UOCR_GLOBAL_VIEW_SIZE;
+    const uint32_t expected_tokens = UOCR_CLIP_CLASS_TOKENS + expected_grid * expected_grid;
+    if (view->width != expected_size || view->height != expected_size) {
+        return metal_fail(error,
+                          error_size,
+                          "Metal CLIP encoding expected %ux%u %s view, got %ux%u",
+                          expected_size,
+                          expected_size,
+                          view->kind == UOCR_VIEW_LOCAL ? "local" : "global",
+                          view->width,
+                          view->height);
+    }
+    if (out_token_count != expected_tokens) {
+        return metal_fail(error,
+                          error_size,
+                          "Metal CLIP output token count mismatch: got %u expected %u",
+                          out_token_count,
+                          expected_tokens);
+    }
+
+    uocr_metal_vision_weights_f16 weights;
+    if (!metal_load_vision_weights_from_bindings(ctx, &weights, error, error_size)) {
+        return 0;
+    }
+
+    uocr_metal_vision_host_scratch scratch;
+    if (!metal_vision_host_scratch_init(&scratch, error, error_size)) {
+        return 0;
+    }
+
+    uocr_metal_vision_project_context project;
+    memset(&project, 0, sizeof(project));
+    project.ctx = ctx;
+    project.weights = &weights;
+    project.scratch = &scratch;
+
+    uint32_t actual_tokens = 0u;
+    uint32_t actual_grid_w = 0u;
+    uint32_t actual_grid_h = 0u;
+    const int ok = metal_encode_one_view_clip_features_f16(&project,
+                                                           view,
+                                                           out_clip_features_f16,
+                                                           &actual_tokens,
+                                                           &actual_grid_w,
+                                                           &actual_grid_h,
+                                                           error,
+                                                           error_size);
+    metal_vision_host_scratch_free(&scratch);
+    if (!ok) {
+        return 0;
+    }
+    if (actual_tokens != out_token_count || actual_grid_w != expected_grid || actual_grid_h != expected_grid) {
+        return metal_fail(error,
+                          error_size,
+                          "Metal CLIP output shape changed during encoding: got tokens=%u grid=%ux%u expected tokens=%u grid=%ux%u",
+                          actual_tokens,
+                          actual_grid_w,
+                          actual_grid_h,
+                          out_token_count,
+                          expected_grid,
+                          expected_grid);
     }
 
     metal_clear_error(error, error_size);

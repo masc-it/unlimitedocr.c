@@ -39,6 +39,10 @@ SAM_FEATURES_BIN = "sam_features_f16.bin"
 SAM_FEATURE_CHANNELS = 1024
 SAM_GLOBAL_GRID = 16
 SAM_LOCAL_GRID = 10
+CLIP_FEATURES_BIN = "clip_features_f16.bin"
+CLIP_HIDDEN_SIZE = 1024
+CLIP_GLOBAL_TOKENS = 257
+CLIP_LOCAL_TOKENS = 101
 TEXT_DECODER_LAYER_COUNT = 12
 DEFAULT_LOGITS_TOP_K = 16
 INPUT_IDS_BIN = "input_ids_i32.bin"
@@ -173,6 +177,12 @@ def sam_features_filename(view_index: int) -> str:
     if view_index < 0:
         raise ValueError(f"view_index must be non-negative, got {view_index}")
     return SAM_FEATURES_BIN if view_index == 0 else f"sam_features_view_{view_index}_f16.bin"
+
+
+def clip_features_filename(view_index: int) -> str:
+    if view_index < 0:
+        raise ValueError(f"view_index must be non-negative, got {view_index}")
+    return CLIP_FEATURES_BIN if view_index == 0 else f"clip_features_view_{view_index}_f16.bin"
 
 
 def _read_json_if_exists(path: Path) -> dict[str, Any] | None:
@@ -1388,6 +1398,94 @@ def load_sam_features_dump(
     if bits.size != expected_values:
         raise ValueError(f"sam_features size mismatch: expected {expected_values} f16 values, got {bits.size}")
     return bits.reshape((channels, grid_h, grid_w))
+
+
+def _infer_clip_tokens_from_manifest(manifest: dict[str, Any], view_index: int) -> int | None:
+    views = manifest.get("views") if isinstance(manifest, dict) else None
+    if not isinstance(views, list) or view_index < 0 or view_index >= len(views):
+        return None
+    meta = views[view_index]
+    if not isinstance(meta, dict):
+        return None
+    width = int(meta.get("width", 0))
+    height = int(meta.get("height", 0))
+    kind = str(meta.get("kind", ""))
+    if width == 1024 and height == 1024 and kind == "global":
+        return CLIP_GLOBAL_TOKENS
+    if width == 640 and height == 640 and kind == "local":
+        return CLIP_LOCAL_TOKENS
+    return None
+
+
+def _clip_feature_meta(manifest: dict[str, Any], view_index: int) -> dict[str, Any]:
+    golden = manifest.get("golden_tensors", {}).get("clip_features", {}) if isinstance(manifest, dict) else {}
+    if not isinstance(golden, dict):
+        return {}
+    views = golden.get("views")
+    if isinstance(views, list):
+        if view_index < 0 or view_index >= len(views):
+            raise ValueError(f"clip_features view index {view_index} is outside manifest view metadata")
+        meta = views[view_index]
+        if not isinstance(meta, dict):
+            raise ValueError(f"invalid clip_features metadata for view {view_index}")
+        return meta
+    return golden
+
+
+def load_clip_features_dump(
+    fixture_dir: str | Path,
+    *,
+    view_index: int = 0,
+    token_count: int | None = None,
+) -> NDArray[np.uint16]:
+    """Load a Python/HF CLIP output fixture as uint16 fp16 bits.
+
+    The tensor contract is the upstream ``vision_model(view, sam_features)``
+    output including the class token, without the batch dimension:
+    ``[tokens, 1024]`` where ``tokens`` is ``257`` for global views and ``101``
+    for local views. Shape metadata may also use upstream ``[1,tokens,1024]``.
+    """
+
+    if view_index < 0:
+        raise ValueError(f"view_index must be non-negative, got {view_index}")
+    root = Path(fixture_dir)
+    manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+    if not isinstance(manifest, dict):
+        raise ValueError(f"expected manifest object in {root}")
+    meta = _clip_feature_meta(manifest, view_index)
+    filename = meta.get("file") if isinstance(meta, dict) else None
+    if not isinstance(filename, str):
+        default_name = clip_features_filename(view_index)
+        if not (root / default_name).exists() and view_index != 0:
+            default_name = CLIP_FEATURES_BIN
+        filename = default_name
+
+    shape = meta.get("shape") if isinstance(meta, dict) else None
+    if isinstance(shape, list) and len(shape) == 2:
+        tokens = int(shape[0])
+        hidden_size = int(shape[1])
+    elif isinstance(shape, list) and len(shape) == 3:
+        batch = int(shape[0])
+        if batch != 1:
+            raise ValueError(f"clip_features batch dimension must be 1, got {batch} in {root}")
+        tokens = int(shape[1])
+        hidden_size = int(shape[2])
+    else:
+        inferred = token_count if token_count is not None else _infer_clip_tokens_from_manifest(manifest, view_index)
+        if inferred is None:
+            raise ValueError(f"missing clip_features shape metadata in {root}")
+        tokens = int(inferred)
+        hidden_size = CLIP_HIDDEN_SIZE
+
+    if tokens <= 0 or hidden_size != CLIP_HIDDEN_SIZE:
+        raise ValueError(f"invalid clip_features shape [{tokens}, {hidden_size}] in {root}")
+    if token_count is not None and tokens != int(token_count):
+        raise ValueError(f"clip_features token count {tokens} does not match expected {token_count}")
+    bits = np.fromfile(root / filename, dtype=np.dtype("<u2"))
+    expected_values = tokens * hidden_size
+    if bits.size != expected_values:
+        raise ValueError(f"clip_features size mismatch: expected {expected_values} f16 values, got {bits.size}")
+    return bits.reshape((tokens, hidden_size))
 
 
 def load_prompt_embedding_dump(fixture_dir: str | Path) -> PromptEmbeddingDump:
