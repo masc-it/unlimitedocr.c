@@ -3799,17 +3799,58 @@ static int metal_encode_one_view_clip_features_f16(uocr_metal_vision_project_con
     return 1;
 }
 
+static int metal_vision_workspace_slice_rows(uocr_metal_vision_workspace_slice slice,
+                                             uint32_t first_row,
+                                             uint32_t row_count,
+                                             uocr_metal_vision_workspace_slice *out,
+                                             char *error,
+                                             size_t error_size) {
+    if (out == NULL || slice.buffer == nil || slice.f16 == NULL || row_count == 0u) {
+        return metal_fail(error, error_size, "invalid Metal vision row-slice request");
+    }
+    uint64_t first_value = 0u;
+    uint64_t value_count = 0u;
+    uint64_t byte_offset = 0u;
+    uint64_t byte_count = 0u;
+    if (!checked_mul_u64((uint64_t)first_row, (uint64_t)UOCR_HIDDEN_SIZE, &first_value) ||
+        !checked_mul_u64((uint64_t)row_count, (uint64_t)UOCR_HIDDEN_SIZE, &value_count) ||
+        !checked_mul_u64(first_value, 2u, &byte_offset) || !checked_mul_u64(value_count, 2u, &byte_count)) {
+        return metal_fail(error, error_size, "Metal vision row-slice byte-size overflow");
+    }
+    uint64_t byte_end = 0u;
+    uint64_t absolute_offset = 0u;
+    if (!checked_add_u64(byte_offset, byte_count, &byte_end) || byte_end > slice.bytes ||
+        !checked_add_u64((uint64_t)slice.offset, byte_offset, &absolute_offset) || absolute_offset > (uint64_t)NSUIntegerMax) {
+        return metal_fail(error,
+                          error_size,
+                          "Metal vision row-slice range %u+%u exceeds backing rows",
+                          first_row,
+                          row_count);
+    }
+    out->buffer = slice.buffer;
+    out->offset = (NSUInteger)absolute_offset;
+    out->bytes = byte_count;
+    out->f16 = &slice.f16[first_value];
+    return 1;
+}
+
 static int metal_encode_one_view_projected_f16(uocr_metal_vision_project_context *project,
                                                const uocr_image_view *view,
-                                               uint16_t *out_projected_rows_f16,
+                                               uocr_metal_vision_workspace_slice out_projected_rows,
                                                char *error,
                                                size_t error_size) {
     if (project == NULL || project->ctx == NULL || project->weights == NULL || project->scratch == NULL ||
-        view == NULL || out_projected_rows_f16 == NULL) {
+        view == NULL || out_projected_rows.buffer == nil || out_projected_rows.f16 == NULL) {
         return metal_fail(error, error_size, "invalid Metal vision view-encoding request");
     }
     const uint32_t expected_projected_grid = view->kind == UOCR_VIEW_LOCAL ? UOCR_LOCAL_GRID_QUERIES : UOCR_GLOBAL_GRID_QUERIES;
     const uint32_t expected_clip_tokens = UOCR_CLIP_CLASS_TOKENS + expected_projected_grid * expected_projected_grid;
+    const uint64_t expected_projected_bytes = (uint64_t)expected_projected_grid * (uint64_t)expected_projected_grid *
+                                              (uint64_t)UOCR_HIDDEN_SIZE * 2u;
+    if (out_projected_rows.bytes < expected_projected_bytes ||
+        !metal_slice_valid((uocr_metal_buffer_slice){out_projected_rows.buffer, out_projected_rows.offset}, expected_projected_bytes)) {
+        return metal_fail(error, error_size, "Metal projected-row output slice is too small");
+    }
     const uocr_metal_vision_weights_f16 *weights = project->weights;
     uocr_metal_vision_workspace *scratch = project->scratch;
     uocr_metal_context *ctx = project->ctx;
@@ -3866,7 +3907,7 @@ static int metal_encode_one_view_projected_f16(uocr_metal_vision_project_context
                                                              weights->projector_bias.host_f16,
                                                              sam_grid_w * sam_grid_h,
                                                              UOCR_METAL_DENSE_OUTPUT_F16,
-                                                             out_projected_rows_f16,
+                                                             out_projected_rows.f16,
                                                              error,
                                                              error_size));
     metal_profile_add_event_now(ctx, "metal.vision.projector", projector_start_ns);
@@ -4084,12 +4125,12 @@ static int metal_format_local_visual_rows_f16(uocr_metal_context *ctx,
 }
 
 static int metal_project_vision_chunk_f16(const uocr_vision_chunk *chunk,
-                                          uint16_t *projected_scratch_f16,
+                                          uocr_metal_vision_workspace_slice projected_rows,
                                           uint32_t projected_scratch_rows,
                                           void *user_data,
                                           char *error,
                                           size_t error_size) {
-    if (chunk == NULL || projected_scratch_f16 == NULL || user_data == NULL) {
+    if (chunk == NULL || projected_rows.buffer == nil || projected_rows.f16 == NULL || user_data == NULL) {
         (void)metal_fail(error, error_size, "invalid Metal vision chunk projection request");
         return UOCR_ERROR_INVALID_ARGUMENT;
     }
@@ -4099,6 +4140,12 @@ static int metal_project_vision_chunk_f16(const uocr_vision_chunk *chunk,
                          "Metal vision projected scratch has %u rows, need %u",
                          projected_scratch_rows,
                          chunk->projected_token_count);
+        return UOCR_ERROR_OUT_OF_MEMORY;
+    }
+    const uint64_t projected_bytes = (uint64_t)chunk->projected_token_count * (uint64_t)UOCR_HIDDEN_SIZE * 2u;
+    if (projected_rows.bytes < projected_bytes ||
+        !metal_slice_valid((uocr_metal_buffer_slice){projected_rows.buffer, projected_rows.offset}, projected_bytes)) {
+        (void)metal_fail(error, error_size, "Metal vision projected-row slice is too small for chunk");
         return UOCR_ERROR_OUT_OF_MEMORY;
     }
 
@@ -4112,7 +4159,15 @@ static int metal_project_vision_chunk_f16(const uocr_vision_chunk *chunk,
     const uint64_t chunk_encode_start_ns = uocr_profile_now_ns();
     for (uint32_t view_index = 0u; view_index < chunk->view_count; ++view_index) {
         const uocr_image_view *view = &project->request->views[chunk->first_view + view_index];
-        uint16_t *projected_out = &projected_scratch_f16[(size_t)view_index * (size_t)chunk->projected_tokens_per_view * (size_t)UOCR_HIDDEN_SIZE];
+        uocr_metal_vision_workspace_slice projected_out;
+        if (!metal_vision_workspace_slice_rows(projected_rows,
+                                               view_index * chunk->projected_tokens_per_view,
+                                               chunk->projected_tokens_per_view,
+                                               &projected_out,
+                                               error,
+                                               error_size)) {
+            return UOCR_ERROR_OUT_OF_MEMORY;
+        }
         if (!metal_encode_one_view_projected_f16(project, view, projected_out, error, error_size)) {
             return UOCR_ERROR_INTERNAL;
         }
@@ -4213,7 +4268,7 @@ static int metal_context_encode_visual_features_to_workspace_f16(uocr_metal_cont
     for (uint32_t chunk_index = 0u; process_status == UOCR_OK && chunk_index < schedule->chunk_count; ++chunk_index) {
         const uocr_vision_chunk *chunk = &chunks[chunk_index];
         process_status = metal_project_vision_chunk_f16(chunk,
-                                                        scratch->projected_rows.f16,
+                                                        scratch->projected_rows,
                                                         scratch->projected_row_capacity,
                                                         &project,
                                                         error,
@@ -4563,7 +4618,7 @@ int uocr_metal_context_encode_projected_features_f16(uocr_metal_context *ctx,
     }
 
     uocr_metal_vision_workspace scratch;
-    if (!metal_vision_workspace_init(ctx, &scratch, expected_size, 0u, 0u, error, error_size)) {
+    if (!metal_vision_workspace_init(ctx, &scratch, expected_size, expected_rows, 0u, error, error_size)) {
         return 0;
     }
 
@@ -4575,9 +4630,12 @@ int uocr_metal_context_encode_projected_features_f16(uocr_metal_context *ctx,
 
     const int ok = metal_encode_one_view_projected_f16(&project,
                                                        view,
-                                                       out_projected_features_f16,
+                                                       scratch.projected_rows,
                                                        error,
                                                        error_size);
+    if (ok) {
+        memcpy(out_projected_features_f16, scratch.projected_rows.f16, (size_t)scratch.projected_rows.bytes);
+    }
     metal_vision_workspace_reset(&scratch);
     if (!ok) {
         return 0;
