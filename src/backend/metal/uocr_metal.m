@@ -5,6 +5,7 @@
 #include "model/uocr_tensor_registry.h"
 #include "quant/uocr_quant.h"
 #include "runtime/uocr_memory.h"
+#include "runtime/uocr_sequence.h"
 #include "runtime/uocr_vision.h"
 
 #include <errno.h>
@@ -5632,6 +5633,30 @@ int uocr_metal_context_generate_f16(uocr_metal_context *ctx,
         return 1;
     }
 
+    uocr_prepared_request sequence_request;
+    memset(&sequence_request, 0, sizeof(sequence_request));
+    sequence_request.input_ids = request->input_ids;
+    sequence_request.image_mask = request->image_mask;
+    sequence_request.n_tokens = request->n_tokens;
+    sequence_request.max_new_tokens = request->max_new_tokens;
+    sequence_request.no_repeat_ngram_size = request->no_repeat_ngram_size;
+    sequence_request.no_repeat_window = request->no_repeat_window;
+
+    uocr_sequence_state sequence_state;
+    char sequence_error[256];
+    memset(&sequence_state, 0, sizeof(sequence_state));
+    memset(sequence_error, 0, sizeof(sequence_error));
+    int sequence_status = uocr_build_sequence_state(&sequence_request,
+                                                    &sequence_state,
+                                                    sequence_error,
+                                                    sizeof(sequence_error));
+    if (sequence_status != UOCR_OK) {
+        return metal_fail(error,
+                          error_size,
+                          "failed to build integrated Metal fp16 sequence state: %s",
+                          sequence_error[0] != '\0' ? sequence_error : uocr_status_string(sequence_status));
+    }
+
     uint64_t sequence_len_u64 = 0u;
     uint64_t sequence_bytes = 0u;
     if (!checked_add_u64((uint64_t)request->n_tokens, (uint64_t)request->max_new_tokens, &sequence_len_u64) ||
@@ -5644,8 +5669,18 @@ int uocr_metal_context_generate_f16(uocr_metal_context *ctx,
     if (sequence == NULL) {
         return metal_fail(error, error_size, "failed to allocate integrated Metal fp16 decode sequence buffer");
     }
-    memcpy(sequence, request->input_ids, (size_t)request->n_tokens * sizeof(int32_t));
-    uint32_t sequence_len = request->n_tokens;
+    sequence_status = uocr_sequence_attach_generation_buffers(&sequence_state,
+                                                             result->generated_ids,
+                                                             result->generated_capacity,
+                                                             sequence,
+                                                             (uint32_t)sequence_len_u64);
+    if (sequence_status != UOCR_OK) {
+        uocr_free(sequence);
+        return metal_fail(error,
+                          error_size,
+                          "failed to attach integrated Metal fp16 generation buffers: %s",
+                          uocr_status_string(sequence_status));
+    }
 
     uocr_metal_buffer_slice logits;
     uocr_metal_buffer_slice token_slot;
@@ -5683,18 +5718,24 @@ int uocr_metal_context_generate_f16(uocr_metal_context *ctx,
         goto decode_loop_done;                              \
     } while (0)
 
-    while (result->generated_count < request->max_new_tokens) {
+    while (!uocr_sequence_generation_done(&sequence_state)) {
         uint32_t token_id = UINT32_MAX;
         float score = 0.0f;
+        uocr_no_repeat_ngram_config no_repeat_config;
+        const int no_repeat_status = uocr_sequence_no_repeat_config(&sequence_state, &no_repeat_config);
+        if (no_repeat_status != UOCR_OK) {
+            UOCR_METAL_DECODE_LOOP_FAIL("integrated Metal fp16 no-repeat state is invalid: %s",
+                                        uocr_status_string(no_repeat_status));
+        }
         if (!metal_select_next_token_from_hidden_slice_f16(ctx,
                                                            hidden_for_selection,
                                                            norm_scratch,
                                                            logits,
                                                            token_slot,
-                                                           sequence,
-                                                           sequence_len,
-                                                           request->no_repeat_ngram_size,
-                                                           request->no_repeat_window,
+                                                           no_repeat_config.sequence != NULL ? no_repeat_config.sequence : sequence_state.token_history,
+                                                           no_repeat_config.sequence != NULL ? no_repeat_config.sequence_len : sequence_state.token_history_count,
+                                                           no_repeat_config.ngram_size,
+                                                           no_repeat_config.window,
                                                            &token_id,
                                                            &score,
                                                            error,
@@ -5707,19 +5748,23 @@ int uocr_metal_context_generate_f16(uocr_metal_context *ctx,
             UOCR_METAL_DECODE_LOOP_FAIL("integrated Metal fp16 selected invalid token id %u", token_id);
         }
 
-        result->generated_ids[result->generated_count] = (int32_t)token_id;
-        if (result->generated_scores_f32_or_null != NULL) {
-            result->generated_scores_f32_or_null[result->generated_count] = score;
+        const uint32_t generated_index = sequence_state.generated_count;
+        const int accept_status = uocr_sequence_accept_generated_token(&sequence_state, (int32_t)token_id, NULL, 0u);
+        if (accept_status != UOCR_OK) {
+            UOCR_METAL_DECODE_LOOP_FAIL("integrated Metal fp16 generated-token state update failed: %s",
+                                        uocr_status_string(accept_status));
         }
-        sequence[sequence_len++] = (int32_t)token_id;
-        ++result->generated_count;
+        if (result->generated_scores_f32_or_null != NULL) {
+            result->generated_scores_f32_or_null[generated_index] = score;
+        }
+        result->generated_count = sequence_state.generated_count;
         result->last_token_id = token_id;
         result->last_score_f32 = score;
-        if (token_id == (uint32_t)UOCR_TOKEN_EOS) {
+        if (sequence_state.eos) {
             result->stopped_on_eos = 1u;
             break;
         }
-        if (result->generated_count >= request->max_new_tokens) {
+        if (uocr_sequence_generation_done(&sequence_state)) {
             break;
         }
 
@@ -5740,7 +5785,7 @@ int uocr_metal_context_generate_f16(uocr_metal_context *ctx,
         if (!metal_run_decoder_decode_one_f16(ctx,
                                               request->slot,
                                               request->n_tokens,
-                                              result->generated_count,
+                                              sequence_state.generated_count,
                                               error,
                                               error_size)) {
             char detail[512];

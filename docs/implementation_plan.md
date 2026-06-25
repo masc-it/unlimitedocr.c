@@ -503,13 +503,13 @@ Current priority slice, in order. The coding agent should take the first uncheck
   - [x] allow zero disabled values
   - [x] support upstream defaults `35/128` and `35/1024`
   - [x] implement CPU no-repeat processor over the current full token sequence (`prompt + generated`) with the same sliding-window scan as upstream `LogitsProcessor`
-- [ ] Build per-sequence state:
+- [x] Build per-sequence state:
   - [x] prompt token count
   - [x] text ranges around the single visual span
   - [x] image feature span range
   - [x] max generation length
-  - [ ] no-repeat state over prompt plus generated ids
-  - [ ] generated token buffer
+  - [x] no-repeat state over prompt plus generated ids
+  - [x] generated token buffer
   - [x] position counter
   - [x] EOS status
 
