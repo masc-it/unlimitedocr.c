@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ctypes as ct
 import os
+from dataclasses import replace
 
 import numpy as np
 import pytest
@@ -12,6 +13,7 @@ from unlimitedocr_c.ffi import (
     UOCR_ERROR_NOT_IMPLEMENTED,
     UOCR_MEMORY_KV_CACHE,
     _copy_result_tokens,
+    as_c_request,
     find_library_path,
 )
 from unlimitedocr_c.frontend import (
@@ -133,6 +135,41 @@ def test_ctypes_image_validation_smoke() -> None:
         outputs = engine.generate_prepared(req)
     assert len(outputs) == 1
     assert outputs[0].shape == (0,)
+
+
+def test_as_c_request_rejects_strided_view_pixels() -> None:
+    req = prepare_image(Image.new("RGB", (64, 64), (1, 2, 3)), preset="base", max_new_tokens=0)
+    strided_view = replace(req.views[0], pixels=req.views[0].pixels[:, :, ::-1])
+    bad_req = replace(req, views=(strided_view,))
+    with pytest.raises(ValueError, match="C-contiguous"):
+        as_c_request(bad_req)
+
+
+def test_as_c_request_rejects_view_metadata_mismatch() -> None:
+    req = prepare_image(Image.new("RGB", (64, 64), (1, 2, 3)), preset="base", max_new_tokens=0)
+    bad_view = replace(req.views[0], width=640)
+    bad_req = replace(req, views=(bad_view,))
+    with pytest.raises(ValueError, match="shape"):
+        as_c_request(bad_req)
+
+
+def test_as_c_request_enforces_public_base_view_contract() -> None:
+    req = prepare_image(Image.new("RGB", (64, 64), (1, 2, 3)), preset="base", max_new_tokens=0)
+    duplicate_global = replace(req, views=(req.views[0], req.views[0]))
+    with pytest.raises(ValueError, match="exactly one global"):
+        as_c_request(duplicate_global)
+
+    local_base = replace(req, views=(replace(req.views[0], kind="local"),))
+    with pytest.raises(ValueError, match="local view 0"):
+        as_c_request(local_base)
+
+
+def test_as_c_request_enforces_public_gundam_view_order() -> None:
+    req = prepare_image(_gradient_image(1280, 640), preset="gundam", max_new_tokens=0)
+    assert [view.kind for view in req.views] == ["local", "local", "global"]
+    bad_req = replace(req, views=(req.views[-1],) + req.views[:-1])
+    with pytest.raises(ValueError, match="gundam crop view 0"):
+        as_c_request(bad_req)
 
 
 def test_cpu_ref_generation_not_implemented_message() -> None:

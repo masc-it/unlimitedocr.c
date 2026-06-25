@@ -12,7 +12,7 @@ from typing import Sequence
 import numpy as np
 from numpy.typing import NDArray
 
-from .frontend import PreparedRequest, project_root
+from .frontend import GLOBAL_VIEW_SIZE, LOCAL_VIEW_SIZE, PreparedRequest, project_root
 
 UOCR_OK = 0
 UOCR_ERROR_INVALID_ARGUMENT = -1
@@ -227,6 +227,87 @@ def _view_kind(kind: str) -> int:
     raise ValueError(f"unsupported view kind {kind!r}")
 
 
+def _validate_c_contiguous_array(name: str, array: np.ndarray, dtype: np.dtype[np.generic], ndim: int) -> None:
+    if array.dtype != dtype:
+        raise ValueError(f"{name} must have dtype {dtype}, got {array.dtype}")
+    if array.ndim != ndim:
+        raise ValueError(f"{name} must be {ndim}D, got shape {array.shape}")
+    if not array.flags.c_contiguous:
+        raise ValueError(f"{name} must be C-contiguous; v1 C ABI does not accept strides")
+
+
+def _validate_view_pixels(request: PreparedRequest) -> None:
+    for index, view in enumerate(request.views):
+        pixels = view.pixels
+        if view.format == "f16_nchw":
+            expected_dtype = np.dtype(np.float16)
+        elif view.format == "f32_nchw":
+            expected_dtype = np.dtype(np.float32)
+        else:
+            raise ValueError(f"unsupported pixel format {view.format!r}")
+        _validate_c_contiguous_array(f"view {index} pixels", pixels, expected_dtype, 3)
+        expected_shape = (3, int(view.height), int(view.width))
+        if pixels.shape != expected_shape:
+            raise ValueError(f"view {index} pixels must have shape {expected_shape}, got {pixels.shape}")
+        if view.kind == "global":
+            if view.width != GLOBAL_VIEW_SIZE or view.height != GLOBAL_VIEW_SIZE:
+                raise ValueError(
+                    f"global view {index} must be {GLOBAL_VIEW_SIZE}x{GLOBAL_VIEW_SIZE}, got {view.width}x{view.height}"
+                )
+        elif view.kind == "local":
+            if view.width != LOCAL_VIEW_SIZE or view.height != LOCAL_VIEW_SIZE:
+                raise ValueError(
+                    f"local view {index} must be {LOCAL_VIEW_SIZE}x{LOCAL_VIEW_SIZE}, got {view.width}x{view.height}"
+                )
+        else:
+            raise ValueError(f"unsupported view kind {view.kind!r}")
+
+
+def _validate_public_view_contract(request: PreparedRequest) -> None:
+    _validate_view_pixels(request)
+    if request.mode == "text-only":
+        if request.views:
+            raise ValueError("text-only requests must not include image views")
+        return
+    if request.mode == "base":
+        if request.crop_grid_w != 1 or request.crop_grid_h != 1:
+            raise ValueError(f"base image requests must use crop grid 1x1, got {request.crop_grid_w}x{request.crop_grid_h}")
+        if len(request.views) != 1 or request.views[0].kind != "global":
+            raise ValueError("base image requests must have exactly one global 1024x1024 view")
+        return
+    if request.mode == "multi-page-base":
+        if request.crop_grid_w != 1 or request.crop_grid_h != 1:
+            raise ValueError(
+                f"multi-page base requests must use crop grid 1x1, got {request.crop_grid_w}x{request.crop_grid_h}"
+            )
+        if not request.views:
+            raise ValueError("multi-page base requests require at least one global view")
+        for index, view in enumerate(request.views):
+            if view.kind != "global":
+                raise ValueError(f"multi-page base view {index} must be global")
+            if view.source_index != index:
+                raise ValueError(f"multi-page base view {index} must have source_index {index}, got {view.source_index}")
+        return
+    if request.mode == "gundam":
+        if request.crop_grid_w <= 0 or request.crop_grid_h <= 0:
+            raise ValueError(f"gundam requests require a positive crop grid, got {request.crop_grid_w}x{request.crop_grid_h}")
+        expected_locals = int(request.crop_grid_w) * int(request.crop_grid_h)
+        if expected_locals == 1:
+            if len(request.views) != 1 or request.views[0].kind != "global":
+                raise ValueError("gundam 1x1 requests must have exactly one global 1024x1024 view")
+            return
+        if len(request.views) != expected_locals + 1:
+            raise ValueError(
+                f"gundam crop grid {request.crop_grid_w}x{request.crop_grid_h} expects "
+                f"{expected_locals} local views plus one global view, got {len(request.views)} views"
+            )
+        for index, view in enumerate(request.views[:-1]):
+            if view.kind != "local":
+                raise ValueError(f"gundam crop view {index} must be local")
+        if request.views[-1].kind != "global":
+            raise ValueError("gundam crop final view must be the global view")
+
+
 def _copy_result_tokens(lib: ct.CDLL, result: ct.c_void_p) -> list[NDArray[np.int32]]:
     count = lib.uocr_result_count(result)
     outputs: list[NDArray[np.int32]] = []
@@ -242,17 +323,20 @@ def _copy_result_tokens(lib: ct.CDLL, result: ct.c_void_p) -> list[NDArray[np.in
 
 
 def as_c_request(request: PreparedRequest) -> _PreparedKeepalive:
-    input_ids = np.ascontiguousarray(request.input_ids, dtype=np.int32)
-    image_mask = np.ascontiguousarray(request.image_mask, dtype=np.uint8)
-    if input_ids.ndim != 1 or image_mask.ndim != 1 or input_ids.shape[0] != image_mask.shape[0]:
+    input_ids = request.input_ids
+    image_mask = request.image_mask
+    _validate_c_contiguous_array("input_ids", input_ids, np.dtype(np.int32), 1)
+    _validate_c_contiguous_array("image_mask", image_mask, np.dtype(np.uint8), 1)
+    if input_ids.shape[0] != image_mask.shape[0]:
         raise ValueError("input_ids and image_mask must be same-length 1D arrays")
+    _validate_public_view_contract(request)
 
     view_pixels: list[NDArray[np.float16] | NDArray[np.float32]] = []
     c_views: ct.Array[CImageView] | None = None
     if request.views:
         c_views = (CImageView * len(request.views))()
         for i, view in enumerate(request.views):
-            pixels = np.ascontiguousarray(view.pixels)
+            pixels = view.pixels
             view_pixels.append(pixels)
             c_views[i] = CImageView(
                 pixels=ct.c_void_p(int(pixels.ctypes.data)),

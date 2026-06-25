@@ -440,12 +440,12 @@ Current priority slice, in order. The coding agent should take the first uncheck
   - [x] `uocr_pixel_format`: `UOCR_PIXEL_F16_NCHW`, `UOCR_PIXEL_F32_NCHW`
   - [x] `uocr_view_kind`: `UOCR_VIEW_GLOBAL`, `UOCR_VIEW_LOCAL`
   - [x] backend ids or backend string handling: `metal`, `cpu-ref`, later `cuda`
-- [ ] Define `uocr_image_view`:
+- [x] Define `uocr_image_view`:
   - [x] pointer to contiguous `[3,H,W]` normalized pixels
   - [x] width/height
   - [x] format
   - [x] kind
-  - [ ] no strides in v1; Python must pass contiguous arrays and C validates expected byte size from format/shape
+  - [x] no strides in v1; Python must pass contiguous arrays and C validates expected byte size from format/shape
 - [x] Define `uocr_prepared_request`:
   - [x] `input_ids`
   - [x] `image_mask`
@@ -491,8 +491,8 @@ Current priority slice, in order. The coding agent should take the first uncheck
 - [x] Validate supported view dimensions:
   - [x] `1024x1024` global
   - [x] `640x640` local
-- [ ] Validate view order rules:
-  - [ ] base single image: exactly one global `1024x1024` view
+- [x] Validate view order rules:
+  - [x] base single image: exactly one global `1024x1024` view
   - [x] multi-page: one or more global `1024x1024` views, all in page order
   - [x] gundam `[1,1]`: exactly one global `1024x1024` view
   - [x] gundam real crop: exactly `W*H` local `640x640` views in row-major order followed by one global `1024x1024` view
