@@ -721,7 +721,7 @@ These tasks turn the fp16 decoder primitives/parity helpers into the first real 
   - [x] router top-6 agreement
   - [x] logits
   - [x] generated ids/text
-- [ ] Keep this mode available permanently as a parity/debug path even after Metal vision exists.
+- [x] Keep this mode available permanently as a parity/debug path even after Metal vision exists.
 
 ### 15.1 Integrated dumped-embedding generation path
 
@@ -733,7 +733,7 @@ Do this immediately after section 14.5 and before porting SAM/CLIP. The goal is 
 - [x] Validate image span length equals dumped visual feature rows and that the prepared request's view/crop metadata still passes normal validation.
 - [x] Run prefill/decode/generation through the integrated decoder for dumped image embeddings.
 - [x] Compare generated ids/text against Python dumped-image fixtures; logits/top-k and router checks remain mandatory diagnostics when generated ids drift.
-- [ ] Keep this path as a permanent opt-in parity mode after Metal vision lands.
+- [x] Keep this path as a permanent opt-in parity mode after Metal vision lands.
 
 ## 16. Metal fp16 vision encoder
 

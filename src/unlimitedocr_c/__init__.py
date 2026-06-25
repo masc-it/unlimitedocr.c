@@ -114,6 +114,12 @@ from .ocr import (
     ocr_pdf,
     pdf_to_images,
 )
+from .parity import (
+    DumpedImageEmbeddingGenerationResult,
+    default_metal_resource_path,
+    generate_from_dumped_image_embeddings,
+    load_dumped_image_embedding_expected_ids,
+)
 
 __all__ = [
     "CalibrationCandidateReport",
@@ -217,4 +223,8 @@ __all__ = [
     "ocr_pages",
     "ocr_pdf",
     "pdf_to_images",
+    "DumpedImageEmbeddingGenerationResult",
+    "default_metal_resource_path",
+    "generate_from_dumped_image_embeddings",
+    "load_dumped_image_embedding_expected_ids",
 ]
