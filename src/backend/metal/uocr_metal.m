@@ -25,6 +25,7 @@
 #import <Metal/Metal.h>
 
 #define UOCR_METAL_MPS_DATA_TYPE_FLOAT16 (0x10000000U | 16U)
+#define UOCR_METAL_MPS_DATA_TYPE_FLOAT32 (0x10000000U | 32U)
 #define UOCR_METAL_MPS_MATMUL_MIN_FLOPS 64000000ULL
 
 @interface NSObject (UOCRMetalMPSDynamic)
@@ -6083,19 +6084,23 @@ static int metal_mps_matmul_nt_f16_should_use(uint32_t rows, uint32_t in_feature
     return flops >= metal_mps_matmul_min_flops();
 }
 
-static id metal_mps_descriptor_for_shape(uocr_metal_context *ctx, uint32_t rows, uint32_t cols, int transpose) {
+static id metal_mps_descriptor_for_shape(uocr_metal_context *ctx,
+                                         uint32_t rows,
+                                         uint32_t cols,
+                                         int transpose,
+                                         uint32_t data_type) {
     const uocr_metal_mps_class_cache *classes = metal_mps_classes();
     if (!classes->available || rows == 0u || cols == 0u) {
         return nil;
     }
-    NSString *key = [NSString stringWithFormat:@"%u:%u:%u", rows, cols, transpose ? 1u : 0u];
+    NSString *key = [NSString stringWithFormat:@"%u:%u:%u:%u", rows, cols, transpose ? 1u : 0u, data_type];
     id cached = (ctx != NULL && ctx->mps_descriptor_cache != nil && key != nil) ? [ctx->mps_descriptor_cache objectForKey:key] : nil;
     if (cached != nil) {
         metal_profile_add_event_ms(ctx, "metal.mps.descriptor_cache.hit", 0.0);
         return cached;
     }
     const uint64_t descriptor_start_ns = uocr_profile_now_ns();
-    id desc = [classes->descriptor_class descriptorWithDataType:UOCR_METAL_MPS_DATA_TYPE_FLOAT16
+    id desc = [classes->descriptor_class descriptorWithDataType:data_type
                                                           shape:@[ @((NSUInteger)rows), @((NSUInteger)cols) ]];
     metal_profile_add_event_now(ctx, "metal.mps.ndarray_descriptor", descriptor_start_ns);
     if (desc == nil) {
@@ -6119,13 +6124,15 @@ static id metal_mps_descriptor_for_shape(uocr_metal_context *ctx, uint32_t rows,
 static NSString *metal_mps_ndarray_cache_key(uocr_metal_buffer_slice slice,
                                              uint32_t rows,
                                              uint32_t cols,
-                                             int transpose) {
-    return [NSString stringWithFormat:@"%p:%llu:%u:%u:%u",
+                                             int transpose,
+                                             uint32_t data_type) {
+    return [NSString stringWithFormat:@"%p:%llu:%u:%u:%u:%u",
                                       (void *)slice.buffer,
                                       (unsigned long long)slice.offset,
                                       rows,
                                       cols,
-                                      transpose ? 1u : 0u];
+                                      transpose ? 1u : 0u,
+                                      data_type];
 }
 
 static id metal_mps_matrix_array_from_slice(uocr_metal_context *ctx,
@@ -6133,6 +6140,7 @@ static id metal_mps_matrix_array_from_slice(uocr_metal_context *ctx,
                                             uint32_t rows,
                                             uint32_t cols,
                                             int transpose,
+                                            uint32_t data_type,
                                             int cache_if_model_backed,
                                             int cache_if_workspace_backed,
                                             uint64_t byte_length) {
@@ -6156,7 +6164,7 @@ static id metal_mps_matrix_array_from_slice(uocr_metal_context *ctx,
         cache_create_event = "metal.mps.workspace_ndarray_cache.create";
     }
     if (array_cache != nil) {
-        array_key = metal_mps_ndarray_cache_key(slice, rows, cols, transpose);
+        array_key = metal_mps_ndarray_cache_key(slice, rows, cols, transpose, data_type);
         id cached = array_key != nil ? [array_cache objectForKey:array_key] : nil;
         if (cached != nil) {
             [cached retain];
@@ -6164,7 +6172,7 @@ static id metal_mps_matrix_array_from_slice(uocr_metal_context *ctx,
             return cached;
         }
     }
-    id desc = metal_mps_descriptor_for_shape(ctx, rows, cols, transpose);
+    id desc = metal_mps_descriptor_for_shape(ctx, rows, cols, transpose, data_type);
     if (desc == nil) {
         return nil;
     }
@@ -6207,20 +6215,28 @@ static id metal_ensure_mps_matmul_kernel(uocr_metal_context *ctx, char *error, s
     return kernel;
 }
 
-static int metal_run_mps_matmul_nt_f16(uocr_metal_context *ctx,
-                                       uocr_metal_buffer_slice input,
-                                       uocr_metal_buffer_slice weight_nk,
-                                       uocr_metal_buffer_slice dst,
-                                       uint32_t rows,
-                                       uint32_t in_features,
-                                       uint32_t out_features,
-                                       const char *op_name,
-                                       char *error,
-                                       size_t error_size) {
+static int metal_run_mps_matmul_nt_f16_to_type(uocr_metal_context *ctx,
+                                               uocr_metal_buffer_slice input,
+                                               uocr_metal_buffer_slice weight_nk,
+                                               uocr_metal_buffer_slice dst,
+                                               uint32_t rows,
+                                               uint32_t in_features,
+                                               uint32_t out_features,
+                                               uint32_t dst_data_type,
+                                               uint64_t dst_element_bytes,
+                                               const char *op_name,
+                                               char *error,
+                                               size_t error_size) {
     const uint64_t input_bytes = (uint64_t)rows * (uint64_t)in_features * 2u;
     const uint64_t weight_bytes = (uint64_t)out_features * (uint64_t)in_features * 2u;
-    const uint64_t dst_bytes = (uint64_t)rows * (uint64_t)out_features * 2u;
-    if (ctx == NULL || rows == 0u || in_features == 0u || out_features == 0u ||
+    uint64_t dst_values = 0u;
+    uint64_t dst_bytes = 0u;
+    if (!checked_mul_u64((uint64_t)rows, (uint64_t)out_features, &dst_values) ||
+        !checked_mul_u64(dst_values, dst_element_bytes, &dst_bytes)) {
+        return metal_fail(error, error_size, "%s MPS matmul output byte-size overflow", op_name != NULL ? op_name : "Metal");
+    }
+    if (ctx == NULL || rows == 0u || in_features == 0u || out_features == 0u || dst_element_bytes == 0u ||
+        (dst_data_type != UOCR_METAL_MPS_DATA_TYPE_FLOAT16 && dst_data_type != UOCR_METAL_MPS_DATA_TYPE_FLOAT32) ||
         !metal_slice_valid(input, input_bytes) || !metal_slice_valid(weight_nk, weight_bytes) ||
         !metal_slice_valid(dst, dst_bytes)) {
         return metal_fail(error, error_size, "invalid %s MPS matmul request", op_name != NULL ? op_name : "Metal");
@@ -6232,9 +6248,33 @@ static int metal_run_mps_matmul_nt_f16(uocr_metal_context *ctx,
         if (kernel == nil) {
             return 0;
         }
-        id x_array = metal_mps_matrix_array_from_slice(ctx, input, rows, in_features, 0, 0, 1, input_bytes);
-        id w_array = metal_mps_matrix_array_from_slice(ctx, weight_nk, out_features, in_features, 1, 1, 0, weight_bytes);
-        id y_array = metal_mps_matrix_array_from_slice(ctx, dst, rows, out_features, 0, 0, 1, dst_bytes);
+        id x_array = metal_mps_matrix_array_from_slice(ctx,
+                                                        input,
+                                                        rows,
+                                                        in_features,
+                                                        0,
+                                                        UOCR_METAL_MPS_DATA_TYPE_FLOAT16,
+                                                        0,
+                                                        1,
+                                                        input_bytes);
+        id w_array = metal_mps_matrix_array_from_slice(ctx,
+                                                        weight_nk,
+                                                        out_features,
+                                                        in_features,
+                                                        1,
+                                                        UOCR_METAL_MPS_DATA_TYPE_FLOAT16,
+                                                        1,
+                                                        0,
+                                                        weight_bytes);
+        id y_array = metal_mps_matrix_array_from_slice(ctx,
+                                                        dst,
+                                                        rows,
+                                                        out_features,
+                                                        0,
+                                                        dst_data_type,
+                                                        0,
+                                                        1,
+                                                        dst_bytes);
         if (x_array == nil || w_array == nil || y_array == nil) {
             [x_array release];
             [w_array release];
@@ -6299,6 +6339,54 @@ static int metal_run_mps_matmul_nt_f16(uocr_metal_context *ctx,
         metal_profile_add_event_now(ctx, "metal.mps.matmul", mps_call_start_ns);
         return ok;
     }
+}
+
+static int metal_run_mps_matmul_nt_f16(uocr_metal_context *ctx,
+                                       uocr_metal_buffer_slice input,
+                                       uocr_metal_buffer_slice weight_nk,
+                                       uocr_metal_buffer_slice dst,
+                                       uint32_t rows,
+                                       uint32_t in_features,
+                                       uint32_t out_features,
+                                       const char *op_name,
+                                       char *error,
+                                       size_t error_size) {
+    return metal_run_mps_matmul_nt_f16_to_type(ctx,
+                                               input,
+                                               weight_nk,
+                                               dst,
+                                               rows,
+                                               in_features,
+                                               out_features,
+                                               UOCR_METAL_MPS_DATA_TYPE_FLOAT16,
+                                               2u,
+                                               op_name,
+                                               error,
+                                               error_size);
+}
+
+static int metal_run_mps_matmul_nt_f16_to_f32(uocr_metal_context *ctx,
+                                              uocr_metal_buffer_slice input,
+                                              uocr_metal_buffer_slice weight_nk,
+                                              uocr_metal_buffer_slice dst,
+                                              uint32_t rows,
+                                              uint32_t in_features,
+                                              uint32_t out_features,
+                                              const char *op_name,
+                                              char *error,
+                                              size_t error_size) {
+    return metal_run_mps_matmul_nt_f16_to_type(ctx,
+                                               input,
+                                               weight_nk,
+                                               dst,
+                                               rows,
+                                               in_features,
+                                               out_features,
+                                               UOCR_METAL_MPS_DATA_TYPE_FLOAT32,
+                                               (uint64_t)sizeof(float),
+                                               op_name,
+                                               error,
+                                               error_size);
 }
 
 static int metal_hidden_arena_segment_slice(const uocr_metal_context *ctx,
@@ -7866,39 +7954,63 @@ static int metal_run_moe_router_buffer_f16(uocr_metal_context *ctx,
     (void)logits_bytes;
     (void)top_ids_bytes;
     (void)top_weights_bytes;
+    const int use_mps_logits = metal_mps_matmul_nt_f16_should_use(n_tokens, UOCR_HIDDEN_SIZE, UOCR_ROUTED_EXPERTS);
     @autoreleasepool {
-        id<MTLComputePipelineState> logits_pipeline = metal_get_pipeline(ctx, "uocr_moe_router_logits_f16_to_f32", error, error_size);
+        id<MTLComputePipelineState> logits_pipeline = use_mps_logits ? nil :
+            metal_get_pipeline(ctx, "uocr_moe_router_logits_f16_to_f32", error, error_size);
         id<MTLComputePipelineState> topk_pipeline = metal_get_pipeline(ctx, "uocr_moe_router_softmax_topk_f32", error, error_size);
-        if (logits_pipeline == nil || topk_pipeline == nil) {
+        if ((!use_mps_logits && logits_pipeline == nil) || topk_pipeline == nil) {
             return 0;
         }
         if (topk_pipeline.maxTotalThreadsPerThreadgroup < (NSUInteger)UOCR_ROUTED_EXPERTS) {
             return metal_fail(error, error_size, "integrated MoE router top-k pipeline does not support 64 threads");
-        }
-        int owned_command_buffer = 0;
-        id<MTLCommandBuffer> cb = metal_command_buffer_for_op(ctx, &owned_command_buffer, "integrated MoE router", error, error_size);
-        if (cb == nil) {
-            return 0;
         }
         uocr_metal_moe_router_params params;
         params.n_tokens = n_tokens;
         params.hidden_size = UOCR_HIDDEN_SIZE;
         params.experts = UOCR_ROUTED_EXPERTS;
         params.top_k = UOCR_MOE_TOP_K;
-        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
-        if (enc == nil) {
-            return metal_fail(error, error_size, "failed to create integrated MoE router logits encoder");
+
+        if (use_mps_logits) {
+            uocr_metal_buffer_slice router_weight_slice = { router_weight->buffer, router_weight->offset };
+            const uint64_t router_mps_start_ns = uocr_profile_now_ns();
+            if (!metal_run_mps_matmul_nt_f16_to_f32(ctx,
+                                                    input,
+                                                    router_weight_slice,
+                                                    logits,
+                                                    n_tokens,
+                                                    UOCR_HIDDEN_SIZE,
+                                                    UOCR_ROUTED_EXPERTS,
+                                                    "integrated MoE router MPS logits",
+                                                    error,
+                                                    error_size)) {
+                return 0;
+            }
+            metal_profile_add_event_now(ctx, "metal.prefill.moe_router_mps_logits", router_mps_start_ns);
         }
-        const NSUInteger logits_threads = metal_power2_threadgroup_width(256u, logits_pipeline.maxTotalThreadsPerThreadgroup);
-        [enc setComputePipelineState:logits_pipeline];
-        [enc setBuffer:input.buffer offset:input.offset atIndex:0u];
-        [enc setBuffer:router_weight->buffer offset:router_weight->offset atIndex:1u];
-        [enc setBuffer:logits.buffer offset:logits.offset atIndex:2u];
-        [enc setBytes:&params length:sizeof(params) atIndex:3u];
-        [enc setThreadgroupMemoryLength:logits_threads * sizeof(float) atIndex:0u];
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)router_values, 1u, 1u)
-             threadsPerThreadgroup:MTLSizeMake(logits_threads, 1u, 1u)];
-        [enc endEncoding];
+
+        int owned_command_buffer = 0;
+        id<MTLCommandBuffer> cb = metal_command_buffer_for_op(ctx, &owned_command_buffer, "integrated MoE router", error, error_size);
+        if (cb == nil) {
+            return 0;
+        }
+        id<MTLComputeCommandEncoder> enc = nil;
+        if (!use_mps_logits) {
+            enc = metal_compute_command_encoder(ctx, cb);
+            if (enc == nil) {
+                return metal_fail(error, error_size, "failed to create integrated MoE router logits encoder");
+            }
+            const NSUInteger logits_threads = metal_power2_threadgroup_width(256u, logits_pipeline.maxTotalThreadsPerThreadgroup);
+            [enc setComputePipelineState:logits_pipeline];
+            [enc setBuffer:input.buffer offset:input.offset atIndex:0u];
+            [enc setBuffer:router_weight->buffer offset:router_weight->offset atIndex:1u];
+            [enc setBuffer:logits.buffer offset:logits.offset atIndex:2u];
+            [enc setBytes:&params length:sizeof(params) atIndex:3u];
+            [enc setThreadgroupMemoryLength:logits_threads * sizeof(float) atIndex:0u];
+            [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)router_values, 1u, 1u)
+                 threadsPerThreadgroup:MTLSizeMake(logits_threads, 1u, 1u)];
+            [enc endEncoding];
+        }
 
         enc = metal_compute_command_encoder(ctx, cb);
         if (enc == nil) {
@@ -16334,11 +16446,6 @@ int uocr_metal_context_lm_head_f16(uocr_metal_context *ctx,
     }
 
     @autoreleasepool {
-        id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, "uocr_dense_f16_to_f32", error, error_size);
-        if (pipeline == nil) {
-            return 0;
-        }
-
         id<MTLBuffer> src = metal_new_buffer_with_bytes(ctx, input_f16, (NSUInteger)input_bytes, MTLResourceStorageModeShared);
         if (src == nil) {
             return metal_fail(error, error_size, "failed to allocate Metal LM-head input buffer");
@@ -16351,54 +16458,84 @@ int uocr_metal_context_lm_head_f16(uocr_metal_context *ctx,
             return metal_fail(error, error_size, "failed to allocate Metal LM-head logits buffer");
         }
         dst.label = @"uocr_lm_head_logits_f32";
-        memset([dst contents], 0, (size_t)output_bytes);
 
-        id<MTLCommandBuffer> cb = metal_new_command_buffer(ctx);
-        if (cb == nil) {
-            [dst release];
-            [src release];
-            return metal_fail(error, error_size, "failed to create Metal LM-head command buffer");
-        }
-        cb.label = @"uocr_lm_head_command_buffer";
+        const int use_mps_lm_head = metal_mps_matmul_nt_f16_should_use(n_rows, UOCR_HIDDEN_SIZE, UOCR_VOCAB_SIZE);
+        if (use_mps_lm_head) {
+            uocr_metal_buffer_slice src_slice = { src, 0u };
+            uocr_metal_buffer_slice weight_slice = { lm_head_weight, lm_head_offset };
+            uocr_metal_buffer_slice dst_slice = { dst, 0u };
+            const uint64_t lm_mps_start_ns = uocr_profile_now_ns();
+            if (!metal_run_mps_matmul_nt_f16_to_f32(ctx,
+                                                    src_slice,
+                                                    weight_slice,
+                                                    dst_slice,
+                                                    n_rows,
+                                                    UOCR_HIDDEN_SIZE,
+                                                    UOCR_VOCAB_SIZE,
+                                                    "Metal LM-head MPS matmul",
+                                                    error,
+                                                    error_size)) {
+                [dst release];
+                [src release];
+                return 0;
+            }
+            metal_profile_add_event_now(ctx, "metal.lm_head.mps_matmul", lm_mps_start_ns);
+        } else {
+            id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, "uocr_dense_f16_to_f32", error, error_size);
+            if (pipeline == nil) {
+                [dst release];
+                [src release];
+                return 0;
+            }
+            memset([dst contents], 0, (size_t)output_bytes);
 
-        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
-        if (enc == nil) {
-            [dst release];
-            [src release];
-            return metal_fail(error, error_size, "failed to create Metal LM-head command encoder");
-        }
+            id<MTLCommandBuffer> cb = metal_new_command_buffer(ctx);
+            if (cb == nil) {
+                [dst release];
+                [src release];
+                return metal_fail(error, error_size, "failed to create Metal LM-head command buffer");
+            }
+            cb.label = @"uocr_lm_head_command_buffer";
 
-        uocr_metal_dense_params params;
-        params.input_rows = n_rows;
-        params.in_features = UOCR_HIDDEN_SIZE;
-        params.out_features = UOCR_VOCAB_SIZE;
-        params.has_bias = 0u;
+            id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
+            if (enc == nil) {
+                [dst release];
+                [src release];
+                return metal_fail(error, error_size, "failed to create Metal LM-head command encoder");
+            }
 
-        const NSUInteger threads_per_group = metal_power2_threadgroup_width(256u, pipeline.maxTotalThreadsPerThreadgroup);
-        const uint64_t threadgroup_bytes = (uint64_t)threads_per_group * (uint64_t)sizeof(float);
-        if (threadgroup_bytes > (uint64_t)ctx->device.maxThreadgroupMemoryLength) {
-            [dst release];
-            [src release];
-            return metal_fail(error, error_size, "Metal LM-head threadgroup memory exceeds device limit");
-        }
+            uocr_metal_dense_params params;
+            params.input_rows = n_rows;
+            params.in_features = UOCR_HIDDEN_SIZE;
+            params.out_features = UOCR_VOCAB_SIZE;
+            params.has_bias = 0u;
 
-        [enc setComputePipelineState:pipeline];
-        [enc setBuffer:src offset:0u atIndex:0u];
-        [enc setBuffer:lm_head_weight offset:lm_head_offset atIndex:1u];
-        [enc setBuffer:lm_head_weight offset:lm_head_offset atIndex:2u];
-        [enc setBuffer:dst offset:0u atIndex:3u];
-        [enc setBytes:&params length:sizeof(params) atIndex:4u];
-        [enc setThreadgroupMemoryLength:threads_per_group * sizeof(float) atIndex:0u];
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)output_values, 1u, 1u)
-             threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1u, 1u)];
-        [enc endEncoding];
+            const NSUInteger threads_per_group = metal_power2_threadgroup_width(256u, pipeline.maxTotalThreadsPerThreadgroup);
+            const uint64_t threadgroup_bytes = (uint64_t)threads_per_group * (uint64_t)sizeof(float);
+            if (threadgroup_bytes > (uint64_t)ctx->device.maxThreadgroupMemoryLength) {
+                [dst release];
+                [src release];
+                return metal_fail(error, error_size, "Metal LM-head threadgroup memory exceeds device limit");
+            }
 
-        UOCR_METAL_COMMIT_AND_WAIT_PROFILED(ctx, cb);
-        if (cb.status == MTLCommandBufferStatusError) {
-            NSString *description = cb.error != nil ? [cb.error localizedDescription] : @"unknown command-buffer error";
-            [dst release];
-            [src release];
-            return metal_fail(error, error_size, "Metal LM-head command failed: %s", [description UTF8String]);
+            [enc setComputePipelineState:pipeline];
+            [enc setBuffer:src offset:0u atIndex:0u];
+            [enc setBuffer:lm_head_weight offset:lm_head_offset atIndex:1u];
+            [enc setBuffer:lm_head_weight offset:lm_head_offset atIndex:2u];
+            [enc setBuffer:dst offset:0u atIndex:3u];
+            [enc setBytes:&params length:sizeof(params) atIndex:4u];
+            [enc setThreadgroupMemoryLength:threads_per_group * sizeof(float) atIndex:0u];
+            [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)output_values, 1u, 1u)
+                 threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1u, 1u)];
+            [enc endEncoding];
+
+            UOCR_METAL_COMMIT_AND_WAIT_PROFILED(ctx, cb);
+            if (cb.status == MTLCommandBufferStatusError) {
+                NSString *description = cb.error != nil ? [cb.error localizedDescription] : @"unknown command-buffer error";
+                [dst release];
+                [src release];
+                return metal_fail(error, error_size, "Metal LM-head command failed: %s", [description UTF8String]);
+            }
         }
 
         memcpy(logits_out_f32, [dst contents], (size_t)output_bytes);

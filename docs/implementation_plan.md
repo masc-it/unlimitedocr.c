@@ -158,6 +158,7 @@ Implementation status:
 - [x] Replace standalone prompt assembly with one prefill-graph step: text-token gather plus image-feature blit into the prompt arena.
 - [x] Encode prompt assembly and all prefill layers into one command buffer.
 - [ ] Use MPSNDArray matrix multiplication for decoder prefill QKV, O projection, dense layer-0 MLP, shared experts, routed experts, and LM head prefill-size GEMMs.
+- [x] Add f32 MPSNDArray matmul support for decoder prefill router logits and row-batched LM-head logits.
 - [ ] Use custom tiled single-token kernels for decode QKV, O projection, dense layer-0 MLP, router, shared experts, routed experts, combine, and LM-head argmax.
 - [ ] Store no-repeat history in a reusable GPU sequence buffer.
 - [ ] Use the GPU-written token slot directly for generated-token embedding.
