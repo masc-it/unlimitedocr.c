@@ -247,7 +247,7 @@ Implementation status:
 
 Acceptance target:
 
-- [ ] Base request non-model arena capacity is within 25% of the request estimate.
+- [x] Base request non-model arena capacity is within 25% of the request estimate.
 
 ## 9. Quantization policy after fp16 10x
 

@@ -4688,7 +4688,10 @@ static uocr_memory_category scratch_slot_memory_category(uocr_metal_scratch_slot
     }
 }
 
-static int scratch_capacity_for_request(uint64_t current_capacity, uint64_t min_length, uint64_t *out_capacity) {
+static int scratch_capacity_for_request(uocr_metal_scratch_slot slot,
+                                        uint64_t current_capacity,
+                                        uint64_t min_length,
+                                        uint64_t *out_capacity) {
     const uint64_t min_allocation = 4096u;
     uint64_t requested = 0u;
     if (!align_up_u64_checked(min_length, 256u, &requested)) {
@@ -4696,6 +4699,16 @@ static int scratch_capacity_for_request(uint64_t current_capacity, uint64_t min_
     }
     if (requested < min_allocation) {
         requested = min_allocation;
+    }
+
+    /* Vision scratch is the public request-shaped workspace reported in memory
+     * estimates.  Allocate it to the exact aligned request size on first use so
+     * a fresh base request does not inherit the generic power-of-two slack used
+     * for small transient/decoder scratch buffers.
+     */
+    if (slot == UOCR_METAL_SCRATCH_VISION) {
+        *out_capacity = requested;
+        return 1;
     }
 
     uint64_t capacity = current_capacity;
@@ -4829,7 +4842,8 @@ static int metal_context_ensure_scratch_accounted(uocr_metal_context *ctx,
     }
 
     uint64_t new_capacity = 0u;
-    if (!scratch_capacity_for_request(scratch->capacity, min_length, &new_capacity) || new_capacity > (uint64_t)SIZE_MAX) {
+    if (!scratch_capacity_for_request(slot, scratch->capacity, min_length, &new_capacity) ||
+        new_capacity > (uint64_t)SIZE_MAX) {
         return metal_fail(error,
                           error_size,
                           "Metal scratch capacity overflow for %s request of %llu bytes",
