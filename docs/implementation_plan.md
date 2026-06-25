@@ -340,8 +340,8 @@ Implementation status:
 - [x] Add a Metal formatter that writes newline/separator rows and crop/global order directly.
 - [ ] Prefer projector output directly into final visual layout when shape/order allows.
 - [x] Splice GPU visual rows into prompt arena without host copy.
-- [ ] Validate byte-for-byte final visual rows against the current formatter.
-- [ ] Remove host formatting from the production path after the GPU formatter is confirmed.
+- [x] Validate byte-for-byte final visual rows against the current formatter.
+- [x] Remove host formatting from the production path after the GPU formatter is confirmed.
 
 ## 14. Production-path cleanup: no fallback code
 
