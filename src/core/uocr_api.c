@@ -694,7 +694,12 @@ int uocr_generate_prepared(uocr_engine *engine,
                                  engine->max_batch);
     }
 
-    const uocr_request_limits limits = {engine->max_prompt_tokens, engine->max_gen_tokens};
+    uocr_request_limits limits;
+    memset(&limits, 0, sizeof(limits));
+    limits.max_prompt_tokens = engine->max_prompt_tokens;
+    limits.max_gen_tokens = engine->max_gen_tokens;
+    limits.max_position_tokens = UOCR_MAX_POSITIONS;
+    limits.generated_ring_window = UOCR_GENERATED_RING_WINDOW;
     uint32_t max_prompt_tokens_in_batch = 0u;
     uint32_t max_visual_tokens_in_batch = 0u;
     uint32_t max_vision_chunk_projected_rows = 0u;

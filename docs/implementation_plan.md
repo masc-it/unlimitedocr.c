@@ -498,7 +498,7 @@ Current priority slice, in order. The coding agent should take the first uncheck
   - [x] gundam real crop: exactly `W*H` local `640x640` views in row-major order followed by one global `1024x1024` view
   - [x] reject mixed local/global orders that do not match this contract
 - [x] Validate prompt length plus `max_new_tokens` fits engine limits.
-- [ ] Validate KV budget before running vision/prefill.
+- [x] Validate KV budget before running vision/prefill.
 - [x] Validate no-repeat config:
   - [x] allow zero disabled values
   - [x] support upstream defaults `35/128` and `35/1024`

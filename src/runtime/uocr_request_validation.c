@@ -69,6 +69,45 @@ uint32_t uocr_count_image_placeholders(const uocr_prepared_request *request) {
     return count;
 }
 
+static int validate_kv_and_position_budget(const uocr_prepared_request *request,
+                                           const uocr_request_limits *limits,
+                                           char *error,
+                                           size_t error_size) {
+    if (limits->max_position_tokens != 0u) {
+        if (request->n_tokens > limits->max_position_tokens ||
+            request->max_new_tokens > limits->max_position_tokens - request->n_tokens) {
+            return fail(error,
+                        error_size,
+                        "sequence length exceeds model position budget: prompt %u + max_new_tokens %u > %u",
+                        request->n_tokens,
+                        request->max_new_tokens,
+                        limits->max_position_tokens);
+        }
+    }
+
+    if (limits->max_prompt_tokens != 0u && limits->generated_ring_window != 0u) {
+        const uint32_t live_generated = request->max_new_tokens < limits->generated_ring_window ?
+                                            request->max_new_tokens :
+                                            limits->generated_ring_window;
+        const uint64_t required_cached_tokens = (uint64_t)request->n_tokens + (uint64_t)live_generated;
+        const uint64_t capacity_cached_tokens = (uint64_t)limits->max_prompt_tokens +
+                                                (uint64_t)limits->generated_ring_window;
+        if (required_cached_tokens > capacity_cached_tokens) {
+            return fail(error,
+                        error_size,
+                        "KV cache budget exceeded: request needs %llu cached tokens (prompt %u + live generated %u), capacity is %llu (prompt capacity %u + ring %u)",
+                        (unsigned long long)required_cached_tokens,
+                        request->n_tokens,
+                        live_generated,
+                        (unsigned long long)capacity_cached_tokens,
+                        limits->max_prompt_tokens,
+                        limits->generated_ring_window);
+        }
+    }
+
+    return UOCR_OK;
+}
+
 static int expected_visual_tokens(const uocr_prepared_request *request,
                                   uint32_t *out_expected,
                                   char *error,
@@ -190,6 +229,10 @@ int uocr_validate_prepared_request(const uocr_prepared_request *request,
                     "request asks for %u new tokens, engine limit is %u",
                     request->max_new_tokens,
                     limits->max_gen_tokens);
+    }
+    const int budget_status = validate_kv_and_position_budget(request, limits, error, error_size);
+    if (budget_status != UOCR_OK) {
+        return budget_status;
     }
     if (request->input_ids[0] != UOCR_TOKEN_BOS) {
         return fail(error, error_size, "first token must be BOS id %d, got %d", UOCR_TOKEN_BOS, request->input_ids[0]);

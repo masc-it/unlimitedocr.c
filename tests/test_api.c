@@ -1,5 +1,6 @@
 #include "unlimitedocr.h"
 
+#include "model/uocr_constants.h"
 #include "model/uocr_format.h"
 #include "runtime/uocr_memory.h"
 #include "runtime/uocr_vision.h"
@@ -635,6 +636,44 @@ static int test_request_validation_rejects_bad_no_repeat_config(void) {
     return 0;
 }
 
+static int test_request_validation_rejects_sequence_position_overflow(void) {
+    uocr_engine_opts opts;
+    memset(&opts, 0, sizeof(opts));
+    opts.backend = "cpu-ref";
+    opts.max_batch = 1;
+    opts.max_prompt_tokens = 16;
+    opts.max_gen_tokens = UOCR_MAX_POSITIONS;
+
+    uocr_engine *engine = uocr_engine_open(&opts);
+    CHECK(engine != NULL);
+
+    const int32_t input_ids[] = {0, 42};
+    const uint8_t image_mask[] = {0, 0};
+    uocr_prepared_request req;
+    memset(&req, 0, sizeof(req));
+    req.input_ids = input_ids;
+    req.image_mask = image_mask;
+    req.n_tokens = 2;
+    req.crop_grid_w = 1;
+    req.crop_grid_h = 1;
+    req.max_new_tokens = UOCR_MAX_POSITIONS - 1u;
+
+    uocr_result *result = NULL;
+    int status = uocr_generate_prepared(engine, &req, 1, &result);
+    CHECK(status == UOCR_ERROR_INVALID_ARGUMENT);
+    CHECK(result == NULL);
+    CHECK(strstr(uocr_last_error(engine), "position budget") != NULL);
+
+    req.max_new_tokens = UOCR_MAX_POSITIONS - 2u;
+    status = uocr_generate_prepared(engine, &req, 1, &result);
+    CHECK(status == UOCR_ERROR_NOT_IMPLEMENTED);
+    CHECK(result == NULL);
+    CHECK(strstr(uocr_last_error(engine), "inference kernels") != NULL);
+
+    uocr_engine_close(engine);
+    return 0;
+}
+
 static int test_request_validation_rejects_bad_bos(void) {
     uocr_engine_opts opts;
     memset(&opts, 0, sizeof(opts));
@@ -682,6 +721,7 @@ int main(void) {
     if (test_request_validation_rejects_bad_visual_count() != 0) return 1;
     if (test_request_validation_accepts_upstream_no_repeat_defaults() != 0) return 1;
     if (test_request_validation_rejects_bad_no_repeat_config() != 0) return 1;
+    if (test_request_validation_rejects_sequence_position_overflow() != 0) return 1;
     if (test_request_validation_rejects_bad_bos() != 0) return 1;
     return 0;
 }
