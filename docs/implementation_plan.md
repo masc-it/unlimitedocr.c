@@ -217,7 +217,7 @@ confirmed per-shape implementations, not runtime fallback paths.
 Implementation status:
 
 - [x] Add MPS allocation/object counters and per-call timings.
-- [ ] Cache stable descriptors and long-lived weight NDArrays by shape/layout/transpose.
+- [x] Cache stable descriptors and long-lived weight NDArrays by shape/layout/transpose.
 - [ ] Reuse input/output NDArray wrappers where buffer lifetimes allow.
 - [ ] Measure whether destination zero-fill blits are required; remove them if confirmed unnecessary.
 - [ ] Benchmark MPS vs custom kernels per operation shape: vision block matmuls, decoder prefill matmuls, decode matvecs.
