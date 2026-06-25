@@ -243,6 +243,8 @@ void uocr_metal_context_release_runtime_arenas(uocr_metal_context *ctx);
 uint64_t uocr_metal_context_runtime_arena_capacity(const uocr_metal_context *ctx,
                                                    uocr_metal_runtime_arena_slot slot);
 uint64_t uocr_metal_context_total_runtime_arena_capacity(const uocr_metal_context *ctx);
+uint32_t uocr_metal_context_runtime_arena_batch_slots(const uocr_metal_context *ctx);
+uint32_t uocr_metal_context_runtime_arena_prompt_token_capacity(const uocr_metal_context *ctx);
 int uocr_metal_context_get_kv_cache_layout(const uocr_metal_context *ctx,
                                            uocr_metal_kv_cache_layout *out_layout);
 int uocr_metal_kv_cache_offset(const uocr_metal_kv_cache_layout *layout,

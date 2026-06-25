@@ -47,7 +47,7 @@ Implementation status:
 - [ ] Use **MPSNDArray matrix multiplication** for large dense GEMMs in SAM, CLIP, projector, and decoder prefill.
 - [ ] Use **custom tiled Metal kernels** for SAM attention, SAM patch/neck/stride convolutions, visual formatting, decode single-token matvecs, routed/shared MoE, and LM-head argmax.
 - [x] Use **persistent GPU token-id buffers** and fold prompt assembly into the prefill command graph.
-- [ ] Use **request-sized lazy arena growth before command encoding**; never grow inside a hot loop.
+- [x] Use **request-sized lazy arena growth before command encoding**; never grow inside a hot loop.
 - [ ] Use **cached Python tokenizers** keyed by resolved tokenizer path.
 - [ ] Keep the 10x milestone on **fp16 weights**; q8 decoder is a follow-up compression milestone after fp16 speed is fixed.
 - [ ] Remove production runtime toggles that preserve slow paths after the chosen path lands.
@@ -237,11 +237,11 @@ Current finding:
 
 Implementation status:
 
-- [ ] Remove decoder arena allocation from `uocr_engine_open()`.
-- [ ] Grow decoder arenas once during request admission using the accepted request shape.
-- [ ] Keep engine hard caps for max batch, max prompt tokens, and max gen tokens.
-- [ ] Reject requests that exceed hard caps before allocating.
-- [ ] Record current capacity and high-water usage in memory reports.
+- [x] Remove decoder arena allocation from `uocr_engine_open()`.
+- [x] Grow decoder arenas once during request admission using the accepted request shape.
+- [x] Keep engine hard caps for max batch, max prompt tokens, and max gen tokens.
+- [x] Reject requests that exceed hard caps before allocating.
+- [x] Record current capacity and high-water usage in memory reports.
 - [ ] Update admission errors with requested limits, configured limits, and current arena capacity.
 - [ ] Prove no arena growth occurs across prefill, decode, vision, and token-selection hot loops.
 

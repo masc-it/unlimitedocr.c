@@ -5353,6 +5353,14 @@ uint64_t uocr_metal_context_total_runtime_arena_capacity(const uocr_metal_contex
     return total;
 }
 
+uint32_t uocr_metal_context_runtime_arena_batch_slots(const uocr_metal_context *ctx) {
+    return (ctx != NULL && ctx->has_kv_cache_layout) ? ctx->kv_cache_layout.batch_slots : 0u;
+}
+
+uint32_t uocr_metal_context_runtime_arena_prompt_token_capacity(const uocr_metal_context *ctx) {
+    return (ctx != NULL && ctx->has_kv_cache_layout) ? ctx->kv_cache_layout.prompt_token_capacity : 0u;
+}
+
 int uocr_metal_context_get_kv_cache_layout(const uocr_metal_context *ctx,
                                            uocr_metal_kv_cache_layout *out_layout) {
     if (ctx == NULL || out_layout == NULL || !ctx->has_kv_cache_layout) {

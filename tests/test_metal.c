@@ -15507,18 +15507,18 @@ static int test_public_engine_open_initializes_metal(void) {
     CHECK(report.recommended_working_set_bytes == uocr_metal_recommended_working_set_size());
     CHECK(report.memory_budget_bytes == uocr_metal_default_memory_budget_bytes(report.recommended_working_set_bytes));
     CHECK(report.memory_budget_bytes > 0u);
-    CHECK(report.category_live_bytes[UOCR_MEMORY_KV_CACHE] == report.estimated_kv_cache_bytes);
-    CHECK(report.category_live_bytes[UOCR_MEMORY_PROMPT_EMBEDDINGS] == report.estimated_prompt_embeddings_bytes);
-    CHECK(report.category_live_bytes[UOCR_MEMORY_VISION_SCRATCH] == report.estimated_vision_scratch_bytes);
-    CHECK(report.category_live_bytes[UOCR_MEMORY_DECODER_SCRATCH] == report.estimated_decoder_scratch_bytes);
-    CHECK(report.category_live_bytes[UOCR_MEMORY_MOE_SCRATCH] == report.estimated_moe_scratch_bytes);
-    CHECK(report.category_live_bytes[UOCR_MEMORY_LOGITS_READBACK] == report.estimated_logits_readback_bytes);
-    CHECK(report.total_live_bytes == report.estimated_kv_cache_bytes +
-                                     report.estimated_prompt_embeddings_bytes +
-                                     report.estimated_vision_scratch_bytes +
-                                     report.estimated_decoder_scratch_bytes +
-                                     report.estimated_moe_scratch_bytes +
-                                     report.estimated_logits_readback_bytes);
+    CHECK(report.estimated_kv_cache_bytes > 0u);
+    CHECK(report.estimated_prompt_embeddings_bytes > 0u);
+    CHECK(report.estimated_decoder_scratch_bytes > 0u);
+    CHECK(report.estimated_moe_scratch_bytes > 0u);
+    CHECK(report.estimated_logits_readback_bytes > 0u);
+    CHECK(report.category_live_bytes[UOCR_MEMORY_KV_CACHE] == 0u);
+    CHECK(report.category_live_bytes[UOCR_MEMORY_PROMPT_EMBEDDINGS] == 0u);
+    CHECK(report.category_live_bytes[UOCR_MEMORY_VISION_SCRATCH] == 0u);
+    CHECK(report.category_live_bytes[UOCR_MEMORY_DECODER_SCRATCH] == 0u);
+    CHECK(report.category_live_bytes[UOCR_MEMORY_MOE_SCRATCH] == 0u);
+    CHECK(report.category_live_bytes[UOCR_MEMORY_LOGITS_READBACK] == 0u);
+    CHECK(report.total_live_bytes == 0u);
 
     uocr_engine_close(engine);
     return 0;

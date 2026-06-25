@@ -41,6 +41,10 @@ struct uocr_engine {
     uocr_memory_tracker memory_tracker;
     uocr_runtime_memory_estimate capacity_estimate;
     uocr_runtime_memory_estimate last_estimate;
+#if UOCR_HAVE_METAL
+    uocr_runtime_memory_estimate metal_runtime_arena_estimate;
+    int has_metal_runtime_arena_accounting;
+#endif
     uocr_profile_state profile;
 #if UOCR_HAVE_METAL
     uocr_metal_context *metal;
@@ -231,36 +235,140 @@ static void untrack_engine_memory(uocr_engine *engine, uocr_memory_category cate
     }
 }
 
+static void release_runtime_arena_accounting_estimate(uocr_engine *engine,
+                                                      const uocr_runtime_memory_estimate *estimate) {
+    if (engine == NULL || estimate == NULL) {
+        return;
+    }
+    (void)uocr_memory_release(&engine->memory_tracker, UOCR_MEMORY_KV_CACHE, estimate->kv_cache_bytes);
+    (void)uocr_memory_release(&engine->memory_tracker, UOCR_MEMORY_PROMPT_EMBEDDINGS, estimate->prompt_embeddings_bytes);
+    (void)uocr_memory_release(&engine->memory_tracker, UOCR_MEMORY_DECODER_SCRATCH, estimate->decoder_scratch_bytes);
+    (void)uocr_memory_release(&engine->memory_tracker, UOCR_MEMORY_MOE_SCRATCH, estimate->moe_scratch_bytes);
+    (void)uocr_memory_release(&engine->memory_tracker, UOCR_MEMORY_LOGITS_READBACK, estimate->logits_readback_bytes);
+}
+
+static void release_metal_runtime_arena_accounting(uocr_engine *engine) {
+    if (engine == NULL || !engine->has_metal_runtime_arena_accounting) {
+        return;
+    }
+    release_runtime_arena_accounting_estimate(engine, &engine->metal_runtime_arena_estimate);
+    memset(&engine->metal_runtime_arena_estimate, 0, sizeof(engine->metal_runtime_arena_estimate));
+    engine->has_metal_runtime_arena_accounting = 0;
+}
+
 static int reserve_runtime_arena_accounting(uocr_engine *engine, const uocr_runtime_memory_estimate *estimate) {
-    int status = uocr_memory_reserve(&engine->memory_tracker, UOCR_MEMORY_KV_CACHE, estimate->kv_cache_bytes);
-    if (status != UOCR_OK) {
-        return status;
+    if (engine == NULL || estimate == NULL || engine->has_metal_runtime_arena_accounting) {
+        return UOCR_ERROR_INVALID_ARGUMENT;
     }
-    status = uocr_memory_reserve(&engine->memory_tracker, UOCR_MEMORY_PROMPT_EMBEDDINGS, estimate->prompt_embeddings_bytes);
-    if (status != UOCR_OK) {
-        return status;
+
+    uocr_runtime_memory_estimate reserved;
+    memset(&reserved, 0, sizeof(reserved));
+#define RESERVE_ARENA_CATEGORY(category__, field__)                                      \
+    do {                                                                                \
+        const uint64_t bytes__ = estimate->field__;                                     \
+        const int status__ = uocr_memory_reserve(&engine->memory_tracker,               \
+                                                 (category__),                          \
+                                                 bytes__);                              \
+        if (status__ != UOCR_OK) {                                                      \
+            release_runtime_arena_accounting_estimate(engine, &reserved);               \
+            return status__;                                                            \
+        }                                                                               \
+        reserved.field__ = bytes__;                                                     \
+    } while (0)
+
+    RESERVE_ARENA_CATEGORY(UOCR_MEMORY_KV_CACHE, kv_cache_bytes);
+    RESERVE_ARENA_CATEGORY(UOCR_MEMORY_PROMPT_EMBEDDINGS, prompt_embeddings_bytes);
+    RESERVE_ARENA_CATEGORY(UOCR_MEMORY_DECODER_SCRATCH, decoder_scratch_bytes);
+    RESERVE_ARENA_CATEGORY(UOCR_MEMORY_MOE_SCRATCH, moe_scratch_bytes);
+    RESERVE_ARENA_CATEGORY(UOCR_MEMORY_LOGITS_READBACK, logits_readback_bytes);
+
+#undef RESERVE_ARENA_CATEGORY
+
+    engine->metal_runtime_arena_estimate = reserved;
+    engine->has_metal_runtime_arena_accounting = 1;
+    return UOCR_OK;
+}
+
+static int ensure_metal_runtime_arenas_for_request(uocr_engine *engine,
+                                                   uint32_t batch_slots,
+                                                   uint32_t prompt_token_capacity) {
+    if (engine == NULL || engine->metal == NULL || batch_slots == 0u || prompt_token_capacity == 0u) {
+        return set_engine_errorf(engine, UOCR_ERROR_INVALID_ARGUMENT, "invalid Metal runtime arena request shape");
     }
-    status = uocr_memory_reserve(&engine->memory_tracker, UOCR_MEMORY_VISION_GPU_WORKSPACE, estimate->vision_gpu_workspace_bytes);
-    if (status != UOCR_OK) {
-        return status;
+    if (batch_slots > engine->max_batch || prompt_token_capacity > engine->max_prompt_tokens) {
+        return set_engine_errorf(engine,
+                                 UOCR_ERROR_INVALID_ARGUMENT,
+                                 "Metal runtime arena request %u slots/%u prompt tokens exceeds engine caps %u/%u",
+                                 batch_slots,
+                                 prompt_token_capacity,
+                                 engine->max_batch,
+                                 engine->max_prompt_tokens);
     }
-    status = uocr_memory_reserve(&engine->memory_tracker, UOCR_MEMORY_VISION_FINAL_FEATURES, estimate->vision_final_features_bytes);
-    if (status != UOCR_OK) {
-        return status;
+
+    const uint32_t current_batch = uocr_metal_context_runtime_arena_batch_slots(engine->metal);
+    const uint32_t current_prompt = uocr_metal_context_runtime_arena_prompt_token_capacity(engine->metal);
+    if (current_batch >= batch_slots && current_prompt >= prompt_token_capacity) {
+        return UOCR_OK;
     }
-    status = uocr_memory_reserve(&engine->memory_tracker, UOCR_MEMORY_VISION_HOST_STAGING, estimate->vision_host_staging_bytes);
-    if (status != UOCR_OK) {
-        return status;
+
+    const uint32_t target_batch = current_batch > batch_slots ? current_batch : batch_slots;
+    const uint32_t target_prompt = current_prompt > prompt_token_capacity ? current_prompt : prompt_token_capacity;
+    if (target_batch > engine->max_batch || target_prompt > engine->max_prompt_tokens) {
+        return set_engine_errorf(engine,
+                                 UOCR_ERROR_INVALID_ARGUMENT,
+                                 "Metal runtime arena growth target %u slots/%u prompt tokens exceeds engine caps %u/%u",
+                                 target_batch,
+                                 target_prompt,
+                                 engine->max_batch,
+                                 engine->max_prompt_tokens);
     }
-    status = uocr_memory_reserve(&engine->memory_tracker, UOCR_MEMORY_DECODER_SCRATCH, estimate->decoder_scratch_bytes);
-    if (status != UOCR_OK) {
-        return status;
+
+    uocr_runtime_memory_estimate arena_estimate;
+    memset(&arena_estimate, 0, sizeof(arena_estimate));
+    const int estimate_status = uocr_estimate_minimal_runtime_memory(target_batch,
+                                                                     target_prompt,
+                                                                     0u,
+                                                                     &arena_estimate);
+    if (estimate_status != UOCR_OK) {
+        return set_engine_errorf(engine,
+                                 estimate_status,
+                                 "failed to estimate Metal runtime arena growth to %u slots/%u prompt tokens",
+                                 target_batch,
+                                 target_prompt);
     }
-    status = uocr_memory_reserve(&engine->memory_tracker, UOCR_MEMORY_MOE_SCRATCH, estimate->moe_scratch_bytes);
-    if (status != UOCR_OK) {
-        return status;
+
+    char metal_error[512];
+    memset(metal_error, 0, sizeof(metal_error));
+    const uint64_t grow_start_ns = uocr_profile_now_ns();
+    release_metal_runtime_arena_accounting(engine);
+    if (!uocr_metal_context_allocate_runtime_arenas(engine->metal,
+                                                    target_batch,
+                                                    target_prompt,
+                                                    metal_error,
+                                                    sizeof(metal_error))) {
+        return set_engine_errorf(engine,
+                                 UOCR_ERROR_OUT_OF_MEMORY,
+                                 "failed to grow Metal runtime arenas to %u slots/%u prompt tokens "
+                                 "(requested %u/%u, previous %u/%u): %s",
+                                 target_batch,
+                                 target_prompt,
+                                 batch_slots,
+                                 prompt_token_capacity,
+                                 current_batch,
+                                 current_prompt,
+                                 metal_error[0] != '\0' ? metal_error : "unknown error");
     }
-    return uocr_memory_reserve(&engine->memory_tracker, UOCR_MEMORY_LOGITS_READBACK, estimate->logits_readback_bytes);
+    const int reserve_status = reserve_runtime_arena_accounting(engine, &arena_estimate);
+    if (reserve_status != UOCR_OK) {
+        uocr_metal_context_release_runtime_arenas(engine->metal);
+        return set_engine_errorf(engine,
+                                 reserve_status,
+                                 "failed to account grown Metal runtime arenas for %u slots/%u prompt tokens",
+                                 target_batch,
+                                 target_prompt);
+    }
+    uocr_profile_add_event_now(&engine->profile, "metal.runtime_arena_grow", grow_start_ns);
+    return UOCR_OK;
 }
 
 static int generate_metal_text_fp16(uocr_engine *engine,
@@ -289,7 +397,10 @@ static int generate_metal_text_fp16(uocr_engine *engine,
                                  "Metal fp16 text generation requires complete validated decoder tensor bindings");
     }
 
-    int status = UOCR_OK;
+    int status = ensure_metal_runtime_arenas_for_request(engine, 1u, request->n_tokens);
+    if (status != UOCR_OK) {
+        return status;
+    }
     uint64_t generated_bytes = 0u;
     if ((uint64_t)request->max_new_tokens > (uint64_t)SIZE_MAX / sizeof(int32_t)) {
         return set_engine_errorf(engine, UOCR_ERROR_OUT_OF_MEMORY, "generated-token buffer size overflow");
@@ -426,6 +537,11 @@ static int generate_metal_image_fp16(uocr_engine *engine,
                                  "Metal fp16 image generation image span length %u does not match formatted visual rows %u",
                                  sequence_state.image_span_length,
                                  vision_schedule.final_visual_tokens);
+    }
+
+    status = ensure_metal_runtime_arenas_for_request(engine, 1u, request->n_tokens);
+    if (status != UOCR_OK) {
+        return status;
     }
 
     if ((uint64_t)request->max_new_tokens > (uint64_t)SIZE_MAX / sizeof(int32_t)) {
@@ -703,12 +819,6 @@ uocr_engine *uocr_engine_open(const uocr_engine_opts *opts) {
 
 #if UOCR_HAVE_METAL
     if (strcmp(engine->backend, "metal") == 0) {
-        if (engine->memory_budget_bytes != 0u && engine->capacity_estimate.total_bytes > engine->memory_budget_bytes) {
-            (void)set_admission_error(engine, "engine", &engine->capacity_estimate, engine->memory_budget_bytes);
-            uocr_engine_close(engine);
-            return NULL;
-        }
-
         char metal_error[512];
         engine->metal = uocr_metal_context_create(engine->resource_path, metal_error, sizeof(metal_error));
         if (engine->metal == NULL) {
@@ -729,21 +839,6 @@ uocr_engine *uocr_engine_open(const uocr_engine_opts *opts) {
                               UOCR_ERROR_NOT_IMPLEMENTED,
                               "Metal fp16 image generation requires complete validated vision tensor bindings: %s",
                               uocr_metal_context_vision_binding_error(engine->metal));
-            uocr_engine_close(engine);
-            return NULL;
-        }
-        if (!uocr_metal_context_allocate_runtime_arenas(engine->metal,
-                                                        engine->max_batch,
-                                                        engine->max_prompt_tokens,
-                                                        metal_error,
-                                                        sizeof(metal_error))) {
-            set_engine_errorf(engine, UOCR_ERROR_OUT_OF_MEMORY, "failed to allocate Metal runtime arenas: %s", metal_error);
-            uocr_engine_close(engine);
-            return NULL;
-        }
-        const int arena_reserve_status = reserve_runtime_arena_accounting(engine, &engine->capacity_estimate);
-        if (arena_reserve_status != UOCR_OK) {
-            set_engine_errorf(engine, arena_reserve_status, "failed to account Metal runtime arena bytes");
             uocr_engine_close(engine);
             return NULL;
         }
