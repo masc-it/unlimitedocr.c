@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import dataclass, replace
+from functools import lru_cache
 import argparse
 import hashlib
 import json
@@ -208,6 +209,47 @@ EXPECTED_CONFIG_DEFAULTS: Mapping[str, int | float | str | bool] = {
     "scoring_func": "softmax",
     "routed_scaling_factor": 1.0,
     "norm_topk_prob": False,
+}
+
+EXPECTED_TOP_LEVEL_CONFIG: Mapping[str, int | str | bool | list[list[int]]] = {
+    "model_type": "unlimited-ocr",
+    "torch_dtype": "bfloat16",
+    "global_view_pos": "head",
+    "tile_tag": "2D",
+    "candidate_resolutions": [[1024, 1024]],
+    "use_mla": False,
+    "sliding_window": 128,
+}
+
+EXPECTED_PROJECTOR_CONFIG: Mapping[str, int | str] = {
+    "input_dim": 2048,
+    "n_embed": 1280,
+    "projector_type": "linear",
+}
+
+EXPECTED_PROCESSOR_CONFIG: Mapping[str, int | str | bool | list[float] | list[list[int]]] = {
+    "processor_class": "UnlimitedOCRHFProcessor",
+    "candidate_resolutions": [[1024, 1024]],
+    "image_mean": [0.5, 0.5, 0.5],
+    "image_std": [0.5, 0.5, 0.5],
+    "image_token": "<image>",
+    "pad_token": "<｜▁pad▁｜>",
+    "patch_size": 16,
+    "downsample_ratio": 4,
+    "normalize": True,
+    "add_special_token": False,
+    "mask_prompt": False,
+    "ignore_id": -100,
+    "sft_format": "unlimitedocr",
+}
+
+EXPECTED_TOKENIZER_CLASS = "LlamaTokenizerFast"
+EXPECTED_TOKENIZER_MODEL_TYPE = "BPE"
+EXPECTED_SPECIAL_TOKENS: Mapping[int, str] = {
+    0: "<｜begin▁of▁sentence｜>",
+    1: "<｜end▁of▁sentence｜>",
+    2: "<｜▁pad▁｜>",
+    128_815: "<image>",
 }
 
 _FILE_HEADER_STRUCT = struct.Struct("<4s7I2Q32s32s")
@@ -409,6 +451,24 @@ class SectionPlan:
 
 
 @dataclass(frozen=True)
+class SourceMetadata:
+    config: dict[str, Any]
+    processor: dict[str, Any]
+    tokenizer: dict[str, Any]
+    safetensors: dict[str, Any]
+    hashes: dict[str, str]
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "config": dict(self.config),
+            "processor": dict(self.processor),
+            "tokenizer": dict(self.tokenizer),
+            "safetensors": dict(self.safetensors),
+            "hashes": dict(self.hashes),
+        }
+
+
+@dataclass(frozen=True)
 class DryRunPlan:
     hf_dir: Path
     qprofile: str
@@ -418,6 +478,7 @@ class DryRunPlan:
     planned_file_size: int
     metadata_bytes: int
     sections: tuple[SectionPlan, ...]
+    source_metadata: SourceMetadata
     qtype_histogram: Mapping[str, int]
     qtype_reason_histogram: Mapping[str, int]
     promotion_reason_histogram: Mapping[str, int]
@@ -449,6 +510,7 @@ class DryRunPlan:
             "planned_file_size": self.planned_file_size,
             "metadata_bytes": self.metadata_bytes,
             "sections": [section.as_dict() for section in self.sections],
+            "source_metadata": self.source_metadata.as_dict(),
             "qtype_histogram": dict(self.qtype_histogram),
             "qtype_reason_histogram": dict(self.qtype_reason_histogram),
             "promotion_reason_histogram": dict(self.promotion_reason_histogram),
@@ -478,10 +540,26 @@ def _read_json(path: Path) -> Any:
         return json.load(f)
 
 
+@lru_cache(maxsize=16)
+def _read_json_cached(path: str) -> Any:
+    return _read_json(Path(path))
+
+
 def _read_json_if_exists(path: Path) -> Any | None:
     if not path.exists():
         return None
     return _read_json(path)
+
+
+def _read_json_object_if_exists(path: Path, *, strict: bool, label: str) -> dict[str, Any] | None:
+    if not path.exists():
+        if strict:
+            raise FileNotFoundError(f"missing {label} file {path}")
+        return None
+    data = _read_json_cached(str(path.resolve()))
+    if not isinstance(data, dict):
+        raise ValueError(f"{label} file {path} must contain a JSON object")
+    return data
 
 
 def _sha256_file(path: Path | None) -> bytes:
@@ -491,6 +569,12 @@ def _sha256_file(path: Path | None) -> bytes:
             for chunk in iter(lambda: f.read(1024 * 1024), b""):
                 hasher.update(chunk)
     return hasher.digest()
+
+
+def _sha256_file_hex(path: Path | None) -> str:
+    if path is None or not path.exists():
+        return ""
+    return _sha256_file(path).hex()
 
 
 def _product(shape: Iterable[int]) -> int:
@@ -960,30 +1044,219 @@ def _default_safetensors_payload_path(hf_dir: Path) -> Path:
     raise FileNotFoundError(f"no real .safetensors payload file found under {hf_dir}")
 
 
-def _check_config_value(actual: Any, expected: int | float | str | bool, key: str) -> None:
+def _check_config_value(actual: Any, expected: Any, key: str, *, label: str = "config") -> None:
     if isinstance(expected, float):
         if abs(float(actual) - expected) > 1e-12:
-            raise ValueError(f"config {key} mismatch: got {actual!r}, expected {expected!r}")
+            raise ValueError(f"{label} {key} mismatch: got {actual!r}, expected {expected!r}")
     elif actual != expected:
-        raise ValueError(f"config {key} mismatch: got {actual!r}, expected {expected!r}")
+        raise ValueError(f"{label} {key} mismatch: got {actual!r}, expected {expected!r}")
 
 
-def validate_config(hf_dir: Path) -> None:
-    config_path = hf_dir / "config.json"
-    if not config_path.exists():
-        return
-    config = _read_json(config_path)
-    for key, expected in EXPECTED_CONFIG.items():
-        if key not in config:
-            raise ValueError(f"config missing required key {key!r}")
-        _check_config_value(config[key], expected, key)
+def _check_required_values(data: Mapping[str, Any], expected_values: Mapping[str, Any], *, label: str) -> None:
+    for key, expected in expected_values.items():
+        if key not in data:
+            raise ValueError(f"{label} missing required key {key!r}")
+        _check_config_value(data[key], expected, key, label=label)
+
+
+def _token_content(value: Any) -> str | None:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, Mapping):
+        content = value.get("content")
+        return str(content) if isinstance(content, str) else None
+    return None
+
+
+def _check_token_content(value: Any, expected: str, key: str, *, label: str) -> None:
+    actual = _token_content(value)
+    if actual != expected:
+        raise ValueError(f"{label} {key} mismatch: got {actual!r}, expected {expected!r}")
+
+
+def _validate_config_object(config: Mapping[str, Any], *, label: str = "config") -> dict[str, Any]:
+    _check_required_values(config, EXPECTED_CONFIG, label=label)
+    _check_required_values(config, EXPECTED_TOP_LEVEL_CONFIG, label=label)
     for key, expected in EXPECTED_CONFIG_DEFAULTS.items():
         if key in config:
-            _check_config_value(config[key], expected, key)
+            _check_config_value(config[key], expected, key, label=label)
+
+    language_config = config.get("language_config")
+    if isinstance(language_config, Mapping):
+        _check_required_values(language_config, EXPECTED_CONFIG, label=f"{label}.language_config")
+        language_label = f"{label}.language_config"
+        _check_config_value(language_config.get("use_mla"), False, "use_mla", label=language_label)
+        _check_config_value(language_config.get("sliding_window_size"), 128, "sliding_window_size", label=language_label)
+        _check_config_value(language_config.get("bos_token_id"), 0, "bos_token_id", label=language_label)
+        _check_config_value(language_config.get("eos_token_id"), 1, "eos_token_id", label=language_label)
+
+    projector_config = config.get("projector_config")
+    if not isinstance(projector_config, Mapping):
+        raise ValueError(f"{label} missing projector_config object")
+    _check_required_values(projector_config, EXPECTED_PROJECTOR_CONFIG, label=f"{label}.projector_config")
+
+    vision_config = config.get("vision_config")
+    vision_width = vision_config.get("width") if isinstance(vision_config, Mapping) else None
+    if not isinstance(vision_width, Mapping):
+        raise ValueError(f"{label} missing vision_config.width object")
+    sam = vision_width.get("sam_vit_b")
+    clip = vision_width.get("clip-l-14-224")
+    if not isinstance(sam, Mapping) or not isinstance(clip, Mapping):
+        raise ValueError(f"{label} missing SAM/CLIP vision width metadata")
+    sam_label = f"{label}.vision.sam_vit_b"
+    clip_label = f"{label}.vision.clip-l-14-224"
+    _check_config_value(sam.get("layers"), 12, "layers", label=sam_label)
+    _check_config_value(sam.get("heads"), 12, "heads", label=sam_label)
+    _check_config_value(sam.get("width"), 768, "width", label=sam_label)
+    _check_config_value(sam.get("global_attn_indexes"), [2, 5, 8, 11], "global_attn_indexes", label=sam_label)
+    _check_config_value(sam.get("downsample_channels"), [512, 1024], "downsample_channels", label=sam_label)
+    _check_config_value(clip.get("layers"), 24, "layers", label=clip_label)
+    _check_config_value(clip.get("heads"), 16, "heads", label=clip_label)
+    _check_config_value(clip.get("width"), 1024, "width", label=clip_label)
+    _check_config_value(clip.get("patch_size"), 14, "patch_size", label=clip_label)
 
     head_dim = int(config["hidden_size"]) // int(config["num_attention_heads"])
     if head_dim != 128:
         raise ValueError(f"derived attention head dim mismatch: got {head_dim}, expected 128")
+
+    return {
+        "present": True,
+        "validated": True,
+        "model_type": str(config.get("model_type")),
+        "torch_dtype": str(config.get("torch_dtype")),
+        "vocab_size": int(config["vocab_size"]),
+        "hidden_size": int(config["hidden_size"]),
+        "decoder_layers": int(config["num_hidden_layers"]),
+        "attention_heads": int(config["num_attention_heads"]),
+        "kv_heads": int(config["num_key_value_heads"]),
+        "head_dim": head_dim,
+        "sliding_window": int(config.get("sliding_window", 0)),
+        "projector_in": int(projector_config["input_dim"]),
+        "projector_out": int(projector_config["n_embed"]),
+        "sam_layers": int(sam["layers"]),
+        "clip_layers": int(clip["layers"]),
+        "candidate_resolutions": list(config.get("candidate_resolutions", [])),
+    }
+
+
+def validate_config(hf_dir: Path, *, strict: bool = True) -> dict[str, Any]:
+    config = _read_json_object_if_exists(hf_dir / "config.json", strict=strict, label="config")
+    if config is None:
+        return {"present": False, "validated": False}
+    if not strict and not all(key in config for key in EXPECTED_CONFIG):
+        return {"present": True, "validated": False}
+    return _validate_config_object(config)
+
+
+def validate_processor_config(hf_dir: Path, *, strict: bool = True) -> dict[str, Any]:
+    processor = _read_json_object_if_exists(hf_dir / "processor_config.json", strict=strict, label="processor_config")
+    if processor is None:
+        return {"present": False, "validated": False}
+    if not strict and not all(key in processor for key in EXPECTED_PROCESSOR_CONFIG):
+        return {"present": True, "validated": False}
+    _check_required_values(processor, EXPECTED_PROCESSOR_CONFIG, label="processor_config")
+    return {
+        "present": True,
+        "validated": True,
+        "processor_class": str(processor["processor_class"]),
+        "candidate_resolutions": list(processor["candidate_resolutions"]),
+        "image_mean": list(processor["image_mean"]),
+        "image_std": list(processor["image_std"]),
+        "image_token": str(processor["image_token"]),
+        "patch_size": int(processor["patch_size"]),
+        "downsample_ratio": int(processor["downsample_ratio"]),
+        "normalize": bool(processor["normalize"]),
+    }
+
+
+def validate_tokenizer_metadata(hf_dir: Path, *, strict: bool = True) -> dict[str, Any]:
+    tokenizer_path = hf_dir / "tokenizer.json"
+    tokenizer_config_path = hf_dir / "tokenizer_config.json"
+    special_tokens_path = hf_dir / "special_tokens_map.json"
+
+    tokenizer_config = _read_json_object_if_exists(tokenizer_config_path, strict=strict, label="tokenizer_config")
+    special_tokens = _read_json_object_if_exists(special_tokens_path, strict=strict, label="special_tokens_map")
+    tokenizer_json = _read_json_object_if_exists(tokenizer_path, strict=strict, label="tokenizer")
+
+    if tokenizer_config is None and special_tokens is None and tokenizer_json is None:
+        return {"present": False, "validated": False}
+    if not strict:
+        required = (
+            isinstance(tokenizer_config, Mapping)
+            and isinstance(tokenizer_config.get("added_tokens_decoder"), Mapping)
+            and isinstance(tokenizer_json, Mapping)
+            and isinstance((tokenizer_json.get("model") if isinstance(tokenizer_json, Mapping) else None), Mapping)
+        )
+        if not required:
+            return {"present": True, "validated": False}
+
+    assert tokenizer_config is not None and tokenizer_json is not None
+    _check_config_value(
+        tokenizer_config.get("tokenizer_class"), EXPECTED_TOKENIZER_CLASS, "tokenizer_class", label="tokenizer_config"
+    )
+    _check_config_value(tokenizer_config.get("add_bos_token"), True, "add_bos_token", label="tokenizer_config")
+    _check_config_value(tokenizer_config.get("add_eos_token"), False, "add_eos_token", label="tokenizer_config")
+    added_decoder = tokenizer_config.get("added_tokens_decoder", {})
+    for token_id, content in EXPECTED_SPECIAL_TOKENS.items():
+        _check_token_content(
+            added_decoder.get(str(token_id)), content, str(token_id), label="tokenizer_config.added_tokens_decoder"
+        )
+    _check_config_value(len(added_decoder), 830, "added_tokens_decoder", label="tokenizer_config")
+    _check_token_content(
+        tokenizer_config.get("bos_token"), EXPECTED_SPECIAL_TOKENS[0], "bos_token", label="tokenizer_config"
+    )
+    _check_token_content(
+        tokenizer_config.get("eos_token"), EXPECTED_SPECIAL_TOKENS[1], "eos_token", label="tokenizer_config"
+    )
+    _check_token_content(
+        tokenizer_config.get("pad_token"), EXPECTED_SPECIAL_TOKENS[2], "pad_token", label="tokenizer_config"
+    )
+
+    if special_tokens is not None:
+        _check_token_content(
+            special_tokens.get("bos_token"), EXPECTED_SPECIAL_TOKENS[0], "bos_token", label="special_tokens_map"
+        )
+        _check_token_content(
+            special_tokens.get("eos_token"), EXPECTED_SPECIAL_TOKENS[1], "eos_token", label="special_tokens_map"
+        )
+        _check_token_content(
+            special_tokens.get("pad_token"), EXPECTED_SPECIAL_TOKENS[2], "pad_token", label="special_tokens_map"
+        )
+
+    model = tokenizer_json.get("model")
+    if not isinstance(model, Mapping):
+        raise ValueError("tokenizer.json missing model object")
+    vocab = model.get("vocab")
+    added_tokens = tokenizer_json.get("added_tokens")
+    if not isinstance(vocab, Mapping) or not isinstance(added_tokens, list):
+        raise ValueError("tokenizer.json missing vocab or added_tokens metadata")
+    _check_config_value(model.get("type"), EXPECTED_TOKENIZER_MODEL_TYPE, "model.type", label="tokenizer")
+    _check_config_value(len(vocab), 128_000, "model.vocab", label="tokenizer")
+    _check_config_value(len(added_tokens), 830, "added_tokens", label="tokenizer")
+    added_by_id = {
+        int(token["id"]): token for token in added_tokens if isinstance(token, Mapping) and "id" in token
+    }
+    for token_id, content in EXPECTED_SPECIAL_TOKENS.items():
+        _check_token_content(
+            added_by_id.get(token_id), content, str(token_id), label="tokenizer.added_tokens"
+        )
+
+    return {
+        "present": True,
+        "validated": True,
+        "tokenizer_class": str(tokenizer_config["tokenizer_class"]),
+        "tokenizer_model_type": str(model["type"]),
+        "vocab_size": 129_280,
+        "bpe_vocab_size": len(vocab),
+        "added_token_count": len(added_tokens),
+        "special_token_ids": {
+            "bos": 0,
+            "eos": 1,
+            "pad": 2,
+            "image": 128_815,
+        },
+        "image_token": EXPECTED_SPECIAL_TOKENS[128_815],
+    }
 
 
 def _validate_header_entry(name: str, entry: Mapping[str, Any]) -> None:
@@ -1014,6 +1287,75 @@ def _validate_key_shapes(entries: Mapping[str, Mapping[str, Any]]) -> None:
         actual_shape = tuple(int(dim) for dim in entry["shape"])
         if actual_shape != expected_shape:
             raise ValueError(f"tensor {name} shape mismatch: got {actual_shape}, expected {expected_shape}")
+
+
+def _build_source_metadata(
+    hf_dir: Path,
+    *,
+    entries: Mapping[str, Mapping[str, Any]],
+    index: Mapping[str, Any] | None,
+    index_path: Path,
+    strict: bool,
+) -> SourceMetadata:
+    config = validate_config(hf_dir, strict=strict)
+    processor = validate_processor_config(hf_dir, strict=strict)
+    tokenizer = validate_tokenizer_metadata(hf_dir, strict=strict)
+
+    total_payload_bytes = 0
+    max_payload_end = 0
+    dtype_counts: Counter[str] = Counter()
+    for entry in entries.values():
+        offsets = entry.get("data_offsets", [0, 0])
+        start, end = int(offsets[0]), int(offsets[1])
+        total_payload_bytes += end - start
+        max_payload_end = max(max_payload_end, end)
+        dtype_counts[str(entry.get("dtype", ""))] += 1
+
+    weight_map = index.get("weight_map", {}) if isinstance(index, Mapping) else {}
+    source_files = sorted({str(value) for value in weight_map.values()}) if isinstance(weight_map, Mapping) else []
+    index_total = int(index.get("metadata", {}).get("total_size", -1)) if isinstance(index, Mapping) else -1
+    source_dtype = next(iter(dtype_counts)) if len(dtype_counts) == 1 else "mixed"
+    safetensors = {
+        "tensor_count": len(entries),
+        "total_payload_bytes": total_payload_bytes,
+        "max_payload_end": max_payload_end,
+        "index_total_size": index_total,
+        "source_dtype": source_dtype,
+        "dtype_counts": dict(dtype_counts),
+        "file_count": len(source_files),
+        "source_files": source_files,
+        "index_present": index is not None,
+    }
+    if strict:
+        _check_config_value(safetensors["tensor_count"], EXPECTED_TENSOR_COUNT, "tensor_count", label="safetensors")
+        _check_config_value(
+            safetensors["total_payload_bytes"], EXPECTED_TOTAL_BYTES, "total_payload_bytes", label="safetensors"
+        )
+        _check_config_value(
+            safetensors["max_payload_end"], EXPECTED_TOTAL_BYTES, "max_payload_end", label="safetensors"
+        )
+        _check_config_value(safetensors["source_dtype"], EXPECTED_SOURCE_DTYPE, "source_dtype", label="safetensors")
+        if index is not None:
+            _check_config_value(index_total, EXPECTED_TOTAL_BYTES, "index_total_size", label="safetensors")
+            _check_config_value(len(weight_map), EXPECTED_TENSOR_COUNT, "index.weight_map", label="safetensors")
+            if len(source_files) != 1:
+                raise ValueError(f"safetensors expected one source file, got {source_files!r}")
+
+    hashes = {
+        "config_sha256": _sha256_file_hex(hf_dir / "config.json"),
+        "processor_config_sha256": _sha256_file_hex(hf_dir / "processor_config.json"),
+        "tokenizer_sha256": _sha256_file_hex(hf_dir / "tokenizer.json"),
+        "tokenizer_config_sha256": _sha256_file_hex(hf_dir / "tokenizer_config.json"),
+        "special_tokens_map_sha256": _sha256_file_hex(hf_dir / "special_tokens_map.json"),
+        "safetensors_index_sha256": _sha256_file_hex(index_path),
+    }
+    return SourceMetadata(
+        config=config,
+        processor=processor,
+        tokenizer=tokenizer,
+        safetensors=safetensors,
+        hashes=hashes,
+    )
 
 
 def is_preserved_unused_in_normal_ocr(name: str) -> bool:
@@ -1337,8 +1679,6 @@ def build_dry_run_plan(
     if qprofile not in QPROFILE_IDS:
         raise ValueError(f"unknown qprofile {qprofile!r}")
 
-    validate_config(hf_dir)
-
     header = _read_safetensors_header(Path(header_path) if header_path is not None else _default_header_path(hf_dir))
     entries: dict[str, Mapping[str, Any]] = {
         name: entry for name, entry in header.items() if name != "__metadata__"
@@ -1388,6 +1728,14 @@ def build_dry_run_plan(
         if missing_from_index:
             raise ValueError(f"{len(missing_from_index)} header tensors missing from index; first={missing_from_index[0]}")
 
+    source_metadata = _build_source_metadata(
+        hf_dir,
+        entries=entries,
+        index=index,
+        index_path=index_file,
+        strict=strict,
+    )
+
     return DryRunPlan(
         hf_dir=hf_dir,
         qprofile=qprofile,
@@ -1397,6 +1745,7 @@ def build_dry_run_plan(
         planned_file_size=planned_file_size,
         metadata_bytes=metadata_bytes,
         sections=sections,
+        source_metadata=source_metadata,
         qtype_histogram=_qtype_histogram(tensors),
         qtype_reason_histogram=_qtype_reason_histogram(tensors),
         promotion_reason_histogram=_promotion_reason_histogram(tensors),
@@ -1787,6 +2136,14 @@ def _print_summary(plan: DryRunPlan, *, dry_run: bool) -> None:
         ratio = plan.total_output_bytes / plan.total_source_bytes
         print(f"estimated weight savings: {savings} ({ratio:.3f}x source bytes)")
     print(f"planned file size: {plan.planned_file_size}")
+    metadata = plan.source_metadata
+    print(
+        "source metadata: "
+        f"config_validated={metadata.config.get('validated', False)} "
+        f"processor_validated={metadata.processor.get('validated', False)} "
+        f"tokenizer_validated={metadata.tokenizer.get('validated', False)} "
+        f"safetensors_tensors={metadata.safetensors.get('tensor_count', 0)}"
+    )
     tensor_data = next((section for section in plan.sections if section.section_type == UOCR_SECTION_TENSOR_DATA), None)
     if tensor_data is not None:
         print(f"tensor data: offset={tensor_data.offset} size={tensor_data.size} alignment={tensor_data.alignment}")

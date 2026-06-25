@@ -395,7 +395,7 @@ Current priority slice, in order. The coding agent should take the first uncheck
 ## 8. fp16 converter
 
 - [x] Implement `tools/uocr-convert` dry-run CLI (Python first; native conversion can follow once layout is stable).
-- [ ] Read `config.json`, `processor_config.json`, tokenizer metadata, and safetensors metadata.
+- [x] Read `config.json`, `processor_config.json`, tokenizer metadata, and safetensors metadata.
 - [x] Support the current one-file safetensors layout `model-00001-of-000001.safetensors`; keep multi-file safetensors support possible through the index file.
 - [ ] Parse safetensors without loading all weights at once:
   - [x] read header length

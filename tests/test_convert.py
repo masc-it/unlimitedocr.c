@@ -190,6 +190,40 @@ def test_fp16_converter_dry_run_against_cached_header() -> None:
     assert plan.promotion_reason_histogram == {"none": EXPECTED_TENSOR_COUNT}
     assert plan.usage_histogram == {"runtime": EXPECTED_TENSOR_COUNT - 1, "preserved-unused": 1}
 
+    source_metadata = plan.summary_dict()["source_metadata"]
+    assert source_metadata["config"]["validated"] is True
+    assert source_metadata["config"]["model_type"] == "unlimited-ocr"
+    assert source_metadata["config"]["torch_dtype"] == "bfloat16"
+    assert source_metadata["config"]["hidden_size"] == 1280
+    assert source_metadata["config"]["decoder_layers"] == 12
+    assert source_metadata["config"]["projector_in"] == 2048
+    assert source_metadata["config"]["projector_out"] == 1280
+    assert source_metadata["config"]["sam_layers"] == 12
+    assert source_metadata["config"]["clip_layers"] == 24
+    assert source_metadata["config"]["candidate_resolutions"] == [[1024, 1024]]
+    assert source_metadata["processor"]["validated"] is True
+    assert source_metadata["processor"]["processor_class"] == "UnlimitedOCRHFProcessor"
+    assert source_metadata["processor"]["image_mean"] == [0.5, 0.5, 0.5]
+    assert source_metadata["processor"]["image_std"] == [0.5, 0.5, 0.5]
+    assert source_metadata["processor"]["image_token"] == "<image>"
+    assert source_metadata["processor"]["patch_size"] == 16
+    assert source_metadata["processor"]["downsample_ratio"] == 4
+    assert source_metadata["tokenizer"]["validated"] is True
+    assert source_metadata["tokenizer"]["tokenizer_class"] == "LlamaTokenizerFast"
+    assert source_metadata["tokenizer"]["tokenizer_model_type"] == "BPE"
+    assert source_metadata["tokenizer"]["bpe_vocab_size"] == 128000
+    assert source_metadata["tokenizer"]["vocab_size"] == 129280
+    assert source_metadata["tokenizer"]["added_token_count"] == 830
+    assert source_metadata["tokenizer"]["special_token_ids"] == {"bos": 0, "eos": 1, "pad": 2, "image": 128815}
+    assert source_metadata["safetensors"]["tensor_count"] == EXPECTED_TENSOR_COUNT
+    assert source_metadata["safetensors"]["total_payload_bytes"] == EXPECTED_TOTAL_BYTES
+    assert source_metadata["safetensors"]["max_payload_end"] == EXPECTED_TOTAL_BYTES
+    assert source_metadata["safetensors"]["source_dtype"] == "BF16"
+    assert source_metadata["safetensors"]["dtype_counts"] == {"BF16": EXPECTED_TENSOR_COUNT}
+    assert source_metadata["safetensors"]["file_count"] == 1
+    assert source_metadata["safetensors"]["source_files"] == ["model-00001-of-000001.safetensors"]
+    assert all(len(value) == 64 for value in source_metadata["hashes"].values())
+
     preserved_unused = [tensor for tensor in plan.tensors if tensor.usage == "preserved-unused"]
     assert [tensor.name for tensor in preserved_unused] == ["model.vision_model.embeddings.patch_embedding.weight"]
     assert all(is_preserved_unused_in_normal_ocr(tensor.name) for tensor in preserved_unused)

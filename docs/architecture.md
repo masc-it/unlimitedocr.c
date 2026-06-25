@@ -309,7 +309,7 @@ Initial policy keeps unaligned down projections in `Q8_0`, unless the converter 
 
 `uocr-convert` pipeline:
 
-1. Load `config.json`, `processor_config.json`, `tokenizer.json` metadata, and safetensors.
+1. Load `config.json`, `processor_config.json`, tokenizer metadata (`tokenizer.json`, `tokenizer_config.json`, `special_tokens_map.json`), and safetensors metadata; dry-run summaries record the validated source facts and SHA-256 hashes for provenance/debugging.
 2. Validate all expected tensor names and shapes.
 3. Map HF names to tensor registry ids.
 4. Convert BF16 -> fp16/f32 temporary rows.
