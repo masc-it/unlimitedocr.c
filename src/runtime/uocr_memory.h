@@ -20,11 +20,21 @@ typedef struct uocr_memory_tracker {
     uint64_t total_peak_bytes;
 } uocr_memory_tracker;
 
+typedef struct uocr_vision_memory_estimate {
+    uint64_t gpu_workspace_bytes;
+    uint64_t final_feature_bytes;
+    uint64_t host_staging_bytes;
+    uint64_t total_bytes;
+} uocr_vision_memory_estimate;
+
 typedef struct uocr_runtime_memory_estimate {
     uint64_t model_views_bytes;
     uint64_t kv_cache_bytes;
     uint64_t prompt_embeddings_bytes;
     uint64_t vision_scratch_bytes;
+    uint64_t vision_gpu_workspace_bytes;
+    uint64_t vision_final_features_bytes;
+    uint64_t vision_host_staging_bytes;
     uint64_t decoder_scratch_bytes;
     uint64_t moe_scratch_bytes;
     uint64_t logits_readback_bytes;
@@ -41,6 +51,10 @@ void uocr_memory_tracker_reset_peaks(uocr_memory_tracker *tracker);
 uint64_t uocr_kv_cache_bytes_per_token(void);
 int uocr_estimate_kv_cache_bytes(uint32_t batch_slots, uint32_t prompt_token_capacity, uint64_t *out_bytes);
 int uocr_estimate_prompt_embedding_bytes(uint32_t batch_slots, uint32_t prompt_token_capacity, uint64_t *out_bytes);
+int uocr_estimate_vision_memory_for_shape(uint32_t max_view_size,
+                                          uint32_t final_visual_rows,
+                                          uint32_t max_chunk_projected_rows,
+                                          uocr_vision_memory_estimate *out_estimate);
 int uocr_estimate_vision_scratch_bytes_for_shape(uint32_t max_view_size,
                                                  uint32_t final_visual_rows,
                                                  uint32_t max_chunk_projected_rows,

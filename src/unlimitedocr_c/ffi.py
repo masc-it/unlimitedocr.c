@@ -29,12 +29,15 @@ UOCR_VIEW_LOCAL = 1
 UOCR_MEMORY_MODEL_VIEWS = 0
 UOCR_MEMORY_KV_CACHE = 1
 UOCR_MEMORY_PROMPT_EMBEDDINGS = 2
-UOCR_MEMORY_VISION_SCRATCH = 3
-UOCR_MEMORY_DECODER_SCRATCH = 4
-UOCR_MEMORY_MOE_SCRATCH = 5
-UOCR_MEMORY_LOGITS_READBACK = 6
-UOCR_MEMORY_TRANSIENT_BUFFERS = 7
-UOCR_MEMORY_CATEGORY_COUNT = 8
+UOCR_MEMORY_VISION_GPU_WORKSPACE = 3
+UOCR_MEMORY_VISION_FINAL_FEATURES = 4
+UOCR_MEMORY_VISION_HOST_STAGING = 5
+UOCR_MEMORY_DECODER_SCRATCH = 6
+UOCR_MEMORY_MOE_SCRATCH = 7
+UOCR_MEMORY_LOGITS_READBACK = 8
+UOCR_MEMORY_TRANSIENT_BUFFERS = 9
+UOCR_MEMORY_CATEGORY_COUNT = 10
+UOCR_MEMORY_VISION_SCRATCH = UOCR_MEMORY_VISION_GPU_WORKSPACE
 
 UOCR_PROFILE_EVENT_NAME_SIZE = 64
 UOCR_PROFILE_MAX_EVENTS = 256
@@ -50,6 +53,9 @@ class CMemoryReport(ct.Structure):
         ("estimated_kv_cache_bytes", ct.c_uint64),
         ("estimated_prompt_embeddings_bytes", ct.c_uint64),
         ("estimated_vision_scratch_bytes", ct.c_uint64),
+        ("estimated_vision_gpu_workspace_bytes", ct.c_uint64),
+        ("estimated_vision_final_features_bytes", ct.c_uint64),
+        ("estimated_vision_host_staging_bytes", ct.c_uint64),
         ("estimated_decoder_scratch_bytes", ct.c_uint64),
         ("estimated_moe_scratch_bytes", ct.c_uint64),
         ("estimated_logits_readback_bytes", ct.c_uint64),
@@ -143,6 +149,9 @@ class MemoryReport:
     estimated_kv_cache_bytes: int
     estimated_prompt_embeddings_bytes: int
     estimated_vision_scratch_bytes: int
+    estimated_vision_gpu_workspace_bytes: int
+    estimated_vision_final_features_bytes: int
+    estimated_vision_host_staging_bytes: int
     estimated_decoder_scratch_bytes: int
     estimated_moe_scratch_bytes: int
     estimated_logits_readback_bytes: int
@@ -510,6 +519,9 @@ class Engine:
             estimated_kv_cache_bytes=int(report.estimated_kv_cache_bytes),
             estimated_prompt_embeddings_bytes=int(report.estimated_prompt_embeddings_bytes),
             estimated_vision_scratch_bytes=int(report.estimated_vision_scratch_bytes),
+            estimated_vision_gpu_workspace_bytes=int(report.estimated_vision_gpu_workspace_bytes),
+            estimated_vision_final_features_bytes=int(report.estimated_vision_final_features_bytes),
+            estimated_vision_host_staging_bytes=int(report.estimated_vision_host_staging_bytes),
             estimated_decoder_scratch_bytes=int(report.estimated_decoder_scratch_bytes),
             estimated_moe_scratch_bytes=int(report.estimated_moe_scratch_bytes),
             estimated_logits_readback_bytes=int(report.estimated_logits_readback_bytes),

@@ -29,14 +29,17 @@ def _perf_test_enabled() -> bool:
 
 def _dummy_memory_report() -> MemoryReport:
     return MemoryReport(
-        category_live_bytes=(1, 2, 3, 4, 5, 6, 7, 8),
-        category_peak_bytes=(8, 7, 6, 5, 4, 3, 2, 1),
+        category_live_bytes=(1, 2, 3, 4, 5, 6, 7, 8, 9, 10),
+        category_peak_bytes=(10, 9, 8, 7, 6, 5, 4, 3, 2, 1),
         total_live_bytes=1234,
         total_peak_bytes=5678,
         estimated_model_views_bytes=10,
         estimated_kv_cache_bytes=20,
         estimated_prompt_embeddings_bytes=30,
         estimated_vision_scratch_bytes=40,
+        estimated_vision_gpu_workspace_bytes=35,
+        estimated_vision_final_features_bytes=3,
+        estimated_vision_host_staging_bytes=2,
         estimated_decoder_scratch_bytes=50,
         estimated_moe_scratch_bytes=60,
         estimated_logits_readback_bytes=70,

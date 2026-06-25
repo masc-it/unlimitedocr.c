@@ -11,6 +11,7 @@ from unlimitedocr_c.ffi import (
     Engine,
     EngineOptions,
     UOCR_ERROR_NOT_IMPLEMENTED,
+    UOCR_MEMORY_CATEGORY_COUNT,
     UOCR_MEMORY_KV_CACHE,
     _copy_result_tokens,
     as_c_request,
@@ -125,7 +126,7 @@ def test_ctypes_memory_report_smoke() -> None:
     assert before.recommended_working_set_bytes == 0
     assert before.estimated_kv_cache_bytes > 0
     assert after.estimated_total_bytes < before.estimated_total_bytes
-    assert len(after.category_live_bytes) == 8
+    assert len(after.category_live_bytes) == UOCR_MEMORY_CATEGORY_COUNT
 
 
 def test_ctypes_image_validation_smoke() -> None:

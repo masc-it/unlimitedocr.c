@@ -100,7 +100,7 @@ Current finding:
 
 - [x] `runtime_arena_capacities()` now leaves `UOCR_METAL_ARENA_VISION_SCRATCH` empty; request-shaped vision workspace allocation is handled by `UOCR_METAL_SCRATCH_VISION`.
 - [x] The current production vision path does not use that runtime arena.
-- [x] The estimator now mirrors the reusable Metal vision workspace high-water for SAM, CLIP, concat, projected chunk, and final visual rows, while still grouping those bytes under one “vision scratch” category (`src/runtime/uocr_memory.c`).
+- [x] The estimator now mirrors the reusable Metal vision workspace high-water for SAM, CLIP, concat, projected chunk, and final visual rows; final visual features, GPU workspace, and remaining host staging are now split in memory reports (`src/runtime/uocr_memory.c`).
 - [x] A 4096-token default engine no longer reserves a stale prompt-sized vision arena at open; final visual/workspace estimates are now attached to accepted image requests.
 
 Impact: memory reports and admission decisions are wrong. They over-reserve an
@@ -110,7 +110,7 @@ it harder to run small requests on constrained machines.
 Implementation status:
 
 - [x] Remove unused `UOCR_METAL_ARENA_VISION_SCRATCH` from production allocation or repurpose it as the confirmed GPU-resident visual workspace.
-- [ ] Separate memory categories for final visual features, GPU vision workspace, host staging, and transient buffers.
+- [x] Separate memory categories for final visual features, GPU vision workspace, host staging, and transient buffers.
 - [x] Size final visual features from actual visual rows and hidden size, not prompt token capacity.
 - [x] Size vision workspace from actual view shape and chunk size.
 - [x] Include vision workspace high-water marks in `uocr_engine_memory_report()`.

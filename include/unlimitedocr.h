@@ -22,7 +22,7 @@ extern "C" {
 
 #define UOCR_VERSION_MAJOR 0u
 #define UOCR_VERSION_MINOR 1u
-#define UOCR_VERSION_PATCH 1u
+#define UOCR_VERSION_PATCH 2u
 #define UOCR_ABI_VERSION ((UOCR_VERSION_MAJOR << 16) | (UOCR_VERSION_MINOR << 8) | UOCR_VERSION_PATCH)
 
 typedef struct uocr_engine uocr_engine;
@@ -51,12 +51,15 @@ typedef enum uocr_memory_category {
     UOCR_MEMORY_MODEL_VIEWS = 0,
     UOCR_MEMORY_KV_CACHE = 1,
     UOCR_MEMORY_PROMPT_EMBEDDINGS = 2,
-    UOCR_MEMORY_VISION_SCRATCH = 3,
-    UOCR_MEMORY_DECODER_SCRATCH = 4,
-    UOCR_MEMORY_MOE_SCRATCH = 5,
-    UOCR_MEMORY_LOGITS_READBACK = 6,
-    UOCR_MEMORY_TRANSIENT_BUFFERS = 7,
-    UOCR_MEMORY_CATEGORY_COUNT = 8
+    UOCR_MEMORY_VISION_GPU_WORKSPACE = 3,
+    UOCR_MEMORY_VISION_FINAL_FEATURES = 4,
+    UOCR_MEMORY_VISION_HOST_STAGING = 5,
+    UOCR_MEMORY_DECODER_SCRATCH = 6,
+    UOCR_MEMORY_MOE_SCRATCH = 7,
+    UOCR_MEMORY_LOGITS_READBACK = 8,
+    UOCR_MEMORY_TRANSIENT_BUFFERS = 9,
+    UOCR_MEMORY_CATEGORY_COUNT = 10,
+    UOCR_MEMORY_VISION_SCRATCH = UOCR_MEMORY_VISION_GPU_WORKSPACE
 } uocr_memory_category;
 
 #define UOCR_PROFILE_EVENT_NAME_SIZE 64u
@@ -79,6 +82,9 @@ typedef struct uocr_memory_report {
     uint64_t estimated_kv_cache_bytes;
     uint64_t estimated_prompt_embeddings_bytes;
     uint64_t estimated_vision_scratch_bytes;
+    uint64_t estimated_vision_gpu_workspace_bytes;
+    uint64_t estimated_vision_final_features_bytes;
+    uint64_t estimated_vision_host_staging_bytes;
     uint64_t estimated_decoder_scratch_bytes;
     uint64_t estimated_moe_scratch_bytes;
     uint64_t estimated_logits_readback_bytes;

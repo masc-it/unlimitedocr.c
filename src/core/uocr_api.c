@@ -97,6 +97,9 @@ static void copy_estimate_to_report(const uocr_runtime_memory_estimate *estimate
     report->estimated_kv_cache_bytes = estimate->kv_cache_bytes;
     report->estimated_prompt_embeddings_bytes = estimate->prompt_embeddings_bytes;
     report->estimated_vision_scratch_bytes = estimate->vision_scratch_bytes;
+    report->estimated_vision_gpu_workspace_bytes = estimate->vision_gpu_workspace_bytes;
+    report->estimated_vision_final_features_bytes = estimate->vision_final_features_bytes;
+    report->estimated_vision_host_staging_bytes = estimate->vision_host_staging_bytes;
     report->estimated_decoder_scratch_bytes = estimate->decoder_scratch_bytes;
     report->estimated_moe_scratch_bytes = estimate->moe_scratch_bytes;
     report->estimated_logits_readback_bytes = estimate->logits_readback_bytes;
@@ -122,7 +125,7 @@ static int set_admission_error(uocr_engine *engine,
     return set_engine_errorf(engine,
                              UOCR_ERROR_OUT_OF_MEMORY,
                              "%s admission rejected: memory estimate %llu bytes exceeds budget %llu bytes "
-                             "(model=%llu kv=%llu prompt=%llu vision=%llu decoder=%llu moe=%llu logits=%llu transient=%llu safety=%llu)",
+                             "(model=%llu kv=%llu prompt=%llu vision=%llu vision_gpu_workspace=%llu vision_final_features=%llu vision_host_staging=%llu decoder=%llu moe=%llu logits=%llu transient=%llu safety=%llu)",
                              scope,
                              (unsigned long long)estimate->total_bytes,
                              (unsigned long long)budget_bytes,
@@ -130,6 +133,9 @@ static int set_admission_error(uocr_engine *engine,
                              (unsigned long long)estimate->kv_cache_bytes,
                              (unsigned long long)estimate->prompt_embeddings_bytes,
                              (unsigned long long)estimate->vision_scratch_bytes,
+                             (unsigned long long)estimate->vision_gpu_workspace_bytes,
+                             (unsigned long long)estimate->vision_final_features_bytes,
+                             (unsigned long long)estimate->vision_host_staging_bytes,
                              (unsigned long long)estimate->decoder_scratch_bytes,
                              (unsigned long long)estimate->moe_scratch_bytes,
                              (unsigned long long)estimate->logits_readback_bytes,
@@ -176,7 +182,15 @@ static int reserve_runtime_arena_accounting(uocr_engine *engine, const uocr_runt
     if (status != UOCR_OK) {
         return status;
     }
-    status = uocr_memory_reserve(&engine->memory_tracker, UOCR_MEMORY_VISION_SCRATCH, estimate->vision_scratch_bytes);
+    status = uocr_memory_reserve(&engine->memory_tracker, UOCR_MEMORY_VISION_GPU_WORKSPACE, estimate->vision_gpu_workspace_bytes);
+    if (status != UOCR_OK) {
+        return status;
+    }
+    status = uocr_memory_reserve(&engine->memory_tracker, UOCR_MEMORY_VISION_FINAL_FEATURES, estimate->vision_final_features_bytes);
+    if (status != UOCR_OK) {
+        return status;
+    }
+    status = uocr_memory_reserve(&engine->memory_tracker, UOCR_MEMORY_VISION_HOST_STAGING, estimate->vision_host_staging_bytes);
     if (status != UOCR_OK) {
         return status;
     }
@@ -464,8 +478,12 @@ const char *uocr_memory_category_name(uocr_memory_category category) {
             return "kv-cache";
         case UOCR_MEMORY_PROMPT_EMBEDDINGS:
             return "prompt-embeddings";
-        case UOCR_MEMORY_VISION_SCRATCH:
-            return "vision-scratch";
+        case UOCR_MEMORY_VISION_GPU_WORKSPACE:
+            return "vision-gpu-workspace";
+        case UOCR_MEMORY_VISION_FINAL_FEATURES:
+            return "vision-final-features";
+        case UOCR_MEMORY_VISION_HOST_STAGING:
+            return "vision-host-staging";
         case UOCR_MEMORY_DECODER_SCRATCH:
             return "decoder-scratch";
         case UOCR_MEMORY_MOE_SCRATCH:
