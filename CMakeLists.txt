@@ -198,6 +198,17 @@ if(UOCR_BUILD_TESTS)
     uocr_apply_sanitizers(test_uocr_model_file)
     add_test(NAME uocr_model_file COMMAND test_uocr_model_file)
 
+    if(UOCR_BUILD_TOOLS)
+        add_executable(test_uocr_dump tests/test_uocr_dump.c)
+        target_include_directories(test_uocr_dump PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/include"
+            "${CMAKE_CURRENT_SOURCE_DIR}/src"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests")
+        uocr_apply_common_warnings(test_uocr_dump)
+        uocr_apply_sanitizers(test_uocr_dump)
+        add_test(NAME uocr_dump COMMAND test_uocr_dump $<TARGET_FILE:uocr-dump>)
+    endif()
+
     add_executable(test_alloc tests/test_alloc.c)
     target_include_directories(test_alloc PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/include"
