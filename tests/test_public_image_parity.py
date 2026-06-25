@@ -44,6 +44,17 @@ from unlimitedocr_c.golden import (
     load_sam_features_dump,
     load_visual_features_dump,
 )
+from unlimitedocr_c.parity_thresholds import (
+    CLIP_FEATURE_FP16,
+    FINAL_VISUAL_FEATURE_FP16,
+    GENERATED_IDS_FP16,
+    PROJECTED_FEATURE_FP16,
+    SAM_FEATURE_FP16,
+    FeatureTolerance,
+    require_exact_generated_ids,
+    require_exact_text,
+    require_f16_feature_close,
+)
 
 
 def native_library_available() -> bool:
@@ -478,86 +489,28 @@ def _assert_feature_bits_close(
     expected_bits: np.ndarray,
     *,
     label: str,
-    env_prefix: str,
-    default_atol: float,
-    default_p99_atol: float,
-    default_mean_atol: float,
-    default_rtol: float,
+    tolerance: FeatureTolerance,
 ) -> None:
-    actual = actual_bits.view(np.float16).astype(np.float32)
-    expected = expected_bits.view(np.float16).astype(np.float32)
-    if not np.all(np.isfinite(actual)) or not np.all(np.isfinite(expected)):
-        pytest.fail(f"{label} features contain non-finite values")
-    diff = np.abs(actual - expected)
-    ref_scale = np.maximum(np.abs(expected), np.float32(1.0e-3))
-    rel = diff / ref_scale
-    max_abs = float(np.max(diff))
-    mean_abs = float(np.mean(diff))
-    p99_abs = float(np.quantile(diff, 0.99))
-    max_rel = float(np.max(rel))
-
-    atol = float(os.environ.get(f"{env_prefix}_ATOL", str(default_atol)))
-    p99_atol = float(os.environ.get(f"{env_prefix}_P99_ATOL", str(default_p99_atol)))
-    mean_atol = float(os.environ.get(f"{env_prefix}_MEAN_ATOL", str(default_mean_atol)))
-    rtol = float(os.environ.get(f"{env_prefix}_RTOL", str(default_rtol)))
-    if max_abs > atol or p99_abs > p99_atol or mean_abs > mean_atol or max_rel > rtol:
-        pytest.fail(
-            f"{label} feature mismatch: max_abs={max_abs:.6g} (limit {atol}), "
-            f"p99_abs={p99_abs:.6g} (limit {p99_atol}), "
-            f"mean_abs={mean_abs:.6g} (limit {mean_atol}), max_rel={max_rel:.6g} (limit {rtol})"
-        )
+    try:
+        require_f16_feature_close(actual_bits, expected_bits, tolerance.from_env(), label=label)
+    except (AssertionError, ValueError) as exc:
+        pytest.fail(str(exc))
 
 
 def _assert_visual_features_close(actual_bits: np.ndarray, expected_bits: np.ndarray, *, label: str) -> None:
-    _assert_feature_bits_close(
-        actual_bits,
-        expected_bits,
-        label=label,
-        env_prefix="UOCR_IMAGE_VISUAL",
-        default_atol=0.08,
-        default_p99_atol=0.02,
-        default_mean_atol=0.004,
-        default_rtol=0.08,
-    )
+    _assert_feature_bits_close(actual_bits, expected_bits, label=label, tolerance=FINAL_VISUAL_FEATURE_FP16)
 
 
 def _assert_sam_features_close(actual_bits: np.ndarray, expected_bits: np.ndarray, *, label: str) -> None:
-    _assert_feature_bits_close(
-        actual_bits,
-        expected_bits,
-        label=label,
-        env_prefix="UOCR_SAM_FEATURE",
-        default_atol=0.08,
-        default_p99_atol=0.02,
-        default_mean_atol=0.004,
-        default_rtol=0.08,
-    )
+    _assert_feature_bits_close(actual_bits, expected_bits, label=label, tolerance=SAM_FEATURE_FP16)
 
 
 def _assert_clip_features_close(actual_bits: np.ndarray, expected_bits: np.ndarray, *, label: str) -> None:
-    _assert_feature_bits_close(
-        actual_bits,
-        expected_bits,
-        label=label,
-        env_prefix="UOCR_CLIP_FEATURE",
-        default_atol=0.12,
-        default_p99_atol=0.03,
-        default_mean_atol=0.006,
-        default_rtol=0.10,
-    )
+    _assert_feature_bits_close(actual_bits, expected_bits, label=label, tolerance=CLIP_FEATURE_FP16)
 
 
 def _assert_projected_features_close(actual_bits: np.ndarray, expected_bits: np.ndarray, *, label: str) -> None:
-    _assert_feature_bits_close(
-        actual_bits,
-        expected_bits,
-        label=label,
-        env_prefix="UOCR_PROJECTED_FEATURE",
-        default_atol=0.14,
-        default_p99_atol=0.035,
-        default_mean_atol=0.007,
-        default_rtol=0.12,
-    )
+    _assert_feature_bits_close(actual_bits, expected_bits, label=label, tolerance=PROJECTED_FEATURE_FP16)
 
 
 def _run_public_generation(model_path: str, resource_path: str, request: PreparedRequest) -> np.ndarray:
@@ -624,12 +577,12 @@ def _run_image_parity_case(label: str, root: Path) -> None:
     _assert_visual_features_close(actual_visual, expected_visual, label=label)
 
     actual_ids = _run_public_generation(model_path, resource_path, request)
-    np.testing.assert_array_equal(actual_ids, expected_ids)
+    require_exact_generated_ids(actual_ids, expected_ids, GENERATED_IDS_FP16)
 
     reference_text = _load_reference_text(root)
     actual_text = decode_generated_text(actual_ids, request.tokenizer_path)
     if reference_text is not None:
-        assert actual_text == reference_text
+        require_exact_text(actual_text, reference_text, GENERATED_IDS_FP16)
     print(f"{label} image parity generated ids={actual_ids.tolist()} decoded={actual_text!r}")
 
 

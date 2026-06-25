@@ -1002,12 +1002,12 @@ Do not start the stable high-level OCR/PDF API until Gate E2E-0 passes: public f
   - [ ] public image generated ids/text match Python fixture for at least one base/global image
   - [x] unsupported public paths still return clear `UOCR_ERROR_NOT_IMPLEMENTED` messages
   - [x] no-allocation guard passes around the decode token loop
-- [ ] Define fp16 parity thresholds per stage:
-  - [ ] prompt embeddings: near exact within dtype tolerance
-  - [ ] vision projected features: small absolute/relative tolerance after fp16 conversion
-  - [ ] router top-6: exact ids for fp16 baseline
-  - [ ] logits: top-k agreement and bounded max error
-  - [ ] generated ids: exact for deterministic greedy smoke fixtures where possible
+- [x] Define fp16 parity thresholds per stage:
+  - [x] prompt embeddings: near exact within dtype tolerance
+  - [x] vision projected features: small absolute/relative tolerance after fp16 conversion
+  - [x] router top-6: exact ids for fp16 baseline
+  - [x] logits: top-k agreement and bounded max error
+  - [x] generated ids: exact for deterministic greedy smoke fixtures where possible
 - [ ] Define q8/q4 parity thresholds separately:
   - [ ] router top-6 agreement must remain high because router itself is fp16
   - [ ] logits top-k/KL within calibrated thresholds
