@@ -613,6 +613,15 @@ _Static_assert(sizeof(uocr_metal_sam_residual_params) == 16u,
 _Static_assert(sizeof(uocr_metal_sam_mlp_params) == 16u,
                "uocr_metal_sam_mlp_params ABI mismatch");
 
+enum {
+    UOCR_METAL_LM_HEAD_ARGMAX_TILE_TOKENS = 16u,
+    UOCR_METAL_LM_HEAD_ARGMAX_LANES_PER_TOKEN = 16u,
+    UOCR_METAL_LM_HEAD_ARGMAX_THREADS = UOCR_METAL_LM_HEAD_ARGMAX_TILE_TOKENS * UOCR_METAL_LM_HEAD_ARGMAX_LANES_PER_TOKEN,
+};
+
+_Static_assert(UOCR_METAL_LM_HEAD_ARGMAX_THREADS == 256u,
+               "LM-head argmax kernel expects 256 threads per threadgroup");
+
 typedef struct uocr_metal_argmax_params {
     uint32_t rows;
     uint32_t vocab_size;
@@ -627,6 +636,35 @@ typedef struct uocr_metal_no_repeat_ngram_params {
     uint32_t reserved0;
 } uocr_metal_no_repeat_ngram_params;
 
+typedef struct uocr_metal_no_repeat_collect_params {
+    uint32_t sequence_len;
+    uint32_t ngram_size;
+    uint32_t window;
+    uint32_t candidate_count;
+    uint32_t vocab_size;
+    uint32_t reserved0;
+    uint32_t reserved1;
+    uint32_t reserved2;
+} uocr_metal_no_repeat_collect_params;
+
+typedef struct uocr_metal_lm_head_argmax_params {
+    uint32_t vocab_size;
+    uint32_t hidden_size;
+    uint32_t tile_tokens;
+    uint32_t lanes_per_token;
+    uint32_t banned_count;
+    uint32_t partial_count;
+    uint32_t reserved0;
+    uint32_t reserved1;
+} uocr_metal_lm_head_argmax_params;
+
+typedef struct uocr_metal_argmax_pairs_params {
+    uint32_t count;
+    uint32_t reserved0;
+    uint32_t reserved1;
+    uint32_t reserved2;
+} uocr_metal_argmax_pairs_params;
+
 typedef struct uocr_metal_no_repeat_ngram_pack {
     int32_t *sequences;
     uint32_t *row_offsets;
@@ -637,6 +675,13 @@ typedef struct uocr_metal_no_repeat_ngram_pack {
     uint32_t max_candidates;
     int has_work;
 } uocr_metal_no_repeat_ngram_pack;
+
+_Static_assert(sizeof(uocr_metal_no_repeat_collect_params) == 32u,
+               "uocr_metal_no_repeat_collect_params ABI mismatch");
+_Static_assert(sizeof(uocr_metal_lm_head_argmax_params) == 32u,
+               "uocr_metal_lm_head_argmax_params ABI mismatch");
+_Static_assert(sizeof(uocr_metal_argmax_pairs_params) == 16u,
+               "uocr_metal_argmax_pairs_params ABI mismatch");
 
 typedef struct uocr_metal_attention_projection_params {
     uint32_t n_tokens;
@@ -4115,6 +4160,9 @@ static int metal_prewarm_integrated_decoder_pipelines(uocr_metal_context *ctx, c
     static const char *const pipeline_names[] = {
         "uocr_rmsnorm_f16_to_f16",
         "uocr_dense_f16_to_f32",
+        "uocr_no_repeat_collect_banned_i32",
+        "uocr_lm_head_argmax_f16",
+        "uocr_argmax_pairs_f32",
         "uocr_get_rows_f16_to_f16",
         "uocr_attention_qkvo_f16_to_f16",
         "uocr_rope_qk_f16_to_f16",
@@ -4673,15 +4721,84 @@ static int metal_logits_arena_slices(const uocr_metal_context *ctx,
            metal_slice_valid(*next_token, (uint64_t)sizeof(int32_t));
 }
 
-static float *metal_logits_slice_cpu_ptr(uocr_metal_buffer_slice logits) {
-    if (logits.buffer == nil) {
-        return NULL;
+typedef struct uocr_metal_decode_selection_slices {
+    uocr_metal_buffer_slice sequence;
+    uocr_metal_buffer_slice ban_flags;
+    uocr_metal_buffer_slice partial_scores;
+    uocr_metal_buffer_slice partial_ids;
+    uocr_metal_buffer_slice score;
+    uint32_t partial_count;
+} uocr_metal_decode_selection_slices;
+
+static int metal_selection_scratch_subslice(uocr_metal_buffer_slice base,
+                                            uint64_t relative_offset,
+                                            uint64_t bytes,
+                                            uocr_metal_buffer_slice *out) {
+    if (out == NULL || relative_offset > (uint64_t)NSUIntegerMax || base.offset > NSUIntegerMax - (NSUInteger)relative_offset) {
+        return 0;
     }
-    void *base = [logits.buffer contents];
-    if (base == NULL) {
-        return NULL;
+    out->buffer = base.buffer;
+    out->offset = base.offset + (NSUInteger)relative_offset;
+    return metal_slice_valid(*out, bytes);
+}
+
+static int metal_decode_selection_slices(uocr_metal_buffer_slice scratch,
+                                         uint32_t sequence_len,
+                                         uint32_t banned_capacity,
+                                         uocr_metal_decode_selection_slices *out) {
+    if (out == NULL) {
+        return 0;
     }
-    return (float *)((uint8_t *)base + (size_t)logits.offset);
+    memset(out, 0, sizeof(*out));
+    const uint32_t partial_count = (UOCR_VOCAB_SIZE + UOCR_METAL_LM_HEAD_ARGMAX_TILE_TOKENS - 1u) /
+                                   UOCR_METAL_LM_HEAD_ARGMAX_TILE_TOKENS;
+    uint64_t sequence_bytes = 0u;
+    const uint64_t ban_flags_bytes = banned_capacity != 0u ? (uint64_t)UOCR_VOCAB_SIZE : 0u;
+    uint64_t partial_bytes = 0u;
+    if (!checked_mul_u64((uint64_t)sequence_len, (uint64_t)sizeof(int32_t), &sequence_bytes) ||
+        !checked_mul_u64((uint64_t)partial_count, (uint64_t)sizeof(float), &partial_bytes)) {
+        return 0;
+    }
+
+    uint64_t cursor = 0u;
+#define METAL_SELECTION_ALIGN_CURSOR()                     \
+    do {                                                    \
+        if (!align_up_u64_checked(cursor, 16u, &cursor)) {  \
+            return 0;                                       \
+        }                                                   \
+    } while (0)
+
+    METAL_SELECTION_ALIGN_CURSOR();
+    const uint64_t sequence_offset = cursor;
+    if (!checked_add_u64(cursor, sequence_bytes, &cursor)) return 0;
+    METAL_SELECTION_ALIGN_CURSOR();
+    const uint64_t ban_flags_offset = cursor;
+    if (!checked_add_u64(cursor, ban_flags_bytes, &cursor)) return 0;
+    METAL_SELECTION_ALIGN_CURSOR();
+    const uint64_t partial_scores_offset = cursor;
+    if (!checked_add_u64(cursor, partial_bytes, &cursor)) return 0;
+    METAL_SELECTION_ALIGN_CURSOR();
+    const uint64_t partial_ids_offset = cursor;
+    if (!checked_add_u64(cursor, partial_bytes, &cursor)) return 0;
+    METAL_SELECTION_ALIGN_CURSOR();
+    const uint64_t score_offset = cursor;
+    if (!checked_add_u64(cursor, (uint64_t)sizeof(float), &cursor)) return 0;
+
+#undef METAL_SELECTION_ALIGN_CURSOR
+
+    const uint64_t scratch_bytes = (uint64_t)UOCR_VOCAB_SIZE * (uint64_t)sizeof(float);
+    if (cursor > scratch_bytes || !metal_slice_valid(scratch, scratch_bytes)) {
+        return 0;
+    }
+    if (!metal_selection_scratch_subslice(scratch, sequence_offset, sequence_bytes, &out->sequence) ||
+        !metal_selection_scratch_subslice(scratch, ban_flags_offset, ban_flags_bytes, &out->ban_flags) ||
+        !metal_selection_scratch_subslice(scratch, partial_scores_offset, partial_bytes, &out->partial_scores) ||
+        !metal_selection_scratch_subslice(scratch, partial_ids_offset, partial_bytes, &out->partial_ids) ||
+        !metal_selection_scratch_subslice(scratch, score_offset, (uint64_t)sizeof(float), &out->score)) {
+        return 0;
+    }
+    out->partial_count = partial_count;
+    return 1;
 }
 
 static int32_t *metal_token_slice_cpu_ptr(uocr_metal_buffer_slice token) {
@@ -4695,32 +4812,15 @@ static int32_t *metal_token_slice_cpu_ptr(uocr_metal_buffer_slice token) {
     return (int32_t *)((uint8_t *)base + (size_t)token.offset);
 }
 
-static int metal_cpu_argmax_logits(const float *logits,
-                                   uint32_t vocab_size,
-                                   uint32_t *token_id_out,
-                                   float *score_out) {
-    if (logits == NULL || token_id_out == NULL || score_out == NULL || vocab_size == 0u) {
-        return 0;
+static float *metal_score_slice_cpu_ptr(uocr_metal_buffer_slice score) {
+    if (score.buffer == nil) {
+        return NULL;
     }
-    uint32_t best_id = UINT32_MAX;
-    float best_score = -INFINITY;
-    for (uint32_t token = 0u; token < vocab_size; ++token) {
-        const float score = logits[token];
-        if (isnan(score)) {
-            continue;
-        }
-        if (best_id == UINT32_MAX || score > best_score || (score == best_score && token < best_id)) {
-            best_id = token;
-            best_score = score;
-        }
+    void *base = [score.buffer contents];
+    if (base == NULL) {
+        return NULL;
     }
-    if (best_id == UINT32_MAX) {
-        best_id = 0u;
-        best_score = -INFINITY;
-    }
-    *token_id_out = best_id;
-    *score_out = best_score;
-    return 1;
+    return (float *)((uint8_t *)base + (size_t)score.offset);
 }
 
 static int metal_read_slice_to_host(uocr_metal_context *ctx,
@@ -5022,19 +5122,93 @@ static int metal_run_token_embedding_from_token_slot_f16(uocr_metal_context *ctx
     }
 }
 
-static int metal_run_lm_head_buffer_f32(uocr_metal_context *ctx,
+static uint32_t metal_no_repeat_candidate_count(uint32_t sequence_len, uint32_t ngram_size, uint32_t window);
+
+static int metal_run_no_repeat_collect_ban_flags_to_slice(uocr_metal_context *ctx,
+                                                          uocr_metal_buffer_slice sequence,
+                                                          uocr_metal_buffer_slice ban_flags,
+                                                          uint32_t sequence_len,
+                                                          uint32_t ngram_size,
+                                                          uint32_t window,
+                                                          uint32_t candidate_count,
+                                                          char *error,
+                                                          size_t error_size) {
+    if (candidate_count == 0u) {
+        return 1;
+    }
+    uint64_t sequence_bytes = 0u;
+    if (ctx == NULL || sequence_len == 0u || ngram_size == 0u ||
+        !checked_mul_u64((uint64_t)sequence_len, (uint64_t)sizeof(int32_t), &sequence_bytes) ||
+        !metal_slice_valid(sequence, sequence_bytes) || !metal_slice_valid(ban_flags, (uint64_t)UOCR_VOCAB_SIZE)) {
+        return metal_fail(error, error_size, "invalid integrated no-repeat collection request");
+    }
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, "uocr_no_repeat_collect_banned_i32", error, error_size);
+        if (pipeline == nil) {
+            return 0;
+        }
+        NSUInteger threads = metal_power2_threadgroup_width(128u, pipeline.maxTotalThreadsPerThreadgroup);
+        if (threads > (NSUInteger)candidate_count) {
+            threads = metal_power2_threadgroup_width((NSUInteger)candidate_count, threads);
+        }
+        if (threads == 0u) {
+            threads = 1u;
+        }
+        int owned_command_buffer = 0;
+        id<MTLCommandBuffer> cb = metal_command_buffer_for_op(ctx, &owned_command_buffer, "integrated no-repeat collection", error, error_size);
+        if (cb == nil) {
+            return 0;
+        }
+        id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+        if (blit == nil) {
+            return metal_fail(error, error_size, "failed to create integrated no-repeat flag-clear encoder");
+        }
+        [blit fillBuffer:ban_flags.buffer range:NSMakeRange(ban_flags.offset, (NSUInteger)UOCR_VOCAB_SIZE) value:0u];
+        [blit endEncoding];
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        if (enc == nil) {
+            return metal_fail(error, error_size, "failed to create integrated no-repeat collection encoder");
+        }
+        uocr_metal_no_repeat_collect_params params;
+        params.sequence_len = sequence_len;
+        params.ngram_size = ngram_size;
+        params.window = window;
+        params.candidate_count = candidate_count;
+        params.vocab_size = UOCR_VOCAB_SIZE;
+        params.reserved0 = 0u;
+        params.reserved1 = 0u;
+        params.reserved2 = 0u;
+        [enc setComputePipelineState:pipeline];
+        [enc setBuffer:sequence.buffer offset:sequence.offset atIndex:0u];
+        [enc setBuffer:ban_flags.buffer offset:ban_flags.offset atIndex:1u];
+        [enc setBytes:&params length:sizeof(params) atIndex:2u];
+        [enc dispatchThreads:MTLSizeMake((NSUInteger)candidate_count, 1u, 1u)
+       threadsPerThreadgroup:MTLSizeMake(threads, 1u, 1u)];
+        [enc endEncoding];
+        return metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, "integrated no-repeat collection", error, error_size);
+    }
+}
+
+static int metal_run_lm_head_argmax_f16(uocr_metal_context *ctx,
                                         uocr_metal_buffer_slice input,
-                                        uint32_t n_rows,
-                                        uocr_metal_buffer_slice logits,
+                                        uocr_metal_buffer_slice ban_flags,
+                                        uint32_t banned_count,
+                                        uocr_metal_buffer_slice partial_scores,
+                                        uocr_metal_buffer_slice partial_ids,
+                                        uint32_t partial_count,
                                         char *error,
                                         size_t error_size) {
-    const uint64_t input_bytes = (uint64_t)n_rows * (uint64_t)UOCR_HIDDEN_SIZE * 2u;
+    const uint64_t input_bytes = (uint64_t)UOCR_HIDDEN_SIZE * 2u;
     const uint64_t weight_bytes = (uint64_t)UOCR_VOCAB_SIZE * (uint64_t)UOCR_HIDDEN_SIZE * 2u;
-    const uint64_t output_values = (uint64_t)n_rows * (uint64_t)UOCR_VOCAB_SIZE;
-    const uint64_t output_bytes = output_values * (uint64_t)sizeof(float);
-    if (ctx == NULL || n_rows == 0u || output_values > (uint64_t)UINT32_MAX ||
-        !metal_slice_valid(input, input_bytes) || !metal_slice_valid(logits, output_bytes)) {
-        return metal_fail(error, error_size, "invalid integrated LM-head request");
+    uint64_t partial_bytes = 0u;
+    const uint32_t expected_partials = (UOCR_VOCAB_SIZE + UOCR_METAL_LM_HEAD_ARGMAX_TILE_TOKENS - 1u) /
+                                       UOCR_METAL_LM_HEAD_ARGMAX_TILE_TOKENS;
+    if (ctx == NULL || partial_count != expected_partials ||
+        !checked_mul_u64((uint64_t)partial_count, (uint64_t)sizeof(float), &partial_bytes) ||
+        !metal_slice_valid(input, input_bytes) ||
+        (banned_count != 0u && !metal_slice_valid(ban_flags, (uint64_t)UOCR_VOCAB_SIZE)) ||
+        !metal_slice_valid(partial_scores, partial_bytes) || !metal_slice_valid(partial_ids, partial_bytes)) {
+        return metal_fail(error, error_size, "invalid integrated fused LM-head argmax request");
     }
     const uocr_metal_decoder_binding *lm_head = metal_require_decoder_binding(ctx,
                                                                               UOCR_TENSOR_ID_LM_HEAD,
@@ -5045,39 +5219,117 @@ static int metal_run_lm_head_buffer_f32(uocr_metal_context *ctx,
         return 0;
     }
     @autoreleasepool {
-        id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, "uocr_dense_f16_to_f32", error, error_size);
+        id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, "uocr_lm_head_argmax_f16", error, error_size);
         if (pipeline == nil) {
             return 0;
         }
-        const NSUInteger threads = metal_power2_threadgroup_width(256u, pipeline.maxTotalThreadsPerThreadgroup);
-        if ((uint64_t)threads * sizeof(float) > (uint64_t)ctx->device.maxThreadgroupMemoryLength) {
-            return metal_fail(error, error_size, "integrated LM-head threadgroup memory exceeds device limit");
+        const NSUInteger threads = (NSUInteger)UOCR_METAL_LM_HEAD_ARGMAX_THREADS;
+        if (pipeline.maxTotalThreadsPerThreadgroup < threads) {
+            return metal_fail(error,
+                              error_size,
+                              "integrated fused LM-head argmax requires %u threads per threadgroup, device supports %llu",
+                              UOCR_METAL_LM_HEAD_ARGMAX_THREADS,
+                              (unsigned long long)pipeline.maxTotalThreadsPerThreadgroup);
+        }
+        const uint64_t sum_bytes = (uint64_t)threads * (uint64_t)sizeof(float);
+        const uint64_t id_bytes = (uint64_t)threads * (uint64_t)sizeof(uint32_t);
+        const uint64_t hidden_bytes = (uint64_t)UOCR_HIDDEN_SIZE * 2u;
+        uint64_t tg_bytes = 0u;
+        if (!checked_add_u64(sum_bytes, id_bytes, &tg_bytes) ||
+            !checked_add_u64(tg_bytes, hidden_bytes, &tg_bytes) ||
+            tg_bytes > (uint64_t)ctx->device.maxThreadgroupMemoryLength) {
+            return metal_fail(error, error_size, "integrated fused LM-head argmax threadgroup memory exceeds device limit");
         }
         int owned_command_buffer = 0;
-        id<MTLCommandBuffer> cb = metal_command_buffer_for_op(ctx, &owned_command_buffer, "integrated LM-head", error, error_size);
+        id<MTLCommandBuffer> cb = metal_command_buffer_for_op(ctx, &owned_command_buffer, "integrated fused LM-head argmax", error, error_size);
         if (cb == nil) {
             return 0;
         }
         id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
         if (enc == nil) {
-            return metal_fail(error, error_size, "failed to create integrated LM-head command encoder");
+            return metal_fail(error, error_size, "failed to create integrated fused LM-head argmax encoder");
         }
-        uocr_metal_dense_params params;
-        params.input_rows = n_rows;
-        params.in_features = UOCR_HIDDEN_SIZE;
-        params.out_features = UOCR_VOCAB_SIZE;
-        params.has_bias = 0u;
+        uocr_metal_lm_head_argmax_params params;
+        params.vocab_size = UOCR_VOCAB_SIZE;
+        params.hidden_size = UOCR_HIDDEN_SIZE;
+        params.tile_tokens = UOCR_METAL_LM_HEAD_ARGMAX_TILE_TOKENS;
+        params.lanes_per_token = UOCR_METAL_LM_HEAD_ARGMAX_LANES_PER_TOKEN;
+        params.banned_count = banned_count;
+        params.partial_count = partial_count;
+        params.reserved0 = 0u;
+        params.reserved1 = 0u;
         [enc setComputePipelineState:pipeline];
         [enc setBuffer:input.buffer offset:input.offset atIndex:0u];
         [enc setBuffer:lm_head->buffer offset:lm_head->offset atIndex:1u];
-        [enc setBuffer:lm_head->buffer offset:lm_head->offset atIndex:2u];
-        [enc setBuffer:logits.buffer offset:logits.offset atIndex:3u];
-        [enc setBytes:&params length:sizeof(params) atIndex:4u];
-        [enc setThreadgroupMemoryLength:threads * sizeof(float) atIndex:0u];
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)output_values, 1u, 1u)
+        [enc setBuffer:ban_flags.buffer offset:ban_flags.offset atIndex:2u];
+        [enc setBuffer:partial_scores.buffer offset:partial_scores.offset atIndex:3u];
+        [enc setBuffer:partial_ids.buffer offset:partial_ids.offset atIndex:4u];
+        [enc setBytes:&params length:sizeof(params) atIndex:5u];
+        [enc setThreadgroupMemoryLength:(NSUInteger)sum_bytes atIndex:0u];
+        [enc setThreadgroupMemoryLength:(NSUInteger)id_bytes atIndex:1u];
+        [enc setThreadgroupMemoryLength:(NSUInteger)hidden_bytes atIndex:2u];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)partial_count, 1u, 1u)
              threadsPerThreadgroup:MTLSizeMake(threads, 1u, 1u)];
         [enc endEncoding];
-        return metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, "integrated LM-head", error, error_size);
+        return metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, "integrated fused LM-head argmax", error, error_size);
+    }
+}
+
+static int metal_run_argmax_pairs_to_token(uocr_metal_context *ctx,
+                                           uocr_metal_buffer_slice partial_scores,
+                                           uocr_metal_buffer_slice partial_ids,
+                                           uint32_t partial_count,
+                                           uocr_metal_buffer_slice token_slot,
+                                           uocr_metal_buffer_slice score_slot,
+                                           char *error,
+                                           size_t error_size) {
+    uint64_t partial_bytes = 0u;
+    if (ctx == NULL || partial_count == 0u ||
+        !checked_mul_u64((uint64_t)partial_count, (uint64_t)sizeof(float), &partial_bytes) ||
+        !metal_slice_valid(partial_scores, partial_bytes) || !metal_slice_valid(partial_ids, partial_bytes) ||
+        !metal_slice_valid(token_slot, (uint64_t)sizeof(int32_t)) ||
+        !metal_slice_valid(score_slot, (uint64_t)sizeof(float))) {
+        return metal_fail(error, error_size, "invalid integrated argmax-pair finalization request");
+    }
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, "uocr_argmax_pairs_f32", error, error_size);
+        if (pipeline == nil) {
+            return 0;
+        }
+        const NSUInteger threads = metal_power2_threadgroup_width(256u, pipeline.maxTotalThreadsPerThreadgroup);
+        const uint64_t score_tg_bytes = (uint64_t)threads * (uint64_t)sizeof(float);
+        const uint64_t id_tg_bytes = (uint64_t)threads * (uint64_t)sizeof(uint32_t);
+        uint64_t tg_bytes = 0u;
+        if (!checked_add_u64(score_tg_bytes, id_tg_bytes, &tg_bytes) ||
+            tg_bytes > (uint64_t)ctx->device.maxThreadgroupMemoryLength) {
+            return metal_fail(error, error_size, "integrated argmax-pair finalization threadgroup memory exceeds device limit");
+        }
+        int owned_command_buffer = 0;
+        id<MTLCommandBuffer> cb = metal_command_buffer_for_op(ctx, &owned_command_buffer, "integrated argmax-pair finalization", error, error_size);
+        if (cb == nil) {
+            return 0;
+        }
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        if (enc == nil) {
+            return metal_fail(error, error_size, "failed to create integrated argmax-pair finalization encoder");
+        }
+        uocr_metal_argmax_pairs_params params;
+        params.count = partial_count;
+        params.reserved0 = 0u;
+        params.reserved1 = 0u;
+        params.reserved2 = 0u;
+        [enc setComputePipelineState:pipeline];
+        [enc setBuffer:partial_scores.buffer offset:partial_scores.offset atIndex:0u];
+        [enc setBuffer:partial_ids.buffer offset:partial_ids.offset atIndex:1u];
+        [enc setBuffer:token_slot.buffer offset:token_slot.offset atIndex:2u];
+        [enc setBuffer:score_slot.buffer offset:score_slot.offset atIndex:3u];
+        [enc setBytes:&params length:sizeof(params) atIndex:4u];
+        [enc setThreadgroupMemoryLength:(NSUInteger)score_tg_bytes atIndex:0u];
+        [enc setThreadgroupMemoryLength:(NSUInteger)id_tg_bytes atIndex:1u];
+        [enc dispatchThreadgroups:MTLSizeMake(1u, 1u, 1u)
+             threadsPerThreadgroup:MTLSizeMake(threads, 1u, 1u)];
+        [enc endEncoding];
+        return metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, "integrated argmax-pair finalization", error, error_size);
     }
 }
 
@@ -5158,6 +5410,25 @@ static int metal_select_next_token_from_hidden_slice_f16(uocr_metal_context *ctx
     if (final_norm == NULL) {
         return 0;
     }
+    const uint32_t banned_capacity = metal_no_repeat_candidate_count(sequence_len,
+                                                                     no_repeat_ngram_size,
+                                                                     no_repeat_window);
+    uocr_metal_decode_selection_slices selection_slices;
+    if (!metal_decode_selection_slices(logits, sequence_len, banned_capacity, &selection_slices)) {
+        return metal_fail(error, error_size, "integrated next-token selection scratch layout is invalid");
+    }
+    if (banned_capacity != 0u) {
+        uint64_t sequence_bytes = 0u;
+        if (!checked_mul_u64((uint64_t)sequence_len, (uint64_t)sizeof(int32_t), &sequence_bytes)) {
+            return metal_fail(error, error_size, "integrated no-repeat sequence byte-size overflow");
+        }
+        void *sequence_base = [selection_slices.sequence.buffer contents];
+        if (sequence_base == NULL) {
+            return metal_fail(error, error_size, "integrated no-repeat sequence scratch is not CPU-visible");
+        }
+        memcpy((uint8_t *)sequence_base + (size_t)selection_slices.sequence.offset, sequence, (size_t)sequence_bytes);
+    }
+
     if (!metal_run_rmsnorm_buffer_f16(ctx,
                                       hidden,
                                       final_norm,
@@ -5166,45 +5437,49 @@ static int metal_select_next_token_from_hidden_slice_f16(uocr_metal_context *ctx
                                       "integrated final RMSNorm",
                                       error,
                                       error_size) ||
-        !metal_run_lm_head_buffer_f32(ctx, norm_scratch, 1u, logits, error, error_size)) {
+        !metal_run_no_repeat_collect_ban_flags_to_slice(ctx,
+                                                        selection_slices.sequence,
+                                                        selection_slices.ban_flags,
+                                                        sequence_len,
+                                                        no_repeat_ngram_size,
+                                                        no_repeat_window,
+                                                        banned_capacity,
+                                                        error,
+                                                        error_size) ||
+        !metal_run_lm_head_argmax_f16(ctx,
+                                      norm_scratch,
+                                      selection_slices.ban_flags,
+                                      banned_capacity,
+                                      selection_slices.partial_scores,
+                                      selection_slices.partial_ids,
+                                      selection_slices.partial_count,
+                                      error,
+                                      error_size) ||
+        !metal_run_argmax_pairs_to_token(ctx,
+                                         selection_slices.partial_scores,
+                                         selection_slices.partial_ids,
+                                         selection_slices.partial_count,
+                                         token_slot,
+                                         selection_slices.score,
+                                         error,
+                                         error_size)) {
         return 0;
     }
     if (metal_command_batch_active(ctx) &&
-        !metal_command_batch_commit_and_wait(ctx, "integrated next-token logits", error, error_size)) {
+        !metal_command_batch_commit_and_wait(ctx, "integrated next-token selection", error, error_size)) {
         return 0;
     }
 
-    float *logits_ptr = metal_logits_slice_cpu_ptr(logits);
     int32_t *token_ptr = metal_token_slice_cpu_ptr(token_slot);
-    if (logits_ptr == NULL || token_ptr == NULL) {
-        return metal_fail(error, error_size, "integrated next-token selection requires CPU-visible logits arena");
+    float *score_ptr = metal_score_slice_cpu_ptr(selection_slices.score);
+    if (token_ptr == NULL || score_ptr == NULL) {
+        return metal_fail(error, error_size, "integrated next-token selection requires CPU-visible result slots");
     }
-
-    if (no_repeat_ngram_size != 0u) {
-        const int status = uocr_no_repeat_ngram_apply(logits_ptr,
-                                                      UOCR_VOCAB_SIZE,
-                                                      sequence,
-                                                      sequence_len,
-                                                      no_repeat_ngram_size,
-                                                      no_repeat_window,
-                                                      NULL,
-                                                      0u);
-        if (status != UOCR_OK) {
-            return metal_fail(error,
-                              error_size,
-                              "integrated no-repeat-ngram processor failed: %s",
-                              uocr_status_string(status));
-        }
+    if (*token_ptr < 0 || (uint32_t)*token_ptr >= UOCR_VOCAB_SIZE) {
+        return metal_fail(error, error_size, "integrated greedy argmax selected invalid token id %d", *token_ptr);
     }
-
-    uint32_t token_id = UINT32_MAX;
-    float score = 0.0f;
-    if (!metal_cpu_argmax_logits(logits_ptr, UOCR_VOCAB_SIZE, &token_id, &score) || token_id >= UOCR_VOCAB_SIZE) {
-        return metal_fail(error, error_size, "integrated greedy argmax failed");
-    }
-    *token_ptr = (int32_t)token_id;
-    *token_id_out = token_id;
-    *score_out = score;
+    *token_id_out = (uint32_t)*token_ptr;
+    *score_out = *score_ptr;
     return 1;
 }
 
