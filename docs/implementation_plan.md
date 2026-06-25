@@ -46,7 +46,7 @@ Implementation status:
 - [ ] Use **GPU-private vision workspace** for all intermediate SAM, CLIP, concat, projector, and formatted visual rows.
 - [ ] Use **MPSNDArray matrix multiplication** for large dense GEMMs in SAM, CLIP, projector, and decoder prefill.
 - [ ] Use **custom tiled Metal kernels** for SAM attention, SAM patch/neck/stride convolutions, visual formatting, decode single-token matvecs, routed/shared MoE, and LM-head argmax.
-- [ ] Use **persistent GPU token-id buffers** and fold prompt assembly into the prefill command graph.
+- [x] Use **persistent GPU token-id buffers** and fold prompt assembly into the prefill command graph.
 - [ ] Use **request-sized lazy arena growth before command encoding**; never grow inside a hot loop.
 - [ ] Use **cached Python tokenizers** keyed by resolved tokenizer path.
 - [ ] Keep the 10x milestone on **fp16 weights**; q8 decoder is a follow-up compression milestone after fp16 speed is fixed.
@@ -155,8 +155,8 @@ Implementation status:
 
 - [x] Allocate one persistent GPU token-id buffer per engine slot.
 - [x] Copy request input ids into the persistent token-id buffer before command encoding.
-- [ ] Replace standalone prompt assembly with one prefill-graph step: text-token gather plus image-feature blit into the prompt arena.
-- [ ] Encode prompt assembly and all prefill layers into one command buffer.
+- [x] Replace standalone prompt assembly with one prefill-graph step: text-token gather plus image-feature blit into the prompt arena.
+- [x] Encode prompt assembly and all prefill layers into one command buffer.
 - [ ] Use MPSNDArray matrix multiplication for decoder prefill QKV, O projection, dense layer-0 MLP, shared experts, routed experts, and LM head prefill-size GEMMs.
 - [ ] Use custom tiled single-token kernels for decode QKV, O projection, dense layer-0 MLP, router, shared experts, routed experts, combine, and LM-head argmax.
 - [ ] Store no-repeat history in a reusable GPU sequence buffer.
@@ -298,7 +298,7 @@ Implementation status:
 - [ ] Convert production vision helpers to buffer-slice APIs and GPU-private workspace.
 - [ ] Rewrite SAM attention and convolution kernels.
 - [ ] Cache MPS descriptors/NDArrays and lock large GEMMs to the fixed MPS path.
-- [ ] Fuse prompt assembly into the prefill command graph.
+- [x] Fuse prompt assembly into the prefill command graph.
 - [ ] Replace decode single-token matvec/MoE kernels with custom tiled kernels.
 - [ ] Add Python tokenizer/decode caching.
 - [ ] Implement request-sized lazy arenas.

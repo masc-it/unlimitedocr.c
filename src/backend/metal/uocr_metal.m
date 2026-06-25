@@ -5625,6 +5625,8 @@ static int metal_prewarm_integrated_decoder_pipelines(uocr_metal_context *ctx, c
         "uocr_lm_head_argmax_f16",
         "uocr_argmax_pairs_f32",
         "uocr_get_rows_f16_to_f16",
+        "uocr_assemble_prompt_text_f16",
+        "uocr_assemble_prompt_with_image_f16",
         "uocr_attention_qkvo_f16_to_f16",
         "uocr_rope_qk_f16_to_f16",
         "uocr_kv_cache_write_f16",
@@ -8707,6 +8709,18 @@ static int metal_context_generate_f16(uocr_metal_context *ctx,
         }
     }
 
+    const uint64_t pipeline_prewarm_start_ns = uocr_profile_now_ns();
+    if (!metal_prewarm_integrated_decoder_pipelines(ctx, error, error_size)) {
+        char detail[512];
+        (void)snprintf(detail, sizeof(detail), "%s", (error != NULL && error[0] != '\0') ? error : "unknown error");
+        return metal_fail(error, error_size, "failed to prepare integrated Metal fp16 decoder pipelines: %s", detail);
+    }
+    metal_profile_add_event_now(ctx, "metal.pipeline_prewarm", pipeline_prewarm_start_ns);
+
+    if (!metal_command_batch_begin(ctx, error, error_size)) {
+        return 0;
+    }
+
     const uint64_t prompt_assembly_start_ns = uocr_profile_now_ns();
     if (!metal_context_assemble_prompt_from_model_to_arena_f16(ctx,
                                                                request->input_ids,
@@ -8721,17 +8735,11 @@ static int metal_context_generate_f16(uocr_metal_context *ctx,
                                                                error_size)) {
         char detail[512];
         (void)snprintf(detail, sizeof(detail), "%s", (error != NULL && error[0] != '\0') ? error : "unknown error");
-        return metal_fail(error, error_size, "failed to assemble integrated prompt into Metal arena: %s", detail);
+        metal_command_batch_abort(ctx);
+        return metal_fail(error, error_size, "failed to assemble integrated prompt into Metal prefill graph: %s", detail);
     }
     metal_profile_add_event_now(ctx, "metal.prompt_assembly", prompt_assembly_start_ns);
-
-    const uint64_t pipeline_prewarm_start_ns = uocr_profile_now_ns();
-    if (!metal_prewarm_integrated_decoder_pipelines(ctx, error, error_size)) {
-        char detail[512];
-        (void)snprintf(detail, sizeof(detail), "%s", (error != NULL && error[0] != '\0') ? error : "unknown error");
-        return metal_fail(error, error_size, "failed to prepare integrated Metal fp16 decoder pipelines: %s", detail);
-    }
-    metal_profile_add_event_now(ctx, "metal.pipeline_prewarm", pipeline_prewarm_start_ns);
+    metal_profile_add_event_now(ctx, "metal.prefill.prompt_assembly", prompt_assembly_start_ns);
 
     const uocr_metal_hot_path_alloc_guard prefill_guard =
         metal_hot_path_alloc_guard_begin(ctx);
@@ -9598,7 +9606,8 @@ static int metal_context_assemble_prompt_f16_with_table_buffer_to_buffer(uocr_me
             }
         }
 
-        id<MTLCommandBuffer> cb = metal_new_command_buffer(ctx);
+        int owned_command_buffer = 0;
+        id<MTLCommandBuffer> cb = metal_command_buffer_for_op(ctx, &owned_command_buffer, op, error, error_size);
         if (cb == nil) {
             if (owns_image_features) {
                 [image_features release];
@@ -9606,9 +9615,11 @@ static int metal_context_assemble_prompt_f16_with_table_buffer_to_buffer(uocr_me
             if (owns_tokens) {
                 [tokens release];
             }
-            return metal_fail(error, error_size, "failed to create %s command buffer", op);
+            return 0;
         }
-        cb.label = @"uocr_prompt_assembly_command_buffer";
+        if (owned_command_buffer) {
+            cb.label = @"uocr_prompt_assembly_command_buffer";
+        }
 
         id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
         if (enc == nil) {
@@ -9654,16 +9665,30 @@ static int metal_context_assemble_prompt_f16_with_table_buffer_to_buffer(uocr_me
        threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1u, 1u)];
         [enc endEncoding];
 
-        UOCR_METAL_COMMIT_AND_WAIT_PROFILED(ctx, cb);
-        if (cb.status == MTLCommandBufferStatusError) {
-            NSString *description = cb.error != nil ? [cb.error localizedDescription] : @"unknown command-buffer error";
+        if (!owned_command_buffer) {
+            if (owns_tokens && !metal_retain_transient_until_completed(ctx, cb, tokens, error, error_size)) {
+                if (owns_image_features) {
+                    [image_features release];
+                }
+                [tokens release];
+                return 0;
+            }
+            if (owns_image_features && !metal_retain_transient_until_completed(ctx, cb, image_features, error, error_size)) {
+                [image_features release];
+                if (owns_tokens) {
+                    [tokens release];
+                }
+                return 0;
+            }
+        }
+        if (!metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, op, error, error_size)) {
             if (owns_image_features) {
                 [image_features release];
             }
             if (owns_tokens) {
                 [tokens release];
             }
-            return metal_fail(error, error_size, "%s command failed: %s", op, [description UTF8String]);
+            return 0;
         }
 
         if (owns_image_features) {
