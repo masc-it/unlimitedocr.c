@@ -23,6 +23,8 @@
 #define UOCR_THREAD_LOCAL _Thread_local
 #endif
 
+#define UOCR_ERROR_TEXT_SIZE 1024u
+
 struct uocr_engine {
     char *model_path;
     char *backend;
@@ -41,10 +43,10 @@ struct uocr_engine {
 #if UOCR_HAVE_METAL
     uocr_metal_context *metal;
 #endif
-    char last_error[512];
+    char last_error[UOCR_ERROR_TEXT_SIZE];
 };
 
-static UOCR_THREAD_LOCAL char g_last_error[512] = "OK";
+static UOCR_THREAD_LOCAL char g_last_error[UOCR_ERROR_TEXT_SIZE] = "OK";
 
 static char *uocr_strdup_or_null(const char *s) {
     if (s == NULL) {
@@ -67,7 +69,7 @@ static void set_global_error_text(const char *text) {
 }
 
 static int set_engine_errorf(uocr_engine *engine, int status, const char *fmt, ...) {
-    char buffer[512];
+    char buffer[UOCR_ERROR_TEXT_SIZE];
     va_list ap;
     va_start(ap, fmt);
     (void)vsnprintf(buffer, sizeof(buffer), fmt, ap);
@@ -99,6 +101,38 @@ static void copy_estimate_to_report(const uocr_runtime_memory_estimate *estimate
     report->estimated_transient_bytes = estimate->transient_bytes;
     report->estimated_safety_margin_bytes = estimate->safety_margin_bytes;
     report->estimated_total_bytes = estimate->total_bytes;
+}
+
+static int set_admission_error(uocr_engine *engine,
+                               const char *scope,
+                               const uocr_runtime_memory_estimate *estimate,
+                               uint64_t budget_bytes) {
+    if (scope == NULL || scope[0] == '\0') {
+        scope = "request";
+    }
+    if (estimate == NULL) {
+        return set_engine_errorf(engine,
+                                 UOCR_ERROR_OUT_OF_MEMORY,
+                                 "%s admission rejected: memory estimate exceeds budget %llu bytes",
+                                 scope,
+                                 (unsigned long long)budget_bytes);
+    }
+    return set_engine_errorf(engine,
+                             UOCR_ERROR_OUT_OF_MEMORY,
+                             "%s admission rejected: memory estimate %llu bytes exceeds budget %llu bytes "
+                             "(model=%llu kv=%llu prompt=%llu vision=%llu decoder=%llu moe=%llu logits=%llu transient=%llu safety=%llu)",
+                             scope,
+                             (unsigned long long)estimate->total_bytes,
+                             (unsigned long long)budget_bytes,
+                             (unsigned long long)estimate->model_views_bytes,
+                             (unsigned long long)estimate->kv_cache_bytes,
+                             (unsigned long long)estimate->prompt_embeddings_bytes,
+                             (unsigned long long)estimate->vision_scratch_bytes,
+                             (unsigned long long)estimate->decoder_scratch_bytes,
+                             (unsigned long long)estimate->moe_scratch_bytes,
+                             (unsigned long long)estimate->logits_readback_bytes,
+                             (unsigned long long)estimate->transient_bytes,
+                             (unsigned long long)estimate->safety_margin_bytes);
 }
 
 static uint64_t model_tensor_data_bytes(const uocr_model_file *model) {
@@ -576,11 +610,7 @@ uocr_engine *uocr_engine_open(const uocr_engine_opts *opts) {
 #if UOCR_HAVE_METAL
     if (strcmp(engine->backend, "metal") == 0) {
         if (engine->memory_budget_bytes != 0u && engine->capacity_estimate.total_bytes > engine->memory_budget_bytes) {
-            set_engine_errorf(engine,
-                              UOCR_ERROR_OUT_OF_MEMORY,
-                              "engine runtime memory estimate %llu bytes exceeds Metal budget %llu bytes",
-                              (unsigned long long)engine->capacity_estimate.total_bytes,
-                              (unsigned long long)engine->memory_budget_bytes);
+            (void)set_admission_error(engine, "engine", &engine->capacity_estimate, engine->memory_budget_bytes);
             uocr_engine_close(engine);
             return NULL;
         }
@@ -754,11 +784,7 @@ int uocr_generate_prepared(uocr_engine *engine,
     }
     engine->last_estimate = request_estimate;
     if (engine->memory_budget_bytes != 0u && request_estimate.total_bytes > engine->memory_budget_bytes) {
-        return set_engine_errorf(engine,
-                                 UOCR_ERROR_OUT_OF_MEMORY,
-                                 "request memory estimate %llu bytes exceeds budget %llu bytes",
-                                 (unsigned long long)request_estimate.total_bytes,
-                                 (unsigned long long)engine->memory_budget_bytes);
+        return set_admission_error(engine, "request", &request_estimate, engine->memory_budget_bytes);
     }
 
     if (any_generation_requested) {

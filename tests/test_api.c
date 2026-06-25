@@ -337,7 +337,17 @@ static int test_memory_budget_rejects_request(void) {
     const int status = uocr_generate_prepared(engine, &req, 1, &result);
     CHECK(status == UOCR_ERROR_OUT_OF_MEMORY);
     CHECK(result == NULL);
-    CHECK(strstr(uocr_last_error(engine), "exceeds budget") != NULL);
+    const char *error = uocr_last_error(engine);
+    CHECK(strstr(error, "request admission rejected") != NULL);
+    CHECK(strstr(error, "exceeds budget") != NULL);
+    CHECK(strstr(error, "model=") != NULL);
+    CHECK(strstr(error, "kv=") != NULL);
+    CHECK(strstr(error, "prompt=") != NULL);
+    CHECK(strstr(error, "vision=") != NULL);
+    CHECK(strstr(error, "decoder=") != NULL);
+    CHECK(strstr(error, "moe=") != NULL);
+    CHECK(strstr(error, "logits=") != NULL);
+    CHECK(strstr(error, "safety=") != NULL);
 
     uocr_memory_report report;
     memset(&report, 0, sizeof(report));

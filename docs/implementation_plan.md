@@ -539,7 +539,7 @@ Current priority slice, in order. The coding agent should take the first uncheck
   - [x] logits/readback
   - [x] transient buffers
 - [x] Add `uocr_engine_memory_report()` or log output at open and after first run.
-- [ ] Implement admission control:
+- [x] Implement admission control:
   - [x] minimal request memory-budget enforcement before generation/ABI smoke path
   - [x] resident weights estimate from `.uocr` tensor-data section and model-open budget rejection
   - [x] KV cache estimate
