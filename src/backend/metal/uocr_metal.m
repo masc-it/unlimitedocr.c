@@ -3730,7 +3730,7 @@ static int metal_hot_path_alloc_guard_end(const uocr_metal_context *ctx,
     return 1;
 }
 
-static int metal_prewarm_integrated_decode_pipelines(uocr_metal_context *ctx, char *error, size_t error_size) {
+static int metal_prewarm_integrated_decoder_pipelines(uocr_metal_context *ctx, char *error, size_t error_size) {
     static const char *const pipeline_names[] = {
         "uocr_rmsnorm_f16_to_f16",
         "uocr_dense_f16_to_f32",
@@ -3738,6 +3738,7 @@ static int metal_prewarm_integrated_decode_pipelines(uocr_metal_context *ctx, ch
         "uocr_attention_qkvo_f16_to_f16",
         "uocr_rope_qk_f16_to_f16",
         "uocr_kv_cache_write_f16",
+        "uocr_prefill_attention_f16_to_f16",
         "uocr_decode_attention_f16_to_f16",
         "uocr_attention_output_residual_f16_to_f16",
         "uocr_dense_swiglu_gate_up_f16",
@@ -5595,11 +5596,35 @@ int uocr_metal_context_generate_f16(uocr_metal_context *ctx,
         return metal_fail(error, error_size, "failed to assemble integrated prompt into Metal arena: %s", detail);
     }
 
-    if (!metal_run_decoder_prefill_text_f16(ctx, request->slot, request->n_tokens, error, error_size)) {
+    if (!metal_prewarm_integrated_decoder_pipelines(ctx, error, error_size)) {
         char detail[512];
         (void)snprintf(detail, sizeof(detail), "%s", (error != NULL && error[0] != '\0') ? error : "unknown error");
+        return metal_fail(error, error_size, "failed to prepare integrated Metal fp16 decoder pipelines: %s", detail);
+    }
+
+    const uocr_metal_hot_path_alloc_guard prefill_guard =
+        metal_hot_path_alloc_guard_begin(ctx);
+    char prefill_error[512];
+    prefill_error[0] = '\0';
+    const int prefill_ok = metal_run_decoder_prefill_text_f16(ctx,
+                                                             request->slot,
+                                                             request->n_tokens,
+                                                             prefill_error,
+                                                             sizeof(prefill_error));
+    if (!metal_hot_path_alloc_guard_end(ctx,
+                                        &prefill_guard,
+                                        "integrated Metal fp16 prompt prefill",
+                                        error,
+                                        error_size)) {
         ctx->has_integrated_prefill = 0;
-        return metal_fail(error, error_size, "integrated Metal fp16 prompt prefill failed: %s", detail);
+        return 0;
+    }
+    if (!prefill_ok) {
+        ctx->has_integrated_prefill = 0;
+        return metal_fail(error,
+                          error_size,
+                          "integrated Metal fp16 prompt prefill failed: %s",
+                          prefill_error[0] != '\0' ? prefill_error : "unknown error");
     }
 
     if (request->max_new_tokens == 0u) {
@@ -5641,13 +5666,6 @@ int uocr_metal_context_generate_f16(uocr_metal_context *ctx,
                                         &hidden_for_selection)) {
         uocr_free(sequence);
         return metal_fail(error, error_size, "integrated Metal fp16 prefill final-token hidden slice is invalid");
-    }
-
-    if (!metal_prewarm_integrated_decode_pipelines(ctx, error, error_size)) {
-        char detail[512];
-        (void)snprintf(detail, sizeof(detail), "%s", (error != NULL && error[0] != '\0') ? error : "unknown error");
-        uocr_free(sequence);
-        return metal_fail(error, error_size, "failed to prepare integrated Metal fp16 decode pipelines: %s", detail);
     }
 
     const uocr_metal_hot_path_alloc_guard decode_loop_guard =

@@ -528,7 +528,7 @@ Current priority slice, in order. The coding agent should take the first uncheck
   - [x] `uocr_malloc_zeroed` using `malloc + memset`, not lazy `calloc`, for large hot-state buffers
   - [x] internal live/peak/total/failure allocation counters
   - [x] no-allocation guard primitive for future hot-path checks
-- [ ] Add allocation guard around prefill/decode hot paths.
+- [x] Add allocation guard around prefill/decode hot paths.
 - [x] Implement runtime memory categories and live/peak counters:
   - [x] model views
   - [x] KV cache
