@@ -114,6 +114,13 @@ from .ocr import (
     ocr_pdf,
     pdf_to_images,
 )
+from .perf import (
+    PerfSmokeResult,
+    build_perf_smoke_result,
+    deterministic_perf_image,
+    generation_tokens_per_second,
+    run_public_metal_perf_smoke,
+)
 from .parity import (
     DumpedImageEmbeddingGenerationResult,
     default_metal_resource_path,
@@ -258,6 +265,11 @@ __all__ = [
     "ocr_pages",
     "ocr_pdf",
     "pdf_to_images",
+    "PerfSmokeResult",
+    "build_perf_smoke_result",
+    "deterministic_perf_image",
+    "generation_tokens_per_second",
+    "run_public_metal_perf_smoke",
     "DumpedImageEmbeddingGenerationResult",
     "default_metal_resource_path",
     "generate_from_dumped_image_embeddings",

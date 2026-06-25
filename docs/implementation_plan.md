@@ -1012,11 +1012,11 @@ Do not start the stable high-level OCR/PDF API until Gate E2E-0 passes: public f
   - [x] router top-6 agreement must remain high because router itself is fp16
   - [x] logits top-k/KL within calibrated thresholds
   - [x] generated OCR text/layout stable on calibration set
-- [ ] Add perf smoke tests:
-  - [ ] model open time
-  - [ ] first-token latency after warmup
-  - [ ] decode tokens/sec single request
-  - [ ] peak memory report
+- [x] Add perf smoke tests:
+  - [x] model open time
+  - [x] first-token latency after warmup
+  - [x] decode tokens/sec single request
+  - [x] peak memory report
 - [ ] Keep large conversion and full inference tests manual/opt-in until weights are available locally.
 
 ## 22. Documentation and developer workflow
