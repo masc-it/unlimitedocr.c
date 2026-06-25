@@ -1625,6 +1625,10 @@ static int metal_refresh_vision_binding_cache(uocr_metal_context *ctx,
                                               const uocr_model_file *model,
                                               char *error,
                                               size_t error_size);
+static int metal_prebuild_mps_model_objects(uocr_metal_context *ctx,
+                                            const uocr_model_file *model,
+                                            char *error,
+                                            size_t error_size);
 static int metal_vision_weight_cache_build_direct(const uocr_metal_vision_binding_cache *binding_cache,
                                                   uocr_metal_vision_weights_f16 *out_weights,
                                                   char *error,
@@ -1810,6 +1814,16 @@ int uocr_metal_context_map_model(uocr_metal_context *ctx, const uocr_model_file 
     if (!metal_refresh_vision_binding_cache(ctx, model, vision_error, sizeof(vision_error))) {
         metal_invalidate_vision_binding_cache(ctx,
                                               vision_error[0] != '\0' ? vision_error : "vision tensor bindings are not available");
+    }
+
+    char mps_error[256];
+    memset(mps_error, 0, sizeof(mps_error));
+    if (!metal_prebuild_mps_model_objects(ctx, model, mps_error, sizeof(mps_error))) {
+        uocr_metal_context_unmap_model(ctx);
+        return metal_fail(error,
+                          error_size,
+                          "failed to prebuild Metal MPS model objects: %s",
+                          mps_error[0] != '\0' ? mps_error : "unknown error");
     }
 
     metal_clear_error(error, error_size);
@@ -6856,6 +6870,107 @@ static id metal_mps_matrix_array_from_slice(uocr_metal_context *ctx,
         metal_profile_add_event_ms(ctx, cache_create_event, 0.0);
     }
     return array;
+}
+
+static int metal_tensor_shape2_is(const uocr_tensor_entry *tensor, uint32_t rows, uint32_t cols) {
+    return tensor != NULL && tensor->rank == 2u && tensor->logical_shape[0] == rows &&
+           tensor->logical_shape[1] == cols && tensor->physical_shape[0] == rows &&
+           tensor->physical_shape[1] == cols;
+}
+
+static int metal_tensor_is_mps_gemm_weight(const uocr_tensor_entry *tensor) {
+    if (tensor == NULL || tensor->usage != UOCR_TENSOR_USAGE_RUNTIME || tensor->qtype != UOCR_TENSOR_F16 ||
+        tensor->rank != 2u || tensor->logical_shape[0] == 0u || tensor->logical_shape[1] == 0u ||
+        tensor->physical_shape[0] != tensor->logical_shape[0] || tensor->physical_shape[1] != tensor->logical_shape[1]) {
+        return 0;
+    }
+    switch (tensor->family) {
+        case UOCR_TENSOR_FAMILY_LM_HEAD:
+        case UOCR_TENSOR_FAMILY_LAYER_ATTN:
+        case UOCR_TENSOR_FAMILY_LAYER_DENSE_MLP:
+        case UOCR_TENSOR_FAMILY_MOE_ROUTER:
+        case UOCR_TENSOR_FAMILY_MOE_EXPERT:
+        case UOCR_TENSOR_FAMILY_MOE_SHARED:
+        case UOCR_TENSOR_FAMILY_PROJECTOR:
+            return 1;
+        case UOCR_TENSOR_FAMILY_VISION_SAM:
+            return metal_tensor_shape2_is(tensor, UOCR_SAM_QKV_SIZE, UOCR_SAM_HIDDEN_SIZE) ||
+                   metal_tensor_shape2_is(tensor, UOCR_SAM_HIDDEN_SIZE, UOCR_SAM_HIDDEN_SIZE) ||
+                   metal_tensor_shape2_is(tensor, UOCR_SAM_MLP_INTERMEDIATE, UOCR_SAM_HIDDEN_SIZE) ||
+                   metal_tensor_shape2_is(tensor, UOCR_SAM_HIDDEN_SIZE, UOCR_SAM_MLP_INTERMEDIATE);
+        case UOCR_TENSOR_FAMILY_VISION_CLIP:
+            return metal_tensor_shape2_is(tensor, UOCR_CLIP_QKV_SIZE, UOCR_CLIP_HIDDEN_SIZE) ||
+                   metal_tensor_shape2_is(tensor, UOCR_CLIP_HIDDEN_SIZE, UOCR_CLIP_HIDDEN_SIZE) ||
+                   metal_tensor_shape2_is(tensor, UOCR_CLIP_MLP_INTERMEDIATE, UOCR_CLIP_HIDDEN_SIZE) ||
+                   metal_tensor_shape2_is(tensor, UOCR_CLIP_HIDDEN_SIZE, UOCR_CLIP_MLP_INTERMEDIATE);
+        default:
+            return 0;
+    }
+}
+
+static int metal_prebuild_mps_weight_ndarray(uocr_metal_context *ctx,
+                                             const uocr_tensor_entry *tensor,
+                                             char *error,
+                                             size_t error_size) {
+    if (ctx == NULL || tensor == NULL) {
+        return metal_fail(error, error_size, "invalid Metal MPS weight prebuild request");
+    }
+    if (tensor->payload_size == 0u || tensor->payload_size > (uint64_t)NSUIntegerMax) {
+        return metal_fail(error, error_size, "Metal MPS weight tensor %u has invalid payload size", tensor->id);
+    }
+    id<MTLBuffer> buffer = nil;
+    NSUInteger offset = 0u;
+    if (!metal_get_mapped_tensor_buffer(ctx, tensor->id, tensor->payload_size, &buffer, &offset, error, error_size)) {
+        return 0;
+    }
+    uocr_metal_buffer_slice slice = { buffer, offset };
+    id array = metal_mps_matrix_array_from_slice(ctx,
+                                                  slice,
+                                                  tensor->logical_shape[0],
+                                                  tensor->logical_shape[1],
+                                                  1,
+                                                  UOCR_METAL_MPS_DATA_TYPE_FLOAT16,
+                                                  1,
+                                                  0,
+                                                  tensor->payload_size);
+    if (array == nil) {
+        return metal_fail(error, error_size, "failed to prebuild Metal MPS weight NDArray for tensor %u", tensor->id);
+    }
+    [array release];
+    return 1;
+}
+
+static int metal_prebuild_mps_model_objects(uocr_metal_context *ctx,
+                                            const uocr_model_file *model,
+                                            char *error,
+                                            size_t error_size) {
+    if (ctx == NULL || model == NULL || model->tensors == NULL) {
+        return metal_fail(error, error_size, "invalid Metal MPS model prebuild request");
+    }
+    if (!metal_mps_framework_available()) {
+        metal_profile_add_event_ms(ctx, "metal.mps.prebuild_model_objects.skipped", 0.0);
+        return 1;
+    }
+    if (!uocr_metal_context_decoder_bindings_ready(ctx) && !uocr_metal_context_vision_bindings_ready(ctx)) {
+        metal_profile_add_event_ms(ctx, "metal.mps.prebuild_model_objects.no_valid_bindings", 0.0);
+        return 1;
+    }
+
+    const uint64_t prebuild_start_ns = uocr_profile_now_ns();
+    @autoreleasepool {
+        for (uint32_t i = 0u; i < model->tensor_count; ++i) {
+            const uocr_tensor_entry *tensor = &model->tensors[i];
+            if (!metal_tensor_is_mps_gemm_weight(tensor)) {
+                continue;
+            }
+            if (!metal_prebuild_mps_weight_ndarray(ctx, tensor, error, error_size)) {
+                return 0;
+            }
+        }
+    }
+    metal_profile_add_event_now(ctx, "metal.mps.prebuild_model_objects", prebuild_start_ns);
+    metal_clear_error(error, error_size);
+    return 1;
 }
 
 static id metal_ensure_mps_matmul_kernel(uocr_metal_context *ctx, char *error, size_t error_size) {

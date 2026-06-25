@@ -124,7 +124,7 @@ Implementation status:
 - [ ] Precompute SAM absolute position tables during conversion for `64x64` and `40x40` patch grids.
 - [ ] Precompute CLIP absolute position tables during conversion for `16x16` and `10x10` patch grids.
 - [ ] Use MPSNDArray matrix multiplication for SAM QKV, SAM output projection, SAM MLP, CLIP QKV, CLIP output projection, CLIP MLP, and projector dense GEMMs.
-- [ ] Cache all MPS descriptors and weight NDArrays at model map time.
+- [x] Cache all MPS descriptors and weight NDArrays at model map time.
 - [ ] Replace SAM patch embed with a custom tiled patch kernel.
 - [ ] Replace SAM neck 1x1, neck 3x3, net_2, and net_3 with custom tiled convolution kernels.
 - [ ] Fuse vision epilogues into fixed kernels: bias, GELU, QuickGELU, residual add, and layout conversion.
@@ -214,7 +214,7 @@ Implementation status:
 - [x] Add MPS allocation/object counters and per-call timings.
 - [x] Cache stable descriptors and long-lived weight NDArrays by shape/layout/transpose.
 - [ ] Cache workspace input/output NDArrays for every reusable vision and decoder prefill slice.
-- [ ] Prebuild all MPS descriptors and weight NDArrays during model map/binding validation.
+- [x] Prebuild all MPS descriptors and weight NDArrays during model map/binding validation.
 - [ ] Use stack/static small Objective-C arrays for fixed two-input matmul encoding where supported by the API boundary.
 - [x] Remove destination zero-fill blits from MPS matmul calls after parity confirms all destinations are fully overwritten.
 - [ ] Make public Metal OCR require the chosen MPS GEMM path for large GEMMs.
