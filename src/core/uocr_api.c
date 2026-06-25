@@ -777,6 +777,7 @@ int uocr_generate_prepared(uocr_engine *engine,
     uint32_t max_prompt_tokens_in_batch = 0u;
     uint32_t max_visual_tokens_in_batch = 0u;
     uint32_t max_vision_chunk_projected_rows = 0u;
+    uint32_t max_vision_view_size = 0u;
     int any_generation_requested = 0;
     const uint64_t validation_start_ns = uocr_profile_now_ns();
     for (uint32_t i = 0u; i < n_requests; ++i) {
@@ -809,6 +810,14 @@ int uocr_generate_prepared(uocr_engine *engine,
         if (vision_schedule.max_chunk_projected_tokens > max_vision_chunk_projected_rows) {
             max_vision_chunk_projected_rows = vision_schedule.max_chunk_projected_tokens;
         }
+        for (uint32_t view_index = 0u; view_index < requests[i].n_views; ++view_index) {
+            const uint32_t view_size = requests[i].views[view_index].width > requests[i].views[view_index].height ?
+                                           requests[i].views[view_index].width :
+                                           requests[i].views[view_index].height;
+            if (view_size > max_vision_view_size) {
+                max_vision_view_size = view_size;
+            }
+        }
         if (requests[i].n_tokens > max_prompt_tokens_in_batch) {
             max_prompt_tokens_in_batch = requests[i].n_tokens;
         }
@@ -821,12 +830,13 @@ int uocr_generate_prepared(uocr_engine *engine,
 
     uocr_runtime_memory_estimate request_estimate;
     const uint64_t estimate_start_ns = uocr_profile_now_ns();
-    const int estimate_status = uocr_estimate_runtime_memory_with_vision(n_requests,
-                                                                         max_prompt_tokens_in_batch,
-                                                                         engine->model_view_bytes,
-                                                                         max_visual_tokens_in_batch,
-                                                                         max_vision_chunk_projected_rows,
-                                                                         &request_estimate);
+    const int estimate_status = uocr_estimate_runtime_memory_with_vision_shape(n_requests,
+                                                                               max_prompt_tokens_in_batch,
+                                                                               engine->model_view_bytes,
+                                                                               max_visual_tokens_in_batch,
+                                                                               max_vision_chunk_projected_rows,
+                                                                               max_vision_view_size,
+                                                                               &request_estimate);
     if (estimate_status != UOCR_OK) {
         return set_engine_errorf(engine, estimate_status, "failed to estimate request memory requirements");
     }

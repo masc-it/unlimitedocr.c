@@ -2768,8 +2768,35 @@ static int metal_vision_workspace_assign_slice(uocr_metal_vision_workspace_slice
     return 1;
 }
 
+static int metal_vision_workspace_shape_for_view_size(uint32_t max_view_size,
+                                                       uint32_t *out_patch_grid,
+                                                       uint32_t *out_projected_grid,
+                                                       char *error,
+                                                       size_t error_size) {
+    if (out_patch_grid == NULL || out_projected_grid == NULL) {
+        return metal_fail(error, error_size, "invalid Metal vision workspace shape output");
+    }
+    if (max_view_size == UOCR_GLOBAL_VIEW_SIZE) {
+        *out_patch_grid = UOCR_GLOBAL_VIEW_SIZE / UOCR_VISION_PATCH_SIZE;
+        *out_projected_grid = UOCR_GLOBAL_GRID_QUERIES;
+        return 1;
+    }
+    if (max_view_size == UOCR_LOCAL_VIEW_SIZE) {
+        *out_patch_grid = UOCR_LOCAL_VIEW_SIZE / UOCR_VISION_PATCH_SIZE;
+        *out_projected_grid = UOCR_LOCAL_GRID_QUERIES;
+        return 1;
+    }
+    return metal_fail(error,
+                      error_size,
+                      "Metal vision workspace max view size must be %u or %u, got %u",
+                      UOCR_LOCAL_VIEW_SIZE,
+                      UOCR_GLOBAL_VIEW_SIZE,
+                      max_view_size);
+}
+
 static int metal_vision_workspace_init(uocr_metal_context *ctx,
                                        uocr_metal_vision_workspace *workspace,
+                                       uint32_t max_view_size,
                                        uint32_t projected_row_capacity,
                                        uint32_t final_visual_row_capacity,
                                        char *error,
@@ -2778,14 +2805,21 @@ static int metal_vision_workspace_init(uocr_metal_context *ctx,
         return metal_fail(error, error_size, "Metal vision workspace output is null");
     }
     memset(workspace, 0, sizeof(*workspace));
-    const uint64_t sam_bhwc_values = (uint64_t)UOCR_SAM_MAX_GRID_TOKENS * (uint64_t)UOCR_SAM_HIDDEN_SIZE;
-    const uint64_t sam_neck_values = (uint64_t)UOCR_SAM_NECK_CHANNELS * (uint64_t)UOCR_SAM_MAX_GRID_TOKENS;
-    const uint64_t max_net2_grid = (uint64_t)((UOCR_SAM_MAX_GRID_SIZE + 1u) / 2u);
+    uint32_t patch_grid = 0u;
+    uint32_t projected_grid = 0u;
+    if (!metal_vision_workspace_shape_for_view_size(max_view_size, &patch_grid, &projected_grid, error, error_size)) {
+        return 0;
+    }
+    const uint64_t patch_tokens = (uint64_t)patch_grid * (uint64_t)patch_grid;
+    const uint64_t projected_tokens_per_view = (uint64_t)projected_grid * (uint64_t)projected_grid;
+    const uint64_t sam_bhwc_values = patch_tokens * (uint64_t)UOCR_SAM_HIDDEN_SIZE;
+    const uint64_t sam_neck_values = (uint64_t)UOCR_SAM_NECK_CHANNELS * patch_tokens;
+    const uint64_t max_net2_grid = ((uint64_t)patch_grid + 1u) / 2u;
     const uint64_t max_net3_grid = (max_net2_grid + 1u) / 2u;
     const uint64_t sam_net2_values = (uint64_t)UOCR_SAM_NET2_CHANNELS * max_net2_grid * max_net2_grid;
     const uint64_t sam_net3_values = (uint64_t)UOCR_SAM_NET3_CHANNELS * max_net3_grid * max_net3_grid;
-    const uint64_t clip_values = (uint64_t)UOCR_CLIP_MAX_TOKENS * (uint64_t)UOCR_CLIP_HIDDEN_SIZE;
-    const uint64_t concat_values = (uint64_t)UOCR_GLOBAL_GRID_QUERIES * (uint64_t)UOCR_GLOBAL_GRID_QUERIES * (uint64_t)UOCR_PROJECTOR_IN_SIZE;
+    const uint64_t clip_values = (projected_tokens_per_view + (uint64_t)UOCR_CLIP_CLASS_TOKENS) * (uint64_t)UOCR_CLIP_HIDDEN_SIZE;
+    const uint64_t concat_values = projected_tokens_per_view * (uint64_t)UOCR_PROJECTOR_IN_SIZE;
     uint64_t projected_values = 0u;
     uint64_t final_visual_values = 0u;
     if (projected_row_capacity != 0u &&
@@ -3261,8 +3295,17 @@ static int metal_context_encode_visual_features_to_workspace_f16(uocr_metal_cont
         return 0;
     }
 
+    uint32_t max_view_size = 0u;
+    for (uint32_t i = 0u; i < request->n_views; ++i) {
+        const uint32_t view_size = request->views[i].width > request->views[i].height ? request->views[i].width : request->views[i].height;
+        if (view_size > max_view_size) {
+            max_view_size = view_size;
+        }
+    }
+
     if (!metal_vision_workspace_init(ctx,
                                      scratch,
+                                     max_view_size,
                                      schedule->max_chunk_projected_tokens,
                                      schedule->final_visual_tokens,
                                      error,
@@ -3426,7 +3469,7 @@ int uocr_metal_context_encode_sam_features_f16(uocr_metal_context *ctx,
     }
 
     uocr_metal_vision_workspace scratch;
-    if (!metal_vision_workspace_init(ctx, &scratch, 0u, 0u, error, error_size)) {
+    if (!metal_vision_workspace_init(ctx, &scratch, expected_size, 0u, 0u, error, error_size)) {
         return 0;
     }
 
@@ -3509,7 +3552,7 @@ int uocr_metal_context_encode_clip_features_f16(uocr_metal_context *ctx,
     }
 
     uocr_metal_vision_workspace scratch;
-    if (!metal_vision_workspace_init(ctx, &scratch, 0u, 0u, error, error_size)) {
+    if (!metal_vision_workspace_init(ctx, &scratch, expected_size, 0u, 0u, error, error_size)) {
         return 0;
     }
 
@@ -3596,7 +3639,7 @@ int uocr_metal_context_encode_projected_features_f16(uocr_metal_context *ctx,
     }
 
     uocr_metal_vision_workspace scratch;
-    if (!metal_vision_workspace_init(ctx, &scratch, 0u, 0u, error, error_size)) {
+    if (!metal_vision_workspace_init(ctx, &scratch, expected_size, 0u, 0u, error, error_size)) {
         return 0;
     }
 
