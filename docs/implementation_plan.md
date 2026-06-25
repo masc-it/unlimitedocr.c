@@ -970,7 +970,7 @@ Do not start the stable high-level OCR/PDF API until Gate E2E-0 passes: public f
 - [ ] Add fast always-on tests:
   - [x] tokenizer metadata validation
   - [x] prompt construction
-  - [ ] visual token count formulas
+  - [x] visual token count formulas
   - [ ] image preprocessing against upstream for tiny fixtures
   - [ ] `.uocr` synthetic loader/dumper
   - [ ] prepared-request validation

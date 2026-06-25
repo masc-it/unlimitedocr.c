@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 import importlib.util
 import json
+import math
 import sys
 
 import numpy as np
@@ -16,6 +17,8 @@ from unlimitedocr_c.frontend import (
     EOS_TOKEN_ID,
     EXPECTED_OUTPUT_IDS_NPY,
     EXPECTED_TEXT_TXT,
+    DOWNSAMPLE_RATIO,
+    GLOBAL_VIEW_SIZE,
     GLOBAL_VISUAL_TOKENS,
     IMAGE_TOKEN,
     IMAGE_TOKEN_ID,
@@ -23,9 +26,12 @@ from unlimitedocr_c.frontend import (
     LOCAL_VIEW_SIZE,
     MODEL_VOCAB_SIZE,
     PAD_TOKEN_ID,
+    PATCH_SIZE,
+    crop_visual_token_count,
     default_tokenizer_path,
     dynamic_preprocess,
     format_messages_plain,
+    global_visual_token_count,
     load_prepared_fixture,
     load_tokenizer,
     prepare_image,
@@ -160,6 +166,63 @@ def test_prompt_construction_rejects_placeholder_count_mismatch() -> None:
         prepare_text("<image>oops", max_new_tokens=0)
     with pytest.raises(ValueError, match="prompt has 0 <image> placeholders but 1 visual spans"):
         prepare_image(solid_image(64, 64), prompt="document parsing.", preset="base", max_new_tokens=0)
+
+
+@pytest.mark.parametrize(
+    ("image_size", "queries", "expected_tokens"),
+    [
+        (GLOBAL_VIEW_SIZE, 16, 273),
+        (LOCAL_VIEW_SIZE, 10, 111),
+    ],
+)
+def test_global_visual_token_count_formula(image_size: int, queries: int, expected_tokens: int) -> None:
+    assert queries == math.ceil((image_size // PATCH_SIZE) / DOWNSAMPLE_RATIO)
+    assert global_visual_token_count(image_size) == (queries + 1) * queries + 1
+    assert global_visual_token_count(image_size) == expected_tokens
+    assert GLOBAL_VISUAL_TOKENS == global_visual_token_count(GLOBAL_VIEW_SIZE)
+
+
+@pytest.mark.parametrize(
+    ("grid_w", "grid_h"),
+    [
+        (2, 1),
+        (1, 2),
+        (3, 2),
+        (4, 3),
+    ],
+)
+def test_crop_visual_token_count_formula(grid_w: int, grid_h: int) -> None:
+    stitched_local_rows = (LOCAL_QUERIES * grid_w + 1) * (LOCAL_QUERIES * grid_h)
+    assert crop_visual_token_count(grid_w, grid_h) == stitched_local_rows + GLOBAL_VISUAL_TOKENS
+
+
+def test_crop_visual_token_count_single_crop_shortcut_and_invalid_grids() -> None:
+    assert crop_visual_token_count(1, 1) == GLOBAL_VISUAL_TOKENS
+    assert crop_visual_token_count(1, 1) != (LOCAL_QUERIES + 1) * LOCAL_QUERIES + GLOBAL_VISUAL_TOKENS
+    with pytest.raises(ValueError, match="invalid crop grid"):
+        crop_visual_token_count(0, 1)
+    with pytest.raises(ValueError, match="invalid crop grid"):
+        crop_visual_token_count(1, 0)
+
+
+def test_prepared_requests_use_visual_token_formulas() -> None:
+    base = prepare_image(solid_image(320, 240), preset="base", max_new_tokens=0)
+    assert base.expected_visual_tokens == global_visual_token_count(GLOBAL_VIEW_SIZE)
+    assert int(base.image_mask.sum(dtype=np.uint64)) == base.expected_visual_tokens
+
+    gundam_small = prepare_image(solid_image(320, 240), preset="gundam", max_new_tokens=0)
+    assert (gundam_small.crop_grid_w, gundam_small.crop_grid_h) == (1, 1)
+    assert gundam_small.expected_visual_tokens == crop_visual_token_count(1, 1)
+    assert int(gundam_small.image_mask.sum(dtype=np.uint64)) == gundam_small.expected_visual_tokens
+
+    gundam_wide = prepare_image(solid_image(1280, 640), preset="gundam", max_new_tokens=0)
+    assert (gundam_wide.crop_grid_w, gundam_wide.crop_grid_h) == (2, 1)
+    assert gundam_wide.expected_visual_tokens == crop_visual_token_count(2, 1)
+    assert int(gundam_wide.image_mask.sum(dtype=np.uint64)) == gundam_wide.expected_visual_tokens
+
+    pages = prepare_pages([solid_image(300, 500), solid_image(500, 300), solid_image(256, 256)], max_new_tokens=0)
+    assert pages.expected_visual_tokens == 3 * global_visual_token_count(GLOBAL_VIEW_SIZE)
+    assert int(pages.image_mask.sum(dtype=np.uint64)) == pages.expected_visual_tokens
 
 
 def test_prepare_gundam_small_image_uses_global_only() -> None:
