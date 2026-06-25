@@ -591,15 +591,15 @@ Current priority slice, in order. The coding agent should take the first uncheck
 
 ## 13. CPU reference and diagnostic kernels
 
-- [ ] Implement CPU reference code only for correctness diagnostics; do not aim for full fast CPU inference.
-- [ ] Implement scalar conversions:
-  - [ ] BF16 -> F32
-  - [ ] F32 -> F16
-  - [ ] F16 -> F32
-- [ ] Implement fp32/fp16 tensor helpers for small fixtures.
-- [ ] Implement CPU RMSNorm with fp32 variance and eps `1e-6`.
-- [ ] Implement Llama/DeepSeek RoPE using split-half layout, not interleaved layout.
-- [ ] Implement CPU causal SDPA for tiny text-only fixtures.
+- [x] Implement CPU reference code only for correctness diagnostics; do not aim for full fast CPU inference.
+- [x] Implement scalar conversions:
+  - [x] BF16 -> F32
+  - [x] F32 -> F16
+  - [x] F16 -> F32
+- [x] Implement fp32/fp16 tensor helpers for small fixtures.
+- [x] Implement CPU RMSNorm with fp32 variance and eps `1e-6`.
+- [x] Implement Llama/DeepSeek RoPE using split-half layout, not interleaved layout.
+- [x] Implement CPU causal SDPA for tiny text-only fixtures.
 - [ ] Implement CPU KV cache append/ring behavior for tiny fixtures.
 - [ ] Implement CPU dense SwiGLU for layer 0.
 - [ ] Implement CPU MoE router:
@@ -983,7 +983,7 @@ Do not start the stable high-level OCR/PDF API until Gate E2E-0 passes: public f
   - [x] tensor id lookup
   - [x] allocation wrapper accounting/overflow/guard tests
   - [x] runtime memory accounting and KV formula tests
-  - [ ] CPU reference tiny ops
+  - [x] CPU reference tiny ops
 - [ ] Add Metal tests that do not need full model weights:
   - [x] compile all kernels
   - [x] run RMSNorm on synthetic tensor

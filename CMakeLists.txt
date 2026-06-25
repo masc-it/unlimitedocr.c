@@ -87,6 +87,9 @@ uocr_apply_sanitizers(uocr_core)
 
 if(UOCR_ENABLE_CPU_REF)
     target_sources(uocr_core PRIVATE src/backend/cpu_ref/uocr_cpu_ref.c)
+    if(NOT APPLE AND NOT WIN32)
+        target_link_libraries(uocr_core PUBLIC m)
+    endif()
 endif()
 
 if(UOCR_METAL_ENABLED)
@@ -257,6 +260,17 @@ if(UOCR_BUILD_TESTS)
     uocr_apply_common_warnings(test_vision)
     uocr_apply_sanitizers(test_vision)
     add_test(NAME uocr_vision COMMAND test_vision)
+
+    if(UOCR_ENABLE_CPU_REF)
+        add_executable(test_cpu_ref tests/test_cpu_ref.c)
+        target_include_directories(test_cpu_ref PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/include"
+            "${CMAKE_CURRENT_SOURCE_DIR}/src")
+        target_link_libraries(test_cpu_ref PRIVATE uocr_core)
+        uocr_apply_common_warnings(test_cpu_ref)
+        uocr_apply_sanitizers(test_cpu_ref)
+        add_test(NAME uocr_cpu_ref COMMAND test_cpu_ref)
+    endif()
 
     if(UOCR_METAL_ENABLED AND UOCR_METAL_RUNTIME_COMPILE)
         add_executable(test_metal tests/test_metal.c)
