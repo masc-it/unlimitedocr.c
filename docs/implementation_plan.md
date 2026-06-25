@@ -428,7 +428,7 @@ Current priority slice, in order. The coding agent should take the first uncheck
 - [x] Add single-tensor compare mode for converter development.
 - [x] Add strict loader tests using only a tiny synthetic `.uocr` file, so CI does not require full weights.
 - [x] Add writer tests using tiny synthetic safetensors payloads so `.uocr` serialization and BF16->fp16 streaming are covered without full weights.
-- [ ] Add an opt-in full-model converter smoke test for local machines with the full safetensors file.
+- [x] Add an opt-in full-model converter smoke test for local machines with the full safetensors file.
 - [x] Keep converter/loader unit tests runnable without full weights by using synthetic `.uocr` files, synthetic safetensors payloads, and the cached safetensors header/index.
 
 ## 9. C public API and Python FFI

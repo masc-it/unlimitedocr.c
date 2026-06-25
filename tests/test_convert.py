@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import struct
 from pathlib import Path
 
@@ -156,6 +157,30 @@ def _write_tiny_safetensors(hf_dir) -> tuple[dict[str, bytes], dict[str, tuple[i
     (hf_dir / "model.safetensors.index.json").write_text(json.dumps(index), encoding="utf-8")
     (hf_dir / "tokenizer.json").write_text("{}\n", encoding="utf-8")
     return payloads, {name: shape for name, (_values, shape) in tensors.items()}
+
+
+def _full_model_converter_hf_dir_or_skip() -> Path:
+    if os.environ.get("UOCR_RUN_LARGE_TESTS") != "1":
+        pytest.skip("set UOCR_RUN_LARGE_TESTS=1 to run the full-model converter smoke test")
+    hf_dir_env = os.environ.get("UOCR_HF_DIR")
+    if not hf_dir_env:
+        pytest.skip("set UOCR_HF_DIR to a local baidu/Unlimited-OCR checkout with full safetensors payload")
+    hf_dir = Path(hf_dir_env)
+    if not hf_dir.exists():
+        pytest.fail(f"UOCR_HF_DIR does not exist: {hf_dir}")
+    required = [
+        "config.json",
+        "processor_config.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "special_tokens_map.json",
+        "model.safetensors.index.json",
+        "model-00001-of-000001.safetensors",
+    ]
+    missing = [name for name in required if not (hf_dir / name).exists()]
+    if missing:
+        pytest.fail(f"UOCR_HF_DIR is missing required full-model files: {missing}")
+    return hf_dir
 
 
 def _write_stats_safetensors(hf_dir) -> tuple[bytes, np.ndarray]:
@@ -841,6 +866,53 @@ def test_converter_cli_compare_single_tensor(tmp_path) -> None:
         ]
     )
     assert status == 0
+
+
+def test_full_model_converter_smoke_streams_selected_real_tensors(tmp_path) -> None:
+    hf_dir = _full_model_converter_hf_dir_or_skip()
+
+    fp16_plan = build_dry_run_plan(hf_dir, qprofile="fp16")
+    assert fp16_plan.tensor_count == EXPECTED_TENSOR_COUNT
+    assert fp16_plan.total_source_bytes == EXPECTED_TOTAL_BYTES
+    assert fp16_plan.usage_histogram == {"runtime": EXPECTED_TENSOR_COUNT - 1, "preserved-unused": 1}
+    assert fp16_plan.summary_dict()["source_metadata"]["safetensors"]["source_files"] == [
+        "model-00001-of-000001.safetensors"
+    ]
+
+    fp16_selected = filter_plan_tensors(fp16_plan, "model.image_newline")
+    assert fp16_selected.tensor_count == 1
+    assert fp16_selected.tensors[0].qtype == "UOCR_TENSOR_F16"
+    fp16_out = tmp_path / "image_newline-fp16.uocr"
+    fp16_stats_path = tmp_path / "image_newline-fp16.stats.json"
+    write_uocr_model(fp16_selected, fp16_out, stats_path=fp16_stats_path)
+    fp16_compare = compare_single_tensor_conversion(fp16_selected, fp16_out)
+    assert fp16_compare.matches is True
+    fp16_stats = json.loads(fp16_stats_path.read_text(encoding="utf-8"))
+    assert fp16_stats["tensor_count"] == 1
+    assert fp16_stats["tensors"][0]["name"] == "model.image_newline"
+    assert fp16_stats["tensors"][0]["output_bytes_written"] == fp16_selected.tensors[0].output_bytes
+
+    q8_plan = build_dry_run_plan(hf_dir, qprofile="dyn-q8")
+    assert q8_plan.tensor_count == EXPECTED_TENSOR_COUNT
+    assert q8_plan.qtype_histogram["UOCR_TENSOR_Q8_0"] > 0
+    assert q8_plan.qtype_histogram["UOCR_TENSOR_F16"] > 0
+    q8_selected = filter_plan_tensors(q8_plan, "model.sam_model.patch_embed.proj.weight")
+    q8_tensor = q8_selected.tensors[0]
+    assert q8_tensor.qtype == "UOCR_TENSOR_Q8_0"
+    assert q8_tensor.logical_shape == (768, 768)
+    assert q8_tensor.physical_shape == (768, 768)
+    assert q8_tensor.output_bytes == 768 * ((768 // UOCR_Q8_0_BLOCK_SIZE) * UOCR_Q8_0_TYPE_SIZE)
+
+    q8_out = tmp_path / "sam-patch-q8.uocr"
+    q8_stats_path = tmp_path / "sam-patch-q8.stats.json"
+    write_uocr_model(q8_selected, q8_out, stats_path=q8_stats_path)
+    q8_compare = compare_single_tensor_conversion(q8_selected, q8_out)
+    assert q8_compare.matches is True
+    q8_stats = json.loads(q8_stats_path.read_text(encoding="utf-8"))
+    assert q8_stats["qprofile"] == "dyn-q8"
+    assert q8_stats["tensor_count"] == 1
+    assert q8_stats["tensors"][0]["qtype"] == "UOCR_TENSOR_Q8_0"
+    assert q8_stats["tensors"][0]["output_bytes_written"] == q8_tensor.output_bytes
 
 
 def test_write_uocr_model_requires_overwrite_for_existing_output(tmp_path) -> None:
