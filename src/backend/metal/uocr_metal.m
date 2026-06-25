@@ -10279,13 +10279,11 @@ int uocr_metal_context_clip_attention_f16(uocr_metal_context *ctx,
     uint64_t attention_values = 0u;
     uint64_t input_bytes = 0u;
     uint64_t output_bytes = 0u;
-    uint64_t group_count = 0u;
     const uint64_t output_element_bytes = output_type == UOCR_METAL_DENSE_OUTPUT_F16 ? 2u : (uint64_t)sizeof(float);
     if (!checked_mul_u64((uint64_t)token_count, (uint64_t)UOCR_CLIP_HIDDEN_SIZE, &attention_values) ||
         !checked_mul_u64(attention_values, 2u, &input_bytes) ||
         !checked_mul_u64(attention_values, output_element_bytes, &output_bytes) ||
-        !checked_mul_u64((uint64_t)token_count, (uint64_t)UOCR_CLIP_ATTENTION_HEADS, &group_count) ||
-        attention_values > (uint64_t)UINT32_MAX || group_count > (uint64_t)UINT32_MAX ||
+        attention_values > (uint64_t)UINT32_MAX ||
         input_bytes > (uint64_t)SIZE_MAX || output_bytes > (uint64_t)SIZE_MAX) {
         return metal_fail(error, error_size, "Metal CLIP attention byte-size overflow");
     }
@@ -11740,16 +11738,12 @@ static int metal_context_sam_attention_f16(uocr_metal_context *ctx,
     uint64_t attention_values = 0u;
     uint64_t input_bytes = 0u;
     uint64_t output_bytes = 0u;
-    uint64_t group_count = 0u;
     const uint64_t output_element_bytes = output_type == UOCR_METAL_DENSE_OUTPUT_F16 ? 2u : (uint64_t)sizeof(float);
     if (!checked_mul_u64((uint64_t)windows, (uint64_t)tokens_per_window, &attention_values) ||
         !checked_mul_u64(attention_values, (uint64_t)UOCR_SAM_HIDDEN_SIZE, &attention_values) ||
         !checked_mul_u64(attention_values, 2u, &input_bytes) ||
         !checked_mul_u64(attention_values, output_element_bytes, &output_bytes) ||
-        !checked_mul_u64((uint64_t)windows, (uint64_t)tokens_per_window, &group_count) ||
-        !checked_mul_u64(group_count, (uint64_t)UOCR_SAM_ATTENTION_HEADS, &group_count) ||
-        input_bytes > (uint64_t)SIZE_MAX || output_bytes > (uint64_t)SIZE_MAX ||
-        group_count > (uint64_t)UINT32_MAX) {
+        input_bytes > (uint64_t)SIZE_MAX || output_bytes > (uint64_t)SIZE_MAX) {
         return metal_fail(error, error_size, "%s byte-size overflow", diagnostic_name);
     }
 
@@ -12015,7 +12009,6 @@ int uocr_metal_context_sam_rel_pos_attention_f16(uocr_metal_context *ctx,
     uint64_t rel_w_values = 0u;
     uint64_t rel_h_bytes = 0u;
     uint64_t rel_w_bytes = 0u;
-    uint64_t group_count = 0u;
     const uint64_t output_element_bytes = output_type == UOCR_METAL_DENSE_OUTPUT_F16 ? 2u : (uint64_t)sizeof(float);
     if (!checked_mul_u64((uint64_t)grid_w, (uint64_t)grid_h, &tokens) || tokens == 0u ||
         tokens > (uint64_t)UOCR_SAM_MAX_GRID_TOKENS || tokens > (uint64_t)UINT32_MAX ||
@@ -12027,11 +12020,8 @@ int uocr_metal_context_sam_rel_pos_attention_f16(uocr_metal_context *ctx,
         !checked_mul_u64((uint64_t)rel_pos_w_length, (uint64_t)UOCR_SAM_HEAD_DIM, &rel_w_values) ||
         !checked_mul_u64(rel_h_values, 2u, &rel_h_bytes) ||
         !checked_mul_u64(rel_w_values, 2u, &rel_w_bytes) ||
-        !checked_mul_u64((uint64_t)n_windows, tokens, &group_count) ||
-        !checked_mul_u64(group_count, (uint64_t)UOCR_SAM_ATTENTION_HEADS, &group_count) ||
         input_bytes > (uint64_t)SIZE_MAX || output_bytes > (uint64_t)SIZE_MAX ||
-        rel_h_bytes > (uint64_t)SIZE_MAX || rel_w_bytes > (uint64_t)SIZE_MAX ||
-        group_count > (uint64_t)UINT32_MAX) {
+        rel_h_bytes > (uint64_t)SIZE_MAX || rel_w_bytes > (uint64_t)SIZE_MAX) {
         return metal_fail(error, error_size, "Metal SAM relative-position attention byte-size overflow");
     }
 
