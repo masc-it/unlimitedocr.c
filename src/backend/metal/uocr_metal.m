@@ -5705,6 +5705,7 @@ static int metal_prewarm_integrated_decoder_pipelines(uocr_metal_context *ctx, c
         "uocr_argmax_pairs_f32",
         "uocr_get_rows_f16_to_f16",
         "uocr_assemble_prompt_text_f16",
+        "uocr_assemble_prompt_text_skip_image_f16",
         "uocr_assemble_prompt_with_image_f16",
         "uocr_attention_qkvo_f16_to_f16",
         "uocr_rope_qk_f16_to_f16",
@@ -7464,6 +7465,7 @@ static int metal_select_next_token_from_hidden_slice_f16(uocr_metal_context *ctx
     }
     *token_id_out = (uint32_t)*token_ptr;
     *score_out = *score_ptr;
+    metal_profile_add_event_now(ctx, "metal.token_readback", token_readback_start_ns);
     metal_profile_add_event_now(ctx, "metal.decode.token_readback", token_readback_start_ns);
     return 1;
 }
@@ -8549,6 +8551,7 @@ static int metal_run_decoder_decode_one_f16(uocr_metal_context *ctx,
         current = output;
         current_segment = output_segment;
         metal_profile_add_event_now(ctx, "metal.decode.layer", layer_start_ns);
+        metal_profile_add_event_now(ctx, "metal.decode.layer_kernels", layer_start_ns);
         metal_profile_add_event_now_f(ctx, layer_start_ns, "metal.decode.layer.%02u", layer);
     }
 
@@ -8585,6 +8588,7 @@ static int metal_run_decoder_prefill_text_f16(uocr_metal_context *ctx,
         }
     }
 
+    const uint64_t prefill_command_encoding_start_ns = uocr_profile_now_ns();
     if (!metal_command_batch_begin(ctx, error, error_size)) {
         return 0;
     }
@@ -8772,10 +8776,13 @@ static int metal_run_decoder_prefill_text_f16(uocr_metal_context *ctx,
         }
         current_segment = 0u;
     }
+    metal_profile_add_event_now(ctx, "metal.prefill.command_encoding", prefill_command_encoding_start_ns);
+    const uint64_t prefill_command_wait_start_ns = uocr_profile_now_ns();
     if (!metal_command_batch_commit_and_wait(ctx, "integrated decoder prefill batch", error, error_size)) {
         ctx->has_integrated_prefill = 0;
         return 0;
     }
+    metal_profile_add_event_now(ctx, "metal.prefill.command_wait", prefill_command_wait_start_ns);
     ctx->has_integrated_prefill = 1;
     ctx->integrated_prefill_slot = slot;
     ctx->integrated_prefill_tokens = n_tokens;
@@ -9765,8 +9772,20 @@ static int metal_context_assemble_prompt_f16_with_table_buffer_to_buffer(uocr_me
                           (unsigned long long)dst_length);
     }
 
+    uint64_t image_dst_offset = 0u;
+    if (has_image_span) {
+        uint64_t image_dst_values = 0u;
+        uint64_t image_dst_delta = 0u;
+        if (!checked_mul_u64((uint64_t)image_span_start, (uint64_t)hidden_size, &image_dst_values) ||
+            !checked_mul_u64(image_dst_values, 2u, &image_dst_delta) ||
+            !checked_add_u64(dst_offset_u64, image_dst_delta, &image_dst_offset) ||
+            image_dst_offset > (uint64_t)NSUIntegerMax || image_bytes > (uint64_t)NSUIntegerMax) {
+            return metal_fail(error, error_size, "%s image-span output offset overflow", op);
+        }
+    }
+
     @autoreleasepool {
-        const char *function_name = has_image_span ? "uocr_assemble_prompt_with_image_f16" : "uocr_assemble_prompt_text_f16";
+        const char *function_name = has_image_span ? "uocr_assemble_prompt_text_skip_image_f16" : "uocr_assemble_prompt_text_f16";
         id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, function_name, error, error_size);
         if (pipeline == nil) {
             return 0;
@@ -9854,17 +9873,12 @@ static int metal_context_assemble_prompt_f16_with_table_buffer_to_buffer(uocr_me
         params.reserved1 = 0u;
         params.reserved2 = 0u;
 
+        const uint64_t token_gather_start_ns = uocr_profile_now_ns();
         [enc setComputePipelineState:pipeline];
         [enc setBuffer:table_buffer offset:table_offset atIndex:0u];
         [enc setBuffer:tokens offset:tokens_bind_offset atIndex:1u];
-        if (has_image_span) {
-            [enc setBuffer:image_features offset:image_features_bind_offset atIndex:2u];
-            [enc setBuffer:dst_buffer offset:dst_offset atIndex:3u];
-            [enc setBytes:&params length:sizeof(params) atIndex:4u];
-        } else {
-            [enc setBuffer:dst_buffer offset:dst_offset atIndex:2u];
-            [enc setBytes:&params length:sizeof(params) atIndex:3u];
-        }
+        [enc setBuffer:dst_buffer offset:dst_offset atIndex:2u];
+        [enc setBytes:&params length:sizeof(params) atIndex:3u];
 
         NSUInteger threads_per_group = pipeline.threadExecutionWidth;
         if (threads_per_group == 0u) {
@@ -9876,6 +9890,30 @@ static int metal_context_assemble_prompt_f16_with_table_buffer_to_buffer(uocr_me
         [enc dispatchThreads:MTLSizeMake((NSUInteger)hidden_size, (NSUInteger)n_tokens, 1u)
        threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1u, 1u)];
         [enc endEncoding];
+        metal_profile_add_event_now(ctx, "metal.prompt.token_gather", token_gather_start_ns);
+        metal_profile_add_event_now(ctx, "metal.prefill.token_gather", token_gather_start_ns);
+
+        if (has_image_span) {
+            const uint64_t image_blit_start_ns = uocr_profile_now_ns();
+            id<MTLBlitCommandEncoder> blit = metal_blit_command_encoder(ctx, cb);
+            if (blit == nil) {
+                if (owns_image_features) {
+                    [image_features release];
+                }
+                if (owns_tokens) {
+                    [tokens release];
+                }
+                return metal_fail(error, error_size, "failed to create %s image-span blit encoder", op);
+            }
+            [blit copyFromBuffer:image_features
+                    sourceOffset:image_features_bind_offset
+                        toBuffer:dst_buffer
+               destinationOffset:(NSUInteger)image_dst_offset
+                            size:(NSUInteger)image_bytes];
+            [blit endEncoding];
+            metal_profile_add_event_now(ctx, "metal.prompt.image_span_blit", image_blit_start_ns);
+            metal_profile_add_event_now(ctx, "metal.prefill.image_span_blit", image_blit_start_ns);
+        }
 
         if (!owned_command_buffer) {
             if (owns_tokens && !metal_retain_transient_until_completed(ctx, cb, tokens, error, error_size)) {

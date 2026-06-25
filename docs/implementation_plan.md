@@ -163,7 +163,7 @@ Implementation status:
 - [ ] Store no-repeat history in a reusable GPU sequence buffer.
 - [ ] Use the GPU-written token slot directly for generated-token embedding.
 - [ ] Fuse decode epilogues into fixed kernels: projection bias, residual add, MoE combine, and final hidden copy.
-- [ ] Add detailed timing for token gather, image-span blit, prefill command encoding, prefill wait, decode layer kernels, and token readback.
+- [x] Add detailed timing for token gather, image-span blit, prefill command encoding, prefill wait, decode layer kernels, and token readback.
 - [ ] Validate fixed-prompt generated ids and `docs/test.png` text before deleting old kernels.
 - [ ] Delete slow/unselected prompt, prefill, and decode production paths after the fused path passes parity and timing gates.
 
