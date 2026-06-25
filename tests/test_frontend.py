@@ -7,6 +7,7 @@ import sys
 
 import numpy as np
 from PIL import Image
+import pytest
 
 from unlimitedocr_c.frontend import (
     ADDED_TOKEN_COUNT,
@@ -112,6 +113,53 @@ def test_prepare_text_has_bos_and_no_image_mask() -> None:
     assert req.image_mask.sum() == 0
     assert req.max_new_tokens == 3
     assert req.views == ()
+
+
+def test_text_prompt_construction_prepends_bos_without_eos() -> None:
+    prompt = "  alpha beta  "
+    tokenizer = load_tokenizer()
+    req = prepare_text(prompt, max_new_tokens=0)
+
+    rendered = render_prompt(prompt)
+    expected_text_ids = tokenizer.encode(rendered, add_special_tokens=False).ids
+    np.testing.assert_array_equal(req.input_ids, np.array([BOS_TOKEN_ID, *expected_text_ids], dtype=np.int32))
+    np.testing.assert_array_equal(req.image_mask, np.zeros(1 + len(expected_text_ids), dtype=np.uint8))
+    assert req.rendered_prompt == "alpha beta"
+    assert int(req.input_ids[-1]) != EOS_TOKEN_ID
+
+
+def test_image_prompt_construction_splices_visual_span_between_text_segments() -> None:
+    prompt = "  before <image> after  "
+    tokenizer = load_tokenizer()
+    req = prepare_image(solid_image(64, 64), prompt=prompt, preset="base", max_new_tokens=0)
+
+    rendered = render_prompt(prompt)
+    prefix, suffix = rendered.split(IMAGE_TOKEN)
+    prefix_ids = tokenizer.encode(prefix, add_special_tokens=False).ids
+    suffix_ids = tokenizer.encode(suffix, add_special_tokens=False).ids
+    expected_ids = np.array(
+        [BOS_TOKEN_ID, *prefix_ids, *([IMAGE_TOKEN_ID] * GLOBAL_VISUAL_TOKENS), *suffix_ids],
+        dtype=np.int32,
+    )
+    expected_mask = np.array(
+        [0] * (1 + len(prefix_ids)) + [1] * GLOBAL_VISUAL_TOKENS + [0] * len(suffix_ids),
+        dtype=np.uint8,
+    )
+
+    np.testing.assert_array_equal(req.input_ids, expected_ids)
+    np.testing.assert_array_equal(req.image_mask, expected_mask)
+    assert req.expected_visual_tokens == GLOBAL_VISUAL_TOKENS
+    visual_start = 1 + len(prefix_ids)
+    visual_stop = visual_start + GLOBAL_VISUAL_TOKENS
+    assert np.flatnonzero(req.image_mask).tolist() == list(range(visual_start, visual_stop))
+    assert int(req.input_ids[-1]) != EOS_TOKEN_ID
+
+
+def test_prompt_construction_rejects_placeholder_count_mismatch() -> None:
+    with pytest.raises(ValueError, match="prompt has 1 <image> placeholders but 0 visual spans"):
+        prepare_text("<image>oops", max_new_tokens=0)
+    with pytest.raises(ValueError, match="prompt has 0 <image> placeholders but 1 visual spans"):
+        prepare_image(solid_image(64, 64), prompt="document parsing.", preset="base", max_new_tokens=0)
 
 
 def test_prepare_gundam_small_image_uses_global_only() -> None:
