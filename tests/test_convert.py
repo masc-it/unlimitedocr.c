@@ -53,9 +53,11 @@ from unlimitedocr_c.convert import (
     _TENSOR_ENTRY_STRUCT,
     _tensor_directory_bytes,
     build_dry_run_plan,
+    compare_single_tensor_conversion,
     describe_padded_q4_k_design,
     filter_plan_tensors,
     is_preserved_unused_in_normal_ocr,
+    main as convert_main,
     write_uocr_model,
 )
 from unlimitedocr_c.tensor_registry import (
@@ -765,6 +767,80 @@ def test_write_uocr_model_streams_dyn_q8_payload(tmp_path) -> None:
     assert q8_stats["source_nonfinite_count"] == 0
     assert q8_stats["source_bytes"] == len(payloads[q8_tensor.name])
     assert q8_stats["output_bytes_written"] == q8_tensor.output_bytes
+
+
+def test_compare_single_tensor_conversion_matches_fp16_and_reports_mismatch(tmp_path) -> None:
+    _write_tiny_safetensors(tmp_path)
+    plan = filter_plan_tensors(
+        build_dry_run_plan(tmp_path, qprofile="fp16", strict=False),
+        "model.sam_model.tiny_a.weight",
+    )
+    out = tmp_path / "tiny-single.uocr"
+    write_uocr_model(plan, out)
+
+    result = compare_single_tensor_conversion(plan, out)
+    assert result.matches is True
+    assert result.metadata_matches is True
+    assert result.payload_matches is True
+    assert result.expected_bytes == plan.tensors[0].output_bytes
+    assert result.actual_bytes == plan.tensors[0].output_bytes
+    assert result.compared_bytes == plan.tensors[0].output_bytes
+    assert result.expected_sha256 == result.actual_sha256
+    assert result.first_mismatch_offset is None
+    assert result.as_dict()["matches"] is True
+
+    raw = bytearray(out.read_bytes())
+    raw[plan.tensors[0].payload_offset + 3] ^= 0x7F
+    corrupt = tmp_path / "tiny-single-corrupt.uocr"
+    corrupt.write_bytes(raw)
+
+    mismatch = compare_single_tensor_conversion(plan, corrupt)
+    assert mismatch.matches is False
+    assert mismatch.metadata_matches is True
+    assert mismatch.payload_matches is False
+    assert mismatch.expected_sha256 != mismatch.actual_sha256
+    assert mismatch.first_mismatch_offset == 3
+    assert mismatch.expected_byte is not None
+    assert mismatch.actual_byte is not None
+
+
+def test_compare_single_tensor_conversion_matches_dyn_q8(tmp_path) -> None:
+    _write_tiny_safetensors(tmp_path)
+    plan = filter_plan_tensors(
+        build_dry_run_plan(tmp_path, qprofile="dyn-q8", strict=False),
+        "model.sam_model.tiny_a.weight",
+    )
+    out = tmp_path / "tiny-single-q8.uocr"
+    write_uocr_model(plan, out)
+
+    result = compare_single_tensor_conversion(plan, out)
+    assert result.matches is True
+    assert result.qtype == "UOCR_TENSOR_Q8_0"
+    assert result.expected_bytes == 2 * UOCR_Q8_0_TYPE_SIZE
+    assert result.expected_sha256 == result.actual_sha256
+
+
+def test_converter_cli_compare_single_tensor(tmp_path) -> None:
+    _write_tiny_safetensors(tmp_path)
+    tensor_name = "model.sam_model.tiny_a.weight"
+    plan = filter_plan_tensors(build_dry_run_plan(tmp_path, qprofile="fp16", strict=False), tensor_name)
+    out = tmp_path / "tiny-cli.uocr"
+    write_uocr_model(plan, out)
+
+    status = convert_main(
+        [
+            "--hf-dir",
+            str(tmp_path),
+            "--qprofile",
+            "fp16",
+            "--tensor",
+            tensor_name,
+            "--compare-uocr",
+            str(out),
+            "--relaxed-validation",
+        ]
+    )
+    assert status == 0
 
 
 def test_write_uocr_model_requires_overwrite_for_existing_output(tmp_path) -> None:

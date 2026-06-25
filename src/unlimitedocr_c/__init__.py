@@ -18,8 +18,10 @@ from .calibrate import (
 from .convert import (
     DryRunPlan,
     SectionPlan,
+    TensorCompareResult,
     TensorPlan,
     build_dry_run_plan,
+    compare_single_tensor_conversion,
     filter_plan_tensors,
     write_uocr_model,
 )
@@ -129,8 +131,10 @@ __all__ = [
     "run_calibration",
     "DryRunPlan",
     "SectionPlan",
+    "TensorCompareResult",
     "TensorPlan",
     "build_dry_run_plan",
+    "compare_single_tensor_conversion",
     "filter_plan_tensors",
     "write_uocr_model",
     "TensorFamily",

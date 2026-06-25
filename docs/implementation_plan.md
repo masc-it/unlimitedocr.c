@@ -425,7 +425,7 @@ Current priority slice, in order. The coding agent should take the first uncheck
   - [x] qtype/promotion reason
   - [x] source accounting status: runtime / preserved-unused / omitted
   - [x] planned `.uocr` section layout and tensor payload offsets/alignment
-- [ ] Add single-tensor compare mode for converter development.
+- [x] Add single-tensor compare mode for converter development.
 - [x] Add strict loader tests using only a tiny synthetic `.uocr` file, so CI does not require full weights.
 - [x] Add writer tests using tiny synthetic safetensors payloads so `.uocr` serialization and BF16->fp16 streaming are covered without full weights.
 - [ ] Add an opt-in full-model converter smoke test for local machines with the full safetensors file.

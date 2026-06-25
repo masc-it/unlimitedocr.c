@@ -586,6 +586,73 @@ class TensorConversionStats:
 
 
 @dataclass(frozen=True)
+class TensorCompareResult:
+    name: str
+    tensor_id: int
+    qtype: str
+    qtype_id: int
+    model_path: str
+    source_path: str
+    expected_bytes: int
+    actual_bytes: int
+    compared_bytes: int
+    expected_sha256: str
+    actual_sha256: str
+    payload_matches: bool
+    metadata_mismatches: tuple[str, ...]
+    first_mismatch_offset: int | None
+    expected_byte: int | None
+    actual_byte: int | None
+
+    @property
+    def metadata_matches(self) -> bool:
+        return not self.metadata_mismatches
+
+    @property
+    def matches(self) -> bool:
+        return self.payload_matches and self.metadata_matches
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "tensor_id": self.tensor_id,
+            "qtype": self.qtype,
+            "qtype_id": self.qtype_id,
+            "model_path": self.model_path,
+            "source_path": self.source_path,
+            "expected_bytes": self.expected_bytes,
+            "actual_bytes": self.actual_bytes,
+            "compared_bytes": self.compared_bytes,
+            "expected_sha256": self.expected_sha256,
+            "actual_sha256": self.actual_sha256,
+            "metadata_matches": self.metadata_matches,
+            "payload_matches": self.payload_matches,
+            "matches": self.matches,
+            "metadata_mismatches": list(self.metadata_mismatches),
+            "first_mismatch_offset": self.first_mismatch_offset,
+            "expected_byte": self.expected_byte,
+            "actual_byte": self.actual_byte,
+        }
+
+
+@dataclass(frozen=True)
+class _UocrTensorPayloadView:
+    qprofile_id: int
+    tensor_id: int
+    qtype_id: int
+    flags: int
+    rank: int
+    logical_shape: tuple[int, ...]
+    physical_shape: tuple[int, ...]
+    payload_offset: int
+    payload_size: int
+    block_size: int
+    row_size: int
+    qtype_reason_id: int
+    promotion_reason_id: int
+
+
+@dataclass(frozen=True)
 class DryRunPlan:
     hf_dir: Path
     qprofile: str
@@ -2304,6 +2371,259 @@ def _stream_bf16_to_q8_0(
     return bytes_written
 
 
+def _read_uocr_tensor_payload_view(model_path: str | Path, tensor_id: int) -> _UocrTensorPayloadView:
+    path = Path(model_path)
+    with path.open("rb") as f:
+        header_bytes = f.read(UOCR_FILE_HEADER_SIZE)
+        if len(header_bytes) != UOCR_FILE_HEADER_SIZE:
+            raise ValueError(f"{path} is too small to contain a .uocr header")
+        header = _FILE_HEADER_STRUCT.unpack(header_bytes)
+        magic, version, header_size, endian_marker, _alignment, qprofile_id, section_count, _reserved = header[:8]
+        file_size, section_dir_offset = header[8], header[9]
+        if magic != b"UOCR":
+            raise ValueError(f"{path} is not a .uocr file")
+        if version != UOCR_FORMAT_VERSION:
+            raise ValueError(f"{path} has unsupported .uocr version {version}")
+        if header_size != UOCR_FILE_HEADER_SIZE:
+            raise ValueError(f"{path} has unexpected .uocr header size {header_size}")
+        if endian_marker != UOCR_ENDIAN_MARKER:
+            raise ValueError(f"{path} has unexpected endian marker 0x{endian_marker:x}")
+        actual_size = path.stat().st_size
+        if file_size != actual_size:
+            raise ValueError(f"{path} file size mismatch: header={file_size}, actual={actual_size}")
+
+        f.seek(section_dir_offset)
+        tensor_dir_offset: int | None = None
+        tensor_dir_size: int | None = None
+        for _index in range(section_count):
+            section_bytes = f.read(UOCR_SECTION_ENTRY_SIZE)
+            if len(section_bytes) != UOCR_SECTION_ENTRY_SIZE:
+                raise ValueError(f"{path} truncated while reading section directory")
+            section_type, _flags, section_offset, section_size, _section_alignment = _SECTION_ENTRY_STRUCT.unpack(
+                section_bytes
+            )
+            if section_type == UOCR_SECTION_TENSOR_DIRECTORY:
+                tensor_dir_offset = int(section_offset)
+                tensor_dir_size = int(section_size)
+        if tensor_dir_offset is None or tensor_dir_size is None:
+            raise ValueError(f"{path} does not contain a tensor-directory section")
+
+        f.seek(tensor_dir_offset)
+        dir_header_bytes = f.read(UOCR_TENSOR_DIRECTORY_HEADER_SIZE)
+        if len(dir_header_bytes) != UOCR_TENSOR_DIRECTORY_HEADER_SIZE:
+            raise ValueError(f"{path} truncated while reading tensor-directory header")
+        dir_magic, dir_version, entry_size, tensor_count = _TENSOR_DIRECTORY_HEADER_STRUCT.unpack(dir_header_bytes)
+        if dir_magic != UOCR_TENSOR_DIR_MAGIC:
+            raise ValueError(f"{path} has invalid tensor-directory magic 0x{dir_magic:x}")
+        if dir_version != UOCR_FORMAT_VERSION:
+            raise ValueError(f"{path} has unsupported tensor-directory version {dir_version}")
+        if entry_size != UOCR_TENSOR_ENTRY_SIZE:
+            raise ValueError(f"{path} has unexpected tensor entry size {entry_size}")
+        expected_dir_size = UOCR_TENSOR_DIRECTORY_HEADER_SIZE + tensor_count * UOCR_TENSOR_ENTRY_SIZE
+        if tensor_dir_size != expected_dir_size:
+            raise ValueError(f"{path} tensor-directory size/count mismatch")
+
+        for _index in range(tensor_count):
+            entry_bytes = f.read(UOCR_TENSOR_ENTRY_SIZE)
+            if len(entry_bytes) != UOCR_TENSOR_ENTRY_SIZE:
+                raise ValueError(f"{path} truncated while reading tensor-directory entries")
+            entry = _TENSOR_ENTRY_STRUCT.unpack(entry_bytes)
+            if int(entry[0]) != tensor_id:
+                continue
+            rank = int(entry[8])
+            if rank < 0 or rank > 4:
+                raise ValueError(f"tensor {tensor_id} in {path} has invalid rank {rank}")
+            return _UocrTensorPayloadView(
+                qprofile_id=int(qprofile_id),
+                tensor_id=int(entry[0]),
+                qtype_id=int(entry[6]),
+                flags=int(entry[7]),
+                rank=rank,
+                logical_shape=tuple(int(value) for value in entry[9 : 9 + rank]),
+                physical_shape=tuple(int(value) for value in entry[13 : 13 + rank]),
+                payload_offset=int(entry[17]),
+                payload_size=int(entry[18]),
+                block_size=int(entry[19]),
+                row_size=int(entry[20]),
+                qtype_reason_id=int(entry[25]),
+                promotion_reason_id=int(entry[26]),
+            )
+        raise ValueError(f"tensor id {tensor_id} is not present in {path}")
+
+
+def _iter_expected_converted_tensor_chunks(
+    src: BinaryIO,
+    tensor: TensorPlan,
+    *,
+    chunk_source_bytes: int = 8 * 1024 * 1024,
+) -> Iterable[bytes]:
+    if tensor.qtype_id == UOCR_TENSOR_F16:
+        if tensor.source_bytes % 2 != 0:
+            raise ValueError(f"BF16 tensor byte count must be even, got {tensor.source_bytes}")
+        remaining = tensor.source_bytes
+        chunk_bytes = max(2, chunk_source_bytes - (chunk_source_bytes % 2))
+        while remaining:
+            wanted = min(remaining, chunk_bytes)
+            raw = src.read(wanted)
+            if len(raw) != wanted:
+                raise EOFError(f"unexpected end of safetensors payload while reading {tensor.name}")
+            yield _bf16_bytes_to_f32(raw).astype(np.dtype("<f2"), copy=False).tobytes()
+            remaining -= wanted
+        return
+
+    if tensor.qtype_id == UOCR_TENSOR_Q8_0:
+        if len(tensor.logical_shape) != 2 or len(tensor.physical_shape) != 2:
+            raise ValueError(f"Q8_0 tensor {tensor.name} must have 2D logical/physical shapes")
+        rows, logical_inner = tensor.logical_shape
+        physical_rows, physical_inner = tensor.physical_shape
+        if physical_rows != rows or physical_inner < logical_inner or physical_inner % UOCR_Q8_0_BLOCK_SIZE != 0:
+            raise ValueError(f"Q8_0 tensor {tensor.name} has invalid logical/physical shapes")
+        source_row_bytes = logical_inner * 2
+        rows_per_chunk = max(1, chunk_source_bytes // max(1, source_row_bytes))
+        rows_done = 0
+        while rows_done < rows:
+            batch_rows = min(rows_per_chunk, rows - rows_done)
+            raw = src.read(batch_rows * source_row_bytes)
+            if len(raw) != batch_rows * source_row_bytes:
+                raise EOFError(f"unexpected end of safetensors payload while reading {tensor.name}")
+            values = _bf16_bytes_to_f32(raw).reshape(batch_rows, logical_inner)
+            if physical_inner != logical_inner:
+                padded = np.zeros((batch_rows, physical_inner), dtype=np.float32)
+                padded[:, :logical_inner] = values
+                values = padded
+            yield _pack_q8_0_rows(values)
+            rows_done += batch_rows
+        return
+
+    raise NotImplementedError(f"single-tensor compare for qtype {tensor.qtype} is not implemented")
+
+
+def _metadata_mismatches_for_compare(
+    plan: DryRunPlan, tensor: TensorPlan, view: _UocrTensorPayloadView
+) -> tuple[str, ...]:
+    mismatches: list[str] = []
+    expected_qprofile = QPROFILE_IDS[plan.qprofile]
+    if view.qprofile_id != expected_qprofile:
+        mismatches.append(f"qprofile_id actual={view.qprofile_id} expected={expected_qprofile}")
+    if view.qtype_id != tensor.qtype_id:
+        mismatches.append(f"qtype_id actual={view.qtype_id} expected={tensor.qtype_id}")
+    if view.flags != tensor.layout_flags:
+        mismatches.append(f"flags actual=0x{view.flags:x} expected=0x{tensor.layout_flags:x}")
+    if view.rank != len(tensor.logical_shape):
+        mismatches.append(f"rank actual={view.rank} expected={len(tensor.logical_shape)}")
+    if view.logical_shape != tensor.logical_shape:
+        mismatches.append(f"logical_shape actual={view.logical_shape} expected={tensor.logical_shape}")
+    if view.physical_shape != tensor.physical_shape:
+        mismatches.append(f"physical_shape actual={view.physical_shape} expected={tensor.physical_shape}")
+    if view.payload_size != tensor.output_bytes:
+        mismatches.append(f"payload_size actual={view.payload_size} expected={tensor.output_bytes}")
+    if view.block_size != tensor.block_size:
+        mismatches.append(f"block_size actual={view.block_size} expected={tensor.block_size}")
+    if view.row_size != tensor.row_size:
+        mismatches.append(f"row_size actual={view.row_size} expected={tensor.row_size}")
+    if view.qtype_reason_id != tensor.qtype_reason_id:
+        mismatches.append(f"qtype_reason_id actual={view.qtype_reason_id} expected={tensor.qtype_reason_id}")
+    if view.promotion_reason_id != tensor.promotion_reason_id:
+        mismatches.append(f"promotion_reason_id actual={view.promotion_reason_id} expected={tensor.promotion_reason_id}")
+    return tuple(mismatches)
+
+
+def compare_single_tensor_conversion(
+    plan: DryRunPlan,
+    model_path: str | Path,
+    *,
+    safetensors_path: str | Path | None = None,
+    chunk_source_bytes: int = 8 * 1024 * 1024,
+) -> TensorCompareResult:
+    """Compare one planned tensor's source conversion against bytes in a `.uocr` file.
+
+    ``plan`` must already be filtered to exactly one tensor.  The function streams
+    BF16 source bytes and the target model payload in chunks, so it is safe to use
+    on very large tensors without allocating another full tensor-sized temporary.
+    """
+
+    if plan.tensor_count != 1:
+        raise ValueError("single-tensor compare requires a plan filtered with --tensor")
+    tensor = plan.tensors[0]
+    if tensor.usage_id == UOCR_TENSOR_USAGE_OMITTED_WITH_REASON:
+        raise ValueError(f"tensor {tensor.name} has no payload to compare")
+    if tensor.qtype_id not in {UOCR_TENSOR_F16, UOCR_TENSOR_Q8_0}:
+        raise NotImplementedError(f"single-tensor compare for qtype {tensor.qtype} is not implemented")
+
+    model = Path(model_path)
+    view = _read_uocr_tensor_payload_view(model, tensor.tensor_id)
+    metadata_mismatches = _metadata_mismatches_for_compare(plan, tensor, view)
+    source, data_start = _resolve_safetensors_payload_path(plan, safetensors_path)
+
+    expected_hash = hashlib.sha256()
+    actual_hash = hashlib.sha256()
+    compared_bytes = 0
+    first_mismatch_offset: int | None = None
+    expected_byte: int | None = None
+    actual_byte: int | None = None
+
+    with source.open("rb") as src, model.open("rb") as actual:
+        src.seek(data_start + tensor.source_offsets[0])
+        actual.seek(view.payload_offset)
+        for expected_chunk in _iter_expected_converted_tensor_chunks(
+            src, tensor, chunk_source_bytes=chunk_source_bytes
+        ):
+            expected_hash.update(expected_chunk)
+            actual_chunk = actual.read(len(expected_chunk))
+            actual_hash.update(actual_chunk)
+            if first_mismatch_offset is None and actual_chunk != expected_chunk:
+                limit = min(len(actual_chunk), len(expected_chunk))
+                for index in range(limit):
+                    if actual_chunk[index] != expected_chunk[index]:
+                        first_mismatch_offset = compared_bytes + index
+                        expected_byte = expected_chunk[index]
+                        actual_byte = actual_chunk[index]
+                        break
+                if first_mismatch_offset is None:
+                    first_mismatch_offset = compared_bytes + limit
+                    expected_byte = expected_chunk[limit] if limit < len(expected_chunk) else None
+                    actual_byte = actual_chunk[limit] if limit < len(actual_chunk) else None
+            compared_bytes += len(expected_chunk)
+
+        if view.payload_size > compared_bytes:
+            remaining = view.payload_size - compared_bytes
+            if first_mismatch_offset is None:
+                first_mismatch_offset = compared_bytes
+                expected_byte = None
+            while remaining:
+                chunk = actual.read(min(remaining, 1024 * 1024))
+                if not chunk:
+                    break
+                if actual_byte is None:
+                    actual_byte = chunk[0]
+                actual_hash.update(chunk)
+                remaining -= len(chunk)
+
+    payload_matches = (
+        first_mismatch_offset is None
+        and compared_bytes == tensor.output_bytes
+        and view.payload_size == tensor.output_bytes
+    )
+    return TensorCompareResult(
+        name=tensor.name,
+        tensor_id=tensor.tensor_id,
+        qtype=tensor.qtype,
+        qtype_id=tensor.qtype_id,
+        model_path=str(model),
+        source_path=str(source),
+        expected_bytes=tensor.output_bytes,
+        actual_bytes=view.payload_size,
+        compared_bytes=compared_bytes,
+        expected_sha256=expected_hash.hexdigest(),
+        actual_sha256=actual_hash.hexdigest(),
+        payload_matches=payload_matches,
+        metadata_mismatches=metadata_mismatches,
+        first_mismatch_offset=first_mismatch_offset,
+        expected_byte=expected_byte,
+        actual_byte=actual_byte,
+    )
+
+
 def write_uocr_model(
     plan: DryRunPlan,
     out_path: str | Path,
@@ -2471,10 +2791,21 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--hf-dir", type=Path, default=project_root() / "data/context")
     parser.add_argument("--header", type=Path, default=None, help="optional safetensors header/cache path")
     parser.add_argument("--index", type=Path, default=None, help="optional safetensors index path")
-    parser.add_argument("--safetensors", type=Path, default=None, help="explicit source .safetensors payload for --out")
+    parser.add_argument(
+        "--safetensors",
+        type=Path,
+        default=None,
+        help="explicit source .safetensors payload for --out or --compare-uocr",
+    )
     parser.add_argument("--qprofile", choices=["fp16", "dyn-q8", "dyn-q4"], default="fp16")
     parser.add_argument("--dry-run", action="store_true", help="plan only; does not require full weights")
     parser.add_argument("--out", type=Path, default=None, help="write an fp16 or dyn-q8 .uocr file to this path")
+    parser.add_argument(
+        "--compare-uocr",
+        type=Path,
+        default=None,
+        help="compare the selected --tensor against an existing .uocr payload without rewriting the full model",
+    )
     parser.add_argument("--tensor", default=None, help="optional single tensor source name or stable tensor id")
     parser.add_argument("--overwrite", action="store_true", help="replace an existing --out file")
     parser.add_argument(
@@ -2491,8 +2822,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    if args.out is None and not args.dry_run:
-        parser.error("either --dry-run or --out is required")
+    if args.out is None and args.compare_uocr is None and not args.dry_run:
+        parser.error("either --dry-run, --out, or --compare-uocr is required")
+    if args.compare_uocr is not None and args.tensor is None:
+        parser.error("--compare-uocr requires --tensor")
     if args.conversion_stats is not None and args.out is None:
         parser.error("--conversion-stats requires --out")
     if args.out is not None and args.qprofile == "dyn-q4":
@@ -2520,6 +2853,28 @@ def main(argv: list[str] | None = None) -> int:
         print(f"wrote: {written}")
         if args.conversion_stats is not None:
             print(f"conversion stats: {args.conversion_stats}")
+    if args.compare_uocr is not None:
+        comparison = compare_single_tensor_conversion(plan, args.compare_uocr, safetensors_path=args.safetensors)
+        print(
+            "compare: "
+            f"tensor={comparison.name} id={comparison.tensor_id} qtype={comparison.qtype} "
+            f"metadata={'ok' if comparison.metadata_matches else 'mismatch'} "
+            f"payload={'ok' if comparison.payload_matches else 'mismatch'} "
+            f"bytes={comparison.compared_bytes}"
+        )
+        print(f"compare expected_sha256={comparison.expected_sha256}")
+        print(f"compare actual_sha256={comparison.actual_sha256}")
+        if not comparison.metadata_matches:
+            print("compare metadata mismatches:")
+            for mismatch in comparison.metadata_mismatches:
+                print(f"  - {mismatch}")
+        if comparison.first_mismatch_offset is not None:
+            print(
+                "compare first payload mismatch: "
+                f"offset={comparison.first_mismatch_offset} "
+                f"expected={comparison.expected_byte} actual={comparison.actual_byte}"
+            )
+        return 0 if comparison.matches else 1
     return 0
 
 
