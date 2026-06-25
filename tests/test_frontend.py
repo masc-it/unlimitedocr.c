@@ -7,7 +7,7 @@ import math
 import sys
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageOps
 import pytest
 
 from unlimitedocr_c.frontend import (
@@ -34,6 +34,7 @@ from unlimitedocr_c.frontend import (
     global_visual_token_count,
     load_prepared_fixture,
     load_tokenizer,
+    preprocess_view,
     prepare_image,
     project_root,
     render_prompt,
@@ -46,6 +47,22 @@ from unlimitedocr_c.frontend import (
 
 def solid_image(width: int, height: int, color: tuple[int, int, int] = (220, 20, 60)) -> Image.Image:
     return Image.new("RGB", (width, height), color)
+
+
+def gradient_image(width: int, height: int) -> Image.Image:
+    yy, xx = np.mgrid[:height, :width]
+    pixels = np.empty((height, width, 3), dtype=np.uint8)
+    pixels[..., 0] = (xx * 3 + yy * 5) % 256
+    pixels[..., 1] = (xx * 7 + yy * 11 + 17) % 256
+    pixels[..., 2] = (xx * 13 + yy * 19 + 29) % 256
+    return Image.fromarray(pixels, mode="RGB")
+
+
+def upstream_preprocess_view_reference(image: Image.Image, size: int) -> np.ndarray:
+    padded = ImageOps.pad(image, (size, size), color=(127, 127, 127))
+    hwc = np.asarray(padded, dtype=np.float32) / 255.0
+    chw = np.transpose(hwc, (2, 0, 1))
+    return np.ascontiguousarray((chw - 0.5) / 0.5, dtype=np.float32)
 
 
 def upstream_model_source() -> str:
@@ -223,6 +240,51 @@ def test_prepared_requests_use_visual_token_formulas() -> None:
     pages = prepare_pages([solid_image(300, 500), solid_image(500, 300), solid_image(256, 256)], max_new_tokens=0)
     assert pages.expected_visual_tokens == 3 * global_visual_token_count(GLOBAL_VIEW_SIZE)
     assert int(pages.image_mask.sum(dtype=np.uint64)) == pages.expected_visual_tokens
+
+
+def test_preprocess_view_matches_upstream_tiny_fixture_exactly() -> None:
+    image = gradient_image(17, 11)
+    expected = upstream_preprocess_view_reference(image, 32)
+    actual = preprocess_view(image, 32, dtype=np.float32)
+
+    assert actual.dtype == np.float32
+    assert actual.shape == (3, 32, 32)
+    assert actual.flags.c_contiguous
+    np.testing.assert_array_equal(actual, expected)
+    assert np.isclose(actual.min(), -1.0)
+    assert np.isclose(actual.max(), 1.0)
+    assert np.any(np.isclose(actual, (127.0 / 255.0 - 0.5) / 0.5))
+
+
+def test_prepare_image_pixels_match_upstream_tiny_base_and_gundam_views() -> None:
+    base_image = gradient_image(19, 13)
+    base = prepare_image(base_image, preset="base", max_new_tokens=0, dtype=np.float32)
+    assert len(base.views) == 1
+    np.testing.assert_array_equal(base.views[0].pixels, upstream_preprocess_view_reference(base_image, GLOBAL_VIEW_SIZE))
+    assert base.views[0].pixels.flags.c_contiguous
+
+    crop_image = gradient_image(1280, 640)
+    expected_crops, expected_grid = dynamic_preprocess(crop_image)
+    gundam = prepare_image(crop_image, preset="gundam", max_new_tokens=0, dtype=np.float32)
+    assert expected_grid == (2, 1)
+    assert (gundam.crop_grid_w, gundam.crop_grid_h) == expected_grid
+    assert [view.kind for view in gundam.views] == ["local", "local", "global"]
+    for view, crop in zip(gundam.views[:-1], expected_crops, strict=True):
+        np.testing.assert_array_equal(view.pixels, upstream_preprocess_view_reference(crop, LOCAL_VIEW_SIZE))
+        assert view.pixels.flags.c_contiguous
+    np.testing.assert_array_equal(gundam.views[-1].pixels, upstream_preprocess_view_reference(crop_image, GLOBAL_VIEW_SIZE))
+    assert gundam.views[-1].pixels.flags.c_contiguous
+
+
+def test_preprocess_view_f16_is_contiguous_upstream_f32_rounded_to_f16() -> None:
+    image = gradient_image(9, 7)
+    expected = upstream_preprocess_view_reference(image, 16).astype(np.float16)
+    actual = preprocess_view(image, 16, dtype=np.float16)
+
+    assert actual.dtype == np.float16
+    assert actual.shape == (3, 16, 16)
+    assert actual.flags.c_contiguous
+    np.testing.assert_array_equal(actual, expected)
 
 
 def test_prepare_gundam_small_image_uses_global_only() -> None:

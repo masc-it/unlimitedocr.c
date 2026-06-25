@@ -971,7 +971,7 @@ Do not start the stable high-level OCR/PDF API until Gate E2E-0 passes: public f
   - [x] tokenizer metadata validation
   - [x] prompt construction
   - [x] visual token count formulas
-  - [ ] image preprocessing against upstream for tiny fixtures
+  - [x] image preprocessing against upstream for tiny fixtures
   - [ ] `.uocr` synthetic loader/dumper
   - [ ] prepared-request validation
   - [ ] no-repeat-ngram processor
