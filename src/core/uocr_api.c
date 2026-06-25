@@ -570,11 +570,23 @@ uocr_engine *uocr_engine_open(const uocr_engine_opts *opts) {
         engine->has_model_file = 1;
         engine->model_view_bytes = model_tensor_data_bytes(&engine->model_file);
         if (engine->memory_budget_bytes != 0u && engine->model_view_bytes > engine->memory_budget_bytes) {
-            set_engine_errorf(engine,
-                              UOCR_ERROR_OUT_OF_MEMORY,
-                              "model tensor-data view estimate %llu bytes exceeds budget %llu bytes",
-                              (unsigned long long)engine->model_view_bytes,
-                              (unsigned long long)engine->memory_budget_bytes);
+            uocr_runtime_memory_estimate reject_estimate;
+            memset(&reject_estimate, 0, sizeof(reject_estimate));
+            const int reject_estimate_status = uocr_estimate_minimal_runtime_memory(engine->max_batch,
+                                                                                    engine->max_prompt_tokens,
+                                                                                    engine->model_view_bytes,
+                                                                                    &reject_estimate);
+            if (reject_estimate_status == UOCR_OK) {
+                engine->capacity_estimate = reject_estimate;
+                engine->last_estimate = reject_estimate;
+                (void)set_admission_error(engine, "engine", &reject_estimate, engine->memory_budget_bytes);
+            } else {
+                set_engine_errorf(engine,
+                                  UOCR_ERROR_OUT_OF_MEMORY,
+                                  "engine admission rejected: model tensor-data view estimate %llu bytes exceeds budget %llu bytes",
+                                  (unsigned long long)engine->model_view_bytes,
+                                  (unsigned long long)engine->memory_budget_bytes);
+            }
             uocr_engine_close(engine);
             return NULL;
         }

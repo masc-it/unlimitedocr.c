@@ -269,7 +269,18 @@ static int test_engine_rejects_model_over_budget(void) {
 
     uocr_engine *engine = uocr_engine_open(&opts);
     CHECK(engine == NULL);
-    CHECK(strstr(uocr_last_error(NULL), "tensor-data view estimate") != NULL);
+    const char *error = uocr_last_error(NULL);
+    CHECK(strstr(error, "engine admission rejected") != NULL);
+    CHECK(strstr(error, "exceeds budget") != NULL);
+    CHECK(strstr(error, "model=") != NULL);
+    CHECK(strstr(error, "kv=") != NULL);
+    CHECK(strstr(error, "prompt=") != NULL);
+    CHECK(strstr(error, "vision=") != NULL);
+    CHECK(strstr(error, "decoder=") != NULL);
+    CHECK(strstr(error, "moe=") != NULL);
+    CHECK(strstr(error, "logits=") != NULL);
+    CHECK(strstr(error, "transient=") != NULL);
+    CHECK(strstr(error, "safety=") != NULL);
     unlink(path);
     return 0;
 }

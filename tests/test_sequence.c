@@ -234,6 +234,15 @@ static int test_generation_zero_budget_is_done(void) {
     char error[128];
     CHECK(uocr_build_sequence_state(&request, &state, error, sizeof(error)) == UOCR_OK);
     CHECK(uocr_sequence_generation_done(&state) == 1);
+
+    int32_t history[1] = {123};
+    CHECK(uocr_sequence_attach_generation_buffers(&state, NULL, 0u, history, 1u) == UOCR_OK);
+    CHECK(state.generated_tokens == NULL);
+    CHECK(state.generated_capacity == 0u);
+    CHECK(state.token_history == history);
+    CHECK(state.token_history_count == 1u);
+    CHECK(history[0] == 0);
+
     int32_t generated[1] = {0};
     CHECK(uocr_sequence_accept_generated_token(&state, 5, generated, 1u) == UOCR_ERROR_INVALID_ARGUMENT);
     return 0;
