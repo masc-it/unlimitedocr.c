@@ -356,3 +356,21 @@ End goal: keep follow-up work ordered after the fp16 Metal E2E engine is usable.
 - [ ] Wheel packaging and bundled Metal resources.
 - [ ] Server APIs.
 - [ ] Additional automated test infrastructure or new parity fixture generation.
+
+## 15. Profiling baseline for future optimization
+
+End goal: every real-image run can produce enough speed and memory visibility to
+rank future code and kernel optimization work by measured impact.
+
+- [ ] Add an opt-in profiling mode for the public Python path, e.g. `profile=True` or `UOCR_PROFILE=1`.
+- [ ] Emit one structured profiling record per request, preferably JSON plus concise human-readable summary.
+- [ ] Include request metadata: image path, preset, view count, crop grid, prompt tokens, image tokens, requested max-new-token count, generated count, EOS status, backend, qprofile, and model path basename.
+- [ ] Record wall-clock timings for Python preprocessing, engine open, request validation, memory admission, vision encoding, prompt assembly, decoder prefill, first token, full decode loop, total generation, and Python decoding.
+- [ ] Record Metal-stage timings for SAM patch embedding, SAM positional embedding, each SAM transformer block group, SAM neck, CLIP embedding, each CLIP transformer block group, projector, visual formatter, prompt assembly, each decoder layer prefill, final norm, LM head, no-repeat processing, argmax, and each decode step.
+- [ ] Record throughput metrics: image tokens/sec for vision, prompt tokens/sec for prefill, decode tokens/sec, first-token latency, average decode-token latency, p50/p95 decode-token latency, and total tokens/sec.
+- [ ] Record memory metrics: model view bytes, KV cache bytes, prompt arena bytes, vision scratch high-water mark, decoder scratch high-water mark, MoE scratch high-water mark, logits/readback bytes, transient buffer high-water mark, total estimated bytes, and total live/peak bytes.
+- [ ] Record Metal resource metrics when available: recommended working set, selected memory budget, model view count, tensor binding count, scratch buffer capacities, command-buffer count, and CPU readback byte count.
+- [ ] Persist profiling artifacts under a user-selected directory such as `dist/profiles/`, with filenames including timestamp, preset, generated token count, and image stem.
+- [ ] Add a compact summary table that ranks the top time-consuming stages and top memory-consuming arenas for `docs/test.png`.
+- [ ] Produce baseline profiles for `docs/test.png` with `preset="base"`, `preset="gundam"`, `max_length=4096`, and the default OCR settings.
+- [ ] Use profiling output to label future optimization targets by stage: vision kernels, decoder prefill, decode loop, LM head/readback, memory allocation, or Python frontend.
