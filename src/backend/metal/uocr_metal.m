@@ -6158,17 +6158,6 @@ static int metal_run_mps_matmul_nt_f16(uocr_metal_context *ctx,
             [y_array release];
             return 0;
         }
-        const uint64_t fill_start_ns = uocr_profile_now_ns();
-        id<MTLBlitCommandEncoder> fill = metal_blit_command_encoder(ctx, cb);
-        if (fill == nil) {
-            [x_array release];
-            [w_array release];
-            [y_array release];
-            return metal_fail(error, error_size, "failed to create %s MPS destination fill encoder", op_name != NULL ? op_name : "Metal");
-        }
-        [fill fillBuffer:dst.buffer range:NSMakeRange(dst.offset, (NSUInteger)dst_bytes) value:0u];
-        [fill endEncoding];
-        metal_profile_add_event_now(ctx, "metal.mps.matmul.fill", fill_start_ns);
         const uint64_t encode_start_ns = uocr_profile_now_ns();
         id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
         if (enc == nil) {
