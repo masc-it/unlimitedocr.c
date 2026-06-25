@@ -4109,8 +4109,8 @@ static int metal_prewarm_integrated_decoder_pipelines(uocr_metal_context *ctx, c
         "uocr_attention_qkvo_f16_to_f16",
         "uocr_rope_qk_f16_to_f16",
         "uocr_kv_cache_write_f16",
-        "uocr_prefill_attention_f16_to_f16",
-        "uocr_decode_attention_f16_to_f16",
+        "uocr_prefill_attention_flash_f16_to_f16",
+        "uocr_decode_attention_flash_f16_to_f16",
         "uocr_attention_output_residual_f16_to_f16",
         "uocr_clip_residual_add_f16_to_f16",
         "uocr_dense_swiglu_gate_up_f16",
@@ -5448,16 +5448,13 @@ static int metal_run_decode_attention_buffer_f16(uocr_metal_context *ctx,
         return metal_fail(error, error_size, "integrated decode attention KV arena is invalid");
     }
     @autoreleasepool {
-        id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, "uocr_decode_attention_f16_to_f16", error, error_size);
+        id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, "uocr_decode_attention_flash_f16_to_f16", error, error_size);
         if (pipeline == nil) {
             return 0;
         }
-        if (pipeline.maxTotalThreadsPerThreadgroup < (NSUInteger)UOCR_HEAD_DIM) {
-            return metal_fail(error, error_size, "integrated decode attention pipeline cannot run one head per group");
-        }
-        const NSUInteger threads = (NSUInteger)UOCR_HEAD_DIM;
-        if ((uint64_t)threads * sizeof(float) > (uint64_t)ctx->device.maxThreadgroupMemoryLength) {
-            return metal_fail(error, error_size, "integrated decode attention threadgroup memory exceeds device limit");
+        const NSUInteger threads = 32u;
+        if (pipeline.maxTotalThreadsPerThreadgroup < threads) {
+            return metal_fail(error, error_size, "integrated decode flash-attention pipeline cannot run one simdgroup per head");
         }
         int owned_command_buffer = 0;
         id<MTLCommandBuffer> cb = metal_command_buffer_for_op(ctx, &owned_command_buffer, "integrated decode attention", error, error_size);
@@ -5488,7 +5485,6 @@ static int metal_run_decode_attention_buffer_f16(uocr_metal_context *ctx,
         [enc setBuffer:kv offset:(NSUInteger)ctx->kv_cache_layout.v_offset_bytes atIndex:2u];
         [enc setBuffer:dst.buffer offset:dst.offset atIndex:3u];
         [enc setBytes:&params length:sizeof(params) atIndex:4u];
-        [enc setThreadgroupMemoryLength:threads * sizeof(float) atIndex:0u];
         [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)UOCR_ATTENTION_HEADS, 1u, 1u)
              threadsPerThreadgroup:MTLSizeMake(threads, 1u, 1u)];
         [enc endEncoding];
@@ -5505,28 +5501,21 @@ static int metal_run_prefill_attention_buffer_f16(uocr_metal_context *ctx,
                                                   char *error,
                                                   size_t error_size) {
     const uint64_t hidden_bytes = (uint64_t)n_tokens * (uint64_t)UOCR_HIDDEN_SIZE * 2u;
-    uint64_t groups = 0u;
+    uint64_t query_blocks = ((uint64_t)n_tokens + 3u) / 4u;
     if (ctx == NULL || n_tokens == 0u || n_tokens > UOCR_MAX_POSITIONS ||
         !metal_slice_valid(q, hidden_bytes) || !metal_slice_valid(k, hidden_bytes) ||
         !metal_slice_valid(v, hidden_bytes) || !metal_slice_valid(dst, hidden_bytes) ||
-        !checked_mul_u64((uint64_t)n_tokens, (uint64_t)UOCR_ATTENTION_HEADS, &groups) ||
-        groups > (uint64_t)UINT32_MAX) {
+        query_blocks > (uint64_t)UINT32_MAX) {
         return metal_fail(error, error_size, "invalid integrated prefill attention request");
     }
     @autoreleasepool {
-        id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, "uocr_prefill_attention_f16_to_f16", error, error_size);
+        id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, "uocr_prefill_attention_flash_f16_to_f16", error, error_size);
         if (pipeline == nil) {
             return 0;
         }
-        NSUInteger threads = metal_power2_threadgroup_width(128u, pipeline.maxTotalThreadsPerThreadgroup);
-        uint64_t floats = 0u;
-        uint64_t requested = 0u;
-        uint64_t tg_bytes = 0u;
-        if (!checked_add_u64((uint64_t)n_tokens, (uint64_t)threads, &floats) ||
-            !checked_mul_u64(floats, (uint64_t)sizeof(float), &requested) ||
-            !align_up_u64_checked(requested, 16u, &tg_bytes) ||
-            tg_bytes > (uint64_t)ctx->device.maxThreadgroupMemoryLength) {
-            return metal_fail(error, error_size, "integrated prefill attention threadgroup memory overflow");
+        const NSUInteger threads = 128u;
+        if (pipeline.maxTotalThreadsPerThreadgroup < threads) {
+            return metal_fail(error, error_size, "integrated prefill flash-attention pipeline cannot run four simdgroups per block");
         }
         int owned_command_buffer = 0;
         id<MTLCommandBuffer> cb = metal_command_buffer_for_op(ctx, &owned_command_buffer, "integrated prefill attention", error, error_size);
@@ -5548,8 +5537,7 @@ static int metal_run_prefill_attention_buffer_f16(uocr_metal_context *ctx,
         [enc setBuffer:v.buffer offset:v.offset atIndex:2u];
         [enc setBuffer:dst.buffer offset:dst.offset atIndex:3u];
         [enc setBytes:&params length:sizeof(params) atIndex:4u];
-        [enc setThreadgroupMemoryLength:(NSUInteger)tg_bytes atIndex:0u];
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)groups, 1u, 1u)
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)UOCR_ATTENTION_HEADS, (NSUInteger)query_blocks, 1u)
              threadsPerThreadgroup:MTLSizeMake(threads, 1u, 1u)];
         [enc endEncoding];
         return metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, "integrated prefill attention", error, error_size);
@@ -10312,13 +10300,14 @@ int uocr_metal_context_clip_attention_f16(uocr_metal_context *ctx,
 
     int result = 0;
     @autoreleasepool {
-        /* The SAM window-attention shader is an all-to-all attention primitive
-         * parameterized by token count, head count, and head dim. CLIP full
-         * attention is represented as one window spanning the whole token set.
+        /* The SAM window-attention flash shader is an all-to-all attention
+         * primitive parameterized by token count, head count, and head dim.
+         * CLIP full attention is represented as one window spanning the whole
+         * token set.
          */
         const char *function_name = output_type == UOCR_METAL_DENSE_OUTPUT_F16 ?
-                                        "uocr_sam_window_attention_f16_to_f16" :
-                                        "uocr_sam_window_attention_f16_to_f32";
+                                        "uocr_sam_window_attention_flash_f16_to_f16" :
+                                        "uocr_sam_window_attention_flash_f16_to_f32";
         id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, function_name, error, error_size);
         if (pipeline == nil) {
             return 0;
@@ -10368,15 +10357,10 @@ int uocr_metal_context_clip_attention_f16(uocr_metal_context *ctx,
         params.reserved1 = 0u;
         params.reserved2 = 0u;
 
-        const NSUInteger threads_per_group = metal_power2_threadgroup_width((NSUInteger)UOCR_CLIP_HEAD_DIM,
-                                                                            pipeline.maxTotalThreadsPerThreadgroup);
-        if (threads_per_group < (NSUInteger)UOCR_CLIP_HEAD_DIM) {
-            result = metal_fail(error, error_size, "Metal CLIP attention needs at least %u threads", UOCR_CLIP_HEAD_DIM);
-            goto cleanup_clip_attention;
-        }
-        const uint64_t threadgroup_bytes = (uint64_t)threads_per_group * (uint64_t)sizeof(float);
-        if (threadgroup_bytes > (uint64_t)ctx->device.maxThreadgroupMemoryLength) {
-            result = metal_fail(error, error_size, "Metal CLIP attention threadgroup memory exceeds device limit");
+        const NSUInteger threads_per_group = 128u;
+        const NSUInteger query_blocks = (NSUInteger)((token_count + 3u) / 4u);
+        if (pipeline.maxTotalThreadsPerThreadgroup < threads_per_group) {
+            result = metal_fail(error, error_size, "Metal CLIP flash attention cannot run four simdgroups per block");
             goto cleanup_clip_attention;
         }
 
@@ -10399,8 +10383,7 @@ int uocr_metal_context_clip_attention_f16(uocr_metal_context *ctx,
         [enc setBuffer:v_src offset:0u atIndex:2u];
         [enc setBuffer:dst offset:0u atIndex:3u];
         [enc setBytes:&params length:sizeof(params) atIndex:4u];
-        [enc setThreadgroupMemoryLength:threads_per_group * sizeof(float) atIndex:0u];
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)group_count, 1u, 1u)
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)UOCR_CLIP_ATTENTION_HEADS, query_blocks, 1u)
              threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1u, 1u)];
         [enc endEncoding];
 
@@ -11785,8 +11768,8 @@ static int metal_context_sam_attention_f16(uocr_metal_context *ctx,
          * spanning the whole SAM patch grid.
          */
         const char *function_name = output_type == UOCR_METAL_DENSE_OUTPUT_F16 ?
-                                        "uocr_sam_window_attention_f16_to_f16" :
-                                        "uocr_sam_window_attention_f16_to_f32";
+                                        "uocr_sam_window_attention_flash_f16_to_f16" :
+                                        "uocr_sam_window_attention_flash_f16_to_f32";
         id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, function_name, error, error_size);
         if (pipeline == nil) {
             return 0;
@@ -11858,22 +11841,14 @@ static int metal_context_sam_attention_f16(uocr_metal_context *ctx,
         params.reserved1 = 0u;
         params.reserved2 = 0u;
 
-        const NSUInteger threads_per_group = metal_power2_threadgroup_width((NSUInteger)UOCR_SAM_HEAD_DIM,
-                                                                            pipeline.maxTotalThreadsPerThreadgroup);
-        if (threads_per_group < (NSUInteger)UOCR_SAM_HEAD_DIM) {
+        const NSUInteger threads_per_group = 128u;
+        const NSUInteger query_blocks = (NSUInteger)((tokens_per_window + 3u) / 4u);
+        if (pipeline.maxTotalThreadsPerThreadgroup < threads_per_group) {
             [dst release];
             [v_src release];
             [k_src release];
             [q_src release];
-            return metal_fail(error, error_size, "%s needs at least %u threads", diagnostic_name, UOCR_SAM_HEAD_DIM);
-        }
-        const uint64_t threadgroup_bytes = (uint64_t)threads_per_group * (uint64_t)sizeof(float);
-        if (threadgroup_bytes > (uint64_t)ctx->device.maxThreadgroupMemoryLength) {
-            [dst release];
-            [v_src release];
-            [k_src release];
-            [q_src release];
-            return metal_fail(error, error_size, "%s threadgroup memory exceeds device limit", diagnostic_name);
+            return metal_fail(error, error_size, "%s flash path cannot run four simdgroups per block", diagnostic_name);
         }
 
         [enc setComputePipelineState:pipeline];
@@ -11882,8 +11857,7 @@ static int metal_context_sam_attention_f16(uocr_metal_context *ctx,
         [enc setBuffer:v_src offset:0u atIndex:2u];
         [enc setBuffer:dst offset:0u atIndex:3u];
         [enc setBytes:&params length:sizeof(params) atIndex:4u];
-        [enc setThreadgroupMemoryLength:threads_per_group * sizeof(float) atIndex:0u];
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)group_count, 1u, 1u)
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)UOCR_SAM_ATTENTION_HEADS, query_blocks, (NSUInteger)windows)
              threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1u, 1u)];
         [enc endEncoding];
 
@@ -12079,8 +12053,8 @@ int uocr_metal_context_sam_rel_pos_attention_f16(uocr_metal_context *ctx,
 
     @autoreleasepool {
         const char *function_name = output_type == UOCR_METAL_DENSE_OUTPUT_F16 ?
-                                        "uocr_sam_rel_pos_attention_f16_to_f16" :
-                                        "uocr_sam_rel_pos_attention_f16_to_f32";
+                                        "uocr_sam_rel_pos_attention_flash_f16_to_f16" :
+                                        "uocr_sam_rel_pos_attention_flash_f16_to_f32";
         id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, function_name, error, error_size);
         if (pipeline == nil) {
             return 0;
@@ -12185,29 +12159,16 @@ int uocr_metal_context_sam_rel_pos_attention_f16(uocr_metal_context *ctx,
         params.reserved1 = 0u;
         params.reserved2 = 0u;
 
-        const NSUInteger threads_per_group = metal_power2_threadgroup_width((NSUInteger)UOCR_SAM_HEAD_DIM,
-                                                                            pipeline.maxTotalThreadsPerThreadgroup);
-        if (threads_per_group < (NSUInteger)UOCR_SAM_HEAD_DIM) {
+        const NSUInteger threads_per_group = 128u;
+        const NSUInteger query_blocks = (NSUInteger)(((uint32_t)tokens + 3u) / 4u);
+        if (pipeline.maxTotalThreadsPerThreadgroup < threads_per_group) {
             [dst release];
             [rel_w release];
             [rel_h release];
             [v_src release];
             [k_src release];
             [q_src release];
-            return metal_fail(error,
-                              error_size,
-                              "Metal SAM relative-position attention needs at least %u threads",
-                              UOCR_SAM_HEAD_DIM);
-        }
-        const uint64_t threadgroup_bytes = (uint64_t)threads_per_group * (uint64_t)sizeof(float);
-        if (threadgroup_bytes > (uint64_t)ctx->device.maxThreadgroupMemoryLength) {
-            [dst release];
-            [rel_w release];
-            [rel_h release];
-            [v_src release];
-            [k_src release];
-            [q_src release];
-            return metal_fail(error, error_size, "Metal SAM relative-position attention threadgroup memory exceeds device limit");
+            return metal_fail(error, error_size, "Metal SAM relative-position flash attention cannot run four simdgroups per block");
         }
 
         [enc setComputePipelineState:pipeline];
@@ -12218,8 +12179,7 @@ int uocr_metal_context_sam_rel_pos_attention_f16(uocr_metal_context *ctx,
         [enc setBuffer:rel_w offset:0u atIndex:4u];
         [enc setBuffer:dst offset:0u atIndex:5u];
         [enc setBytes:&params length:sizeof(params) atIndex:6u];
-        [enc setThreadgroupMemoryLength:threads_per_group * sizeof(float) atIndex:0u];
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)group_count, 1u, 1u)
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)UOCR_SAM_ATTENTION_HEADS, query_blocks, (NSUInteger)n_windows)
              threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1u, 1u)];
         [enc endEncoding];
 
@@ -17816,36 +17776,17 @@ int uocr_metal_context_prefill_attention_f16(uocr_metal_context *ctx,
 
     @autoreleasepool {
         const char *function_name = output_type == UOCR_METAL_DENSE_OUTPUT_F16 ?
-                                        "uocr_prefill_attention_f16_to_f16" :
-                                        "uocr_prefill_attention_f16_to_f32";
+                                        "uocr_prefill_attention_flash_f16_to_f16" :
+                                        "uocr_prefill_attention_flash_f16_to_f32";
         id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, function_name, error, error_size);
         if (pipeline == nil) {
             return 0;
         }
 
-        NSUInteger threads_per_group = metal_power2_threadgroup_width(128u, pipeline.maxTotalThreadsPerThreadgroup);
-        if (threads_per_group == 0u) {
-            threads_per_group = 1u;
-        }
-        uint64_t threadgroup_float_count = 0u;
-        uint64_t requested_threadgroup_bytes = 0u;
-        uint64_t threadgroup_bytes = 0u;
-        /* Metal API validation requires threadgroup memory lengths to be
-         * 16-byte aligned; the kernel only touches the requested float range.
-         */
-        if (!checked_add_u64((uint64_t)n_tokens, (uint64_t)threads_per_group, &threadgroup_float_count) ||
-            !checked_mul_u64(threadgroup_float_count, (uint64_t)sizeof(float), &requested_threadgroup_bytes) ||
-            !align_up_u64_checked(requested_threadgroup_bytes, 16u, &threadgroup_bytes) ||
-            threadgroup_bytes > (uint64_t)NSUIntegerMax) {
-            return metal_fail(error, error_size, "Metal prefill attention threadgroup memory overflow");
-        }
-        const NSUInteger max_threadgroup_memory = ctx->device.maxThreadgroupMemoryLength;
-        if (threadgroup_bytes > (uint64_t)max_threadgroup_memory) {
-            return metal_fail(error,
-                              error_size,
-                              "Metal prefill attention needs %llu bytes of threadgroup memory, exceeding limit %llu",
-                              (unsigned long long)threadgroup_bytes,
-                              (unsigned long long)max_threadgroup_memory);
+        const NSUInteger threads_per_group = 128u;
+        const NSUInteger query_blocks = (NSUInteger)((n_tokens + 3u) / 4u);
+        if (pipeline.maxTotalThreadsPerThreadgroup < threads_per_group) {
+            return metal_fail(error, error_size, "Metal prefill flash attention cannot run four simdgroups per block");
         }
 
         id<MTLBuffer> q_src = [ctx->device newBufferWithBytes:q_f16
@@ -17916,8 +17857,7 @@ int uocr_metal_context_prefill_attention_f16(uocr_metal_context *ctx,
         [enc setBuffer:v_src offset:0u atIndex:2u];
         [enc setBuffer:dst offset:0u atIndex:3u];
         [enc setBytes:&params length:sizeof(params) atIndex:4u];
-        [enc setThreadgroupMemoryLength:(NSUInteger)threadgroup_bytes atIndex:0u];
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)attention_groups, 1u, 1u)
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)UOCR_ATTENTION_HEADS, query_blocks, 1u)
              threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1u, 1u)];
         [enc endEncoding];
 
@@ -18232,22 +18172,18 @@ int uocr_metal_context_decode_attention_f16(uocr_metal_context *ctx,
 
     @autoreleasepool {
         const char *function_name = output_type == UOCR_METAL_DENSE_OUTPUT_F16 ?
-                                        "uocr_decode_attention_f16_to_f16" :
-                                        "uocr_decode_attention_f16_to_f32";
+                                        "uocr_decode_attention_flash_f16_to_f16" :
+                                        "uocr_decode_attention_flash_f16_to_f32";
         id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, function_name, error, error_size);
         if (pipeline == nil) {
             return 0;
         }
-        if (pipeline.maxTotalThreadsPerThreadgroup < (NSUInteger)UOCR_HEAD_DIM) {
+        const NSUInteger threads_per_group = 32u;
+        if (pipeline.maxTotalThreadsPerThreadgroup < threads_per_group) {
             return metal_fail(error,
                               error_size,
-                              "Metal decode attention pipeline supports only %llu threads per group",
+                              "Metal decode flash attention pipeline supports only %llu threads per group",
                               (unsigned long long)pipeline.maxTotalThreadsPerThreadgroup);
-        }
-        const NSUInteger threads_per_group = (NSUInteger)UOCR_HEAD_DIM;
-        const uint64_t threadgroup_bytes = (uint64_t)threads_per_group * (uint64_t)sizeof(float);
-        if (threadgroup_bytes > (uint64_t)ctx->device.maxThreadgroupMemoryLength) {
-            return metal_fail(error, error_size, "Metal decode attention threadgroup memory exceeds device limit");
         }
 
         id<MTLBuffer> q_src = [ctx->device newBufferWithBytes:q_f16
@@ -18327,7 +18263,6 @@ int uocr_metal_context_decode_attention_f16(uocr_metal_context *ctx,
         [enc setBuffer:v_cache offset:0u atIndex:2u];
         [enc setBuffer:dst offset:0u atIndex:3u];
         [enc setBytes:&params length:sizeof(params) atIndex:4u];
-        [enc setThreadgroupMemoryLength:(NSUInteger)threadgroup_bytes atIndex:0u];
         [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)UOCR_ATTENTION_HEADS, 1u, 1u)
              threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1u, 1u)];
         [enc endEncoding];
