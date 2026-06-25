@@ -44,6 +44,16 @@ int uocr_cpu_ref_causal_sdpa_f32(const float *q,
                                  float scale,
                                  float *out);
 
+int uocr_cpu_ref_dense_swiglu_f32(const float *input,
+                                  const float *gate_weight,
+                                  const float *up_weight,
+                                  const float *down_weight,
+                                  uint32_t rows,
+                                  uint32_t hidden_dim,
+                                  uint32_t intermediate_dim,
+                                  float *swiglu_workspace,
+                                  float *out);
+
 typedef struct uocr_cpu_ref_kv_cache_layout {
     uint32_t prompt_token_capacity;
     uint32_t generated_ring_window;

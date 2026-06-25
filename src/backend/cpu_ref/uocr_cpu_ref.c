@@ -288,6 +288,66 @@ static int checked_mul_u64(uint64_t a, uint64_t b, uint64_t *out) {
     return 1;
 }
 
+static float dense_dot_row_f32(const float *input_row,
+                               const float *weight_row,
+                               uint32_t input_dim) {
+    float sum = 0.0f;
+    for (uint32_t col = 0u; col < input_dim; ++col) {
+        sum = fmaf(input_row[col], weight_row[col], sum);
+    }
+    return sum;
+}
+
+static float silu_f32(float value) {
+    return value / (1.0f + expf(-value));
+}
+
+int uocr_cpu_ref_dense_swiglu_f32(const float *input,
+                                  const float *gate_weight,
+                                  const float *up_weight,
+                                  const float *down_weight,
+                                  uint32_t rows,
+                                  uint32_t hidden_dim,
+                                  uint32_t intermediate_dim,
+                                  float *swiglu_workspace,
+                                  float *out) {
+    if (input == NULL || gate_weight == NULL || up_weight == NULL || down_weight == NULL ||
+        swiglu_workspace == NULL || out == NULL || rows == 0u || hidden_dim == 0u || intermediate_dim == 0u) {
+        return 0;
+    }
+
+    uint64_t input_count = 0u;
+    uint64_t workspace_count = 0u;
+    if (!checked_mul_u64((uint64_t)rows, (uint64_t)hidden_dim, &input_count) ||
+        !checked_mul_u64((uint64_t)rows, (uint64_t)intermediate_dim, &workspace_count) ||
+        input_count > (uint64_t)SIZE_MAX || workspace_count > (uint64_t)SIZE_MAX) {
+        return 0;
+    }
+
+    for (uint32_t row = 0u; row < rows; ++row) {
+        const float *input_row = input + (size_t)row * hidden_dim;
+        float *workspace_row = swiglu_workspace + (size_t)row * intermediate_dim;
+        for (uint32_t inter = 0u; inter < intermediate_dim; ++inter) {
+            const float *gate_row = gate_weight + (size_t)inter * hidden_dim;
+            const float *up_row = up_weight + (size_t)inter * hidden_dim;
+            const float gate = dense_dot_row_f32(input_row, gate_row, hidden_dim);
+            const float up = dense_dot_row_f32(input_row, up_row, hidden_dim);
+            workspace_row[inter] = silu_f32(gate) * up;
+        }
+    }
+
+    for (uint32_t row = 0u; row < rows; ++row) {
+        const float *workspace_row = swiglu_workspace + (size_t)row * intermediate_dim;
+        float *out_row = out + (size_t)row * hidden_dim;
+        for (uint32_t hidden = 0u; hidden < hidden_dim; ++hidden) {
+            const float *down_row = down_weight + (size_t)hidden * intermediate_dim;
+            out_row[hidden] = dense_dot_row_f32(workspace_row, down_row, intermediate_dim);
+        }
+    }
+
+    return 1;
+}
+
 int uocr_cpu_ref_kv_cache_layout_init(uint32_t prompt_token_capacity,
                                       uint32_t generated_ring_window,
                                       uint32_t heads,

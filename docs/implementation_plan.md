@@ -601,7 +601,7 @@ Current priority slice, in order. The coding agent should take the first uncheck
 - [x] Implement Llama/DeepSeek RoPE using split-half layout, not interleaved layout.
 - [x] Implement CPU causal SDPA for tiny text-only fixtures.
 - [x] Implement CPU KV cache append/ring behavior for tiny fixtures.
-- [ ] Implement CPU dense SwiGLU for layer 0.
+- [x] Implement CPU dense SwiGLU for layer 0.
 - [ ] Implement CPU MoE router:
   - [ ] router matmul in fp32
   - [ ] softmax in fp32

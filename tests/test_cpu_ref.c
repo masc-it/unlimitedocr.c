@@ -175,6 +175,97 @@ static int test_causal_sdpa(void) {
     return 0;
 }
 
+static float test_silu(float value) {
+    return value / (1.0f + expf(-value));
+}
+
+static int test_dense_swiglu(void) {
+    enum { ROWS = 2u, HIDDEN = 2u, INTERMEDIATE = 3u };
+    const float input[ROWS * HIDDEN] = {
+        1.0f, 2.0f,
+        -1.0f, 0.5f,
+    };
+    const float gate_weight[INTERMEDIATE * HIDDEN] = {
+        1.0f, 0.0f,
+        0.0f, 1.0f,
+        1.0f, -1.0f,
+    };
+    const float up_weight[INTERMEDIATE * HIDDEN] = {
+        2.0f, 0.0f,
+        0.0f, 3.0f,
+        1.0f, 1.0f,
+    };
+    const float down_weight[HIDDEN * INTERMEDIATE] = {
+        1.0f, 0.0f, 1.0f,
+        0.5f, -1.0f, 2.0f,
+    };
+    float workspace[ROWS * INTERMEDIATE] = {0.0f};
+    float out[ROWS * HIDDEN] = {0.0f};
+
+    CHECK(uocr_cpu_ref_dense_swiglu_f32(input,
+                                        gate_weight,
+                                        up_weight,
+                                        down_weight,
+                                        ROWS,
+                                        HIDDEN,
+                                        INTERMEDIATE,
+                                        workspace,
+                                        out) == 1);
+
+    float expected_workspace[ROWS * INTERMEDIATE] = {0.0f};
+    for (uint32_t row = 0u; row < ROWS; ++row) {
+        const float x0 = input[(size_t)row * HIDDEN];
+        const float x1 = input[(size_t)row * HIDDEN + 1u];
+        const float gates[INTERMEDIATE] = {x0, x1, x0 - x1};
+        const float ups[INTERMEDIATE] = {2.0f * x0, 3.0f * x1, x0 + x1};
+        for (uint32_t inter = 0u; inter < INTERMEDIATE; ++inter) {
+            expected_workspace[(size_t)row * INTERMEDIATE + inter] = test_silu(gates[inter]) * ups[inter];
+            CHECK(nearly_equal(workspace[(size_t)row * INTERMEDIATE + inter],
+                               expected_workspace[(size_t)row * INTERMEDIATE + inter],
+                               1.0e-6f));
+        }
+    }
+
+    for (uint32_t row = 0u; row < ROWS; ++row) {
+        const float m0 = expected_workspace[(size_t)row * INTERMEDIATE];
+        const float m1 = expected_workspace[(size_t)row * INTERMEDIATE + 1u];
+        const float m2 = expected_workspace[(size_t)row * INTERMEDIATE + 2u];
+        const float expected0 = m0 + m2;
+        const float expected1 = 0.5f * m0 - m1 + 2.0f * m2;
+        CHECK(nearly_equal(out[(size_t)row * HIDDEN], expected0, 1.0e-6f));
+        CHECK(nearly_equal(out[(size_t)row * HIDDEN + 1u], expected1, 1.0e-6f));
+    }
+
+    CHECK(uocr_cpu_ref_dense_swiglu_f32(NULL,
+                                        gate_weight,
+                                        up_weight,
+                                        down_weight,
+                                        ROWS,
+                                        HIDDEN,
+                                        INTERMEDIATE,
+                                        workspace,
+                                        out) == 0);
+    CHECK(uocr_cpu_ref_dense_swiglu_f32(input,
+                                        gate_weight,
+                                        up_weight,
+                                        down_weight,
+                                        0u,
+                                        HIDDEN,
+                                        INTERMEDIATE,
+                                        workspace,
+                                        out) == 0);
+    CHECK(uocr_cpu_ref_dense_swiglu_f32(input,
+                                        gate_weight,
+                                        up_weight,
+                                        down_weight,
+                                        ROWS,
+                                        HIDDEN,
+                                        INTERMEDIATE,
+                                        NULL,
+                                        out) == 0);
+    return 0;
+}
+
 static void fill_kv_token(float *k, float *v, uint32_t value, uint32_t stride) {
     for (uint32_t index = 0u; index < stride; ++index) {
         k[index] = (float)(value * 100u + index);
@@ -281,6 +372,7 @@ int main(void) {
     if (test_rmsnorm() != 0) return 1;
     if (test_rope_split_half() != 0) return 1;
     if (test_causal_sdpa() != 0) return 1;
+    if (test_dense_swiglu() != 0) return 1;
     if (test_kv_cache_ring() != 0) return 1;
     return 0;
 }
