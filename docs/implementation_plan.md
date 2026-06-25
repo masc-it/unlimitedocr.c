@@ -242,7 +242,7 @@ Implementation status:
 - [x] Keep engine hard caps for max batch, max prompt tokens, and max gen tokens.
 - [x] Reject requests that exceed hard caps before allocating.
 - [x] Record current capacity and high-water usage in memory reports.
-- [ ] Update admission errors with requested limits, configured limits, and current arena capacity.
+- [x] Update admission errors with requested limits, configured limits, and current arena capacity.
 - [ ] Prove no arena growth occurs across prefill, decode, vision, and token-selection hot loops.
 
 Acceptance target:

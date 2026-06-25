@@ -100,6 +100,7 @@ typedef struct uocr_admission_request_shape {
     uint32_t request_count;
     uint64_t requested_views;
     uint32_t prompt_tokens;
+    uint32_t max_new_tokens;
     uint32_t visual_rows;
     uint32_t max_chunk_projected_rows;
     uint32_t max_view_size;
@@ -125,6 +126,39 @@ static void copy_estimate_to_report(const uocr_runtime_memory_estimate *estimate
     report->estimated_total_bytes = estimate->total_bytes;
 }
 
+static uint32_t current_metal_arena_batch_slots(const uocr_engine *engine) {
+#if UOCR_HAVE_METAL
+    return (engine != NULL && engine->metal != NULL) ?
+               uocr_metal_context_runtime_arena_batch_slots(engine->metal) :
+               0u;
+#else
+    (void)engine;
+    return 0u;
+#endif
+}
+
+static uint32_t current_metal_arena_prompt_token_capacity(const uocr_engine *engine) {
+#if UOCR_HAVE_METAL
+    return (engine != NULL && engine->metal != NULL) ?
+               uocr_metal_context_runtime_arena_prompt_token_capacity(engine->metal) :
+               0u;
+#else
+    (void)engine;
+    return 0u;
+#endif
+}
+
+static uint64_t current_metal_arena_bytes(const uocr_engine *engine) {
+#if UOCR_HAVE_METAL
+    return (engine != NULL && engine->metal != NULL) ?
+               uocr_metal_context_total_runtime_arena_capacity(engine->metal) :
+               0u;
+#else
+    (void)engine;
+    return 0u;
+#endif
+}
+
 static int set_admission_error_with_shape(uocr_engine *engine,
                                            const char *scope,
                                            const uocr_runtime_memory_estimate *estimate,
@@ -133,12 +167,27 @@ static int set_admission_error_with_shape(uocr_engine *engine,
     if (scope == NULL || scope[0] == '\0') {
         scope = "request";
     }
+    const uint32_t configured_max_batch = engine != NULL ? engine->max_batch : 0u;
+    const uint32_t configured_max_prompt_tokens = engine != NULL ? engine->max_prompt_tokens : 0u;
+    const uint32_t configured_max_gen_tokens = engine != NULL ? engine->max_gen_tokens : 0u;
+    const uint32_t arena_batch = current_metal_arena_batch_slots(engine);
+    const uint32_t arena_prompt = current_metal_arena_prompt_token_capacity(engine);
+    const uint64_t arena_bytes = current_metal_arena_bytes(engine);
     if (estimate == NULL) {
         return set_engine_errorf(engine,
                                  UOCR_ERROR_OUT_OF_MEMORY,
-                                 "%s admission rejected: memory estimate exceeds budget %llu bytes",
+                                 "%s admission rejected: memory estimate exceeds budget %llu bytes "
+                                 "(configured_max_batch=%u configured_max_prompt_tokens=%u configured_max_gen_tokens=%u "
+                                 "current_metal_arena_batch_slots=%u current_metal_arena_prompt_token_capacity=%u "
+                                 "current_metal_arena_bytes=%llu)",
                                  scope,
-                                 (unsigned long long)budget_bytes);
+                                 (unsigned long long)budget_bytes,
+                                 configured_max_batch,
+                                 configured_max_prompt_tokens,
+                                 configured_max_gen_tokens,
+                                 arena_batch,
+                                 arena_prompt,
+                                 (unsigned long long)arena_bytes);
     }
     const uint64_t vision_workspace_bytes = saturated_add_u64(estimate->vision_gpu_workspace_bytes,
                                                               estimate->vision_final_features_bytes);
@@ -146,8 +195,10 @@ static int set_admission_error_with_shape(uocr_engine *engine,
         return set_engine_errorf(engine,
                                  UOCR_ERROR_OUT_OF_MEMORY,
                                  "%s admission rejected: memory estimate %llu bytes exceeds budget %llu bytes "
-                                 "(configured_budget=%llu requests=%u requested_views=%llu prompt_tokens=%u visual_rows=%u "
-                                 "max_view_size=%u max_chunk_projected_rows=%u vision_workspace=%llu "
+                                 "(configured_budget=%llu requests=%u requested_views=%llu prompt_tokens=%u max_new_tokens=%u "
+                                 "visual_rows=%u max_view_size=%u max_chunk_projected_rows=%u configured_max_batch=%u "
+                                 "configured_max_prompt_tokens=%u configured_max_gen_tokens=%u current_metal_arena_batch_slots=%u "
+                                 "current_metal_arena_prompt_token_capacity=%u current_metal_arena_bytes=%llu vision_workspace=%llu "
                                  "vision=%llu vision_gpu_workspace=%llu vision_final_features=%llu vision_host_staging=%llu "
                                  "model=%llu kv=%llu prompt=%llu decoder=%llu moe=%llu logits=%llu transient=%llu safety=%llu)",
                                  scope,
@@ -157,9 +208,16 @@ static int set_admission_error_with_shape(uocr_engine *engine,
                                  shape->request_count,
                                  (unsigned long long)shape->requested_views,
                                  shape->prompt_tokens,
+                                 shape->max_new_tokens,
                                  shape->visual_rows,
                                  shape->max_view_size,
                                  shape->max_chunk_projected_rows,
+                                 configured_max_batch,
+                                 configured_max_prompt_tokens,
+                                 configured_max_gen_tokens,
+                                 arena_batch,
+                                 arena_prompt,
+                                 (unsigned long long)arena_bytes,
                                  (unsigned long long)vision_workspace_bytes,
                                  (unsigned long long)estimate->vision_scratch_bytes,
                                  (unsigned long long)estimate->vision_gpu_workspace_bytes,
@@ -177,12 +235,20 @@ static int set_admission_error_with_shape(uocr_engine *engine,
     return set_engine_errorf(engine,
                              UOCR_ERROR_OUT_OF_MEMORY,
                              "%s admission rejected: memory estimate %llu bytes exceeds budget %llu bytes "
-                             "(configured_budget=%llu vision_workspace=%llu model=%llu kv=%llu prompt=%llu vision=%llu "
+                             "(configured_budget=%llu configured_max_batch=%u configured_max_prompt_tokens=%u configured_max_gen_tokens=%u "
+                             "current_metal_arena_batch_slots=%u current_metal_arena_prompt_token_capacity=%u "
+                             "current_metal_arena_bytes=%llu vision_workspace=%llu model=%llu kv=%llu prompt=%llu vision=%llu "
                              "vision_gpu_workspace=%llu vision_final_features=%llu vision_host_staging=%llu decoder=%llu moe=%llu logits=%llu transient=%llu safety=%llu)",
                              scope,
                              (unsigned long long)estimate->total_bytes,
                              (unsigned long long)budget_bytes,
                              (unsigned long long)budget_bytes,
+                             configured_max_batch,
+                             configured_max_prompt_tokens,
+                             configured_max_gen_tokens,
+                             arena_batch,
+                             arena_prompt,
+                             (unsigned long long)arena_bytes,
                              (unsigned long long)vision_workspace_bytes,
                              (unsigned long long)estimate->model_views_bytes,
                              (unsigned long long)estimate->kv_cache_bytes,
@@ -298,15 +364,27 @@ static int ensure_metal_runtime_arenas_for_request(uocr_engine *engine,
     if (batch_slots > engine->max_batch || prompt_token_capacity > engine->max_prompt_tokens) {
         return set_engine_errorf(engine,
                                  UOCR_ERROR_INVALID_ARGUMENT,
-                                 "Metal runtime arena request %u slots/%u prompt tokens exceeds engine caps %u/%u",
+                                 "Metal runtime arena request %u slots/%u prompt tokens exceeds engine caps %u/%u "
+                                 "(requested_batch=%u requested_prompt_tokens=%u configured_max_batch=%u "
+                                 "configured_max_prompt_tokens=%u configured_max_gen_tokens=%u current_metal_arena_batch_slots=%u "
+                                 "current_metal_arena_prompt_token_capacity=%u current_metal_arena_bytes=%llu)",
                                  batch_slots,
                                  prompt_token_capacity,
                                  engine->max_batch,
-                                 engine->max_prompt_tokens);
+                                 engine->max_prompt_tokens,
+                                 batch_slots,
+                                 prompt_token_capacity,
+                                 engine->max_batch,
+                                 engine->max_prompt_tokens,
+                                 engine->max_gen_tokens,
+                                 current_metal_arena_batch_slots(engine),
+                                 current_metal_arena_prompt_token_capacity(engine),
+                                 (unsigned long long)current_metal_arena_bytes(engine));
     }
 
     const uint32_t current_batch = uocr_metal_context_runtime_arena_batch_slots(engine->metal);
     const uint32_t current_prompt = uocr_metal_context_runtime_arena_prompt_token_capacity(engine->metal);
+    const uint64_t current_bytes = uocr_metal_context_total_runtime_arena_capacity(engine->metal);
     if (current_batch >= batch_slots && current_prompt >= prompt_token_capacity) {
         return UOCR_OK;
     }
@@ -316,11 +394,22 @@ static int ensure_metal_runtime_arenas_for_request(uocr_engine *engine,
     if (target_batch > engine->max_batch || target_prompt > engine->max_prompt_tokens) {
         return set_engine_errorf(engine,
                                  UOCR_ERROR_INVALID_ARGUMENT,
-                                 "Metal runtime arena growth target %u slots/%u prompt tokens exceeds engine caps %u/%u",
+                                 "Metal runtime arena growth target %u slots/%u prompt tokens exceeds engine caps %u/%u "
+                                 "(requested_batch=%u requested_prompt_tokens=%u configured_max_batch=%u "
+                                 "configured_max_prompt_tokens=%u configured_max_gen_tokens=%u current_metal_arena_batch_slots=%u "
+                                 "current_metal_arena_prompt_token_capacity=%u current_metal_arena_bytes=%llu)",
                                  target_batch,
                                  target_prompt,
                                  engine->max_batch,
-                                 engine->max_prompt_tokens);
+                                 engine->max_prompt_tokens,
+                                 batch_slots,
+                                 prompt_token_capacity,
+                                 engine->max_batch,
+                                 engine->max_prompt_tokens,
+                                 engine->max_gen_tokens,
+                                 current_batch,
+                                 current_prompt,
+                                 (unsigned long long)current_bytes);
     }
 
     uocr_runtime_memory_estimate arena_estimate;
@@ -349,13 +438,19 @@ static int ensure_metal_runtime_arenas_for_request(uocr_engine *engine,
         return set_engine_errorf(engine,
                                  UOCR_ERROR_OUT_OF_MEMORY,
                                  "failed to grow Metal runtime arenas to %u slots/%u prompt tokens "
-                                 "(requested %u/%u, previous %u/%u): %s",
+                                 "(requested_batch=%u requested_prompt_tokens=%u configured_max_batch=%u "
+                                 "configured_max_prompt_tokens=%u configured_max_gen_tokens=%u previous_arena_batch_slots=%u "
+                                 "previous_arena_prompt_token_capacity=%u previous_arena_bytes=%llu): %s",
                                  target_batch,
                                  target_prompt,
                                  batch_slots,
                                  prompt_token_capacity,
+                                 engine->max_batch,
+                                 engine->max_prompt_tokens,
+                                 engine->max_gen_tokens,
                                  current_batch,
                                  current_prompt,
+                                 (unsigned long long)current_bytes,
                                  metal_error[0] != '\0' ? metal_error : "unknown error");
     }
     const int reserve_status = reserve_runtime_arena_accounting(engine, &arena_estimate);
@@ -928,9 +1023,19 @@ int uocr_generate_prepared(uocr_engine *engine,
     if (n_requests > engine->max_batch) {
         return set_engine_errorf(engine,
                                  UOCR_ERROR_INVALID_ARGUMENT,
-                                 "batch size %u exceeds engine limit %u",
+                                 "batch size %u exceeds engine limit %u "
+                                 "(requested_batch=%u configured_max_batch=%u configured_max_prompt_tokens=%u "
+                                 "configured_max_gen_tokens=%u current_metal_arena_batch_slots=%u "
+                                 "current_metal_arena_prompt_token_capacity=%u current_metal_arena_bytes=%llu)",
                                  n_requests,
-                                 engine->max_batch);
+                                 engine->max_batch,
+                                 n_requests,
+                                 engine->max_batch,
+                                 engine->max_prompt_tokens,
+                                 engine->max_gen_tokens,
+                                 current_metal_arena_batch_slots(engine),
+                                 current_metal_arena_prompt_token_capacity(engine),
+                                 (unsigned long long)current_metal_arena_bytes(engine));
     }
 
     uocr_profile_begin_request(&engine->profile);
@@ -945,6 +1050,7 @@ int uocr_generate_prepared(uocr_engine *engine,
     limits.max_position_tokens = UOCR_MAX_POSITIONS;
     limits.generated_ring_window = UOCR_GENERATED_RING_WINDOW;
     uint32_t max_prompt_tokens_in_batch = 0u;
+    uint32_t max_new_tokens_in_batch = 0u;
     uint32_t max_visual_tokens_in_batch = 0u;
     uint32_t max_vision_chunk_projected_rows = 0u;
     uint32_t max_vision_view_size = 0u;
@@ -955,7 +1061,23 @@ int uocr_generate_prepared(uocr_engine *engine,
         char validation_error[512];
         const int status = uocr_validate_prepared_request(&requests[i], &limits, validation_error, sizeof(validation_error));
         if (status != UOCR_OK) {
-            return set_engine_errorf(engine, status, "request %u invalid: %s", i, validation_error);
+            return set_engine_errorf(engine,
+                                     status,
+                                     "request %u invalid: %s (requested_batch=%u requested_prompt_tokens=%u "
+                                     "requested_max_new_tokens=%u configured_max_batch=%u configured_max_prompt_tokens=%u "
+                                     "configured_max_gen_tokens=%u current_metal_arena_batch_slots=%u "
+                                     "current_metal_arena_prompt_token_capacity=%u current_metal_arena_bytes=%llu)",
+                                     i,
+                                     validation_error,
+                                     n_requests,
+                                     requests[i].n_tokens,
+                                     requests[i].max_new_tokens,
+                                     engine->max_batch,
+                                     engine->max_prompt_tokens,
+                                     engine->max_gen_tokens,
+                                     current_metal_arena_batch_slots(engine),
+                                     current_metal_arena_prompt_token_capacity(engine),
+                                     (unsigned long long)current_metal_arena_bytes(engine));
         }
         uocr_sequence_state sequence_state;
         const int state_status = uocr_build_sequence_state(&requests[i], &sequence_state, validation_error, sizeof(validation_error));
@@ -992,6 +1114,9 @@ int uocr_generate_prepared(uocr_engine *engine,
         if (requests[i].n_tokens > max_prompt_tokens_in_batch) {
             max_prompt_tokens_in_batch = requests[i].n_tokens;
         }
+        if (requests[i].max_new_tokens > max_new_tokens_in_batch) {
+            max_new_tokens_in_batch = requests[i].max_new_tokens;
+        }
         if (requests[i].max_new_tokens > 0u) {
             any_generation_requested = 1;
         }
@@ -1019,6 +1144,7 @@ int uocr_generate_prepared(uocr_engine *engine,
         request_shape.request_count = n_requests;
         request_shape.requested_views = requested_views_in_batch;
         request_shape.prompt_tokens = max_prompt_tokens_in_batch;
+        request_shape.max_new_tokens = max_new_tokens_in_batch;
         request_shape.visual_rows = max_visual_tokens_in_batch;
         request_shape.max_chunk_projected_rows = max_vision_chunk_projected_rows;
         request_shape.max_view_size = max_vision_view_size;
