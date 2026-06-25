@@ -254,6 +254,15 @@ if(UOCR_BUILD_TESTS)
     uocr_apply_sanitizers(test_logits_processor)
     add_test(NAME uocr_logits_processor COMMAND test_logits_processor)
 
+    add_executable(test_request_validation tests/test_request_validation.c)
+    target_include_directories(test_request_validation PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/include"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    target_link_libraries(test_request_validation PRIVATE uocr_core)
+    uocr_apply_common_warnings(test_request_validation)
+    uocr_apply_sanitizers(test_request_validation)
+    add_test(NAME uocr_request_validation COMMAND test_request_validation)
+
     add_executable(test_sequence tests/test_sequence.c)
     target_include_directories(test_sequence PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/include"

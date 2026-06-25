@@ -256,6 +256,8 @@ int uocr_validate_prepared_request(const uocr_prepared_request *request,
     }
 
     uint32_t image_placeholders = 0u;
+    uint32_t first_image = request->n_tokens;
+    uint32_t last_image = 0u;
     for (uint32_t i = 0u; i < request->n_tokens; ++i) {
         const int32_t token = request->input_ids[i];
         if (token < 0 || token >= (int32_t)UOCR_VOCAB_SIZE) {
@@ -273,8 +275,26 @@ int uocr_validate_prepared_request(const uocr_prepared_request *request,
                             token,
                             UOCR_TOKEN_IMAGE);
             }
+            if (first_image == request->n_tokens) {
+                first_image = i;
+            }
+            last_image = i;
             ++image_placeholders;
+        } else if (token == UOCR_TOKEN_IMAGE) {
+            return fail(error,
+                        error_size,
+                        "token %u is image token %d but image_mask is 0",
+                        i,
+                        UOCR_TOKEN_IMAGE);
         }
+    }
+    if (image_placeholders != 0u && last_image - first_image + 1u != image_placeholders) {
+        return fail(error,
+                    error_size,
+                    "image placeholders must be one contiguous span; first=%u last=%u count=%u",
+                    first_image,
+                    last_image,
+                    image_placeholders);
     }
 
     uint32_t expected_visual = 0u;

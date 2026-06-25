@@ -973,7 +973,7 @@ Do not start the stable high-level OCR/PDF API until Gate E2E-0 passes: public f
   - [x] visual token count formulas
   - [x] image preprocessing against upstream for tiny fixtures
   - [x] `.uocr` synthetic loader/dumper
-  - [ ] prepared-request validation
+  - [x] prepared-request validation
   - [ ] no-repeat-ngram processor
   - [x] KV ring index arithmetic
 - [ ] Add native CTest tests:
