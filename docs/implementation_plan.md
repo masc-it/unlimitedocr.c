@@ -176,11 +176,11 @@ encoding overhead.
 
 Implementation status:
 
-- [ ] Build direct decoder binding structs at model map time: per-layer norms, Q/K/V/O, layer-0 MLP, each MoE router/shared, and each routed expert slab.
-- [ ] Validate MoE expert contiguity once during binding, cache one slab slice per MoE layer, and remove per-token expert-slab scans.
-- [ ] Replace linear tensor-id lookup in hot decode/prefill with direct cached pointers/slices.
+- [x] Build direct decoder binding structs at model map time: per-layer norms, Q/K/V/O, layer-0 MLP, each MoE router/shared, and each routed expert slab.
+- [x] Validate MoE expert contiguity once during binding, cache one slab slice per MoE layer, and remove per-token expert-slab scans.
+- [x] Replace linear tensor-id lookup in hot decode/prefill with direct cached pointers/slices.
 - [ ] Add profiling counters for binding lookup and expert-slab validation before removal.
-- [ ] Delete the old hot-path lookup path after cached bindings are validated.
+- [x] Delete the old hot-path lookup path after cached bindings are validated.
 
 ## 6. Convert vision weights to direct Metal slices
 
@@ -373,7 +373,7 @@ Implementation status:
 - [x] Land profiling/timing/memory instrumentation and capture baselines.
 - [ ] Rewrite vision to be GPU-resident through prompt splice; remove host-scratch production path.
 - [ ] Fix vision memory accounting to match the new GPU-resident workspace.
-- [ ] Cache decoder bindings and MoE expert slabs to remove hot-loop CPU lookup/validation.
+- [x] Cache decoder bindings and MoE expert slabs to remove hot-loop CPU lookup/validation.
 - [ ] Optimize decode matvec/MoE kernels, including LM-head tuning, with before/after timings.
 - [ ] Cache MPS descriptors/NDArrays and select one measured matmul path per shape.
 - [ ] Fuse dense epilogues and packed projections where timings improve.

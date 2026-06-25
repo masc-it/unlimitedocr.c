@@ -82,9 +82,40 @@ typedef struct uocr_metal_decoder_binding {
     uint64_t payload_size;
 } uocr_metal_decoder_binding;
 
+#define UOCR_METAL_DECODER_BINDING_INDEX_INVALID UINT32_MAX
+
+typedef struct uocr_metal_decoder_expert_slab_cache {
+    int valid;
+    uint32_t reserved;
+    id<MTLBuffer> buffer;
+    NSUInteger offset;
+    uint64_t byte_length;
+} uocr_metal_decoder_expert_slab_cache;
+
+typedef struct uocr_metal_decoder_layer_binding_cache {
+    uint32_t input_norm;
+    uint32_t post_attn_norm;
+    uint32_t q_proj;
+    uint32_t k_proj;
+    uint32_t v_proj;
+    uint32_t o_proj;
+    uint32_t dense_gate;
+    uint32_t dense_up;
+    uint32_t dense_down;
+    uint32_t moe_router;
+    uint32_t moe_shared_gate;
+    uint32_t moe_shared_up;
+    uint32_t moe_shared_down;
+    uocr_metal_decoder_expert_slab_cache expert_slab;
+} uocr_metal_decoder_layer_binding_cache;
+
 typedef struct uocr_metal_decoder_binding_cache {
     int valid;
     uint32_t count;
+    uint32_t token_embedding;
+    uint32_t lm_head;
+    uint32_t final_norm;
+    uocr_metal_decoder_layer_binding_cache layers[UOCR_DECODER_LAYERS];
     uocr_metal_decoder_binding tensors[UOCR_METAL_DECODER_REQUIRED_TENSOR_COUNT];
 } uocr_metal_decoder_binding_cache;
 
@@ -159,6 +190,7 @@ struct uocr_metal_context {
 };
 
 static int metal_fail(char *error, size_t error_size, const char *fmt, ...);
+static int metal_buffer_range_valid(id<MTLBuffer> buffer, NSUInteger offset, uint64_t bytes);
 static int metal_context_ensure_scratch_accounted(uocr_metal_context *ctx,
                                                   uocr_metal_scratch_slot slot,
                                                   uint64_t min_length,
@@ -1750,11 +1782,41 @@ static int metal_get_mapped_tensor_buffer(const uocr_metal_context *ctx,
     return 1;
 }
 
+static void metal_decoder_binding_cache_init(uocr_metal_decoder_binding_cache *cache) {
+    if (cache == NULL) {
+        return;
+    }
+    memset(cache, 0, sizeof(*cache));
+    cache->token_embedding = UOCR_METAL_DECODER_BINDING_INDEX_INVALID;
+    cache->lm_head = UOCR_METAL_DECODER_BINDING_INDEX_INVALID;
+    cache->final_norm = UOCR_METAL_DECODER_BINDING_INDEX_INVALID;
+    for (uint32_t layer = 0u; layer < UOCR_DECODER_LAYERS; ++layer) {
+        uocr_metal_decoder_layer_binding_cache *layer_cache = &cache->layers[layer];
+        layer_cache->input_norm = UOCR_METAL_DECODER_BINDING_INDEX_INVALID;
+        layer_cache->post_attn_norm = UOCR_METAL_DECODER_BINDING_INDEX_INVALID;
+        layer_cache->q_proj = UOCR_METAL_DECODER_BINDING_INDEX_INVALID;
+        layer_cache->k_proj = UOCR_METAL_DECODER_BINDING_INDEX_INVALID;
+        layer_cache->v_proj = UOCR_METAL_DECODER_BINDING_INDEX_INVALID;
+        layer_cache->o_proj = UOCR_METAL_DECODER_BINDING_INDEX_INVALID;
+        layer_cache->dense_gate = UOCR_METAL_DECODER_BINDING_INDEX_INVALID;
+        layer_cache->dense_up = UOCR_METAL_DECODER_BINDING_INDEX_INVALID;
+        layer_cache->dense_down = UOCR_METAL_DECODER_BINDING_INDEX_INVALID;
+        layer_cache->moe_router = UOCR_METAL_DECODER_BINDING_INDEX_INVALID;
+        layer_cache->moe_shared_gate = UOCR_METAL_DECODER_BINDING_INDEX_INVALID;
+        layer_cache->moe_shared_up = UOCR_METAL_DECODER_BINDING_INDEX_INVALID;
+        layer_cache->moe_shared_down = UOCR_METAL_DECODER_BINDING_INDEX_INVALID;
+        layer_cache->expert_slab.valid = 0;
+        layer_cache->expert_slab.buffer = nil;
+        layer_cache->expert_slab.offset = 0u;
+        layer_cache->expert_slab.byte_length = 0u;
+    }
+}
+
 static void metal_invalidate_decoder_binding_cache(uocr_metal_context *ctx, const char *reason) {
     if (ctx == NULL) {
         return;
     }
-    memset(&ctx->decoder_bindings, 0, sizeof(ctx->decoder_bindings));
+    metal_decoder_binding_cache_init(&ctx->decoder_bindings);
     if (reason == NULL || reason[0] == '\0') {
         reason = "decoder tensor bindings are not validated";
     }
@@ -1939,6 +2001,254 @@ static int metal_append_decoder_binding2(uocr_metal_context *ctx,
     return metal_append_decoder_binding(ctx, model, cache, tensor_id, family, layer, expert, projection, 2u, dims, error, error_size);
 }
 
+static int metal_decoder_binding_cache_find_index(const uocr_metal_decoder_binding_cache *cache,
+                                                  uint32_t tensor_id,
+                                                  uint32_t *out_index) {
+    if (cache == NULL || out_index == NULL || tensor_id == 0u) {
+        return 0;
+    }
+    for (uint32_t i = 0u; i < cache->count; ++i) {
+        if (cache->tensors[i].tensor_id == tensor_id) {
+            *out_index = i;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int metal_decoder_binding_cache_require_index(const uocr_metal_decoder_binding_cache *cache,
+                                                     uint32_t tensor_id,
+                                                     const char *label,
+                                                     uint32_t *out_index,
+                                                     char *error,
+                                                     size_t error_size) {
+    if (!metal_decoder_binding_cache_find_index(cache, tensor_id, out_index)) {
+        return metal_fail(error,
+                          error_size,
+                          "missing validated decoder tensor for %s (id=%u)",
+                          label != NULL ? label : "binding",
+                          tensor_id);
+    }
+    const uocr_metal_decoder_binding *binding = &cache->tensors[*out_index];
+    if (binding->buffer == nil) {
+        return metal_fail(error,
+                          error_size,
+                          "validated decoder tensor for %s has no Metal buffer (id=%u)",
+                          label != NULL ? label : "binding",
+                          tensor_id);
+    }
+    return 1;
+}
+
+static int metal_decoder_binding_cache_validate_expert_slab(const uocr_metal_decoder_binding_cache *cache,
+                                                            uint32_t layer,
+                                                            uocr_metal_decoder_expert_slab_cache *out_slab,
+                                                            char *error,
+                                                            size_t error_size) {
+    if (cache == NULL || out_slab == NULL || layer == 0u || layer >= UOCR_DECODER_LAYERS) {
+        return metal_fail(error, error_size, "invalid decoder MoE expert slab cache request");
+    }
+    memset(out_slab, 0, sizeof(*out_slab));
+    const uint64_t projection_values = (uint64_t)UOCR_MOE_EXPERT_INTERMEDIATE * (uint64_t)UOCR_HIDDEN_SIZE;
+    const uint64_t projection_bytes = projection_values * 2u;
+    const uint64_t expert_stride_bytes = projection_bytes * 3u;
+    const uint64_t total_bytes = expert_stride_bytes * (uint64_t)UOCR_ROUTED_EXPERTS;
+
+    uint32_t gate0_index = UOCR_METAL_DECODER_BINDING_INDEX_INVALID;
+    if (!metal_decoder_binding_cache_require_index(cache,
+                                                   uocr_tensor_id_moe_expert(layer, 0u, UOCR_TENSOR_PROJ_GATE),
+                                                   "MoE expert0 gate",
+                                                   &gate0_index,
+                                                   error,
+                                                   error_size)) {
+        return 0;
+    }
+    const uocr_metal_decoder_binding *gate0 = &cache->tensors[gate0_index];
+    if (gate0->offset > NSUIntegerMax || !metal_buffer_range_valid(gate0->buffer, gate0->offset, total_bytes)) {
+        return metal_fail(error,
+                          error_size,
+                          "integrated MoE expert slab for layer %u is not contiguous in one Metal view",
+                          layer);
+    }
+
+    for (uint32_t expert = 0u; expert < UOCR_ROUTED_EXPERTS; ++expert) {
+        const uint64_t base = (uint64_t)gate0->offset + (uint64_t)expert * expert_stride_bytes;
+        uint32_t gate_index = UOCR_METAL_DECODER_BINDING_INDEX_INVALID;
+        uint32_t up_index = UOCR_METAL_DECODER_BINDING_INDEX_INVALID;
+        uint32_t down_index = UOCR_METAL_DECODER_BINDING_INDEX_INVALID;
+        if (!metal_decoder_binding_cache_require_index(cache,
+                                                       uocr_tensor_id_moe_expert(layer, expert, UOCR_TENSOR_PROJ_GATE),
+                                                       "MoE expert gate",
+                                                       &gate_index,
+                                                       error,
+                                                       error_size) ||
+            !metal_decoder_binding_cache_require_index(cache,
+                                                       uocr_tensor_id_moe_expert(layer, expert, UOCR_TENSOR_PROJ_UP),
+                                                       "MoE expert up",
+                                                       &up_index,
+                                                       error,
+                                                       error_size) ||
+            !metal_decoder_binding_cache_require_index(cache,
+                                                       uocr_tensor_id_moe_expert(layer, expert, UOCR_TENSOR_PROJ_DOWN),
+                                                       "MoE expert down",
+                                                       &down_index,
+                                                       error,
+                                                       error_size)) {
+            return 0;
+        }
+        const uocr_metal_decoder_binding *gate = &cache->tensors[gate_index];
+        const uocr_metal_decoder_binding *up = &cache->tensors[up_index];
+        const uocr_metal_decoder_binding *down = &cache->tensors[down_index];
+        if (gate->buffer != gate0->buffer || up->buffer != gate0->buffer || down->buffer != gate0->buffer ||
+            (uint64_t)gate->offset != base || (uint64_t)up->offset != base + projection_bytes ||
+            (uint64_t)down->offset != base + 2u * projection_bytes) {
+            return metal_fail(error,
+                              error_size,
+                              "integrated MoE expert tensors for layer %u are not interleaved-contiguous at expert %u",
+                              layer,
+                              expert);
+        }
+    }
+
+    out_slab->valid = 1;
+    out_slab->buffer = gate0->buffer;
+    out_slab->offset = gate0->offset;
+    out_slab->byte_length = total_bytes;
+    return 1;
+}
+
+static int metal_decoder_binding_cache_build_direct(uocr_metal_context *ctx,
+                                                    uocr_metal_decoder_binding_cache *cache,
+                                                    char *error,
+                                                    size_t error_size) {
+    if (ctx == NULL || cache == NULL) {
+        return metal_fail(error, error_size, "invalid decoder direct binding cache request");
+    }
+
+    if (!metal_decoder_binding_cache_require_index(cache,
+                                                   UOCR_TENSOR_ID_TOK_EMBED,
+                                                   "token embedding",
+                                                   &cache->token_embedding,
+                                                   error,
+                                                   error_size) ||
+        !metal_decoder_binding_cache_require_index(cache,
+                                                   UOCR_TENSOR_ID_LM_HEAD,
+                                                   "LM head",
+                                                   &cache->lm_head,
+                                                   error,
+                                                   error_size) ||
+        !metal_decoder_binding_cache_require_index(cache,
+                                                   UOCR_TENSOR_ID_FINAL_NORM,
+                                                   "final norm",
+                                                   &cache->final_norm,
+                                                   error,
+                                                   error_size)) {
+        return 0;
+    }
+
+    for (uint32_t layer = 0u; layer < UOCR_DECODER_LAYERS; ++layer) {
+        uocr_metal_decoder_layer_binding_cache *layer_cache = &cache->layers[layer];
+        if (!metal_decoder_binding_cache_require_index(cache,
+                                                       uocr_tensor_id_layer_input_norm(layer),
+                                                       "layer input norm",
+                                                       &layer_cache->input_norm,
+                                                       error,
+                                                       error_size) ||
+            !metal_decoder_binding_cache_require_index(cache,
+                                                       uocr_tensor_id_layer_post_attn_norm(layer),
+                                                       "layer post-attention norm",
+                                                       &layer_cache->post_attn_norm,
+                                                       error,
+                                                       error_size) ||
+            !metal_decoder_binding_cache_require_index(cache,
+                                                       uocr_tensor_id_layer_attn(layer, UOCR_TENSOR_PROJ_Q),
+                                                       "attention q_proj",
+                                                       &layer_cache->q_proj,
+                                                       error,
+                                                       error_size) ||
+            !metal_decoder_binding_cache_require_index(cache,
+                                                       uocr_tensor_id_layer_attn(layer, UOCR_TENSOR_PROJ_K),
+                                                       "attention k_proj",
+                                                       &layer_cache->k_proj,
+                                                       error,
+                                                       error_size) ||
+            !metal_decoder_binding_cache_require_index(cache,
+                                                       uocr_tensor_id_layer_attn(layer, UOCR_TENSOR_PROJ_V),
+                                                       "attention v_proj",
+                                                       &layer_cache->v_proj,
+                                                       error,
+                                                       error_size) ||
+            !metal_decoder_binding_cache_require_index(cache,
+                                                       uocr_tensor_id_layer_attn(layer, UOCR_TENSOR_PROJ_O),
+                                                       "attention o_proj",
+                                                       &layer_cache->o_proj,
+                                                       error,
+                                                       error_size)) {
+            return 0;
+        }
+    }
+
+    uocr_metal_decoder_layer_binding_cache *dense_layer = &cache->layers[0];
+    if (!metal_decoder_binding_cache_require_index(cache,
+                                                   uocr_tensor_id_layer_dense_mlp(UOCR_TENSOR_PROJ_GATE),
+                                                   "layer0 dense gate",
+                                                   &dense_layer->dense_gate,
+                                                   error,
+                                                   error_size) ||
+        !metal_decoder_binding_cache_require_index(cache,
+                                                   uocr_tensor_id_layer_dense_mlp(UOCR_TENSOR_PROJ_UP),
+                                                   "layer0 dense up",
+                                                   &dense_layer->dense_up,
+                                                   error,
+                                                   error_size) ||
+        !metal_decoder_binding_cache_require_index(cache,
+                                                   uocr_tensor_id_layer_dense_mlp(UOCR_TENSOR_PROJ_DOWN),
+                                                   "layer0 dense down",
+                                                   &dense_layer->dense_down,
+                                                   error,
+                                                   error_size)) {
+        return 0;
+    }
+
+    const uint64_t slab_validation_start_ns = uocr_profile_now_ns();
+    for (uint32_t layer = 1u; layer < UOCR_DECODER_LAYERS; ++layer) {
+        uocr_metal_decoder_layer_binding_cache *layer_cache = &cache->layers[layer];
+        if (!metal_decoder_binding_cache_require_index(cache,
+                                                       uocr_tensor_id_moe_router(layer),
+                                                       "MoE router",
+                                                       &layer_cache->moe_router,
+                                                       error,
+                                                       error_size) ||
+            !metal_decoder_binding_cache_require_index(cache,
+                                                       uocr_tensor_id_moe_shared(layer, UOCR_TENSOR_PROJ_GATE),
+                                                       "MoE shared gate",
+                                                       &layer_cache->moe_shared_gate,
+                                                       error,
+                                                       error_size) ||
+            !metal_decoder_binding_cache_require_index(cache,
+                                                       uocr_tensor_id_moe_shared(layer, UOCR_TENSOR_PROJ_UP),
+                                                       "MoE shared up",
+                                                       &layer_cache->moe_shared_up,
+                                                       error,
+                                                       error_size) ||
+            !metal_decoder_binding_cache_require_index(cache,
+                                                       uocr_tensor_id_moe_shared(layer, UOCR_TENSOR_PROJ_DOWN),
+                                                       "MoE shared down",
+                                                       &layer_cache->moe_shared_down,
+                                                       error,
+                                                       error_size) ||
+            !metal_decoder_binding_cache_validate_expert_slab(cache,
+                                                              layer,
+                                                              &layer_cache->expert_slab,
+                                                              error,
+                                                              error_size)) {
+            return 0;
+        }
+    }
+    metal_profile_add_event_now(ctx, "metal.decoder_binding_cache.expert_slab_validation", slab_validation_start_ns);
+    return 1;
+}
+
 static int metal_refresh_decoder_binding_cache(uocr_metal_context *ctx,
                                                const uocr_model_file *model,
                                                char *error,
@@ -1949,7 +2259,7 @@ static int metal_refresh_decoder_binding_cache(uocr_metal_context *ctx,
     }
 
     uocr_metal_decoder_binding_cache cache;
-    memset(&cache, 0, sizeof(cache));
+    metal_decoder_binding_cache_init(&cache);
 
 #define APPEND1(tensor_id, family, layer, expert, projection, d0) \
     do { \
@@ -2114,23 +2424,15 @@ static int metal_refresh_decoder_binding_cache(uocr_metal_context *ctx,
                           cache.count,
                           (uint32_t)UOCR_METAL_DECODER_REQUIRED_TENSOR_COUNT);
     }
+    const uint64_t direct_cache_start_ns = uocr_profile_now_ns();
+    if (!metal_decoder_binding_cache_build_direct(ctx, &cache, error, error_size)) {
+        return 0;
+    }
+    metal_profile_add_event_now(ctx, "metal.decoder_binding_cache.direct", direct_cache_start_ns);
     cache.valid = 1;
     ctx->decoder_bindings = cache;
     ctx->decoder_binding_error[0] = '\0';
     return 1;
-}
-
-static const uocr_metal_decoder_binding *metal_find_decoder_binding(const uocr_metal_context *ctx,
-                                                                    uint32_t tensor_id) {
-    if (ctx == NULL || !ctx->decoder_bindings.valid || tensor_id == 0u) {
-        return NULL;
-    }
-    for (uint32_t i = 0u; i < ctx->decoder_bindings.count; ++i) {
-        if (ctx->decoder_bindings.tensors[i].tensor_id == tensor_id) {
-            return &ctx->decoder_bindings.tensors[i];
-        }
-    }
-    return NULL;
 }
 
 uint32_t uocr_metal_context_decoder_binding_count(const uocr_metal_context *ctx) {
@@ -5584,14 +5886,22 @@ static int metal_run_packed_qkv_mps_f16(uocr_metal_context *ctx,
     return 1;
 }
 
-static const uocr_metal_decoder_binding *metal_require_decoder_binding(const uocr_metal_context *ctx,
-                                                                       uint32_t tensor_id,
-                                                                       const char *label,
-                                                                       char *error,
-                                                                       size_t error_size) {
-    const uocr_metal_decoder_binding *binding = metal_find_decoder_binding(ctx, tensor_id);
-    if (binding == NULL || binding->buffer == nil) {
-        (void)metal_fail(error, error_size, "missing mapped decoder tensor for %s (id=%u)", label, tensor_id);
+static const uocr_metal_decoder_binding *metal_require_decoder_binding_index(const uocr_metal_context *ctx,
+                                                                             uint32_t binding_index,
+                                                                             const char *label,
+                                                                             char *error,
+                                                                             size_t error_size) {
+    if (ctx == NULL || !ctx->decoder_bindings.valid || binding_index >= ctx->decoder_bindings.count) {
+        (void)metal_fail(error, error_size, "missing cached decoder tensor for %s", label != NULL ? label : "binding");
+        return NULL;
+    }
+    const uocr_metal_decoder_binding *binding = &ctx->decoder_bindings.tensors[binding_index];
+    if (binding->buffer == nil) {
+        (void)metal_fail(error,
+                         error_size,
+                         "cached decoder tensor for %s has no Metal buffer (id=%u)",
+                         label != NULL ? label : "binding",
+                         binding->tensor_id);
         return NULL;
     }
     return binding;
@@ -5607,11 +5917,11 @@ static int metal_run_token_embedding_from_token_slot_f16(uocr_metal_context *ctx
         return metal_fail(error, error_size, "invalid integrated token-embedding request");
     }
     const uint64_t table_bytes = (uint64_t)UOCR_VOCAB_SIZE * (uint64_t)UOCR_HIDDEN_SIZE * 2u;
-    const uocr_metal_decoder_binding *embedding = metal_require_decoder_binding(ctx,
-                                                                                UOCR_TENSOR_ID_TOK_EMBED,
-                                                                                "token embedding",
-                                                                                error,
-                                                                                error_size);
+    const uocr_metal_decoder_binding *embedding = metal_require_decoder_binding_index(ctx,
+                                                                                      ctx->decoder_bindings.token_embedding,
+                                                                                      "token embedding",
+                                                                                      error,
+                                                                                      error_size);
     if (embedding == NULL || !metal_buffer_range_valid(embedding->buffer, embedding->offset, table_bytes)) {
         return 0;
     }
@@ -5737,11 +6047,11 @@ static int metal_run_lm_head_argmax_f16(uocr_metal_context *ctx,
         !metal_slice_valid(partial_scores, partial_bytes) || !metal_slice_valid(partial_ids, partial_bytes)) {
         return metal_fail(error, error_size, "invalid integrated fused LM-head argmax request");
     }
-    const uocr_metal_decoder_binding *lm_head = metal_require_decoder_binding(ctx,
-                                                                              UOCR_TENSOR_ID_LM_HEAD,
-                                                                              "LM head",
-                                                                              error,
-                                                                              error_size);
+    const uocr_metal_decoder_binding *lm_head = metal_require_decoder_binding_index(ctx,
+                                                                                    ctx->decoder_bindings.lm_head,
+                                                                                    "LM head",
+                                                                                    error,
+                                                                                    error_size);
     if (lm_head == NULL || !metal_buffer_range_valid(lm_head->buffer, lm_head->offset, weight_bytes)) {
         return 0;
     }
@@ -5929,11 +6239,11 @@ static int metal_select_next_token_from_hidden_slice_f16(uocr_metal_context *ctx
         !metal_slice_valid(token_slot, sizeof(int32_t))) {
         return metal_fail(error, error_size, "invalid integrated next-token selection request");
     }
-    const uocr_metal_decoder_binding *final_norm = metal_require_decoder_binding(ctx,
-                                                                                 UOCR_TENSOR_ID_FINAL_NORM,
-                                                                                 "final norm",
-                                                                                 error,
-                                                                                 error_size);
+    const uocr_metal_decoder_binding *final_norm = metal_require_decoder_binding_index(ctx,
+                                                                                       ctx->decoder_bindings.final_norm,
+                                                                                       "final norm",
+                                                                                       error,
+                                                                                       error_size);
     if (final_norm == NULL) {
         return 0;
     }
@@ -6671,35 +6981,21 @@ static int metal_expert_interleaved_slab_for_layer(const uocr_metal_context *ctx
     if (ctx == NULL || out_slab == NULL || layer == 0u || layer >= UOCR_DECODER_LAYERS) {
         return metal_fail(error, error_size, "invalid integrated MoE expert slab request");
     }
-    const uint64_t projection_values = (uint64_t)UOCR_MOE_EXPERT_INTERMEDIATE * (uint64_t)UOCR_HIDDEN_SIZE;
-    const uint64_t projection_bytes = projection_values * 2u;
-    const uint64_t expert_stride_bytes = projection_bytes * 3u;
-    const uint64_t total_bytes = expert_stride_bytes * (uint64_t)UOCR_ROUTED_EXPERTS;
-    const uocr_metal_decoder_binding *gate0 = metal_require_decoder_binding(ctx,
-                                                                            uocr_tensor_id_moe_expert(layer, 0u, UOCR_TENSOR_PROJ_GATE),
-                                                                            "MoE expert0 gate",
-                                                                            error,
-                                                                            error_size);
-    if (gate0 == NULL || gate0->offset > NSUIntegerMax || !metal_buffer_range_valid(gate0->buffer, gate0->offset, total_bytes)) {
-        return metal_fail(error, error_size, "integrated MoE expert slab for layer %u is not contiguous in one Metal view", layer);
+    const uocr_metal_decoder_expert_slab_cache *slab = &ctx->decoder_bindings.layers[layer].expert_slab;
+    if (!ctx->decoder_bindings.valid || !slab->valid || slab->buffer == nil) {
+        return metal_fail(error,
+                          error_size,
+                          "missing cached integrated MoE expert slab for layer %u",
+                          layer);
     }
-    for (uint32_t expert = 0u; expert < UOCR_ROUTED_EXPERTS; ++expert) {
-        const uint64_t base = (uint64_t)gate0->offset + (uint64_t)expert * expert_stride_bytes;
-        const uocr_metal_decoder_binding *gate = metal_find_decoder_binding(ctx, uocr_tensor_id_moe_expert(layer, expert, UOCR_TENSOR_PROJ_GATE));
-        const uocr_metal_decoder_binding *up = metal_find_decoder_binding(ctx, uocr_tensor_id_moe_expert(layer, expert, UOCR_TENSOR_PROJ_UP));
-        const uocr_metal_decoder_binding *down = metal_find_decoder_binding(ctx, uocr_tensor_id_moe_expert(layer, expert, UOCR_TENSOR_PROJ_DOWN));
-        if (gate == NULL || up == NULL || down == NULL || gate->buffer != gate0->buffer || up->buffer != gate0->buffer ||
-            down->buffer != gate0->buffer || (uint64_t)gate->offset != base ||
-            (uint64_t)up->offset != base + projection_bytes || (uint64_t)down->offset != base + 2u * projection_bytes) {
-            return metal_fail(error,
-                              error_size,
-                              "integrated MoE expert tensors for layer %u are not interleaved-contiguous at expert %u",
-                              layer,
-                              expert);
-        }
+    if (!metal_buffer_range_valid(slab->buffer, slab->offset, slab->byte_length)) {
+        return metal_fail(error,
+                          error_size,
+                          "cached integrated MoE expert slab for layer %u is outside its Metal buffer",
+                          layer);
     }
-    out_slab->buffer = gate0->buffer;
-    out_slab->offset = gate0->offset;
+    out_slab->buffer = slab->buffer;
+    out_slab->offset = slab->offset;
     return 1;
 }
 
@@ -6891,36 +7187,37 @@ static int metal_run_decoder_decode_one_f16(uocr_metal_context *ctx,
         uocr_metal_buffer_slice output = k;
         const uint32_t output_segment = k_segment;
 
-        const uocr_metal_decoder_binding *input_norm = metal_require_decoder_binding(ctx,
-                                                                                     uocr_tensor_id_layer_input_norm(layer),
-                                                                                     "decode input RMSNorm",
-                                                                                     error,
-                                                                                     error_size);
-        const uocr_metal_decoder_binding *post_norm = metal_require_decoder_binding(ctx,
-                                                                                    uocr_tensor_id_layer_post_attn_norm(layer),
-                                                                                    "decode post-attention RMSNorm",
-                                                                                    error,
-                                                                                    error_size);
-        const uocr_metal_decoder_binding *q_weight = metal_require_decoder_binding(ctx,
-                                                                                   uocr_tensor_id_layer_attn(layer, UOCR_TENSOR_PROJ_Q),
-                                                                                   "decode attention q_proj",
-                                                                                   error,
-                                                                                   error_size);
-        const uocr_metal_decoder_binding *k_weight = metal_require_decoder_binding(ctx,
-                                                                                   uocr_tensor_id_layer_attn(layer, UOCR_TENSOR_PROJ_K),
-                                                                                   "decode attention k_proj",
-                                                                                   error,
-                                                                                   error_size);
-        const uocr_metal_decoder_binding *v_weight = metal_require_decoder_binding(ctx,
-                                                                                   uocr_tensor_id_layer_attn(layer, UOCR_TENSOR_PROJ_V),
-                                                                                   "decode attention v_proj",
-                                                                                   error,
-                                                                                   error_size);
-        const uocr_metal_decoder_binding *o_weight = metal_require_decoder_binding(ctx,
-                                                                                   uocr_tensor_id_layer_attn(layer, UOCR_TENSOR_PROJ_O),
-                                                                                   "decode attention o_proj",
-                                                                                   error,
-                                                                                   error_size);
+        const uocr_metal_decoder_layer_binding_cache *layer_bindings = &ctx->decoder_bindings.layers[layer];
+        const uocr_metal_decoder_binding *input_norm = metal_require_decoder_binding_index(ctx,
+                                                                                           layer_bindings->input_norm,
+                                                                                           "decode input RMSNorm",
+                                                                                           error,
+                                                                                           error_size);
+        const uocr_metal_decoder_binding *post_norm = metal_require_decoder_binding_index(ctx,
+                                                                                          layer_bindings->post_attn_norm,
+                                                                                          "decode post-attention RMSNorm",
+                                                                                          error,
+                                                                                          error_size);
+        const uocr_metal_decoder_binding *q_weight = metal_require_decoder_binding_index(ctx,
+                                                                                         layer_bindings->q_proj,
+                                                                                         "decode attention q_proj",
+                                                                                         error,
+                                                                                         error_size);
+        const uocr_metal_decoder_binding *k_weight = metal_require_decoder_binding_index(ctx,
+                                                                                         layer_bindings->k_proj,
+                                                                                         "decode attention k_proj",
+                                                                                         error,
+                                                                                         error_size);
+        const uocr_metal_decoder_binding *v_weight = metal_require_decoder_binding_index(ctx,
+                                                                                         layer_bindings->v_proj,
+                                                                                         "decode attention v_proj",
+                                                                                         error,
+                                                                                         error_size);
+        const uocr_metal_decoder_binding *o_weight = metal_require_decoder_binding_index(ctx,
+                                                                                         layer_bindings->o_proj,
+                                                                                         "decode attention o_proj",
+                                                                                         error,
+                                                                                         error_size);
         if (input_norm == NULL || post_norm == NULL || q_weight == NULL || k_weight == NULL || v_weight == NULL || o_weight == NULL) {
             return 0;
         }
@@ -6989,21 +7286,21 @@ static int metal_run_decoder_decode_one_f16(uocr_metal_context *ctx,
                                                       error_size));
 
         if (layer == 0u) {
-            const uocr_metal_decoder_binding *gate = metal_require_decoder_binding(ctx,
-                                                                                   uocr_tensor_id_layer_dense_mlp(UOCR_TENSOR_PROJ_GATE),
-                                                                                   "decode layer0 dense gate",
-                                                                                   error,
-                                                                                   error_size);
-            const uocr_metal_decoder_binding *up = metal_require_decoder_binding(ctx,
-                                                                                 uocr_tensor_id_layer_dense_mlp(UOCR_TENSOR_PROJ_UP),
-                                                                                 "decode layer0 dense up",
-                                                                                 error,
-                                                                                 error_size);
-            const uocr_metal_decoder_binding *down = metal_require_decoder_binding(ctx,
-                                                                                   uocr_tensor_id_layer_dense_mlp(UOCR_TENSOR_PROJ_DOWN),
-                                                                                   "decode layer0 dense down",
-                                                                                   error,
-                                                                                   error_size);
+            const uocr_metal_decoder_binding *gate = metal_require_decoder_binding_index(ctx,
+                                                                                         layer_bindings->dense_gate,
+                                                                                         "decode layer0 dense gate",
+                                                                                         error,
+                                                                                         error_size);
+            const uocr_metal_decoder_binding *up = metal_require_decoder_binding_index(ctx,
+                                                                                       layer_bindings->dense_up,
+                                                                                       "decode layer0 dense up",
+                                                                                       error,
+                                                                                       error_size);
+            const uocr_metal_decoder_binding *down = metal_require_decoder_binding_index(ctx,
+                                                                                         layer_bindings->dense_down,
+                                                                                         "decode layer0 dense down",
+                                                                                         error,
+                                                                                         error_size);
             const uint64_t mid_bytes = (uint64_t)UOCR_DENSE_LAYER0_INTERMEDIATE * 2u;
             uocr_metal_buffer_slice mid;
             if (gate == NULL || up == NULL || down == NULL) {
@@ -7028,26 +7325,26 @@ static int metal_run_decoder_decode_one_f16(uocr_metal_context *ctx,
                                                                error,
                                                                error_size));
         } else {
-            const uocr_metal_decoder_binding *router = metal_require_decoder_binding(ctx,
-                                                                                     uocr_tensor_id_moe_router(layer),
-                                                                                     "decode MoE router",
-                                                                                     error,
-                                                                                     error_size);
-            const uocr_metal_decoder_binding *shared_gate = metal_require_decoder_binding(ctx,
-                                                                                          uocr_tensor_id_moe_shared(layer, UOCR_TENSOR_PROJ_GATE),
-                                                                                          "decode MoE shared gate",
-                                                                                          error,
-                                                                                          error_size);
-            const uocr_metal_decoder_binding *shared_up = metal_require_decoder_binding(ctx,
-                                                                                        uocr_tensor_id_moe_shared(layer, UOCR_TENSOR_PROJ_UP),
-                                                                                        "decode MoE shared up",
-                                                                                        error,
-                                                                                        error_size);
-            const uocr_metal_decoder_binding *shared_down = metal_require_decoder_binding(ctx,
-                                                                                          uocr_tensor_id_moe_shared(layer, UOCR_TENSOR_PROJ_DOWN),
-                                                                                          "decode MoE shared down",
-                                                                                          error,
-                                                                                          error_size);
+            const uocr_metal_decoder_binding *router = metal_require_decoder_binding_index(ctx,
+                                                                                           layer_bindings->moe_router,
+                                                                                           "decode MoE router",
+                                                                                           error,
+                                                                                           error_size);
+            const uocr_metal_decoder_binding *shared_gate = metal_require_decoder_binding_index(ctx,
+                                                                                                layer_bindings->moe_shared_gate,
+                                                                                                "decode MoE shared gate",
+                                                                                                error,
+                                                                                                error_size);
+            const uocr_metal_decoder_binding *shared_up = metal_require_decoder_binding_index(ctx,
+                                                                                              layer_bindings->moe_shared_up,
+                                                                                              "decode MoE shared up",
+                                                                                              error,
+                                                                                              error_size);
+            const uocr_metal_decoder_binding *shared_down = metal_require_decoder_binding_index(ctx,
+                                                                                                layer_bindings->moe_shared_down,
+                                                                                                "decode MoE shared down",
+                                                                                                error,
+                                                                                                error_size);
             uocr_metal_buffer_slice top_ids;
             uocr_metal_buffer_slice top_weights;
             uocr_metal_buffer_slice expert_slab;
@@ -7176,36 +7473,37 @@ static int metal_run_decoder_prefill_text_f16(uocr_metal_context *ctx,
 
         char label[64];
         snprintf(label, sizeof(label), "layer%u input RMSNorm", layer);
-        const uocr_metal_decoder_binding *input_norm = metal_require_decoder_binding(ctx,
-                                                                                     uocr_tensor_id_layer_input_norm(layer),
-                                                                                     label,
-                                                                                     error,
-                                                                                     error_size);
-        const uocr_metal_decoder_binding *post_norm = metal_require_decoder_binding(ctx,
-                                                                                    uocr_tensor_id_layer_post_attn_norm(layer),
-                                                                                    "post-attention norm",
-                                                                                    error,
-                                                                                    error_size);
-        const uocr_metal_decoder_binding *q_weight = metal_require_decoder_binding(ctx,
-                                                                                   uocr_tensor_id_layer_attn(layer, UOCR_TENSOR_PROJ_Q),
-                                                                                   "attention q_proj",
-                                                                                   error,
-                                                                                   error_size);
-        const uocr_metal_decoder_binding *k_weight = metal_require_decoder_binding(ctx,
-                                                                                   uocr_tensor_id_layer_attn(layer, UOCR_TENSOR_PROJ_K),
-                                                                                   "attention k_proj",
-                                                                                   error,
-                                                                                   error_size);
-        const uocr_metal_decoder_binding *v_weight = metal_require_decoder_binding(ctx,
-                                                                                   uocr_tensor_id_layer_attn(layer, UOCR_TENSOR_PROJ_V),
-                                                                                   "attention v_proj",
-                                                                                   error,
-                                                                                   error_size);
-        const uocr_metal_decoder_binding *o_weight = metal_require_decoder_binding(ctx,
-                                                                                   uocr_tensor_id_layer_attn(layer, UOCR_TENSOR_PROJ_O),
-                                                                                   "attention o_proj",
-                                                                                   error,
-                                                                                   error_size);
+        const uocr_metal_decoder_layer_binding_cache *layer_bindings = &ctx->decoder_bindings.layers[layer];
+        const uocr_metal_decoder_binding *input_norm = metal_require_decoder_binding_index(ctx,
+                                                                                           layer_bindings->input_norm,
+                                                                                           label,
+                                                                                           error,
+                                                                                           error_size);
+        const uocr_metal_decoder_binding *post_norm = metal_require_decoder_binding_index(ctx,
+                                                                                          layer_bindings->post_attn_norm,
+                                                                                          "post-attention norm",
+                                                                                          error,
+                                                                                          error_size);
+        const uocr_metal_decoder_binding *q_weight = metal_require_decoder_binding_index(ctx,
+                                                                                         layer_bindings->q_proj,
+                                                                                         "attention q_proj",
+                                                                                         error,
+                                                                                         error_size);
+        const uocr_metal_decoder_binding *k_weight = metal_require_decoder_binding_index(ctx,
+                                                                                         layer_bindings->k_proj,
+                                                                                         "attention k_proj",
+                                                                                         error,
+                                                                                         error_size);
+        const uocr_metal_decoder_binding *v_weight = metal_require_decoder_binding_index(ctx,
+                                                                                         layer_bindings->v_proj,
+                                                                                         "attention v_proj",
+                                                                                         error,
+                                                                                         error_size);
+        const uocr_metal_decoder_binding *o_weight = metal_require_decoder_binding_index(ctx,
+                                                                                         layer_bindings->o_proj,
+                                                                                         "attention o_proj",
+                                                                                         error,
+                                                                                         error_size);
         if (input_norm == NULL || post_norm == NULL || q_weight == NULL || k_weight == NULL || v_weight == NULL || o_weight == NULL) {
             return 0;
         }
@@ -7221,21 +7519,21 @@ static int metal_run_decoder_prefill_text_f16(uocr_metal_context *ctx,
         }
 
         if (layer == 0u) {
-            const uocr_metal_decoder_binding *gate = metal_require_decoder_binding(ctx,
-                                                                                   uocr_tensor_id_layer_dense_mlp(UOCR_TENSOR_PROJ_GATE),
-                                                                                   "layer0 dense gate",
-                                                                                   error,
-                                                                                   error_size);
-            const uocr_metal_decoder_binding *up = metal_require_decoder_binding(ctx,
-                                                                                 uocr_tensor_id_layer_dense_mlp(UOCR_TENSOR_PROJ_UP),
-                                                                                 "layer0 dense up",
-                                                                                 error,
-                                                                                 error_size);
-            const uocr_metal_decoder_binding *down = metal_require_decoder_binding(ctx,
-                                                                                   uocr_tensor_id_layer_dense_mlp(UOCR_TENSOR_PROJ_DOWN),
-                                                                                   "layer0 dense down",
-                                                                                   error,
-                                                                                   error_size);
+            const uocr_metal_decoder_binding *gate = metal_require_decoder_binding_index(ctx,
+                                                                                         layer_bindings->dense_gate,
+                                                                                         "layer0 dense gate",
+                                                                                         error,
+                                                                                         error_size);
+            const uocr_metal_decoder_binding *up = metal_require_decoder_binding_index(ctx,
+                                                                                       layer_bindings->dense_up,
+                                                                                       "layer0 dense up",
+                                                                                       error,
+                                                                                       error_size);
+            const uocr_metal_decoder_binding *down = metal_require_decoder_binding_index(ctx,
+                                                                                         layer_bindings->dense_down,
+                                                                                         "layer0 dense down",
+                                                                                         error,
+                                                                                         error_size);
             const uint64_t mid_bytes = (uint64_t)n_tokens * (uint64_t)UOCR_DENSE_LAYER0_INTERMEDIATE * 2u;
             uocr_metal_buffer_slice mid;
             if (gate == NULL || up == NULL || down == NULL ||
@@ -7257,26 +7555,26 @@ static int metal_run_decoder_prefill_text_f16(uocr_metal_context *ctx,
                 return 0;
             }
         } else {
-            const uocr_metal_decoder_binding *router = metal_require_decoder_binding(ctx,
-                                                                                     uocr_tensor_id_moe_router(layer),
-                                                                                     "MoE router",
-                                                                                     error,
-                                                                                     error_size);
-            const uocr_metal_decoder_binding *shared_gate = metal_require_decoder_binding(ctx,
-                                                                                          uocr_tensor_id_moe_shared(layer, UOCR_TENSOR_PROJ_GATE),
-                                                                                          "MoE shared gate",
-                                                                                          error,
-                                                                                          error_size);
-            const uocr_metal_decoder_binding *shared_up = metal_require_decoder_binding(ctx,
-                                                                                        uocr_tensor_id_moe_shared(layer, UOCR_TENSOR_PROJ_UP),
-                                                                                        "MoE shared up",
-                                                                                        error,
-                                                                                        error_size);
-            const uocr_metal_decoder_binding *shared_down = metal_require_decoder_binding(ctx,
-                                                                                          uocr_tensor_id_moe_shared(layer, UOCR_TENSOR_PROJ_DOWN),
-                                                                                          "MoE shared down",
-                                                                                          error,
-                                                                                          error_size);
+            const uocr_metal_decoder_binding *router = metal_require_decoder_binding_index(ctx,
+                                                                                           layer_bindings->moe_router,
+                                                                                           "MoE router",
+                                                                                           error,
+                                                                                           error_size);
+            const uocr_metal_decoder_binding *shared_gate = metal_require_decoder_binding_index(ctx,
+                                                                                                layer_bindings->moe_shared_gate,
+                                                                                                "MoE shared gate",
+                                                                                                error,
+                                                                                                error_size);
+            const uocr_metal_decoder_binding *shared_up = metal_require_decoder_binding_index(ctx,
+                                                                                              layer_bindings->moe_shared_up,
+                                                                                              "MoE shared up",
+                                                                                              error,
+                                                                                              error_size);
+            const uocr_metal_decoder_binding *shared_down = metal_require_decoder_binding_index(ctx,
+                                                                                                layer_bindings->moe_shared_down,
+                                                                                                "MoE shared down",
+                                                                                                error,
+                                                                                                error_size);
             uocr_metal_buffer_slice top_ids;
             uocr_metal_buffer_slice top_weights;
             uocr_metal_buffer_slice expert_slab;
@@ -7359,9 +7657,9 @@ static int metal_context_generate_f16(uocr_metal_context *ctx,
         return metal_fail(error, error_size, "Metal integrated decoder requires allocated runtime arenas");
     }
     if (!uocr_metal_context_decoder_bindings_ready(ctx) ||
-        metal_find_decoder_binding(ctx, UOCR_TENSOR_ID_TOK_EMBED) == NULL ||
-        metal_find_decoder_binding(ctx, UOCR_TENSOR_ID_FINAL_NORM) == NULL ||
-        metal_find_decoder_binding(ctx, UOCR_TENSOR_ID_LM_HEAD) == NULL) {
+        ctx->decoder_bindings.token_embedding == UOCR_METAL_DECODER_BINDING_INDEX_INVALID ||
+        ctx->decoder_bindings.final_norm == UOCR_METAL_DECODER_BINDING_INDEX_INVALID ||
+        ctx->decoder_bindings.lm_head == UOCR_METAL_DECODER_BINDING_INDEX_INVALID) {
         const char *binding_error = ctx->decoder_binding_error[0] != '\0' ?
                                         ctx->decoder_binding_error :
                                         "decoder tensor bindings are not validated";
