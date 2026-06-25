@@ -188,6 +188,49 @@ static void metal_profile_count_buffer(const uocr_metal_context *ctx, uint64_t b
     }
 }
 
+static void metal_profile_count_buffer_if_allocated(const uocr_metal_context *ctx, id<MTLBuffer> buffer, NSUInteger bytes) {
+    if (buffer != nil) {
+        metal_profile_count_buffer(ctx, (uint64_t)bytes);
+    }
+}
+
+static id<MTLBuffer> metal_new_buffer_with_length(uocr_metal_context *ctx, NSUInteger length, MTLResourceOptions options) {
+    if (ctx == NULL || ctx->device == nil) {
+        return nil;
+    }
+    id<MTLBuffer> buffer = [ctx->device newBufferWithLength:length options:options];
+    metal_profile_count_buffer_if_allocated(ctx, buffer, length);
+    return buffer;
+}
+
+static id<MTLBuffer> metal_new_buffer_with_bytes(uocr_metal_context *ctx,
+                                                 const void *bytes,
+                                                 NSUInteger length,
+                                                 MTLResourceOptions options) {
+    if (ctx == NULL || ctx->device == nil) {
+        return nil;
+    }
+    id<MTLBuffer> buffer = [ctx->device newBufferWithBytes:bytes length:length options:options];
+    metal_profile_count_buffer_if_allocated(ctx, buffer, length);
+    return buffer;
+}
+
+static id<MTLBuffer> metal_new_buffer_with_bytes_no_copy(uocr_metal_context *ctx,
+                                                         void *bytes,
+                                                         NSUInteger length,
+                                                         MTLResourceOptions options,
+                                                         void (^deallocator)(void *, NSUInteger)) {
+    if (ctx == NULL || ctx->device == nil) {
+        return nil;
+    }
+    id<MTLBuffer> buffer = [ctx->device newBufferWithBytesNoCopy:bytes
+                                                          length:length
+                                                         options:options
+                                                     deallocator:deallocator];
+    metal_profile_count_buffer_if_allocated(ctx, buffer, length);
+    return buffer;
+}
+
 #define UOCR_METAL_COMMIT_AND_WAIT_PROFILED(ctx_, cb_)                                  \
     do {                                                                                 \
         const uint64_t uocr_metal_wait_start_ns__ = uocr_profile_now_ns();                \
@@ -1469,10 +1512,7 @@ int uocr_metal_context_map_model(uocr_metal_context *ctx, const uocr_model_file 
                 return metal_fail(error, error_size, "Metal model view %u is too large for this platform", i);
             }
             void *view_ptr = (void *)(uintptr_t)(model->data + views[i].file_offset);
-            id<MTLBuffer> buffer = [ctx->device newBufferWithBytesNoCopy:view_ptr
-                                                                   length:(NSUInteger)views[i].length
-                                                                  options:MTLResourceStorageModeShared
-                                                              deallocator:nil];
+            id<MTLBuffer> buffer = metal_new_buffer_with_bytes_no_copy(ctx, view_ptr, (NSUInteger)views[i].length, MTLResourceStorageModeShared, nil);
             if (buffer == nil) {
                 for (uint32_t j = 0u; j < i; ++j) {
                     [views[j].buffer release];
@@ -1487,7 +1527,6 @@ int uocr_metal_context_map_model(uocr_metal_context *ctx, const uocr_model_file 
                                   (unsigned long long)views[i].file_offset,
                                   (unsigned long long)views[i].length);
             }
-            metal_profile_count_buffer(ctx, views[i].length);
             buffer.label = [NSString stringWithFormat:@"uocr_model_view_%u", i];
             views[i].buffer = buffer;
         }
@@ -3527,7 +3566,7 @@ int uocr_metal_context_ensure_scratch(uocr_metal_context *ctx,
 
     @autoreleasepool {
         const MTLResourceOptions storage_mode = wants_cpu_visible ? MTLResourceStorageModeShared : MTLResourceStorageModePrivate;
-        id<MTLBuffer> buffer = [ctx->device newBufferWithLength:(NSUInteger)new_capacity options:storage_mode];
+        id<MTLBuffer> buffer = metal_new_buffer_with_length(ctx, (NSUInteger)new_capacity, storage_mode);
         if (buffer == nil) {
             return metal_fail(error,
                               error_size,
@@ -3535,7 +3574,6 @@ int uocr_metal_context_ensure_scratch(uocr_metal_context *ctx,
                               scratch_slot_name(slot),
                               (unsigned long long)new_capacity);
         }
-        metal_profile_count_buffer(ctx, new_capacity);
         buffer.label = [NSString stringWithFormat:@"uocr_scratch_%s", scratch_slot_name(slot)];
         [scratch->buffer release];
         scratch->buffer = buffer;
@@ -3933,7 +3971,7 @@ int uocr_metal_context_allocate_runtime_arenas(uocr_metal_context *ctx,
             }
             const int cpu_visible = runtime_arena_is_cpu_visible(slot);
             const MTLResourceOptions storage_mode = cpu_visible ? MTLResourceStorageModeShared : MTLResourceStorageModePrivate;
-            id<MTLBuffer> buffer = [ctx->device newBufferWithLength:(NSUInteger)bytes options:storage_mode];
+            id<MTLBuffer> buffer = metal_new_buffer_with_length(ctx, (NSUInteger)bytes, storage_mode);
             if (buffer == nil) {
                 uocr_metal_context_release_runtime_arenas(ctx);
                 return metal_fail(error,
@@ -3942,7 +3980,6 @@ int uocr_metal_context_allocate_runtime_arenas(uocr_metal_context *ctx,
                                   runtime_arena_slot_name(slot),
                                   (unsigned long long)bytes);
             }
-            metal_profile_count_buffer(ctx, bytes);
             buffer.label = [NSString stringWithFormat:@"uocr_arena_%s", runtime_arena_slot_name(slot)];
             ctx->runtime_arenas[i].buffer = buffer;
             ctx->runtime_arenas[i].capacity = bytes;
@@ -4966,11 +5003,10 @@ static int metal_read_slice_to_host(uocr_metal_context *ctx,
         return metal_fail(error, error_size, "invalid %s readback request", op_name);
     }
     @autoreleasepool {
-        id<MTLBuffer> readback = [ctx->device newBufferWithLength:(NSUInteger)bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> readback = metal_new_buffer_with_length(ctx, (NSUInteger)bytes, MTLResourceStorageModeShared);
         if (readback == nil) {
             return metal_fail(error, error_size, "failed to allocate %s readback buffer", op_name);
         }
-        metal_profile_count_buffer(ctx, bytes);
         id<MTLCommandBuffer> cb = metal_new_command_buffer(ctx);
         if (cb == nil) {
             [readback release];
@@ -7293,25 +7329,20 @@ int uocr_metal_context_get_rows_f16(uocr_metal_context *ctx,
             return 0;
         }
 
-        id<MTLBuffer> table = [ctx->device newBufferWithBytes:table_f16
-                                                       length:(NSUInteger)table_bytes
-                                                      options:MTLResourceStorageModeShared];
+        id<MTLBuffer> table = metal_new_buffer_with_bytes(ctx, table_f16, (NSUInteger)table_bytes, MTLResourceStorageModeShared);
         if (table == nil) {
             return metal_fail(error, error_size, "failed to allocate Metal get-rows table buffer");
         }
         table.label = @"uocr_get_rows_table_f16";
 
-        id<MTLBuffer> ids = [ctx->device newBufferWithBytes:row_ids
-                                                     length:(NSUInteger)ids_bytes
-                                                    options:MTLResourceStorageModeShared];
+        id<MTLBuffer> ids = metal_new_buffer_with_bytes(ctx, row_ids, (NSUInteger)ids_bytes, MTLResourceStorageModeShared);
         if (ids == nil) {
             [table release];
             return metal_fail(error, error_size, "failed to allocate Metal get-rows id buffer");
         }
         ids.label = @"uocr_get_rows_ids";
 
-        id<MTLBuffer> dst = [ctx->device newBufferWithLength:(NSUInteger)out_bytes
-                                                     options:MTLResourceStorageModeShared];
+        id<MTLBuffer> dst = metal_new_buffer_with_length(ctx, (NSUInteger)out_bytes, MTLResourceStorageModeShared);
         if (dst == nil) {
             [ids release];
             [table release];
@@ -7453,25 +7484,20 @@ int uocr_metal_context_get_rows_q8_0(uocr_metal_context *ctx,
             return 0;
         }
 
-        id<MTLBuffer> table = [ctx->device newBufferWithBytes:table_q8_0
-                                                       length:(NSUInteger)table_bytes
-                                                      options:MTLResourceStorageModeShared];
+        id<MTLBuffer> table = metal_new_buffer_with_bytes(ctx, table_q8_0, (NSUInteger)table_bytes, MTLResourceStorageModeShared);
         if (table == nil) {
             return metal_fail(error, error_size, "failed to allocate Metal Q8_0 get-rows table buffer");
         }
         table.label = @"uocr_get_rows_table_q8_0";
 
-        id<MTLBuffer> ids = [ctx->device newBufferWithBytes:row_ids
-                                                     length:(NSUInteger)ids_bytes
-                                                    options:MTLResourceStorageModeShared];
+        id<MTLBuffer> ids = metal_new_buffer_with_bytes(ctx, row_ids, (NSUInteger)ids_bytes, MTLResourceStorageModeShared);
         if (ids == nil) {
             [table release];
             return metal_fail(error, error_size, "failed to allocate Metal Q8_0 get-rows id buffer");
         }
         ids.label = @"uocr_get_rows_q8_ids";
 
-        id<MTLBuffer> dst = [ctx->device newBufferWithLength:(NSUInteger)out_bytes
-                                                     options:MTLResourceStorageModeShared];
+        id<MTLBuffer> dst = metal_new_buffer_with_length(ctx, (NSUInteger)out_bytes, MTLResourceStorageModeShared);
         if (dst == nil) {
             [ids release];
             [table release];
@@ -7678,9 +7704,7 @@ static int metal_context_assemble_prompt_f16_with_table_buffer_to_buffer(uocr_me
             return 0;
         }
 
-        id<MTLBuffer> tokens = [ctx->device newBufferWithBytes:input_ids
-                                                        length:(NSUInteger)token_bytes
-                                                       options:MTLResourceStorageModeShared];
+        id<MTLBuffer> tokens = metal_new_buffer_with_bytes(ctx, input_ids, (NSUInteger)token_bytes, MTLResourceStorageModeShared);
         if (tokens == nil) {
             return metal_fail(error, error_size, "failed to allocate %s token-id buffer", op);
         }
@@ -7688,9 +7712,7 @@ static int metal_context_assemble_prompt_f16_with_table_buffer_to_buffer(uocr_me
 
         id<MTLBuffer> image_features = nil;
         if (has_image_span) {
-            image_features = [ctx->device newBufferWithBytes:image_features_f16
-                                                      length:(NSUInteger)image_bytes
-                                                     options:MTLResourceStorageModeShared];
+            image_features = metal_new_buffer_with_bytes(ctx, image_features_f16, (NSUInteger)image_bytes, MTLResourceStorageModeShared);
             if (image_features == nil) {
                 [tokens release];
                 return metal_fail(error, error_size, "failed to allocate %s image-feature buffer", op);
@@ -7791,8 +7813,7 @@ static int metal_context_assemble_prompt_f16_with_table_buffer(uocr_metal_contex
     }
 
     @autoreleasepool {
-        id<MTLBuffer> dst = [ctx->device newBufferWithLength:(NSUInteger)output_bytes
-                                                     options:MTLResourceStorageModeShared];
+        id<MTLBuffer> dst = metal_new_buffer_with_length(ctx, (NSUInteger)output_bytes, MTLResourceStorageModeShared);
         if (dst == nil) {
             return metal_fail(error, error_size, "failed to allocate %s output buffer", op);
         }
@@ -7848,9 +7869,7 @@ int uocr_metal_context_assemble_prompt_f16(uocr_metal_context *ctx,
     }
 
     @autoreleasepool {
-        id<MTLBuffer> table = [ctx->device newBufferWithBytes:embedding_table_f16
-                                                       length:(NSUInteger)table_bytes
-                                                      options:MTLResourceStorageModeShared];
+        id<MTLBuffer> table = metal_new_buffer_with_bytes(ctx, embedding_table_f16, (NSUInteger)table_bytes, MTLResourceStorageModeShared);
         if (table == nil) {
             return metal_fail(error, error_size, "failed to allocate Metal prompt embedding table buffer");
         }
@@ -7988,26 +8007,20 @@ int uocr_metal_context_sam_patch_embed_f16(uocr_metal_context *ctx,
     }
 
     @autoreleasepool {
-        id<MTLBuffer> pixel_buffer = [ctx->device newBufferWithBytes:pixels
-                                                              length:(NSUInteger)pixel_bytes
-                                                             options:MTLResourceStorageModeShared];
+        id<MTLBuffer> pixel_buffer = metal_new_buffer_with_bytes(ctx, pixels, (NSUInteger)pixel_bytes, MTLResourceStorageModeShared);
         if (pixel_buffer == nil) {
             return metal_fail(error, error_size, "failed to allocate Metal SAM patch-embed pixel buffer");
         }
         pixel_buffer.label = @"uocr_sam_patch_pixels";
 
-        id<MTLBuffer> weight_buffer = [ctx->device newBufferWithBytes:patch_weight_f16
-                                                               length:(NSUInteger)weight_bytes
-                                                              options:MTLResourceStorageModeShared];
+        id<MTLBuffer> weight_buffer = metal_new_buffer_with_bytes(ctx, patch_weight_f16, (NSUInteger)weight_bytes, MTLResourceStorageModeShared);
         if (weight_buffer == nil) {
             [pixel_buffer release];
             return metal_fail(error, error_size, "failed to allocate Metal SAM patch-embed weight buffer");
         }
         weight_buffer.label = @"uocr_sam_patch_weight_f16";
 
-        id<MTLBuffer> bias_buffer = [ctx->device newBufferWithBytes:bias_source
-                                                             length:(NSUInteger)UOCR_SAM_HIDDEN_SIZE * sizeof(uint16_t)
-                                                            options:MTLResourceStorageModeShared];
+        id<MTLBuffer> bias_buffer = metal_new_buffer_with_bytes(ctx, bias_source, (NSUInteger)UOCR_SAM_HIDDEN_SIZE * sizeof(uint16_t), MTLResourceStorageModeShared);
         if (bias_buffer == nil) {
             [weight_buffer release];
             [pixel_buffer release];
@@ -8015,8 +8028,7 @@ int uocr_metal_context_sam_patch_embed_f16(uocr_metal_context *ctx,
         }
         bias_buffer.label = @"uocr_sam_patch_bias_f16";
 
-        id<MTLBuffer> output_buffer = [ctx->device newBufferWithLength:(NSUInteger)output_bytes
-                                                                options:MTLResourceStorageModeShared];
+        id<MTLBuffer> output_buffer = metal_new_buffer_with_length(ctx, (NSUInteger)output_bytes, MTLResourceStorageModeShared);
         if (output_buffer == nil) {
             [bias_buffer release];
             [weight_buffer release];
@@ -8149,25 +8161,20 @@ int uocr_metal_context_sam_add_abs_pos_f16(uocr_metal_context *ctx,
     }
 
     @autoreleasepool {
-        id<MTLBuffer> patch_buffer = [ctx->device newBufferWithBytes:patch_bhwc_f16
-                                                             length:(NSUInteger)target_bytes
-                                                            options:MTLResourceStorageModeShared];
+        id<MTLBuffer> patch_buffer = metal_new_buffer_with_bytes(ctx, patch_bhwc_f16, (NSUInteger)target_bytes, MTLResourceStorageModeShared);
         if (patch_buffer == nil) {
             return metal_fail(error, error_size, "failed to allocate Metal SAM absolute-position patch buffer");
         }
         patch_buffer.label = @"uocr_sam_abs_pos_patch_bhwc_f16";
 
-        id<MTLBuffer> pos_buffer = [ctx->device newBufferWithBytes:pos_embed_f16
-                                                           length:(NSUInteger)source_bytes
-                                                          options:MTLResourceStorageModeShared];
+        id<MTLBuffer> pos_buffer = metal_new_buffer_with_bytes(ctx, pos_embed_f16, (NSUInteger)source_bytes, MTLResourceStorageModeShared);
         if (pos_buffer == nil) {
             [patch_buffer release];
             return metal_fail(error, error_size, "failed to allocate Metal SAM absolute-position table buffer");
         }
         pos_buffer.label = @"uocr_sam_abs_pos_table_f16";
 
-        id<MTLBuffer> output_buffer = [ctx->device newBufferWithLength:(NSUInteger)target_bytes
-                                                                options:MTLResourceStorageModeShared];
+        id<MTLBuffer> output_buffer = metal_new_buffer_with_length(ctx, (NSUInteger)target_bytes, MTLResourceStorageModeShared);
         if (output_buffer == nil) {
             [pos_buffer release];
             [patch_buffer release];
@@ -8357,8 +8364,7 @@ int uocr_metal_context_read_prompt_arena_f16(uocr_metal_context *ctx,
     }
 
     @autoreleasepool {
-        id<MTLBuffer> readback = [ctx->device newBufferWithLength:(NSUInteger)readback_bytes
-                                                          options:MTLResourceStorageModeShared];
+        id<MTLBuffer> readback = metal_new_buffer_with_length(ctx, (NSUInteger)readback_bytes, MTLResourceStorageModeShared);
         if (readback == nil) {
             return metal_fail(error, error_size, "failed to allocate Metal prompt arena readback buffer");
         }
@@ -8485,15 +8491,13 @@ static int metal_context_rmsnorm_f16_with_weight_buffer(uocr_metal_context *ctx,
             return 0;
         }
 
-        id<MTLBuffer> src = [ctx->device newBufferWithBytes:input_f16
-                                                     length:(NSUInteger)input_bytes
-                                                    options:MTLResourceStorageModeShared];
+        id<MTLBuffer> src = metal_new_buffer_with_bytes(ctx, input_f16, (NSUInteger)input_bytes, MTLResourceStorageModeShared);
         if (src == nil) {
             return metal_fail(error, error_size, "failed to allocate %s input buffer", op);
         }
         src.label = @"uocr_rmsnorm_input_f16";
 
-        id<MTLBuffer> dst = [ctx->device newBufferWithLength:(NSUInteger)output_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> dst = metal_new_buffer_with_length(ctx, (NSUInteger)output_bytes, MTLResourceStorageModeShared);
         if (dst == nil) {
             [src release];
             return metal_fail(error, error_size, "failed to allocate %s output buffer", op);
@@ -8585,9 +8589,7 @@ int uocr_metal_context_rmsnorm_f16(uocr_metal_context *ctx,
     }
 
     @autoreleasepool {
-        id<MTLBuffer> weight = [ctx->device newBufferWithBytes:weight_f16
-                                                        length:(NSUInteger)weight_bytes
-                                                       options:MTLResourceStorageModeShared];
+        id<MTLBuffer> weight = metal_new_buffer_with_bytes(ctx, weight_f16, (NSUInteger)weight_bytes, MTLResourceStorageModeShared);
         if (weight == nil) {
             return metal_fail(error, error_size, "failed to allocate Metal RMSNorm weight buffer");
         }
@@ -8686,15 +8688,13 @@ static int metal_context_layernorm_f16_with_parameter_buffers(uocr_metal_context
             return 0;
         }
 
-        id<MTLBuffer> src = [ctx->device newBufferWithBytes:input_f16
-                                                     length:(NSUInteger)input_bytes
-                                                    options:MTLResourceStorageModeShared];
+        id<MTLBuffer> src = metal_new_buffer_with_bytes(ctx, input_f16, (NSUInteger)input_bytes, MTLResourceStorageModeShared);
         if (src == nil) {
             return metal_fail(error, error_size, "failed to allocate %s input buffer", op);
         }
         src.label = @"uocr_layernorm_input_f16";
 
-        id<MTLBuffer> dst = [ctx->device newBufferWithLength:(NSUInteger)output_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> dst = metal_new_buffer_with_length(ctx, (NSUInteger)output_bytes, MTLResourceStorageModeShared);
         if (dst == nil) {
             [src release];
             return metal_fail(error, error_size, "failed to allocate %s output buffer", op);
@@ -8783,17 +8783,13 @@ int uocr_metal_context_sam_layernorm_f16(uocr_metal_context *ctx,
     }
 
     @autoreleasepool {
-        id<MTLBuffer> weight = [ctx->device newBufferWithBytes:weight_f16
-                                                        length:(NSUInteger)parameter_bytes
-                                                       options:MTLResourceStorageModeShared];
+        id<MTLBuffer> weight = metal_new_buffer_with_bytes(ctx, weight_f16, (NSUInteger)parameter_bytes, MTLResourceStorageModeShared);
         if (weight == nil) {
             return metal_fail(error, error_size, "failed to allocate Metal SAM LayerNorm weight buffer");
         }
         weight.label = @"uocr_sam_layernorm_weight_f16";
 
-        id<MTLBuffer> bias = [ctx->device newBufferWithBytes:bias_f16
-                                                      length:(NSUInteger)parameter_bytes
-                                                     options:MTLResourceStorageModeShared];
+        id<MTLBuffer> bias = metal_new_buffer_with_bytes(ctx, bias_f16, (NSUInteger)parameter_bytes, MTLResourceStorageModeShared);
         if (bias == nil) {
             [weight release];
             return metal_fail(error, error_size, "failed to allocate Metal SAM LayerNorm bias buffer");
@@ -8885,26 +8881,20 @@ int uocr_metal_context_sam_qkv_f16(uocr_metal_context *ctx,
             return 0;
         }
 
-        id<MTLBuffer> src = [ctx->device newBufferWithBytes:input_f16
-                                                     length:(NSUInteger)input_bytes
-                                                    options:MTLResourceStorageModeShared];
+        id<MTLBuffer> src = metal_new_buffer_with_bytes(ctx, input_f16, (NSUInteger)input_bytes, MTLResourceStorageModeShared);
         if (src == nil) {
             return metal_fail(error, error_size, "failed to allocate Metal SAM QKV input buffer");
         }
         src.label = @"uocr_sam_qkv_input_f16";
 
-        id<MTLBuffer> weight = [ctx->device newBufferWithBytes:qkv_weight_f16
-                                                        length:(NSUInteger)weight_bytes
-                                                       options:MTLResourceStorageModeShared];
+        id<MTLBuffer> weight = metal_new_buffer_with_bytes(ctx, qkv_weight_f16, (NSUInteger)weight_bytes, MTLResourceStorageModeShared);
         if (weight == nil) {
             [src release];
             return metal_fail(error, error_size, "failed to allocate Metal SAM QKV weight buffer");
         }
         weight.label = @"uocr_sam_qkv_weight_f16";
 
-        id<MTLBuffer> bias = [ctx->device newBufferWithBytes:qkv_bias_f16
-                                                      length:(NSUInteger)bias_bytes
-                                                     options:MTLResourceStorageModeShared];
+        id<MTLBuffer> bias = metal_new_buffer_with_bytes(ctx, qkv_bias_f16, (NSUInteger)bias_bytes, MTLResourceStorageModeShared);
         if (bias == nil) {
             [weight release];
             [src release];
@@ -8912,9 +8902,9 @@ int uocr_metal_context_sam_qkv_f16(uocr_metal_context *ctx,
         }
         bias.label = @"uocr_sam_qkv_bias_f16";
 
-        id<MTLBuffer> q_dst = [ctx->device newBufferWithLength:(NSUInteger)output_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> k_dst = [ctx->device newBufferWithLength:(NSUInteger)output_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> v_dst = [ctx->device newBufferWithLength:(NSUInteger)output_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> q_dst = metal_new_buffer_with_length(ctx, (NSUInteger)output_bytes, MTLResourceStorageModeShared);
+        id<MTLBuffer> k_dst = metal_new_buffer_with_length(ctx, (NSUInteger)output_bytes, MTLResourceStorageModeShared);
+        id<MTLBuffer> v_dst = metal_new_buffer_with_length(ctx, (NSUInteger)output_bytes, MTLResourceStorageModeShared);
         if (q_dst == nil || k_dst == nil || v_dst == nil) {
             [v_dst release];
             [k_dst release];
@@ -9161,16 +9151,14 @@ int uocr_metal_context_sam_window_partition_f16(uocr_metal_context *ctx,
         id<MTLCommandBuffer> cb = nil;
         id<MTLComputeCommandEncoder> enc = nil;
 
-        src = [ctx->device newBufferWithBytes:input_bhwc_f16
-                                       length:(NSUInteger)input_bytes
-                                      options:MTLResourceStorageModeShared];
+        src = metal_new_buffer_with_bytes(ctx, input_bhwc_f16, (NSUInteger)input_bytes, MTLResourceStorageModeShared);
         if (src == nil) {
             result = metal_fail(error, error_size, "failed to allocate Metal SAM window partition input buffer");
             goto cleanup_window_partition;
         }
         src.label = @"uocr_sam_window_partition_input_bhwc_f16";
 
-        dst = [ctx->device newBufferWithLength:(NSUInteger)window_bytes options:MTLResourceStorageModeShared];
+        dst = metal_new_buffer_with_length(ctx, (NSUInteger)window_bytes, MTLResourceStorageModeShared);
         if (dst == nil) {
             result = metal_fail(error, error_size, "failed to allocate Metal SAM window partition output buffer");
             goto cleanup_window_partition;
@@ -9306,16 +9294,14 @@ int uocr_metal_context_sam_window_unpartition_f16(uocr_metal_context *ctx,
         id<MTLCommandBuffer> cb = nil;
         id<MTLComputeCommandEncoder> enc = nil;
 
-        src = [ctx->device newBufferWithBytes:windows_f16
-                                       length:(NSUInteger)window_bytes
-                                      options:MTLResourceStorageModeShared];
+        src = metal_new_buffer_with_bytes(ctx, windows_f16, (NSUInteger)window_bytes, MTLResourceStorageModeShared);
         if (src == nil) {
             result = metal_fail(error, error_size, "failed to allocate Metal SAM window unpartition input buffer");
             goto cleanup_window_unpartition;
         }
         src.label = @"uocr_sam_window_unpartition_input_f16";
 
-        dst = [ctx->device newBufferWithLength:(NSUInteger)output_bytes options:MTLResourceStorageModeShared];
+        dst = metal_new_buffer_with_length(ctx, (NSUInteger)output_bytes, MTLResourceStorageModeShared);
         if (dst == nil) {
             result = metal_fail(error, error_size, "failed to allocate Metal SAM window unpartition output buffer");
             goto cleanup_window_unpartition;
@@ -9444,25 +9430,21 @@ int uocr_metal_context_sam_neck_conv1x1_f16(uocr_metal_context *ctx,
         id<MTLCommandBuffer> cb = nil;
         id<MTLComputeCommandEncoder> enc = nil;
 
-        src = [ctx->device newBufferWithBytes:input_bhwc_f16
-                                       length:(NSUInteger)input_bytes
-                                      options:MTLResourceStorageModeShared];
+        src = metal_new_buffer_with_bytes(ctx, input_bhwc_f16, (NSUInteger)input_bytes, MTLResourceStorageModeShared);
         if (src == nil) {
             result = metal_fail(error, error_size, "failed to allocate Metal SAM neck 1x1 input buffer");
             goto cleanup_sam_neck_conv1x1;
         }
         src.label = @"uocr_sam_neck_conv1x1_input_bhwc_f16";
 
-        weight = [ctx->device newBufferWithBytes:weight_f16
-                                          length:(NSUInteger)weight_bytes
-                                         options:MTLResourceStorageModeShared];
+        weight = metal_new_buffer_with_bytes(ctx, weight_f16, (NSUInteger)weight_bytes, MTLResourceStorageModeShared);
         if (weight == nil) {
             result = metal_fail(error, error_size, "failed to allocate Metal SAM neck 1x1 weight buffer");
             goto cleanup_sam_neck_conv1x1;
         }
         weight.label = @"uocr_sam_neck_conv1x1_weight_f16";
 
-        dst = [ctx->device newBufferWithLength:(NSUInteger)output_bytes options:MTLResourceStorageModeShared];
+        dst = metal_new_buffer_with_length(ctx, (NSUInteger)output_bytes, MTLResourceStorageModeShared);
         if (dst == nil) {
             result = metal_fail(error, error_size, "failed to allocate Metal SAM neck 1x1 output buffer");
             goto cleanup_sam_neck_conv1x1;
@@ -9594,25 +9576,21 @@ int uocr_metal_context_sam_neck_conv3x3_f16(uocr_metal_context *ctx,
         id<MTLCommandBuffer> cb = nil;
         id<MTLComputeCommandEncoder> enc = nil;
 
-        src = [ctx->device newBufferWithBytes:input_nchw_f16
-                                       length:(NSUInteger)tensor_bytes
-                                      options:MTLResourceStorageModeShared];
+        src = metal_new_buffer_with_bytes(ctx, input_nchw_f16, (NSUInteger)tensor_bytes, MTLResourceStorageModeShared);
         if (src == nil) {
             result = metal_fail(error, error_size, "failed to allocate Metal SAM neck 3x3 input buffer");
             goto cleanup_sam_neck_conv3x3;
         }
         src.label = @"uocr_sam_neck_conv3x3_input_nchw_f16";
 
-        weight = [ctx->device newBufferWithBytes:weight_f16
-                                          length:(NSUInteger)weight_bytes
-                                         options:MTLResourceStorageModeShared];
+        weight = metal_new_buffer_with_bytes(ctx, weight_f16, (NSUInteger)weight_bytes, MTLResourceStorageModeShared);
         if (weight == nil) {
             result = metal_fail(error, error_size, "failed to allocate Metal SAM neck 3x3 weight buffer");
             goto cleanup_sam_neck_conv3x3;
         }
         weight.label = @"uocr_sam_neck_conv3x3_weight_f16";
 
-        dst = [ctx->device newBufferWithLength:(NSUInteger)output_bytes options:MTLResourceStorageModeShared];
+        dst = metal_new_buffer_with_length(ctx, (NSUInteger)output_bytes, MTLResourceStorageModeShared);
         if (dst == nil) {
             result = metal_fail(error, error_size, "failed to allocate Metal SAM neck 3x3 output buffer");
             goto cleanup_sam_neck_conv3x3;
@@ -9743,34 +9721,28 @@ int uocr_metal_context_sam_layernorm2d_f16(uocr_metal_context *ctx,
         id<MTLCommandBuffer> cb = nil;
         id<MTLComputeCommandEncoder> enc = nil;
 
-        src = [ctx->device newBufferWithBytes:input_nchw_f16
-                                       length:(NSUInteger)tensor_bytes
-                                      options:MTLResourceStorageModeShared];
+        src = metal_new_buffer_with_bytes(ctx, input_nchw_f16, (NSUInteger)tensor_bytes, MTLResourceStorageModeShared);
         if (src == nil) {
             result = metal_fail(error, error_size, "failed to allocate Metal SAM LayerNorm2d input buffer");
             goto cleanup_sam_layernorm2d;
         }
         src.label = @"uocr_sam_layernorm2d_input_nchw_f16";
 
-        weight = [ctx->device newBufferWithBytes:weight_f16
-                                          length:(NSUInteger)parameter_bytes
-                                         options:MTLResourceStorageModeShared];
+        weight = metal_new_buffer_with_bytes(ctx, weight_f16, (NSUInteger)parameter_bytes, MTLResourceStorageModeShared);
         if (weight == nil) {
             result = metal_fail(error, error_size, "failed to allocate Metal SAM LayerNorm2d weight buffer");
             goto cleanup_sam_layernorm2d;
         }
         weight.label = @"uocr_sam_layernorm2d_weight_f16";
 
-        bias = [ctx->device newBufferWithBytes:bias_f16
-                                        length:(NSUInteger)parameter_bytes
-                                       options:MTLResourceStorageModeShared];
+        bias = metal_new_buffer_with_bytes(ctx, bias_f16, (NSUInteger)parameter_bytes, MTLResourceStorageModeShared);
         if (bias == nil) {
             result = metal_fail(error, error_size, "failed to allocate Metal SAM LayerNorm2d bias buffer");
             goto cleanup_sam_layernorm2d;
         }
         bias.label = @"uocr_sam_layernorm2d_bias_f16";
 
-        dst = [ctx->device newBufferWithLength:(NSUInteger)output_bytes options:MTLResourceStorageModeShared];
+        dst = metal_new_buffer_with_length(ctx, (NSUInteger)output_bytes, MTLResourceStorageModeShared);
         if (dst == nil) {
             result = metal_fail(error, error_size, "failed to allocate Metal SAM LayerNorm2d output buffer");
             goto cleanup_sam_layernorm2d;
@@ -9927,25 +9899,21 @@ static int metal_context_sam_conv3x3_stride2_nchw_f16(uocr_metal_context *ctx,
         id<MTLCommandBuffer> cb = nil;
         id<MTLComputeCommandEncoder> enc = nil;
 
-        src = [ctx->device newBufferWithBytes:input_nchw_f16
-                                       length:(NSUInteger)input_bytes
-                                      options:MTLResourceStorageModeShared];
+        src = metal_new_buffer_with_bytes(ctx, input_nchw_f16, (NSUInteger)input_bytes, MTLResourceStorageModeShared);
         if (src == nil) {
             result = metal_fail(error, error_size, "failed to allocate %s input buffer", diagnostic_name);
             goto cleanup_sam_conv3x3_stride2;
         }
         src.label = @"uocr_sam_conv3x3_stride2_input_nchw_f16";
 
-        weight = [ctx->device newBufferWithBytes:weight_f16
-                                          length:(NSUInteger)weight_bytes
-                                         options:MTLResourceStorageModeShared];
+        weight = metal_new_buffer_with_bytes(ctx, weight_f16, (NSUInteger)weight_bytes, MTLResourceStorageModeShared);
         if (weight == nil) {
             result = metal_fail(error, error_size, "failed to allocate %s weight buffer", diagnostic_name);
             goto cleanup_sam_conv3x3_stride2;
         }
         weight.label = @"uocr_sam_conv3x3_stride2_weight_f16";
 
-        dst = [ctx->device newBufferWithLength:(NSUInteger)output_bytes options:MTLResourceStorageModeShared];
+        dst = metal_new_buffer_with_length(ctx, (NSUInteger)output_bytes, MTLResourceStorageModeShared);
         if (dst == nil) {
             result = metal_fail(error, error_size, "failed to allocate %s output buffer", diagnostic_name);
             goto cleanup_sam_conv3x3_stride2;
@@ -10132,24 +10100,20 @@ int uocr_metal_context_clip_embed_sam_f16(uocr_metal_context *ctx,
             return 0;
         }
 
-        id<MTLBuffer> src = [ctx->device newBufferWithBytes:sam_nchw_f16
-                                                     length:(NSUInteger)input_bytes
-                                                    options:MTLResourceStorageModeShared];
+        id<MTLBuffer> src = metal_new_buffer_with_bytes(ctx, sam_nchw_f16, (NSUInteger)input_bytes, MTLResourceStorageModeShared);
         if (src == nil) {
             return metal_fail(error, error_size, "failed to allocate Metal CLIP SAM embedding input buffer");
         }
         src.label = @"uocr_clip_embed_sam_input_nchw_f16";
 
-        id<MTLBuffer> cls = [ctx->device newBufferWithBytes:class_embedding_f16
-                                                     length:(NSUInteger)class_bytes
-                                                    options:MTLResourceStorageModeShared];
+        id<MTLBuffer> cls = metal_new_buffer_with_bytes(ctx, class_embedding_f16, (NSUInteger)class_bytes, MTLResourceStorageModeShared);
         if (cls == nil) {
             [src release];
             return metal_fail(error, error_size, "failed to allocate Metal CLIP SAM embedding class buffer");
         }
         cls.label = @"uocr_clip_embed_sam_class_f16";
 
-        id<MTLBuffer> dst = [ctx->device newBufferWithLength:(NSUInteger)output_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> dst = metal_new_buffer_with_length(ctx, (NSUInteger)output_bytes, MTLResourceStorageModeShared);
         if (dst == nil) {
             [cls release];
             [src release];
@@ -10284,24 +10248,20 @@ int uocr_metal_context_clip_add_abs_pos_f16(uocr_metal_context *ctx,
             return 0;
         }
 
-        id<MTLBuffer> tokens = [ctx->device newBufferWithBytes:tokens_f16
-                                                        length:(NSUInteger)token_bytes
-                                                       options:MTLResourceStorageModeShared];
+        id<MTLBuffer> tokens = metal_new_buffer_with_bytes(ctx, tokens_f16, (NSUInteger)token_bytes, MTLResourceStorageModeShared);
         if (tokens == nil) {
             return metal_fail(error, error_size, "failed to allocate Metal CLIP abs pos token buffer");
         }
         tokens.label = @"uocr_clip_abs_pos_tokens_f16";
 
-        id<MTLBuffer> pos = [ctx->device newBufferWithBytes:pos_embed_f16
-                                                     length:(NSUInteger)pos_bytes
-                                                    options:MTLResourceStorageModeShared];
+        id<MTLBuffer> pos = metal_new_buffer_with_bytes(ctx, pos_embed_f16, (NSUInteger)pos_bytes, MTLResourceStorageModeShared);
         if (pos == nil) {
             [tokens release];
             return metal_fail(error, error_size, "failed to allocate Metal CLIP abs pos table buffer");
         }
         pos.label = @"uocr_clip_abs_pos_table_f16";
 
-        id<MTLBuffer> dst = [ctx->device newBufferWithLength:(NSUInteger)output_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> dst = metal_new_buffer_with_length(ctx, (NSUInteger)output_bytes, MTLResourceStorageModeShared);
         if (dst == nil) {
             [pos release];
             [tokens release];
@@ -10404,17 +10364,13 @@ static int metal_context_clip_token_layernorm_f16(uocr_metal_context *ctx,
     }
 
     @autoreleasepool {
-        id<MTLBuffer> weight = [ctx->device newBufferWithBytes:weight_f16
-                                                        length:(NSUInteger)parameter_bytes
-                                                       options:MTLResourceStorageModeShared];
+        id<MTLBuffer> weight = metal_new_buffer_with_bytes(ctx, weight_f16, (NSUInteger)parameter_bytes, MTLResourceStorageModeShared);
         if (weight == nil) {
             return metal_fail(error, error_size, "failed to allocate %s weight buffer", op_name);
         }
         weight.label = weight_label;
 
-        id<MTLBuffer> bias = [ctx->device newBufferWithBytes:bias_f16
-                                                      length:(NSUInteger)parameter_bytes
-                                                     options:MTLResourceStorageModeShared];
+        id<MTLBuffer> bias = metal_new_buffer_with_bytes(ctx, bias_f16, (NSUInteger)parameter_bytes, MTLResourceStorageModeShared);
         if (bias == nil) {
             [weight release];
             return metal_fail(error, error_size, "failed to allocate %s bias buffer", op_name);
@@ -10570,36 +10526,30 @@ int uocr_metal_context_clip_qkv_f16(uocr_metal_context *ctx,
         id<MTLBuffer> k_dst = nil;
         id<MTLBuffer> v_dst = nil;
 
-        src = [ctx->device newBufferWithBytes:input_f16
-                                       length:(NSUInteger)input_bytes
-                                      options:MTLResourceStorageModeShared];
+        src = metal_new_buffer_with_bytes(ctx, input_f16, (NSUInteger)input_bytes, MTLResourceStorageModeShared);
         if (src == nil) {
             result = metal_fail(error, error_size, "failed to allocate Metal CLIP QKV input buffer");
             goto cleanup_clip_qkv;
         }
         src.label = @"uocr_clip_qkv_input_f16";
 
-        weight = [ctx->device newBufferWithBytes:qkv_weight_f16
-                                          length:(NSUInteger)weight_bytes
-                                         options:MTLResourceStorageModeShared];
+        weight = metal_new_buffer_with_bytes(ctx, qkv_weight_f16, (NSUInteger)weight_bytes, MTLResourceStorageModeShared);
         if (weight == nil) {
             result = metal_fail(error, error_size, "failed to allocate Metal CLIP QKV weight buffer");
             goto cleanup_clip_qkv;
         }
         weight.label = @"uocr_clip_qkv_weight_f16";
 
-        bias = [ctx->device newBufferWithBytes:qkv_bias_f16
-                                        length:(NSUInteger)bias_bytes
-                                       options:MTLResourceStorageModeShared];
+        bias = metal_new_buffer_with_bytes(ctx, qkv_bias_f16, (NSUInteger)bias_bytes, MTLResourceStorageModeShared);
         if (bias == nil) {
             result = metal_fail(error, error_size, "failed to allocate Metal CLIP QKV bias buffer");
             goto cleanup_clip_qkv;
         }
         bias.label = @"uocr_clip_qkv_bias_f16";
 
-        q_dst = [ctx->device newBufferWithLength:(NSUInteger)output_bytes options:MTLResourceStorageModeShared];
-        k_dst = [ctx->device newBufferWithLength:(NSUInteger)output_bytes options:MTLResourceStorageModeShared];
-        v_dst = [ctx->device newBufferWithLength:(NSUInteger)output_bytes options:MTLResourceStorageModeShared];
+        q_dst = metal_new_buffer_with_length(ctx, (NSUInteger)output_bytes, MTLResourceStorageModeShared);
+        k_dst = metal_new_buffer_with_length(ctx, (NSUInteger)output_bytes, MTLResourceStorageModeShared);
+        v_dst = metal_new_buffer_with_length(ctx, (NSUInteger)output_bytes, MTLResourceStorageModeShared);
         if (q_dst == nil || k_dst == nil || v_dst == nil) {
             result = metal_fail(error, error_size, "failed to allocate Metal CLIP QKV output buffers");
             goto cleanup_clip_qkv;
@@ -10772,28 +10722,28 @@ int uocr_metal_context_clip_attention_f16(uocr_metal_context *ctx,
         id<MTLBuffer> v_src = nil;
         id<MTLBuffer> dst = nil;
 
-        q_src = [ctx->device newBufferWithBytes:q_f16 length:(NSUInteger)input_bytes options:MTLResourceStorageModeShared];
+        q_src = metal_new_buffer_with_bytes(ctx, q_f16, (NSUInteger)input_bytes, MTLResourceStorageModeShared);
         if (q_src == nil) {
             result = metal_fail(error, error_size, "failed to allocate Metal CLIP attention Q buffer");
             goto cleanup_clip_attention;
         }
         q_src.label = @"uocr_clip_attention_q_f16";
 
-        k_src = [ctx->device newBufferWithBytes:k_f16 length:(NSUInteger)input_bytes options:MTLResourceStorageModeShared];
+        k_src = metal_new_buffer_with_bytes(ctx, k_f16, (NSUInteger)input_bytes, MTLResourceStorageModeShared);
         if (k_src == nil) {
             result = metal_fail(error, error_size, "failed to allocate Metal CLIP attention K buffer");
             goto cleanup_clip_attention;
         }
         k_src.label = @"uocr_clip_attention_k_f16";
 
-        v_src = [ctx->device newBufferWithBytes:v_f16 length:(NSUInteger)input_bytes options:MTLResourceStorageModeShared];
+        v_src = metal_new_buffer_with_bytes(ctx, v_f16, (NSUInteger)input_bytes, MTLResourceStorageModeShared);
         if (v_src == nil) {
             result = metal_fail(error, error_size, "failed to allocate Metal CLIP attention V buffer");
             goto cleanup_clip_attention;
         }
         v_src.label = @"uocr_clip_attention_v_f16";
 
-        dst = [ctx->device newBufferWithLength:(NSUInteger)output_bytes options:MTLResourceStorageModeShared];
+        dst = metal_new_buffer_with_length(ctx, (NSUInteger)output_bytes, MTLResourceStorageModeShared);
         if (dst == nil) {
             result = metal_fail(error, error_size, "failed to allocate Metal CLIP attention output buffer");
             goto cleanup_clip_attention;
@@ -10971,16 +10921,14 @@ int uocr_metal_context_clip_quickgelu_f16(uocr_metal_context *ctx,
         id<MTLCommandBuffer> cb = nil;
         id<MTLComputeCommandEncoder> enc = nil;
 
-        src = [ctx->device newBufferWithBytes:input_f16
-                                       length:(NSUInteger)input_bytes
-                                      options:MTLResourceStorageModeShared];
+        src = metal_new_buffer_with_bytes(ctx, input_f16, (NSUInteger)input_bytes, MTLResourceStorageModeShared);
         if (src == nil) {
             result = metal_fail(error, error_size, "failed to allocate Metal CLIP QuickGELU input buffer");
             goto cleanup_clip_quickgelu;
         }
         src.label = @"uocr_clip_quickgelu_input_f16";
 
-        dst = [ctx->device newBufferWithLength:(NSUInteger)output_bytes options:MTLResourceStorageModeShared];
+        dst = metal_new_buffer_with_length(ctx, (NSUInteger)output_bytes, MTLResourceStorageModeShared);
         if (dst == nil) {
             result = metal_fail(error, error_size, "failed to allocate Metal CLIP QuickGELU output buffer");
             goto cleanup_clip_quickgelu;
@@ -11233,25 +11181,21 @@ int uocr_metal_context_clip_residual_add_f16(uocr_metal_context *ctx,
         id<MTLCommandBuffer> cb = nil;
         id<MTLComputeCommandEncoder> enc = nil;
 
-        base = [ctx->device newBufferWithBytes:base_f16
-                                        length:(NSUInteger)input_bytes
-                                       options:MTLResourceStorageModeShared];
+        base = metal_new_buffer_with_bytes(ctx, base_f16, (NSUInteger)input_bytes, MTLResourceStorageModeShared);
         if (base == nil) {
             result = metal_fail(error, error_size, "failed to allocate Metal CLIP residual base buffer");
             goto cleanup_clip_residual;
         }
         base.label = @"uocr_clip_residual_base_f16";
 
-        update = [ctx->device newBufferWithBytes:update_f16
-                                          length:(NSUInteger)input_bytes
-                                         options:MTLResourceStorageModeShared];
+        update = metal_new_buffer_with_bytes(ctx, update_f16, (NSUInteger)input_bytes, MTLResourceStorageModeShared);
         if (update == nil) {
             result = metal_fail(error, error_size, "failed to allocate Metal CLIP residual update buffer");
             goto cleanup_clip_residual;
         }
         update.label = @"uocr_clip_residual_update_f16";
 
-        dst = [ctx->device newBufferWithLength:(NSUInteger)output_bytes options:MTLResourceStorageModeShared];
+        dst = metal_new_buffer_with_length(ctx, (NSUInteger)output_bytes, MTLResourceStorageModeShared);
         if (dst == nil) {
             result = metal_fail(error, error_size, "failed to allocate Metal CLIP residual output buffer");
             goto cleanup_clip_residual;
@@ -11659,25 +11603,21 @@ int uocr_metal_context_clip_sam_concat_f16(uocr_metal_context *ctx,
         id<MTLCommandBuffer> cb = nil;
         id<MTLComputeCommandEncoder> enc = nil;
 
-        clip = [ctx->device newBufferWithBytes:clip_tokens_f16
-                                        length:(NSUInteger)clip_bytes
-                                       options:MTLResourceStorageModeShared];
+        clip = metal_new_buffer_with_bytes(ctx, clip_tokens_f16, (NSUInteger)clip_bytes, MTLResourceStorageModeShared);
         if (clip == nil) {
             result = metal_fail(error, error_size, "failed to allocate Metal CLIP/SAM concat CLIP buffer");
             goto cleanup_clip_sam_concat;
         }
         clip.label = @"uocr_clip_sam_concat_clip_tokens_f16";
 
-        sam = [ctx->device newBufferWithBytes:sam_nchw_f16
-                                       length:(NSUInteger)sam_bytes
-                                      options:MTLResourceStorageModeShared];
+        sam = metal_new_buffer_with_bytes(ctx, sam_nchw_f16, (NSUInteger)sam_bytes, MTLResourceStorageModeShared);
         if (sam == nil) {
             result = metal_fail(error, error_size, "failed to allocate Metal CLIP/SAM concat SAM buffer");
             goto cleanup_clip_sam_concat;
         }
         sam.label = @"uocr_clip_sam_concat_sam_nchw_f16";
 
-        dst = [ctx->device newBufferWithLength:(NSUInteger)output_bytes options:MTLResourceStorageModeShared];
+        dst = metal_new_buffer_with_length(ctx, (NSUInteger)output_bytes, MTLResourceStorageModeShared);
         if (dst == nil) {
             result = metal_fail(error, error_size, "failed to allocate Metal CLIP/SAM concat output buffer");
             goto cleanup_clip_sam_concat;
@@ -12231,26 +12171,20 @@ static int metal_context_sam_attention_f16(uocr_metal_context *ctx,
             return 0;
         }
 
-        id<MTLBuffer> q_src = [ctx->device newBufferWithBytes:q_f16
-                                                       length:(NSUInteger)input_bytes
-                                                      options:MTLResourceStorageModeShared];
+        id<MTLBuffer> q_src = metal_new_buffer_with_bytes(ctx, q_f16, (NSUInteger)input_bytes, MTLResourceStorageModeShared);
         if (q_src == nil) {
             return metal_fail(error, error_size, "failed to allocate %s Q buffer", diagnostic_name);
         }
         q_src.label = @"uocr_sam_attention_q_f16";
 
-        id<MTLBuffer> k_src = [ctx->device newBufferWithBytes:k_f16
-                                                       length:(NSUInteger)input_bytes
-                                                      options:MTLResourceStorageModeShared];
+        id<MTLBuffer> k_src = metal_new_buffer_with_bytes(ctx, k_f16, (NSUInteger)input_bytes, MTLResourceStorageModeShared);
         if (k_src == nil) {
             [q_src release];
             return metal_fail(error, error_size, "failed to allocate %s K buffer", diagnostic_name);
         }
         k_src.label = @"uocr_sam_attention_k_f16";
 
-        id<MTLBuffer> v_src = [ctx->device newBufferWithBytes:v_f16
-                                                       length:(NSUInteger)input_bytes
-                                                      options:MTLResourceStorageModeShared];
+        id<MTLBuffer> v_src = metal_new_buffer_with_bytes(ctx, v_f16, (NSUInteger)input_bytes, MTLResourceStorageModeShared);
         if (v_src == nil) {
             [k_src release];
             [q_src release];
@@ -12258,7 +12192,7 @@ static int metal_context_sam_attention_f16(uocr_metal_context *ctx,
         }
         v_src.label = @"uocr_sam_attention_v_f16";
 
-        id<MTLBuffer> dst = [ctx->device newBufferWithLength:(NSUInteger)output_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> dst = metal_new_buffer_with_length(ctx, (NSUInteger)output_bytes, MTLResourceStorageModeShared);
         if (dst == nil) {
             [v_src release];
             [k_src release];
@@ -12511,26 +12445,20 @@ int uocr_metal_context_sam_rel_pos_attention_f16(uocr_metal_context *ctx,
             return 0;
         }
 
-        id<MTLBuffer> q_src = [ctx->device newBufferWithBytes:q_f16
-                                                       length:(NSUInteger)input_bytes
-                                                      options:MTLResourceStorageModeShared];
+        id<MTLBuffer> q_src = metal_new_buffer_with_bytes(ctx, q_f16, (NSUInteger)input_bytes, MTLResourceStorageModeShared);
         if (q_src == nil) {
             return metal_fail(error, error_size, "failed to allocate Metal SAM relative-position attention Q buffer");
         }
         q_src.label = @"uocr_sam_rel_pos_attention_q_f16";
 
-        id<MTLBuffer> k_src = [ctx->device newBufferWithBytes:k_f16
-                                                       length:(NSUInteger)input_bytes
-                                                      options:MTLResourceStorageModeShared];
+        id<MTLBuffer> k_src = metal_new_buffer_with_bytes(ctx, k_f16, (NSUInteger)input_bytes, MTLResourceStorageModeShared);
         if (k_src == nil) {
             [q_src release];
             return metal_fail(error, error_size, "failed to allocate Metal SAM relative-position attention K buffer");
         }
         k_src.label = @"uocr_sam_rel_pos_attention_k_f16";
 
-        id<MTLBuffer> v_src = [ctx->device newBufferWithBytes:v_f16
-                                                       length:(NSUInteger)input_bytes
-                                                      options:MTLResourceStorageModeShared];
+        id<MTLBuffer> v_src = metal_new_buffer_with_bytes(ctx, v_f16, (NSUInteger)input_bytes, MTLResourceStorageModeShared);
         if (v_src == nil) {
             [k_src release];
             [q_src release];
@@ -12538,9 +12466,7 @@ int uocr_metal_context_sam_rel_pos_attention_f16(uocr_metal_context *ctx,
         }
         v_src.label = @"uocr_sam_rel_pos_attention_v_f16";
 
-        id<MTLBuffer> rel_h = [ctx->device newBufferWithBytes:rel_pos_h_f16
-                                                      length:(NSUInteger)rel_h_bytes
-                                                     options:MTLResourceStorageModeShared];
+        id<MTLBuffer> rel_h = metal_new_buffer_with_bytes(ctx, rel_pos_h_f16, (NSUInteger)rel_h_bytes, MTLResourceStorageModeShared);
         if (rel_h == nil) {
             [v_src release];
             [k_src release];
@@ -12549,9 +12475,7 @@ int uocr_metal_context_sam_rel_pos_attention_f16(uocr_metal_context *ctx,
         }
         rel_h.label = @"uocr_sam_rel_pos_h_f16";
 
-        id<MTLBuffer> rel_w = [ctx->device newBufferWithBytes:rel_pos_w_f16
-                                                      length:(NSUInteger)rel_w_bytes
-                                                     options:MTLResourceStorageModeShared];
+        id<MTLBuffer> rel_w = metal_new_buffer_with_bytes(ctx, rel_pos_w_f16, (NSUInteger)rel_w_bytes, MTLResourceStorageModeShared);
         if (rel_w == nil) {
             [rel_h release];
             [v_src release];
@@ -12561,7 +12485,7 @@ int uocr_metal_context_sam_rel_pos_attention_f16(uocr_metal_context *ctx,
         }
         rel_w.label = @"uocr_sam_rel_pos_w_f16";
 
-        id<MTLBuffer> dst = [ctx->device newBufferWithLength:(NSUInteger)output_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> dst = metal_new_buffer_with_length(ctx, (NSUInteger)output_bytes, MTLResourceStorageModeShared);
         if (dst == nil) {
             [rel_w release];
             [rel_h release];
@@ -12713,25 +12637,21 @@ int uocr_metal_context_sam_residual_add_f16(uocr_metal_context *ctx,
         id<MTLCommandBuffer> cb = nil;
         id<MTLComputeCommandEncoder> enc = nil;
 
-        base = [ctx->device newBufferWithBytes:base_f16
-                                        length:(NSUInteger)input_bytes
-                                       options:MTLResourceStorageModeShared];
+        base = metal_new_buffer_with_bytes(ctx, base_f16, (NSUInteger)input_bytes, MTLResourceStorageModeShared);
         if (base == nil) {
             result = metal_fail(error, error_size, "failed to allocate Metal SAM residual base buffer");
             goto cleanup_residual_add;
         }
         base.label = @"uocr_sam_residual_base_f16";
 
-        update = [ctx->device newBufferWithBytes:update_f16
-                                          length:(NSUInteger)input_bytes
-                                         options:MTLResourceStorageModeShared];
+        update = metal_new_buffer_with_bytes(ctx, update_f16, (NSUInteger)input_bytes, MTLResourceStorageModeShared);
         if (update == nil) {
             result = metal_fail(error, error_size, "failed to allocate Metal SAM residual update buffer");
             goto cleanup_residual_add;
         }
         update.label = @"uocr_sam_residual_update_f16";
 
-        dst = [ctx->device newBufferWithLength:(NSUInteger)output_bytes options:MTLResourceStorageModeShared];
+        dst = metal_new_buffer_with_length(ctx, (NSUInteger)output_bytes, MTLResourceStorageModeShared);
         if (dst == nil) {
             result = metal_fail(error, error_size, "failed to allocate Metal SAM residual output buffer");
             goto cleanup_residual_add;
@@ -12857,43 +12777,35 @@ int uocr_metal_context_sam_attention_project_residual_f16(uocr_metal_context *ct
         id<MTLCommandBuffer> cb = nil;
         id<MTLComputeCommandEncoder> enc = nil;
 
-        src = [ctx->device newBufferWithBytes:attention_context_f16
-                                       length:(NSUInteger)activation_bytes
-                                      options:MTLResourceStorageModeShared];
+        src = metal_new_buffer_with_bytes(ctx, attention_context_f16, (NSUInteger)activation_bytes, MTLResourceStorageModeShared);
         if (src == nil) {
             result = metal_fail(error, error_size, "failed to allocate Metal SAM attention residual context buffer");
             goto cleanup_attention_residual;
         }
         src.label = @"uocr_sam_attention_project_context_f16";
 
-        weight = [ctx->device newBufferWithBytes:proj_weight_f16
-                                          length:(NSUInteger)weight_bytes
-                                         options:MTLResourceStorageModeShared];
+        weight = metal_new_buffer_with_bytes(ctx, proj_weight_f16, (NSUInteger)weight_bytes, MTLResourceStorageModeShared);
         if (weight == nil) {
             result = metal_fail(error, error_size, "failed to allocate Metal SAM attention residual weight buffer");
             goto cleanup_attention_residual;
         }
         weight.label = @"uocr_sam_attention_project_weight_f16";
 
-        bias = [ctx->device newBufferWithBytes:proj_bias_f16
-                                        length:(NSUInteger)bias_bytes
-                                       options:MTLResourceStorageModeShared];
+        bias = metal_new_buffer_with_bytes(ctx, proj_bias_f16, (NSUInteger)bias_bytes, MTLResourceStorageModeShared);
         if (bias == nil) {
             result = metal_fail(error, error_size, "failed to allocate Metal SAM attention residual bias buffer");
             goto cleanup_attention_residual;
         }
         bias.label = @"uocr_sam_attention_project_bias_f16";
 
-        residual = [ctx->device newBufferWithBytes:residual_f16
-                                            length:(NSUInteger)activation_bytes
-                                           options:MTLResourceStorageModeShared];
+        residual = metal_new_buffer_with_bytes(ctx, residual_f16, (NSUInteger)activation_bytes, MTLResourceStorageModeShared);
         if (residual == nil) {
             result = metal_fail(error, error_size, "failed to allocate Metal SAM attention residual shortcut buffer");
             goto cleanup_attention_residual;
         }
         residual.label = @"uocr_sam_attention_project_residual_f16";
 
-        dst = [ctx->device newBufferWithLength:(NSUInteger)output_bytes options:MTLResourceStorageModeShared];
+        dst = metal_new_buffer_with_length(ctx, (NSUInteger)output_bytes, MTLResourceStorageModeShared);
         if (dst == nil) {
             result = metal_fail(error, error_size, "failed to allocate Metal SAM attention residual output buffer");
             goto cleanup_attention_residual;
@@ -13035,26 +12947,20 @@ int uocr_metal_context_sam_mlp_f16(uocr_metal_context *ctx,
             return 0;
         }
 
-        id<MTLBuffer> input = [ctx->device newBufferWithBytes:input_f16
-                                                       length:(NSUInteger)input_bytes
-                                                      options:MTLResourceStorageModeShared];
+        id<MTLBuffer> input = metal_new_buffer_with_bytes(ctx, input_f16, (NSUInteger)input_bytes, MTLResourceStorageModeShared);
         if (input == nil) {
             return metal_fail(error, error_size, "failed to allocate Metal SAM MLP input buffer");
         }
         input.label = @"uocr_sam_mlp_input_f16";
 
-        id<MTLBuffer> lin1_weight = [ctx->device newBufferWithBytes:lin1_weight_f16
-                                                             length:(NSUInteger)weight_bytes
-                                                            options:MTLResourceStorageModeShared];
+        id<MTLBuffer> lin1_weight = metal_new_buffer_with_bytes(ctx, lin1_weight_f16, (NSUInteger)weight_bytes, MTLResourceStorageModeShared);
         if (lin1_weight == nil) {
             [input release];
             return metal_fail(error, error_size, "failed to allocate Metal SAM MLP lin1 weight buffer");
         }
         lin1_weight.label = @"uocr_sam_mlp_lin1_weight_f16";
 
-        id<MTLBuffer> lin1_bias = [ctx->device newBufferWithBytes:lin1_bias_f16
-                                                           length:(NSUInteger)lin1_bias_bytes
-                                                          options:MTLResourceStorageModeShared];
+        id<MTLBuffer> lin1_bias = metal_new_buffer_with_bytes(ctx, lin1_bias_f16, (NSUInteger)lin1_bias_bytes, MTLResourceStorageModeShared);
         if (lin1_bias == nil) {
             [lin1_weight release];
             [input release];
@@ -13062,9 +12968,7 @@ int uocr_metal_context_sam_mlp_f16(uocr_metal_context *ctx,
         }
         lin1_bias.label = @"uocr_sam_mlp_lin1_bias_f16";
 
-        id<MTLBuffer> lin2_weight = [ctx->device newBufferWithBytes:lin2_weight_f16
-                                                             length:(NSUInteger)weight_bytes
-                                                            options:MTLResourceStorageModeShared];
+        id<MTLBuffer> lin2_weight = metal_new_buffer_with_bytes(ctx, lin2_weight_f16, (NSUInteger)weight_bytes, MTLResourceStorageModeShared);
         if (lin2_weight == nil) {
             [lin1_bias release];
             [lin1_weight release];
@@ -13073,9 +12977,7 @@ int uocr_metal_context_sam_mlp_f16(uocr_metal_context *ctx,
         }
         lin2_weight.label = @"uocr_sam_mlp_lin2_weight_f16";
 
-        id<MTLBuffer> lin2_bias = [ctx->device newBufferWithBytes:lin2_bias_f16
-                                                           length:(NSUInteger)lin2_bias_bytes
-                                                          options:MTLResourceStorageModeShared];
+        id<MTLBuffer> lin2_bias = metal_new_buffer_with_bytes(ctx, lin2_bias_f16, (NSUInteger)lin2_bias_bytes, MTLResourceStorageModeShared);
         if (lin2_bias == nil) {
             [lin2_weight release];
             [lin1_bias release];
@@ -13085,8 +12987,7 @@ int uocr_metal_context_sam_mlp_f16(uocr_metal_context *ctx,
         }
         lin2_bias.label = @"uocr_sam_mlp_lin2_bias_f16";
 
-        id<MTLBuffer> mid = [ctx->device newBufferWithLength:(NSUInteger)intermediate_bytes
-                                                     options:MTLResourceStorageModeShared];
+        id<MTLBuffer> mid = metal_new_buffer_with_length(ctx, (NSUInteger)intermediate_bytes, MTLResourceStorageModeShared);
         if (mid == nil) {
             [lin2_bias release];
             [lin2_weight release];
@@ -13098,7 +12999,7 @@ int uocr_metal_context_sam_mlp_f16(uocr_metal_context *ctx,
         mid.label = @"uocr_sam_mlp_mid_f16";
         memset([mid contents], 0, (size_t)intermediate_bytes);
 
-        id<MTLBuffer> dst = [ctx->device newBufferWithLength:(NSUInteger)output_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> dst = metal_new_buffer_with_length(ctx, (NSUInteger)output_bytes, MTLResourceStorageModeShared);
         if (dst == nil) {
             [mid release];
             [lin2_bias release];
@@ -13296,15 +13197,13 @@ int uocr_metal_context_lm_head_f16(uocr_metal_context *ctx,
             return 0;
         }
 
-        id<MTLBuffer> src = [ctx->device newBufferWithBytes:input_f16
-                                                     length:(NSUInteger)input_bytes
-                                                    options:MTLResourceStorageModeShared];
+        id<MTLBuffer> src = metal_new_buffer_with_bytes(ctx, input_f16, (NSUInteger)input_bytes, MTLResourceStorageModeShared);
         if (src == nil) {
             return metal_fail(error, error_size, "failed to allocate Metal LM-head input buffer");
         }
         src.label = @"uocr_lm_head_input_f16";
 
-        id<MTLBuffer> dst = [ctx->device newBufferWithLength:(NSUInteger)output_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> dst = metal_new_buffer_with_length(ctx, (NSUInteger)output_bytes, MTLResourceStorageModeShared);
         if (dst == nil) {
             [src release];
             return metal_fail(error, error_size, "failed to allocate Metal LM-head logits buffer");
@@ -13542,24 +13441,12 @@ int uocr_metal_context_apply_no_repeat_ngram_f32(uocr_metal_context *ctx,
             return 0;
         }
 
-        id<MTLBuffer> logits = [ctx->device newBufferWithBytes:logits_f32
-                                                        length:(NSUInteger)logits_bytes
-                                                       options:MTLResourceStorageModeShared];
-        id<MTLBuffer> sequences = [ctx->device newBufferWithBytes:pack.sequences
-                                                           length:(NSUInteger)sequence_bytes
-                                                          options:MTLResourceStorageModeShared];
-        id<MTLBuffer> row_offsets = [ctx->device newBufferWithBytes:pack.row_offsets
-                                                             length:(NSUInteger)row_bytes
-                                                            options:MTLResourceStorageModeShared];
-        id<MTLBuffer> sequence_lengths = [ctx->device newBufferWithBytes:pack.sequence_lengths
-                                                                  length:(NSUInteger)row_bytes
-                                                                 options:MTLResourceStorageModeShared];
-        id<MTLBuffer> ngram_sizes = [ctx->device newBufferWithBytes:pack.ngram_sizes
-                                                             length:(NSUInteger)row_bytes
-                                                            options:MTLResourceStorageModeShared];
-        id<MTLBuffer> windows = [ctx->device newBufferWithBytes:pack.windows
-                                                        length:(NSUInteger)row_bytes
-                                                       options:MTLResourceStorageModeShared];
+        id<MTLBuffer> logits = metal_new_buffer_with_bytes(ctx, logits_f32, (NSUInteger)logits_bytes, MTLResourceStorageModeShared);
+        id<MTLBuffer> sequences = metal_new_buffer_with_bytes(ctx, pack.sequences, (NSUInteger)sequence_bytes, MTLResourceStorageModeShared);
+        id<MTLBuffer> row_offsets = metal_new_buffer_with_bytes(ctx, pack.row_offsets, (NSUInteger)row_bytes, MTLResourceStorageModeShared);
+        id<MTLBuffer> sequence_lengths = metal_new_buffer_with_bytes(ctx, pack.sequence_lengths, (NSUInteger)row_bytes, MTLResourceStorageModeShared);
+        id<MTLBuffer> ngram_sizes = metal_new_buffer_with_bytes(ctx, pack.ngram_sizes, (NSUInteger)row_bytes, MTLResourceStorageModeShared);
+        id<MTLBuffer> windows = metal_new_buffer_with_bytes(ctx, pack.windows, (NSUInteger)row_bytes, MTLResourceStorageModeShared);
         if (logits == nil || sequences == nil || row_offsets == nil || sequence_lengths == nil || ngram_sizes == nil || windows == nil) {
             [windows release];
             [ngram_sizes release];
@@ -13706,16 +13593,14 @@ int uocr_metal_context_argmax_f32(uocr_metal_context *ctx,
             return 0;
         }
 
-        id<MTLBuffer> logits = [ctx->device newBufferWithBytes:logits_f32
-                                                        length:(NSUInteger)logits_bytes
-                                                       options:MTLResourceStorageModeShared];
+        id<MTLBuffer> logits = metal_new_buffer_with_bytes(ctx, logits_f32, (NSUInteger)logits_bytes, MTLResourceStorageModeShared);
         if (logits == nil) {
             return metal_fail(error, error_size, "failed to allocate Metal argmax logits buffer");
         }
         logits.label = @"uocr_argmax_logits_f32";
 
-        id<MTLBuffer> ids = [ctx->device newBufferWithLength:(NSUInteger)ids_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> scores = [ctx->device newBufferWithLength:(NSUInteger)scores_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> ids = metal_new_buffer_with_length(ctx, (NSUInteger)ids_bytes, MTLResourceStorageModeShared);
+        id<MTLBuffer> scores = metal_new_buffer_with_length(ctx, (NSUInteger)scores_bytes, MTLResourceStorageModeShared);
         if (ids == nil || scores == nil) {
             [scores release];
             [ids release];
@@ -13955,17 +13840,13 @@ int uocr_metal_context_dense_f16(uocr_metal_context *ctx,
             return 0;
         }
 
-        id<MTLBuffer> src = [ctx->device newBufferWithBytes:input_f16
-                                                     length:(NSUInteger)input_bytes
-                                                    options:MTLResourceStorageModeShared];
+        id<MTLBuffer> src = metal_new_buffer_with_bytes(ctx, input_f16, (NSUInteger)input_bytes, MTLResourceStorageModeShared);
         if (src == nil) {
             return metal_fail(error, error_size, "failed to allocate Metal dense input buffer");
         }
         src.label = @"uocr_dense_input_f16";
 
-        id<MTLBuffer> weight = [ctx->device newBufferWithBytes:weight_f16
-                                                        length:(NSUInteger)weight_bytes
-                                                       options:MTLResourceStorageModeShared];
+        id<MTLBuffer> weight = metal_new_buffer_with_bytes(ctx, weight_f16, (NSUInteger)weight_bytes, MTLResourceStorageModeShared);
         if (weight == nil) {
             [src release];
             return metal_fail(error, error_size, "failed to allocate Metal dense weight buffer");
@@ -13975,9 +13856,7 @@ int uocr_metal_context_dense_f16(uocr_metal_context *ctx,
         id<MTLBuffer> bias = nil;
         id<MTLBuffer> bias_arg = weight;
         if (bias_f16_or_null != NULL) {
-            bias = [ctx->device newBufferWithBytes:bias_f16_or_null
-                                            length:(NSUInteger)bias_bytes
-                                           options:MTLResourceStorageModeShared];
+            bias = metal_new_buffer_with_bytes(ctx, bias_f16_or_null, (NSUInteger)bias_bytes, MTLResourceStorageModeShared);
             if (bias == nil) {
                 [weight release];
                 [src release];
@@ -13987,7 +13866,7 @@ int uocr_metal_context_dense_f16(uocr_metal_context *ctx,
             bias_arg = bias;
         }
 
-        id<MTLBuffer> dst = [ctx->device newBufferWithLength:(NSUInteger)output_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> dst = metal_new_buffer_with_length(ctx, (NSUInteger)output_bytes, MTLResourceStorageModeShared);
         if (dst == nil) {
             [bias release];
             [weight release];
@@ -14160,17 +14039,13 @@ int uocr_metal_context_dense_q8_0(uocr_metal_context *ctx,
             return 0;
         }
 
-        id<MTLBuffer> src = [ctx->device newBufferWithBytes:input_f16
-                                                     length:(NSUInteger)input_bytes
-                                                    options:MTLResourceStorageModeShared];
+        id<MTLBuffer> src = metal_new_buffer_with_bytes(ctx, input_f16, (NSUInteger)input_bytes, MTLResourceStorageModeShared);
         if (src == nil) {
             return metal_fail(error, error_size, "failed to allocate Metal Q8_0 dense input buffer");
         }
         src.label = @"uocr_dense_q8_input_f16";
 
-        id<MTLBuffer> weight = [ctx->device newBufferWithBytes:weight_q8_0
-                                                        length:(NSUInteger)weight_bytes
-                                                       options:MTLResourceStorageModeShared];
+        id<MTLBuffer> weight = metal_new_buffer_with_bytes(ctx, weight_q8_0, (NSUInteger)weight_bytes, MTLResourceStorageModeShared);
         if (weight == nil) {
             [src release];
             return metal_fail(error, error_size, "failed to allocate Metal Q8_0 dense weight buffer");
@@ -14180,9 +14055,7 @@ int uocr_metal_context_dense_q8_0(uocr_metal_context *ctx,
         id<MTLBuffer> bias = nil;
         id<MTLBuffer> bias_arg = weight;
         if (bias_f16_or_null != NULL) {
-            bias = [ctx->device newBufferWithBytes:bias_f16_or_null
-                                            length:(NSUInteger)bias_bytes
-                                           options:MTLResourceStorageModeShared];
+            bias = metal_new_buffer_with_bytes(ctx, bias_f16_or_null, (NSUInteger)bias_bytes, MTLResourceStorageModeShared);
             if (bias == nil) {
                 [weight release];
                 [src release];
@@ -14192,7 +14065,7 @@ int uocr_metal_context_dense_q8_0(uocr_metal_context *ctx,
             bias_arg = bias;
         }
 
-        id<MTLBuffer> dst = [ctx->device newBufferWithLength:(NSUInteger)output_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> dst = metal_new_buffer_with_length(ctx, (NSUInteger)output_bytes, MTLResourceStorageModeShared);
         if (dst == nil) {
             [bias release];
             [weight release];
@@ -14335,17 +14208,13 @@ int uocr_metal_context_dense_q4_k(uocr_metal_context *ctx,
             return 0;
         }
 
-        id<MTLBuffer> src = [ctx->device newBufferWithBytes:input_f16
-                                                     length:(NSUInteger)input_bytes
-                                                    options:MTLResourceStorageModeShared];
+        id<MTLBuffer> src = metal_new_buffer_with_bytes(ctx, input_f16, (NSUInteger)input_bytes, MTLResourceStorageModeShared);
         if (src == nil) {
             return metal_fail(error, error_size, "failed to allocate Metal Q4_K dense input buffer");
         }
         src.label = @"uocr_dense_q4_input_f16";
 
-        id<MTLBuffer> weight = [ctx->device newBufferWithBytes:weight_q4_k
-                                                        length:(NSUInteger)weight_bytes
-                                                       options:MTLResourceStorageModeShared];
+        id<MTLBuffer> weight = metal_new_buffer_with_bytes(ctx, weight_q4_k, (NSUInteger)weight_bytes, MTLResourceStorageModeShared);
         if (weight == nil) {
             [src release];
             return metal_fail(error, error_size, "failed to allocate Metal Q4_K dense weight buffer");
@@ -14355,9 +14224,7 @@ int uocr_metal_context_dense_q4_k(uocr_metal_context *ctx,
         id<MTLBuffer> bias = nil;
         id<MTLBuffer> bias_arg = weight;
         if (bias_f16_or_null != NULL) {
-            bias = [ctx->device newBufferWithBytes:bias_f16_or_null
-                                            length:(NSUInteger)bias_bytes
-                                           options:MTLResourceStorageModeShared];
+            bias = metal_new_buffer_with_bytes(ctx, bias_f16_or_null, (NSUInteger)bias_bytes, MTLResourceStorageModeShared);
             if (bias == nil) {
                 [weight release];
                 [src release];
@@ -14367,7 +14234,7 @@ int uocr_metal_context_dense_q4_k(uocr_metal_context *ctx,
             bias_arg = bias;
         }
 
-        id<MTLBuffer> dst = [ctx->device newBufferWithLength:(NSUInteger)output_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> dst = metal_new_buffer_with_length(ctx, (NSUInteger)output_bytes, MTLResourceStorageModeShared);
         if (dst == nil) {
             [bias release];
             [weight release];
@@ -14498,26 +14365,20 @@ int uocr_metal_context_attention_qkvo_f16(uocr_metal_context *ctx,
             return 0;
         }
 
-        id<MTLBuffer> src = [ctx->device newBufferWithBytes:input_f16
-                                                     length:(NSUInteger)input_bytes
-                                                    options:MTLResourceStorageModeShared];
+        id<MTLBuffer> src = metal_new_buffer_with_bytes(ctx, input_f16, (NSUInteger)input_bytes, MTLResourceStorageModeShared);
         if (src == nil) {
             return metal_fail(error, error_size, "failed to allocate Metal attention projection input buffer");
         }
         src.label = @"uocr_attention_projection_input_f16";
 
-        id<MTLBuffer> q_weight = [ctx->device newBufferWithBytes:q_weight_f16
-                                                          length:(NSUInteger)weight_bytes
-                                                         options:MTLResourceStorageModeShared];
+        id<MTLBuffer> q_weight = metal_new_buffer_with_bytes(ctx, q_weight_f16, (NSUInteger)weight_bytes, MTLResourceStorageModeShared);
         if (q_weight == nil) {
             [src release];
             return metal_fail(error, error_size, "failed to allocate Metal Q projection weight buffer");
         }
         q_weight.label = @"uocr_attention_q_weight_f16";
 
-        id<MTLBuffer> k_weight = [ctx->device newBufferWithBytes:k_weight_f16
-                                                          length:(NSUInteger)weight_bytes
-                                                         options:MTLResourceStorageModeShared];
+        id<MTLBuffer> k_weight = metal_new_buffer_with_bytes(ctx, k_weight_f16, (NSUInteger)weight_bytes, MTLResourceStorageModeShared);
         if (k_weight == nil) {
             [q_weight release];
             [src release];
@@ -14525,9 +14386,7 @@ int uocr_metal_context_attention_qkvo_f16(uocr_metal_context *ctx,
         }
         k_weight.label = @"uocr_attention_k_weight_f16";
 
-        id<MTLBuffer> v_weight = [ctx->device newBufferWithBytes:v_weight_f16
-                                                          length:(NSUInteger)weight_bytes
-                                                         options:MTLResourceStorageModeShared];
+        id<MTLBuffer> v_weight = metal_new_buffer_with_bytes(ctx, v_weight_f16, (NSUInteger)weight_bytes, MTLResourceStorageModeShared);
         if (v_weight == nil) {
             [k_weight release];
             [q_weight release];
@@ -14536,9 +14395,7 @@ int uocr_metal_context_attention_qkvo_f16(uocr_metal_context *ctx,
         }
         v_weight.label = @"uocr_attention_v_weight_f16";
 
-        id<MTLBuffer> o_weight = [ctx->device newBufferWithBytes:o_weight_f16
-                                                          length:(NSUInteger)weight_bytes
-                                                         options:MTLResourceStorageModeShared];
+        id<MTLBuffer> o_weight = metal_new_buffer_with_bytes(ctx, o_weight_f16, (NSUInteger)weight_bytes, MTLResourceStorageModeShared);
         if (o_weight == nil) {
             [v_weight release];
             [k_weight release];
@@ -14548,10 +14405,10 @@ int uocr_metal_context_attention_qkvo_f16(uocr_metal_context *ctx,
         }
         o_weight.label = @"uocr_attention_o_weight_f16";
 
-        id<MTLBuffer> q_dst = [ctx->device newBufferWithLength:(NSUInteger)output_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> k_dst = [ctx->device newBufferWithLength:(NSUInteger)output_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> v_dst = [ctx->device newBufferWithLength:(NSUInteger)output_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> o_dst = [ctx->device newBufferWithLength:(NSUInteger)output_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> q_dst = metal_new_buffer_with_length(ctx, (NSUInteger)output_bytes, MTLResourceStorageModeShared);
+        id<MTLBuffer> k_dst = metal_new_buffer_with_length(ctx, (NSUInteger)output_bytes, MTLResourceStorageModeShared);
+        id<MTLBuffer> v_dst = metal_new_buffer_with_length(ctx, (NSUInteger)output_bytes, MTLResourceStorageModeShared);
+        id<MTLBuffer> o_dst = metal_new_buffer_with_length(ctx, (NSUInteger)output_bytes, MTLResourceStorageModeShared);
         if (q_dst == nil || k_dst == nil || v_dst == nil || o_dst == nil) {
             [o_dst release];
             [v_dst release];
@@ -14710,26 +14567,20 @@ int uocr_metal_context_attention_output_residual_f16(uocr_metal_context *ctx,
             return 0;
         }
 
-        id<MTLBuffer> src = [ctx->device newBufferWithBytes:attention_context_f16
-                                                     length:(NSUInteger)activation_bytes
-                                                    options:MTLResourceStorageModeShared];
+        id<MTLBuffer> src = metal_new_buffer_with_bytes(ctx, attention_context_f16, (NSUInteger)activation_bytes, MTLResourceStorageModeShared);
         if (src == nil) {
             return metal_fail(error, error_size, "failed to allocate Metal attention output input buffer");
         }
         src.label = @"uocr_attention_output_context_f16";
 
-        id<MTLBuffer> weight = [ctx->device newBufferWithBytes:o_weight_f16
-                                                        length:(NSUInteger)weight_bytes
-                                                       options:MTLResourceStorageModeShared];
+        id<MTLBuffer> weight = metal_new_buffer_with_bytes(ctx, o_weight_f16, (NSUInteger)weight_bytes, MTLResourceStorageModeShared);
         if (weight == nil) {
             [src release];
             return metal_fail(error, error_size, "failed to allocate Metal attention output weight buffer");
         }
         weight.label = @"uocr_attention_output_weight_f16";
 
-        id<MTLBuffer> residual = [ctx->device newBufferWithBytes:residual_f16
-                                                          length:(NSUInteger)activation_bytes
-                                                         options:MTLResourceStorageModeShared];
+        id<MTLBuffer> residual = metal_new_buffer_with_bytes(ctx, residual_f16, (NSUInteger)activation_bytes, MTLResourceStorageModeShared);
         if (residual == nil) {
             [weight release];
             [src release];
@@ -14737,7 +14588,7 @@ int uocr_metal_context_attention_output_residual_f16(uocr_metal_context *ctx,
         }
         residual.label = @"uocr_attention_output_residual_f16";
 
-        id<MTLBuffer> dst = [ctx->device newBufferWithLength:(NSUInteger)output_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> dst = metal_new_buffer_with_length(ctx, (NSUInteger)output_bytes, MTLResourceStorageModeShared);
         if (dst == nil) {
             [residual release];
             [weight release];
@@ -14874,26 +14725,20 @@ static int metal_context_swiglu_f16(uocr_metal_context *ctx,
             return 0;
         }
 
-        id<MTLBuffer> input = [ctx->device newBufferWithBytes:input_f16
-                                                       length:(NSUInteger)input_bytes
-                                                      options:MTLResourceStorageModeShared];
+        id<MTLBuffer> input = metal_new_buffer_with_bytes(ctx, input_f16, (NSUInteger)input_bytes, MTLResourceStorageModeShared);
         if (input == nil) {
             return metal_fail(error, error_size, "failed to allocate Metal %s input buffer", op_label);
         }
         input.label = @"uocr_dense_swiglu_input_f16";
 
-        id<MTLBuffer> gate_weight = [ctx->device newBufferWithBytes:gate_weight_f16
-                                                             length:(NSUInteger)weight_bytes
-                                                            options:MTLResourceStorageModeShared];
+        id<MTLBuffer> gate_weight = metal_new_buffer_with_bytes(ctx, gate_weight_f16, (NSUInteger)weight_bytes, MTLResourceStorageModeShared);
         if (gate_weight == nil) {
             [input release];
             return metal_fail(error, error_size, "failed to allocate Metal %s gate weight buffer", op_label);
         }
         gate_weight.label = @"uocr_dense_swiglu_gate_weight_f16";
 
-        id<MTLBuffer> up_weight = [ctx->device newBufferWithBytes:up_weight_f16
-                                                           length:(NSUInteger)weight_bytes
-                                                          options:MTLResourceStorageModeShared];
+        id<MTLBuffer> up_weight = metal_new_buffer_with_bytes(ctx, up_weight_f16, (NSUInteger)weight_bytes, MTLResourceStorageModeShared);
         if (up_weight == nil) {
             [gate_weight release];
             [input release];
@@ -14901,9 +14746,7 @@ static int metal_context_swiglu_f16(uocr_metal_context *ctx,
         }
         up_weight.label = @"uocr_dense_swiglu_up_weight_f16";
 
-        id<MTLBuffer> down_weight = [ctx->device newBufferWithBytes:down_weight_f16
-                                                             length:(NSUInteger)weight_bytes
-                                                            options:MTLResourceStorageModeShared];
+        id<MTLBuffer> down_weight = metal_new_buffer_with_bytes(ctx, down_weight_f16, (NSUInteger)weight_bytes, MTLResourceStorageModeShared);
         if (down_weight == nil) {
             [up_weight release];
             [gate_weight release];
@@ -14915,9 +14758,7 @@ static int metal_context_swiglu_f16(uocr_metal_context *ctx,
         id<MTLBuffer> residual = nil;
         id<MTLBuffer> residual_arg = down_weight;
         if (residual_f16_or_null != NULL) {
-            residual = [ctx->device newBufferWithBytes:residual_f16_or_null
-                                                length:(NSUInteger)input_bytes
-                                               options:MTLResourceStorageModeShared];
+            residual = metal_new_buffer_with_bytes(ctx, residual_f16_or_null, (NSUInteger)input_bytes, MTLResourceStorageModeShared);
             if (residual == nil) {
                 [down_weight release];
                 [up_weight release];
@@ -14929,8 +14770,7 @@ static int metal_context_swiglu_f16(uocr_metal_context *ctx,
             residual_arg = residual;
         }
 
-        id<MTLBuffer> mid = [ctx->device newBufferWithLength:(NSUInteger)intermediate_bytes
-                                                     options:MTLResourceStorageModeShared];
+        id<MTLBuffer> mid = metal_new_buffer_with_length(ctx, (NSUInteger)intermediate_bytes, MTLResourceStorageModeShared);
         if (mid == nil) {
             [residual release];
             [down_weight release];
@@ -14942,7 +14782,7 @@ static int metal_context_swiglu_f16(uocr_metal_context *ctx,
         mid.label = @"uocr_dense_swiglu_mid_f16";
         memset([mid contents], 0, (size_t)intermediate_bytes);
 
-        id<MTLBuffer> dst = [ctx->device newBufferWithLength:(NSUInteger)output_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> dst = metal_new_buffer_with_length(ctx, (NSUInteger)output_bytes, MTLResourceStorageModeShared);
         if (dst == nil) {
             [mid release];
             [residual release];
@@ -15181,26 +15021,20 @@ int uocr_metal_context_moe_shared_experts_q8_0(uocr_metal_context *ctx,
             return 0;
         }
 
-        id<MTLBuffer> input = [ctx->device newBufferWithBytes:input_f16
-                                                       length:(NSUInteger)input_bytes
-                                                      options:MTLResourceStorageModeShared];
+        id<MTLBuffer> input = metal_new_buffer_with_bytes(ctx, input_f16, (NSUInteger)input_bytes, MTLResourceStorageModeShared);
         if (input == nil) {
             return metal_fail(error, error_size, "failed to allocate Metal MoE shared Q8_0 input buffer");
         }
         input.label = @"uocr_moe_shared_q8_input_f16";
 
-        id<MTLBuffer> gate_weight = [ctx->device newBufferWithBytes:shared_gate_weight_q8_0
-                                                             length:(NSUInteger)gate_weight_bytes
-                                                            options:MTLResourceStorageModeShared];
+        id<MTLBuffer> gate_weight = metal_new_buffer_with_bytes(ctx, shared_gate_weight_q8_0, (NSUInteger)gate_weight_bytes, MTLResourceStorageModeShared);
         if (gate_weight == nil) {
             [input release];
             return metal_fail(error, error_size, "failed to allocate Metal MoE shared Q8_0 gate weight buffer");
         }
         gate_weight.label = @"uocr_moe_shared_gate_weight_q8_0";
 
-        id<MTLBuffer> up_weight = [ctx->device newBufferWithBytes:shared_up_weight_q8_0
-                                                           length:(NSUInteger)gate_weight_bytes
-                                                          options:MTLResourceStorageModeShared];
+        id<MTLBuffer> up_weight = metal_new_buffer_with_bytes(ctx, shared_up_weight_q8_0, (NSUInteger)gate_weight_bytes, MTLResourceStorageModeShared);
         if (up_weight == nil) {
             [gate_weight release];
             [input release];
@@ -15208,9 +15042,7 @@ int uocr_metal_context_moe_shared_experts_q8_0(uocr_metal_context *ctx,
         }
         up_weight.label = @"uocr_moe_shared_up_weight_q8_0";
 
-        id<MTLBuffer> down_weight = [ctx->device newBufferWithBytes:shared_down_weight_q8_0
-                                                             length:(NSUInteger)down_weight_bytes
-                                                            options:MTLResourceStorageModeShared];
+        id<MTLBuffer> down_weight = metal_new_buffer_with_bytes(ctx, shared_down_weight_q8_0, (NSUInteger)down_weight_bytes, MTLResourceStorageModeShared);
         if (down_weight == nil) {
             [up_weight release];
             [gate_weight release];
@@ -15219,8 +15051,7 @@ int uocr_metal_context_moe_shared_experts_q8_0(uocr_metal_context *ctx,
         }
         down_weight.label = @"uocr_moe_shared_down_weight_q8_0";
 
-        id<MTLBuffer> mid = [ctx->device newBufferWithLength:(NSUInteger)intermediate_bytes
-                                                     options:MTLResourceStorageModeShared];
+        id<MTLBuffer> mid = metal_new_buffer_with_length(ctx, (NSUInteger)intermediate_bytes, MTLResourceStorageModeShared);
         if (mid == nil) {
             [down_weight release];
             [up_weight release];
@@ -15231,7 +15062,7 @@ int uocr_metal_context_moe_shared_experts_q8_0(uocr_metal_context *ctx,
         mid.label = @"uocr_moe_shared_q8_mid_f16";
         memset([mid contents], 0, (size_t)intermediate_bytes);
 
-        id<MTLBuffer> dst = [ctx->device newBufferWithLength:(NSUInteger)output_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> dst = metal_new_buffer_with_length(ctx, (NSUInteger)output_bytes, MTLResourceStorageModeShared);
         if (dst == nil) {
             [mid release];
             [down_weight release];
@@ -15416,27 +15247,23 @@ int uocr_metal_context_moe_router_f16(uocr_metal_context *ctx,
                               (unsigned)UOCR_ROUTED_EXPERTS);
         }
 
-        id<MTLBuffer> input = [ctx->device newBufferWithBytes:input_f16
-                                                       length:(NSUInteger)input_bytes
-                                                      options:MTLResourceStorageModeShared];
+        id<MTLBuffer> input = metal_new_buffer_with_bytes(ctx, input_f16, (NSUInteger)input_bytes, MTLResourceStorageModeShared);
         if (input == nil) {
             return metal_fail(error, error_size, "failed to allocate Metal MoE router input buffer");
         }
         input.label = @"uocr_moe_router_input_f16";
 
-        id<MTLBuffer> weight = [ctx->device newBufferWithBytes:router_weight_f16
-                                                        length:(NSUInteger)weight_bytes
-                                                       options:MTLResourceStorageModeShared];
+        id<MTLBuffer> weight = metal_new_buffer_with_bytes(ctx, router_weight_f16, (NSUInteger)weight_bytes, MTLResourceStorageModeShared);
         if (weight == nil) {
             [input release];
             return metal_fail(error, error_size, "failed to allocate Metal MoE router weight buffer");
         }
         weight.label = @"uocr_moe_router_weight_f16";
 
-        id<MTLBuffer> logits = [ctx->device newBufferWithLength:(NSUInteger)router_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> probs = [ctx->device newBufferWithLength:(NSUInteger)router_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> top_ids = [ctx->device newBufferWithLength:(NSUInteger)top_ids_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> top_weights = [ctx->device newBufferWithLength:(NSUInteger)top_weights_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> logits = metal_new_buffer_with_length(ctx, (NSUInteger)router_bytes, MTLResourceStorageModeShared);
+        id<MTLBuffer> probs = metal_new_buffer_with_length(ctx, (NSUInteger)router_bytes, MTLResourceStorageModeShared);
+        id<MTLBuffer> top_ids = metal_new_buffer_with_length(ctx, (NSUInteger)top_ids_bytes, MTLResourceStorageModeShared);
+        id<MTLBuffer> top_weights = metal_new_buffer_with_length(ctx, (NSUInteger)top_weights_bytes, MTLResourceStorageModeShared);
         if (logits == nil || probs == nil || top_ids == nil || top_weights == nil) {
             [top_weights release];
             [top_ids release];
@@ -15651,52 +15478,42 @@ int uocr_metal_context_moe_selected_experts_decode_f16(uocr_metal_context *ctx,
         id<MTLBuffer> mid = nil;
         id<MTLBuffer> dst = nil;
 
-        input = [ctx->device newBufferWithBytes:input_f16
-                                         length:(NSUInteger)input_bytes
-                                        options:MTLResourceStorageModeShared];
+        input = metal_new_buffer_with_bytes(ctx, input_f16, (NSUInteger)input_bytes, MTLResourceStorageModeShared);
         if (input == nil) {
             (void)metal_fail(error, error_size, "failed to allocate Metal MoE selected input buffer");
             goto cleanup;
         }
         input.label = @"uocr_moe_selected_input_f16";
 
-        gate_weight = [ctx->device newBufferWithBytes:selected_gate_weight_f16
-                                               length:(NSUInteger)selected_weight_bytes
-                                              options:MTLResourceStorageModeShared];
+        gate_weight = metal_new_buffer_with_bytes(ctx, selected_gate_weight_f16, (NSUInteger)selected_weight_bytes, MTLResourceStorageModeShared);
         if (gate_weight == nil) {
             (void)metal_fail(error, error_size, "failed to allocate Metal MoE selected gate-weight buffer");
             goto cleanup;
         }
         gate_weight.label = @"uocr_moe_selected_gate_weight_f16";
 
-        up_weight = [ctx->device newBufferWithBytes:selected_up_weight_f16
-                                             length:(NSUInteger)selected_weight_bytes
-                                            options:MTLResourceStorageModeShared];
+        up_weight = metal_new_buffer_with_bytes(ctx, selected_up_weight_f16, (NSUInteger)selected_weight_bytes, MTLResourceStorageModeShared);
         if (up_weight == nil) {
             (void)metal_fail(error, error_size, "failed to allocate Metal MoE selected up-weight buffer");
             goto cleanup;
         }
         up_weight.label = @"uocr_moe_selected_up_weight_f16";
 
-        down_weight = [ctx->device newBufferWithBytes:selected_down_weight_f16
-                                               length:(NSUInteger)selected_weight_bytes
-                                              options:MTLResourceStorageModeShared];
+        down_weight = metal_new_buffer_with_bytes(ctx, selected_down_weight_f16, (NSUInteger)selected_weight_bytes, MTLResourceStorageModeShared);
         if (down_weight == nil) {
             (void)metal_fail(error, error_size, "failed to allocate Metal MoE selected down-weight buffer");
             goto cleanup;
         }
         down_weight.label = @"uocr_moe_selected_down_weight_f16";
 
-        top_weights = [ctx->device newBufferWithBytes:top_weights_f32
-                                               length:(NSUInteger)top_weights_bytes
-                                              options:MTLResourceStorageModeShared];
+        top_weights = metal_new_buffer_with_bytes(ctx, top_weights_f32, (NSUInteger)top_weights_bytes, MTLResourceStorageModeShared);
         if (top_weights == nil) {
             (void)metal_fail(error, error_size, "failed to allocate Metal MoE selected top-weight buffer");
             goto cleanup;
         }
         top_weights.label = @"uocr_moe_selected_top_weights_f32";
 
-        mid = [ctx->device newBufferWithLength:(NSUInteger)intermediate_bytes options:MTLResourceStorageModeShared];
+        mid = metal_new_buffer_with_length(ctx, (NSUInteger)intermediate_bytes, MTLResourceStorageModeShared);
         if (mid == nil) {
             (void)metal_fail(error, error_size, "failed to allocate Metal MoE selected intermediate buffer");
             goto cleanup;
@@ -15704,7 +15521,7 @@ int uocr_metal_context_moe_selected_experts_decode_f16(uocr_metal_context *ctx,
         mid.label = @"uocr_moe_selected_mid_f16";
         memset([mid contents], 0, (size_t)intermediate_bytes);
 
-        dst = [ctx->device newBufferWithLength:(NSUInteger)output_bytes options:MTLResourceStorageModeShared];
+        dst = metal_new_buffer_with_length(ctx, (NSUInteger)output_bytes, MTLResourceStorageModeShared);
         if (dst == nil) {
             (void)metal_fail(error, error_size, "failed to allocate Metal MoE selected output buffer");
             goto cleanup;
@@ -15902,52 +15719,42 @@ int uocr_metal_context_moe_selected_experts_decode_q4_k(uocr_metal_context *ctx,
         id<MTLBuffer> mid = nil;
         id<MTLBuffer> dst = nil;
 
-        input = [ctx->device newBufferWithBytes:input_f16
-                                         length:(NSUInteger)input_bytes
-                                        options:MTLResourceStorageModeShared];
+        input = metal_new_buffer_with_bytes(ctx, input_f16, (NSUInteger)input_bytes, MTLResourceStorageModeShared);
         if (input == nil) {
             (void)metal_fail(error, error_size, "failed to allocate Metal MoE selected Q4_K input buffer");
             goto cleanup;
         }
         input.label = @"uocr_moe_selected_q4_input_f16";
 
-        gate_weight = [ctx->device newBufferWithBytes:selected_gate_weight_q4_k
-                                               length:(NSUInteger)gate_weight_bytes
-                                              options:MTLResourceStorageModeShared];
+        gate_weight = metal_new_buffer_with_bytes(ctx, selected_gate_weight_q4_k, (NSUInteger)gate_weight_bytes, MTLResourceStorageModeShared);
         if (gate_weight == nil) {
             (void)metal_fail(error, error_size, "failed to allocate Metal MoE selected Q4_K gate-weight buffer");
             goto cleanup;
         }
         gate_weight.label = @"uocr_moe_selected_gate_weight_q4_k";
 
-        up_weight = [ctx->device newBufferWithBytes:selected_up_weight_q4_k
-                                             length:(NSUInteger)gate_weight_bytes
-                                            options:MTLResourceStorageModeShared];
+        up_weight = metal_new_buffer_with_bytes(ctx, selected_up_weight_q4_k, (NSUInteger)gate_weight_bytes, MTLResourceStorageModeShared);
         if (up_weight == nil) {
             (void)metal_fail(error, error_size, "failed to allocate Metal MoE selected Q4_K up-weight buffer");
             goto cleanup;
         }
         up_weight.label = @"uocr_moe_selected_up_weight_q4_k";
 
-        down_weight = [ctx->device newBufferWithBytes:selected_down_weight_f16
-                                               length:(NSUInteger)down_weight_bytes
-                                              options:MTLResourceStorageModeShared];
+        down_weight = metal_new_buffer_with_bytes(ctx, selected_down_weight_f16, (NSUInteger)down_weight_bytes, MTLResourceStorageModeShared);
         if (down_weight == nil) {
             (void)metal_fail(error, error_size, "failed to allocate Metal MoE selected Q4_K down-weight buffer");
             goto cleanup;
         }
         down_weight.label = @"uocr_moe_selected_q4_down_weight_f16";
 
-        top_weights = [ctx->device newBufferWithBytes:top_weights_f32
-                                               length:(NSUInteger)top_weights_bytes
-                                              options:MTLResourceStorageModeShared];
+        top_weights = metal_new_buffer_with_bytes(ctx, top_weights_f32, (NSUInteger)top_weights_bytes, MTLResourceStorageModeShared);
         if (top_weights == nil) {
             (void)metal_fail(error, error_size, "failed to allocate Metal MoE selected Q4_K top-weight buffer");
             goto cleanup;
         }
         top_weights.label = @"uocr_moe_selected_q4_top_weights_f32";
 
-        mid = [ctx->device newBufferWithLength:(NSUInteger)intermediate_bytes options:MTLResourceStorageModeShared];
+        mid = metal_new_buffer_with_length(ctx, (NSUInteger)intermediate_bytes, MTLResourceStorageModeShared);
         if (mid == nil) {
             (void)metal_fail(error, error_size, "failed to allocate Metal MoE selected Q4_K intermediate buffer");
             goto cleanup;
@@ -15955,7 +15762,7 @@ int uocr_metal_context_moe_selected_experts_decode_q4_k(uocr_metal_context *ctx,
         mid.label = @"uocr_moe_selected_q4_mid_f16";
         memset([mid contents], 0, (size_t)intermediate_bytes);
 
-        dst = [ctx->device newBufferWithLength:(NSUInteger)output_bytes options:MTLResourceStorageModeShared];
+        dst = metal_new_buffer_with_length(ctx, (NSUInteger)output_bytes, MTLResourceStorageModeShared);
         if (dst == nil) {
             (void)metal_fail(error, error_size, "failed to allocate Metal MoE selected Q4_K output buffer");
             goto cleanup;
@@ -16180,52 +15987,42 @@ int uocr_metal_context_moe_selected_experts_decode_q4_k_q8_0(uocr_metal_context 
         id<MTLBuffer> mid = nil;
         id<MTLBuffer> dst = nil;
 
-        input = [ctx->device newBufferWithBytes:input_f16
-                                         length:(NSUInteger)input_bytes
-                                        options:MTLResourceStorageModeShared];
+        input = metal_new_buffer_with_bytes(ctx, input_f16, (NSUInteger)input_bytes, MTLResourceStorageModeShared);
         if (input == nil) {
             (void)metal_fail(error, error_size, "failed to allocate Metal MoE selected Q4_K/Q8_0 input buffer");
             goto cleanup;
         }
         input.label = @"uocr_moe_selected_q4q8_input_f16";
 
-        gate_weight = [ctx->device newBufferWithBytes:selected_gate_weight_q4_k
-                                               length:(NSUInteger)gate_weight_bytes
-                                              options:MTLResourceStorageModeShared];
+        gate_weight = metal_new_buffer_with_bytes(ctx, selected_gate_weight_q4_k, (NSUInteger)gate_weight_bytes, MTLResourceStorageModeShared);
         if (gate_weight == nil) {
             (void)metal_fail(error, error_size, "failed to allocate Metal MoE selected Q4_K/Q8_0 gate-weight buffer");
             goto cleanup;
         }
         gate_weight.label = @"uocr_moe_selected_q4q8_gate_weight_q4_k";
 
-        up_weight = [ctx->device newBufferWithBytes:selected_up_weight_q4_k
-                                             length:(NSUInteger)gate_weight_bytes
-                                            options:MTLResourceStorageModeShared];
+        up_weight = metal_new_buffer_with_bytes(ctx, selected_up_weight_q4_k, (NSUInteger)gate_weight_bytes, MTLResourceStorageModeShared);
         if (up_weight == nil) {
             (void)metal_fail(error, error_size, "failed to allocate Metal MoE selected Q4_K/Q8_0 up-weight buffer");
             goto cleanup;
         }
         up_weight.label = @"uocr_moe_selected_q4q8_up_weight_q4_k";
 
-        down_weight = [ctx->device newBufferWithBytes:selected_down_weight_q8_0
-                                               length:(NSUInteger)down_weight_bytes
-                                              options:MTLResourceStorageModeShared];
+        down_weight = metal_new_buffer_with_bytes(ctx, selected_down_weight_q8_0, (NSUInteger)down_weight_bytes, MTLResourceStorageModeShared);
         if (down_weight == nil) {
             (void)metal_fail(error, error_size, "failed to allocate Metal MoE selected Q4_K/Q8_0 down-weight buffer");
             goto cleanup;
         }
         down_weight.label = @"uocr_moe_selected_q4q8_down_weight_q8_0";
 
-        top_weights = [ctx->device newBufferWithBytes:top_weights_f32
-                                               length:(NSUInteger)top_weights_bytes
-                                              options:MTLResourceStorageModeShared];
+        top_weights = metal_new_buffer_with_bytes(ctx, top_weights_f32, (NSUInteger)top_weights_bytes, MTLResourceStorageModeShared);
         if (top_weights == nil) {
             (void)metal_fail(error, error_size, "failed to allocate Metal MoE selected Q4_K/Q8_0 top-weight buffer");
             goto cleanup;
         }
         top_weights.label = @"uocr_moe_selected_q4q8_top_weights_f32";
 
-        mid = [ctx->device newBufferWithLength:(NSUInteger)intermediate_bytes options:MTLResourceStorageModeShared];
+        mid = metal_new_buffer_with_length(ctx, (NSUInteger)intermediate_bytes, MTLResourceStorageModeShared);
         if (mid == nil) {
             (void)metal_fail(error, error_size, "failed to allocate Metal MoE selected Q4_K/Q8_0 intermediate buffer");
             goto cleanup;
@@ -16233,7 +16030,7 @@ int uocr_metal_context_moe_selected_experts_decode_q4_k_q8_0(uocr_metal_context 
         mid.label = @"uocr_moe_selected_q4q8_mid_f16";
         memset([mid contents], 0, (size_t)intermediate_bytes);
 
-        dst = [ctx->device newBufferWithLength:(NSUInteger)output_bytes options:MTLResourceStorageModeShared];
+        dst = metal_new_buffer_with_length(ctx, (NSUInteger)output_bytes, MTLResourceStorageModeShared);
         if (dst == nil) {
             (void)metal_fail(error, error_size, "failed to allocate Metal MoE selected Q4_K/Q8_0 output buffer");
             goto cleanup;
@@ -16465,52 +16262,42 @@ int uocr_metal_context_moe_selected_experts_decode_q4_k_padded(uocr_metal_contex
         id<MTLBuffer> mid = nil;
         id<MTLBuffer> dst = nil;
 
-        input = [ctx->device newBufferWithBytes:input_f16
-                                         length:(NSUInteger)input_bytes
-                                        options:MTLResourceStorageModeShared];
+        input = metal_new_buffer_with_bytes(ctx, input_f16, (NSUInteger)input_bytes, MTLResourceStorageModeShared);
         if (input == nil) {
             (void)metal_fail(error, error_size, "failed to allocate Metal MoE selected Q4_K/padded-Q4_K input buffer");
             goto cleanup;
         }
         input.label = @"uocr_moe_selected_q4p_input_f16";
 
-        gate_weight = [ctx->device newBufferWithBytes:selected_gate_weight_q4_k
-                                               length:(NSUInteger)gate_weight_bytes
-                                              options:MTLResourceStorageModeShared];
+        gate_weight = metal_new_buffer_with_bytes(ctx, selected_gate_weight_q4_k, (NSUInteger)gate_weight_bytes, MTLResourceStorageModeShared);
         if (gate_weight == nil) {
             (void)metal_fail(error, error_size, "failed to allocate Metal MoE selected Q4_K/padded-Q4_K gate-weight buffer");
             goto cleanup;
         }
         gate_weight.label = @"uocr_moe_selected_q4p_gate_weight_q4_k";
 
-        up_weight = [ctx->device newBufferWithBytes:selected_up_weight_q4_k
-                                             length:(NSUInteger)gate_weight_bytes
-                                            options:MTLResourceStorageModeShared];
+        up_weight = metal_new_buffer_with_bytes(ctx, selected_up_weight_q4_k, (NSUInteger)gate_weight_bytes, MTLResourceStorageModeShared);
         if (up_weight == nil) {
             (void)metal_fail(error, error_size, "failed to allocate Metal MoE selected Q4_K/padded-Q4_K up-weight buffer");
             goto cleanup;
         }
         up_weight.label = @"uocr_moe_selected_q4p_up_weight_q4_k";
 
-        down_weight = [ctx->device newBufferWithBytes:selected_down_weight_padded_q4_k
-                                               length:(NSUInteger)down_weight_bytes
-                                              options:MTLResourceStorageModeShared];
+        down_weight = metal_new_buffer_with_bytes(ctx, selected_down_weight_padded_q4_k, (NSUInteger)down_weight_bytes, MTLResourceStorageModeShared);
         if (down_weight == nil) {
             (void)metal_fail(error, error_size, "failed to allocate Metal MoE selected Q4_K/padded-Q4_K down-weight buffer");
             goto cleanup;
         }
         down_weight.label = @"uocr_moe_selected_q4p_down_weight_q4_k";
 
-        top_weights = [ctx->device newBufferWithBytes:top_weights_f32
-                                               length:(NSUInteger)top_weights_bytes
-                                              options:MTLResourceStorageModeShared];
+        top_weights = metal_new_buffer_with_bytes(ctx, top_weights_f32, (NSUInteger)top_weights_bytes, MTLResourceStorageModeShared);
         if (top_weights == nil) {
             (void)metal_fail(error, error_size, "failed to allocate Metal MoE selected Q4_K/padded-Q4_K top-weight buffer");
             goto cleanup;
         }
         top_weights.label = @"uocr_moe_selected_q4p_top_weights_f32";
 
-        mid = [ctx->device newBufferWithLength:(NSUInteger)intermediate_bytes options:MTLResourceStorageModeShared];
+        mid = metal_new_buffer_with_length(ctx, (NSUInteger)intermediate_bytes, MTLResourceStorageModeShared);
         if (mid == nil) {
             (void)metal_fail(error, error_size, "failed to allocate Metal MoE selected Q4_K/padded-Q4_K intermediate buffer");
             goto cleanup;
@@ -16518,7 +16305,7 @@ int uocr_metal_context_moe_selected_experts_decode_q4_k_padded(uocr_metal_contex
         mid.label = @"uocr_moe_selected_q4p_mid_f16";
         memset([mid contents], 0, (size_t)intermediate_bytes);
 
-        dst = [ctx->device newBufferWithLength:(NSUInteger)output_bytes options:MTLResourceStorageModeShared];
+        dst = metal_new_buffer_with_length(ctx, (NSUInteger)output_bytes, MTLResourceStorageModeShared);
         if (dst == nil) {
             (void)metal_fail(error, error_size, "failed to allocate Metal MoE selected Q4_K/padded-Q4_K output buffer");
             goto cleanup;
@@ -16745,61 +16532,49 @@ int uocr_metal_context_moe_selected_experts_prefill_f16(uocr_metal_context *ctx,
         id<MTLBuffer> mid = nil;
         id<MTLBuffer> dst = nil;
 
-        input = [ctx->device newBufferWithBytes:input_f16
-                                         length:(NSUInteger)input_bytes
-                                        options:MTLResourceStorageModeShared];
+        input = metal_new_buffer_with_bytes(ctx, input_f16, (NSUInteger)input_bytes, MTLResourceStorageModeShared);
         if (input == nil) {
             (void)metal_fail(error, error_size, "failed to allocate Metal MoE prefill input buffer");
             goto cleanup;
         }
         input.label = @"uocr_moe_prefill_input_f16";
 
-        top_ids = [ctx->device newBufferWithBytes:top_expert_ids
-                                           length:(NSUInteger)top_ids_bytes
-                                          options:MTLResourceStorageModeShared];
+        top_ids = metal_new_buffer_with_bytes(ctx, top_expert_ids, (NSUInteger)top_ids_bytes, MTLResourceStorageModeShared);
         if (top_ids == nil) {
             (void)metal_fail(error, error_size, "failed to allocate Metal MoE prefill top-id buffer");
             goto cleanup;
         }
         top_ids.label = @"uocr_moe_prefill_top_ids_u32";
 
-        top_weights = [ctx->device newBufferWithBytes:top_weights_f32
-                                               length:(NSUInteger)top_weights_bytes
-                                              options:MTLResourceStorageModeShared];
+        top_weights = metal_new_buffer_with_bytes(ctx, top_weights_f32, (NSUInteger)top_weights_bytes, MTLResourceStorageModeShared);
         if (top_weights == nil) {
             (void)metal_fail(error, error_size, "failed to allocate Metal MoE prefill top-weight buffer");
             goto cleanup;
         }
         top_weights.label = @"uocr_moe_prefill_top_weights_f32";
 
-        gate_weight = [ctx->device newBufferWithBytes:expert_gate_weight_f16
-                                               length:(NSUInteger)weight_bytes
-                                              options:MTLResourceStorageModeShared];
+        gate_weight = metal_new_buffer_with_bytes(ctx, expert_gate_weight_f16, (NSUInteger)weight_bytes, MTLResourceStorageModeShared);
         if (gate_weight == nil) {
             (void)metal_fail(error, error_size, "failed to allocate Metal MoE prefill gate-weight buffer");
             goto cleanup;
         }
         gate_weight.label = @"uocr_moe_prefill_gate_weight_f16";
 
-        up_weight = [ctx->device newBufferWithBytes:expert_up_weight_f16
-                                             length:(NSUInteger)weight_bytes
-                                            options:MTLResourceStorageModeShared];
+        up_weight = metal_new_buffer_with_bytes(ctx, expert_up_weight_f16, (NSUInteger)weight_bytes, MTLResourceStorageModeShared);
         if (up_weight == nil) {
             (void)metal_fail(error, error_size, "failed to allocate Metal MoE prefill up-weight buffer");
             goto cleanup;
         }
         up_weight.label = @"uocr_moe_prefill_up_weight_f16";
 
-        down_weight = [ctx->device newBufferWithBytes:expert_down_weight_f16
-                                               length:(NSUInteger)weight_bytes
-                                              options:MTLResourceStorageModeShared];
+        down_weight = metal_new_buffer_with_bytes(ctx, expert_down_weight_f16, (NSUInteger)weight_bytes, MTLResourceStorageModeShared);
         if (down_weight == nil) {
             (void)metal_fail(error, error_size, "failed to allocate Metal MoE prefill down-weight buffer");
             goto cleanup;
         }
         down_weight.label = @"uocr_moe_prefill_down_weight_f16";
 
-        mid = [ctx->device newBufferWithLength:(NSUInteger)mid_bytes options:MTLResourceStorageModeShared];
+        mid = metal_new_buffer_with_length(ctx, (NSUInteger)mid_bytes, MTLResourceStorageModeShared);
         if (mid == nil) {
             (void)metal_fail(error, error_size, "failed to allocate Metal MoE prefill intermediate buffer");
             goto cleanup;
@@ -16807,7 +16582,7 @@ int uocr_metal_context_moe_selected_experts_prefill_f16(uocr_metal_context *ctx,
         mid.label = @"uocr_moe_prefill_mid_f16";
         memset([mid contents], 0, (size_t)mid_bytes);
 
-        dst = [ctx->device newBufferWithLength:(NSUInteger)output_bytes options:MTLResourceStorageModeShared];
+        dst = metal_new_buffer_with_length(ctx, (NSUInteger)output_bytes, MTLResourceStorageModeShared);
         if (dst == nil) {
             (void)metal_fail(error, error_size, "failed to allocate Metal MoE prefill output buffer");
             goto cleanup;
@@ -17043,61 +16818,49 @@ int uocr_metal_context_moe_selected_experts_prefill_q4_k(uocr_metal_context *ctx
         id<MTLBuffer> mid = nil;
         id<MTLBuffer> dst = nil;
 
-        input = [ctx->device newBufferWithBytes:input_f16
-                                         length:(NSUInteger)input_bytes
-                                        options:MTLResourceStorageModeShared];
+        input = metal_new_buffer_with_bytes(ctx, input_f16, (NSUInteger)input_bytes, MTLResourceStorageModeShared);
         if (input == nil) {
             (void)metal_fail(error, error_size, "failed to allocate Metal MoE Q4_K prefill input buffer");
             goto cleanup;
         }
         input.label = @"uocr_moe_prefill_q4_input_f16";
 
-        top_ids = [ctx->device newBufferWithBytes:top_expert_ids
-                                           length:(NSUInteger)top_ids_bytes
-                                          options:MTLResourceStorageModeShared];
+        top_ids = metal_new_buffer_with_bytes(ctx, top_expert_ids, (NSUInteger)top_ids_bytes, MTLResourceStorageModeShared);
         if (top_ids == nil) {
             (void)metal_fail(error, error_size, "failed to allocate Metal MoE Q4_K prefill top-id buffer");
             goto cleanup;
         }
         top_ids.label = @"uocr_moe_prefill_q4_top_ids_u32";
 
-        top_weights = [ctx->device newBufferWithBytes:top_weights_f32
-                                               length:(NSUInteger)top_weights_bytes
-                                              options:MTLResourceStorageModeShared];
+        top_weights = metal_new_buffer_with_bytes(ctx, top_weights_f32, (NSUInteger)top_weights_bytes, MTLResourceStorageModeShared);
         if (top_weights == nil) {
             (void)metal_fail(error, error_size, "failed to allocate Metal MoE Q4_K prefill top-weight buffer");
             goto cleanup;
         }
         top_weights.label = @"uocr_moe_prefill_q4_top_weights_f32";
 
-        gate_weight = [ctx->device newBufferWithBytes:expert_gate_weight_q4_k
-                                               length:(NSUInteger)gate_weight_bytes
-                                              options:MTLResourceStorageModeShared];
+        gate_weight = metal_new_buffer_with_bytes(ctx, expert_gate_weight_q4_k, (NSUInteger)gate_weight_bytes, MTLResourceStorageModeShared);
         if (gate_weight == nil) {
             (void)metal_fail(error, error_size, "failed to allocate Metal MoE Q4_K prefill gate-weight buffer");
             goto cleanup;
         }
         gate_weight.label = @"uocr_moe_prefill_gate_weight_q4_k";
 
-        up_weight = [ctx->device newBufferWithBytes:expert_up_weight_q4_k
-                                             length:(NSUInteger)gate_weight_bytes
-                                            options:MTLResourceStorageModeShared];
+        up_weight = metal_new_buffer_with_bytes(ctx, expert_up_weight_q4_k, (NSUInteger)gate_weight_bytes, MTLResourceStorageModeShared);
         if (up_weight == nil) {
             (void)metal_fail(error, error_size, "failed to allocate Metal MoE Q4_K prefill up-weight buffer");
             goto cleanup;
         }
         up_weight.label = @"uocr_moe_prefill_up_weight_q4_k";
 
-        down_weight = [ctx->device newBufferWithBytes:expert_down_weight_f16
-                                               length:(NSUInteger)down_weight_bytes
-                                              options:MTLResourceStorageModeShared];
+        down_weight = metal_new_buffer_with_bytes(ctx, expert_down_weight_f16, (NSUInteger)down_weight_bytes, MTLResourceStorageModeShared);
         if (down_weight == nil) {
             (void)metal_fail(error, error_size, "failed to allocate Metal MoE Q4_K prefill down-weight buffer");
             goto cleanup;
         }
         down_weight.label = @"uocr_moe_prefill_q4_down_weight_f16";
 
-        mid = [ctx->device newBufferWithLength:(NSUInteger)mid_bytes options:MTLResourceStorageModeShared];
+        mid = metal_new_buffer_with_length(ctx, (NSUInteger)mid_bytes, MTLResourceStorageModeShared);
         if (mid == nil) {
             (void)metal_fail(error, error_size, "failed to allocate Metal MoE Q4_K prefill intermediate buffer");
             goto cleanup;
@@ -17105,7 +16868,7 @@ int uocr_metal_context_moe_selected_experts_prefill_q4_k(uocr_metal_context *ctx
         mid.label = @"uocr_moe_prefill_q4_mid_f16";
         memset([mid contents], 0, (size_t)mid_bytes);
 
-        dst = [ctx->device newBufferWithLength:(NSUInteger)output_bytes options:MTLResourceStorageModeShared];
+        dst = metal_new_buffer_with_length(ctx, (NSUInteger)output_bytes, MTLResourceStorageModeShared);
         if (dst == nil) {
             (void)metal_fail(error, error_size, "failed to allocate Metal MoE Q4_K prefill output buffer");
             goto cleanup;
@@ -17366,61 +17129,49 @@ int uocr_metal_context_moe_selected_experts_prefill_q4_k_q8_0(uocr_metal_context
         id<MTLBuffer> mid = nil;
         id<MTLBuffer> dst = nil;
 
-        input = [ctx->device newBufferWithBytes:input_f16
-                                         length:(NSUInteger)input_bytes
-                                        options:MTLResourceStorageModeShared];
+        input = metal_new_buffer_with_bytes(ctx, input_f16, (NSUInteger)input_bytes, MTLResourceStorageModeShared);
         if (input == nil) {
             (void)metal_fail(error, error_size, "failed to allocate Metal MoE Q4_K/Q8_0 prefill input buffer");
             goto cleanup;
         }
         input.label = @"uocr_moe_prefill_q4q8_input_f16";
 
-        top_ids = [ctx->device newBufferWithBytes:top_expert_ids
-                                           length:(NSUInteger)top_ids_bytes
-                                          options:MTLResourceStorageModeShared];
+        top_ids = metal_new_buffer_with_bytes(ctx, top_expert_ids, (NSUInteger)top_ids_bytes, MTLResourceStorageModeShared);
         if (top_ids == nil) {
             (void)metal_fail(error, error_size, "failed to allocate Metal MoE Q4_K/Q8_0 prefill top-id buffer");
             goto cleanup;
         }
         top_ids.label = @"uocr_moe_prefill_q4q8_top_ids_u32";
 
-        top_weights = [ctx->device newBufferWithBytes:top_weights_f32
-                                               length:(NSUInteger)top_weights_bytes
-                                              options:MTLResourceStorageModeShared];
+        top_weights = metal_new_buffer_with_bytes(ctx, top_weights_f32, (NSUInteger)top_weights_bytes, MTLResourceStorageModeShared);
         if (top_weights == nil) {
             (void)metal_fail(error, error_size, "failed to allocate Metal MoE Q4_K/Q8_0 prefill top-weight buffer");
             goto cleanup;
         }
         top_weights.label = @"uocr_moe_prefill_q4q8_top_weights_f32";
 
-        gate_weight = [ctx->device newBufferWithBytes:expert_gate_weight_q4_k
-                                               length:(NSUInteger)gate_weight_bytes
-                                              options:MTLResourceStorageModeShared];
+        gate_weight = metal_new_buffer_with_bytes(ctx, expert_gate_weight_q4_k, (NSUInteger)gate_weight_bytes, MTLResourceStorageModeShared);
         if (gate_weight == nil) {
             (void)metal_fail(error, error_size, "failed to allocate Metal MoE Q4_K/Q8_0 prefill gate-weight buffer");
             goto cleanup;
         }
         gate_weight.label = @"uocr_moe_prefill_q4q8_gate_weight_q4_k";
 
-        up_weight = [ctx->device newBufferWithBytes:expert_up_weight_q4_k
-                                             length:(NSUInteger)gate_weight_bytes
-                                            options:MTLResourceStorageModeShared];
+        up_weight = metal_new_buffer_with_bytes(ctx, expert_up_weight_q4_k, (NSUInteger)gate_weight_bytes, MTLResourceStorageModeShared);
         if (up_weight == nil) {
             (void)metal_fail(error, error_size, "failed to allocate Metal MoE Q4_K/Q8_0 prefill up-weight buffer");
             goto cleanup;
         }
         up_weight.label = @"uocr_moe_prefill_q4q8_up_weight_q4_k";
 
-        down_weight = [ctx->device newBufferWithBytes:expert_down_weight_q8_0
-                                               length:(NSUInteger)down_weight_bytes
-                                              options:MTLResourceStorageModeShared];
+        down_weight = metal_new_buffer_with_bytes(ctx, expert_down_weight_q8_0, (NSUInteger)down_weight_bytes, MTLResourceStorageModeShared);
         if (down_weight == nil) {
             (void)metal_fail(error, error_size, "failed to allocate Metal MoE Q4_K/Q8_0 prefill down-weight buffer");
             goto cleanup;
         }
         down_weight.label = @"uocr_moe_prefill_q4q8_down_weight_q8_0";
 
-        mid = [ctx->device newBufferWithLength:(NSUInteger)mid_bytes options:MTLResourceStorageModeShared];
+        mid = metal_new_buffer_with_length(ctx, (NSUInteger)mid_bytes, MTLResourceStorageModeShared);
         if (mid == nil) {
             (void)metal_fail(error, error_size, "failed to allocate Metal MoE Q4_K/Q8_0 prefill intermediate buffer");
             goto cleanup;
@@ -17428,7 +17179,7 @@ int uocr_metal_context_moe_selected_experts_prefill_q4_k_q8_0(uocr_metal_context
         mid.label = @"uocr_moe_prefill_q4q8_mid_f16";
         memset([mid contents], 0, (size_t)mid_bytes);
 
-        dst = [ctx->device newBufferWithLength:(NSUInteger)output_bytes options:MTLResourceStorageModeShared];
+        dst = metal_new_buffer_with_length(ctx, (NSUInteger)output_bytes, MTLResourceStorageModeShared);
         if (dst == nil) {
             (void)metal_fail(error, error_size, "failed to allocate Metal MoE Q4_K/Q8_0 prefill output buffer");
             goto cleanup;
@@ -17692,61 +17443,49 @@ int uocr_metal_context_moe_selected_experts_prefill_q4_k_padded(uocr_metal_conte
         id<MTLBuffer> mid = nil;
         id<MTLBuffer> dst = nil;
 
-        input = [ctx->device newBufferWithBytes:input_f16
-                                         length:(NSUInteger)input_bytes
-                                        options:MTLResourceStorageModeShared];
+        input = metal_new_buffer_with_bytes(ctx, input_f16, (NSUInteger)input_bytes, MTLResourceStorageModeShared);
         if (input == nil) {
             (void)metal_fail(error, error_size, "failed to allocate Metal MoE Q4_K/padded-Q4_K prefill input buffer");
             goto cleanup;
         }
         input.label = @"uocr_moe_prefill_q4p_input_f16";
 
-        top_ids = [ctx->device newBufferWithBytes:top_expert_ids
-                                           length:(NSUInteger)top_ids_bytes
-                                          options:MTLResourceStorageModeShared];
+        top_ids = metal_new_buffer_with_bytes(ctx, top_expert_ids, (NSUInteger)top_ids_bytes, MTLResourceStorageModeShared);
         if (top_ids == nil) {
             (void)metal_fail(error, error_size, "failed to allocate Metal MoE Q4_K/padded-Q4_K prefill top-id buffer");
             goto cleanup;
         }
         top_ids.label = @"uocr_moe_prefill_q4p_top_ids_u32";
 
-        top_weights = [ctx->device newBufferWithBytes:top_weights_f32
-                                               length:(NSUInteger)top_weights_bytes
-                                              options:MTLResourceStorageModeShared];
+        top_weights = metal_new_buffer_with_bytes(ctx, top_weights_f32, (NSUInteger)top_weights_bytes, MTLResourceStorageModeShared);
         if (top_weights == nil) {
             (void)metal_fail(error, error_size, "failed to allocate Metal MoE Q4_K/padded-Q4_K prefill top-weight buffer");
             goto cleanup;
         }
         top_weights.label = @"uocr_moe_prefill_q4p_top_weights_f32";
 
-        gate_weight = [ctx->device newBufferWithBytes:expert_gate_weight_q4_k
-                                               length:(NSUInteger)gate_weight_bytes
-                                              options:MTLResourceStorageModeShared];
+        gate_weight = metal_new_buffer_with_bytes(ctx, expert_gate_weight_q4_k, (NSUInteger)gate_weight_bytes, MTLResourceStorageModeShared);
         if (gate_weight == nil) {
             (void)metal_fail(error, error_size, "failed to allocate Metal MoE Q4_K/padded-Q4_K prefill gate-weight buffer");
             goto cleanup;
         }
         gate_weight.label = @"uocr_moe_prefill_q4p_gate_weight_q4_k";
 
-        up_weight = [ctx->device newBufferWithBytes:expert_up_weight_q4_k
-                                             length:(NSUInteger)gate_weight_bytes
-                                            options:MTLResourceStorageModeShared];
+        up_weight = metal_new_buffer_with_bytes(ctx, expert_up_weight_q4_k, (NSUInteger)gate_weight_bytes, MTLResourceStorageModeShared);
         if (up_weight == nil) {
             (void)metal_fail(error, error_size, "failed to allocate Metal MoE Q4_K/padded-Q4_K prefill up-weight buffer");
             goto cleanup;
         }
         up_weight.label = @"uocr_moe_prefill_q4p_up_weight_q4_k";
 
-        down_weight = [ctx->device newBufferWithBytes:expert_down_weight_padded_q4_k
-                                               length:(NSUInteger)down_weight_bytes
-                                              options:MTLResourceStorageModeShared];
+        down_weight = metal_new_buffer_with_bytes(ctx, expert_down_weight_padded_q4_k, (NSUInteger)down_weight_bytes, MTLResourceStorageModeShared);
         if (down_weight == nil) {
             (void)metal_fail(error, error_size, "failed to allocate Metal MoE Q4_K/padded-Q4_K prefill down-weight buffer");
             goto cleanup;
         }
         down_weight.label = @"uocr_moe_prefill_q4p_down_weight_q4_k";
 
-        mid = [ctx->device newBufferWithLength:(NSUInteger)mid_bytes options:MTLResourceStorageModeShared];
+        mid = metal_new_buffer_with_length(ctx, (NSUInteger)mid_bytes, MTLResourceStorageModeShared);
         if (mid == nil) {
             (void)metal_fail(error, error_size, "failed to allocate Metal MoE Q4_K/padded-Q4_K prefill intermediate buffer");
             goto cleanup;
@@ -17754,7 +17493,7 @@ int uocr_metal_context_moe_selected_experts_prefill_q4_k_padded(uocr_metal_conte
         mid.label = @"uocr_moe_prefill_q4p_mid_f16";
         memset([mid contents], 0, (size_t)mid_bytes);
 
-        dst = [ctx->device newBufferWithLength:(NSUInteger)output_bytes options:MTLResourceStorageModeShared];
+        dst = metal_new_buffer_with_length(ctx, (NSUInteger)output_bytes, MTLResourceStorageModeShared);
         if (dst == nil) {
             (void)metal_fail(error, error_size, "failed to allocate Metal MoE Q4_K/padded-Q4_K prefill output buffer");
             goto cleanup;
@@ -17905,18 +17644,14 @@ int uocr_metal_context_moe_combine_f16(uocr_metal_context *ctx,
         id<MTLBuffer> residual = nil;
         id<MTLBuffer> dst = nil;
 
-        routed = [ctx->device newBufferWithBytes:routed_f16
-                                          length:(NSUInteger)input_bytes
-                                         options:MTLResourceStorageModeShared];
+        routed = metal_new_buffer_with_bytes(ctx, routed_f16, (NSUInteger)input_bytes, MTLResourceStorageModeShared);
         if (routed == nil) {
             (void)metal_fail(error, error_size, "failed to allocate Metal MoE combine routed buffer");
             goto cleanup;
         }
         routed.label = @"uocr_moe_combine_routed_f16";
 
-        shared = [ctx->device newBufferWithBytes:shared_f16
-                                          length:(NSUInteger)input_bytes
-                                         options:MTLResourceStorageModeShared];
+        shared = metal_new_buffer_with_bytes(ctx, shared_f16, (NSUInteger)input_bytes, MTLResourceStorageModeShared);
         if (shared == nil) {
             (void)metal_fail(error, error_size, "failed to allocate Metal MoE combine shared buffer");
             goto cleanup;
@@ -17925,9 +17660,7 @@ int uocr_metal_context_moe_combine_f16(uocr_metal_context *ctx,
 
         id<MTLBuffer> residual_arg = shared;
         if (residual_f16_or_null != NULL) {
-            residual = [ctx->device newBufferWithBytes:residual_f16_or_null
-                                                length:(NSUInteger)input_bytes
-                                               options:MTLResourceStorageModeShared];
+            residual = metal_new_buffer_with_bytes(ctx, residual_f16_or_null, (NSUInteger)input_bytes, MTLResourceStorageModeShared);
             if (residual == nil) {
                 (void)metal_fail(error, error_size, "failed to allocate Metal MoE combine residual buffer");
                 goto cleanup;
@@ -17936,7 +17669,7 @@ int uocr_metal_context_moe_combine_f16(uocr_metal_context *ctx,
             residual_arg = residual;
         }
 
-        dst = [ctx->device newBufferWithLength:(NSUInteger)output_bytes options:MTLResourceStorageModeShared];
+        dst = metal_new_buffer_with_length(ctx, (NSUInteger)output_bytes, MTLResourceStorageModeShared);
         if (dst == nil) {
             (void)metal_fail(error, error_size, "failed to allocate Metal MoE combine output buffer");
             goto cleanup;
@@ -18056,25 +17789,21 @@ int uocr_metal_context_rope_qk_f16(uocr_metal_context *ctx,
             return 0;
         }
 
-        id<MTLBuffer> q_src = [ctx->device newBufferWithBytes:q_f16
-                                                       length:(NSUInteger)input_bytes
-                                                      options:MTLResourceStorageModeShared];
+        id<MTLBuffer> q_src = metal_new_buffer_with_bytes(ctx, q_f16, (NSUInteger)input_bytes, MTLResourceStorageModeShared);
         if (q_src == nil) {
             return metal_fail(error, error_size, "failed to allocate Metal RoPE Q input buffer");
         }
         q_src.label = @"uocr_rope_q_input_f16";
 
-        id<MTLBuffer> k_src = [ctx->device newBufferWithBytes:k_f16
-                                                       length:(NSUInteger)input_bytes
-                                                      options:MTLResourceStorageModeShared];
+        id<MTLBuffer> k_src = metal_new_buffer_with_bytes(ctx, k_f16, (NSUInteger)input_bytes, MTLResourceStorageModeShared);
         if (k_src == nil) {
             [q_src release];
             return metal_fail(error, error_size, "failed to allocate Metal RoPE K input buffer");
         }
         k_src.label = @"uocr_rope_k_input_f16";
 
-        id<MTLBuffer> q_dst = [ctx->device newBufferWithLength:(NSUInteger)output_bytes options:MTLResourceStorageModeShared];
-        id<MTLBuffer> k_dst = [ctx->device newBufferWithLength:(NSUInteger)output_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> q_dst = metal_new_buffer_with_length(ctx, (NSUInteger)output_bytes, MTLResourceStorageModeShared);
+        id<MTLBuffer> k_dst = metal_new_buffer_with_length(ctx, (NSUInteger)output_bytes, MTLResourceStorageModeShared);
         if (q_dst == nil || k_dst == nil) {
             [k_dst release];
             [q_dst release];
@@ -18215,26 +17944,20 @@ int uocr_metal_context_prefill_attention_f16(uocr_metal_context *ctx,
             return metal_fail(error, error_size, "Metal prefill flash attention cannot run four simdgroups per block");
         }
 
-        id<MTLBuffer> q_src = [ctx->device newBufferWithBytes:q_f16
-                                                       length:(NSUInteger)input_bytes
-                                                      options:MTLResourceStorageModeShared];
+        id<MTLBuffer> q_src = metal_new_buffer_with_bytes(ctx, q_f16, (NSUInteger)input_bytes, MTLResourceStorageModeShared);
         if (q_src == nil) {
             return metal_fail(error, error_size, "failed to allocate Metal prefill attention Q buffer");
         }
         q_src.label = @"uocr_prefill_attention_q_f16";
 
-        id<MTLBuffer> k_src = [ctx->device newBufferWithBytes:k_f16
-                                                       length:(NSUInteger)input_bytes
-                                                      options:MTLResourceStorageModeShared];
+        id<MTLBuffer> k_src = metal_new_buffer_with_bytes(ctx, k_f16, (NSUInteger)input_bytes, MTLResourceStorageModeShared);
         if (k_src == nil) {
             [q_src release];
             return metal_fail(error, error_size, "failed to allocate Metal prefill attention K buffer");
         }
         k_src.label = @"uocr_prefill_attention_k_f16";
 
-        id<MTLBuffer> v_src = [ctx->device newBufferWithBytes:v_f16
-                                                       length:(NSUInteger)input_bytes
-                                                      options:MTLResourceStorageModeShared];
+        id<MTLBuffer> v_src = metal_new_buffer_with_bytes(ctx, v_f16, (NSUInteger)input_bytes, MTLResourceStorageModeShared);
         if (v_src == nil) {
             [k_src release];
             [q_src release];
@@ -18242,7 +17965,7 @@ int uocr_metal_context_prefill_attention_f16(uocr_metal_context *ctx,
         }
         v_src.label = @"uocr_prefill_attention_v_f16";
 
-        id<MTLBuffer> dst = [ctx->device newBufferWithLength:(NSUInteger)output_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> dst = metal_new_buffer_with_length(ctx, (NSUInteger)output_bytes, MTLResourceStorageModeShared);
         if (dst == nil) {
             [v_src release];
             [k_src release];
@@ -18400,26 +18123,20 @@ int uocr_metal_context_prefill_attention_varlen_f16(uocr_metal_context *ctx,
             return metal_fail(error, error_size, "Metal varlen prefill attention threadgroup memory exceeds device limit");
         }
 
-        id<MTLBuffer> q_src = [ctx->device newBufferWithBytes:q_f16
-                                                       length:(NSUInteger)input_bytes
-                                                      options:MTLResourceStorageModeShared];
+        id<MTLBuffer> q_src = metal_new_buffer_with_bytes(ctx, q_f16, (NSUInteger)input_bytes, MTLResourceStorageModeShared);
         if (q_src == nil) {
             return metal_fail(error, error_size, "failed to allocate Metal varlen prefill Q buffer");
         }
         q_src.label = @"uocr_prefill_varlen_q_f16";
 
-        id<MTLBuffer> k_src = [ctx->device newBufferWithBytes:k_f16
-                                                       length:(NSUInteger)input_bytes
-                                                      options:MTLResourceStorageModeShared];
+        id<MTLBuffer> k_src = metal_new_buffer_with_bytes(ctx, k_f16, (NSUInteger)input_bytes, MTLResourceStorageModeShared);
         if (k_src == nil) {
             [q_src release];
             return metal_fail(error, error_size, "failed to allocate Metal varlen prefill K buffer");
         }
         k_src.label = @"uocr_prefill_varlen_k_f16";
 
-        id<MTLBuffer> v_src = [ctx->device newBufferWithBytes:v_f16
-                                                       length:(NSUInteger)input_bytes
-                                                      options:MTLResourceStorageModeShared];
+        id<MTLBuffer> v_src = metal_new_buffer_with_bytes(ctx, v_f16, (NSUInteger)input_bytes, MTLResourceStorageModeShared);
         if (v_src == nil) {
             [k_src release];
             [q_src release];
@@ -18427,9 +18144,7 @@ int uocr_metal_context_prefill_attention_varlen_f16(uocr_metal_context *ctx,
         }
         v_src.label = @"uocr_prefill_varlen_v_f16";
 
-        id<MTLBuffer> cu = [ctx->device newBufferWithBytes:cu_seqlens
-                                                    length:(NSUInteger)cu_bytes
-                                                   options:MTLResourceStorageModeShared];
+        id<MTLBuffer> cu = metal_new_buffer_with_bytes(ctx, cu_seqlens, (NSUInteger)cu_bytes, MTLResourceStorageModeShared);
         if (cu == nil) {
             [v_src release];
             [k_src release];
@@ -18438,7 +18153,7 @@ int uocr_metal_context_prefill_attention_varlen_f16(uocr_metal_context *ctx,
         }
         cu.label = @"uocr_prefill_varlen_cu_seqlens";
 
-        id<MTLBuffer> dst = [ctx->device newBufferWithLength:(NSUInteger)output_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> dst = metal_new_buffer_with_length(ctx, (NSUInteger)output_bytes, MTLResourceStorageModeShared);
         if (dst == nil) {
             [cu release];
             [v_src release];
@@ -18610,26 +18325,20 @@ int uocr_metal_context_decode_attention_f16(uocr_metal_context *ctx,
                               (unsigned long long)pipeline.maxTotalThreadsPerThreadgroup);
         }
 
-        id<MTLBuffer> q_src = [ctx->device newBufferWithBytes:q_f16
-                                                       length:(NSUInteger)q_bytes
-                                                      options:MTLResourceStorageModeShared];
+        id<MTLBuffer> q_src = metal_new_buffer_with_bytes(ctx, q_f16, (NSUInteger)q_bytes, MTLResourceStorageModeShared);
         if (q_src == nil) {
             return metal_fail(error, error_size, "failed to allocate Metal decode attention Q buffer");
         }
         q_src.label = @"uocr_decode_attention_q_f16";
 
-        id<MTLBuffer> k_cache = [ctx->device newBufferWithBytes:k_cache_f16
-                                                         length:(NSUInteger)cache_bytes
-                                                        options:MTLResourceStorageModeShared];
+        id<MTLBuffer> k_cache = metal_new_buffer_with_bytes(ctx, k_cache_f16, (NSUInteger)cache_bytes, MTLResourceStorageModeShared);
         if (k_cache == nil) {
             [q_src release];
             return metal_fail(error, error_size, "failed to allocate Metal decode attention K cache buffer");
         }
         k_cache.label = @"uocr_decode_attention_k_cache_f16";
 
-        id<MTLBuffer> v_cache = [ctx->device newBufferWithBytes:v_cache_f16
-                                                         length:(NSUInteger)cache_bytes
-                                                        options:MTLResourceStorageModeShared];
+        id<MTLBuffer> v_cache = metal_new_buffer_with_bytes(ctx, v_cache_f16, (NSUInteger)cache_bytes, MTLResourceStorageModeShared);
         if (v_cache == nil) {
             [k_cache release];
             [q_src release];
@@ -18637,7 +18346,7 @@ int uocr_metal_context_decode_attention_f16(uocr_metal_context *ctx,
         }
         v_cache.label = @"uocr_decode_attention_v_cache_f16";
 
-        id<MTLBuffer> dst = [ctx->device newBufferWithLength:(NSUInteger)output_bytes options:MTLResourceStorageModeShared];
+        id<MTLBuffer> dst = metal_new_buffer_with_length(ctx, (NSUInteger)output_bytes, MTLResourceStorageModeShared);
         if (dst == nil) {
             [v_cache release];
             [k_cache release];
@@ -18799,17 +18508,13 @@ int uocr_metal_context_write_kv_cache_f16(uocr_metal_context *ctx,
             return 0;
         }
 
-        id<MTLBuffer> k_src = [ctx->device newBufferWithBytes:k_f16
-                                                       length:(NSUInteger)src_bytes
-                                                      options:MTLResourceStorageModeShared];
+        id<MTLBuffer> k_src = metal_new_buffer_with_bytes(ctx, k_f16, (NSUInteger)src_bytes, MTLResourceStorageModeShared);
         if (k_src == nil) {
             return metal_fail(error, error_size, "failed to allocate Metal KV K input buffer");
         }
         k_src.label = @"uocr_kv_write_k_input_f16";
 
-        id<MTLBuffer> v_src = [ctx->device newBufferWithBytes:v_f16
-                                                       length:(NSUInteger)src_bytes
-                                                      options:MTLResourceStorageModeShared];
+        id<MTLBuffer> v_src = metal_new_buffer_with_bytes(ctx, v_f16, (NSUInteger)src_bytes, MTLResourceStorageModeShared);
         if (v_src == nil) {
             [k_src release];
             return metal_fail(error, error_size, "failed to allocate Metal KV V input buffer");
@@ -18818,11 +18523,9 @@ int uocr_metal_context_write_kv_cache_f16(uocr_metal_context *ctx,
 
         id<MTLBuffer> k_cache = nil;
         if (initial_k_cache_f16_or_null != NULL) {
-            k_cache = [ctx->device newBufferWithBytes:initial_k_cache_f16_or_null
-                                               length:(NSUInteger)cache_bytes
-                                              options:MTLResourceStorageModeShared];
+            k_cache = metal_new_buffer_with_bytes(ctx, initial_k_cache_f16_or_null, (NSUInteger)cache_bytes, MTLResourceStorageModeShared);
         } else {
-            k_cache = [ctx->device newBufferWithLength:(NSUInteger)cache_bytes options:MTLResourceStorageModeShared];
+            k_cache = metal_new_buffer_with_length(ctx, (NSUInteger)cache_bytes, MTLResourceStorageModeShared);
             if (k_cache != nil) {
                 memset([k_cache contents], 0, (size_t)cache_bytes);
             }
@@ -18836,11 +18539,9 @@ int uocr_metal_context_write_kv_cache_f16(uocr_metal_context *ctx,
 
         id<MTLBuffer> v_cache = nil;
         if (initial_v_cache_f16_or_null != NULL) {
-            v_cache = [ctx->device newBufferWithBytes:initial_v_cache_f16_or_null
-                                               length:(NSUInteger)cache_bytes
-                                              options:MTLResourceStorageModeShared];
+            v_cache = metal_new_buffer_with_bytes(ctx, initial_v_cache_f16_or_null, (NSUInteger)cache_bytes, MTLResourceStorageModeShared);
         } else {
-            v_cache = [ctx->device newBufferWithLength:(NSUInteger)cache_bytes options:MTLResourceStorageModeShared];
+            v_cache = metal_new_buffer_with_length(ctx, (NSUInteger)cache_bytes, MTLResourceStorageModeShared);
             if (v_cache != nil) {
                 memset([v_cache contents], 0, (size_t)cache_bytes);
             }
@@ -19002,10 +18703,7 @@ static int run_no_copy_kernel_smoke(uocr_metal_context *ctx, char *error, size_t
         src_words[i] = 0x1000u + i;
     }
 
-    id<MTLBuffer> src = [ctx->device newBufferWithBytesNoCopy:mapping
-                                                        length:map_size
-                                                       options:MTLResourceStorageModeShared
-                                                   deallocator:nil];
+    id<MTLBuffer> src = metal_new_buffer_with_bytes_no_copy(ctx, mapping, map_size, MTLResourceStorageModeShared, nil);
     if (src == nil) {
         (void)munmap(mapping, map_size);
         (void)close(fd);
@@ -19013,7 +18711,7 @@ static int run_no_copy_kernel_smoke(uocr_metal_context *ctx, char *error, size_t
     }
     src.label = @"uocr_mmap_no_copy_smoke_src";
 
-    id<MTLBuffer> dst = [ctx->device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
+    id<MTLBuffer> dst = metal_new_buffer_with_length(ctx, bytes, MTLResourceStorageModeShared);
     if (dst == nil) {
         [src release];
         (void)munmap(mapping, map_size);
