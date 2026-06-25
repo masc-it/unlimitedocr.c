@@ -152,11 +152,12 @@ uint32_t uocr_metal_context_vision_binding_count(const uocr_metal_context *ctx);
 int uocr_metal_context_vision_bindings_ready(const uocr_metal_context *ctx);
 const char *uocr_metal_context_vision_binding_error(const uocr_metal_context *ctx);
 
-/* Production fp16 vision encoder boundary. The request must already satisfy the
- * public prepared-request contract. The runner processes public preprocessed
- * views through SAM -> CLIP -> projector in bounded chunks, then formats rows
- * with image_newline/view_separator into out_visual_features_f16
- * [out_visual_rows,1280]. max_views_per_chunk==0 means one view per chunk.
+/* Diagnostic final-visual parity boundary. Production public OCR must call
+ * uocr_metal_context_generate_image_f16() so final visual rows stay in the
+ * reusable Metal vision workspace and are spliced directly into the prompt
+ * arena. This helper runs the same GPU-resident vision graph, then performs a
+ * synchronous host copy of [out_visual_rows,1280] solely for opt-in parity and
+ * probe code. max_views_per_chunk==0 means one view per chunk.
  */
 int uocr_metal_context_encode_visual_features_f16(uocr_metal_context *ctx,
                                                   const uocr_prepared_request *request,
@@ -166,8 +167,8 @@ int uocr_metal_context_encode_visual_features_f16(uocr_metal_context *ctx,
                                                   char *error,
                                                   size_t error_size);
 
-/* Diagnostic SAM-stage parity boundary. Runs the same production SAM path used
- * by encode_visual_features for one public preprocessed view and writes the
+/* Diagnostic SAM-stage parity boundary. Runs the same SAM path used by
+ * production vision for one public preprocessed view and writes the
  * upstream sam_model(view) output without batch dimension as fp16 NCHW
  * [1024,out_grid_h,out_grid_w]. This is intentionally internal/opt-in test
  * surface, not a stable public OCR API.
@@ -180,10 +181,11 @@ int uocr_metal_context_encode_sam_features_f16(uocr_metal_context *ctx,
                                                char *error,
                                                size_t error_size);
 
-/* Diagnostic CLIP-stage parity boundary. Runs the production SAM+CLIP path for
- * one public preprocessed view and writes the upstream vision_model(view,
- * sam_features) output without batch dimension as fp16 [out_token_count,1024],
- * including the leading class token. This is intentionally internal/opt-in test
+/* Diagnostic CLIP-stage parity boundary. Runs the same SAM+CLIP path used by
+ * production vision for one public preprocessed view and writes the upstream
+ * vision_model(view, sam_features) output without batch dimension as fp16
+ * [out_token_count,1024], including the leading class token. This is
+ * intentionally internal/opt-in test
  * surface, not a stable public OCR API.
  */
 int uocr_metal_context_encode_clip_features_f16(uocr_metal_context *ctx,
@@ -193,11 +195,11 @@ int uocr_metal_context_encode_clip_features_f16(uocr_metal_context *ctx,
                                                 char *error,
                                                 size_t error_size);
 
-/* Diagnostic projector-stage parity boundary. Runs the production SAM+CLIP+
- * projector path for one public preprocessed view and writes the upstream
- * per-view projector output without batch dimension as fp16
- * [out_projected_rows,1280], before newline/view-separator formatting. This is
- * intentionally internal/opt-in test surface, not a stable public OCR API.
+/* Diagnostic projector-stage parity boundary. Runs the same SAM+CLIP+
+ * projector path used by production vision for one public preprocessed view
+ * and writes the upstream per-view projector output without batch dimension as
+ * fp16 [out_projected_rows,1280], before newline/view-separator formatting.
+ * This is intentionally internal/opt-in test surface, not a stable public OCR API.
  */
 int uocr_metal_context_encode_projected_features_f16(uocr_metal_context *ctx,
                                                      const uocr_image_view *view,

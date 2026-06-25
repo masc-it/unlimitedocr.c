@@ -4227,6 +4227,13 @@ static int metal_context_encode_visual_features_to_workspace_f16(uocr_metal_cont
     return metal_fail(error, error_size, "Metal vision encoding failed: %s", detail);
 }
 
+/* Diagnostic host-output vision helpers. Public OCR dispatch must use
+ * uocr_metal_context_generate_image_f16(), which keeps the final visual rows in
+ * the reusable Metal workspace and binds that slice directly into prompt
+ * assembly. These helpers deliberately copy results back to caller-owned host
+ * buffers for parity probes only; profile markers make accidental production
+ * use visible.
+ */
 int uocr_metal_context_encode_visual_features_f16(uocr_metal_context *ctx,
                                                   const uocr_prepared_request *request,
                                                   uint32_t max_views_per_chunk,
@@ -4238,6 +4245,7 @@ int uocr_metal_context_encode_visual_features_f16(uocr_metal_context *ctx,
     if (ctx == NULL || request == NULL) {
         return metal_fail(error, error_size, "Metal vision encoding requires a context and prepared request");
     }
+    metal_profile_add_event_ms(ctx, "metal.vision.diagnostic_final_host_output", 0.0);
     if (!uocr_metal_context_vision_bindings_ready(ctx)) {
         return metal_fail(error,
                           error_size,
@@ -4306,6 +4314,7 @@ int uocr_metal_context_encode_sam_features_f16(uocr_metal_context *ctx,
     if (ctx == NULL || view == NULL || out_sam_features_f16 == NULL) {
         return metal_fail(error, error_size, "Metal SAM encoding requires a context, view, and output buffer");
     }
+    metal_profile_add_event_ms(ctx, "metal.vision.diagnostic_sam_host_output", 0.0);
     if (!uocr_metal_context_vision_bindings_ready(ctx)) {
         return metal_fail(error,
                           error_size,
@@ -4390,6 +4399,7 @@ int uocr_metal_context_encode_clip_features_f16(uocr_metal_context *ctx,
     if (ctx == NULL || view == NULL || out_clip_features_f16 == NULL) {
         return metal_fail(error, error_size, "Metal CLIP encoding requires a context, view, and output buffer");
     }
+    metal_profile_add_event_ms(ctx, "metal.vision.diagnostic_clip_host_output", 0.0);
     if (!uocr_metal_context_vision_bindings_ready(ctx)) {
         return metal_fail(error,
                           error_size,
@@ -4477,6 +4487,7 @@ int uocr_metal_context_encode_projected_features_f16(uocr_metal_context *ctx,
     if (ctx == NULL || view == NULL || out_projected_features_f16 == NULL) {
         return metal_fail(error, error_size, "Metal projected-feature encoding requires a context, view, and output buffer");
     }
+    metal_profile_add_event_ms(ctx, "metal.vision.diagnostic_projected_host_output", 0.0);
     if (!uocr_metal_context_vision_bindings_ready(ctx)) {
         return metal_fail(error,
                           error_size,
