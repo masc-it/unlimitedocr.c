@@ -812,7 +812,7 @@ Do not resume quantization, batching, CUDA, or high-level OCR/PDF/postprocess AP
 
 - [x] Concatenate CLIP token features without CLS and SAM feature-map tokens: `1024 + 1024 = 2048`.
 - [x] Implement linear projector `2048 -> 1280` with bias.
-- [ ] Validate projected features against Python dumps.
+- [x] Validate projected features against Python dumps.
 - [x] Format global view features:
   - [x] reshape to grid `16x16` for `1024`
   - [x] append `image_newline` after each row -> `272` tokens

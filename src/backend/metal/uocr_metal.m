@@ -3218,6 +3218,76 @@ int uocr_metal_context_encode_clip_features_f16(uocr_metal_context *ctx,
     return 1;
 }
 
+int uocr_metal_context_encode_projected_features_f16(uocr_metal_context *ctx,
+                                                     const uocr_image_view *view,
+                                                     uint16_t *out_projected_features_f16,
+                                                     uint32_t out_projected_rows,
+                                                     char *error,
+                                                     size_t error_size) {
+    metal_clear_error(error, error_size);
+    if (ctx == NULL || view == NULL || out_projected_features_f16 == NULL) {
+        return metal_fail(error, error_size, "Metal projected-feature encoding requires a context, view, and output buffer");
+    }
+    if (!uocr_metal_context_vision_bindings_ready(ctx)) {
+        return metal_fail(error,
+                          error_size,
+                          "Metal projected-feature encoding requires validated fp16 vision tensor bindings: %s",
+                          uocr_metal_context_vision_binding_error(ctx));
+    }
+    if (view->kind != UOCR_VIEW_LOCAL && view->kind != UOCR_VIEW_GLOBAL) {
+        return metal_fail(error, error_size, "Metal projected-feature encoding has invalid view kind %d", (int)view->kind);
+    }
+    const uint32_t expected_grid = view->kind == UOCR_VIEW_LOCAL ? UOCR_LOCAL_GRID_QUERIES : UOCR_GLOBAL_GRID_QUERIES;
+    const uint32_t expected_size = view->kind == UOCR_VIEW_LOCAL ? UOCR_LOCAL_VIEW_SIZE : UOCR_GLOBAL_VIEW_SIZE;
+    const uint32_t expected_rows = expected_grid * expected_grid;
+    if (view->width != expected_size || view->height != expected_size) {
+        return metal_fail(error,
+                          error_size,
+                          "Metal projected-feature encoding expected %ux%u %s view, got %ux%u",
+                          expected_size,
+                          expected_size,
+                          view->kind == UOCR_VIEW_LOCAL ? "local" : "global",
+                          view->width,
+                          view->height);
+    }
+    if (out_projected_rows != expected_rows) {
+        return metal_fail(error,
+                          error_size,
+                          "Metal projected-feature row count mismatch: got %u expected %u",
+                          out_projected_rows,
+                          expected_rows);
+    }
+
+    uocr_metal_vision_weights_f16 weights;
+    if (!metal_load_vision_weights_from_bindings(ctx, &weights, error, error_size)) {
+        return 0;
+    }
+
+    uocr_metal_vision_host_scratch scratch;
+    if (!metal_vision_host_scratch_init(&scratch, error, error_size)) {
+        return 0;
+    }
+
+    uocr_metal_vision_project_context project;
+    memset(&project, 0, sizeof(project));
+    project.ctx = ctx;
+    project.weights = &weights;
+    project.scratch = &scratch;
+
+    const int ok = metal_encode_one_view_projected_f16(&project,
+                                                       view,
+                                                       out_projected_features_f16,
+                                                       error,
+                                                       error_size);
+    metal_vision_host_scratch_free(&scratch);
+    if (!ok) {
+        return 0;
+    }
+
+    metal_clear_error(error, error_size);
+    return 1;
+}
+
 static int scratch_slot_valid(uocr_metal_scratch_slot slot) {
     return slot >= UOCR_METAL_SCRATCH_VISION && slot < UOCR_METAL_SCRATCH_COUNT;
 }

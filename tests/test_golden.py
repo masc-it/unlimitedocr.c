@@ -11,6 +11,9 @@ from unlimitedocr_c.golden import (
     CLIP_GLOBAL_TOKENS,
     CLIP_HIDDEN_SIZE,
     CLIP_LOCAL_TOKENS,
+    PROJECTED_FEATURES_BIN,
+    PROJECTED_GLOBAL_ROWS,
+    PROJECTED_LOCAL_ROWS,
     SAM_FEATURES_BIN,
     SAM_FEATURE_CHANNELS,
     clip_features_filename,
@@ -21,6 +24,7 @@ from unlimitedocr_c.golden import (
     load_image_generated_ids_dump,
     load_clip_features_dump,
     load_image_prompt_embedding_dump,
+    load_projected_features_dump,
     load_prompt_embedding_dump,
     load_sam_features_dump,
     load_text_decoder_layers_dump,
@@ -30,6 +34,7 @@ from unlimitedocr_c.golden import (
     read_bf16_rows_as_f16_bits,
     read_bf16_tensor_as_f16_bits,
     sam_features_filename,
+    projected_features_filename,
 )
 
 
@@ -245,6 +250,37 @@ def test_load_clip_features_dump_reads_single_and_per_view_files(tmp_path) -> No
 
     np.testing.assert_array_equal(load_clip_features_dump(tmp_path, view_index=0, token_count=CLIP_GLOBAL_TOKENS), global_bits)
     np.testing.assert_array_equal(load_clip_features_dump(tmp_path, view_index=1, token_count=CLIP_LOCAL_TOKENS), local_bits)
+
+
+def test_load_projected_features_dump_reads_single_and_per_view_files(tmp_path) -> None:
+    manifest = {
+        "views": [
+            {"name": "global", "kind": "global", "width": 1024, "height": 1024},
+            {"name": "local", "kind": "local", "width": 640, "height": 640},
+        ],
+        "golden_tensors": {
+            "projected_features": {
+                "views": [
+                    {"file": PROJECTED_FEATURES_BIN, "shape": [1, PROJECTED_GLOBAL_ROWS, 1280]},
+                    {"file": projected_features_filename(1), "shape": [PROJECTED_LOCAL_ROWS, 1280]},
+                ]
+            }
+        },
+    }
+    (tmp_path / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    global_bits = np.arange(PROJECTED_GLOBAL_ROWS * 1280, dtype=np.dtype("<u2")).reshape((PROJECTED_GLOBAL_ROWS, 1280))
+    local_bits = np.arange(PROJECTED_LOCAL_ROWS * 1280, dtype=np.dtype("<u2")).reshape((PROJECTED_LOCAL_ROWS, 1280))
+    global_bits.tofile(tmp_path / PROJECTED_FEATURES_BIN)
+    local_bits.tofile(tmp_path / projected_features_filename(1))
+
+    np.testing.assert_array_equal(
+        load_projected_features_dump(tmp_path, view_index=0, row_count=PROJECTED_GLOBAL_ROWS),
+        global_bits,
+    )
+    np.testing.assert_array_equal(
+        load_projected_features_dump(tmp_path, view_index=1, row_count=PROJECTED_LOCAL_ROWS),
+        local_bits,
+    )
 
 
 def test_load_image_decoder_layers_dump_reads_native_hidden_files(tmp_path) -> None:
