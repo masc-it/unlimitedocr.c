@@ -418,6 +418,14 @@ static void fill_memory_report(const uocr_engine *engine, uocr_memory_report *re
     copy_estimate_to_report(&engine->last_estimate, report);
     report->memory_budget_bytes = engine->memory_budget_bytes;
     report->recommended_working_set_bytes = engine->recommended_working_set_bytes;
+#if UOCR_HAVE_METAL
+    if (engine->metal != NULL) {
+        report->vision_workspace_capacity_bytes =
+            uocr_metal_context_scratch_capacity(engine->metal, UOCR_METAL_SCRATCH_VISION);
+        report->vision_workspace_high_watermark_bytes =
+            uocr_metal_context_scratch_high_watermark(engine->metal, UOCR_METAL_SCRATCH_VISION);
+    }
+#endif
 }
 
 static void fill_profile_report(const uocr_engine *engine, uocr_profile_report *report) {

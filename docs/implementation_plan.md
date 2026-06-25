@@ -113,7 +113,7 @@ Implementation status:
 - [ ] Separate memory categories for final visual features, GPU vision workspace, host staging, and transient buffers.
 - [x] Size final visual features from actual visual rows and hidden size, not prompt token capacity.
 - [ ] Size vision workspace from actual view shape and chunk size.
-- [ ] Include vision workspace high-water marks in `uocr_engine_memory_report()`.
+- [x] Include vision workspace high-water marks in `uocr_engine_memory_report()`.
 - [ ] Update OOM diagnostics to show requested views, visual rows, workspace bytes, and configured budget.
 - [ ] Verify memory reports against measured allocations before and after the GPU-resident vision rewrite.
 

@@ -58,6 +58,8 @@ class CMemoryReport(ct.Structure):
         ("estimated_total_bytes", ct.c_uint64),
         ("memory_budget_bytes", ct.c_uint64),
         ("recommended_working_set_bytes", ct.c_uint64),
+        ("vision_workspace_capacity_bytes", ct.c_uint64),
+        ("vision_workspace_high_watermark_bytes", ct.c_uint64),
     ]
 
 
@@ -149,6 +151,8 @@ class MemoryReport:
     estimated_total_bytes: int
     memory_budget_bytes: int
     recommended_working_set_bytes: int
+    vision_workspace_capacity_bytes: int = 0
+    vision_workspace_high_watermark_bytes: int = 0
 
 
 @dataclass(frozen=True)
@@ -514,6 +518,8 @@ class Engine:
             estimated_total_bytes=int(report.estimated_total_bytes),
             memory_budget_bytes=int(report.memory_budget_bytes),
             recommended_working_set_bytes=int(report.recommended_working_set_bytes),
+            vision_workspace_capacity_bytes=int(report.vision_workspace_capacity_bytes),
+            vision_workspace_high_watermark_bytes=int(report.vision_workspace_high_watermark_bytes),
         )
 
     def memory_report(self) -> MemoryReport:

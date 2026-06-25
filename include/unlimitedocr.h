@@ -22,7 +22,7 @@ extern "C" {
 
 #define UOCR_VERSION_MAJOR 0u
 #define UOCR_VERSION_MINOR 1u
-#define UOCR_VERSION_PATCH 0u
+#define UOCR_VERSION_PATCH 1u
 #define UOCR_ABI_VERSION ((UOCR_VERSION_MAJOR << 16) | (UOCR_VERSION_MINOR << 8) | UOCR_VERSION_PATCH)
 
 typedef struct uocr_engine uocr_engine;
@@ -87,6 +87,8 @@ typedef struct uocr_memory_report {
     uint64_t estimated_total_bytes;
     uint64_t memory_budget_bytes;
     uint64_t recommended_working_set_bytes;
+    uint64_t vision_workspace_capacity_bytes;
+    uint64_t vision_workspace_high_watermark_bytes;
 } uocr_memory_report;
 
 typedef struct uocr_profile_report {
