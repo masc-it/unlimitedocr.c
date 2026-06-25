@@ -251,6 +251,10 @@ struct uocr_metal_context {
     uint64_t last_model_warmup_bytes;
     uocr_metal_scratch_buffer scratch[UOCR_METAL_SCRATCH_COUNT];
     uocr_metal_runtime_arena runtime_arenas[UOCR_METAL_ARENA_COUNT];
+    id<MTLBuffer> prompt_token_ids_buffer;
+    uint64_t prompt_token_ids_capacity;
+    uint32_t prompt_token_ids_batch_slots;
+    uint32_t prompt_token_ids_prompt_capacity;
     uocr_metal_decoder_binding_cache decoder_bindings;
     char decoder_binding_error[256];
     uocr_metal_vision_binding_cache vision_bindings;
@@ -5222,6 +5226,11 @@ void uocr_metal_context_release_runtime_arenas(uocr_metal_context *ctx) {
             arena->capacity = 0u;
             arena->cpu_visible = 0;
         }
+        [ctx->prompt_token_ids_buffer release];
+        ctx->prompt_token_ids_buffer = nil;
+        ctx->prompt_token_ids_capacity = 0u;
+        ctx->prompt_token_ids_batch_slots = 0u;
+        ctx->prompt_token_ids_prompt_capacity = 0u;
         memset(&ctx->kv_cache_layout, 0, sizeof(ctx->kv_cache_layout));
         ctx->has_kv_cache_layout = 0;
         ctx->has_integrated_prefill = 0;
@@ -5294,6 +5303,28 @@ int uocr_metal_context_allocate_runtime_arenas(uocr_metal_context *ctx,
             ctx->runtime_arenas[i].capacity = bytes;
             ctx->runtime_arenas[i].cpu_visible = cpu_visible;
         }
+        uint64_t prompt_token_id_bytes = 0u;
+        if (!checked_mul_u64((uint64_t)batch_slots, (uint64_t)prompt_token_capacity, &prompt_token_id_bytes) ||
+            !checked_mul_u64(prompt_token_id_bytes, (uint64_t)sizeof(int32_t), &prompt_token_id_bytes) ||
+            prompt_token_id_bytes > max_buffer_length || prompt_token_id_bytes > (uint64_t)SIZE_MAX) {
+            uocr_metal_context_release_runtime_arenas(ctx);
+            return metal_fail(error, error_size, "Metal prompt token-id arena byte-size overflow");
+        }
+        id<MTLBuffer> prompt_tokens = metal_new_buffer_with_length(ctx,
+                                                                   (NSUInteger)prompt_token_id_bytes,
+                                                                   MTLResourceStorageModeShared);
+        if (prompt_tokens == nil) {
+            uocr_metal_context_release_runtime_arenas(ctx);
+            return metal_fail(error,
+                              error_size,
+                              "failed to allocate persistent Metal prompt token-id buffer with %llu bytes",
+                              (unsigned long long)prompt_token_id_bytes);
+        }
+        prompt_tokens.label = @"uocr_persistent_prompt_token_ids";
+        ctx->prompt_token_ids_buffer = prompt_tokens;
+        ctx->prompt_token_ids_capacity = prompt_token_id_bytes;
+        ctx->prompt_token_ids_batch_slots = batch_slots;
+        ctx->prompt_token_ids_prompt_capacity = prompt_token_capacity;
         ctx->kv_cache_layout = kv_layout;
         ctx->has_kv_cache_layout = 1;
     }
@@ -9399,6 +9430,8 @@ static int metal_context_assemble_prompt_f16_with_table_buffer_to_buffer(uocr_me
                                                                           uint32_t hidden_size,
                                                                           const int32_t *input_ids,
                                                                           uint32_t n_tokens,
+                                                                          id<MTLBuffer> input_ids_buffer,
+                                                                          NSUInteger input_ids_offset,
                                                                           uint32_t image_span_start,
                                                                           uint32_t image_span_length,
                                                                           const uint16_t *image_features_f16,
@@ -9519,11 +9552,31 @@ static int metal_context_assemble_prompt_f16_with_table_buffer_to_buffer(uocr_me
             return 0;
         }
 
-        id<MTLBuffer> tokens = metal_new_buffer_with_bytes(ctx, input_ids, (NSUInteger)token_bytes, MTLResourceStorageModeShared);
-        if (tokens == nil) {
-            return metal_fail(error, error_size, "failed to allocate %s token-id buffer", op);
+        id<MTLBuffer> tokens = input_ids_buffer;
+        NSUInteger tokens_bind_offset = input_ids_offset;
+        int owns_tokens = 0;
+        if (tokens != nil) {
+            const uint64_t token_offset_u64 = (uint64_t)input_ids_offset;
+            const uint64_t token_length = (uint64_t)[tokens length];
+            uint64_t token_end = 0u;
+            if (!checked_add_u64(token_offset_u64, token_bytes, &token_end) || token_end > token_length) {
+                return metal_fail(error,
+                                  error_size,
+                                  "%s persistent token-id range [%llu,%llu) exceeds Metal buffer length %llu",
+                                  op,
+                                  (unsigned long long)token_offset_u64,
+                                  (unsigned long long)token_end,
+                                  (unsigned long long)token_length);
+            }
+        } else {
+            tokens = metal_new_buffer_with_bytes(ctx, input_ids, (NSUInteger)token_bytes, MTLResourceStorageModeShared);
+            if (tokens == nil) {
+                return metal_fail(error, error_size, "failed to allocate %s token-id buffer", op);
+            }
+            tokens.label = @"uocr_prompt_input_ids";
+            tokens_bind_offset = 0u;
+            owns_tokens = 1;
         }
-        tokens.label = @"uocr_prompt_input_ids";
 
         id<MTLBuffer> image_features = nil;
         NSUInteger image_features_bind_offset = 0u;
@@ -9535,7 +9588,9 @@ static int metal_context_assemble_prompt_f16_with_table_buffer_to_buffer(uocr_me
             } else {
                 image_features = metal_new_buffer_with_bytes(ctx, image_features_f16, (NSUInteger)image_bytes, MTLResourceStorageModeShared);
                 if (image_features == nil) {
-                    [tokens release];
+                    if (owns_tokens) {
+                        [tokens release];
+                    }
                     return metal_fail(error, error_size, "failed to allocate %s image-feature buffer", op);
                 }
                 image_features.label = @"uocr_prompt_image_features_f16";
@@ -9548,7 +9603,9 @@ static int metal_context_assemble_prompt_f16_with_table_buffer_to_buffer(uocr_me
             if (owns_image_features) {
                 [image_features release];
             }
-            [tokens release];
+            if (owns_tokens) {
+                [tokens release];
+            }
             return metal_fail(error, error_size, "failed to create %s command buffer", op);
         }
         cb.label = @"uocr_prompt_assembly_command_buffer";
@@ -9558,7 +9615,9 @@ static int metal_context_assemble_prompt_f16_with_table_buffer_to_buffer(uocr_me
             if (owns_image_features) {
                 [image_features release];
             }
-            [tokens release];
+            if (owns_tokens) {
+                [tokens release];
+            }
             return metal_fail(error, error_size, "failed to create %s command encoder", op);
         }
 
@@ -9574,7 +9633,7 @@ static int metal_context_assemble_prompt_f16_with_table_buffer_to_buffer(uocr_me
 
         [enc setComputePipelineState:pipeline];
         [enc setBuffer:table_buffer offset:table_offset atIndex:0u];
-        [enc setBuffer:tokens offset:0u atIndex:1u];
+        [enc setBuffer:tokens offset:tokens_bind_offset atIndex:1u];
         if (has_image_span) {
             [enc setBuffer:image_features offset:image_features_bind_offset atIndex:2u];
             [enc setBuffer:dst_buffer offset:dst_offset atIndex:3u];
@@ -9601,14 +9660,18 @@ static int metal_context_assemble_prompt_f16_with_table_buffer_to_buffer(uocr_me
             if (owns_image_features) {
                 [image_features release];
             }
-            [tokens release];
+            if (owns_tokens) {
+                [tokens release];
+            }
             return metal_fail(error, error_size, "%s command failed: %s", op, [description UTF8String]);
         }
 
         if (owns_image_features) {
             [image_features release];
         }
-        [tokens release];
+        if (owns_tokens) {
+            [tokens release];
+        }
     }
 
     metal_clear_error(error, error_size);
@@ -9657,6 +9720,8 @@ static int metal_context_assemble_prompt_f16_with_table_buffer(uocr_metal_contex
                                                                                          hidden_size,
                                                                                          input_ids,
                                                                                          n_tokens,
+                                                                                         nil,
+                                                                                         0u,
                                                                                          image_span_start,
                                                                                          image_span_length,
                                                                                          image_features_f16,
@@ -10156,6 +10221,61 @@ static int metal_prompt_arena_slot_offset(const uocr_metal_context *ctx,
     return 1;
 }
 
+static int metal_prompt_token_ids_slice(const uocr_metal_context *ctx,
+                                        uint32_t slot,
+                                        uint32_t n_tokens,
+                                        uocr_metal_buffer_slice *out_slice,
+                                        uint64_t *out_bytes) {
+    if (ctx == NULL || out_slice == NULL || out_bytes == NULL || ctx->prompt_token_ids_buffer == nil || n_tokens == 0u ||
+        slot >= ctx->prompt_token_ids_batch_slots || n_tokens > ctx->prompt_token_ids_prompt_capacity) {
+        return 0;
+    }
+    uint64_t offset_tokens = 0u;
+    uint64_t offset_bytes = 0u;
+    uint64_t token_bytes = 0u;
+    if (!checked_mul_u64((uint64_t)slot, (uint64_t)ctx->prompt_token_ids_prompt_capacity, &offset_tokens) ||
+        !checked_mul_u64(offset_tokens, (uint64_t)sizeof(int32_t), &offset_bytes) ||
+        !checked_mul_u64((uint64_t)n_tokens, (uint64_t)sizeof(int32_t), &token_bytes)) {
+        return 0;
+    }
+    uint64_t end = 0u;
+    if (!checked_add_u64(offset_bytes, token_bytes, &end) || end > ctx->prompt_token_ids_capacity ||
+        offset_bytes > (uint64_t)NSUIntegerMax || token_bytes > (uint64_t)NSUIntegerMax) {
+        return 0;
+    }
+    out_slice->buffer = ctx->prompt_token_ids_buffer;
+    out_slice->offset = (NSUInteger)offset_bytes;
+    *out_bytes = token_bytes;
+    return 1;
+}
+
+static int metal_upload_prompt_token_ids(uocr_metal_context *ctx,
+                                         const int32_t *input_ids,
+                                         uint32_t n_tokens,
+                                         uint32_t slot,
+                                         uocr_metal_buffer_slice *out_slice,
+                                         char *error,
+                                         size_t error_size) {
+    if (ctx == NULL || input_ids == NULL || out_slice == NULL) {
+        return metal_fail(error, error_size, "invalid Metal prompt token-id upload request");
+    }
+    uint64_t token_bytes = 0u;
+    if (!metal_prompt_token_ids_slice(ctx, slot, n_tokens, out_slice, &token_bytes)) {
+        return metal_fail(error,
+                          error_size,
+                          "Metal persistent prompt token-id buffer cannot hold slot %u with %u tokens",
+                          slot,
+                          n_tokens);
+    }
+    uint8_t *contents = (uint8_t *)[out_slice->buffer contents];
+    if (contents == NULL) {
+        return metal_fail(error, error_size, "Metal persistent prompt token-id buffer is not CPU-visible");
+    }
+    memcpy(contents + out_slice->offset, input_ids, (size_t)token_bytes);
+    metal_profile_add_event_ms(ctx, "metal.prompt.token_ids_persistent_update", 0.0);
+    return 1;
+}
+
 static int metal_context_assemble_prompt_from_model_to_arena_f16(uocr_metal_context *ctx,
                                                                   const int32_t *input_ids,
                                                                   uint32_t n_tokens,
@@ -10203,6 +10323,11 @@ static int metal_context_assemble_prompt_from_model_to_arena_f16(uocr_metal_cont
         return 0;
     }
 
+    uocr_metal_buffer_slice token_ids;
+    if (!metal_upload_prompt_token_ids(ctx, input_ids, n_tokens, slot, &token_ids, error, error_size)) {
+        return 0;
+    }
+
     return metal_context_assemble_prompt_f16_with_table_buffer_to_buffer(ctx,
                                                                          table,
                                                                          table_offset,
@@ -10210,6 +10335,8 @@ static int metal_context_assemble_prompt_from_model_to_arena_f16(uocr_metal_cont
                                                                          UOCR_HIDDEN_SIZE,
                                                                          input_ids,
                                                                          n_tokens,
+                                                                         token_ids.buffer,
+                                                                         token_ids.offset,
                                                                          image_span_start,
                                                                          image_span_length,
                                                                          image_features_f16,

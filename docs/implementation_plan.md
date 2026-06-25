@@ -153,8 +153,8 @@ Current finding:
 
 Implementation status:
 
-- [ ] Allocate one persistent GPU token-id buffer per engine slot.
-- [ ] Copy request input ids into the persistent token-id buffer before command encoding.
+- [x] Allocate one persistent GPU token-id buffer per engine slot.
+- [x] Copy request input ids into the persistent token-id buffer before command encoding.
 - [ ] Replace standalone prompt assembly with one prefill-graph step: text-token gather plus image-feature blit into the prompt arena.
 - [ ] Encode prompt assembly and all prefill layers into one command buffer.
 - [ ] Use MPSNDArray matrix multiplication for decoder prefill QKV, O projection, dense layer-0 MLP, shared experts, routed experts, and LM head prefill-size GEMMs.
