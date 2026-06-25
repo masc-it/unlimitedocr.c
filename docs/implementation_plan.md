@@ -1,1051 +1,321 @@
-# Unlimited-OCR C implementation plan
+# Unlimited-OCR C implementation plan: fp16 Metal image-to-text engine
 
-This plan is grounded in the current design docs and reference code:
+This plan is now intentionally narrow.  The only active goal is:
 
-- `docs/foundations.md`
-- `docs/architecture.md`
-- `data/context/*` Hugging Face remote-code/config/tokenizer context
-- `data/ds4/*` DwarfStar mmap/Metal/quantization reference
-- `/Users/mascit/projects/gradients.c/src/ops/*` Metal RoPE/SDPA kernel references
-- `/Users/mascit/Downloads/ocrbaidu/src/ocrbaidu/*` local Python wrapper/postprocess reference
+> **Real image in -> Python-prepared request -> C/Metal fp16 inference -> generated token ids -> decoded text out.**
 
-The plan is intentionally model-specific. The converter absorbs Hugging Face naming/layout complexity; the runtime executes fixed Unlimited-OCR stages.
+Implementation work only.  Do not spend time adding new test suites, parity fixture
+infrastructure, q8/q4 runtime work, batching, CUDA, or packaging polish until the
+fp16 Metal image path can be used directly on real images.
 
-## 0. Refined execution order and acceptance gates
+The frontend remains Python for v1.  The inference core remains C/Metal.
 
-- [x] **Gate A: frontend fixtures are exact.** Python prepared-request fixtures must match upstream for prompt text, token ids, image mask, crop grid, and preprocessed pixels before C inference work depends on them.
-- [x] **Gate B: fp16 `.uocr` is structurally exact.** The converter/loader must account for all `2710` safetensors tensors from the current header, either as runtime tensors or explicitly marked unused/provenance-only.
-- [ ] **Gate C: integrated decoder works without vision.** The public Metal fp16 text-only generation path in `uocr_generate_prepared()` must match Python layer/logit/generated-id dumps before image paths are introduced.
-- [ ] **Gate D: integrated decoder works with dumped image embeddings.** The same generation loop, fed with Python-dumped visual embeddings, must match Python prompt/layer/router/logit/generated-id dumps before implementing the Metal vision stack.
-- [ ] **Gate E / E2E-0: public fp16 image OCR works.** A normal Python `prepare_image()` / `prepare_pages()` request must flow through public `uocr_generate_prepared()` on Metal: views -> SAM -> CLIP -> projector -> newline/separator formatting -> integrated decoder -> generated ids. SAM/CLIP/projector helper kernels alone do not satisfy this gate; formatted visual features and first generated ids must match Python dumps for at least one `1024` global and one `640`/local-crop fixture before quants/optimizations resume.
-- [ ] **Gate F: q8 works before q4.** `dyn-q8` converter/kernels must pass layer/logit/generation parity before enabling any q4 policy.
-- [ ] **Gate G: q4 is calibrated, not global.** `dyn-q4` may only ship as a mixed profile with monotonic promotions and explicit reasons.
-- [ ] **Gate H: batching follows single-request parity.** Static/variable batching starts only after single-request fp16 and q8 paths are stable.
+## 0. Definition of done for this slice
 
-First implementation slice, in order:
+End goal: a developer can point the Python API at a normal image and a converted
+fp16 `.uocr` model and receive decoded text without touching internal debug APIs.
 
-- [x] Land CMake skeleton and `libunlimitedocr` stub.
-- [x] Land Python prepared-request builder and fixture writer.
-- [x] Land synthetic `.uocr` loader/dumper tests without full weights.
-- [x] Land C prepared-request validator and Python `ctypes` smoke test.
-- [x] Land Metal backend init/source-compile/no-copy-mmap smoke test.
-- [x] Land fp16 converter dry-run against cached safetensors header/index before requiring the full weight file.
+- [x] A full HF checkpoint can be downloaded outside the repo metadata cache.
+- [x] The checkpoint can be converted to an fp16 `.uocr` model.
+- [x] The C engine can open an fp16 `.uocr` model with the Metal backend.
+- [x] The public Python wrapper can prepare a real image into a stable C request.
+- [x] Public `uocr_generate_prepared()` has an image path instead of returning `UOCR_ERROR_NOT_IMPLEMENTED` for fp16 Metal image requests.
+- [x] The Metal vision runner is wired before the decoder in the public path.
+- [x] Generated token ids are returned through `uocr_result` and decoded in Python.
+- [ ] A real single-image call such as `ocr_image("page.png", model_path="dist/unlimitedocr-fp16.uocr")` runs to completion and returns a decoded sequence.
+- [ ] The same public path works with `preset="base"` and `preset="gundam"`.
+- [ ] The public path can generate more than one token for useful OCR output, not just a first-token smoke run.
+- [ ] The implementation handles a failed run with actionable user-facing errors: model missing, Metal unavailable, out of memory, invalid request, or unsupported qprofile.
 
-Completed prerequisite decoder slice:
+Canonical user command once this slice is complete:
 
-- [x] Define internal integrated Metal decoder request/result structs and one orchestration entry point; keep existing per-op Metal functions as diagnostic/parity helpers.
-- [x] Validate and cache all decoder-required mapped tensor bindings (`TOK_EMBED`, `FINAL_NORM`, `LM_HEAD`, layer norms, attention, dense MLP, MoE router/shared/expert weights) before running the integrated decoder.
-- [x] Implement single-request, slot-0, text-only prompt prefill orchestration over all 12 layers using persistent arenas and KV cache; no image features and no batching yet.
-- [x] Implement single-token decode-step orchestration using the existing KV ring helpers, prompt+generated-ring attention, final norm, LM head, no-repeat banning, greedy argmax, and EOS handling.
-- [x] Wire the Metal backend path in `uocr_generate_prepared()` for `n_requests=1`, `views=0`, `fp16` model, and `max_new_tokens>0`; return generated ids with `uocr_result_create_from_generated()` instead of `UOCR_ERROR_NOT_IMPLEMENTED` for that narrow case.
-- [x] Add an opt-in full-model public API parity test for text-only generated ids (`UOCR_RUN_LARGE_TESTS=1`, `UOCR_MODEL_PATH`, `UOCR_LAYER_DUMP_DIR` or equivalent fixture).
-- [x] Promote the Python-dumped visual-embedding path from direct Metal tests into the same integrated decoder runner via an internal/test-only fixture adapter, without changing the stable v1 prepared-request image API.
-- [x] Add opt-in generated-id/text parity for the integrated dumped-visual-embedding path.
-- [x] Start section 16 Metal vision helper/kernel work only after the integrated dumped-visual-embedding generation path passes.
+```sh
+UOCR_LIBRARY_PATH=build/debug/libunlimitedocr.dylib uv run python - <<'PY'
+from unlimitedocr_c.ocr import ocr_image
 
-Current priority slice, in order. The coding agent should take the first unchecked item here before doing more quantization, optimization, batching, CUDA, or high-level OCR/PDF/postprocess work. Goal: **Gate E2E-0**, a public fp16 single-image OCR call returns generated ids/text from real pixels.
+result = ocr_image(
+    "path/to/image.png",
+    model_path="dist/unlimitedocr-fp16.uocr",
+    max_gen_tokens=128,
+)
+print(result.text)
+PY
+```
 
-- [x] Define and validate a production fp16 vision tensor-binding cache for all tensors needed by SAM, CLIP, projector, `IMAGE_NEWLINE`, and `VIEW_SEPARATOR`; fail model open/generation early if anything required is missing, non-fp16, or shape-mismatched.
-- [x] Add a production Metal vision runner that consumes validated public `uocr_prepared_request` views and writes one formatted fp16 visual-feature buffer `[image_tokens,1280]` using the existing view scheduler, SAM/CLIP/projector kernels, and newline/separator formatter.
-- [x] Wire the public Metal path in `uocr_generate_prepared()` for `n_requests=1`, fp16 model, `max_new_tokens>0`, and image requests; find/validate the contiguous image span, run vision, then call the existing integrated decoder with `image_features_f16` instead of returning `UOCR_ERROR_NOT_IMPLEMENTED`.
-- [x] Add an opt-in full-model public image smoke test: Python `prepare_image(..., max_new_tokens=1)` -> C `uocr_generate_prepared()` -> at least one valid generated id; decode the id in Python for developer visibility.
-- [x] Add image e2e parity fixtures/tests for formatted visual features and first generated ids/text against the Python/HF path, starting with one base/global `1024` image, then gundam `[1,1]`, then real multi-crop.
-- [x] Add only the thinnest Python convenience wrapper/decoder needed to call the working public path; defer stable `ocr_image`/PDF/postprocess ergonomics until after the native fp16 image path works.
-- [ ] Resume q8/q4 runtime kernels, batching, CUDA, and performance optimization only after Gate E2E-0 passes.
+## 1. Hard scope boundaries
 
-## 1. Critical facts to encode as asserts
+End goal: keep all work directed at the fp16 Metal image-to-text path.
 
-- [x] Assert model constants from `data/context/config.json` and `configuration_deepseek_v2.py` defaults:
-  - [x] vocab `129280`, hidden `1280`, layers `12`, heads `10`, KV heads `10`, head dim `128`
-  - [x] max positions `32768`, generated ring window `128`, RoPE theta `10000`
-  - [x] dense layer-0 intermediate `6848`
-  - [x] MoE layers `1..11`, routed experts `64`, top-k `6`, routed intermediate `896`, shared experts `2`
-  - [x] `hidden_act="silu"`, `rms_norm_eps=1e-6`, `attention_bias=false`, `attention_dropout=0.0`
-  - [x] MoE `scoring_func="softmax"`, `topk_method="greedy"`, `routed_scaling_factor=1.0`, `norm_topk_prob=false`
-- [x] Assert tokenizer facts:
-  - [x] BPE vocab `128000`, total vocab `129280`, added tokens `830`
-  - [x] BOS `0`, EOS `1`, PAD `2`, `<image>` `128815`
-- [x] Assert current safetensors facts:
-  - [x] total weight payload `6,672,212,480` bytes from `model.safetensors.index.json`
-  - [x] `2710` tensor entries in the safetensors header / index
-  - [x] all source tensors are BF16 in the current checkpoint header
-- [x] Assert prompt-template facts:
-  - [x] `plain` conversation template has empty roles and empty separators
-  - [x] upstream strips each message content and strips the final prompt
-  - [x] assistant empty message contributes no text
-  - [x] BOS is manually prepended after text/image expansion
-- [x] Assert generation/cache facts:
-  - [x] upstream `max_length` is total sequence length (`prompt + generated`), while the C API uses `max_new_tokens`
-  - [x] Python disables `config.sliding_window` for generation prefill and stores `_ring_window`
-  - [x] prefill tokens remain fully attendable
-  - [x] only generated tokens use the 128-token ring overwrite behavior
-- [x] Assert crop/view facts:
-  - [x] crop-mode source feature order is local rows first, then global rows, then view separator
-  - [x] placeholder id order is not semantically meaningful because all visual placeholders use the same id
-  - [x] C must validate visual feature count, not trust placeholder construction blindly
+- [x] Python owns image loading, preprocessing, prompt rendering, tokenization, and output decoding.
+- [x] C owns model loading, request validation, memory accounting, Metal execution, KV cache, generation, and result ownership.
+- [x] Start and stay on fp16 weights/activations for this slice.
+- [x] Use Metal as the only production backend for this slice.
+- [x] Keep the runtime model-specific to Unlimited-OCR; do not generalize into a transformer framework.
+- [x] Keep q8/q4 code that already exists, but do not route public image OCR through it for this slice.
+- [x] Keep CUDA, batching, calibration, server APIs, native C tokenization, native C image loading, and PDF/postprocess polish out of scope.
+- [ ] Remove or bypass any remaining implementation blockers that still assume image generation is a diagnostic-only path.
+- [ ] Keep all new work on the direct public path: Python API -> C ABI -> Metal fp16 -> decoded text.
 
-## 2. Non-negotiable constraints
+## 2. Local model artifacts needed for real use
 
-- [ ] Keep the inference core narrow and Unlimited-OCR-specific; do not build a generic transformer runtime.
-- [ ] Keep Python as the v1 frontend: image loading/preprocessing, prompt rendering, tokenization, and output decoding stay in Python.
-- [ ] Keep C as the inference core: model loading, memory management, Metal/CUDA backends, KV cache, generation loop, logits processors, and batching.
-- [ ] Start with Metal; design a narrow backend boundary so CUDA can mirror it later.
-- [ ] Start with fp16 weights/activations for public image-generation parity before any q8/q4 runtime/inference work. Converter/planner experiments may exist, but quantized inference is gated on fp16 E2E.
-- [ ] Keep MoE router weights `model.layers.*.mlp.gate.weight` fp16; do not confuse them with expert `gate_proj` weights.
-- [ ] Keep norms, biases, RoPE/position data, image newline, and view separator tensors fp16 unless a later calibration proves otherwise.
-- [ ] Use DS4/GGML quant layouts where they fit: `Q8_0` first, `Q4_K` only when inner dimension is multiple of `256` or explicitly padded.
-- [ ] Do not allocate in the token loop; preallocate KV/cache/scratch and add debug allocation guards.
-- [ ] Do not eagerly copy the whole `.uocr` model into RAM/GPU private buffers; keep model weights mmap-backed and wrap model ranges as Metal no-copy buffers.
-- [ ] Preserve correctness before speed; no fast path is accepted with unexplained attention, KV, router, or logits drift.
-- [ ] From this point, do not continue q8/q4 runtime work, batching, CUDA, or high-level OCR/PDF/postprocess API work until Gate E2E-0 passes: public fp16 single-image OCR returns generated ids/text through the stable Python/C path. Existing q8 converter/helpers and isolated vision kernels may remain, but the active priority is wiring real image views into the decoder.
+End goal: a developer has a real fp16 `.uocr` file that the C engine can mmap and
+Metal can bind without copying the full model.
 
-## 3. Repository and build bootstrap
+- [x] Download the full `baidu/Unlimited-OCR` HF checkpoint into a local directory.
+  - Current local path used during bring-up: `data/hf/Unlimited-OCR`.
+  - Required payload: `model-00001-of-000001.safetensors`.
+- [x] Avoid relying on the repo's `data/context` metadata-only cache for inference; it has no full safetensors payload.
+- [x] Convert the full checkpoint to fp16 `.uocr`.
+  - Current local artifact: `dist/unlimitedocr-fp16.uocr`.
+  - Current conversion stats: `dist/unlimitedocr-fp16.conversion-stats.json`.
+- [x] Validate model-file structure with `uocr-dump`.
+- [x] Preserve all current checkpoint tensor accounting: `2710` source tensors, `2709` runtime tensors, `1` preserved-unused tensor, `0` omitted tensors.
+- [x] Store fp16 tensor payloads in a page-aligned tensor-data section suitable for Metal `newBufferWithBytesNoCopy` views.
+- [ ] Add a small model-discovery helper in Python so `model_path` can default to `UOCR_MODEL_PATH` or `dist/unlimitedocr-fp16.uocr` when present.
+- [ ] Make converter/runtime diagnostics explicitly tell the user when they accidentally pass the metadata cache directory or an unconverted safetensors file instead of `.uocr`.
+- [ ] Document the minimum disk footprint for the local workflow: HF safetensors plus fp16 `.uocr` are both about 6.2 GiB.
 
-- [ ] Create the planned source layout:
-  - [x] `include/unlimitedocr.h`
-  - [x] `src/core/`
-  - [x] `src/model/`
-  - [x] `src/convert/`
-  - [x] `src/quant/`
-  - [x] `src/runtime/`
-  - [x] `src/backend/cpu_ref/`
-  - [x] `src/backend/metal/`
-  - [x] `src/backend/metal/kernels/`
-  - [x] `src/backend/cuda/` as an empty later-backend placeholder
-  - [x] `src/frontend_native/` as an optional later standalone frontend placeholder
-  - [ ] `python/unlimitedocr_c/`
-  - [x] `tools/`
-  - [x] `tests/`
-  - [x] `probes/`
-- [x] Add a plain CMake build first; do not introduce `scikit-build-core` until the native ABI/resource layout stabilizes.
-- [ ] Add CMake targets:
-  - [x] `uocr_core` object/static library
-  - [x] `uocr_metal` Objective-C/Metal backend on macOS
-  - [ ] `uocr_cuda` optional later backend, default off
-  - [x] `unlimitedocr` shared library exporting the C ABI
-  - [x] `uocr-dump` model-file inspection tool
-  - [x] native CTest tests
-- [x] Add CMake options:
-  - [x] `UOCR_ENABLE_METAL=AUTO`
-  - [x] `UOCR_ENABLE_CUDA=OFF`
-  - [x] `UOCR_ENABLE_CPU_REF=ON`
-  - [x] `UOCR_BUILD_TOOLS=ON`
-  - [x] `UOCR_BUILD_TESTS=ON`
-  - [x] `UOCR_METAL_RUNTIME_COMPILE=ON`
-  - [x] `UOCR_METAL_PRECOMPILE=OFF`
-  - [x] `UOCR_SANITIZE=OFF`
-- [x] Configure Objective-C compilation for `src/backend/metal/*.m` and link Apple frameworks: `Metal`, `Foundation`, and required system frameworks.
-- [x] Use runtime Metal source compilation during development, DS4-style, so `.metal` edits do not require a full packaging flow.
-- [x] Add an optional CMake path to precompile `unlimitedocr.metallib` with `xcrun metal`/`metallib` for future release builds.
-- [x] Keep `pyproject.toml` uv-friendly for now; add Python deps for frontend/tests without switching the build backend yet.
-- [ ] Add Python extras:
-  - [x] runtime/frontend: `numpy`, `pillow`, `tokenizers`, `safetensors`
-  - [ ] reference/golden: `torch`, `transformers`, `einops`, `addict`, `easydict`
-  - [ ] pdf/postprocess optional: `pymupdf`
-  - [x] dev/test: `pytest`
-- [x] Add a build-tree library loading convention for Python:
-  - [x] `UOCR_LIBRARY_PATH=/path/to/libunlimitedocr.dylib`
-  - [x] fallback search under `build/debug`, `build/release`, and package-installed `python/unlimitedocr_c/lib/` later
-- [x] Add a tiny top-level `Makefile` only as a wrapper around `cmake`/`ctest`/`uv`, not as the real build system.
+## 3. Public Python entrypoint
 
-## 4. Python frontend and prepared-request fixtures
+End goal: the normal user-facing Python path accepts an image path/PIL image and
+returns a decoded generated sequence.
 
-- [x] Implement `src/unlimitedocr_c/frontend.py` as the v1 public input path (current uv package layout; docs may move this to `python/` later).
-- [x] Implement preset definitions matching upstream:
-  - [x] `gundam`: `base_size=1024`, `image_size=640`, `crop_mode=True`, single-image only
-  - [x] `base`: `base_size=1024`, `image_size=1024`, `crop_mode=False`
-  - [x] multi-page/PDF: base mode only, `image_size=1024`
-- [x] Implement tokenizer loading with HF `tokenizers` from `tokenizer.json`.
-- [x] Validate tokenizer metadata at startup:
-  - [x] BPE base vocab size `128000`
-  - [x] total vocab size `129280`
-  - [x] BOS id `0`
-  - [x] EOS id `1`
-  - [x] PAD id `2`
-  - [x] `<image>` id `128815`
-- [x] Implement prompt rendering compatible with upstream `format_messages(..., sft_format="plain", system_prompt="")`:
-  - [x] strip each message content before appending, as upstream does
-  - [x] strip the final prompt
-  - [x] ignore role strings in `plain` mode
-  - [x] emit no assistant prefix for the empty assistant message
-- [x] Implement prompt token construction exactly:
-  - [x] split rendered prompt on literal `<image>`
-  - [x] tokenize text pieces with `add_special_tokens=false`
-  - [x] insert repeated `128815` placeholders for the computed visual token count
-  - [x] prepend BOS id `0`
-  - [x] do not append EOS to the prompt
-  - [x] emit same-length `image_mask`
-- [x] Port upstream `dynamic_preprocess()` exactly for crop-mode grid selection:
-  - [x] build target ratios for `min_num=2`, `max_num=32`
-  - [x] choose closest aspect ratio with the same area tie-break
-  - [x] resize source image to `(640 * W, 640 * H)`
-  - [x] split row-major into `640x640` local crops
-  - [x] if source image is at most `640x640`, use crop ratio `[1,1]`
-- [x] Match upstream PIL preprocessing:
-  - [x] open image
-  - [x] EXIF transpose if needed
-  - [x] RGB conversion
-  - [x] `ImageOps.pad(..., color=(127,127,127))` because mean is `(0.5,0.5,0.5)`
-  - [x] upstream default resize interpolation for `image.resize()` and `ImageOps.pad()`
-  - [x] `ToTensor()` semantics: channel-first float in `[0,1]`
-  - [x] normalize with mean/std `(0.5,0.5,0.5)` -> values in `[-1,1]`
-  - [x] output contiguous NCHW `float16` for normal runtime calls
-  - [x] allow `float32` prepared fixtures for preprocessing parity/debug; C/Metal may convert to fp16 on upload
-- [x] Implement single-image base visual-token count:
-  - [x] `num_queries = ceil((1024 / 16) / 4) = 16`
-  - [x] placeholders `([id] * 16 + [id]) * 16 + [id] = 273`
-  - [x] one global `1024x1024` view
-- [x] Implement single-image gundam visual-token count:
-  - [x] global `1024` rows/newlines: `16 * (16 + 1) = 272`
-  - [x] final view separator: `1`
-  - [x] local crops: `num_queries=10` for each `640` view
-  - [x] if real local grid `W x H` exists, add `(10 * W + 1) * (10 * H)` local feature positions
-  - [x] if crop grid is `[1,1]`, do not add local features; total remains `273`
-  - [x] total for real crop grid is `(10 * W + 1) * (10 * H) + 272 + 1`
-  - [x] remember upstream placeholder construction emits global placeholders first, but `masked_scatter_` fills them with source features ordered local-first/global-second/separator-last; C must reproduce the final feature order, not the placeholder-construction order
-- [x] Implement multi-page visual-token construction:
-  - [x] one `<image>` placeholder in prompt
-  - [x] all page/global features concatenated at that span in page order
-  - [x] each `1024` page contributes `273` visual positions
-  - [x] no crop mode
-- [x] Define the Python-to-C view order contract:
-  - [x] base single image: one global `1024x1024` view
-  - [x] multi-page: one global `1024x1024` view per page, in page order
-  - [x] gundam `[1,1]`: one global `1024x1024` view, no local view
-  - [x] gundam real crop: `W*H` local `640x640` views in row-major order, followed by one global `1024x1024` view
-- [x] Define a Python `PreparedRequest` object containing:
-  - [x] `input_ids: int32[n_tokens]`
-  - [x] `image_mask: uint8[n_tokens]`
-  - [x] `views: list[ImageView]` with `kind`, `width`, `height`, `format`, and contiguous pixel array
-  - [x] `crop_grid_w`, `crop_grid_h`
-  - [x] `mode/preset`
-  - [x] `max_new_tokens`
-  - [x] optional original upstream-style `max_length` in fixture metadata for parity debugging
-  - [x] `no_repeat_ngram_size`
-  - [x] `no_repeat_window`
-- [x] Add fixture serialization:
-  - [x] `manifest.json` with prompt, preset, grid, image mask counts, expected visual count, dtype, shape, and source image metadata; token ids/mask are stored as `.npy` arrays
-  - [x] one `.npy` per token/mask array plus a single `.npz` with named view arrays
-  - [x] optional `expected_output_ids.npy` and `expected_text.txt`
-- [x] Add `tools/uocr-ref-dump` Python CLI to emit prepared-request fixtures without requiring C.
-- [x] Add pytest frontend parity tests against the upstream remote code path in `data/context/modeling_unlimitedocr.py`:
-  - [x] local frontend smoke tests for rendered prompt, token ids, image mask, crop grid, pixels, fixture roundtrip
-  - [x] rendered prompt equality
-  - [x] token ids equality
-  - [x] image mask equality
-  - [x] crop grid equality
-  - [x] pixel tensor equality within exact/near-exact tolerance
-  - [x] visual placeholder count equality
-- [x] Keep the native tokenizer/image frontend out of v1; record it under later tasks only.
+- [x] Implement `src/unlimitedocr_c/frontend.py` as the v1 frontend.
+- [x] Load the HF `tokenizer.json` with `tokenizers`.
+- [x] Validate tokenizer constants: BOS `0`, EOS `1`, PAD `2`, `<image>` `128815`, vocab `129280`.
+- [x] Render the upstream-compatible plain prompt.
+- [x] Build prompt token ids with repeated image placeholders and a matching `image_mask`.
+- [x] Preprocess images with PIL: EXIF transpose, RGB conversion, padding, resize, `[-1,1]` normalization, contiguous NCHW.
+- [x] Support `base` preset: one global `1024x1024` view and `273` visual tokens.
+- [x] Support `gundam` preset: local `640x640` crops first, global `1024x1024` view last, and correct visual-token count.
+- [x] Support `prepare_pages()` for base-mode multi-page requests.
+- [x] Implement Python `ctypes` bindings that keep NumPy buffers alive for the duration of the C call.
+- [x] Implement `Engine.generate_prepared()` returning generated token-id arrays.
+- [x] Implement `ocr.generate()` for single-image convenience.
+- [x] Implement `ocr_image()` with upstream-style defaults.
+- [x] Implement `ocr_pages()` and `ocr_pdf()` as Python-side conveniences.
+- [x] Decode returned ids with the same tokenizer and trim one trailing EOS marker.
+- [ ] Add default model-path lookup in `ocr.generate()`, `ocr_image()`, and `ocr_pages()`.
+- [ ] Add a minimal CLI wrapper around `ocr_image()` for manual use, e.g. `uv run tools/uocr-ocr image.png --model dist/unlimitedocr-fp16.uocr`.
+- [ ] Ensure Python errors include the native `uocr_last_error()` detail without hiding the actionable part.
+- [ ] Make the default generation budget useful for OCR while still allowing `max_gen_tokens=1` for quick first-token bring-up.
 
-## 5. Python golden tensor dumper
+## 4. C ABI and public generation dispatch
 
-- [ ] Implement a reference dump mode that loads the official HF model from local/HF context and runs with eager attention.
-- [ ] Use `uv run ...` for all Python scripts and tests.
-- [ ] Add hooks or patched forward calls to dump:
-  - [ ] rendered prompt string
-  - [ ] input token ids
-  - [ ] image mask
-  - [ ] crop grid
-  - [ ] preprocessed view tensors
-  - [ ] SAM output after `sam_model(view)`
-  - [ ] CLIP output after `vision_model(view, sam_features)`
-  - [ ] projected visual features after `projector`
-  - [ ] formatted visual features after newline/separator insertion
-  - [ ] final prompt embeddings after Python `masked_scatter_`
-  - [ ] per-layer hidden state after attention
-  - [ ] per-layer hidden state after dense MLP/MoE
-  - [ ] router logits, probabilities, top-6 expert ids, and top-6 weights for MoE layers
-  - [ ] logits before logits processors
-  - [ ] banned token ids from the no-repeat processor
-  - [ ] generated token ids and decoded text
-- [ ] Dump small, deterministic fixtures first:
-  - [ ] text-only prompt fixture
-  - [ ] single base `1024` image fixture
-  - [ ] single gundam crop fixture with `1x1` crop
-  - [ ] single gundam crop fixture with multi-crop grid
-  - [ ] two-page base fixture
-- [ ] Use fp32 dumps for comparison-critical tensors where feasible, even if model weights are BF16/fp16.
-- [ ] Add an explicit fp16-reference mode for C parity:
-  - [ ] either cast the HF model weights to fp16 before dumping, or
-  - [ ] dump BF16 official tensors plus clear tolerances for the BF16->FP16 converter/runtime difference
-  - [ ] record the reference dtype mode in every fixture manifest
-- [ ] Store metadata with dtype, shape, max/mean statistics, and source module path for every dumped tensor.
-- [ ] Add a fixture reader shared by Python tests and C parity tools.
+End goal: public C ABI accepts prepared image requests and dispatches exactly one
+fp16 Metal image request through vision and decoder.
 
-## 6. `.uocr` model format
-
-- [x] Define `src/model/uocr_format.h` with a versioned binary file format.
-- [x] Use a mmap-friendly layout with a fixed header plus section directory.
-- [x] Define header fields:
-  - [x] magic, e.g. `UOCR`
-  - [x] format version
-  - [x] endian marker
-  - [x] required alignment
-  - [x] model id/source hash
-  - [x] qprofile id: `fp16`, `dyn-q8`, `dyn-q4`, custom
-  - [x] section count and offsets
-- [x] Define a config section with fixed Unlimited-OCR constants:
-  - [x] vocab `129280`
-  - [x] hidden `1280`
-  - [x] decoder layers `12`
-  - [x] attention heads `10`
-  - [x] KV heads `10`
-  - [x] head dim `128`
-  - [x] RoPE theta `10000`
-  - [x] max positions `32768`
-  - [x] generated ring window `128`
-  - [x] dense-first layers `1`
-  - [x] routed experts `64`
-  - [x] top-k `6`
-  - [x] MoE expert intermediate `896`
-  - [x] shared experts `2`
-  - [x] dense layer-0 intermediate `6848`
-  - [x] projector `2048 -> 1280`
-  - [x] vision patch size `16`
-  - [x] downsample ratio `4`
-  - [x] supported global view `1024`
-  - [x] supported local view `640`
-- [x] Define tensor directory entries:
-  - [x] stable tensor id
-  - [x] family/layer/expert/projection fields
-  - [x] logical shape
-  - [x] physical packed shape
-  - [x] dtype/qtype
-  - [x] payload offset/size
-  - [x] block size and row size for quantized tensors
-  - [x] scale/min offsets if stored separately
-  - [x] qtype reason and promotion reason
-  - [x] runtime usage flag: used by inference, unused-but-preserved, or omitted-with-provenance
-- [x] Define qtype enum:
-  - [x] `UOCR_TENSOR_F16`
-  - [x] `UOCR_TENSOR_F32`
-  - [x] `UOCR_TENSOR_Q8_0`
-  - [x] `UOCR_TENSOR_Q4_K`
-  - [x] `UOCR_TENSOR_PADDED_Q4_K`
-  - [x] later placeholders for `Q2_K` and `IQ2_XXS`
-- [x] Define tokenizer metadata section:
-  - [x] tokenizer file hash
-  - [x] BOS/EOS/PAD/image token ids
-  - [x] optional embedded tokenizer payload for future native frontend
-  - [x] explicit flag that C v1 does not require tokenizer tables
-- [x] Define provenance section:
-  - [x] HF model id/commit if known
-  - [x] safetensors file hashes
-  - [x] converter version
-  - [x] config/tokenizer hashes
-  - [x] qprofile and calibration corpus id
-  - [x] complete source tensor accounting: every one of the current `2710` safetensors tensors is mapped to a runtime tensor, marked unused-but-preserved, or marked omitted-with-reason
-- [x] Keep tensor payloads page-aligned enough for Metal no-copy view wrapping.
-- [x] Keep tensor payload separate from metadata/tokenizer so Metal only wraps tensor pages.
-- [x] Write a standalone `uocr-dump` tool to print:
-  - [x] header/config
-  - [x] tensor count
-  - [x] qtype histogram
-  - [x] tensor offsets/sizes/alignment
-  - [x] largest tensors
-  - [x] expected memory footprint
-  - [x] provenance
-  - [x] source tensor accounting summary: runtime / preserved-unused / omitted
-
-## 7. Tensor registry and shape validation
-
-- [x] Implement enum-like tensor ids in `src/model/`, not string lookups in hot runtime paths.
-- [x] Include tensor families:
-  - [x] `TOK_EMBED`
-  - [x] `LM_HEAD`
-  - [x] `FINAL_NORM`
-  - [x] `LAYER[i].ATTN.{Q,K,V,O}`
-  - [x] `LAYER[i].NORM.{INPUT,POST_ATTN}`
-  - [x] `LAYER[0].DENSE_MLP.{GATE,UP,DOWN}`
-  - [x] `LAYER[1..11].MOE.ROUTER`
-  - [x] `LAYER[1..11].MOE.EXPERTS.{GATE,UP,DOWN}`
-  - [x] `LAYER[1..11].MOE.SHARED.{GATE,UP,DOWN}`
-  - [x] `VISION.SAM.*`
-  - [x] `VISION.CLIP.*`
-  - [x] `PROJECTOR`
-  - [x] `IMAGE_NEWLINE`
-  - [x] `VIEW_SEPARATOR`
-- [x] Generate or hardcode expected tensor shapes from `data/context/model.safetensors.header`.
-- [x] Validate key known shapes:
-  - [x] `lm_head.weight`: `[129280,1280]`
-  - [x] `model.embed_tokens.weight`: `[129280,1280]`
-  - [x] decoder attention projection weights: `[1280,1280]`
-  - [x] layer-0 dense `down_proj`: `[1280,6848]`
-  - [x] MoE router `mlp.gate.weight`: `[64,1280]`
-  - [x] routed expert `down_proj`: `[1280,896]`
-  - [x] routed expert `gate_proj/up_proj`: `[896,1280]`
-  - [x] shared expert intermediate: `1792`
-  - [x] projector weight: `[1280,2048]`
-  - [x] projector bias: `[1280]`
-  - [x] image newline/view separator: `[1280]`
-  - [x] SAM patch embed: `[768,3,16,16]`
-  - [x] CLIP qkv: `[3072,1024]`
-- [x] Add a converter validation report that fails if expected tensor names are missing or unexpected shapes appear.
-- [x] Identify tensors that are present but not used in the normal upstream OCR path, especially CLIP pixel patch embedding (`vision_model.embeddings.patch_embedding.*`) because CLIP receives SAM feature maps as `patch_embeds`; either preserve them as unused or omit them with explicit provenance.
-- [x] Add a deterministic tensor-order table used by both converter and runtime.
-- [x] Pack routed experts expert-major:
-  - [x] `[layer][expert][projection][out_row][packed_input]` with interleaved `gate_proj`, `up_proj`, `down_proj` payloads per expert
-- [x] Pack or colocate expert `gate_proj` and `up_proj` so Metal selected-expert kernels can read them together.
-- [x] Store both logical and physical input widths for quantized tensors.
-- [x] Explicitly mark unaligned `Q4_K` hazards:
-  - [x] routed expert `down_proj` input `896`
-  - [x] dense layer-0 `down_proj` input `6848`
-
-## 8. fp16 converter
-
-- [x] Implement `tools/uocr-convert` dry-run CLI (Python first; native conversion can follow once layout is stable).
-- [x] Read `config.json`, `processor_config.json`, tokenizer metadata, and safetensors metadata.
-- [x] Support the current one-file safetensors layout `model-00001-of-000001.safetensors`; keep multi-file safetensors support possible through the index file.
-- [x] Parse safetensors without loading all weights at once:
-  - [x] read header length
-  - [x] parse JSON header
-  - [x] validate that current source tensors are BF16 unless explicitly exempted by a future checkpoint
-  - [x] map or stream individual tensor byte ranges
-  - [x] convert BF16 rows to fp16 payload rows
-  - [x] never allocate a second full-model-sized temporary buffer
-- [x] Implement BF16 -> fp16 conversion using bounded NumPy chunk conversion for the Python converter writer.
-- [x] Record conversion statistics per tensor: source dtype, output dtype/qtype, min/max if cheap, NaN/Inf count, and exact byte count.
-- [x] Preserve row-major matrix layout where runtime kernels expect `[out, in]`.
-- [x] Transpose only where an explicit runtime kernel requires it; record the decision in tensor metadata.
-- [x] Emit pure fp16 `.uocr` first when the safetensors payload is present; always-on tests use tiny synthetic safetensors payloads.
-- [x] Add converter flags:
-  - [x] `--hf-dir PATH`
-  - [x] `--out PATH`
-  - [x] `--qprofile fp16|dyn-q8|dyn-q4`
-  - [x] `--dry-run`
-  - [x] `--tensor NAME_OR_ID` for single-tensor debugging
-  - [x] `--dump-plan`
-  - [x] `--overwrite`
-- [ ] Add dry-run output similar to DS4 quantizer:
-  - [x] tensor name -> tensor id mapping
-  - [x] source shape/dtype
-  - [x] output shape/qtype
-  - [x] output bytes
-  - [x] qtype/promotion reason
-  - [x] source accounting status: runtime / preserved-unused / omitted
-  - [x] planned `.uocr` section layout and tensor payload offsets/alignment
-- [x] Add single-tensor compare mode for converter development.
-- [x] Add strict loader tests using only a tiny synthetic `.uocr` file, so CI does not require full weights.
-- [x] Add writer tests using tiny synthetic safetensors payloads so `.uocr` serialization and BF16->fp16 streaming are covered without full weights.
-- [x] Add an opt-in full-model converter smoke test for local machines with the full safetensors file.
-- [x] Keep converter/loader unit tests runnable without full weights by using synthetic `.uocr` files, synthetic safetensors payloads, and the cached safetensors header/index.
-
-## 9. C public API and Python FFI
-
-- [x] Write `include/unlimitedocr.h` with opaque types:
+- [x] Define stable public types in `include/unlimitedocr.h`:
   - [x] `uocr_engine`
   - [x] `uocr_result`
-- [x] Define C enums:
-  - [x] `uocr_pixel_format`: `UOCR_PIXEL_F16_NCHW`, `UOCR_PIXEL_F32_NCHW`
-  - [x] `uocr_view_kind`: `UOCR_VIEW_GLOBAL`, `UOCR_VIEW_LOCAL`
-  - [x] backend ids or backend string handling: `metal`, `cpu-ref`, later `cuda`
-- [x] Define `uocr_image_view`:
-  - [x] pointer to contiguous `[3,H,W]` normalized pixels
-  - [x] width/height
-  - [x] format
-  - [x] kind
-  - [x] no strides in v1; Python must pass contiguous arrays and C validates expected byte size from format/shape
-- [x] Define `uocr_prepared_request`:
-  - [x] `input_ids`
-  - [x] `image_mask`
-  - [x] `n_tokens`
-  - [x] `views`
-  - [x] `n_views`
-  - [x] `crop_grid_w`, `crop_grid_h`
-  - [x] `max_new_tokens`
-  - [x] `no_repeat_ngram_size`
-  - [x] `no_repeat_window`
-- [x] Define `uocr_engine_opts`:
-  - [x] `model_path`
-  - [x] `backend`
-  - [x] `resource_path` for Metal source/metallib lookup
-  - [x] `max_batch`
-  - [x] `max_prompt_tokens`
-  - [x] `max_gen_tokens`
-  - [x] optional memory budget override
-- [x] Export:
+  - [x] `uocr_image_view`
+  - [x] `uocr_prepared_request`
+  - [x] `uocr_engine_opts`
+- [x] Export public engine/result functions:
   - [x] `uocr_engine_open`
   - [x] `uocr_engine_close`
   - [x] `uocr_generate_prepared`
   - [x] `uocr_result_tokens`
   - [x] `uocr_result_free`
-  - [x] `uocr_last_error` or per-engine error retrieval
-- [x] Keep C ABI stable and plain; no `pybind11`.
-- [x] Implement `src/unlimitedocr_c/ffi.py` with `ctypes` first.
-- [x] Ensure Python holds NumPy arrays alive for the duration of the C call.
-- [x] Add Python tests that call C validation with synthetic prepared requests before real inference exists.
+  - [x] `uocr_last_error`
+  - [x] `uocr_engine_memory_report`
+- [x] Validate token ids, BOS, prompt length, generation length, image mask, view dimensions, and view order before inference.
+- [x] Build a sequence state with prompt length, contiguous image span, generated buffer metadata, no-repeat config, position counters, and EOS status.
+- [x] Reject unsupported batch sizes for generation with a clear message.
+- [x] Route single-request text-only fp16 Metal calls through the integrated decoder.
+- [x] Route single-request image fp16 Metal calls through vision encoding and then the integrated decoder.
+- [x] Allocate and own temporary generated-token buffers before packaging `uocr_result`.
+- [x] Validate image span length equals final formatted visual-feature rows before decoder prefill.
+- [ ] Harden repeated `uocr_generate_prepared()` calls on one engine by explicitly resetting all per-run Metal context state before vision and decoder work.
+- [ ] Ensure public generation errors distinguish vision failure, prompt assembly failure, prefill failure, decode failure, OOM, and unsupported qprofile.
+- [ ] Add a public way to retrieve last generated token count and EOS status if useful for debugging long OCR calls.
 
-## 10. Prepared-request validation and runtime state
+## 5. `.uocr` loader and model binding
 
-- [x] Validate `input_ids` pointer, `image_mask` pointer, and `n_tokens`.
-- [x] Validate token ids are in `[0,129280)`.
-- [x] Validate BOS id `0` is present at position 0 for normal image/text generation.
-- [x] Count `image_mask == 1` positions.
-- [x] Compute expected visual token count from views and crop grid:
-  - [x] base/global `1024`: `273`
-  - [x] local grid `W x H` with `640` crops, only when `W*H > 1`: `(10*W + 1) * (10*H)`
-  - [x] crop mode with real locals: local tokens + `272` global row/newline tokens + `1` separator
-  - [x] no-crop/multi-page: each global page contributes `272` global row/newline tokens + `1` separator
-- [x] Validate placeholder count equals expected visual feature count.
-- [x] Validate supported view dimensions:
-  - [x] `1024x1024` global
-  - [x] `640x640` local
-- [x] Validate view order rules:
-  - [x] base single image: exactly one global `1024x1024` view
-  - [x] multi-page: one or more global `1024x1024` views, all in page order
-  - [x] gundam `[1,1]`: exactly one global `1024x1024` view
-  - [x] gundam real crop: exactly `W*H` local `640x640` views in row-major order followed by one global `1024x1024` view
-  - [x] reject mixed local/global orders that do not match this contract
-- [x] Validate prompt length plus `max_new_tokens` fits engine limits.
+End goal: model open builds all validated fp16 tensor bindings needed by the
+public E2E image path and fails early if any required tensor is missing.
+
+- [x] Implement mmap loader for `.uocr` header, sections, config, tokenizer metadata, provenance, tensor directory, and tensor payloads.
+- [x] Validate compiled Unlimited-OCR constants against the `.uocr` config.
+- [x] Validate tensor payload ranges and alignment.
+- [x] Keep tensor payloads mmap-backed; do not copy full weights into CPU or GPU memory.
+- [x] Plan page-aligned Metal no-copy model views.
+- [x] Wrap model views with `newBufferWithBytesNoCopy`.
+- [x] Cache per-tensor Metal binding `{buffer, inner_offset, payload_size}`.
+- [x] Build and validate decoder tensor bindings for:
+  - [x] token embedding
+  - [x] final norm
+  - [x] LM head
+  - [x] all decoder layer norms
+  - [x] all Q/K/V/O projections
+  - [x] layer-0 dense MLP
+  - [x] MoE routers
+  - [x] routed experts
+  - [x] shared experts
+- [x] Build and validate vision tensor bindings for:
+  - [x] SAM encoder
+  - [x] CLIP encoder
+  - [x] projector
+  - [x] `IMAGE_NEWLINE`
+  - [x] `VIEW_SEPARATOR`
+- [x] Treat CLIP raw-pixel patch embedding as preserved-unused for the normal OCR path.
+- [x] Fail engine open early when an fp16 model lacks required vision bindings.
+- [ ] Confirm all production-required binding errors include the source tensor name or stable tensor id.
+- [ ] Keep q8/q4 `.uocr` artifacts rejected by public fp16 image generation with a precise message.
+
+## 6. Metal backend runtime foundation
+
+End goal: Metal context has all reusable resources needed to run one fp16 image
+request without building a new runtime for each token.
+
+- [x] Create Metal device and command queue.
+- [x] Compile Metal source at runtime in development builds.
+- [x] Support precompiled `.metallib` as a release path.
+- [x] Cache compute pipelines by function name.
+- [x] Track transient shared buffers until command-buffer completion.
+- [x] Allocate named scratch buffers that can grow to high-water marks.
+- [x] Allocate long-lived runtime arenas for prompt embeddings, hidden-state ping-pong, KV cache, router/top-k, MoE, logits, and token slots.
+- [x] Use mmap-backed no-copy buffers for model weights.
+- [x] Use private storage for GPU-only scratch where practical and shared storage for CPU-filled/readback buffers.
+- [x] Maintain memory accounting estimates and expose public memory reports.
+- [x] Use Metal recommended working-set size to choose a default memory budget when available.
+- [ ] Ensure real model open plus one image generation fits the default memory budget on target machines; otherwise improve the default or error message.
+- [ ] Reduce unnecessary per-call CPU allocations in the image path once correctness is established.
+- [ ] Keep the per-token decode loop allocation-free; move any accidental new allocation outside the loop.
+
+## 7. Metal vision encoder: public pixels to formatted visual features
+
+End goal: public `uocr_image_view` pixels become a contiguous fp16 feature buffer
+`[image_tokens,1280]` in the exact order the decoder prompt expects.
+
+- [x] Accept public `UOCR_PIXEL_F16_NCHW` pixels.
+- [x] Accept public `UOCR_PIXEL_F32_NCHW` pixels.
+- [x] Support one global `1024x1024` view.
+- [x] Support zero or more local `640x640` views followed by one global view.
+- [x] Process local crops in chunks to avoid holding all crop intermediates at once.
+- [x] Implement SAM patch embedding from pixels.
+- [x] Add/interpolate SAM absolute position embeddings.
+- [x] Implement all SAM transformer blocks with local/global attention, relative position bias, LayerNorm, GELU MLP, and residuals.
+- [x] Implement SAM neck and downsampling stack to produce `1024 x grid x grid` features.
+- [x] Implement CLIP embeddings from SAM features, including CLS and interpolated absolute positions.
+- [x] Implement all CLIP transformer blocks with full attention, LayerNorm, QuickGELU MLP, and residuals.
+- [x] Concatenate CLIP token features and SAM spatial features into `2048`-wide projector input rows.
+- [x] Apply projector `2048 -> 1280` with bias.
+- [x] Format global view features as `16` rows of `16` projected tokens plus `IMAGE_NEWLINE`, followed by `VIEW_SEPARATOR`.
+- [x] Format local crop features in upstream stitched row order, with newline after each stitched local row.
+- [x] Use crop-mode final order: local rows first, then global rows/newlines, then separator.
+- [x] Use non-crop/multi-page order: each global page rows/newlines plus separator in page order.
+- [x] Return final formatted visual features to the public image generation path.
+- [ ] Keep all vision temporary storage in bounded/reusable arenas instead of ad-hoc heap allocation where possible.
+- [ ] Add clearer runtime diagnostics that name the failed vision stage: SAM patch, SAM transformer, SAM neck, CLIP, projector, or formatter.
+- [ ] Profile first real run and remove obvious serial CPU/GPU synchronization points that make image encoding unusably slow.
+
+## 8. Metal decoder: prompt embeddings to generated token ids
+
+End goal: text embeddings plus formatted image features run through the fp16
+Unlimited-OCR decoder and produce greedy generated ids.
+
+- [x] Gather token embeddings from mmap-backed fp16 token embedding weights.
+- [x] Assemble prompt embeddings directly into the Metal prompt arena.
+- [x] Replace the contiguous image span with formatted visual feature rows.
+- [x] Implement fp16 RMSNorm with fp32 accumulation.
+- [x] Implement decoder attention Q/K/V/O projections.
+- [x] Implement split-half RoPE with theta `10000`.
+- [x] Implement KV cache writes for prompt and generated tokens.
+- [x] Implement full-prompt causal prefill attention.
+- [x] Implement decode attention over full prompt plus generated-ring tokens.
+- [x] Implement layer-0 dense SwiGLU MLP.
+- [x] Implement MoE router softmax and top-6 greedy expert selection.
+- [x] Implement selected routed expert execution.
+- [x] Implement shared experts and routed/shared/residual combine.
+- [x] Implement final RMSNorm and LM head.
+- [x] Implement no-repeat-ngram banning before greedy argmax.
+- [x] Stop generation on EOS id `1` or `max_new_tokens`.
+- [x] Return generated ids via `uocr_result_create_from_generated()`.
+- [x] Use a generated-token ring window of `128` while keeping prompt tokens fully attendable.
+- [ ] Run the public real-image path long enough to expose and fix multi-token decode-state bugs.
+- [ ] Confirm repeated calls do not leak old KV cache, image features, or generated-token state across requests.
+- [ ] Keep CPU readbacks limited to what the current greedy/no-repeat implementation needs.
+- [ ] If generated text is empty or immediately EOS for normal OCR images, inspect prompt construction, image feature assembly, LM-head logits, and no-repeat settings in that order.
+
+## 9. Request and visual-token contract
+
+End goal: every supported Python-prepared image request has exactly the visual
+feature span expected by C/Metal before inference starts.
+
+- [x] Require BOS at token position `0`.
+- [x] Count `image_mask == 1` placeholders.
+- [x] Require one contiguous image placeholder span for image generation.
+- [x] Validate token ids are within `[0,129280)`.
+- [x] Validate global views are exactly `1024x1024`.
+- [x] Validate local views are exactly `640x640`.
+- [x] Validate base single image: one global view, `273` visual tokens.
+- [x] Validate gundam `[1,1]`: one global view, `273` visual tokens.
+- [x] Validate gundam real crop: row-major locals then global, with local visual count plus global/separator count.
+- [x] Validate multi-page base: global views in page order, `273` visual tokens per page.
+- [x] Validate prompt length plus generation length within engine and model limits.
 - [x] Validate KV budget before running vision/prefill.
-- [x] Validate no-repeat config:
-  - [x] allow zero disabled values
-  - [x] support upstream defaults `35/128` and `35/1024`
-  - [x] implement CPU no-repeat processor over the current full token sequence (`prompt + generated`) with the same sliding-window scan as upstream `LogitsProcessor`
-- [x] Build per-sequence state:
-  - [x] prompt token count
-  - [x] text ranges around the single visual span
-  - [x] image feature span range
-  - [x] max generation length
-  - [x] no-repeat state over prompt plus generated ids
-  - [x] generated token buffer
-  - [x] position counter
-  - [x] EOS status
+- [x] Build no-repeat config for upstream defaults `35/128` and `35/1024`.
+- [ ] Make request validation messages concise enough to show directly in Python exceptions.
+- [ ] Ensure high-level Python wrappers choose engine `max_prompt_tokens` and `max_gen_tokens` from the prepared request so ordinary real images are not rejected by default engine limits.
 
-## 11. Model loader and memory management
+## 10. Python decoding and result ergonomics
 
-- [x] Implement `.uocr` mmap loader in `src/core/`/`src/model/`.
-- [x] Parse header, section directory, config, tensor directory, tokenizer metadata, and provenance.
-- [x] Validate `.uocr` config against compiled Unlimited-OCR constants.
-- [x] Validate tensor payload ranges do not exceed file size.
-- [x] Keep tensor data in mmap; do not copy tensors during load.
-- [x] Build runtime tensor table mapping tensor id -> mmap offset/size/qtype/shape.
-- [x] Implement DS4-style allocation wrappers:
-  - [x] `uocr_malloc`
-  - [x] `uocr_calloc`
-  - [x] `uocr_realloc`
-  - [x] `uocr_malloc_zeroed` using `malloc + memset`, not lazy `calloc`, for large hot-state buffers
-  - [x] internal live/peak/total/failure allocation counters
-  - [x] no-allocation guard primitive for future hot-path checks
-- [x] Add allocation guard around prefill/decode hot paths.
-- [x] Implement runtime memory categories and live/peak counters:
-  - [x] model views
-  - [x] KV cache
-  - [x] prompt embeddings
-  - [x] vision scratch
-  - [x] decoder scratch
-  - [x] MoE scratch
-  - [x] logits/readback
-  - [x] transient buffers
-- [x] Add `uocr_engine_memory_report()` or log output at open and after first run.
-- [x] Implement admission control:
-  - [x] minimal request memory-budget enforcement before generation/ABI smoke path
-  - [x] resident weights estimate from `.uocr` tensor-data section and model-open budget rejection
-  - [x] KV cache estimate
-  - [x] prompt embedding estimate
-  - [x] vision scratch estimate for one-view chunk scheduling
-  - [x] decoder/MoE scratch estimate scaffold
-  - [x] logits/readback estimate
-  - [x] safety margin
-  - [x] Metal `recommendedMaxWorkingSetSize` fraction if available
-- [x] Implement KV size formula in code comments/tests:
-  - [x] `2 * 12 * 10 * 128 * 2 = 61,440 bytes/token/sequence`
-- [x] Allocate long-lived runtime arenas at engine/session creation:
-  - [x] KV cache per batch slot
-  - [x] prompt embedding buffer sized by `max_prompt_tokens`
-  - [x] hidden-state ping-pong buffers
-  - [x] router/top-k buffers
-  - [x] MoE intermediate buffers
-  - [x] vision scratch buffers
-  - [x] logits and next-token buffers
+End goal: generated ids from C turn into the same decoded text shape a user
+expects from the upstream wrapper.
 
-## 12. Metal backend skeleton and DS4 memory policy
+- [x] Store generated ids in `uocr_result` with one output sequence per request.
+- [x] Copy generated ids into NumPy arrays on the Python side before freeing `uocr_result`.
+- [x] Decode generated ids with the HF tokenizer.
+- [x] Decode with `skip_special_tokens=False` to match the current upstream-style path.
+- [x] Trim one trailing EOS marker if present.
+- [x] Strip surrounding whitespace from the decoded output.
+- [x] Return a `GenerationResult` with both `token_ids` and `text`.
+- [ ] Preserve enough metadata in `GenerationResult` for practical debugging: prompt length, generated count, stopped-on-EOS if exposed, preset, view count, visual token count.
+- [ ] Add optional printing of generated token ids for manual bring-up without requiring users to import internal helpers.
+- [ ] Keep output postprocessing out of this slice except EOS/whitespace cleanup.
 
-- [x] Implement `src/backend/metal/uocr_metal.m` with Objective-C kept at the backend boundary.
-- [x] Initialize Metal device and command queue.
-- [x] Compile `.metal` source files at runtime in development mode.
-- [x] Add pipeline cache keyed by function name; function-constant variants will extend the same key scheme when needed.
-- [x] Add backend resource lookup from `uocr_engine_opts.resource_path`.
-- [x] Implement mmap-backed model view planning, following DS4:
-  - [x] page-align view ranges to host VM page size
-  - [x] account for device `maxBufferLength`
-  - [x] create coalesced views that cover all tensor payloads
-  - [x] ensure every tensor lives wholly within one view
-  - [x] wrap views with `newBufferWithBytesNoCopy`
-  - [x] cache per-tensor `{id<MTLBuffer>, inner_offset}` after load
-- [ ] Add optional exact-range wrapper cache only if needed; default kernels should use precomputed model views.
-- [x] Add optional Metal model-view warmup hook; residency-set integration remains a future macOS 15+ hint if needed.
-- [x] Add DS4-style transient buffer tracking:
-  - [x] retain CPU-filled shared buffers until command buffer completion
-  - [x] release transients in completion handlers
-- [x] Add named scratch buffers that grow to high-water mark and are reused.
-- [x] Prefer `MTLResourceStorageModePrivate` for GPU-only scratch where possible.
-- [x] Use shared storage only for CPU-filled/readback buffers.
-- [x] Add command-buffer ownership rules and a simple synchronous path first.
-- [x] Add Metal smoke tests:
-  - [x] allocate/free scratch
-  - [x] compile kernels
-  - [x] wrap a synthetic mmap range as no-copy buffer
-  - [x] run a tiny copy/fill kernel
+## 11. Immediate implementation sequence
 
-## 13. CPU reference and diagnostic kernels
+End goal: turn the current mostly-wired code into a usable real-image OCR call.
 
-- [x] Implement CPU reference code only for correctness diagnostics; do not aim for full fast CPU inference.
-- [x] Implement scalar conversions:
-  - [x] BF16 -> F32
-  - [x] F32 -> F16
-  - [x] F16 -> F32
-- [x] Implement fp32/fp16 tensor helpers for small fixtures.
-- [x] Implement CPU RMSNorm with fp32 variance and eps `1e-6`.
-- [x] Implement Llama/DeepSeek RoPE using split-half layout, not interleaved layout.
-- [x] Implement CPU causal SDPA for tiny text-only fixtures.
-- [x] Implement CPU KV cache append/ring behavior for tiny fixtures.
-- [x] Implement CPU dense SwiGLU for layer 0.
-- [x] Implement CPU MoE router:
-  - [x] router matmul in fp32
-  - [x] softmax in fp32
-  - [x] top-6 greedy
-  - [x] no top-k renormalization
-  - [x] shared expert added after routed sum
-- [x] Implement no-repeat-ngram processor matching upstream `SlidingWindowNoRepeatNgramProcessor`.
-- [ ] Copy/adapt DS4 CPU quant dot helpers for `Q8_0` and `Q4_K` once quantization starts.
-- [x] Add CPU reference tests against Python dumped tiny tensors.
+- [x] Download full HF checkpoint to `data/hf/Unlimited-OCR`.
+- [x] Convert full checkpoint to `dist/unlimitedocr-fp16.uocr`.
+- [x] Confirm `uocr-dump dist/unlimitedocr-fp16.uocr` loads and reports valid fp16 tensor accounting.
+- [ ] Run one real image through `ocr.generate(..., preset="base", max_new_tokens=1)` with `dist/unlimitedocr-fp16.uocr`.
+- [ ] If engine open fails, fix model binding, qprofile, resource path, or memory-budget handling first.
+- [ ] If vision fails, fix the named SAM/CLIP/projector/formatter stage in the public `encode_visual_features_f16` path.
+- [ ] If prompt assembly or prefill fails, fix the decoder input span and arena setup before changing decoder math.
+- [ ] If first-token generation fails, fix final norm / LM head / argmax / no-repeat wiring.
+- [ ] Increase to `max_new_tokens=8` and fix decode-loop state issues.
+- [ ] Increase to `max_gen_tokens=128` through `ocr_image()` and fix performance or memory issues that block useful text output.
+- [ ] Run the same public wrapper with `preset="gundam"` on a normal document-like image.
+- [ ] Run a multi-page `ocr_pages()` request if single-image base/gundam are stable.
+- [ ] Add default model lookup and a minimal CLI only after direct Python function calls work.
 
-## 14. Metal fp16 decoder bring-up
+## 12. Known implementation risks to resolve in this slice
 
-### 14.1 Text embedding and prompt assembly
+End goal: prevent likely real-use failures from becoming hidden side quests.
 
-- [x] Adapt DS4 `metal/get_rows.metal` for token embedding gather.
-- [x] Support fp16 embedding weights and fp16/fp32 output activations.
-- [x] Implement direct prompt embedding assembly:
-  - [x] write text token embeddings from token ids
-  - [x] write image features into image spans when provided
-  - [x] avoid emulating Python `masked_scatter_`
-- [x] Add a text-only path where no image features are present.
-- [x] Bind mmap-backed token embeddings for production prompt assembly.
-- [x] Write mapped prompt embeddings into the persistent Metal prompt arena.
-- [x] Compare prompt embeddings against Python dumps.
+- [ ] **Memory pressure:** fp16 weights plus KV/vision/decoder scratch may exceed default Metal budget on smaller machines.  Prefer clear errors and smaller generation defaults over silent failure.
+- [ ] **First-run latency:** runtime Metal compilation plus model mapping plus vision may be slow.  Keep it acceptable for manual use before optimizing deeply.
+- [ ] **Per-call vision allocation:** current public vision path should be hardened so large crop grids do not repeatedly allocate/free large CPU buffers.
+- [ ] **Repeated generation:** persistent arenas and KV state must be reset or overwritten deterministically between calls.
+- [ ] **Long generation:** multi-token decode must preserve position ids, ring indexing, no-repeat history, and generated token embeddings correctly.
+- [ ] **Prompt/image span mismatch:** image placeholders, final visual-feature rows, and prompt assembly must agree for base, gundam, and pages.
+- [ ] **Immediate EOS/empty text:** if real images generate EOS immediately, inspect input prompt, image feature values/order, logits, and no-repeat banning before changing sampling behavior.
+- [ ] **User-facing errors:** Python exceptions should include the native detail and the remedial action when obvious.
 
-### 14.2 Decoder layer primitives
+## 13. Explicitly deferred until fp16 image-to-text works
 
-- [x] Adapt DS4 `metal/norm.metal` or write OCR-specific RMSNorm for hidden `1280`.
-- [x] Ensure RMSNorm variance accumulation is fp32.
-- [x] Implement fp16 dense matrix-vector and matrix-matrix kernels for `[out,in]` row-major weights.
-- [x] Implement attention Q/K/V/O projections for hidden `1280`.
-- [x] Adapt gradients.c `qkv_split_rope` logic:
-  - [x] split-half RoPE layout
-  - [x] head dim `128`
-  - [x] heads `10`
-  - [x] position ids monotonically increasing
-  - [x] theta `10000`
-- [x] Implement KV cache write kernel.
-- [x] Allocate KV cache layout:
-  - [x] K: `[layer][slot][max_prompt_tokens + 128][10][128]` fp16
-  - [x] V: `[layer][slot][max_prompt_tokens + 128][10][128]` fp16
-  - [x] per sequence, ring slots start at actual `prefill_len`, not at `max_prompt_tokens`
-  - [x] attention length uses actual prompt tokens plus live generated-ring tokens; unused prompt capacity is never attended
-- [x] Implement prompt prefill attention over full prompt with causal mask.
-- [x] Adapt gradients.c `sdpa_varlen` for prefill where useful.
-- [x] Implement decode attention for one token attending to full prompt plus generated ring.
-- [x] Adapt gradients.c `sdpa_decode` window/prefix logic to OCR's rule: prompt always attendable, generated ring size `128`.
-- [x] Implement attention output projection and residual add.
+End goal: avoid diluting the E2E fp16 work.
 
-### 14.3 MLP and MoE
-
-- [x] Implement layer-0 dense SwiGLU:
-  - [x] `gate_proj`
-  - [x] `up_proj`
-  - [x] SiLU activation from DeepSeekV2Config default `hidden_act="silu"`; assert this at model load
-  - [x] elementwise multiply
-  - [x] `down_proj`
-- [x] Implement MoE router for layers `1..11`:
-  - [x] fp16 router weight storage, fp32 matmul accumulation
-  - [x] softmax over `64` experts in fp32
-  - [x] top-6 selection; order can differ because weighted sum is commutative
-  - [x] multiply selected probabilities by `routed_scaling_factor=1.0`
-  - [x] no probability renormalization (`norm_topk_prob=false`)
-  - [x] no DS4 router-specific sqrt/softplus/bias behavior
-- [x] Adapt DS4 `argsort.metal` / `dsv4_misc.metal` top-k patterns for OCR's simpler top-6.
-- [x] Implement selected-expert fp16 path for decode.
-- [x] Implement token-batched expert-major routed-expert path for prefill; true group-by-expert optimization can follow after parity.
-- [x] Implement shared experts for every MoE layer with intermediate `1792`.
-- [x] Add routed expert result + shared expert result.
-
-### 14.4 LM head and generation loop
-
-- [x] Implement final RMSNorm.
-- [x] Implement fp16 LM head matvec to vocab `129280` with fp32 logits.
-- [x] Implement greedy argmax.
-- [x] Implement no-repeat-ngram banning before argmax:
-  - [x] CPU version first using logits readback if needed
-  - [x] later GPU version for speed
-- [x] Stop on EOS id `1` or max new tokens.
-- [x] Return generated token ids from the diagnostic/parity selection helper.
-- [x] Wire final RMSNorm, LM head, no-repeat bans, greedy argmax, and EOS handoff in a Metal next-token selection helper.
-- [x] Add text-only fp16 parity test:
-  - [x] prompt embeddings
-  - [x] layer-0 dense decoder output
-  - [x] layer-1 MoE decoder output
-  - [x] remaining layers 2..11 MoE outputs
-  - [x] logits top-k
-  - [x] generated token ids
-
-### 14.5 Integrated public text decoder path
-
-These tasks turn the fp16 decoder primitives/parity helpers into the first real `uocr_generate_prepared()` generation path. Keep the scope narrow: Metal only, fp16 only, single request, text-only, no vision, no batching.
-
-- [x] Define an internal decoder orchestration boundary, e.g. `uocr_metal_context_generate_text_f16()` or equivalent, that owns prefill/decode scheduling instead of exposing another per-op diagnostic helper.
-- [x] Build and validate a decoder tensor-binding table from stable tensor ids once per mapped model; fail early if any text decoder tensor is missing, not fp16, or has an unexpected shape.
-- [x] Assemble text-only prompt embeddings into the persistent prompt arena for slot `0`.
-- [x] Run full-prompt prefill through all 12 decoder layers, writing prompt K/V for every layer and carrying hidden-state ping-pong buffers in Metal arenas.
-- [x] Run decode steps from the last accepted token, writing generated K/V into the 128-token ring and attending to all prompt tokens plus live generated ring tokens.
-- [x] Maintain a preallocated generated-token buffer and prompt+generated no-repeat state; no allocation is allowed inside the per-token loop after initial bring-up.
-- [x] Stop on EOS id `1` or `max_new_tokens` and return generated ids through `uocr_result_create_from_generated()`.
-- [x] Wire only this narrow path into `uocr_generate_prepared()`; keep CPU-ref and unsupported Metal cases returning clear `UOCR_ERROR_NOT_IMPLEMENTED` messages.
-- [x] Add opt-in full-model text-only generated-id parity against Python fixtures.
-
-## 15. Decoder with Python-dumped image embeddings
-
-- [x] Add a C/Metal test mode accepting precomputed projected visual embeddings from Python fixtures.
-- [x] Bypass C vision encoder in this mode.
-- [x] Assemble prompt embeddings with direct spans:
-  - [x] text embeddings before image
-  - [x] dumped visual embeddings
-  - [x] text embeddings after image
-- [x] Validate image placeholder count against dumped visual feature length.
-- [x] Run full decoder prefill/decode with dumped image embeddings.
-- [ ] Compare against Python:
-  - [x] final prompt embeddings
-  - [x] per-layer hidden states
-  - [x] router top-6 agreement
-  - [x] logits
-  - [x] generated ids/text
-- [x] Keep this mode available permanently as a parity/debug path even after Metal vision exists.
-
-### 15.1 Integrated dumped-embedding generation path
-
-Do this immediately after section 14.5 and before porting SAM/CLIP. The goal is to prove the real decoder/generation loop works for image prompts while vision is still bypassed.
-
-- [x] Add an internal/test-only request adapter that supplies preformatted fp16 visual feature rows `[image_tokens,1280]` alongside a normal prepared image request.
-- [x] Reuse the integrated text decoder runner after prompt assembly; do not maintain a separate image-specific decoder loop.
-- [x] Assemble text tokens plus dumped visual rows into the same prompt arena layout that future Metal vision will produce.
-- [x] Validate image span length equals dumped visual feature rows and that the prepared request's view/crop metadata still passes normal validation.
-- [x] Run prefill/decode/generation through the integrated decoder for dumped image embeddings.
-- [x] Compare generated ids/text against Python dumped-image fixtures; logits/top-k and router checks remain mandatory diagnostics when generated ids drift.
-- [x] Keep this path as a permanent opt-in parity mode after Metal vision lands.
-
-## 16. Metal fp16 vision encoder
-
-Status note: this section contains many checked **kernel/helper** items, but Gate E2E-0 is still open until public image smoke/parity tests prove generated ids from real pixels. The public Metal path is now wired through vision and the integrated decoder; next work is opt-in full-model smoke and parity coverage, not more isolated kernels.
-
-Do not resume quantization, batching, CUDA, or high-level OCR/PDF/postprocess API work until section 16.0 passes. Vision must replace dumped visual embeddings in the same integrated decoder path, not introduce a second decoder/generation loop.
-
-### 16.0 Production public image-OCR integration (current priority)
-
-- [x] Build/cache production vision tensor bindings from stable tensor ids/names for SAM, CLIP, projector, `IMAGE_NEWLINE`, and `VIEW_SEPARATOR`.
-- [x] Add a narrow Metal vision runner API, e.g. `uocr_metal_context_encode_visual_features_f16()`, that takes a validated `uocr_prepared_request`, a chunk limit, and a preallocated output buffer.
-- [x] Feed public `uocr_image_view` pixels (`F16_NCHW` and `F32_NCHW`) through SAM -> CLIP -> projector chunk-by-chunk, reusing vision scratch and avoiding full-model or full-view persistent copies.
-- [x] Call `uocr_process_vision_chunks_f16()` or equivalent formatting to produce final visual features in the required order: local rows first, then global rows/newlines, then separator.
-- [x] Compute the contiguous image span from `image_mask`; validate span length equals formatted visual-feature rows before decoder prefill.
-- [x] Wire public `uocr_generate_prepared()` Metal fp16 image case for `n_requests=1`, `max_new_tokens>0`, and fp16 `.uocr`; pass `image_span_start`, `image_span_length`, and `image_features_f16` into the existing integrated decoder.
-- [x] Add opt-in full-model public image smoke test that returns valid generated ids from real image pixels.
-- [x] Add parity tests for final visual features and first generated ids/text against Python/HF dumps.
-- [x] Extend the public image smoke from one base/global image to gundam `[1,1]`, gundam real multi-crop, and multi-page base mode.
-
-### 16.1 Vision scheduling and memory
-
-- [x] Implement view-chunk scheduling so crop mode does not force all local views through vision at once.
-- [x] Process local crops in chunks, append projected features into final visual feature buffer, and reuse SAM/CLIP scratch.
-- [x] Support one global `1024x1024` view and zero or more local `640x640` views.
-- [x] Add vision memory estimates to admission control.
-
-### 16.2 SAM-like encoder
-
-- [x] Implement SAM patch embed conv:
-  - [x] weight shape `[768,3,16,16]`
-  - [x] stride `16`
-  - [x] output grid `64x64` for `1024`, `40x40` for `640`
-  - [x] layout conversion to BHWC as upstream does
-- [x] Add SAM absolute position embedding:
-  - [x] use `get_abs_pos_sam` bicubic interpolation semantics
-  - [x] precompute/store common `64x64` and `40x40` tables in converter if practical (not practical for the current v1 `.uocr` writer; runtime Metal interpolation is used until derived tensors are added)
-- [x] Implement SAM transformer blocks `0..11`:
-  - [x] LayerNorm eps `1e-6`
-  - [x] QKV linear with bias
-  - [x] window attention size `14` for non-global blocks
-  - [x] global attention for blocks `[2,5,8,11]`
-  - [x] decomposed relative position bias from `rel_pos_h` and `rel_pos_w`
-  - [x] GELU MLP with `mlp_ratio=4`
-  - [x] residual connections
-- [x] Implement window partition/unpartition with padding exactly like upstream.
-- [x] Implement SAM neck/net:
-  - [x] `1x1` conv `768 -> 256`, no bias
-  - [x] `LayerNorm2d(256, eps=1e-6)`
-  - [x] `3x3` conv `256 -> 256`, padding `1`, no bias
-  - [x] `LayerNorm2d(256, eps=1e-6)`
-  - [x] `net_2`: `3x3` stride-2 `256 -> 512`, padding `1`
-  - [x] `net_3`: `3x3` stride-2 `512 -> 1024`, padding `1`
-- [x] Validate SAM output against Python dumps for `1024` and `640` views.
-
-### 16.3 CLIP-like encoder
-
-- [x] Implement CLIP embeddings using SAM output as `patch_embeds`; do not use raw-pixel patch embedding in the normal path.
-- [x] Treat `vision_model.embeddings.patch_embedding.*` as unused in normal OCR inference unless a later parity test proves an alternate path needs it.
-- [x] Flatten SAM features to token sequence and prepend class embedding.
-- [x] Add CLIP absolute position embedding using upstream bicubic interpolation with antialias and `align_corners=False`.
-- [x] Support token lengths:
-  - [x] `257` for `16x16 + CLS`
-  - [x] `101` for `10x10 + CLS`
-- [x] Implement pre-LayerNorm eps `1e-5`.
-- [x] Implement 24 CLIP transformer blocks:
-  - [x] LayerNorm eps `1e-5`
-  - [x] QKV projection `[3072,1024]` with bias
-  - [x] full attention, 16 heads, head dim `64`
-  - [x] output projection
-  - [x] QuickGELU: `x * sigmoid(1.702*x)`
-  - [x] MLP `1024 -> 4096 -> 1024`
-  - [x] residual connections
-- [x] Validate CLIP output against Python dumps.
-
-### 16.4 Projector and visual feature formatting
-
-- [x] Concatenate CLIP token features without CLS and SAM feature-map tokens: `1024 + 1024 = 2048`.
-- [x] Implement linear projector `2048 -> 1280` with bias.
-- [x] Validate projected features against Python dumps.
-- [x] Format global view features:
-  - [x] reshape to grid `16x16` for `1024`
-  - [x] append `image_newline` after each row -> `272` tokens
-  - [x] append `view_seperator` -> `273` tokens
-- [x] Format local crop features:
-  - [x] each local `640` crop produces `10x10`
-  - [x] reshape local crops as upstream: `view(height_crop_num, width_crop_num, h2, w2, dim).permute(0,2,1,3,4)`
-  - [x] append newline after each stitched local row
-- [x] Crop-mode final feature order must be local features first, then global row/newline features, then separator.
-- [x] Non-crop/multi-page final feature order must be per-image global row/newline features plus separator.
-- [x] Validate final visual feature buffer length and values against Python dumps.
-
-## 17. Dynamic q8/q4 converter and kernels
-
-Paused until Gate E2E-0. Existing completed q8 converter/helper items are retained, but the next unchecked item in this section must not be picked before public fp16 image OCR works.
-
-### 17.1 Quantization foundations
-
-- [x] Vendor/adapt DS4 `data/ds4/gguf-tools/quants.[ch]` into `src/quant/` with attribution/license notes.
-- [x] Keep only needed initial formats:
-  - [x] `Q8_0`, block size `32`, type size `34`
-  - [x] `Q4_K`, block size `256`, type size `144`
-- [x] Keep `Q2_K` and `IQ2_XXS` code disabled or behind later experimental flags.
-- [x] Implement qtype row-size helpers and alignment validation.
-- [x] Add quantized tensor metadata to `.uocr` with logical and physical widths.
-
-### 17.2 `dyn-q8` profile
-
-- [x] Implement qtype policy for `dyn-q8`:
-  - [x] large decoder linears -> `Q8_0`
-  - [x] LM head -> `Q8_0`
-  - [x] token embedding -> `Q8_0` or fp16 if embedding parity drifts; q8 embedding gather needs a dequantizing get-rows kernel
-  - [x] vision conv/linear weights -> `Q8_0`
-  - [x] MoE router weights -> fp16
-  - [x] norms/biases/position/newline/separator -> fp16
-- [x] Add converter dry-run qtype histogram and memory estimate.
-- [x] Emit q8 `.uocr`.
-- [x] Add CPU dequant/dot tests for q8 tensors.
-- [x] Add Metal tests for Q8_0 get-rows/dequant because token embeddings and possibly LM-head-adjacent paths need it.
-
-### 17.3 `dyn-q4` profile
-
-- [x] Implement conservative q4 policy:
-  - [x] attention projections `1280` inner dim -> `Q4_K` candidates
-  - [x] routed expert `gate_proj/up_proj` inner dim `1280` -> `Q4_K` candidates
-  - [x] routed expert `down_proj` inner dim `896` -> keep `Q8_0` initially
-  - [x] dense layer-0 `down_proj` inner dim `6848` -> keep `Q8_0` initially
-  - [x] shared expert down inner dim `1792` -> `Q4_K` candidate after q8 parity
-  - [x] LM head -> keep `Q8_0` initially
-  - [x] vision -> keep `Q8_0` initially, selective q4 later
-- [x] Add `PADDED_Q4_K` design but do not enable by default:
-  - [x] physical width rounded to multiple of `256`
-  - [x] activation zero-fill/padding in kernels
-  - [x] logical width retained for output correctness
-- [x] Add promotion metadata with reasons: sensitive, unaligned, calibration drift, manual override.
-
-### 17.4 Metal quantized kernels
-
-- [x] Adapt DS4 `metal/dense.metal` Q8_0 matvec for OCR shapes.
-- [x] Add Q8_0 linear kernels for decode and prefill.
-- [x] Adapt DS4 Q8_0 shared gate/up SwiGLU pattern for OCR shared experts if helpful.
-- [x] Adapt DS4 `metal/moe.metal` Q4_K selected-expert kernels for OCR routed experts.
-- [x] Ensure OCR MoE routing math stays OCR-specific; do not import DS4 router softplus/sqrt/scaling behavior.
-- [x] Implement q8 fallback path for unaligned down projections.
-- [x] Add optional padded q4 kernels only after q8/q4 baseline is correct.
-- [x] Compare q8/q4 layer drift against fp16 golden dumps.
-
-## 18. Calibration and dynamic promotion loop
-
-- [ ] Build a representative OCR calibration corpus:
-  - [ ] small scanned document
-  - [ ] dense text page
-  - [ ] table/form page
-  - [ ] multilingual/CJK page
-  - [ ] flyer/graphic-heavy image
-  - [ ] multi-page PDF subset
-  - [ ] crop-mode high aspect-ratio image
-- [x] Add `tools/uocr-calibrate` to run fp16 and candidate quantized models over fixtures.
-- [ ] Add optional DS4-style activation-importance collection for routed experts:
-  - [ ] for routed `gate_proj`/`up_proj`, accumulate squared FFN-normalized input columns per expert
-  - [ ] for routed `down_proj`, accumulate squared routed SwiGLU/down-input columns after route weighting
-  - [ ] pack per-expert vectors into calibration metadata so the quantizer can slice `[expert][column]`
-  - [ ] use weight-energy fallback only when no activation corpus is available
-- [ ] Record metrics:
-  - [ ] tensor/module RMSE
-  - [ ] tensor/module cosine similarity
-  - [x] per-layer hidden-state drift
-  - [x] router top-6 agreement
-  - [x] selected expert frequency
-  - [x] logits KL/top-k agreement
-  - [x] generated token id agreement or longest common prefix
-  - [ ] decoded markdown/layout agreement
-- [ ] Add per-expert/per-projection error and traffic stats.
-- [ ] Implement monotonic promotion:
-  - [ ] `q4 -> q8`
-  - [ ] `q8 -> fp16`
-  - [ ] never demote automatically in the same calibration pass
-- [ ] Persist calibration results/provenance into `.uocr`.
-- [ ] Add manual override file support for qtype decisions.
-
-## 19. Batching and scheduler
-
-- [ ] Implement single-request path first.
-- [ ] Implement static batch with same preset and bounded prompt lengths.
-- [ ] Allocate per-slot KV caches up front.
-- [ ] Add packed prefill data structures:
-  - [ ] sequence offsets
-  - [ ] per-sequence prompt lengths
-  - [ ] per-sequence image feature ranges
-  - [ ] slot map
-- [ ] Extend SDPA prefill to variable-length packed prompts.
-- [ ] Implement decode active-sequence compaction:
-  - [ ] skip completed EOS sequences
-  - [ ] keep per-sequence position counters
-  - [ ] keep per-sequence ring positions
-- [ ] Add MoE batching progression:
-  - [ ] selected-expert matvec per token first
-  - [ ] group `(sequence, token, expert)` pairs by expert for larger batches later
-  - [ ] expert-major batched matmul after correctness
-- [ ] Add admission control for batches before running vision.
-- [ ] Add continuous batching only after static/variable batching is stable.
-
-## 20. Python end-to-end API
-
-Do not start the stable high-level OCR/PDF API until Gate E2E-0 passes: public fp16 Metal image generation returns ids for real image views. A thin `ctypes` `Engine` already exists and may be used for smoke tests; stable ergonomics come after the native image pipeline works.
-
-- [x] Provide temporary `src/unlimitedocr_c/ffi.py::Engine.generate_prepared()` returning generated token ids for currently supported public paths.
-- [ ] Decide whether to keep the existing `src/unlimitedocr_c/ffi.py::Engine` as the public engine or move/wrap it in `python/unlimitedocr_c/engine.py` during packaging cleanup.
-- [x] Implement high-level `ocr.generate(image, prompt, preset=...)`:
-  - [x] build prepared request
-  - [x] call C engine
-  - [x] decode returned token ids with HF tokenizer
-  - [x] strip trailing EOS text if present
-- [x] Implement `ocr_image()` matching local wrapper defaults:
-  - [x] prompt `"<image>document parsing."`
-  - [x] gundam preset default
-  - [x] upstream-style `max_length=32768` converted to C `max_new_tokens = max_length - prompt_tokens`, capped by engine limit
-  - [x] `no_repeat_ngram_size=35`
-  - [x] `ngram_window=128`
-- [x] Implement `ocr_pages()` matching upstream multi-page defaults:
-  - [x] prompt `"<image>Multi page parsing."`
-  - [x] base mode
-  - [x] upstream-style `max_length=32768` converted to C `max_new_tokens = max_length - prompt_tokens`, capped by engine limit
-  - [x] `ngram_window=1024`
-- [x] Implement `ocr_pdf()` using PyMuPDF in Python, not C.
-- [ ] Port useful postprocessing from `/Users/mascit/Downloads/ocrbaidu/src/ocrbaidu/postprocess.py`:
-  - [ ] `parse_regions`
-  - [ ] `clean_lines`
-  - [ ] `merge_lines`
-- [ ] Keep offer/flyer two-stage recovery as a Python-only convenience path after one-pass OCR works.
-- [ ] Add a simple CLI using the Python API, not the C frontend.
-
-## 21. Test and parity gates
-
-- [ ] Add fast always-on tests:
-  - [x] tokenizer metadata validation
-  - [x] prompt construction
-  - [x] visual token count formulas
-  - [x] image preprocessing against upstream for tiny fixtures
-  - [x] `.uocr` synthetic loader/dumper
-  - [x] prepared-request validation
-  - [ ] no-repeat-ngram processor
-  - [x] KV ring index arithmetic
-- [ ] Add native CTest tests:
-  - [x] endian/alignment parsing
-  - [x] tensor directory range validation
-  - [x] qtype row-size math
-  - [x] tensor id lookup
-  - [x] allocation wrapper accounting/overflow/guard tests
-  - [x] runtime memory accounting and KV formula tests
-  - [x] CPU reference tiny ops
-- [ ] Add Metal tests that do not need full model weights:
-  - [x] compile all kernels
-  - [x] run RMSNorm on synthetic tensor
-  - [x] run get_rows on synthetic embedding table
-  - [x] run small RoPE kernel
-  - [x] run small SDPA prefill/decode kernel
-  - [x] run q8/q4 dot kernels once implemented
-- [x] Add opt-in full-model tests guarded by env vars:
-  - [x] `UOCR_MODEL_PATH`
-  - [x] `UOCR_HF_DIR`
-  - [x] `UOCR_RUN_LARGE_TESTS=1`
-- [ ] Add opt-in integrated fp16 generation tests:
-  - [x] public `uocr_generate_prepared()` text-only generated ids match Python fixture
-  - [x] integrated dumped-visual-embedding generated ids/text match Python fixture
-  - [x] public `uocr_generate_prepared()` image path with real views returns valid generated ids on fp16 Metal
-  - [ ] public image generated ids/text match Python fixture for at least one base/global image
-  - [x] unsupported public paths still return clear `UOCR_ERROR_NOT_IMPLEMENTED` messages
-  - [x] no-allocation guard passes around the decode token loop
-- [x] Define fp16 parity thresholds per stage:
-  - [x] prompt embeddings: near exact within dtype tolerance
-  - [x] vision projected features: small absolute/relative tolerance after fp16 conversion
-  - [x] router top-6: exact ids for fp16 baseline
-  - [x] logits: top-k agreement and bounded max error
-  - [x] generated ids: exact for deterministic greedy smoke fixtures where possible
-- [x] Define q8/q4 parity thresholds separately:
-  - [x] router top-6 agreement must remain high because router itself is fp16
-  - [x] logits top-k/KL within calibrated thresholds
-  - [x] generated OCR text/layout stable on calibration set
-- [x] Add perf smoke tests:
-  - [x] model open time
-  - [x] first-token latency after warmup
-  - [x] decode tokens/sec single request
-  - [x] peak memory report
-- [x] Keep large conversion and full inference tests manual/opt-in until weights are available locally.
-
-## 22. Documentation and developer workflow
-
-- [ ] Keep `docs/foundations.md` updated when source facts change.
-- [ ] Keep `docs/architecture.md` updated when API/build/memory decisions change.
-- [ ] Keep this implementation plan updated as tasks complete or split.
-- [ ] Add `README.md` development commands:
-  - [ ] `uv sync --extra dev`
-  - [ ] CMake configure/build commands
-  - [ ] CTest command
-  - [ ] Python pytest command
-  - [ ] converter command examples
-  - [ ] Python API examples
-- [ ] Document full-weight download/conversion requirement once the actual safetensors file is available.
-- [ ] Document memory estimates for fp16/q8/q4 and KV cache.
-- [ ] Document known unsupported v1 features:
-  - [ ] native C tokenizer/image loader
-  - [ ] CUDA backend
-  - [ ] continuous batching
-- [ ] Add comments near inference code explaining non-obvious shape/order/cache choices, following DS4's quality rules.
-
-## 23. Later / explicitly deferred work
-
-- [ ] Add `scikit-build-core` packaging after C ABI/resource layout stabilizes.
-- [ ] Bundle `libunlimitedocr.dylib/.so` and Metal resources inside Python wheels.
-- [ ] Add release-path `.metallib` precompilation and fallback to source compilation.
-- [ ] Add native C tokenizer by adapting DS4's JoyAI/DeepSeek byte-level BPE only if a standalone C CLI is required.
-- [ ] Add native image loading/preprocessing only if a standalone C CLI is required.
-- [ ] Add CUDA backend after Metal fp16 and quantized paths are stable.
-- [ ] Consider experimental `Q2_K` / `IQ2_XXS` routed-expert quantization after dynamic q4 is robust.
-- [ ] Consider server/OpenAI-compatible API only after the Python API is stable.
+- [ ] q8 public inference and q8 parity work.
+- [ ] q4 public inference, q4 calibration, and promotion policies.
+- [ ] Static or continuous batching.
+- [ ] CUDA backend.
+- [ ] Native C tokenizer or native C image loader.
+- [ ] Rich OCR postprocessing, layout recovery, and offer/flyer multi-stage flows.
+- [ ] Wheel packaging and bundled Metal resources.
+- [ ] Server APIs.
+- [ ] Additional automated test infrastructure or new parity fixture generation.
