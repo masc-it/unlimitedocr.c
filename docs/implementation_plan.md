@@ -114,7 +114,7 @@ Implementation status:
 - [x] Size final visual features from actual visual rows and hidden size, not prompt token capacity.
 - [x] Size vision workspace from actual view shape and chunk size.
 - [x] Include vision workspace high-water marks in `uocr_engine_memory_report()`.
-- [ ] Update OOM diagnostics to show requested views, visual rows, workspace bytes, and configured budget.
+- [x] Update OOM diagnostics to show requested views, visual rows, workspace bytes, and configured budget.
 - [ ] Verify memory reports against measured allocations before and after the GPU-resident vision rewrite.
 
 ## 3. Optimize decoder token compute beyond LM head

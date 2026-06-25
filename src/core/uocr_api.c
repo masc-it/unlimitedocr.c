@@ -92,6 +92,19 @@ static void clear_engine_error(uocr_engine *engine) {
     set_global_error_text("OK");
 }
 
+typedef struct uocr_admission_request_shape {
+    uint32_t request_count;
+    uint64_t requested_views;
+    uint32_t prompt_tokens;
+    uint32_t visual_rows;
+    uint32_t max_chunk_projected_rows;
+    uint32_t max_view_size;
+} uocr_admission_request_shape;
+
+static uint64_t saturated_add_u64(uint64_t a, uint64_t b) {
+    return UINT64_MAX - a < b ? UINT64_MAX : a + b;
+}
+
 static void copy_estimate_to_report(const uocr_runtime_memory_estimate *estimate, uocr_memory_report *report) {
     report->estimated_model_views_bytes = estimate->model_views_bytes;
     report->estimated_kv_cache_bytes = estimate->kv_cache_bytes;
@@ -108,10 +121,11 @@ static void copy_estimate_to_report(const uocr_runtime_memory_estimate *estimate
     report->estimated_total_bytes = estimate->total_bytes;
 }
 
-static int set_admission_error(uocr_engine *engine,
-                               const char *scope,
-                               const uocr_runtime_memory_estimate *estimate,
-                               uint64_t budget_bytes) {
+static int set_admission_error_with_shape(uocr_engine *engine,
+                                           const char *scope,
+                                           const uocr_runtime_memory_estimate *estimate,
+                                           uint64_t budget_bytes,
+                                           const uocr_admission_request_shape *shape) {
     if (scope == NULL || scope[0] == '\0') {
         scope = "request";
     }
@@ -122,13 +136,50 @@ static int set_admission_error(uocr_engine *engine,
                                  scope,
                                  (unsigned long long)budget_bytes);
     }
+    const uint64_t vision_workspace_bytes = saturated_add_u64(estimate->vision_gpu_workspace_bytes,
+                                                              estimate->vision_final_features_bytes);
+    if (shape != NULL) {
+        return set_engine_errorf(engine,
+                                 UOCR_ERROR_OUT_OF_MEMORY,
+                                 "%s admission rejected: memory estimate %llu bytes exceeds budget %llu bytes "
+                                 "(configured_budget=%llu requests=%u requested_views=%llu prompt_tokens=%u visual_rows=%u "
+                                 "max_view_size=%u max_chunk_projected_rows=%u vision_workspace=%llu "
+                                 "vision=%llu vision_gpu_workspace=%llu vision_final_features=%llu vision_host_staging=%llu "
+                                 "model=%llu kv=%llu prompt=%llu decoder=%llu moe=%llu logits=%llu transient=%llu safety=%llu)",
+                                 scope,
+                                 (unsigned long long)estimate->total_bytes,
+                                 (unsigned long long)budget_bytes,
+                                 (unsigned long long)budget_bytes,
+                                 shape->request_count,
+                                 (unsigned long long)shape->requested_views,
+                                 shape->prompt_tokens,
+                                 shape->visual_rows,
+                                 shape->max_view_size,
+                                 shape->max_chunk_projected_rows,
+                                 (unsigned long long)vision_workspace_bytes,
+                                 (unsigned long long)estimate->vision_scratch_bytes,
+                                 (unsigned long long)estimate->vision_gpu_workspace_bytes,
+                                 (unsigned long long)estimate->vision_final_features_bytes,
+                                 (unsigned long long)estimate->vision_host_staging_bytes,
+                                 (unsigned long long)estimate->model_views_bytes,
+                                 (unsigned long long)estimate->kv_cache_bytes,
+                                 (unsigned long long)estimate->prompt_embeddings_bytes,
+                                 (unsigned long long)estimate->decoder_scratch_bytes,
+                                 (unsigned long long)estimate->moe_scratch_bytes,
+                                 (unsigned long long)estimate->logits_readback_bytes,
+                                 (unsigned long long)estimate->transient_bytes,
+                                 (unsigned long long)estimate->safety_margin_bytes);
+    }
     return set_engine_errorf(engine,
                              UOCR_ERROR_OUT_OF_MEMORY,
                              "%s admission rejected: memory estimate %llu bytes exceeds budget %llu bytes "
-                             "(model=%llu kv=%llu prompt=%llu vision=%llu vision_gpu_workspace=%llu vision_final_features=%llu vision_host_staging=%llu decoder=%llu moe=%llu logits=%llu transient=%llu safety=%llu)",
+                             "(configured_budget=%llu vision_workspace=%llu model=%llu kv=%llu prompt=%llu vision=%llu "
+                             "vision_gpu_workspace=%llu vision_final_features=%llu vision_host_staging=%llu decoder=%llu moe=%llu logits=%llu transient=%llu safety=%llu)",
                              scope,
                              (unsigned long long)estimate->total_bytes,
                              (unsigned long long)budget_bytes,
+                             (unsigned long long)budget_bytes,
+                             (unsigned long long)vision_workspace_bytes,
                              (unsigned long long)estimate->model_views_bytes,
                              (unsigned long long)estimate->kv_cache_bytes,
                              (unsigned long long)estimate->prompt_embeddings_bytes,
@@ -141,6 +192,13 @@ static int set_admission_error(uocr_engine *engine,
                              (unsigned long long)estimate->logits_readback_bytes,
                              (unsigned long long)estimate->transient_bytes,
                              (unsigned long long)estimate->safety_margin_bytes);
+}
+
+static int set_admission_error(uocr_engine *engine,
+                               const char *scope,
+                               const uocr_runtime_memory_estimate *estimate,
+                               uint64_t budget_bytes) {
+    return set_admission_error_with_shape(engine, scope, estimate, budget_bytes, NULL);
 }
 
 static uint64_t model_tensor_data_bytes(const uocr_model_file *model) {
@@ -796,6 +854,7 @@ int uocr_generate_prepared(uocr_engine *engine,
     uint32_t max_visual_tokens_in_batch = 0u;
     uint32_t max_vision_chunk_projected_rows = 0u;
     uint32_t max_vision_view_size = 0u;
+    uint64_t requested_views_in_batch = 0u;
     int any_generation_requested = 0;
     const uint64_t validation_start_ns = uocr_profile_now_ns();
     for (uint32_t i = 0u; i < n_requests; ++i) {
@@ -822,6 +881,7 @@ int uocr_generate_prepared(uocr_engine *engine,
         if (vision_status != UOCR_OK) {
             return set_engine_errorf(engine, vision_status, "request %u vision scheduling failed: %s", i, validation_error);
         }
+        requested_views_in_batch += (uint64_t)requests[i].n_views;
         if (vision_schedule.final_visual_tokens > max_visual_tokens_in_batch) {
             max_visual_tokens_in_batch = vision_schedule.final_visual_tokens;
         }
@@ -861,7 +921,19 @@ int uocr_generate_prepared(uocr_engine *engine,
     engine->last_estimate = request_estimate;
     uocr_profile_add_event_now(&engine->profile, "request.memory_estimate", estimate_start_ns);
     if (engine->memory_budget_bytes != 0u && request_estimate.total_bytes > engine->memory_budget_bytes) {
-        return set_admission_error(engine, "request", &request_estimate, engine->memory_budget_bytes);
+        uocr_admission_request_shape request_shape;
+        memset(&request_shape, 0, sizeof(request_shape));
+        request_shape.request_count = n_requests;
+        request_shape.requested_views = requested_views_in_batch;
+        request_shape.prompt_tokens = max_prompt_tokens_in_batch;
+        request_shape.visual_rows = max_visual_tokens_in_batch;
+        request_shape.max_chunk_projected_rows = max_vision_chunk_projected_rows;
+        request_shape.max_view_size = max_vision_view_size;
+        return set_admission_error_with_shape(engine,
+                                              "request",
+                                              &request_estimate,
+                                              engine->memory_budget_bytes,
+                                              &request_shape);
     }
 
     if (any_generation_requested) {
