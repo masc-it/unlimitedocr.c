@@ -241,6 +241,7 @@ struct uocr_metal_context {
     NSMutableDictionary<NSString *, id<MTLComputePipelineState>> *pipeline_cache;
     NSMutableDictionary<NSString *, id> *mps_descriptor_cache;
     NSMutableDictionary<NSString *, id> *mps_weight_ndarray_cache;
+    NSMutableDictionary<NSString *, id> *mps_workspace_ndarray_cache;
     NSMutableArray *transient_retains;
     uocr_metal_model_view *model_views;
     uint32_t model_view_count;
@@ -277,6 +278,7 @@ static int metal_context_ensure_scratch_accounted(uocr_metal_context *ctx,
                                                   char *error,
                                                   size_t error_size);
 static void metal_clear_mps_weight_ndarray_cache(uocr_metal_context *ctx);
+static void metal_clear_mps_workspace_ndarray_cache(uocr_metal_context *ctx);
 
 static int metal_profile_enabled(const uocr_metal_context *ctx) {
     return ctx != NULL && uocr_profile_is_enabled(ctx->profile);
@@ -1323,6 +1325,13 @@ uocr_metal_context *uocr_metal_context_create(const char *resource_path, char *e
             return NULL;
         }
 
+        ctx->mps_workspace_ndarray_cache = [[NSMutableDictionary alloc] init];
+        if (ctx->mps_workspace_ndarray_cache == nil) {
+            (void)metal_fail(error, error_size, "failed to allocate Metal MPS workspace NDArray cache");
+            uocr_metal_context_destroy(ctx);
+            return NULL;
+        }
+
         ctx->transient_retains = [[NSMutableArray alloc] init];
         if (ctx->transient_retains == nil) {
             (void)metal_fail(error, error_size, "failed to allocate Metal transient-retain array");
@@ -1632,6 +1641,12 @@ static uocr_metal_tensor_binding_internal *build_tensor_bindings(const uocr_mode
 static void metal_clear_mps_weight_ndarray_cache(uocr_metal_context *ctx) {
     if (ctx != NULL && ctx->mps_weight_ndarray_cache != nil) {
         [ctx->mps_weight_ndarray_cache removeAllObjects];
+    }
+}
+
+static void metal_clear_mps_workspace_ndarray_cache(uocr_metal_context *ctx) {
+    if (ctx != NULL && ctx->mps_workspace_ndarray_cache != nil) {
+        [ctx->mps_workspace_ndarray_cache removeAllObjects];
     }
 }
 
@@ -4787,6 +4802,7 @@ static int metal_context_ensure_scratch_accounted(uocr_metal_context *ctx,
             return 0;
         }
         buffer.label = [NSString stringWithFormat:@"uocr_scratch_%s", scratch_slot_name(slot)];
+        metal_clear_mps_workspace_ndarray_cache(ctx);
         [scratch->buffer release];
         metal_scratch_release_accounting(ctx, scratch);
         scratch->buffer = buffer;
@@ -4825,6 +4841,7 @@ void uocr_metal_context_release_scratch(uocr_metal_context *ctx, uocr_metal_scra
     }
     @autoreleasepool {
         uocr_metal_scratch_buffer *scratch = &ctx->scratch[slot];
+        metal_clear_mps_workspace_ndarray_cache(ctx);
         [scratch->buffer release];
         scratch->buffer = nil;
         scratch->capacity = 0u;
@@ -5139,6 +5156,7 @@ void uocr_metal_context_release_runtime_arenas(uocr_metal_context *ctx) {
         return;
     }
     @autoreleasepool {
+        metal_clear_mps_workspace_ndarray_cache(ctx);
         for (uint32_t i = 0u; i < (uint32_t)UOCR_METAL_ARENA_COUNT; ++i) {
             uocr_metal_runtime_arena *arena = &ctx->runtime_arenas[i];
             [arena->buffer release];
@@ -5594,6 +5612,30 @@ static int metal_slice_is_model_backed(const uocr_metal_context *ctx, uocr_metal
     return 0;
 }
 
+static int metal_slice_is_workspace_backed(const uocr_metal_context *ctx, uocr_metal_buffer_slice slice, uint64_t bytes) {
+    if (ctx == NULL || slice.buffer == nil || bytes == 0u || bytes > (uint64_t)NSUIntegerMax) {
+        return 0;
+    }
+    const uint64_t offset = (uint64_t)slice.offset;
+    uint64_t end = 0u;
+    if (!checked_add_u64(offset, bytes, &end)) {
+        return 0;
+    }
+    for (uint32_t i = 0u; i < (uint32_t)UOCR_METAL_SCRATCH_COUNT; ++i) {
+        const uocr_metal_scratch_buffer *scratch = &ctx->scratch[i];
+        if (scratch->buffer == slice.buffer && end <= scratch->capacity) {
+            return 1;
+        }
+    }
+    for (uint32_t i = 0u; i < (uint32_t)UOCR_METAL_ARENA_COUNT; ++i) {
+        const uocr_metal_runtime_arena *arena = &ctx->runtime_arenas[i];
+        if (arena->buffer == slice.buffer && end <= arena->capacity) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static int metal_host_range_to_slice(id<MTLBuffer> buffer,
                                      NSUInteger buffer_offset,
                                      uint64_t byte_length,
@@ -5983,10 +6025,10 @@ static id metal_mps_descriptor_for_shape(uocr_metal_context *ctx, uint32_t rows,
     return desc;
 }
 
-static NSString *metal_mps_weight_ndarray_cache_key(uocr_metal_buffer_slice slice,
-                                                    uint32_t rows,
-                                                    uint32_t cols,
-                                                    int transpose) {
+static NSString *metal_mps_ndarray_cache_key(uocr_metal_buffer_slice slice,
+                                             uint32_t rows,
+                                             uint32_t cols,
+                                             int transpose) {
     return [NSString stringWithFormat:@"%p:%llu:%u:%u:%u",
                                       (void *)slice.buffer,
                                       (unsigned long long)slice.offset,
@@ -6001,20 +6043,33 @@ static id metal_mps_matrix_array_from_slice(uocr_metal_context *ctx,
                                             uint32_t cols,
                                             int transpose,
                                             int cache_if_model_backed,
+                                            int cache_if_workspace_backed,
                                             uint64_t byte_length) {
     const uocr_metal_mps_class_cache *classes = metal_mps_classes();
     if (!classes->available || slice.buffer == nil || rows == 0u || cols == 0u) {
         return nil;
     }
     NSString *array_key = nil;
-    const int use_array_cache = cache_if_model_backed && ctx != NULL && ctx->mps_weight_ndarray_cache != nil &&
-                                metal_slice_is_model_backed(ctx, slice, byte_length);
-    if (use_array_cache) {
-        array_key = metal_mps_weight_ndarray_cache_key(slice, rows, cols, transpose);
-        id cached = array_key != nil ? [ctx->mps_weight_ndarray_cache objectForKey:array_key] : nil;
+    NSMutableDictionary<NSString *, id> *array_cache = nil;
+    const char *cache_hit_event = NULL;
+    const char *cache_create_event = NULL;
+    if (cache_if_model_backed && ctx != NULL && ctx->mps_weight_ndarray_cache != nil &&
+        metal_slice_is_model_backed(ctx, slice, byte_length)) {
+        array_cache = ctx->mps_weight_ndarray_cache;
+        cache_hit_event = "metal.mps.weight_ndarray_cache.hit";
+        cache_create_event = "metal.mps.weight_ndarray_cache.create";
+    } else if (cache_if_workspace_backed && ctx != NULL && ctx->mps_workspace_ndarray_cache != nil &&
+               metal_slice_is_workspace_backed(ctx, slice, byte_length)) {
+        array_cache = ctx->mps_workspace_ndarray_cache;
+        cache_hit_event = "metal.mps.workspace_ndarray_cache.hit";
+        cache_create_event = "metal.mps.workspace_ndarray_cache.create";
+    }
+    if (array_cache != nil) {
+        array_key = metal_mps_ndarray_cache_key(slice, rows, cols, transpose);
+        id cached = array_key != nil ? [array_cache objectForKey:array_key] : nil;
         if (cached != nil) {
             [cached retain];
-            metal_profile_add_event_ms(ctx, "metal.mps.weight_ndarray_cache.hit", 0.0);
+            metal_profile_add_event_ms(ctx, cache_hit_event, 0.0);
             return cached;
         }
     }
@@ -6028,9 +6083,9 @@ static id metal_mps_matrix_array_from_slice(uocr_metal_context *ctx,
     if (array != nil && metal_profile_enabled(ctx)) {
         uocr_profile_add_metal_mps_ndarray(ctx->profile);
     }
-    if (array != nil && use_array_cache && array_key != nil) {
-        [ctx->mps_weight_ndarray_cache setObject:array forKey:array_key];
-        metal_profile_add_event_ms(ctx, "metal.mps.weight_ndarray_cache.create", 0.0);
+    if (array != nil && array_cache != nil && array_key != nil) {
+        [array_cache setObject:array forKey:array_key];
+        metal_profile_add_event_ms(ctx, cache_create_event, 0.0);
     }
     return array;
 }
@@ -6086,9 +6141,9 @@ static int metal_run_mps_matmul_nt_f16(uocr_metal_context *ctx,
         if (kernel == nil) {
             return 0;
         }
-        id x_array = metal_mps_matrix_array_from_slice(ctx, input, rows, in_features, 0, 0, input_bytes);
-        id w_array = metal_mps_matrix_array_from_slice(ctx, weight_nk, out_features, in_features, 1, 1, weight_bytes);
-        id y_array = metal_mps_matrix_array_from_slice(ctx, dst, rows, out_features, 0, 0, dst_bytes);
+        id x_array = metal_mps_matrix_array_from_slice(ctx, input, rows, in_features, 0, 0, 1, input_bytes);
+        id w_array = metal_mps_matrix_array_from_slice(ctx, weight_nk, out_features, in_features, 1, 1, 0, weight_bytes);
+        id y_array = metal_mps_matrix_array_from_slice(ctx, dst, rows, out_features, 0, 0, 1, dst_bytes);
         if (x_array == nil || w_array == nil || y_array == nil) {
             [x_array release];
             [w_array release];
@@ -21559,6 +21614,7 @@ void uocr_metal_context_destroy(uocr_metal_context *ctx) {
     @autoreleasepool {
         [ctx->transient_retains release];
         [ctx->mps_matmul_kernel release];
+        [ctx->mps_workspace_ndarray_cache release];
         [ctx->mps_weight_ndarray_cache release];
         [ctx->mps_descriptor_cache release];
         [ctx->pipeline_cache release];
