@@ -53,6 +53,18 @@ typedef int (*uocr_vision_project_chunk_f16_fn)(const uocr_vision_chunk *chunk,
 uint32_t uocr_default_vision_max_views_per_chunk(const uocr_prepared_request *request);
 
 /*
+ * Build the fixed production schedule for same-shape batching. Crop-mode
+ * requests produce one local 640x640 chunk followed by one global 1024x1024
+ * chunk. Global-only requests produce one global 1024x1024 chunk.
+ */
+int uocr_plan_vision_schedule_same_shape(const uocr_prepared_request *request,
+                                         uocr_vision_chunk *chunks,
+                                         uint32_t chunk_capacity,
+                                         uocr_vision_schedule *out_schedule,
+                                         char *error,
+                                         size_t error_size);
+
+/*
  * Build the view-processing schedule used by the Metal vision bring-up path.
  *
  * The prepared request is validated with unbounded token/generation limits before

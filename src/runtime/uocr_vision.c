@@ -205,6 +205,39 @@ int uocr_plan_vision_schedule(const uocr_prepared_request *request,
     return UOCR_OK;
 }
 
+int uocr_plan_vision_schedule_same_shape(const uocr_prepared_request *request,
+                                         uocr_vision_chunk *chunks,
+                                         uint32_t chunk_capacity,
+                                         uocr_vision_schedule *out_schedule,
+                                         char *error,
+                                         size_t error_size) {
+    const uint32_t chunk_limit = uocr_default_vision_max_views_per_chunk(request);
+    const int status = uocr_plan_vision_schedule(request,
+                                                 chunk_limit,
+                                                 chunks,
+                                                 chunk_capacity,
+                                                 out_schedule,
+                                                 error,
+                                                 error_size);
+    if (status != UOCR_OK || out_schedule == NULL) {
+        return status;
+    }
+
+    uint32_t expected_chunks = 0u;
+    if (out_schedule->final_visual_tokens != 0u) {
+        expected_chunks = out_schedule->local_view_count == 0u ? 1u : 2u;
+    }
+    if (out_schedule->chunk_count != expected_chunks) {
+        return vision_fail(error,
+                           error_size,
+                           UOCR_ERROR_INTERNAL,
+                           "same-shape schedule produced %u chunks, expected %u",
+                           out_schedule->chunk_count,
+                           expected_chunks);
+    }
+    return UOCR_OK;
+}
+
 static void copy_hidden_row(uint16_t *dst_rows, uint32_t dst_row, const uint16_t *src_row) {
     memcpy(&dst_rows[(size_t)dst_row * (size_t)UOCR_HIDDEN_SIZE],
            src_row,

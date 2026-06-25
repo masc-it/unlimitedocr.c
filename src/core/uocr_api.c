@@ -401,16 +401,14 @@ static int generate_metal_image_fp16(uocr_engine *engine,
                                  "Metal fp16 image generation requires at least one image placeholder");
     }
 
-    const uint32_t vision_max_views_per_chunk = uocr_default_vision_max_views_per_chunk(request);
     uocr_vision_schedule vision_schedule;
     memset(&vision_schedule, 0, sizeof(vision_schedule));
-    status = uocr_plan_vision_schedule(request,
-                                       vision_max_views_per_chunk,
-                                       NULL,
-                                       0u,
-                                       &vision_schedule,
-                                       validation_error,
-                                       sizeof(validation_error));
+    status = uocr_plan_vision_schedule_same_shape(request,
+                                                  NULL,
+                                                  0u,
+                                                  &vision_schedule,
+                                                  validation_error,
+                                                  sizeof(validation_error));
     if (status != UOCR_OK) {
         return set_engine_errorf(engine,
                                  status,
@@ -453,7 +451,7 @@ static int generate_metal_image_fp16(uocr_engine *engine,
     memset(metal_error, 0, sizeof(metal_error));
     if (!uocr_metal_context_generate_image_f16(engine->metal,
                                                request,
-                                               vision_max_views_per_chunk,
+                                               vision_schedule.max_views_per_chunk,
                                                0u,
                                                &metal_result,
                                                metal_error,
@@ -870,16 +868,14 @@ int uocr_generate_prepared(uocr_engine *engine,
             return set_engine_errorf(engine, state_status, "request %u state build failed: %s", i, validation_error);
         }
         (void)sequence_state; /* retained here to exercise state construction before inference kernels land */
-        const uint32_t vision_max_views_per_chunk = uocr_default_vision_max_views_per_chunk(&requests[i]);
         uocr_vision_schedule vision_schedule;
         memset(&vision_schedule, 0, sizeof(vision_schedule));
-        const int vision_status = uocr_plan_vision_schedule(&requests[i],
-                                                            vision_max_views_per_chunk,
-                                                            NULL,
-                                                            0u,
-                                                            &vision_schedule,
-                                                            validation_error,
-                                                            sizeof(validation_error));
+        const int vision_status = uocr_plan_vision_schedule_same_shape(&requests[i],
+                                                                       NULL,
+                                                                       0u,
+                                                                       &vision_schedule,
+                                                                       validation_error,
+                                                                       sizeof(validation_error));
         if (vision_status != UOCR_OK) {
             return set_engine_errorf(engine, vision_status, "request %u vision scheduling failed: %s", i, validation_error);
         }

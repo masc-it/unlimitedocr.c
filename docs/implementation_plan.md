@@ -84,7 +84,7 @@ Current finding:
 Implementation status:
 
 - [x] Change public image generation to pass the full same-shape batch size into `uocr_plan_vision_schedule()` and `uocr_metal_context_generate_image_f16()`.
-- [ ] Partition each request into exactly two shape groups: all local `640x640` views, then all global `1024x1024` views.
+- [x] Partition each request into exactly two shape groups: all local `640x640` views, then all global `1024x1024` views.
 - [ ] Add a batch dimension to SAM patch, SAM transformer, SAM neck, CLIP embedding, CLIP transformer, concat, projector, and formatter dispatch.
 - [ ] Encode the entire local shape group in one command buffer.
 - [ ] Encode the entire global shape group in one command buffer.
