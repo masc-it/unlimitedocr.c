@@ -59,6 +59,17 @@ typedef enum uocr_memory_category {
     UOCR_MEMORY_CATEGORY_COUNT = 8
 } uocr_memory_category;
 
+#define UOCR_PROFILE_EVENT_NAME_SIZE 64u
+#define UOCR_PROFILE_MAX_EVENTS 128u
+
+typedef struct uocr_profile_event {
+    char name[UOCR_PROFILE_EVENT_NAME_SIZE];
+    uint64_t calls;
+    double total_ms;
+    double min_ms;
+    double max_ms;
+} uocr_profile_event;
+
 typedef struct uocr_memory_report {
     uint64_t category_live_bytes[UOCR_MEMORY_CATEGORY_COUNT];
     uint64_t category_peak_bytes[UOCR_MEMORY_CATEGORY_COUNT];
@@ -77,6 +88,25 @@ typedef struct uocr_memory_report {
     uint64_t memory_budget_bytes;
     uint64_t recommended_working_set_bytes;
 } uocr_memory_report;
+
+typedef struct uocr_profile_report {
+    uint32_t enabled;
+    uint32_t event_count;
+    uint32_t dropped_event_count;
+    uint32_t reserved0;
+    uint64_t generation_index;
+    uocr_profile_event events[UOCR_PROFILE_MAX_EVENTS];
+    uint64_t metal_buffer_allocation_count;
+    uint64_t metal_buffer_allocation_bytes;
+    uint64_t metal_command_buffer_count;
+    uint64_t metal_command_encoder_count;
+    uint64_t metal_command_buffer_wait_count;
+    uint64_t metal_mps_descriptor_count;
+    uint64_t metal_mps_ndarray_count;
+    uint64_t metal_nsarray_count;
+    uint64_t metal_transient_retain_object_count;
+    uocr_memory_report memory;
+} uocr_profile_report;
 
 typedef struct uocr_image_view {
     const void *pixels;          /* contiguous [3,H,W], normalized to [-1,1] */
@@ -109,6 +139,8 @@ typedef struct uocr_engine_opts {
     uint32_t max_batch;          /* 0 = default */
     uint32_t max_prompt_tokens;  /* 0 = default */
     uint32_t max_gen_tokens;     /* 0 = default */
+    uint32_t profile;            /* non-zero enables profiling; UOCR_PROFILE=1 also enables it */
+    uint32_t reserved0;
     uint64_t memory_budget_bytes;/* 0 = backend default */
 } uocr_engine_opts;
 
@@ -121,6 +153,8 @@ UOCR_API const char *uocr_last_error(const uocr_engine *engine);
 UOCR_API const char *uocr_engine_backend(const uocr_engine *engine);
 UOCR_API const char *uocr_memory_category_name(uocr_memory_category category);
 UOCR_API int uocr_engine_memory_report(const uocr_engine *engine, uocr_memory_report *out_report);
+UOCR_API int uocr_engine_profile_report(const uocr_engine *engine, uocr_profile_report *out_report);
+UOCR_API int uocr_engine_profile_reset(uocr_engine *engine);
 
 UOCR_API int uocr_generate_prepared(uocr_engine *engine,
                                     const uocr_prepared_request *requests,

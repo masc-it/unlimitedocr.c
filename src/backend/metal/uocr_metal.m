@@ -150,7 +150,54 @@ struct uocr_metal_context {
     uint32_t integrated_prefill_slot;
     uint32_t integrated_prefill_tokens;
     uint32_t integrated_prefill_final_segment;
+    uocr_profile_state *profile;
 };
+
+static int metal_profile_enabled(const uocr_metal_context *ctx) {
+    return ctx != NULL && uocr_profile_is_enabled(ctx->profile);
+}
+
+static void metal_profile_add_event_now(const uocr_metal_context *ctx, const char *name, uint64_t start_ns) {
+    if (metal_profile_enabled(ctx)) {
+        uocr_profile_add_event_now(ctx->profile, name, start_ns);
+    }
+}
+
+static void metal_profile_add_event_now_f(const uocr_metal_context *ctx, uint64_t start_ns, const char *fmt, ...) {
+    if (!metal_profile_enabled(ctx) || fmt == NULL) {
+        return;
+    }
+    char name[UOCR_PROFILE_EVENT_NAME_SIZE];
+    va_list ap;
+    va_start(ap, fmt);
+    (void)vsnprintf(name, sizeof(name), fmt, ap);
+    va_end(ap);
+    name[sizeof(name) - 1u] = '\0';
+    uocr_profile_add_event_now(ctx->profile, name, start_ns);
+}
+
+static void metal_profile_count_buffer(const uocr_metal_context *ctx, uint64_t bytes) {
+    if (metal_profile_enabled(ctx)) {
+        uocr_profile_add_metal_buffer_allocation(ctx->profile, bytes);
+    }
+}
+
+#define UOCR_METAL_COMMIT_AND_WAIT_PROFILED(ctx_, cb_)                                  \
+    do {                                                                                 \
+        const uint64_t uocr_metal_wait_start_ns__ = uocr_profile_now_ns();                \
+        [(cb_) commit];                                                                  \
+        [(cb_) waitUntilCompleted];                                                      \
+        if (metal_profile_enabled((ctx_))) {                                              \
+            uocr_profile_add_metal_command_buffer_wait((ctx_)->profile);                  \
+            uocr_profile_add_event_now((ctx_)->profile,                                  \
+                                       "metal.command_buffer_wait",                      \
+                                       uocr_metal_wait_start_ns__);                       \
+        }                                                                                \
+    } while (0)
+
+static id<MTLCommandBuffer> metal_new_command_buffer(uocr_metal_context *ctx);
+static id<MTLComputeCommandEncoder> metal_compute_command_encoder(uocr_metal_context *ctx, id<MTLCommandBuffer> cb);
+static id<MTLBlitCommandEncoder> metal_blit_command_encoder(uocr_metal_context *ctx, id<MTLCommandBuffer> cb);
 
 static int metal_fail(char *error, size_t error_size, const char *fmt, ...) {
     if (error != NULL && error_size > 0u) {
@@ -901,6 +948,9 @@ static int metal_retain_transient_until_completed(uocr_metal_context *ctx,
     @synchronized(retained_objects) {
         [retained_objects addObject:object];
     }
+    if (metal_profile_enabled(ctx)) {
+        uocr_profile_add_metal_transient_retain_object(ctx->profile);
+    }
     [command_buffer addCompletedHandler:^(id<MTLCommandBuffer> completed) {
         (void)completed;
         @synchronized(retained_objects) {
@@ -1431,6 +1481,7 @@ int uocr_metal_context_map_model(uocr_metal_context *ctx, const uocr_model_file 
                                   (unsigned long long)views[i].file_offset,
                                   (unsigned long long)views[i].length);
             }
+            metal_profile_count_buffer(ctx, views[i].length);
             buffer.label = [NSString stringWithFormat:@"uocr_model_view_%u", i];
             views[i].buffer = buffer;
         }
@@ -2685,11 +2736,13 @@ static int metal_encode_one_view_sam_features_f16(uocr_metal_vision_project_cont
 
 #define RUN_VISION_STEP(step_name, call_expr)                                                        \
     do {                                                                                             \
+        const uint64_t vision_step_start_ns__ = uocr_profile_now_ns();                                \
         if (!(call_expr)) {                                                                          \
             char detail[512];                                                                        \
             metal_copy_error_detail(detail, sizeof(detail), error);                                   \
             return metal_fail(error, error_size, "failed to compute Metal vision %s: %s", step_name, detail); \
         }                                                                                            \
+        metal_profile_add_event_now_f(ctx, vision_step_start_ns__, "metal.vision.%s", step_name);    \
     } while (0)
 
     uint32_t patch_grid_w = 0u;
@@ -2852,11 +2905,13 @@ static int metal_encode_one_view_clip_features_f16(uocr_metal_vision_project_con
 
 #define RUN_VISION_STEP(step_name, call_expr)                                                        \
     do {                                                                                             \
+        const uint64_t vision_step_start_ns__ = uocr_profile_now_ns();                                \
         if (!(call_expr)) {                                                                          \
             char detail[512];                                                                        \
             metal_copy_error_detail(detail, sizeof(detail), error);                                   \
             return metal_fail(error, error_size, "failed to compute Metal vision %s: %s", step_name, detail); \
         }                                                                                            \
+        metal_profile_add_event_now_f(ctx, vision_step_start_ns__, "metal.vision.%s", step_name);    \
     } while (0)
 
     RUN_VISION_STEP("CLIP SAM embedding",
@@ -2946,11 +3001,13 @@ static int metal_encode_one_view_projected_f16(uocr_metal_vision_project_context
 
 #define RUN_VISION_STEP(step_name, call_expr)                                                        \
     do {                                                                                             \
+        const uint64_t vision_step_start_ns__ = uocr_profile_now_ns();                                \
         if (!(call_expr)) {                                                                          \
             char detail[512];                                                                        \
             metal_copy_error_detail(detail, sizeof(detail), error);                                   \
             return metal_fail(error, error_size, "failed to compute Metal vision %s: %s", step_name, detail); \
         }                                                                                            \
+        metal_profile_add_event_now_f(ctx, vision_step_start_ns__, "metal.vision.%s", step_name);    \
     } while (0)
 
     RUN_VISION_STEP("CLIP/SAM concat",
@@ -3452,6 +3509,7 @@ int uocr_metal_context_ensure_scratch(uocr_metal_context *ctx,
                               scratch_slot_name(slot),
                               (unsigned long long)new_capacity);
         }
+        metal_profile_count_buffer(ctx, new_capacity);
         buffer.label = [NSString stringWithFormat:@"uocr_scratch_%s", scratch_slot_name(slot)];
         [scratch->buffer release];
         scratch->buffer = buffer;
@@ -3595,13 +3653,13 @@ int uocr_metal_context_warmup_model_views(uocr_metal_context *ctx,
         }
         memset([dst contents], 0, (size_t)output_bytes);
 
-        id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
+        id<MTLCommandBuffer> cb = metal_new_command_buffer(ctx);
         if (cb == nil) {
             return metal_fail(error, error_size, "failed to create Metal warmup command buffer");
         }
         cb.label = @"uocr_model_view_warmup_command_buffer";
 
-        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
         if (enc == nil) {
             return metal_fail(error, error_size, "failed to create Metal warmup command encoder");
         }
@@ -3641,8 +3699,7 @@ int uocr_metal_context_warmup_model_views(uocr_metal_context *ctx,
         }
         [enc endEncoding];
 
-        [cb commit];
-        [cb waitUntilCompleted];
+        UOCR_METAL_COMMIT_AND_WAIT_PROFILED(ctx, cb);
         if (cb.status == MTLCommandBufferStatusError) {
             NSString *description = cb.error != nil ? [cb.error localizedDescription] : @"unknown command-buffer error";
             return metal_fail(error, error_size, "Metal model-view warmup failed: %s", [description UTF8String]);
@@ -3859,6 +3916,7 @@ int uocr_metal_context_allocate_runtime_arenas(uocr_metal_context *ctx,
                                   runtime_arena_slot_name(slot),
                                   (unsigned long long)bytes);
             }
+            metal_profile_count_buffer(ctx, bytes);
             buffer.label = [NSString stringWithFormat:@"uocr_arena_%s", runtime_arena_slot_name(slot)];
             ctx->runtime_arenas[i].buffer = buffer;
             ctx->runtime_arenas[i].capacity = bytes;
@@ -4217,20 +4275,56 @@ static int metal_slice_valid(uocr_metal_buffer_slice slice, uint64_t bytes) {
     return metal_buffer_range_valid(slice.buffer, slice.offset, bytes);
 }
 
-static int metal_wait_for_command_buffer(id<MTLCommandBuffer> cb,
-                                         const char *op_name,
-                                         char *error,
-                                         size_t error_size) {
+static int metal_wait_for_command_buffer_profiled(uocr_metal_context *ctx,
+                                                  id<MTLCommandBuffer> cb,
+                                                  const char *op_name,
+                                                  char *error,
+                                                  size_t error_size) {
     if (cb == nil) {
         return metal_fail(error, error_size, "failed to create %s command buffer", op_name);
     }
-    [cb commit];
-    [cb waitUntilCompleted];
+    UOCR_METAL_COMMIT_AND_WAIT_PROFILED(ctx, cb);
     if (cb.status == MTLCommandBufferStatusError) {
         NSString *description = cb.error != nil ? [cb.error localizedDescription] : @"unknown command-buffer error";
         return metal_fail(error, error_size, "%s command failed: %s", op_name, [description UTF8String]);
     }
     return 1;
+}
+
+static id<MTLCommandBuffer> metal_new_command_buffer(uocr_metal_context *ctx) {
+    if (ctx == NULL || ctx->queue == nil) {
+        return nil;
+    }
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wobjc-method-access"
+    id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
+#pragma clang diagnostic pop
+    if (cb != nil && metal_profile_enabled(ctx)) {
+        uocr_profile_add_metal_command_buffer(ctx->profile);
+    }
+    return cb;
+}
+
+static id<MTLComputeCommandEncoder> metal_compute_command_encoder(uocr_metal_context *ctx, id<MTLCommandBuffer> cb) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wobjc-method-access"
+    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+#pragma clang diagnostic pop
+    if (enc != nil && metal_profile_enabled(ctx)) {
+        uocr_profile_add_metal_command_encoder(ctx->profile);
+    }
+    return enc;
+}
+
+static id<MTLBlitCommandEncoder> metal_blit_command_encoder(uocr_metal_context *ctx, id<MTLCommandBuffer> cb) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wobjc-method-access"
+    id<MTLBlitCommandEncoder> enc = [cb blitCommandEncoder];
+#pragma clang diagnostic pop
+    if (enc != nil && metal_profile_enabled(ctx)) {
+        uocr_profile_add_metal_command_encoder(ctx->profile);
+    }
+    return enc;
 }
 
 static int metal_command_batch_active(const uocr_metal_context *ctx) {
@@ -4244,7 +4338,7 @@ static int metal_command_batch_begin(uocr_metal_context *ctx, char *error, size_
     if (ctx->active_command_buffer != nil) {
         return 1;
     }
-    id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
+    id<MTLCommandBuffer> cb = metal_new_command_buffer(ctx);
     if (cb == nil) {
         return metal_fail(error, error_size, "failed to create Metal command batch buffer");
     }
@@ -4277,7 +4371,7 @@ static int metal_command_batch_commit_and_wait(uocr_metal_context *ctx,
         return 1;
     }
     ctx->active_command_buffer = nil;
-    const int ok = metal_wait_for_command_buffer(cb, op_name, error, error_size);
+    const int ok = metal_wait_for_command_buffer_profiled(ctx, cb, op_name, error, error_size);
     [cb release];
     return ok;
 }
@@ -4297,7 +4391,7 @@ static id<MTLCommandBuffer> metal_command_buffer_for_op(uocr_metal_context *ctx,
     if (ctx->active_command_buffer != nil) {
         return ctx->active_command_buffer;
     }
-    id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
+    id<MTLCommandBuffer> cb = metal_new_command_buffer(ctx);
     if (cb == nil) {
         (void)metal_fail(error, error_size, "failed to create %s command buffer", op_name);
         return nil;
@@ -4314,11 +4408,10 @@ static int metal_finish_command_buffer_for_op(uocr_metal_context *ctx,
                                               const char *op_name,
                                               char *error,
                                               size_t error_size) {
-    (void)ctx;
     if (!owned) {
         return 1;
     }
-    return metal_wait_for_command_buffer(cb, op_name, error, error_size);
+    return metal_wait_for_command_buffer_profiled(ctx, cb, op_name, error, error_size);
 }
 
 typedef struct uocr_metal_mps_class_cache {
@@ -4394,7 +4487,8 @@ static int metal_mps_matmul_nt_f16_should_use(uint32_t rows, uint32_t in_feature
     return flops >= metal_mps_matmul_min_flops();
 }
 
-static id metal_mps_matrix_array_from_slice(uocr_metal_buffer_slice slice,
+static id metal_mps_matrix_array_from_slice(uocr_metal_context *ctx,
+                                            uocr_metal_buffer_slice slice,
                                             uint32_t rows,
                                             uint32_t cols,
                                             int transpose) {
@@ -4407,11 +4501,19 @@ static id metal_mps_matrix_array_from_slice(uocr_metal_buffer_slice slice,
     if (desc == nil) {
         return nil;
     }
+    if (metal_profile_enabled(ctx)) {
+        uocr_profile_add_metal_mps_descriptor(ctx->profile);
+        uocr_profile_add_metal_nsarray(ctx->profile); /* descriptor shape literal */
+    }
     [desc setPreferPackedRows:YES];
     if (transpose) {
         [desc transposeDimension:0u withDimension:1u];
     }
-    return [[classes->array_class alloc] initWithBuffer:slice.buffer offset:slice.offset descriptor:desc];
+    id array = [[classes->array_class alloc] initWithBuffer:slice.buffer offset:slice.offset descriptor:desc];
+    if (array != nil && metal_profile_enabled(ctx)) {
+        uocr_profile_add_metal_mps_ndarray(ctx->profile);
+    }
+    return array;
 }
 
 static id metal_ensure_mps_matmul_kernel(uocr_metal_context *ctx, char *error, size_t error_size) {
@@ -4463,9 +4565,9 @@ static int metal_run_mps_matmul_nt_f16(uocr_metal_context *ctx,
         if (kernel == nil) {
             return 0;
         }
-        id x_array = metal_mps_matrix_array_from_slice(input, rows, in_features, 0);
-        id w_array = metal_mps_matrix_array_from_slice(weight_nk, out_features, in_features, 1);
-        id y_array = metal_mps_matrix_array_from_slice(dst, rows, out_features, 0);
+        id x_array = metal_mps_matrix_array_from_slice(ctx, input, rows, in_features, 0);
+        id w_array = metal_mps_matrix_array_from_slice(ctx, weight_nk, out_features, in_features, 1);
+        id y_array = metal_mps_matrix_array_from_slice(ctx, dst, rows, out_features, 0);
         if (x_array == nil || w_array == nil || y_array == nil) {
             [x_array release];
             [w_array release];
@@ -4480,7 +4582,7 @@ static int metal_run_mps_matmul_nt_f16(uocr_metal_context *ctx,
             [y_array release];
             return 0;
         }
-        id<MTLBlitCommandEncoder> fill = [cb blitCommandEncoder];
+        id<MTLBlitCommandEncoder> fill = metal_blit_command_encoder(ctx, cb);
         if (fill == nil) {
             [x_array release];
             [w_array release];
@@ -4489,7 +4591,7 @@ static int metal_run_mps_matmul_nt_f16(uocr_metal_context *ctx,
         }
         [fill fillBuffer:dst.buffer range:NSMakeRange(dst.offset, (NSUInteger)dst_bytes) value:0u];
         [fill endEncoding];
-        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
         if (enc == nil) {
             [x_array release];
             [w_array release];
@@ -4498,6 +4600,10 @@ static int metal_run_mps_matmul_nt_f16(uocr_metal_context *ctx,
         }
         NSArray *sources = [[NSArray alloc] initWithObjects:x_array, w_array, nil];
         NSArray *retained_arrays = [[NSArray alloc] initWithObjects:x_array, w_array, y_array, nil];
+        if (metal_profile_enabled(ctx)) {
+            uocr_profile_add_metal_nsarray(ctx->profile);
+            uocr_profile_add_metal_nsarray(ctx->profile);
+        }
         if (sources == nil || retained_arrays == nil) {
             [sources release];
             [retained_arrays release];
@@ -4838,19 +4944,20 @@ static int metal_read_slice_to_host(uocr_metal_context *ctx,
         if (readback == nil) {
             return metal_fail(error, error_size, "failed to allocate %s readback buffer", op_name);
         }
-        id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
+        metal_profile_count_buffer(ctx, bytes);
+        id<MTLCommandBuffer> cb = metal_new_command_buffer(ctx);
         if (cb == nil) {
             [readback release];
             return metal_fail(error, error_size, "failed to create %s readback command buffer", op_name);
         }
-        id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+        id<MTLBlitCommandEncoder> blit = metal_blit_command_encoder(ctx, cb);
         if (blit == nil) {
             [readback release];
             return metal_fail(error, error_size, "failed to create %s readback blit encoder", op_name);
         }
         [blit copyFromBuffer:src.buffer sourceOffset:src.offset toBuffer:readback destinationOffset:0u size:(NSUInteger)bytes];
         [blit endEncoding];
-        if (!metal_wait_for_command_buffer(cb, op_name, error, error_size)) {
+        if (!metal_wait_for_command_buffer_profiled(ctx, cb, op_name, error, error_size)) {
             [readback release];
             return 0;
         }
@@ -4877,7 +4984,7 @@ static int metal_copy_slice(uocr_metal_context *ctx,
         if (cb == nil) {
             return 0;
         }
-        id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+        id<MTLBlitCommandEncoder> blit = metal_blit_command_encoder(ctx, cb);
         if (blit == nil) {
             return metal_fail(error, error_size, "failed to create %s copy blit encoder", op_name);
         }
@@ -4910,7 +5017,7 @@ static int metal_run_residual_add_f16(uocr_metal_context *ctx,
         if (cb == nil) {
             return 0;
         }
-        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
         if (enc == nil) {
             return metal_fail(error, error_size, "failed to create %s residual-add command encoder", op_name != NULL ? op_name : "Metal");
         }
@@ -4958,7 +5065,7 @@ static int metal_run_bias_add_f16_inplace(uocr_metal_context *ctx,
         if (cb == nil) {
             return 0;
         }
-        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
         if (enc == nil) {
             return metal_fail(error, error_size, "failed to create %s bias-add command encoder", op_name != NULL ? op_name : "Metal");
         }
@@ -5098,7 +5205,7 @@ static int metal_run_token_embedding_from_token_slot_f16(uocr_metal_context *ctx
         if (cb == nil) {
             return 0;
         }
-        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
         if (enc == nil) {
             return metal_fail(error, error_size, "failed to create integrated token-embedding command encoder");
         }
@@ -5159,13 +5266,13 @@ static int metal_run_no_repeat_collect_ban_flags_to_slice(uocr_metal_context *ct
         if (cb == nil) {
             return 0;
         }
-        id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+        id<MTLBlitCommandEncoder> blit = metal_blit_command_encoder(ctx, cb);
         if (blit == nil) {
             return metal_fail(error, error_size, "failed to create integrated no-repeat flag-clear encoder");
         }
         [blit fillBuffer:ban_flags.buffer range:NSMakeRange(ban_flags.offset, (NSUInteger)UOCR_VOCAB_SIZE) value:0u];
         [blit endEncoding];
-        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
         if (enc == nil) {
             return metal_fail(error, error_size, "failed to create integrated no-repeat collection encoder");
         }
@@ -5245,7 +5352,7 @@ static int metal_run_lm_head_argmax_f16(uocr_metal_context *ctx,
         if (cb == nil) {
             return 0;
         }
-        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
         if (enc == nil) {
             return metal_fail(error, error_size, "failed to create integrated fused LM-head argmax encoder");
         }
@@ -5309,7 +5416,7 @@ static int metal_run_argmax_pairs_to_token(uocr_metal_context *ctx,
         if (cb == nil) {
             return 0;
         }
-        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
         if (enc == nil) {
             return metal_fail(error, error_size, "failed to create integrated argmax-pair finalization encoder");
         }
@@ -5360,7 +5467,7 @@ static int metal_run_rmsnorm_buffer_f16(uocr_metal_context *ctx,
         if (cb == nil) {
             return 0;
         }
-        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
         if (enc == nil) {
             return metal_fail(error, error_size, "failed to create %s RMSNorm command encoder", op_name);
         }
@@ -5426,9 +5533,12 @@ static int metal_select_next_token_from_hidden_slice_f16(uocr_metal_context *ctx
         if (sequence_base == NULL) {
             return metal_fail(error, error_size, "integrated no-repeat sequence scratch is not CPU-visible");
         }
+        const uint64_t sequence_copy_start_ns = uocr_profile_now_ns();
         memcpy((uint8_t *)sequence_base + (size_t)selection_slices.sequence.offset, sequence, (size_t)sequence_bytes);
+        metal_profile_add_event_now(ctx, "metal.no_repeat_sequence_copy", sequence_copy_start_ns);
     }
 
+    const uint64_t final_norm_start_ns = uocr_profile_now_ns();
     if (!metal_run_rmsnorm_buffer_f16(ctx,
                                       hidden,
                                       final_norm,
@@ -5436,8 +5546,13 @@ static int metal_select_next_token_from_hidden_slice_f16(uocr_metal_context *ctx
                                       norm_scratch,
                                       "integrated final RMSNorm",
                                       error,
-                                      error_size) ||
-        !metal_run_no_repeat_collect_ban_flags_to_slice(ctx,
+                                      error_size)) {
+        return 0;
+    }
+    metal_profile_add_event_now(ctx, "metal.final_norm", final_norm_start_ns);
+
+    const uint64_t no_repeat_start_ns = uocr_profile_now_ns();
+    if (!metal_run_no_repeat_collect_ban_flags_to_slice(ctx,
                                                         selection_slices.sequence,
                                                         selection_slices.ban_flags,
                                                         sequence_len,
@@ -5445,8 +5560,13 @@ static int metal_select_next_token_from_hidden_slice_f16(uocr_metal_context *ctx
                                                         no_repeat_window,
                                                         banned_capacity,
                                                         error,
-                                                        error_size) ||
-        !metal_run_lm_head_argmax_f16(ctx,
+                                                        error_size)) {
+        return 0;
+    }
+    metal_profile_add_event_now(ctx, "metal.no_repeat", no_repeat_start_ns);
+
+    const uint64_t lm_head_start_ns = uocr_profile_now_ns();
+    if (!metal_run_lm_head_argmax_f16(ctx,
                                       norm_scratch,
                                       selection_slices.ban_flags,
                                       banned_capacity,
@@ -5454,8 +5574,13 @@ static int metal_select_next_token_from_hidden_slice_f16(uocr_metal_context *ctx
                                       selection_slices.partial_ids,
                                       selection_slices.partial_count,
                                       error,
-                                      error_size) ||
-        !metal_run_argmax_pairs_to_token(ctx,
+                                      error_size)) {
+        return 0;
+    }
+    metal_profile_add_event_now(ctx, "metal.lm_head_selection", lm_head_start_ns);
+
+    const uint64_t final_argmax_start_ns = uocr_profile_now_ns();
+    if (!metal_run_argmax_pairs_to_token(ctx,
                                          selection_slices.partial_scores,
                                          selection_slices.partial_ids,
                                          selection_slices.partial_count,
@@ -5465,6 +5590,7 @@ static int metal_select_next_token_from_hidden_slice_f16(uocr_metal_context *ctx
                                          error_size)) {
         return 0;
     }
+    metal_profile_add_event_now(ctx, "metal.lm_head_final_argmax", final_argmax_start_ns);
     if (metal_command_batch_active(ctx) &&
         !metal_command_batch_commit_and_wait(ctx, "integrated next-token selection", error, error_size)) {
         return 0;
@@ -5555,7 +5681,7 @@ static int metal_run_attention_qkv_buffer_f16(uocr_metal_context *ctx,
         if (cb == nil) {
             return 0;
         }
-        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
         if (enc == nil) {
             return metal_fail(error, error_size, "failed to create integrated attention QKV command encoder");
         }
@@ -5615,7 +5741,7 @@ static int metal_run_rope_qk_buffer_f16(uocr_metal_context *ctx,
         if (cb == nil) {
             return 0;
         }
-        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
         if (enc == nil) {
             return metal_fail(error, error_size, "failed to create integrated RoPE command encoder");
         }
@@ -5682,7 +5808,7 @@ static int metal_run_kv_write_buffer_f16(uocr_metal_context *ctx,
         if (cb == nil) {
             return 0;
         }
-        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
         if (enc == nil) {
             return metal_fail(error, error_size, "failed to create integrated KV write command encoder");
         }
@@ -5755,7 +5881,7 @@ static int metal_run_decode_attention_buffer_f16(uocr_metal_context *ctx,
         if (cb == nil) {
             return 0;
         }
-        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
         if (enc == nil) {
             return metal_fail(error, error_size, "failed to create integrated decode attention command encoder");
         }
@@ -5816,7 +5942,7 @@ static int metal_run_prefill_attention_buffer_f16(uocr_metal_context *ctx,
         if (cb == nil) {
             return 0;
         }
-        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
         if (enc == nil) {
             return metal_fail(error, error_size, "failed to create integrated prefill attention command encoder");
         }
@@ -5886,7 +6012,7 @@ static int metal_run_attention_output_residual_buffer_f16(uocr_metal_context *ct
         if (cb == nil) {
             return 0;
         }
-        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
         if (enc == nil) {
             return metal_fail(error, error_size, "failed to create integrated attention output command encoder");
         }
@@ -5956,7 +6082,7 @@ static int metal_run_dense_swiglu_buffer_f16(uocr_metal_context *ctx,
         params.hidden_size = UOCR_HIDDEN_SIZE;
         params.intermediate_size = intermediate_size;
         params.has_residual = has_residual ? 1u : 0u;
-        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
         if (enc == nil) {
             return metal_fail(error, error_size, "failed to create %s gate/up command encoder", op_name);
         }
@@ -6000,7 +6126,7 @@ static int metal_run_dense_swiglu_buffer_f16(uocr_metal_context *ctx,
             return 1;
         }
 
-        enc = [cb computeCommandEncoder];
+        enc = metal_compute_command_encoder(ctx, cb);
         if (enc == nil) {
             return metal_fail(error, error_size, "failed to create %s down command encoder", op_name);
         }
@@ -6066,7 +6192,7 @@ static int metal_run_moe_router_buffer_f16(uocr_metal_context *ctx,
         params.hidden_size = UOCR_HIDDEN_SIZE;
         params.experts = UOCR_ROUTED_EXPERTS;
         params.top_k = UOCR_MOE_TOP_K;
-        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
         if (enc == nil) {
             return metal_fail(error, error_size, "failed to create integrated MoE router logits encoder");
         }
@@ -6081,7 +6207,7 @@ static int metal_run_moe_router_buffer_f16(uocr_metal_context *ctx,
              threadsPerThreadgroup:MTLSizeMake(logits_threads, 1u, 1u)];
         [enc endEncoding];
 
-        enc = [cb computeCommandEncoder];
+        enc = metal_compute_command_encoder(ctx, cb);
         if (enc == nil) {
             return metal_fail(error, error_size, "failed to create integrated MoE router top-k encoder");
         }
@@ -6193,7 +6319,7 @@ static int metal_run_moe_interleaved_buffer_f16(uocr_metal_context *ctx,
         params.expert_stride_values = (uint32_t)(projection_values * 3u);
         params.up_offset_values = (uint32_t)projection_values;
         params.down_offset_values = (uint32_t)(projection_values * 2u);
-        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
         if (enc == nil) {
             return metal_fail(error, error_size, "failed to create integrated routed MoE gate/up encoder");
         }
@@ -6209,7 +6335,7 @@ static int metal_run_moe_interleaved_buffer_f16(uocr_metal_context *ctx,
              threadsPerThreadgroup:MTLSizeMake(gate_threads, 1u, 1u)];
         [enc endEncoding];
 
-        enc = [cb computeCommandEncoder];
+        enc = metal_compute_command_encoder(ctx, cb);
         if (enc == nil) {
             return metal_fail(error, error_size, "failed to create integrated routed MoE down encoder");
         }
@@ -6254,7 +6380,7 @@ static int metal_run_moe_combine_buffer_f16(uocr_metal_context *ctx,
         if (cb == nil) {
             return 0;
         }
-        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
         if (enc == nil) {
             return metal_fail(error, error_size, "failed to create integrated MoE combine command encoder");
         }
@@ -6304,6 +6430,7 @@ static int metal_run_decoder_decode_one_f16(uocr_metal_context *ctx,
     uocr_metal_buffer_slice current = scratch[0];
     uint32_t current_segment = 0u;
     for (uint32_t layer = 0u; layer < UOCR_DECODER_LAYERS; ++layer) {
+        const uint64_t layer_start_ns = uocr_profile_now_ns();
         uint32_t available[UOCR_METAL_HIDDEN_SCRATCH_SEGMENTS];
         uint32_t available_count = 0u;
         for (uint32_t i = 0u; i < UOCR_METAL_HIDDEN_SCRATCH_SEGMENTS; ++i) {
@@ -6469,6 +6596,8 @@ static int metal_run_decoder_decode_one_f16(uocr_metal_context *ctx,
 
         current = output;
         current_segment = output_segment;
+        metal_profile_add_event_now(ctx, "metal.decode.layer", layer_start_ns);
+        metal_profile_add_event_now_f(ctx, layer_start_ns, "metal.decode.layer.%02u", layer);
     }
 
     if (current_segment != 0u) {
@@ -6505,6 +6634,7 @@ static int metal_run_decoder_prefill_text_f16(uocr_metal_context *ctx,
     uocr_metal_buffer_slice current = prompt;
     uint32_t current_segment = UINT32_MAX;
     for (uint32_t layer = 0u; layer < UOCR_DECODER_LAYERS; ++layer) {
+        const uint64_t layer_start_ns = uocr_profile_now_ns();
         uint32_t available[UOCR_METAL_HIDDEN_SCRATCH_SEGMENTS];
         uint32_t available_count = 0u;
         for (uint32_t i = 0u; i < UOCR_METAL_HIDDEN_SCRATCH_SEGMENTS; ++i) {
@@ -6673,6 +6803,8 @@ static int metal_run_decoder_prefill_text_f16(uocr_metal_context *ctx,
 
         current = output;
         current_segment = output_segment;
+        metal_profile_add_event_now(ctx, "metal.prefill.layer", layer_start_ns);
+        metal_profile_add_event_now_f(ctx, layer_start_ns, "metal.prefill.layer.%02u", layer);
     }
 
     if (current_segment != 0u) {
@@ -6805,6 +6937,7 @@ int uocr_metal_context_generate_f16(uocr_metal_context *ctx,
         }
     }
 
+    const uint64_t prompt_assembly_start_ns = uocr_profile_now_ns();
     if (!uocr_metal_context_assemble_prompt_from_model_to_arena_f16(ctx,
                                                                     request->input_ids,
                                                                     request->n_tokens,
@@ -6818,17 +6951,21 @@ int uocr_metal_context_generate_f16(uocr_metal_context *ctx,
         (void)snprintf(detail, sizeof(detail), "%s", (error != NULL && error[0] != '\0') ? error : "unknown error");
         return metal_fail(error, error_size, "failed to assemble integrated prompt into Metal arena: %s", detail);
     }
+    metal_profile_add_event_now(ctx, "metal.prompt_assembly", prompt_assembly_start_ns);
 
+    const uint64_t pipeline_prewarm_start_ns = uocr_profile_now_ns();
     if (!metal_prewarm_integrated_decoder_pipelines(ctx, error, error_size)) {
         char detail[512];
         (void)snprintf(detail, sizeof(detail), "%s", (error != NULL && error[0] != '\0') ? error : "unknown error");
         return metal_fail(error, error_size, "failed to prepare integrated Metal fp16 decoder pipelines: %s", detail);
     }
+    metal_profile_add_event_now(ctx, "metal.pipeline_prewarm", pipeline_prewarm_start_ns);
 
     const uocr_metal_hot_path_alloc_guard prefill_guard =
         metal_hot_path_alloc_guard_begin(ctx);
     char prefill_error[512];
     prefill_error[0] = '\0';
+    const uint64_t prefill_start_ns = uocr_profile_now_ns();
     const int prefill_ok = metal_run_decoder_prefill_text_f16(ctx,
                                                              request->slot,
                                                              request->n_tokens,
@@ -6851,6 +6988,7 @@ int uocr_metal_context_generate_f16(uocr_metal_context *ctx,
                           "integrated Metal fp16 prompt prefill failed: %s",
                           prefill_error[0] != '\0' ? prefill_error : "unknown error");
     }
+    metal_profile_add_event_now(ctx, "metal.prefill", prefill_start_ns);
 
     if (request->max_new_tokens == 0u) {
         metal_clear_error(error, error_size);
@@ -6929,6 +7067,7 @@ int uocr_metal_context_generate_f16(uocr_metal_context *ctx,
 
     const uocr_metal_hot_path_alloc_guard decode_loop_guard =
         metal_hot_path_alloc_guard_begin(ctx);
+    const uint64_t decode_loop_start_ns = uocr_profile_now_ns();
     int decode_loop_ok = 1;
     char decode_loop_error[512];
     decode_loop_error[0] = '\0';
@@ -6943,6 +7082,7 @@ int uocr_metal_context_generate_f16(uocr_metal_context *ctx,
     } while (0)
 
     while (!uocr_sequence_generation_done(&sequence_state)) {
+        const uint64_t decode_iteration_start_ns = uocr_profile_now_ns();
         if (!metal_command_batch_begin(ctx, error, error_size)) {
             char detail[512];
             (void)snprintf(detail, sizeof(detail), "%s", (error != NULL && error[0] != '\0') ? error : "unknown error");
@@ -6951,11 +7091,14 @@ int uocr_metal_context_generate_f16(uocr_metal_context *ctx,
         uint32_t token_id = UINT32_MAX;
         float score = 0.0f;
         uocr_no_repeat_ngram_config no_repeat_config;
+        const uint64_t no_repeat_state_start_ns = uocr_profile_now_ns();
         const int no_repeat_status = uocr_sequence_no_repeat_config(&sequence_state, &no_repeat_config);
         if (no_repeat_status != UOCR_OK) {
             UOCR_METAL_DECODE_LOOP_FAIL("integrated Metal fp16 no-repeat state is invalid: %s",
                                         uocr_status_string(no_repeat_status));
         }
+        metal_profile_add_event_now(ctx, "metal.no_repeat_state", no_repeat_state_start_ns);
+        const uint64_t token_selection_start_ns = uocr_profile_now_ns();
         if (!metal_select_next_token_from_hidden_slice_f16(ctx,
                                                            hidden_for_selection,
                                                            norm_scratch,
@@ -6972,6 +7115,10 @@ int uocr_metal_context_generate_f16(uocr_metal_context *ctx,
             char detail[512];
             (void)snprintf(detail, sizeof(detail), "%s", (error != NULL && error[0] != '\0') ? error : "unknown error");
             UOCR_METAL_DECODE_LOOP_FAIL("integrated Metal fp16 next-token selection failed: %s", detail);
+        }
+        metal_profile_add_event_now(ctx, "metal.next_token_selection", token_selection_start_ns);
+        if (sequence_state.generated_count == 0u) {
+            metal_profile_add_event_now(ctx, "metal.first_token", token_selection_start_ns);
         }
         if (token_id >= UOCR_VOCAB_SIZE) {
             UOCR_METAL_DECODE_LOOP_FAIL("integrated Metal fp16 selected invalid token id %u", token_id);
@@ -6994,6 +7141,7 @@ int uocr_metal_context_generate_f16(uocr_metal_context *ctx,
             break;
         }
         if (uocr_sequence_generation_done(&sequence_state)) {
+            metal_profile_add_event_now(ctx, "metal.decode_iteration", decode_iteration_start_ns);
             break;
         }
 
@@ -7007,6 +7155,7 @@ int uocr_metal_context_generate_f16(uocr_metal_context *ctx,
             (void)snprintf(detail, sizeof(detail), "%s", (error != NULL && error[0] != '\0') ? error : "unknown error");
             UOCR_METAL_DECODE_LOOP_FAIL("integrated Metal fp16 decode command batch begin failed: %s", detail);
         }
+        const uint64_t decode_step_start_ns = uocr_profile_now_ns();
         uocr_metal_buffer_slice decode_input;
         uint64_t decode_input_bytes = 0u;
         if (!metal_hidden_arena_segment_slice(ctx, request->slot, 0u, 1u, &decode_input, &decode_input_bytes) ||
@@ -7030,6 +7179,8 @@ int uocr_metal_context_generate_f16(uocr_metal_context *ctx,
             one_hidden_bytes != (uint64_t)UOCR_HIDDEN_SIZE * 2u) {
             UOCR_METAL_DECODE_LOOP_FAIL("integrated Metal fp16 decode hidden slice is invalid");
         }
+        metal_profile_add_event_now(ctx, "metal.decode_step", decode_step_start_ns);
+        metal_profile_add_event_now(ctx, "metal.decode_iteration", decode_iteration_start_ns);
     }
 
 decode_loop_done:
@@ -7049,6 +7200,7 @@ decode_loop_done:
         metal_command_batch_abort(ctx);
         return metal_fail(error, error_size, "%s", decode_loop_error);
     }
+    metal_profile_add_event_now(ctx, "metal.decode_loop", decode_loop_start_ns);
     metal_clear_error(error, error_size);
     return 1;
 }
@@ -7142,7 +7294,7 @@ int uocr_metal_context_get_rows_f16(uocr_metal_context *ctx,
         dst.label = @"uocr_get_rows_output";
         memset([dst contents], 0, (size_t)out_bytes);
 
-        id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
+        id<MTLCommandBuffer> cb = metal_new_command_buffer(ctx);
         if (cb == nil) {
             [dst release];
             [ids release];
@@ -7151,7 +7303,7 @@ int uocr_metal_context_get_rows_f16(uocr_metal_context *ctx,
         }
         cb.label = @"uocr_get_rows_command_buffer";
 
-        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
         if (enc == nil) {
             [dst release];
             [ids release];
@@ -7182,8 +7334,7 @@ int uocr_metal_context_get_rows_f16(uocr_metal_context *ctx,
        threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1u, 1u)];
         [enc endEncoding];
 
-        [cb commit];
-        [cb waitUntilCompleted];
+        UOCR_METAL_COMMIT_AND_WAIT_PROFILED(ctx, cb);
         if (cb.status == MTLCommandBufferStatusError) {
             NSString *description = cb.error != nil ? [cb.error localizedDescription] : @"unknown command-buffer error";
             [dst release];
@@ -7303,7 +7454,7 @@ int uocr_metal_context_get_rows_q8_0(uocr_metal_context *ctx,
         dst.label = @"uocr_get_rows_q8_output";
         memset([dst contents], 0, (size_t)out_bytes);
 
-        id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
+        id<MTLCommandBuffer> cb = metal_new_command_buffer(ctx);
         if (cb == nil) {
             [dst release];
             [ids release];
@@ -7312,7 +7463,7 @@ int uocr_metal_context_get_rows_q8_0(uocr_metal_context *ctx,
         }
         cb.label = @"uocr_get_rows_q8_command_buffer";
 
-        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
         if (enc == nil) {
             [dst release];
             [ids release];
@@ -7347,8 +7498,7 @@ int uocr_metal_context_get_rows_q8_0(uocr_metal_context *ctx,
        threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1u, 1u)];
         [enc endEncoding];
 
-        [cb commit];
-        [cb waitUntilCompleted];
+        UOCR_METAL_COMMIT_AND_WAIT_PROFILED(ctx, cb);
         if (cb.status == MTLCommandBufferStatusError) {
             NSString *description = cb.error != nil ? [cb.error localizedDescription] : @"unknown command-buffer error";
             [dst release];
@@ -7522,7 +7672,7 @@ static int metal_context_assemble_prompt_f16_with_table_buffer_to_buffer(uocr_me
             image_features.label = @"uocr_prompt_image_features_f16";
         }
 
-        id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
+        id<MTLCommandBuffer> cb = metal_new_command_buffer(ctx);
         if (cb == nil) {
             [image_features release];
             [tokens release];
@@ -7530,7 +7680,7 @@ static int metal_context_assemble_prompt_f16_with_table_buffer_to_buffer(uocr_me
         }
         cb.label = @"uocr_prompt_assembly_command_buffer";
 
-        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
         if (enc == nil) {
             [image_features release];
             [tokens release];
@@ -7570,8 +7720,7 @@ static int metal_context_assemble_prompt_f16_with_table_buffer_to_buffer(uocr_me
        threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1u, 1u)];
         [enc endEncoding];
 
-        [cb commit];
-        [cb waitUntilCompleted];
+        UOCR_METAL_COMMIT_AND_WAIT_PROFILED(ctx, cb);
         if (cb.status == MTLCommandBufferStatusError) {
             NSString *description = cb.error != nil ? [cb.error localizedDescription] : @"unknown command-buffer error";
             [image_features release];
@@ -7862,7 +8011,7 @@ int uocr_metal_context_sam_patch_embed_f16(uocr_metal_context *ctx,
             return 0;
         }
 
-        id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
+        id<MTLCommandBuffer> cb = metal_new_command_buffer(ctx);
         if (cb == nil) {
             [output_buffer release];
             [bias_buffer release];
@@ -7871,7 +8020,7 @@ int uocr_metal_context_sam_patch_embed_f16(uocr_metal_context *ctx,
             return metal_fail(error, error_size, "failed to create Metal SAM patch-embed command buffer");
         }
         cb.label = @"uocr_sam_patch_embed_command_buffer";
-        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
         if (enc == nil) {
             [output_buffer release];
             [bias_buffer release];
@@ -7908,8 +8057,7 @@ int uocr_metal_context_sam_patch_embed_f16(uocr_metal_context *ctx,
         [enc dispatchThreads:MTLSizeMake((NSUInteger)UOCR_SAM_HIDDEN_SIZE, (NSUInteger)output_patches, 1u)
        threadsPerThreadgroup:MTLSizeMake(threads_x, 1u, 1u)];
         [enc endEncoding];
-        [cb commit];
-        [cb waitUntilCompleted];
+        UOCR_METAL_COMMIT_AND_WAIT_PROFILED(ctx, cb);
 
         int ok = 1;
         if (cb.status == MTLCommandBufferStatusError) {
@@ -8009,7 +8157,7 @@ int uocr_metal_context_sam_add_abs_pos_f16(uocr_metal_context *ctx,
             return 0;
         }
 
-        id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
+        id<MTLCommandBuffer> cb = metal_new_command_buffer(ctx);
         if (cb == nil) {
             [output_buffer release];
             [pos_buffer release];
@@ -8017,7 +8165,7 @@ int uocr_metal_context_sam_add_abs_pos_f16(uocr_metal_context *ctx,
             return metal_fail(error, error_size, "failed to create Metal SAM absolute-position command buffer");
         }
         cb.label = @"uocr_sam_abs_pos_command_buffer";
-        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
         if (enc == nil) {
             [output_buffer release];
             [pos_buffer release];
@@ -8050,8 +8198,7 @@ int uocr_metal_context_sam_add_abs_pos_f16(uocr_metal_context *ctx,
         [enc dispatchThreads:MTLSizeMake((NSUInteger)target_values, 1u, 1u)
        threadsPerThreadgroup:MTLSizeMake(threads, 1u, 1u)];
         [enc endEncoding];
-        [cb commit];
-        [cb waitUntilCompleted];
+        UOCR_METAL_COMMIT_AND_WAIT_PROFILED(ctx, cb);
 
         int ok = 1;
         if (cb.status == MTLCommandBufferStatusError) {
@@ -8191,14 +8338,14 @@ int uocr_metal_context_read_prompt_arena_f16(uocr_metal_context *ctx,
         }
         readback.label = @"uocr_prompt_arena_readback";
 
-        id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
+        id<MTLCommandBuffer> cb = metal_new_command_buffer(ctx);
         if (cb == nil) {
             [readback release];
             return metal_fail(error, error_size, "failed to create Metal prompt arena readback command buffer");
         }
         cb.label = @"uocr_prompt_arena_readback_command_buffer";
 
-        id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+        id<MTLBlitCommandEncoder> blit = metal_blit_command_encoder(ctx, cb);
         if (blit == nil) {
             [readback release];
             return metal_fail(error, error_size, "failed to create Metal prompt arena readback blit encoder");
@@ -8209,8 +8356,7 @@ int uocr_metal_context_read_prompt_arena_f16(uocr_metal_context *ctx,
            destinationOffset:0u
                         size:(NSUInteger)readback_bytes];
         [blit endEncoding];
-        [cb commit];
-        [cb waitUntilCompleted];
+        UOCR_METAL_COMMIT_AND_WAIT_PROFILED(ctx, cb);
         if (cb.status == MTLCommandBufferStatusError) {
             NSString *description = cb.error != nil ? [cb.error localizedDescription] : @"unknown command-buffer error";
             [readback release];
@@ -8329,7 +8475,7 @@ static int metal_context_rmsnorm_f16_with_weight_buffer(uocr_metal_context *ctx,
         dst.label = @"uocr_rmsnorm_output";
         memset([dst contents], 0, (size_t)output_bytes);
 
-        id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
+        id<MTLCommandBuffer> cb = metal_new_command_buffer(ctx);
         if (cb == nil) {
             [dst release];
             [src release];
@@ -8337,7 +8483,7 @@ static int metal_context_rmsnorm_f16_with_weight_buffer(uocr_metal_context *ctx,
         }
         cb.label = @"uocr_rmsnorm_command_buffer";
 
-        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
         if (enc == nil) {
             [dst release];
             [src release];
@@ -8368,8 +8514,7 @@ static int metal_context_rmsnorm_f16_with_weight_buffer(uocr_metal_context *ctx,
              threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1u, 1u)];
         [enc endEncoding];
 
-        [cb commit];
-        [cb waitUntilCompleted];
+        UOCR_METAL_COMMIT_AND_WAIT_PROFILED(ctx, cb);
         if (cb.status == MTLCommandBufferStatusError) {
             NSString *description = cb.error != nil ? [cb.error localizedDescription] : @"unknown command-buffer error";
             [dst release];
@@ -8531,7 +8676,7 @@ static int metal_context_layernorm_f16_with_parameter_buffers(uocr_metal_context
         dst.label = @"uocr_layernorm_output";
         memset([dst contents], 0, (size_t)output_bytes);
 
-        id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
+        id<MTLCommandBuffer> cb = metal_new_command_buffer(ctx);
         if (cb == nil) {
             [dst release];
             [src release];
@@ -8539,7 +8684,7 @@ static int metal_context_layernorm_f16_with_parameter_buffers(uocr_metal_context
         }
         cb.label = @"uocr_layernorm_command_buffer";
 
-        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
         if (enc == nil) {
             [dst release];
             [src release];
@@ -8571,8 +8716,7 @@ static int metal_context_layernorm_f16_with_parameter_buffers(uocr_metal_context
              threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1u, 1u)];
         [enc endEncoding];
 
-        [cb commit];
-        [cb waitUntilCompleted];
+        UOCR_METAL_COMMIT_AND_WAIT_PROFILED(ctx, cb);
         if (cb.status == MTLCommandBufferStatusError) {
             NSString *description = cb.error != nil ? [cb.error localizedDescription] : @"unknown command-buffer error";
             [dst release];
@@ -8802,7 +8946,7 @@ int uocr_metal_context_sam_qkv_f16(uocr_metal_context *ctx,
             return 1;
         }
 
-        id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
+        id<MTLCommandBuffer> cb = metal_new_command_buffer(ctx);
         if (cb == nil) {
             [v_dst release];
             [k_dst release];
@@ -8814,7 +8958,7 @@ int uocr_metal_context_sam_qkv_f16(uocr_metal_context *ctx,
         }
         cb.label = @"uocr_sam_qkv_command_buffer";
 
-        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
         if (enc == nil) {
             [v_dst release];
             [k_dst release];
@@ -8856,8 +9000,7 @@ int uocr_metal_context_sam_qkv_f16(uocr_metal_context *ctx,
              threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1u, 1u)];
         [enc endEncoding];
 
-        [cb commit];
-        [cb waitUntilCompleted];
+        UOCR_METAL_COMMIT_AND_WAIT_PROFILED(ctx, cb);
         if (cb.status == MTLCommandBufferStatusError) {
             NSString *description = cb.error != nil ? [cb.error localizedDescription] : @"unknown command-buffer error";
             [v_dst release];
@@ -9009,14 +9152,14 @@ int uocr_metal_context_sam_window_partition_f16(uocr_metal_context *ctx,
         dst.label = @"uocr_sam_window_partition_output_f16";
         memset([dst contents], 0, (size_t)window_bytes);
 
-        cb = [ctx->queue commandBuffer];
+        cb = metal_new_command_buffer(ctx);
         if (cb == nil) {
             result = metal_fail(error, error_size, "failed to create Metal SAM window partition command buffer");
             goto cleanup_window_partition;
         }
         cb.label = @"uocr_sam_window_partition_command_buffer";
 
-        enc = [cb computeCommandEncoder];
+        enc = metal_compute_command_encoder(ctx, cb);
         if (enc == nil) {
             result = metal_fail(error, error_size, "failed to create Metal SAM window partition command encoder");
             goto cleanup_window_partition;
@@ -9041,8 +9184,7 @@ int uocr_metal_context_sam_window_partition_f16(uocr_metal_context *ctx,
              threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1u, 1u)];
         [enc endEncoding];
 
-        [cb commit];
-        [cb waitUntilCompleted];
+        UOCR_METAL_COMMIT_AND_WAIT_PROFILED(ctx, cb);
         if (cb.status == MTLCommandBufferStatusError) {
             NSString *description = cb.error != nil ? [cb.error localizedDescription] : @"unknown command-buffer error";
             result = metal_fail(error, error_size, "Metal SAM window partition command failed: %s", [description UTF8String]);
@@ -9155,14 +9297,14 @@ int uocr_metal_context_sam_window_unpartition_f16(uocr_metal_context *ctx,
         dst.label = @"uocr_sam_window_unpartition_output_bhwc_f16";
         memset([dst contents], 0, (size_t)output_bytes);
 
-        cb = [ctx->queue commandBuffer];
+        cb = metal_new_command_buffer(ctx);
         if (cb == nil) {
             result = metal_fail(error, error_size, "failed to create Metal SAM window unpartition command buffer");
             goto cleanup_window_unpartition;
         }
         cb.label = @"uocr_sam_window_unpartition_command_buffer";
 
-        enc = [cb computeCommandEncoder];
+        enc = metal_compute_command_encoder(ctx, cb);
         if (enc == nil) {
             result = metal_fail(error, error_size, "failed to create Metal SAM window unpartition command encoder");
             goto cleanup_window_unpartition;
@@ -9187,8 +9329,7 @@ int uocr_metal_context_sam_window_unpartition_f16(uocr_metal_context *ctx,
              threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1u, 1u)];
         [enc endEncoding];
 
-        [cb commit];
-        [cb waitUntilCompleted];
+        UOCR_METAL_COMMIT_AND_WAIT_PROFILED(ctx, cb);
         if (cb.status == MTLCommandBufferStatusError) {
             NSString *description = cb.error != nil ? [cb.error localizedDescription] : @"unknown command-buffer error";
             result = metal_fail(error,
@@ -9310,14 +9451,14 @@ int uocr_metal_context_sam_neck_conv1x1_f16(uocr_metal_context *ctx,
             goto cleanup_sam_neck_conv1x1;
         }
 
-        cb = [ctx->queue commandBuffer];
+        cb = metal_new_command_buffer(ctx);
         if (cb == nil) {
             result = metal_fail(error, error_size, "failed to create Metal SAM neck 1x1 command buffer");
             goto cleanup_sam_neck_conv1x1;
         }
         cb.label = @"uocr_sam_neck_conv1x1_command_buffer";
 
-        enc = [cb computeCommandEncoder];
+        enc = metal_compute_command_encoder(ctx, cb);
         if (enc == nil) {
             result = metal_fail(error, error_size, "failed to create Metal SAM neck 1x1 command encoder");
             goto cleanup_sam_neck_conv1x1;
@@ -9339,8 +9480,7 @@ int uocr_metal_context_sam_neck_conv1x1_f16(uocr_metal_context *ctx,
              threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1u, 1u)];
         [enc endEncoding];
 
-        [cb commit];
-        [cb waitUntilCompleted];
+        UOCR_METAL_COMMIT_AND_WAIT_PROFILED(ctx, cb);
         if (cb.status == MTLCommandBufferStatusError) {
             NSString *description = cb.error != nil ? [cb.error localizedDescription] : @"unknown command-buffer error";
             result = metal_fail(error, error_size, "Metal SAM neck 1x1 command failed: %s", [description UTF8String]);
@@ -9461,14 +9601,14 @@ int uocr_metal_context_sam_neck_conv3x3_f16(uocr_metal_context *ctx,
             goto cleanup_sam_neck_conv3x3;
         }
 
-        cb = [ctx->queue commandBuffer];
+        cb = metal_new_command_buffer(ctx);
         if (cb == nil) {
             result = metal_fail(error, error_size, "failed to create Metal SAM neck 3x3 command buffer");
             goto cleanup_sam_neck_conv3x3;
         }
         cb.label = @"uocr_sam_neck_conv3x3_command_buffer";
 
-        enc = [cb computeCommandEncoder];
+        enc = metal_compute_command_encoder(ctx, cb);
         if (enc == nil) {
             result = metal_fail(error, error_size, "failed to create Metal SAM neck 3x3 command encoder");
             goto cleanup_sam_neck_conv3x3;
@@ -9490,8 +9630,7 @@ int uocr_metal_context_sam_neck_conv3x3_f16(uocr_metal_context *ctx,
              threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1u, 1u)];
         [enc endEncoding];
 
-        [cb commit];
-        [cb waitUntilCompleted];
+        UOCR_METAL_COMMIT_AND_WAIT_PROFILED(ctx, cb);
         if (cb.status == MTLCommandBufferStatusError) {
             NSString *description = cb.error != nil ? [cb.error localizedDescription] : @"unknown command-buffer error";
             result = metal_fail(error, error_size, "Metal SAM neck 3x3 command failed: %s", [description UTF8String]);
@@ -9628,14 +9767,14 @@ int uocr_metal_context_sam_layernorm2d_f16(uocr_metal_context *ctx,
             goto cleanup_sam_layernorm2d;
         }
 
-        cb = [ctx->queue commandBuffer];
+        cb = metal_new_command_buffer(ctx);
         if (cb == nil) {
             result = metal_fail(error, error_size, "failed to create Metal SAM LayerNorm2d command buffer");
             goto cleanup_sam_layernorm2d;
         }
         cb.label = @"uocr_sam_layernorm2d_command_buffer";
 
-        enc = [cb computeCommandEncoder];
+        enc = metal_compute_command_encoder(ctx, cb);
         if (enc == nil) {
             result = metal_fail(error, error_size, "failed to create Metal SAM LayerNorm2d command encoder");
             goto cleanup_sam_layernorm2d;
@@ -9658,8 +9797,7 @@ int uocr_metal_context_sam_layernorm2d_f16(uocr_metal_context *ctx,
              threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1u, 1u)];
         [enc endEncoding];
 
-        [cb commit];
-        [cb waitUntilCompleted];
+        UOCR_METAL_COMMIT_AND_WAIT_PROFILED(ctx, cb);
         if (cb.status == MTLCommandBufferStatusError) {
             NSString *description = cb.error != nil ? [cb.error localizedDescription] : @"unknown command-buffer error";
             result = metal_fail(error, error_size, "Metal SAM LayerNorm2d command failed: %s", [description UTF8String]);
@@ -9796,14 +9934,14 @@ static int metal_context_sam_conv3x3_stride2_nchw_f16(uocr_metal_context *ctx,
             goto cleanup_sam_conv3x3_stride2;
         }
 
-        cb = [ctx->queue commandBuffer];
+        cb = metal_new_command_buffer(ctx);
         if (cb == nil) {
             result = metal_fail(error, error_size, "failed to create %s command buffer", diagnostic_name);
             goto cleanup_sam_conv3x3_stride2;
         }
         cb.label = @"uocr_sam_conv3x3_stride2_command_buffer";
 
-        enc = [cb computeCommandEncoder];
+        enc = metal_compute_command_encoder(ctx, cb);
         if (enc == nil) {
             result = metal_fail(error, error_size, "failed to create %s command encoder", diagnostic_name);
             goto cleanup_sam_conv3x3_stride2;
@@ -9829,8 +9967,7 @@ static int metal_context_sam_conv3x3_stride2_nchw_f16(uocr_metal_context *ctx,
              threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1u, 1u)];
         [enc endEncoding];
 
-        [cb commit];
-        [cb waitUntilCompleted];
+        UOCR_METAL_COMMIT_AND_WAIT_PROFILED(ctx, cb);
         if (cb.status == MTLCommandBufferStatusError) {
             NSString *description = cb.error != nil ? [cb.error localizedDescription] : @"unknown command-buffer error";
             result = metal_fail(error, error_size, "%s command failed: %s", diagnostic_name, [description UTF8String]);
@@ -9995,7 +10132,7 @@ int uocr_metal_context_clip_embed_sam_f16(uocr_metal_context *ctx,
         dst.label = @"uocr_clip_embed_sam_output_tokens";
         memset([dst contents], 0, (size_t)output_bytes);
 
-        id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
+        id<MTLCommandBuffer> cb = metal_new_command_buffer(ctx);
         if (cb == nil) {
             [dst release];
             [cls release];
@@ -10004,7 +10141,7 @@ int uocr_metal_context_clip_embed_sam_f16(uocr_metal_context *ctx,
         }
         cb.label = @"uocr_clip_embed_sam_command_buffer";
 
-        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
         if (enc == nil) {
             [dst release];
             [cls release];
@@ -10034,8 +10171,7 @@ int uocr_metal_context_clip_embed_sam_f16(uocr_metal_context *ctx,
        threadsPerThreadgroup:MTLSizeMake(threads_x, 1u, 1u)];
         [enc endEncoding];
 
-        [cb commit];
-        [cb waitUntilCompleted];
+        UOCR_METAL_COMMIT_AND_WAIT_PROFILED(ctx, cb);
         if (cb.status == MTLCommandBufferStatusError) {
             NSString *description = cb.error != nil ? [cb.error localizedDescription] : @"unknown command-buffer error";
             result = metal_fail(error,
@@ -10148,7 +10284,7 @@ int uocr_metal_context_clip_add_abs_pos_f16(uocr_metal_context *ctx,
         dst.label = @"uocr_clip_abs_pos_output_tokens";
         memset([dst contents], 0, (size_t)output_bytes);
 
-        id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
+        id<MTLCommandBuffer> cb = metal_new_command_buffer(ctx);
         if (cb == nil) {
             [dst release];
             [pos release];
@@ -10157,7 +10293,7 @@ int uocr_metal_context_clip_add_abs_pos_f16(uocr_metal_context *ctx,
         }
         cb.label = @"uocr_clip_abs_pos_command_buffer";
 
-        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
         if (enc == nil) {
             [dst release];
             [pos release];
@@ -10181,8 +10317,7 @@ int uocr_metal_context_clip_add_abs_pos_f16(uocr_metal_context *ctx,
        threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1u, 1u)];
         [enc endEncoding];
 
-        [cb commit];
-        [cb waitUntilCompleted];
+        UOCR_METAL_COMMIT_AND_WAIT_PROFILED(ctx, cb);
         if (cb.status == MTLCommandBufferStatusError) {
             NSString *description = cb.error != nil ? [cb.error localizedDescription] : @"unknown command-buffer error";
             result = metal_fail(error,
@@ -10493,14 +10628,14 @@ int uocr_metal_context_clip_qkv_f16(uocr_metal_context *ctx,
             goto cleanup_clip_qkv;
         }
 
-        id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
+        id<MTLCommandBuffer> cb = metal_new_command_buffer(ctx);
         if (cb == nil) {
             result = metal_fail(error, error_size, "failed to create Metal CLIP QKV command buffer");
             goto cleanup_clip_qkv;
         }
         cb.label = @"uocr_clip_qkv_command_buffer";
 
-        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
         if (enc == nil) {
             result = metal_fail(error, error_size, "failed to create Metal CLIP QKV command encoder");
             goto cleanup_clip_qkv;
@@ -10519,8 +10654,7 @@ int uocr_metal_context_clip_qkv_f16(uocr_metal_context *ctx,
              threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1u, 1u)];
         [enc endEncoding];
 
-        [cb commit];
-        [cb waitUntilCompleted];
+        UOCR_METAL_COMMIT_AND_WAIT_PROFILED(ctx, cb);
         if (cb.status == MTLCommandBufferStatusError) {
             NSString *description = cb.error != nil ? [cb.error localizedDescription] : @"unknown command-buffer error";
             result = metal_fail(error, error_size, "Metal CLIP QKV command failed: %s", [description UTF8String]);
@@ -10658,14 +10792,14 @@ int uocr_metal_context_clip_attention_f16(uocr_metal_context *ctx,
             goto cleanup_clip_attention;
         }
 
-        id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
+        id<MTLCommandBuffer> cb = metal_new_command_buffer(ctx);
         if (cb == nil) {
             result = metal_fail(error, error_size, "failed to create Metal CLIP attention command buffer");
             goto cleanup_clip_attention;
         }
         cb.label = @"uocr_clip_attention_command_buffer";
 
-        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
         if (enc == nil) {
             result = metal_fail(error, error_size, "failed to create Metal CLIP attention command encoder");
             goto cleanup_clip_attention;
@@ -10681,8 +10815,7 @@ int uocr_metal_context_clip_attention_f16(uocr_metal_context *ctx,
              threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1u, 1u)];
         [enc endEncoding];
 
-        [cb commit];
-        [cb waitUntilCompleted];
+        UOCR_METAL_COMMIT_AND_WAIT_PROFILED(ctx, cb);
         if (cb.status == MTLCommandBufferStatusError) {
             NSString *description = cb.error != nil ? [cb.error localizedDescription] : @"unknown command-buffer error";
             result = metal_fail(error, error_size, "Metal CLIP attention command failed: %s", [description UTF8String]);
@@ -10829,14 +10962,14 @@ int uocr_metal_context_clip_quickgelu_f16(uocr_metal_context *ctx,
         dst.label = @"uocr_clip_quickgelu_output";
         memset([dst contents], 0, (size_t)output_bytes);
 
-        cb = [ctx->queue commandBuffer];
+        cb = metal_new_command_buffer(ctx);
         if (cb == nil) {
             result = metal_fail(error, error_size, "failed to create Metal CLIP QuickGELU command buffer");
             goto cleanup_clip_quickgelu;
         }
         cb.label = @"uocr_clip_quickgelu_command_buffer";
 
-        enc = [cb computeCommandEncoder];
+        enc = metal_compute_command_encoder(ctx, cb);
         if (enc == nil) {
             result = metal_fail(error, error_size, "failed to create Metal CLIP QuickGELU command encoder");
             goto cleanup_clip_quickgelu;
@@ -10851,8 +10984,7 @@ int uocr_metal_context_clip_quickgelu_f16(uocr_metal_context *ctx,
        threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1u, 1u)];
         [enc endEncoding];
 
-        [cb commit];
-        [cb waitUntilCompleted];
+        UOCR_METAL_COMMIT_AND_WAIT_PROFILED(ctx, cb);
         if (cb.status == MTLCommandBufferStatusError) {
             NSString *description = cb.error != nil ? [cb.error localizedDescription] : @"unknown command-buffer error";
             result = metal_fail(error, error_size, "Metal CLIP QuickGELU command failed: %s", [description UTF8String]);
@@ -11101,14 +11233,14 @@ int uocr_metal_context_clip_residual_add_f16(uocr_metal_context *ctx,
         dst.label = @"uocr_clip_residual_output";
         memset([dst contents], 0, (size_t)output_bytes);
 
-        cb = [ctx->queue commandBuffer];
+        cb = metal_new_command_buffer(ctx);
         if (cb == nil) {
             result = metal_fail(error, error_size, "failed to create Metal CLIP residual command buffer");
             goto cleanup_clip_residual;
         }
         cb.label = @"uocr_clip_residual_command_buffer";
 
-        enc = [cb computeCommandEncoder];
+        enc = metal_compute_command_encoder(ctx, cb);
         if (enc == nil) {
             result = metal_fail(error, error_size, "failed to create Metal CLIP residual command encoder");
             goto cleanup_clip_residual;
@@ -11124,8 +11256,7 @@ int uocr_metal_context_clip_residual_add_f16(uocr_metal_context *ctx,
        threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1u, 1u)];
         [enc endEncoding];
 
-        [cb commit];
-        [cb waitUntilCompleted];
+        UOCR_METAL_COMMIT_AND_WAIT_PROFILED(ctx, cb);
         if (cb.status == MTLCommandBufferStatusError) {
             NSString *description = cb.error != nil ? [cb.error localizedDescription] : @"unknown command-buffer error";
             result = metal_fail(error, error_size, "Metal CLIP residual command failed: %s", [description UTF8String]);
@@ -11387,6 +11518,7 @@ int uocr_metal_context_clip_transformer_f16(uocr_metal_context *ctx,
     const uint16_t *current_f16 = input_f16;
     uint16_t *next_f16 = state_a_f16;
     for (uint32_t block_index = 0u; block_index < block_count; ++block_index) {
+        const uint64_t block_start_ns = uocr_profile_now_ns();
         const int is_last = block_index + 1u == block_count;
         const uocr_metal_dense_output_type block_output_type = is_last ? output_type : UOCR_METAL_DENSE_OUTPUT_F16;
         void *block_out = is_last ? out : (void *)next_f16;
@@ -11411,6 +11543,8 @@ int uocr_metal_context_clip_transformer_f16(uocr_metal_context *ctx,
             current_f16 = next_f16;
             next_f16 = next_f16 == state_a_f16 ? state_b_f16 : state_a_f16;
         }
+        metal_profile_add_event_now(ctx, "metal.vision.clip_block", block_start_ns);
+        metal_profile_add_event_now_f(ctx, block_start_ns, "metal.vision.clip_block.%02u", block_index);
     }
 
     result = 1;
@@ -11523,14 +11657,14 @@ int uocr_metal_context_clip_sam_concat_f16(uocr_metal_context *ctx,
         dst.label = @"uocr_clip_sam_concat_output";
         memset([dst contents], 0, (size_t)output_bytes);
 
-        cb = [ctx->queue commandBuffer];
+        cb = metal_new_command_buffer(ctx);
         if (cb == nil) {
             result = metal_fail(error, error_size, "failed to create Metal CLIP/SAM concat command buffer");
             goto cleanup_clip_sam_concat;
         }
         cb.label = @"uocr_clip_sam_concat_command_buffer";
 
-        enc = [cb computeCommandEncoder];
+        enc = metal_compute_command_encoder(ctx, cb);
         if (enc == nil) {
             result = metal_fail(error, error_size, "failed to create Metal CLIP/SAM concat command encoder");
             goto cleanup_clip_sam_concat;
@@ -11560,8 +11694,7 @@ int uocr_metal_context_clip_sam_concat_f16(uocr_metal_context *ctx,
        threadsPerThreadgroup:MTLSizeMake(threads_x, 1u, 1u)];
         [enc endEncoding];
 
-        [cb commit];
-        [cb waitUntilCompleted];
+        UOCR_METAL_COMMIT_AND_WAIT_PROFILED(ctx, cb);
         if (cb.status == MTLCommandBufferStatusError) {
             NSString *description = cb.error != nil ? [cb.error localizedDescription] : @"unknown command-buffer error";
             result = metal_fail(error, error_size, "Metal CLIP/SAM concat command failed: %s", [description UTF8String]);
@@ -11981,6 +12114,7 @@ int uocr_metal_context_sam_transformer_f16(uocr_metal_context *ctx,
     const uint16_t *current_f16 = input_bhwc_f16;
     uint16_t *next_f16 = state_a_f16;
     for (uint32_t block_index = 0u; block_index < block_count; ++block_index) {
+        const uint64_t block_start_ns = uocr_profile_now_ns();
         const int is_last = block_index + 1u == block_count;
         const uocr_metal_dense_output_type block_output_type = is_last ? output_type : UOCR_METAL_DENSE_OUTPUT_F16;
         void *block_out = is_last ? out_bhwc : (void *)next_f16;
@@ -12007,6 +12141,8 @@ int uocr_metal_context_sam_transformer_f16(uocr_metal_context *ctx,
             current_f16 = next_f16;
             next_f16 = next_f16 == state_a_f16 ? state_b_f16 : state_a_f16;
         }
+        metal_profile_add_event_now(ctx, "metal.vision.sam_block", block_start_ns);
+        metal_profile_add_event_now_f(ctx, block_start_ns, "metal.vision.sam_block.%02u", block_index);
     }
 
     result = 1;
@@ -12102,7 +12238,7 @@ static int metal_context_sam_attention_f16(uocr_metal_context *ctx,
         dst.label = @"uocr_sam_attention_output";
         memset([dst contents], 0, (size_t)output_bytes);
 
-        id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
+        id<MTLCommandBuffer> cb = metal_new_command_buffer(ctx);
         if (cb == nil) {
             [dst release];
             [v_src release];
@@ -12112,7 +12248,7 @@ static int metal_context_sam_attention_f16(uocr_metal_context *ctx,
         }
         cb.label = @"uocr_sam_attention_command_buffer";
 
-        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
         if (enc == nil) {
             [dst release];
             [v_src release];
@@ -12151,8 +12287,7 @@ static int metal_context_sam_attention_f16(uocr_metal_context *ctx,
              threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1u, 1u)];
         [enc endEncoding];
 
-        [cb commit];
-        [cb waitUntilCompleted];
+        UOCR_METAL_COMMIT_AND_WAIT_PROFILED(ctx, cb);
         if (cb.status == MTLCommandBufferStatusError) {
             NSString *description = cb.error != nil ? [cb.error localizedDescription] : @"unknown command-buffer error";
             [dst release];
@@ -12408,7 +12543,7 @@ int uocr_metal_context_sam_rel_pos_attention_f16(uocr_metal_context *ctx,
         dst.label = @"uocr_sam_rel_pos_attention_output";
         memset([dst contents], 0, (size_t)output_bytes);
 
-        id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
+        id<MTLCommandBuffer> cb = metal_new_command_buffer(ctx);
         if (cb == nil) {
             [dst release];
             [rel_w release];
@@ -12420,7 +12555,7 @@ int uocr_metal_context_sam_rel_pos_attention_f16(uocr_metal_context *ctx,
         }
         cb.label = @"uocr_sam_rel_pos_attention_command_buffer";
 
-        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
         if (enc == nil) {
             [dst release];
             [rel_w release];
@@ -12469,8 +12604,7 @@ int uocr_metal_context_sam_rel_pos_attention_f16(uocr_metal_context *ctx,
              threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1u, 1u)];
         [enc endEncoding];
 
-        [cb commit];
-        [cb waitUntilCompleted];
+        UOCR_METAL_COMMIT_AND_WAIT_PROFILED(ctx, cb);
         if (cb.status == MTLCommandBufferStatusError) {
             NSString *description = cb.error != nil ? [cb.error localizedDescription] : @"unknown command-buffer error";
             [dst release];
@@ -12575,14 +12709,14 @@ int uocr_metal_context_sam_residual_add_f16(uocr_metal_context *ctx,
         dst.label = @"uocr_sam_residual_output";
         memset([dst contents], 0, (size_t)output_bytes);
 
-        cb = [ctx->queue commandBuffer];
+        cb = metal_new_command_buffer(ctx);
         if (cb == nil) {
             result = metal_fail(error, error_size, "failed to create Metal SAM residual command buffer");
             goto cleanup_residual_add;
         }
         cb.label = @"uocr_sam_residual_command_buffer";
 
-        enc = [cb computeCommandEncoder];
+        enc = metal_compute_command_encoder(ctx, cb);
         if (enc == nil) {
             result = metal_fail(error, error_size, "failed to create Metal SAM residual command encoder");
             goto cleanup_residual_add;
@@ -12604,8 +12738,7 @@ int uocr_metal_context_sam_residual_add_f16(uocr_metal_context *ctx,
              threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1u, 1u)];
         [enc endEncoding];
 
-        [cb commit];
-        [cb waitUntilCompleted];
+        UOCR_METAL_COMMIT_AND_WAIT_PROFILED(ctx, cb);
         if (cb.status == MTLCommandBufferStatusError) {
             NSString *description = cb.error != nil ? [cb.error localizedDescription] : @"unknown command-buffer error";
             result = metal_fail(error, error_size, "Metal SAM residual command failed: %s", [description UTF8String]);
@@ -12738,14 +12871,14 @@ int uocr_metal_context_sam_attention_project_residual_f16(uocr_metal_context *ct
         dst.label = @"uocr_sam_attention_project_residual_output";
         memset([dst contents], 0, (size_t)output_bytes);
 
-        cb = [ctx->queue commandBuffer];
+        cb = metal_new_command_buffer(ctx);
         if (cb == nil) {
             result = metal_fail(error, error_size, "failed to create Metal SAM attention residual command buffer");
             goto cleanup_attention_residual;
         }
         cb.label = @"uocr_sam_attention_project_residual_command_buffer";
 
-        enc = [cb computeCommandEncoder];
+        enc = metal_compute_command_encoder(ctx, cb);
         if (enc == nil) {
             result = metal_fail(error, error_size, "failed to create Metal SAM attention residual command encoder");
             goto cleanup_attention_residual;
@@ -12770,8 +12903,7 @@ int uocr_metal_context_sam_attention_project_residual_f16(uocr_metal_context *ct
              threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1u, 1u)];
         [enc endEncoding];
 
-        [cb commit];
-        [cb waitUntilCompleted];
+        UOCR_METAL_COMMIT_AND_WAIT_PROFILED(ctx, cb);
         if (cb.status == MTLCommandBufferStatusError) {
             NSString *description = cb.error != nil ? [cb.error localizedDescription] : @"unknown command-buffer error";
             result = metal_fail(error,
@@ -12949,7 +13081,7 @@ int uocr_metal_context_sam_mlp_f16(uocr_metal_context *ctx,
         dst.label = @"uocr_sam_mlp_output";
         memset([dst contents], 0, (size_t)output_bytes);
 
-        id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
+        id<MTLCommandBuffer> cb = metal_new_command_buffer(ctx);
         if (cb == nil) {
             [dst release];
             [mid release];
@@ -12968,7 +13100,7 @@ int uocr_metal_context_sam_mlp_f16(uocr_metal_context *ctx,
         params.intermediate_size = UOCR_SAM_MLP_INTERMEDIATE;
         params.reserved = 0u;
 
-        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
         if (enc == nil) {
             [dst release];
             [mid release];
@@ -12991,7 +13123,7 @@ int uocr_metal_context_sam_mlp_f16(uocr_metal_context *ctx,
              threadsPerThreadgroup:MTLSizeMake(lin1_threads, 1u, 1u)];
         [enc endEncoding];
 
-        enc = [cb computeCommandEncoder];
+        enc = metal_compute_command_encoder(ctx, cb);
         if (enc == nil) {
             [dst release];
             [mid release];
@@ -13014,8 +13146,7 @@ int uocr_metal_context_sam_mlp_f16(uocr_metal_context *ctx,
              threadsPerThreadgroup:MTLSizeMake(lin2_threads, 1u, 1u)];
         [enc endEncoding];
 
-        [cb commit];
-        [cb waitUntilCompleted];
+        UOCR_METAL_COMMIT_AND_WAIT_PROFILED(ctx, cb);
         if (cb.status == MTLCommandBufferStatusError) {
             NSString *description = cb.error != nil ? [cb.error localizedDescription] : @"unknown command-buffer error";
             [dst release];
@@ -13151,7 +13282,7 @@ int uocr_metal_context_lm_head_f16(uocr_metal_context *ctx,
         dst.label = @"uocr_lm_head_logits_f32";
         memset([dst contents], 0, (size_t)output_bytes);
 
-        id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
+        id<MTLCommandBuffer> cb = metal_new_command_buffer(ctx);
         if (cb == nil) {
             [dst release];
             [src release];
@@ -13159,7 +13290,7 @@ int uocr_metal_context_lm_head_f16(uocr_metal_context *ctx,
         }
         cb.label = @"uocr_lm_head_command_buffer";
 
-        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
         if (enc == nil) {
             [dst release];
             [src release];
@@ -13191,8 +13322,7 @@ int uocr_metal_context_lm_head_f16(uocr_metal_context *ctx,
              threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1u, 1u)];
         [enc endEncoding];
 
-        [cb commit];
-        [cb waitUntilCompleted];
+        UOCR_METAL_COMMIT_AND_WAIT_PROFILED(ctx, cb);
         if (cb.status == MTLCommandBufferStatusError) {
             NSString *description = cb.error != nil ? [cb.error localizedDescription] : @"unknown command-buffer error";
             [dst release];
@@ -13417,7 +13547,7 @@ int uocr_metal_context_apply_no_repeat_ngram_f32(uocr_metal_context *ctx,
         ngram_sizes.label = @"uocr_no_repeat_ngram_sizes";
         windows.label = @"uocr_no_repeat_windows";
 
-        id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
+        id<MTLCommandBuffer> cb = metal_new_command_buffer(ctx);
         if (cb == nil) {
             [windows release];
             [ngram_sizes release];
@@ -13430,7 +13560,7 @@ int uocr_metal_context_apply_no_repeat_ngram_f32(uocr_metal_context *ctx,
         }
         cb.label = @"uocr_no_repeat_ngram_command_buffer";
 
-        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
         if (enc == nil) {
             [windows release];
             [ngram_sizes release];
@@ -13480,8 +13610,7 @@ int uocr_metal_context_apply_no_repeat_ngram_f32(uocr_metal_context *ctx,
              threadsPerThreadgroup:MTLSizeMake(threads_x, 1u, 1u)];
         [enc endEncoding];
 
-        [cb commit];
-        [cb waitUntilCompleted];
+        UOCR_METAL_COMMIT_AND_WAIT_PROFILED(ctx, cb);
         if (cb.status == MTLCommandBufferStatusError) {
             NSString *description = cb.error != nil ? [cb.error localizedDescription] : @"unknown command-buffer error";
             [windows release];
@@ -13568,7 +13697,7 @@ int uocr_metal_context_argmax_f32(uocr_metal_context *ctx,
         memset([ids contents], 0xff, (size_t)ids_bytes);
         memset([scores contents], 0, (size_t)scores_bytes);
 
-        id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
+        id<MTLCommandBuffer> cb = metal_new_command_buffer(ctx);
         if (cb == nil) {
             [scores release];
             [ids release];
@@ -13577,7 +13706,7 @@ int uocr_metal_context_argmax_f32(uocr_metal_context *ctx,
         }
         cb.label = @"uocr_argmax_command_buffer";
 
-        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
         if (enc == nil) {
             [scores release];
             [ids release];
@@ -13613,8 +13742,7 @@ int uocr_metal_context_argmax_f32(uocr_metal_context *ctx,
              threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1u, 1u)];
         [enc endEncoding];
 
-        [cb commit];
-        [cb waitUntilCompleted];
+        UOCR_METAL_COMMIT_AND_WAIT_PROFILED(ctx, cb);
         if (cb.status == MTLCommandBufferStatusError) {
             NSString *description = cb.error != nil ? [cb.error localizedDescription] : @"unknown command-buffer error";
             [scores release];
@@ -13876,7 +14004,7 @@ int uocr_metal_context_dense_f16(uocr_metal_context *ctx,
             return ok;
         }
 
-        id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
+        id<MTLCommandBuffer> cb = metal_new_command_buffer(ctx);
         if (cb == nil) {
             [dst release];
             [bias release];
@@ -13886,7 +14014,7 @@ int uocr_metal_context_dense_f16(uocr_metal_context *ctx,
         }
         cb.label = @"uocr_dense_command_buffer";
 
-        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
         if (enc == nil) {
             [dst release];
             [bias release];
@@ -13913,8 +14041,7 @@ int uocr_metal_context_dense_f16(uocr_metal_context *ctx,
              threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1u, 1u)];
         [enc endEncoding];
 
-        [cb commit];
-        [cb waitUntilCompleted];
+        UOCR_METAL_COMMIT_AND_WAIT_PROFILED(ctx, cb);
         if (cb.status == MTLCommandBufferStatusError) {
             NSString *description = cb.error != nil ? [cb.error localizedDescription] : @"unknown command-buffer error";
             [dst release];
@@ -14045,7 +14172,7 @@ int uocr_metal_context_dense_q8_0(uocr_metal_context *ctx,
         dst.label = @"uocr_dense_q8_output";
         memset([dst contents], 0, (size_t)output_bytes);
 
-        id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
+        id<MTLCommandBuffer> cb = metal_new_command_buffer(ctx);
         if (cb == nil) {
             [dst release];
             [bias release];
@@ -14055,7 +14182,7 @@ int uocr_metal_context_dense_q8_0(uocr_metal_context *ctx,
         }
         cb.label = @"uocr_dense_q8_command_buffer";
 
-        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
         if (enc == nil) {
             [dst release];
             [bias release];
@@ -14086,8 +14213,7 @@ int uocr_metal_context_dense_q8_0(uocr_metal_context *ctx,
              threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1u, 1u)];
         [enc endEncoding];
 
-        [cb commit];
-        [cb waitUntilCompleted];
+        UOCR_METAL_COMMIT_AND_WAIT_PROFILED(ctx, cb);
         if (cb.status == MTLCommandBufferStatusError) {
             NSString *description = cb.error != nil ? [cb.error localizedDescription] : @"unknown command-buffer error";
             [dst release];
@@ -14221,7 +14347,7 @@ int uocr_metal_context_dense_q4_k(uocr_metal_context *ctx,
         dst.label = @"uocr_dense_q4_output";
         memset([dst contents], 0, (size_t)output_bytes);
 
-        id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
+        id<MTLCommandBuffer> cb = metal_new_command_buffer(ctx);
         if (cb == nil) {
             [dst release];
             [bias release];
@@ -14231,7 +14357,7 @@ int uocr_metal_context_dense_q4_k(uocr_metal_context *ctx,
         }
         cb.label = @"uocr_dense_q4_command_buffer";
 
-        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
         if (enc == nil) {
             [dst release];
             [bias release];
@@ -14262,8 +14388,7 @@ int uocr_metal_context_dense_q4_k(uocr_metal_context *ctx,
              threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1u, 1u)];
         [enc endEncoding];
 
-        [cb commit];
-        [cb waitUntilCompleted];
+        UOCR_METAL_COMMIT_AND_WAIT_PROFILED(ctx, cb);
         if (cb.status == MTLCommandBufferStatusError) {
             NSString *description = cb.error != nil ? [cb.error localizedDescription] : @"unknown command-buffer error";
             [dst release];
@@ -14418,7 +14543,7 @@ int uocr_metal_context_attention_qkvo_f16(uocr_metal_context *ctx,
         memset([v_dst contents], 0, (size_t)output_bytes);
         memset([o_dst contents], 0, (size_t)output_bytes);
 
-        id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
+        id<MTLCommandBuffer> cb = metal_new_command_buffer(ctx);
         if (cb == nil) {
             [o_dst release];
             [v_dst release];
@@ -14433,7 +14558,7 @@ int uocr_metal_context_attention_qkvo_f16(uocr_metal_context *ctx,
         }
         cb.label = @"uocr_attention_projection_command_buffer";
 
-        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
         if (enc == nil) {
             [o_dst release];
             [v_dst release];
@@ -14470,8 +14595,7 @@ int uocr_metal_context_attention_qkvo_f16(uocr_metal_context *ctx,
              threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1u, 1u)];
         [enc endEncoding];
 
-        [cb commit];
-        [cb waitUntilCompleted];
+        UOCR_METAL_COMMIT_AND_WAIT_PROFILED(ctx, cb);
         if (cb.status == MTLCommandBufferStatusError) {
             NSString *description = cb.error != nil ? [cb.error localizedDescription] : @"unknown command-buffer error";
             [o_dst release];
@@ -14593,7 +14717,7 @@ int uocr_metal_context_attention_output_residual_f16(uocr_metal_context *ctx,
         dst.label = @"uocr_attention_output_residual_output";
         memset([dst contents], 0, (size_t)output_bytes);
 
-        id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
+        id<MTLCommandBuffer> cb = metal_new_command_buffer(ctx);
         if (cb == nil) {
             [dst release];
             [residual release];
@@ -14603,7 +14727,7 @@ int uocr_metal_context_attention_output_residual_f16(uocr_metal_context *ctx,
         }
         cb.label = @"uocr_attention_output_command_buffer";
 
-        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
         if (enc == nil) {
             [dst release];
             [residual release];
@@ -14630,8 +14754,7 @@ int uocr_metal_context_attention_output_residual_f16(uocr_metal_context *ctx,
              threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1u, 1u)];
         [enc endEncoding];
 
-        [cb commit];
-        [cb waitUntilCompleted];
+        UOCR_METAL_COMMIT_AND_WAIT_PROFILED(ctx, cb);
         if (cb.status == MTLCommandBufferStatusError) {
             NSString *description = cb.error != nil ? [cb.error localizedDescription] : @"unknown command-buffer error";
             [dst release];
@@ -14802,7 +14925,7 @@ static int metal_context_swiglu_f16(uocr_metal_context *ctx,
         dst.label = @"uocr_dense_swiglu_output";
         memset([dst contents], 0, (size_t)output_bytes);
 
-        id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
+        id<MTLCommandBuffer> cb = metal_new_command_buffer(ctx);
         if (cb == nil) {
             [dst release];
             [mid release];
@@ -14821,7 +14944,7 @@ static int metal_context_swiglu_f16(uocr_metal_context *ctx,
         params.intermediate_size = intermediate_size;
         params.has_residual = residual_f16_or_null != NULL ? 1u : 0u;
 
-        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
         if (enc == nil) {
             [dst release];
             [mid release];
@@ -14844,7 +14967,7 @@ static int metal_context_swiglu_f16(uocr_metal_context *ctx,
              threadsPerThreadgroup:MTLSizeMake(gate_threads, 1u, 1u)];
         [enc endEncoding];
 
-        enc = [cb computeCommandEncoder];
+        enc = metal_compute_command_encoder(ctx, cb);
         if (enc == nil) {
             [dst release];
             [mid release];
@@ -14867,8 +14990,7 @@ static int metal_context_swiglu_f16(uocr_metal_context *ctx,
              threadsPerThreadgroup:MTLSizeMake(down_threads, 1u, 1u)];
         [enc endEncoding];
 
-        [cb commit];
-        [cb waitUntilCompleted];
+        UOCR_METAL_COMMIT_AND_WAIT_PROFILED(ctx, cb);
         if (cb.status == MTLCommandBufferStatusError) {
             NSString *description = cb.error != nil ? [cb.error localizedDescription] : @"unknown command-buffer error";
             [dst release];
@@ -15091,7 +15213,7 @@ int uocr_metal_context_moe_shared_experts_q8_0(uocr_metal_context *ctx,
         dst.label = @"uocr_moe_shared_q8_output";
         memset([dst contents], 0, (size_t)output_bytes);
 
-        id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
+        id<MTLCommandBuffer> cb = metal_new_command_buffer(ctx);
         if (cb == nil) {
             [dst release];
             [mid release];
@@ -15113,7 +15235,7 @@ int uocr_metal_context_moe_shared_experts_q8_0(uocr_metal_context *ctx,
         gate_params.reserved0 = 0u;
         gate_params.reserved1 = 0u;
 
-        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
         if (enc == nil) {
             [dst release];
             [mid release];
@@ -15145,7 +15267,7 @@ int uocr_metal_context_moe_shared_experts_q8_0(uocr_metal_context *ctx,
         down_params.reserved0 = 0u;
         down_params.reserved1 = 0u;
 
-        enc = [cb computeCommandEncoder];
+        enc = metal_compute_command_encoder(ctx, cb);
         if (enc == nil) {
             [dst release];
             [mid release];
@@ -15167,8 +15289,7 @@ int uocr_metal_context_moe_shared_experts_q8_0(uocr_metal_context *ctx,
              threadsPerThreadgroup:MTLSizeMake(down_threads, 1u, 1u)];
         [enc endEncoding];
 
-        [cb commit];
-        [cb waitUntilCompleted];
+        UOCR_METAL_COMMIT_AND_WAIT_PROFILED(ctx, cb);
         if (cb.status == MTLCommandBufferStatusError) {
             NSString *description = cb.error != nil ? [cb.error localizedDescription] : @"unknown command-buffer error";
             [dst release];
@@ -15304,7 +15425,7 @@ int uocr_metal_context_moe_router_f16(uocr_metal_context *ctx,
         memset([top_ids contents], 0, (size_t)top_ids_bytes);
         memset([top_weights contents], 0, (size_t)top_weights_bytes);
 
-        id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
+        id<MTLCommandBuffer> cb = metal_new_command_buffer(ctx);
         if (cb == nil) {
             [top_weights release];
             [top_ids release];
@@ -15322,7 +15443,7 @@ int uocr_metal_context_moe_router_f16(uocr_metal_context *ctx,
         params.experts = UOCR_ROUTED_EXPERTS;
         params.top_k = UOCR_MOE_TOP_K;
 
-        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
         if (enc == nil) {
             [top_weights release];
             [top_ids release];
@@ -15343,7 +15464,7 @@ int uocr_metal_context_moe_router_f16(uocr_metal_context *ctx,
              threadsPerThreadgroup:MTLSizeMake(logits_threads, 1u, 1u)];
         [enc endEncoding];
 
-        enc = [cb computeCommandEncoder];
+        enc = metal_compute_command_encoder(ctx, cb);
         if (enc == nil) {
             [top_weights release];
             [top_ids release];
@@ -15367,8 +15488,7 @@ int uocr_metal_context_moe_router_f16(uocr_metal_context *ctx,
              threadsPerThreadgroup:MTLSizeMake(topk_threads, 1u, 1u)];
         [enc endEncoding];
 
-        [cb commit];
-        [cb waitUntilCompleted];
+        UOCR_METAL_COMMIT_AND_WAIT_PROFILED(ctx, cb);
         if (cb.status == MTLCommandBufferStatusError) {
             NSString *description = cb.error != nil ? [cb.error localizedDescription] : @"unknown command-buffer error";
             [top_weights release];
@@ -15562,7 +15682,7 @@ int uocr_metal_context_moe_selected_experts_decode_f16(uocr_metal_context *ctx,
         dst.label = @"uocr_moe_selected_output";
         memset([dst contents], 0, (size_t)output_bytes);
 
-        id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
+        id<MTLCommandBuffer> cb = metal_new_command_buffer(ctx);
         if (cb == nil) {
             (void)metal_fail(error, error_size, "failed to create Metal MoE selected command buffer");
             goto cleanup;
@@ -15575,7 +15695,7 @@ int uocr_metal_context_moe_selected_experts_decode_f16(uocr_metal_context *ctx,
         params.top_k = UOCR_MOE_TOP_K;
         params.reserved = 0u;
 
-        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
         if (enc == nil) {
             (void)metal_fail(error, error_size, "failed to create Metal MoE selected gate/up command encoder");
             goto cleanup;
@@ -15592,7 +15712,7 @@ int uocr_metal_context_moe_selected_experts_decode_f16(uocr_metal_context *ctx,
              threadsPerThreadgroup:MTLSizeMake(gate_threads, 1u, 1u)];
         [enc endEncoding];
 
-        enc = [cb computeCommandEncoder];
+        enc = metal_compute_command_encoder(ctx, cb);
         if (enc == nil) {
             (void)metal_fail(error, error_size, "failed to create Metal MoE selected down command encoder");
             goto cleanup;
@@ -15609,8 +15729,7 @@ int uocr_metal_context_moe_selected_experts_decode_f16(uocr_metal_context *ctx,
              threadsPerThreadgroup:MTLSizeMake(down_threads, 1u, 1u)];
         [enc endEncoding];
 
-        [cb commit];
-        [cb waitUntilCompleted];
+        UOCR_METAL_COMMIT_AND_WAIT_PROFILED(ctx, cb);
         if (cb.status == MTLCommandBufferStatusError) {
             NSString *description = cb.error != nil ? [cb.error localizedDescription] : @"unknown command-buffer error";
             (void)metal_fail(error, error_size, "Metal MoE selected command failed: %s", [description UTF8String]);
@@ -15814,7 +15933,7 @@ int uocr_metal_context_moe_selected_experts_decode_q4_k(uocr_metal_context *ctx,
         dst.label = @"uocr_moe_selected_q4_output";
         memset([dst contents], 0, (size_t)output_bytes);
 
-        id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
+        id<MTLCommandBuffer> cb = metal_new_command_buffer(ctx);
         if (cb == nil) {
             (void)metal_fail(error, error_size, "failed to create Metal MoE selected Q4_K command buffer");
             goto cleanup;
@@ -15831,7 +15950,7 @@ int uocr_metal_context_moe_selected_experts_decode_q4_k(uocr_metal_context *ctx,
         gate_params.reserved1 = 0u;
         gate_params.reserved2 = 0u;
 
-        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
         if (enc == nil) {
             (void)metal_fail(error, error_size, "failed to create Metal MoE selected Q4_K gate/up command encoder");
             goto cleanup;
@@ -15854,7 +15973,7 @@ int uocr_metal_context_moe_selected_experts_decode_q4_k(uocr_metal_context *ctx,
         down_params.top_k = UOCR_MOE_TOP_K;
         down_params.reserved = 0u;
 
-        enc = [cb computeCommandEncoder];
+        enc = metal_compute_command_encoder(ctx, cb);
         if (enc == nil) {
             (void)metal_fail(error, error_size, "failed to create Metal MoE selected Q4_K down command encoder");
             goto cleanup;
@@ -15871,8 +15990,7 @@ int uocr_metal_context_moe_selected_experts_decode_q4_k(uocr_metal_context *ctx,
              threadsPerThreadgroup:MTLSizeMake(down_threads, 1u, 1u)];
         [enc endEncoding];
 
-        [cb commit];
-        [cb waitUntilCompleted];
+        UOCR_METAL_COMMIT_AND_WAIT_PROFILED(ctx, cb);
         if (cb.status == MTLCommandBufferStatusError) {
             NSString *description = cb.error != nil ? [cb.error localizedDescription] : @"unknown command-buffer error";
             (void)metal_fail(error, error_size, "Metal MoE selected Q4_K command failed: %s", [description UTF8String]);
@@ -16093,7 +16211,7 @@ int uocr_metal_context_moe_selected_experts_decode_q4_k_q8_0(uocr_metal_context 
         dst.label = @"uocr_moe_selected_q4q8_output";
         memset([dst contents], 0, (size_t)output_bytes);
 
-        id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
+        id<MTLCommandBuffer> cb = metal_new_command_buffer(ctx);
         if (cb == nil) {
             (void)metal_fail(error, error_size, "failed to create Metal MoE selected Q4_K/Q8_0 command buffer");
             goto cleanup;
@@ -16110,7 +16228,7 @@ int uocr_metal_context_moe_selected_experts_decode_q4_k_q8_0(uocr_metal_context 
         gate_params.reserved1 = 0u;
         gate_params.reserved2 = 0u;
 
-        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
         if (enc == nil) {
             (void)metal_fail(error, error_size, "failed to create Metal MoE selected Q4_K/Q8_0 gate/up command encoder");
             goto cleanup;
@@ -16137,7 +16255,7 @@ int uocr_metal_context_moe_selected_experts_decode_q4_k_q8_0(uocr_metal_context 
         down_params.reserved1 = 0u;
         down_params.reserved2 = 0u;
 
-        enc = [cb computeCommandEncoder];
+        enc = metal_compute_command_encoder(ctx, cb);
         if (enc == nil) {
             (void)metal_fail(error, error_size, "failed to create Metal MoE selected Q4_K/Q8_0 down command encoder");
             goto cleanup;
@@ -16154,8 +16272,7 @@ int uocr_metal_context_moe_selected_experts_decode_q4_k_q8_0(uocr_metal_context 
              threadsPerThreadgroup:MTLSizeMake(down_threads, 1u, 1u)];
         [enc endEncoding];
 
-        [cb commit];
-        [cb waitUntilCompleted];
+        UOCR_METAL_COMMIT_AND_WAIT_PROFILED(ctx, cb);
         if (cb.status == MTLCommandBufferStatusError) {
             NSString *description = cb.error != nil ? [cb.error localizedDescription] : @"unknown command-buffer error";
             (void)metal_fail(error, error_size, "Metal MoE selected Q4_K/Q8_0 command failed: %s", [description UTF8String]);
@@ -16379,7 +16496,7 @@ int uocr_metal_context_moe_selected_experts_decode_q4_k_padded(uocr_metal_contex
         dst.label = @"uocr_moe_selected_q4p_output";
         memset([dst contents], 0, (size_t)output_bytes);
 
-        id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
+        id<MTLCommandBuffer> cb = metal_new_command_buffer(ctx);
         if (cb == nil) {
             (void)metal_fail(error, error_size, "failed to create Metal MoE selected Q4_K/padded-Q4_K command buffer");
             goto cleanup;
@@ -16396,7 +16513,7 @@ int uocr_metal_context_moe_selected_experts_decode_q4_k_padded(uocr_metal_contex
         gate_params.reserved1 = 0u;
         gate_params.reserved2 = 0u;
 
-        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
         if (enc == nil) {
             (void)metal_fail(error, error_size, "failed to create Metal MoE selected Q4_K/padded-Q4_K gate/up command encoder");
             goto cleanup;
@@ -16423,7 +16540,7 @@ int uocr_metal_context_moe_selected_experts_decode_q4_k_padded(uocr_metal_contex
         down_params.reserved1 = 0u;
         down_params.reserved2 = 0u;
 
-        enc = [cb computeCommandEncoder];
+        enc = metal_compute_command_encoder(ctx, cb);
         if (enc == nil) {
             (void)metal_fail(error, error_size, "failed to create Metal MoE selected Q4_K/padded-Q4_K down command encoder");
             goto cleanup;
@@ -16440,8 +16557,7 @@ int uocr_metal_context_moe_selected_experts_decode_q4_k_padded(uocr_metal_contex
              threadsPerThreadgroup:MTLSizeMake(down_threads, 1u, 1u)];
         [enc endEncoding];
 
-        [cb commit];
-        [cb waitUntilCompleted];
+        UOCR_METAL_COMMIT_AND_WAIT_PROFILED(ctx, cb);
         if (cb.status == MTLCommandBufferStatusError) {
             NSString *description = cb.error != nil ? [cb.error localizedDescription] : @"unknown command-buffer error";
             (void)metal_fail(error, error_size, "Metal MoE selected Q4_K/padded-Q4_K command failed: %s", [description UTF8String]);
@@ -16669,7 +16785,7 @@ int uocr_metal_context_moe_selected_experts_prefill_f16(uocr_metal_context *ctx,
         dst.label = @"uocr_moe_prefill_output";
         memset([dst contents], 0, (size_t)output_bytes);
 
-        id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
+        id<MTLCommandBuffer> cb = metal_new_command_buffer(ctx);
         if (cb == nil) {
             (void)metal_fail(error, error_size, "failed to create Metal MoE prefill command buffer");
             goto cleanup;
@@ -16686,7 +16802,7 @@ int uocr_metal_context_moe_selected_experts_prefill_f16(uocr_metal_context *ctx,
         params.reserved1 = 0u;
         params.reserved2 = 0u;
 
-        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
         if (enc == nil) {
             (void)metal_fail(error, error_size, "failed to create Metal MoE prefill gate/up command encoder");
             goto cleanup;
@@ -16704,7 +16820,7 @@ int uocr_metal_context_moe_selected_experts_prefill_f16(uocr_metal_context *ctx,
              threadsPerThreadgroup:MTLSizeMake(gate_threads, 1u, 1u)];
         [enc endEncoding];
 
-        enc = [cb computeCommandEncoder];
+        enc = metal_compute_command_encoder(ctx, cb);
         if (enc == nil) {
             (void)metal_fail(error, error_size, "failed to create Metal MoE prefill down command encoder");
             goto cleanup;
@@ -16722,8 +16838,7 @@ int uocr_metal_context_moe_selected_experts_prefill_f16(uocr_metal_context *ctx,
              threadsPerThreadgroup:MTLSizeMake(down_threads, 1u, 1u)];
         [enc endEncoding];
 
-        [cb commit];
-        [cb waitUntilCompleted];
+        UOCR_METAL_COMMIT_AND_WAIT_PROFILED(ctx, cb);
         if (cb.status == MTLCommandBufferStatusError) {
             NSString *description = cb.error != nil ? [cb.error localizedDescription] : @"unknown command-buffer error";
             (void)metal_fail(error, error_size, "Metal MoE prefill command failed: %s", [description UTF8String]);
@@ -16968,7 +17083,7 @@ int uocr_metal_context_moe_selected_experts_prefill_q4_k(uocr_metal_context *ctx
         dst.label = @"uocr_moe_prefill_q4_output";
         memset([dst contents], 0, (size_t)output_bytes);
 
-        id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
+        id<MTLCommandBuffer> cb = metal_new_command_buffer(ctx);
         if (cb == nil) {
             (void)metal_fail(error, error_size, "failed to create Metal MoE Q4_K prefill command buffer");
             goto cleanup;
@@ -16985,7 +17100,7 @@ int uocr_metal_context_moe_selected_experts_prefill_q4_k(uocr_metal_context *ctx
         gate_params.gate_row_size = (uint32_t)gate_row_size;
         gate_params.reserved0 = 0u;
 
-        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
         if (enc == nil) {
             (void)metal_fail(error, error_size, "failed to create Metal MoE Q4_K prefill gate/up command encoder");
             goto cleanup;
@@ -17013,7 +17128,7 @@ int uocr_metal_context_moe_selected_experts_prefill_q4_k(uocr_metal_context *ctx
         down_params.reserved1 = 0u;
         down_params.reserved2 = 0u;
 
-        enc = [cb computeCommandEncoder];
+        enc = metal_compute_command_encoder(ctx, cb);
         if (enc == nil) {
             (void)metal_fail(error, error_size, "failed to create Metal MoE Q4_K prefill down command encoder");
             goto cleanup;
@@ -17031,8 +17146,7 @@ int uocr_metal_context_moe_selected_experts_prefill_q4_k(uocr_metal_context *ctx
              threadsPerThreadgroup:MTLSizeMake(down_threads, 1u, 1u)];
         [enc endEncoding];
 
-        [cb commit];
-        [cb waitUntilCompleted];
+        UOCR_METAL_COMMIT_AND_WAIT_PROFILED(ctx, cb);
         if (cb.status == MTLCommandBufferStatusError) {
             NSString *description = cb.error != nil ? [cb.error localizedDescription] : @"unknown command-buffer error";
             (void)metal_fail(error, error_size, "Metal MoE Q4_K prefill command failed: %s", [description UTF8String]);
@@ -17292,7 +17406,7 @@ int uocr_metal_context_moe_selected_experts_prefill_q4_k_q8_0(uocr_metal_context
         dst.label = @"uocr_moe_prefill_q4q8_output";
         memset([dst contents], 0, (size_t)output_bytes);
 
-        id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
+        id<MTLCommandBuffer> cb = metal_new_command_buffer(ctx);
         if (cb == nil) {
             (void)metal_fail(error, error_size, "failed to create Metal MoE Q4_K/Q8_0 prefill command buffer");
             goto cleanup;
@@ -17309,7 +17423,7 @@ int uocr_metal_context_moe_selected_experts_prefill_q4_k_q8_0(uocr_metal_context
         gate_params.gate_row_size = (uint32_t)gate_row_size;
         gate_params.reserved0 = 0u;
 
-        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
         if (enc == nil) {
             (void)metal_fail(error, error_size, "failed to create Metal MoE Q4_K/Q8_0 prefill gate/up command encoder");
             goto cleanup;
@@ -17337,7 +17451,7 @@ int uocr_metal_context_moe_selected_experts_prefill_q4_k_q8_0(uocr_metal_context
         down_params.down_row_size = (uint32_t)down_row_size;
         down_params.reserved0 = 0u;
 
-        enc = [cb computeCommandEncoder];
+        enc = metal_compute_command_encoder(ctx, cb);
         if (enc == nil) {
             (void)metal_fail(error, error_size, "failed to create Metal MoE Q4_K/Q8_0 prefill down command encoder");
             goto cleanup;
@@ -17355,8 +17469,7 @@ int uocr_metal_context_moe_selected_experts_prefill_q4_k_q8_0(uocr_metal_context
              threadsPerThreadgroup:MTLSizeMake(down_threads, 1u, 1u)];
         [enc endEncoding];
 
-        [cb commit];
-        [cb waitUntilCompleted];
+        UOCR_METAL_COMMIT_AND_WAIT_PROFILED(ctx, cb);
         if (cb.status == MTLCommandBufferStatusError) {
             NSString *description = cb.error != nil ? [cb.error localizedDescription] : @"unknown command-buffer error";
             (void)metal_fail(error, error_size, "Metal MoE Q4_K/Q8_0 prefill command failed: %s", [description UTF8String]);
@@ -17619,7 +17732,7 @@ int uocr_metal_context_moe_selected_experts_prefill_q4_k_padded(uocr_metal_conte
         dst.label = @"uocr_moe_prefill_q4p_output";
         memset([dst contents], 0, (size_t)output_bytes);
 
-        id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
+        id<MTLCommandBuffer> cb = metal_new_command_buffer(ctx);
         if (cb == nil) {
             (void)metal_fail(error, error_size, "failed to create Metal MoE Q4_K/padded-Q4_K prefill command buffer");
             goto cleanup;
@@ -17636,7 +17749,7 @@ int uocr_metal_context_moe_selected_experts_prefill_q4_k_padded(uocr_metal_conte
         gate_params.gate_row_size = (uint32_t)gate_row_size;
         gate_params.reserved0 = 0u;
 
-        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
         if (enc == nil) {
             (void)metal_fail(error, error_size, "failed to create Metal MoE Q4_K/padded-Q4_K prefill gate/up command encoder");
             goto cleanup;
@@ -17664,7 +17777,7 @@ int uocr_metal_context_moe_selected_experts_prefill_q4_k_padded(uocr_metal_conte
         down_params.down_row_size = (uint32_t)down_row_size;
         down_params.reserved0 = 0u;
 
-        enc = [cb computeCommandEncoder];
+        enc = metal_compute_command_encoder(ctx, cb);
         if (enc == nil) {
             (void)metal_fail(error, error_size, "failed to create Metal MoE Q4_K/padded-Q4_K prefill down command encoder");
             goto cleanup;
@@ -17682,8 +17795,7 @@ int uocr_metal_context_moe_selected_experts_prefill_q4_k_padded(uocr_metal_conte
              threadsPerThreadgroup:MTLSizeMake(down_threads, 1u, 1u)];
         [enc endEncoding];
 
-        [cb commit];
-        [cb waitUntilCompleted];
+        UOCR_METAL_COMMIT_AND_WAIT_PROFILED(ctx, cb);
         if (cb.status == MTLCommandBufferStatusError) {
             NSString *description = cb.error != nil ? [cb.error localizedDescription] : @"unknown command-buffer error";
             (void)metal_fail(error, error_size, "Metal MoE Q4_K/padded-Q4_K prefill command failed: %s", [description UTF8String]);
@@ -17802,14 +17914,14 @@ int uocr_metal_context_moe_combine_f16(uocr_metal_context *ctx,
         dst.label = @"uocr_moe_combine_output";
         memset([dst contents], 0, (size_t)output_bytes);
 
-        id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
+        id<MTLCommandBuffer> cb = metal_new_command_buffer(ctx);
         if (cb == nil) {
             (void)metal_fail(error, error_size, "failed to create Metal MoE combine command buffer");
             goto cleanup;
         }
         cb.label = @"uocr_moe_combine_command_buffer";
 
-        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
         if (enc == nil) {
             (void)metal_fail(error, error_size, "failed to create Metal MoE combine command encoder");
             goto cleanup;
@@ -17832,8 +17944,7 @@ int uocr_metal_context_moe_combine_f16(uocr_metal_context *ctx,
             threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1u, 1u)];
         [enc endEncoding];
 
-        [cb commit];
-        [cb waitUntilCompleted];
+        UOCR_METAL_COMMIT_AND_WAIT_PROFILED(ctx, cb);
         if (cb.status == MTLCommandBufferStatusError) {
             NSString *description = cb.error != nil ? [cb.error localizedDescription] : @"unknown command-buffer error";
             (void)metal_fail(error, error_size, "Metal MoE combine command failed: %s", [description UTF8String]);
@@ -17946,7 +18057,7 @@ int uocr_metal_context_rope_qk_f16(uocr_metal_context *ctx,
         memset([q_dst contents], 0, (size_t)output_bytes);
         memset([k_dst contents], 0, (size_t)output_bytes);
 
-        id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
+        id<MTLCommandBuffer> cb = metal_new_command_buffer(ctx);
         if (cb == nil) {
             [k_dst release];
             [q_dst release];
@@ -17956,7 +18067,7 @@ int uocr_metal_context_rope_qk_f16(uocr_metal_context *ctx,
         }
         cb.label = @"uocr_rope_command_buffer";
 
-        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
         if (enc == nil) {
             [k_dst release];
             [q_dst release];
@@ -17992,8 +18103,7 @@ int uocr_metal_context_rope_qk_f16(uocr_metal_context *ctx,
        threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1u, 1u)];
         [enc endEncoding];
 
-        [cb commit];
-        [cb waitUntilCompleted];
+        UOCR_METAL_COMMIT_AND_WAIT_PROFILED(ctx, cb);
         if (cb.status == MTLCommandBufferStatusError) {
             NSString *description = cb.error != nil ? [cb.error localizedDescription] : @"unknown command-buffer error";
             [k_dst release];
@@ -18112,7 +18222,7 @@ int uocr_metal_context_prefill_attention_f16(uocr_metal_context *ctx,
         dst.label = @"uocr_prefill_attention_output";
         memset([dst contents], 0, (size_t)output_bytes);
 
-        id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
+        id<MTLCommandBuffer> cb = metal_new_command_buffer(ctx);
         if (cb == nil) {
             [dst release];
             [v_src release];
@@ -18122,7 +18232,7 @@ int uocr_metal_context_prefill_attention_f16(uocr_metal_context *ctx,
         }
         cb.label = @"uocr_prefill_attention_command_buffer";
 
-        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
         if (enc == nil) {
             [dst release];
             [v_src release];
@@ -18147,8 +18257,7 @@ int uocr_metal_context_prefill_attention_f16(uocr_metal_context *ctx,
              threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1u, 1u)];
         [enc endEncoding];
 
-        [cb commit];
-        [cb waitUntilCompleted];
+        UOCR_METAL_COMMIT_AND_WAIT_PROFILED(ctx, cb);
         if (cb.status == MTLCommandBufferStatusError) {
             NSString *description = cb.error != nil ? [cb.error localizedDescription] : @"unknown command-buffer error";
             [dst release];
@@ -18310,7 +18419,7 @@ int uocr_metal_context_prefill_attention_varlen_f16(uocr_metal_context *ctx,
         dst.label = @"uocr_prefill_varlen_output";
         memset([dst contents], 0, (size_t)output_bytes);
 
-        id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
+        id<MTLCommandBuffer> cb = metal_new_command_buffer(ctx);
         if (cb == nil) {
             [dst release];
             [cu release];
@@ -18321,7 +18430,7 @@ int uocr_metal_context_prefill_attention_varlen_f16(uocr_metal_context *ctx,
         }
         cb.label = @"uocr_prefill_varlen_command_buffer";
 
-        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
         if (enc == nil) {
             [dst release];
             [cu release];
@@ -18351,8 +18460,7 @@ int uocr_metal_context_prefill_attention_varlen_f16(uocr_metal_context *ctx,
              threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1u, 1u)];
         [enc endEncoding];
 
-        [cb commit];
-        [cb waitUntilCompleted];
+        UOCR_METAL_COMMIT_AND_WAIT_PROFILED(ctx, cb);
         if (cb.status == MTLCommandBufferStatusError) {
             NSString *description = cb.error != nil ? [cb.error localizedDescription] : @"unknown command-buffer error";
             [dst release];
@@ -18509,7 +18617,7 @@ int uocr_metal_context_decode_attention_f16(uocr_metal_context *ctx,
         dst.label = @"uocr_decode_attention_output";
         memset([dst contents], 0, (size_t)output_bytes);
 
-        id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
+        id<MTLCommandBuffer> cb = metal_new_command_buffer(ctx);
         if (cb == nil) {
             [dst release];
             [v_cache release];
@@ -18519,7 +18627,7 @@ int uocr_metal_context_decode_attention_f16(uocr_metal_context *ctx,
         }
         cb.label = @"uocr_decode_attention_command_buffer";
 
-        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
         if (enc == nil) {
             [dst release];
             [v_cache release];
@@ -18553,8 +18661,7 @@ int uocr_metal_context_decode_attention_f16(uocr_metal_context *ctx,
              threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1u, 1u)];
         [enc endEncoding];
 
-        [cb commit];
-        [cb waitUntilCompleted];
+        UOCR_METAL_COMMIT_AND_WAIT_PROFILED(ctx, cb);
         if (cb.status == MTLCommandBufferStatusError) {
             NSString *description = cb.error != nil ? [cb.error localizedDescription] : @"unknown command-buffer error";
             [dst release];
@@ -18716,7 +18823,7 @@ int uocr_metal_context_write_kv_cache_f16(uocr_metal_context *ctx,
         }
         v_cache.label = @"uocr_kv_write_v_cache_f16";
 
-        id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
+        id<MTLCommandBuffer> cb = metal_new_command_buffer(ctx);
         if (cb == nil) {
             [v_cache release];
             [k_cache release];
@@ -18726,7 +18833,7 @@ int uocr_metal_context_write_kv_cache_f16(uocr_metal_context *ctx,
         }
         cb.label = @"uocr_kv_cache_write_command_buffer";
 
-        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
         if (enc == nil) {
             [v_cache release];
             [k_cache release];
@@ -18766,8 +18873,7 @@ int uocr_metal_context_write_kv_cache_f16(uocr_metal_context *ctx,
        threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1u, 1u)];
         [enc endEncoding];
 
-        [cb commit];
-        [cb waitUntilCompleted];
+        UOCR_METAL_COMMIT_AND_WAIT_PROFILED(ctx, cb);
         if (cb.status == MTLCommandBufferStatusError) {
             NSString *description = cb.error != nil ? [cb.error localizedDescription] : @"unknown command-buffer error";
             [v_cache release];
@@ -18787,6 +18893,12 @@ int uocr_metal_context_write_kv_cache_f16(uocr_metal_context *ctx,
 
     metal_clear_error(error, error_size);
     return 1;
+}
+
+void uocr_metal_context_set_profile(uocr_metal_context *ctx, uocr_profile_state *profile) {
+    if (ctx != NULL) {
+        ctx->profile = profile;
+    }
 }
 
 void uocr_metal_context_destroy(uocr_metal_context *ctx) {
@@ -18890,7 +19002,7 @@ static int run_no_copy_kernel_smoke(uocr_metal_context *ctx, char *error, size_t
         return 0;
     }
 
-    id<MTLCommandBuffer> cb = [ctx->queue commandBuffer];
+    id<MTLCommandBuffer> cb = metal_new_command_buffer(ctx);
     if (cb == nil) {
         [dst release];
         [src release];
@@ -18900,7 +19012,7 @@ static int run_no_copy_kernel_smoke(uocr_metal_context *ctx, char *error, size_t
     }
     cb.label = @"uocr_smoke_command_buffer";
 
-    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+    id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
     if (enc == nil) {
         [dst release];
         [src release];
@@ -18941,8 +19053,7 @@ static int run_no_copy_kernel_smoke(uocr_metal_context *ctx, char *error, size_t
         return metal_fail(error, error_size, "Metal transient retain tracking count did not increase");
     }
 
-    [cb commit];
-    [cb waitUntilCompleted];
+    UOCR_METAL_COMMIT_AND_WAIT_PROFILED(ctx, cb);
     if (cb.status == MTLCommandBufferStatusError) {
         NSString *description = cb.error != nil ? [cb.error localizedDescription] : @"unknown command-buffer error";
         [dst release];

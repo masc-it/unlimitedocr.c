@@ -36,6 +36,9 @@ UOCR_MEMORY_LOGITS_READBACK = 6
 UOCR_MEMORY_TRANSIENT_BUFFERS = 7
 UOCR_MEMORY_CATEGORY_COUNT = 8
 
+UOCR_PROFILE_EVENT_NAME_SIZE = 64
+UOCR_PROFILE_MAX_EVENTS = 128
+
 
 class CMemoryReport(ct.Structure):
     _fields_ = [
@@ -55,6 +58,37 @@ class CMemoryReport(ct.Structure):
         ("estimated_total_bytes", ct.c_uint64),
         ("memory_budget_bytes", ct.c_uint64),
         ("recommended_working_set_bytes", ct.c_uint64),
+    ]
+
+
+class CProfileEvent(ct.Structure):
+    _fields_ = [
+        ("name", ct.c_char * UOCR_PROFILE_EVENT_NAME_SIZE),
+        ("calls", ct.c_uint64),
+        ("total_ms", ct.c_double),
+        ("min_ms", ct.c_double),
+        ("max_ms", ct.c_double),
+    ]
+
+
+class CProfileReport(ct.Structure):
+    _fields_ = [
+        ("enabled", ct.c_uint32),
+        ("event_count", ct.c_uint32),
+        ("dropped_event_count", ct.c_uint32),
+        ("reserved0", ct.c_uint32),
+        ("generation_index", ct.c_uint64),
+        ("events", CProfileEvent * UOCR_PROFILE_MAX_EVENTS),
+        ("metal_buffer_allocation_count", ct.c_uint64),
+        ("metal_buffer_allocation_bytes", ct.c_uint64),
+        ("metal_command_buffer_count", ct.c_uint64),
+        ("metal_command_encoder_count", ct.c_uint64),
+        ("metal_command_buffer_wait_count", ct.c_uint64),
+        ("metal_mps_descriptor_count", ct.c_uint64),
+        ("metal_mps_ndarray_count", ct.c_uint64),
+        ("metal_nsarray_count", ct.c_uint64),
+        ("metal_transient_retain_object_count", ct.c_uint64),
+        ("memory", CMemoryReport),
     ]
 
 
@@ -91,6 +125,8 @@ class CEngineOpts(ct.Structure):
         ("max_batch", ct.c_uint32),
         ("max_prompt_tokens", ct.c_uint32),
         ("max_gen_tokens", ct.c_uint32),
+        ("profile", ct.c_uint32),
+        ("reserved0", ct.c_uint32),
         ("memory_budget_bytes", ct.c_uint64),
     ]
 
@@ -116,6 +152,70 @@ class MemoryReport:
 
 
 @dataclass(frozen=True)
+class ProfileEvent:
+    name: str
+    calls: int
+    total_ms: float
+    min_ms: float
+    max_ms: float
+
+    def as_dict(self) -> dict[str, int | float | str]:
+        return {
+            "name": self.name,
+            "calls": self.calls,
+            "total_ms": self.total_ms,
+            "min_ms": self.min_ms,
+            "max_ms": self.max_ms,
+        }
+
+
+@dataclass(frozen=True)
+class ProfileReport:
+    enabled: bool
+    generation_index: int
+    events: tuple[ProfileEvent, ...]
+    dropped_event_count: int
+    metal_buffer_allocation_count: int
+    metal_buffer_allocation_bytes: int
+    metal_command_buffer_count: int
+    metal_command_encoder_count: int
+    metal_command_buffer_wait_count: int
+    metal_mps_descriptor_count: int
+    metal_mps_ndarray_count: int
+    metal_nsarray_count: int
+    metal_transient_retain_object_count: int
+    memory: MemoryReport
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "enabled": self.enabled,
+            "generation_index": self.generation_index,
+            "events": [event.as_dict() for event in self.events],
+            "dropped_event_count": self.dropped_event_count,
+            "metal_buffer_allocation_count": self.metal_buffer_allocation_count,
+            "metal_buffer_allocation_bytes": self.metal_buffer_allocation_bytes,
+            "metal_command_buffer_count": self.metal_command_buffer_count,
+            "metal_command_encoder_count": self.metal_command_encoder_count,
+            "metal_command_buffer_wait_count": self.metal_command_buffer_wait_count,
+            "metal_mps_descriptor_count": self.metal_mps_descriptor_count,
+            "metal_mps_ndarray_count": self.metal_mps_ndarray_count,
+            "metal_nsarray_count": self.metal_nsarray_count,
+            "metal_transient_retain_object_count": self.metal_transient_retain_object_count,
+            "memory": self.memory.__dict__,
+        }
+
+    def summary(self, *, limit: int = 12) -> str:
+        ordered = sorted(self.events, key=lambda event: event.total_ms, reverse=True)
+        event_bits = ", ".join(f"{event.name}={event.total_ms:.3f}ms/{event.calls}" for event in ordered[:limit])
+        return (
+            f"profile enabled={self.enabled} generation={self.generation_index} "
+            f"events=[{event_bits}] metal_buffers={self.metal_buffer_allocation_count} "
+            f"metal_commands={self.metal_command_buffer_count} encoders={self.metal_command_encoder_count} "
+            f"peak_memory={self.memory.total_peak_bytes}B"
+        )
+
+
+@dataclass(frozen=True)
 class EngineOptions:
     model_path: str | None = None
     backend: str = "cpu-ref"
@@ -124,6 +224,7 @@ class EngineOptions:
     max_prompt_tokens: int = 4096
     max_gen_tokens: int = 512
     memory_budget_bytes: int = 0
+    profile: bool = False
 
 
 @dataclass
@@ -184,6 +285,10 @@ def _bind_library(path: Path) -> ct.CDLL:
     lib.uocr_memory_category_name.restype = ct.c_char_p
     lib.uocr_engine_memory_report.argtypes = [ct.c_void_p, ct.POINTER(CMemoryReport)]
     lib.uocr_engine_memory_report.restype = ct.c_int
+    lib.uocr_engine_profile_report.argtypes = [ct.c_void_p, ct.POINTER(CProfileReport)]
+    lib.uocr_engine_profile_report.restype = ct.c_int
+    lib.uocr_engine_profile_reset.argtypes = [ct.c_void_p]
+    lib.uocr_engine_profile_reset.restype = ct.c_int
     lib.uocr_generate_prepared.argtypes = [ct.c_void_p, ct.POINTER(CPreparedRequest), ct.c_uint32, ct.POINTER(ct.c_void_p)]
     lib.uocr_generate_prepared.restype = ct.c_int
     lib.uocr_result_count.argtypes = [ct.c_void_p]
@@ -373,6 +478,8 @@ class Engine:
             max_batch=opts.max_batch,
             max_prompt_tokens=opts.max_prompt_tokens,
             max_gen_tokens=opts.max_gen_tokens,
+            profile=1 if opts.profile else 0,
+            reserved0=0,
             memory_budget_bytes=opts.memory_budget_bytes,
         )
         self._handle = self._lib.uocr_engine_open(ct.byref(c_opts))
@@ -388,11 +495,8 @@ class Engine:
         raw = self._lib.uocr_memory_category_name(category)
         return raw.decode("utf-8") if raw else ""
 
-    def memory_report(self) -> MemoryReport:
-        report = CMemoryReport()
-        status = self._lib.uocr_engine_memory_report(self._handle, ct.byref(report))
-        if status != UOCR_OK:
-            raise RuntimeError(f"uocr_engine_memory_report failed ({status}): {self.last_error()}")
+    @staticmethod
+    def _memory_report_from_c(report: CMemoryReport) -> MemoryReport:
         return MemoryReport(
             category_live_bytes=tuple(int(report.category_live_bytes[i]) for i in range(UOCR_MEMORY_CATEGORY_COUNT)),
             category_peak_bytes=tuple(int(report.category_peak_bytes[i]) for i in range(UOCR_MEMORY_CATEGORY_COUNT)),
@@ -410,6 +514,53 @@ class Engine:
             estimated_total_bytes=int(report.estimated_total_bytes),
             memory_budget_bytes=int(report.memory_budget_bytes),
             recommended_working_set_bytes=int(report.recommended_working_set_bytes),
+        )
+
+    def memory_report(self) -> MemoryReport:
+        report = CMemoryReport()
+        status = self._lib.uocr_engine_memory_report(self._handle, ct.byref(report))
+        if status != UOCR_OK:
+            raise RuntimeError(f"uocr_engine_memory_report failed ({status}): {self.last_error()}")
+        return self._memory_report_from_c(report)
+
+    def profile_reset(self) -> None:
+        status = self._lib.uocr_engine_profile_reset(self._handle)
+        if status != UOCR_OK:
+            raise RuntimeError(f"uocr_engine_profile_reset failed ({status}): {self.last_error()}")
+
+    def profile_report(self) -> ProfileReport:
+        report = CProfileReport()
+        status = self._lib.uocr_engine_profile_report(self._handle, ct.byref(report))
+        if status != UOCR_OK:
+            raise RuntimeError(f"uocr_engine_profile_report failed ({status}): {self.last_error()}")
+        event_count = min(int(report.event_count), UOCR_PROFILE_MAX_EVENTS)
+        events = []
+        for i in range(event_count):
+            event = report.events[i]
+            events.append(
+                ProfileEvent(
+                    name=bytes(event.name).split(b"\0", 1)[0].decode("utf-8", errors="replace"),
+                    calls=int(event.calls),
+                    total_ms=float(event.total_ms),
+                    min_ms=float(event.min_ms),
+                    max_ms=float(event.max_ms),
+                )
+            )
+        return ProfileReport(
+            enabled=bool(report.enabled),
+            generation_index=int(report.generation_index),
+            events=tuple(events),
+            dropped_event_count=int(report.dropped_event_count),
+            metal_buffer_allocation_count=int(report.metal_buffer_allocation_count),
+            metal_buffer_allocation_bytes=int(report.metal_buffer_allocation_bytes),
+            metal_command_buffer_count=int(report.metal_command_buffer_count),
+            metal_command_encoder_count=int(report.metal_command_encoder_count),
+            metal_command_buffer_wait_count=int(report.metal_command_buffer_wait_count),
+            metal_mps_descriptor_count=int(report.metal_mps_descriptor_count),
+            metal_mps_ndarray_count=int(report.metal_mps_ndarray_count),
+            metal_nsarray_count=int(report.metal_nsarray_count),
+            metal_transient_retain_object_count=int(report.metal_transient_retain_object_count),
+            memory=self._memory_report_from_c(report.memory),
         )
 
     def close(self) -> None:

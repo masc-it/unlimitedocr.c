@@ -69,6 +69,7 @@ add_library(uocr_core STATIC
     src/quant/uocr_quant.c
     src/runtime/uocr_logits_processor.c
     src/runtime/uocr_memory.c
+    src/runtime/uocr_profile.c
     src/runtime/uocr_request_validation.c
     src/runtime/uocr_sequence.c
     src/runtime/uocr_vision.c)

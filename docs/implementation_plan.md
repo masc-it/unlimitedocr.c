@@ -61,8 +61,8 @@ compute, synchronization, and memory traffic.
 
 Implementation status:
 
-- [ ] Add an opt-in profiling mode for public OCR (`profile=True` or `UOCR_PROFILE=1`).
-- [ ] Record wall timings for Python preprocessing, engine open, request validation, vision, prompt assembly, prefill, first token, decode loop, and Python decode.
+- [x] Add an opt-in profiling mode for public OCR (`profile=True` or `UOCR_PROFILE=1`).
+- [x] Record wall timings for Python preprocessing, engine open, request validation, vision, prompt assembly, prefill, first token, decode loop, and Python decode.
 - [ ] Record Metal timings for SAM patch/neck, SAM blocks, CLIP blocks, projector, formatter, prompt assembly, each decoder layer group, final norm, LM-head selection, no-repeat processing, and command-buffer waits.
 - [ ] Record allocation/object counts for Metal buffers, command buffers, command encoders, MPS descriptors, MPS NDArrays, NSArrays, and transient-retain arrays.
 - [ ] Record memory by category: model views, runtime arenas, KV cache, host vision scratch, private/shared vision workspace, transient buffers, logits/selection scratch, and total live/peak bytes.

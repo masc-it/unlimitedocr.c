@@ -6,6 +6,7 @@
 
 #include "model/uocr_model_file.h"
 #include "runtime/uocr_logits_processor.h"
+#include "runtime/uocr_profile.h"
 #include "unlimitedocr.h"
 
 #ifdef __cplusplus
@@ -131,6 +132,7 @@ uint64_t uocr_metal_default_memory_budget_bytes(uint64_t recommended_working_set
 
 uocr_metal_context *uocr_metal_context_create(const char *resource_path, char *error, size_t error_size);
 void uocr_metal_context_destroy(uocr_metal_context *ctx);
+void uocr_metal_context_set_profile(uocr_metal_context *ctx, uocr_profile_state *profile);
 
 int uocr_metal_context_map_model(uocr_metal_context *ctx, const uocr_model_file *model, char *error, size_t error_size);
 void uocr_metal_context_unmap_model(uocr_metal_context *ctx);

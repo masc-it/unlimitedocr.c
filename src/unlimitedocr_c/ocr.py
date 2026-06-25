@@ -9,14 +9,18 @@ fully validated.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import json
+import os
 from pathlib import Path
+from time import perf_counter
+import sys
 import tempfile
 from typing import Any, Sequence
 
 import numpy as np
 from numpy.typing import NDArray
 
-from .ffi import Engine, EngineOptions
+from .ffi import Engine, EngineOptions, ProfileEvent, ProfileReport
 from .frontend import (
     EOS_TOKEN_ID,
     MODEL_VOCAB_SIZE,
@@ -39,6 +43,7 @@ class GenerationResult:
 
     token_ids: NDArray[np.int32]
     text: str
+    profile: ProfileReport | None = None
 
 
 def default_resource_path(backend: str = "metal") -> str | None:
@@ -81,6 +86,46 @@ def _decode_single_output(outputs: list[NDArray[np.int32]], tokenizer_path: str 
     return GenerationResult(token_ids=token_ids, text=decode_generated_ids(token_ids, tokenizer_path))
 
 
+def _profile_env_enabled() -> bool:
+    value = os.environ.get("UOCR_PROFILE")
+    if value is None or value == "":
+        return False
+    return value.lower() not in {"0", "false", "no", "off"}
+
+
+def _profile_enabled(profile: bool | None) -> bool:
+    return _profile_env_enabled() if profile is None else bool(profile)
+
+
+def _profile_event(name: str, elapsed_seconds: float) -> ProfileEvent:
+    elapsed_ms = max(0.0, float(elapsed_seconds) * 1000.0)
+    return ProfileEvent(name=name, calls=1, total_ms=elapsed_ms, min_ms=elapsed_ms, max_ms=elapsed_ms)
+
+
+def _append_profile_events(report: ProfileReport | None, events: Sequence[ProfileEvent], *, enabled: bool) -> ProfileReport | None:
+    if report is None:
+        return None
+    return replace(report, enabled=enabled or report.enabled, events=tuple(events) + report.events)
+
+
+def _profile_report_from_engine(engine: object, events: Sequence[ProfileEvent], *, enabled: bool) -> ProfileReport | None:
+    profile_report = getattr(engine, "profile_report", None)
+    if not callable(profile_report):
+        return None
+    return _append_profile_events(profile_report(), events, enabled=enabled)
+
+
+def _profile_reset_engine(engine: object) -> None:
+    profile_reset = getattr(engine, "profile_reset", None)
+    if callable(profile_reset):
+        profile_reset()
+
+
+def _emit_profile(report: ProfileReport | None, *, enabled: bool) -> None:
+    if enabled and report is not None:
+        print(json.dumps(report.as_dict(), sort_keys=True), file=sys.stderr)
+
+
 def _cap_max_new_tokens(request: PreparedRequest, max_gen_tokens: int | None) -> PreparedRequest:
     """Cap a prepared request's generation budget to the chosen engine limit."""
 
@@ -103,6 +148,8 @@ def generate_prepared(
     resource_path: str | Path | None = None,
     memory_budget_bytes: int = 0,
     library_path: str | Path | None = None,
+    profile: bool | None = None,
+    _profile_events: Sequence[ProfileEvent] = (),
 ) -> GenerationResult:
     """Run one prepared request and decode the generated token ids.
 
@@ -111,8 +158,21 @@ def generate_prepared(
     prepared prompt and generation budget.
     """
 
+    profile_on = _profile_enabled(profile)
+    wall_events = list(_profile_events)
+
     if engine is not None:
-        return _decode_single_output(engine.generate_prepared(request), request.tokenizer_path)
+        if profile_on:
+            _profile_reset_engine(engine)
+        start = perf_counter()
+        outputs = engine.generate_prepared(request)
+        wall_events.append(_profile_event("native.generate_prepared", perf_counter() - start))
+        start = perf_counter()
+        decoded = _decode_single_output(outputs, request.tokenizer_path)
+        wall_events.append(_profile_event("python.decode", perf_counter() - start))
+        report = _profile_report_from_engine(engine, wall_events, enabled=profile_on) if profile_on else None
+        _emit_profile(report, enabled=profile_on)
+        return replace(decoded, profile=report)
 
     backend_name = backend.lower()
     if backend_name != "cpu-ref" and model_path is None:
@@ -122,7 +182,8 @@ def generate_prepared(
     if resolved_resource_path is None:
         resolved_resource_path = default_resource_path(backend_name)
 
-    with Engine(
+    start = perf_counter()
+    owned_engine = Engine(
         EngineOptions(
             model_path=str(model_path) if model_path is not None else None,
             backend=backend_name,
@@ -131,10 +192,23 @@ def generate_prepared(
             max_prompt_tokens=request.n_tokens,
             max_gen_tokens=request.max_new_tokens,
             memory_budget_bytes=memory_budget_bytes,
+            profile=profile_on,
         ),
         library_path=library_path,
-    ) as owned_engine:
-        return _decode_single_output(owned_engine.generate_prepared(request), request.tokenizer_path)
+    )
+    wall_events.append(_profile_event("engine.open", perf_counter() - start))
+    try:
+        start = perf_counter()
+        outputs = owned_engine.generate_prepared(request)
+        wall_events.append(_profile_event("native.generate_prepared", perf_counter() - start))
+        start = perf_counter()
+        decoded = _decode_single_output(outputs, request.tokenizer_path)
+        wall_events.append(_profile_event("python.decode", perf_counter() - start))
+        report = _profile_report_from_engine(owned_engine, wall_events, enabled=profile_on) if profile_on else None
+    finally:
+        owned_engine.close()
+    _emit_profile(report, enabled=profile_on)
+    return replace(decoded, profile=report)
 
 
 def generate(
@@ -154,6 +228,7 @@ def generate(
     resource_path: str | Path | None = None,
     memory_budget_bytes: int = 0,
     library_path: str | Path | None = None,
+    profile: bool | None = None,
 ) -> GenerationResult:
     """Prepare one image, call the native public path, and decode the output.
 
@@ -163,6 +238,9 @@ def generate(
     experiments with an appropriately sized engine.
     """
 
+    profile_on = _profile_enabled(profile)
+    profile_events: list[ProfileEvent] = []
+    start = perf_counter()
     request = prepare_image(
         image,
         prompt=prompt,
@@ -174,6 +252,7 @@ def generate(
         no_repeat_window=no_repeat_window,
         dtype=dtype,
     )
+    profile_events.append(_profile_event("python.preprocessing", perf_counter() - start))
     return generate_prepared(
         request,
         engine=engine,
@@ -182,6 +261,8 @@ def generate(
         resource_path=resource_path,
         memory_budget_bytes=memory_budget_bytes,
         library_path=library_path,
+        profile=profile_on,
+        _profile_events=profile_events,
     )
 
 
@@ -202,6 +283,7 @@ def ocr_image(
     resource_path: str | Path | None = None,
     memory_budget_bytes: int = 0,
     library_path: str | Path | None = None,
+    profile: bool | None = None,
 ) -> GenerationResult:
     """Run single-image OCR with the upstream wrapper defaults.
 
@@ -211,6 +293,9 @@ def ocr_image(
     (the engine generation limit used when this helper opens its own engine).
     """
 
+    profile_on = _profile_enabled(profile)
+    profile_events: list[ProfileEvent] = []
+    start = perf_counter()
     request = prepare_image(
         image,
         prompt=prompt,
@@ -223,6 +308,7 @@ def ocr_image(
         dtype=dtype,
     )
     request = _cap_max_new_tokens(request, max_gen_tokens)
+    profile_events.append(_profile_event("python.preprocessing", perf_counter() - start))
     return generate_prepared(
         request,
         engine=engine,
@@ -231,6 +317,8 @@ def ocr_image(
         resource_path=resource_path,
         memory_budget_bytes=memory_budget_bytes,
         library_path=library_path,
+        profile=profile_on,
+        _profile_events=profile_events,
     )
 
 
@@ -250,6 +338,7 @@ def ocr_pages(
     resource_path: str | Path | None = None,
     memory_budget_bytes: int = 0,
     library_path: str | Path | None = None,
+    profile: bool | None = None,
 ) -> GenerationResult:
     """Run multi-page OCR with the upstream wrapper defaults.
 
@@ -259,6 +348,9 @@ def ocr_pages(
     ``max_gen_tokens`` for the owned-engine path.
     """
 
+    profile_on = _profile_enabled(profile)
+    profile_events: list[ProfileEvent] = []
+    start = perf_counter()
     request = prepare_pages(
         pages,
         prompt=prompt,
@@ -270,6 +362,7 @@ def ocr_pages(
         dtype=dtype,
     )
     request = _cap_max_new_tokens(request, max_gen_tokens)
+    profile_events.append(_profile_event("python.preprocessing", perf_counter() - start))
     return generate_prepared(
         request,
         engine=engine,
@@ -278,6 +371,8 @@ def ocr_pages(
         resource_path=resource_path,
         memory_budget_bytes=memory_budget_bytes,
         library_path=library_path,
+        profile=profile_on,
+        _profile_events=profile_events,
     )
 
 
@@ -341,6 +436,7 @@ def ocr_pdf(
     resource_path: str | Path | None = None,
     memory_budget_bytes: int = 0,
     library_path: str | Path | None = None,
+    profile: bool | None = None,
 ) -> GenerationResult:
     """Rasterize a PDF in Python and run multi-page OCR through the C engine.
 
@@ -368,6 +464,7 @@ def ocr_pdf(
                 resource_path=resource_path,
                 memory_budget_bytes=memory_budget_bytes,
                 library_path=library_path,
+                profile=profile,
             )
 
     pages = pdf_to_images(pdf_path, dpi=dpi, out_dir=page_output_dir)
@@ -386,4 +483,5 @@ def ocr_pdf(
         resource_path=resource_path,
         memory_budget_bytes=memory_budget_bytes,
         library_path=library_path,
+        profile=profile,
     )

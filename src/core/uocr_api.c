@@ -9,6 +9,7 @@
 #include "model/uocr_constants.h"
 #include "model/uocr_model_file.h"
 #include "runtime/uocr_memory.h"
+#include "runtime/uocr_profile.h"
 #include "runtime/uocr_request_validation.h"
 #include "runtime/uocr_sequence.h"
 #include "runtime/uocr_vision.h"
@@ -40,6 +41,7 @@ struct uocr_engine {
     uocr_memory_tracker memory_tracker;
     uocr_runtime_memory_estimate capacity_estimate;
     uocr_runtime_memory_estimate last_estimate;
+    uocr_profile_state profile;
 #if UOCR_HAVE_METAL
     uocr_metal_context *metal;
 #endif
@@ -220,6 +222,7 @@ static int generate_metal_text_fp16(uocr_engine *engine,
 
     char metal_error[1024];
     memset(metal_error, 0, sizeof(metal_error));
+    const uint64_t generate_start_ns = uocr_profile_now_ns();
     if (!uocr_metal_context_generate_f16(engine->metal,
                                          &metal_request,
                                          &metal_result,
@@ -231,6 +234,7 @@ static int generate_metal_text_fp16(uocr_engine *engine,
                                  "Metal fp16 text generation failed: %s",
                                  metal_error[0] != '\0' ? metal_error : "unknown error");
     }
+    uocr_profile_add_event_now(&engine->profile, "metal.text_generate", generate_start_ns);
 
     const int32_t *generated_lists[1] = {generated};
     const uint32_t generated_counts[1] = {metal_result.generated_count};
@@ -343,6 +347,7 @@ static int generate_metal_image_fp16(uocr_engine *engine,
 
     char metal_error[1024];
     memset(metal_error, 0, sizeof(metal_error));
+    const uint64_t vision_start_ns = uocr_profile_now_ns();
     if (!uocr_metal_context_encode_visual_features_f16(engine->metal,
                                                        request,
                                                        1u,
@@ -356,6 +361,7 @@ static int generate_metal_image_fp16(uocr_engine *engine,
                                  "Metal fp16 image vision encoding failed: %s",
                                  metal_error[0] != '\0' ? metal_error : "unknown error");
     }
+    uocr_profile_add_event_now(&engine->profile, "metal.vision", vision_start_ns);
 
     if ((uint64_t)request->max_new_tokens > (uint64_t)SIZE_MAX / sizeof(int32_t)) {
         uocr_free(visual_features_f16);
@@ -387,6 +393,7 @@ static int generate_metal_image_fp16(uocr_engine *engine,
     metal_result.generated_capacity = request->max_new_tokens;
 
     memset(metal_error, 0, sizeof(metal_error));
+    const uint64_t generate_start_ns = uocr_profile_now_ns();
     if (!uocr_metal_context_generate_f16(engine->metal,
                                          &metal_request,
                                          &metal_result,
@@ -399,6 +406,7 @@ static int generate_metal_image_fp16(uocr_engine *engine,
                                  "Metal fp16 image generation failed: %s",
                                  metal_error[0] != '\0' ? metal_error : "unknown error");
     }
+    uocr_profile_add_event_now(&engine->profile, "metal.image_generate", generate_start_ns);
 
     const int32_t *generated_lists[1] = {generated};
     const uint32_t generated_counts[1] = {metal_result.generated_count};
@@ -425,6 +433,11 @@ static void fill_memory_report(const uocr_engine *engine, uocr_memory_report *re
     copy_estimate_to_report(&engine->last_estimate, report);
     report->memory_budget_bytes = engine->memory_budget_bytes;
     report->recommended_working_set_bytes = engine->recommended_working_set_bytes;
+}
+
+static void fill_profile_report(const uocr_engine *engine, uocr_profile_report *report) {
+    *report = engine->profile.report;
+    fill_memory_report(engine, &report->memory);
 }
 
 uint32_t uocr_abi_version(void) {
@@ -540,6 +553,7 @@ uocr_engine *uocr_engine_open(const uocr_engine_opts *opts) {
     engine->max_prompt_tokens = (opts != NULL && opts->max_prompt_tokens != 0u) ? opts->max_prompt_tokens : UOCR_DEFAULT_MAX_PROMPT_TOKENS;
     engine->max_gen_tokens = (opts != NULL && opts->max_gen_tokens != 0u) ? opts->max_gen_tokens : UOCR_DEFAULT_MAX_GEN_TOKENS;
     engine->memory_budget_bytes = opts != NULL ? opts->memory_budget_bytes : 0u;
+    uocr_profile_state_init(&engine->profile, (opts != NULL && opts->profile != 0u) || uocr_profile_env_enabled());
     engine->recommended_working_set_bytes = 0u;
 #if UOCR_HAVE_METAL
     if (strcmp(requested_backend, "metal") == 0) {
@@ -634,6 +648,7 @@ uocr_engine *uocr_engine_open(const uocr_engine_opts *opts) {
             uocr_engine_close(engine);
             return NULL;
         }
+        uocr_metal_context_set_profile(engine->metal, &engine->profile);
         if (engine->has_model_file && !uocr_metal_context_map_model(engine->metal, &engine->model_file, metal_error, sizeof(metal_error))) {
             set_engine_errorf(engine, UOCR_ERROR_INTERNAL, "failed to map model into Metal no-copy views: %s", metal_error);
             uocr_engine_close(engine);
@@ -709,6 +724,22 @@ int uocr_engine_memory_report(const uocr_engine *engine, uocr_memory_report *out
     return UOCR_OK;
 }
 
+int uocr_engine_profile_report(const uocr_engine *engine, uocr_profile_report *out_report) {
+    if (engine == NULL || out_report == NULL) {
+        return set_engine_errorf(NULL, UOCR_ERROR_INVALID_ARGUMENT, "engine and out_report must be non-null");
+    }
+    fill_profile_report(engine, out_report);
+    return UOCR_OK;
+}
+
+int uocr_engine_profile_reset(uocr_engine *engine) {
+    if (engine == NULL) {
+        return set_engine_errorf(NULL, UOCR_ERROR_INVALID_ARGUMENT, "engine is null");
+    }
+    uocr_profile_reset(&engine->profile);
+    return UOCR_OK;
+}
+
 int uocr_generate_prepared(uocr_engine *engine,
                            const uocr_prepared_request *requests,
                            uint32_t n_requests,
@@ -737,6 +768,8 @@ int uocr_generate_prepared(uocr_engine *engine,
                                  engine->max_batch);
     }
 
+    uocr_profile_begin_request(&engine->profile);
+
     uocr_request_limits limits;
     memset(&limits, 0, sizeof(limits));
     limits.max_prompt_tokens = engine->max_prompt_tokens;
@@ -747,6 +780,7 @@ int uocr_generate_prepared(uocr_engine *engine,
     uint32_t max_visual_tokens_in_batch = 0u;
     uint32_t max_vision_chunk_projected_rows = 0u;
     int any_generation_requested = 0;
+    const uint64_t validation_start_ns = uocr_profile_now_ns();
     for (uint32_t i = 0u; i < n_requests; ++i) {
         char validation_error[512];
         const int status = uocr_validate_prepared_request(&requests[i], &limits, validation_error, sizeof(validation_error));
@@ -785,7 +819,10 @@ int uocr_generate_prepared(uocr_engine *engine,
         }
     }
 
+    uocr_profile_add_event_now(&engine->profile, "request.validation", validation_start_ns);
+
     uocr_runtime_memory_estimate request_estimate;
+    const uint64_t estimate_start_ns = uocr_profile_now_ns();
     const int estimate_status = uocr_estimate_runtime_memory_with_vision(n_requests,
                                                                          max_prompt_tokens_in_batch,
                                                                          engine->model_view_bytes,
@@ -796,6 +833,7 @@ int uocr_generate_prepared(uocr_engine *engine,
         return set_engine_errorf(engine, estimate_status, "failed to estimate request memory requirements");
     }
     engine->last_estimate = request_estimate;
+    uocr_profile_add_event_now(&engine->profile, "request.memory_estimate", estimate_start_ns);
     if (engine->memory_budget_bytes != 0u && request_estimate.total_bytes > engine->memory_budget_bytes) {
         return set_admission_error(engine, "request", &request_estimate, engine->memory_budget_bytes);
     }
