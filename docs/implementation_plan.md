@@ -968,7 +968,7 @@ Do not start the stable high-level OCR/PDF API until Gate E2E-0 passes: public f
 ## 21. Test and parity gates
 
 - [ ] Add fast always-on tests:
-  - [ ] tokenizer metadata validation
+  - [x] tokenizer metadata validation
   - [ ] prompt construction
   - [ ] visual token count formulas
   - [ ] image preprocessing against upstream for tiny fixtures
