@@ -1017,7 +1017,7 @@ Do not start the stable high-level OCR/PDF API until Gate E2E-0 passes: public f
   - [x] first-token latency after warmup
   - [x] decode tokens/sec single request
   - [x] peak memory report
-- [ ] Keep large conversion and full inference tests manual/opt-in until weights are available locally.
+- [x] Keep large conversion and full inference tests manual/opt-in until weights are available locally.
 
 ## 22. Documentation and developer workflow
 
