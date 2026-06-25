@@ -143,6 +143,30 @@ static uint64_t model_tensor_data_bytes(const uocr_model_file *model) {
 }
 
 #if UOCR_HAVE_METAL
+static int track_engine_memory(uocr_engine *engine,
+                               uocr_memory_category category,
+                               uint64_t bytes,
+                               const char *label) {
+    if (engine == NULL || bytes == 0u) {
+        return UOCR_OK;
+    }
+    const int status = uocr_memory_reserve(&engine->memory_tracker, category, bytes);
+    if (status != UOCR_OK) {
+        return set_engine_errorf(engine,
+                                 status,
+                                 "failed to account %s memory (%llu bytes)",
+                                 label != NULL ? label : uocr_memory_category_name(category),
+                                 (unsigned long long)bytes);
+    }
+    return UOCR_OK;
+}
+
+static void untrack_engine_memory(uocr_engine *engine, uocr_memory_category category, uint64_t bytes) {
+    if (engine != NULL && bytes != 0u) {
+        (void)uocr_memory_release(&engine->memory_tracker, category, bytes);
+    }
+}
+
 static int reserve_runtime_arena_accounting(uocr_engine *engine, const uocr_runtime_memory_estimate *estimate) {
     int status = uocr_memory_reserve(&engine->memory_tracker, UOCR_MEMORY_KV_CACHE, estimate->kv_cache_bytes);
     if (status != UOCR_OK) {
@@ -193,6 +217,7 @@ static int generate_metal_text_fp16(uocr_engine *engine,
                                  "Metal fp16 text generation requires complete validated decoder tensor bindings");
     }
 
+    int status = UOCR_OK;
     uint64_t generated_bytes = 0u;
     if ((uint64_t)request->max_new_tokens > (uint64_t)SIZE_MAX / sizeof(int32_t)) {
         return set_engine_errorf(engine, UOCR_ERROR_OUT_OF_MEMORY, "generated-token buffer size overflow");
@@ -201,6 +226,11 @@ static int generate_metal_text_fp16(uocr_engine *engine,
     int32_t *generated = (int32_t *)uocr_malloc((size_t)generated_bytes);
     if (generated == NULL) {
         return set_engine_errorf(engine, UOCR_ERROR_OUT_OF_MEMORY, "failed to allocate generated-token buffer");
+    }
+    status = track_engine_memory(engine, UOCR_MEMORY_TRANSIENT_BUFFERS, generated_bytes, "generated-token transient buffer");
+    if (status != UOCR_OK) {
+        uocr_free(generated);
+        return status;
     }
 
     uocr_metal_decoder_request_f16 metal_request;
@@ -229,6 +259,7 @@ static int generate_metal_text_fp16(uocr_engine *engine,
                                          metal_error,
                                          sizeof(metal_error))) {
         uocr_free(generated);
+        untrack_engine_memory(engine, UOCR_MEMORY_TRANSIENT_BUFFERS, generated_bytes);
         return set_engine_errorf(engine,
                                  UOCR_ERROR_INTERNAL,
                                  "Metal fp16 text generation failed: %s",
@@ -238,8 +269,9 @@ static int generate_metal_text_fp16(uocr_engine *engine,
 
     const int32_t *generated_lists[1] = {generated};
     const uint32_t generated_counts[1] = {metal_result.generated_count};
-    const int status = uocr_result_create_from_generated(1u, generated_lists, generated_counts, out_result);
+    status = uocr_result_create_from_generated(1u, generated_lists, generated_counts, out_result);
     uocr_free(generated);
+    untrack_engine_memory(engine, UOCR_MEMORY_TRANSIENT_BUFFERS, generated_bytes);
     if (status != UOCR_OK) {
         return set_engine_errorf(engine, status, "failed to allocate generated-token result");
     }
@@ -344,6 +376,11 @@ static int generate_metal_image_fp16(uocr_engine *engine,
                                  "failed to allocate Metal visual-feature buffer (%llu bytes)",
                                  (unsigned long long)visual_bytes);
     }
+    status = track_engine_memory(engine, UOCR_MEMORY_VISION_SCRATCH, visual_bytes, "host visual-feature rows");
+    if (status != UOCR_OK) {
+        uocr_free(visual_features_f16);
+        return status;
+    }
 
     char metal_error[1024];
     memset(metal_error, 0, sizeof(metal_error));
@@ -356,6 +393,7 @@ static int generate_metal_image_fp16(uocr_engine *engine,
                                                        metal_error,
                                                        sizeof(metal_error))) {
         uocr_free(visual_features_f16);
+        untrack_engine_memory(engine, UOCR_MEMORY_VISION_SCRATCH, visual_bytes);
         return set_engine_errorf(engine,
                                  UOCR_ERROR_INTERNAL,
                                  "Metal fp16 image vision encoding failed: %s",
@@ -365,13 +403,22 @@ static int generate_metal_image_fp16(uocr_engine *engine,
 
     if ((uint64_t)request->max_new_tokens > (uint64_t)SIZE_MAX / sizeof(int32_t)) {
         uocr_free(visual_features_f16);
+        untrack_engine_memory(engine, UOCR_MEMORY_VISION_SCRATCH, visual_bytes);
         return set_engine_errorf(engine, UOCR_ERROR_OUT_OF_MEMORY, "generated-token buffer size overflow");
     }
     const uint64_t generated_bytes = (uint64_t)request->max_new_tokens * (uint64_t)sizeof(int32_t);
     int32_t *generated = (int32_t *)uocr_malloc((size_t)generated_bytes);
     if (generated == NULL) {
         uocr_free(visual_features_f16);
+        untrack_engine_memory(engine, UOCR_MEMORY_VISION_SCRATCH, visual_bytes);
         return set_engine_errorf(engine, UOCR_ERROR_OUT_OF_MEMORY, "failed to allocate generated-token buffer");
+    }
+    status = track_engine_memory(engine, UOCR_MEMORY_TRANSIENT_BUFFERS, generated_bytes, "generated-token transient buffer");
+    if (status != UOCR_OK) {
+        uocr_free(generated);
+        uocr_free(visual_features_f16);
+        untrack_engine_memory(engine, UOCR_MEMORY_VISION_SCRATCH, visual_bytes);
+        return status;
     }
 
     uocr_metal_decoder_request_f16 metal_request;
@@ -401,6 +448,8 @@ static int generate_metal_image_fp16(uocr_engine *engine,
                                          sizeof(metal_error))) {
         uocr_free(generated);
         uocr_free(visual_features_f16);
+        untrack_engine_memory(engine, UOCR_MEMORY_TRANSIENT_BUFFERS, generated_bytes);
+        untrack_engine_memory(engine, UOCR_MEMORY_VISION_SCRATCH, visual_bytes);
         return set_engine_errorf(engine,
                                  UOCR_ERROR_INTERNAL,
                                  "Metal fp16 image generation failed: %s",
@@ -413,6 +462,8 @@ static int generate_metal_image_fp16(uocr_engine *engine,
     status = uocr_result_create_from_generated(1u, generated_lists, generated_counts, out_result);
     uocr_free(generated);
     uocr_free(visual_features_f16);
+    untrack_engine_memory(engine, UOCR_MEMORY_TRANSIENT_BUFFERS, generated_bytes);
+    untrack_engine_memory(engine, UOCR_MEMORY_VISION_SCRATCH, visual_bytes);
     if (status != UOCR_OK) {
         return set_engine_errorf(engine, status, "failed to allocate generated-token result");
     }
@@ -649,6 +700,7 @@ uocr_engine *uocr_engine_open(const uocr_engine_opts *opts) {
             return NULL;
         }
         uocr_metal_context_set_profile(engine->metal, &engine->profile);
+        uocr_metal_context_set_memory_tracker(engine->metal, &engine->memory_tracker);
         if (engine->has_model_file && !uocr_metal_context_map_model(engine->metal, &engine->model_file, metal_error, sizeof(metal_error))) {
             set_engine_errorf(engine, UOCR_ERROR_INTERNAL, "failed to map model into Metal no-copy views: %s", metal_error);
             uocr_engine_close(engine);
@@ -737,6 +789,7 @@ int uocr_engine_profile_reset(uocr_engine *engine) {
         return set_engine_errorf(NULL, UOCR_ERROR_INVALID_ARGUMENT, "engine is null");
     }
     uocr_profile_reset(&engine->profile);
+    uocr_memory_tracker_reset_peaks(&engine->memory_tracker);
     return UOCR_OK;
 }
 
@@ -769,6 +822,9 @@ int uocr_generate_prepared(uocr_engine *engine,
     }
 
     uocr_profile_begin_request(&engine->profile);
+    if (uocr_profile_is_enabled(&engine->profile)) {
+        uocr_memory_tracker_reset_peaks(&engine->memory_tracker);
+    }
 
     uocr_request_limits limits;
     memset(&limits, 0, sizeof(limits));

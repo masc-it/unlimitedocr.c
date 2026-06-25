@@ -151,7 +151,10 @@ struct uocr_metal_context {
     uint32_t integrated_prefill_tokens;
     uint32_t integrated_prefill_final_segment;
     uocr_profile_state *profile;
+    uocr_memory_tracker *memory_tracker;
 };
+
+static int metal_fail(char *error, size_t error_size, const char *fmt, ...);
 
 static int metal_profile_enabled(const uocr_metal_context *ctx) {
     return ctx != NULL && uocr_profile_is_enabled(ctx->profile);
@@ -185,6 +188,66 @@ static void metal_profile_add_event_ms(const uocr_metal_context *ctx, const char
 static void metal_profile_count_buffer(const uocr_metal_context *ctx, uint64_t bytes) {
     if (metal_profile_enabled(ctx)) {
         uocr_profile_add_metal_buffer_allocation(ctx->profile, bytes);
+    }
+}
+
+static int metal_memory_reserve(uocr_metal_context *ctx,
+                                uocr_memory_category category,
+                                uint64_t bytes,
+                                const char *label,
+                                char *error,
+                                size_t error_size) {
+    if (ctx == NULL || ctx->memory_tracker == NULL || bytes == 0u) {
+        return 1;
+    }
+    const int status = uocr_memory_reserve(ctx->memory_tracker, category, bytes);
+    if (status != UOCR_OK) {
+        return metal_fail(error,
+                          error_size,
+                          "failed to account Metal %s memory (%llu bytes): %s",
+                          label != NULL ? label : "buffer",
+                          (unsigned long long)bytes,
+                          uocr_status_string(status));
+    }
+    return 1;
+}
+
+static void metal_memory_release(uocr_metal_context *ctx, uocr_memory_category category, uint64_t bytes) {
+    if (ctx != NULL && ctx->memory_tracker != NULL && bytes != 0u) {
+        (void)uocr_memory_release(ctx->memory_tracker, category, bytes);
+    }
+}
+
+static void *metal_host_malloc_tracked(uocr_metal_context *ctx,
+                                       uocr_memory_category category,
+                                       uint64_t bytes,
+                                       const char *label,
+                                       char *error,
+                                       size_t error_size) {
+    if (bytes > (uint64_t)SIZE_MAX) {
+        (void)metal_fail(error, error_size, "Metal %s allocation size overflows", label != NULL ? label : "host buffer");
+        return NULL;
+    }
+    void *ptr = malloc((size_t)bytes);
+    if (ptr == NULL) {
+        (void)metal_fail(error,
+                         error_size,
+                         "failed to allocate Metal %s host buffer (%llu bytes)",
+                         label != NULL ? label : "scratch",
+                         (unsigned long long)bytes);
+        return NULL;
+    }
+    if (!metal_memory_reserve(ctx, category, bytes, label, error, error_size)) {
+        free(ptr);
+        return NULL;
+    }
+    return ptr;
+}
+
+static void metal_host_free_tracked(uocr_metal_context *ctx, uocr_memory_category category, void *ptr, uint64_t bytes) {
+    if (ptr != NULL) {
+        free(ptr);
+        metal_memory_release(ctx, category, bytes);
     }
 }
 
@@ -2671,6 +2734,8 @@ typedef struct uocr_metal_vision_host_scratch {
     uint16_t *clip_b_f16;
     uint16_t *clip_final_f16;
     uint16_t *concat_f16;
+    uocr_metal_context *tracked_ctx;
+    uint64_t tracked_bytes;
 } uocr_metal_vision_host_scratch;
 
 static void metal_vision_host_scratch_free(uocr_metal_vision_host_scratch *scratch) {
@@ -2688,6 +2753,7 @@ static void metal_vision_host_scratch_free(uocr_metal_vision_host_scratch *scrat
     free(scratch->sam_transformer_bhwc_f16);
     free(scratch->sam_pos_bhwc_f16);
     free(scratch->sam_patch_bhwc_f16);
+    metal_memory_release(scratch->tracked_ctx, UOCR_MEMORY_VISION_SCRATCH, scratch->tracked_bytes);
     memset(scratch, 0, sizeof(*scratch));
 }
 
@@ -2714,7 +2780,8 @@ static int metal_alloc_f16_values(uint16_t **out,
     return 1;
 }
 
-static int metal_vision_host_scratch_init(uocr_metal_vision_host_scratch *scratch,
+static int metal_vision_host_scratch_init(uocr_metal_context *ctx,
+                                          uocr_metal_vision_host_scratch *scratch,
                                           char *error,
                                           size_t error_size) {
     if (scratch == NULL) {
@@ -2729,6 +2796,27 @@ static int metal_vision_host_scratch_init(uocr_metal_vision_host_scratch *scratc
     const uint64_t sam_net3_values = (uint64_t)UOCR_SAM_NET3_CHANNELS * max_net3_grid * max_net3_grid;
     const uint64_t clip_values = (uint64_t)UOCR_CLIP_MAX_TOKENS * (uint64_t)UOCR_CLIP_HIDDEN_SIZE;
     const uint64_t concat_values = (uint64_t)UOCR_GLOBAL_GRID_QUERIES * (uint64_t)UOCR_GLOBAL_GRID_QUERIES * (uint64_t)UOCR_PROJECTOR_IN_SIZE;
+    uint64_t total_values = 0u;
+    uint64_t total_bytes = 0u;
+    if (!checked_add_u64(total_values, sam_bhwc_values, &total_values) ||
+        !checked_add_u64(total_values, sam_bhwc_values, &total_values) ||
+        !checked_add_u64(total_values, sam_bhwc_values, &total_values) ||
+        !checked_add_u64(total_values, sam_neck_values, &total_values) ||
+        !checked_add_u64(total_values, sam_neck_values, &total_values) ||
+        !checked_add_u64(total_values, sam_net2_values, &total_values) ||
+        !checked_add_u64(total_values, sam_net3_values, &total_values) ||
+        !checked_add_u64(total_values, clip_values, &total_values) ||
+        !checked_add_u64(total_values, clip_values, &total_values) ||
+        !checked_add_u64(total_values, clip_values, &total_values) ||
+        !checked_add_u64(total_values, concat_values, &total_values) ||
+        !checked_mul_u64(total_values, 2u, &total_bytes)) {
+        return metal_fail(error, error_size, "Metal vision host scratch byte-size overflow");
+    }
+    if (!metal_memory_reserve(ctx, UOCR_MEMORY_VISION_SCRATCH, total_bytes, "vision host scratch", error, error_size)) {
+        return 0;
+    }
+    scratch->tracked_ctx = ctx;
+    scratch->tracked_bytes = total_bytes;
 
 #define ALLOC_SCRATCH(field, values, label)                              \
     do {                                                                 \
@@ -3184,16 +3272,24 @@ int uocr_metal_context_encode_visual_features_f16(uocr_metal_context *ctx,
     }
 
     uocr_metal_vision_host_scratch scratch;
-    if (!metal_vision_host_scratch_init(&scratch, error, error_size)) {
+    if (!metal_vision_host_scratch_init(ctx, &scratch, error, error_size)) {
         return 0;
     }
 
-    uint16_t *projected_scratch_f16 = NULL;
-    if (!metal_alloc_f16_values(&projected_scratch_f16,
-                                (uint64_t)schedule.max_chunk_projected_tokens * (uint64_t)UOCR_HIDDEN_SIZE,
-                                "projected visual chunk rows",
-                                error,
-                                error_size)) {
+    uint64_t projected_scratch_values = 0u;
+    uint64_t projected_scratch_bytes = 0u;
+    if (!checked_mul_u64((uint64_t)schedule.max_chunk_projected_tokens, (uint64_t)UOCR_HIDDEN_SIZE, &projected_scratch_values) ||
+        !checked_mul_u64(projected_scratch_values, 2u, &projected_scratch_bytes)) {
+        metal_vision_host_scratch_free(&scratch);
+        return metal_fail(error, error_size, "projected visual chunk scratch byte-size overflow");
+    }
+    uint16_t *projected_scratch_f16 = (uint16_t *)metal_host_malloc_tracked(ctx,
+                                                                            UOCR_MEMORY_VISION_SCRATCH,
+                                                                            projected_scratch_bytes,
+                                                                            "projected visual chunk rows",
+                                                                            error,
+                                                                            error_size);
+    if (projected_scratch_f16 == NULL) {
         metal_vision_host_scratch_free(&scratch);
         return 0;
     }
@@ -3225,7 +3321,7 @@ int uocr_metal_context_encode_visual_features_f16(uocr_metal_context *ctx,
         const double formatter_ms = chunk_processing_ms > project.chunk_encode_ms ? chunk_processing_ms - project.chunk_encode_ms : 0.0;
         metal_profile_add_event_ms(ctx, "metal.vision.formatter", formatter_ms);
     }
-    free(projected_scratch_f16);
+    metal_host_free_tracked(ctx, UOCR_MEMORY_VISION_SCRATCH, projected_scratch_f16, projected_scratch_bytes);
     metal_vision_host_scratch_free(&scratch);
     if (process_status != UOCR_OK) {
         char detail[512];
@@ -3285,7 +3381,7 @@ int uocr_metal_context_encode_sam_features_f16(uocr_metal_context *ctx,
     }
 
     uocr_metal_vision_host_scratch scratch;
-    if (!metal_vision_host_scratch_init(&scratch, error, error_size)) {
+    if (!metal_vision_host_scratch_init(ctx, &scratch, error, error_size)) {
         return 0;
     }
 
@@ -3368,7 +3464,7 @@ int uocr_metal_context_encode_clip_features_f16(uocr_metal_context *ctx,
     }
 
     uocr_metal_vision_host_scratch scratch;
-    if (!metal_vision_host_scratch_init(&scratch, error, error_size)) {
+    if (!metal_vision_host_scratch_init(ctx, &scratch, error, error_size)) {
         return 0;
     }
 
@@ -3455,7 +3551,7 @@ int uocr_metal_context_encode_projected_features_f16(uocr_metal_context *ctx,
     }
 
     uocr_metal_vision_host_scratch scratch;
-    if (!metal_vision_host_scratch_init(&scratch, error, error_size)) {
+    if (!metal_vision_host_scratch_init(ctx, &scratch, error, error_size)) {
         return 0;
     }
 
@@ -3497,6 +3593,22 @@ static const char *scratch_slot_name(uocr_metal_scratch_slot slot) {
             return "transient";
         default:
             return "unknown";
+    }
+}
+
+static uocr_memory_category scratch_slot_memory_category(uocr_metal_scratch_slot slot) {
+    switch (slot) {
+        case UOCR_METAL_SCRATCH_VISION:
+            return UOCR_MEMORY_VISION_SCRATCH;
+        case UOCR_METAL_SCRATCH_DECODER:
+            return UOCR_MEMORY_DECODER_SCRATCH;
+        case UOCR_METAL_SCRATCH_MOE:
+            return UOCR_MEMORY_MOE_SCRATCH;
+        case UOCR_METAL_SCRATCH_LOGITS:
+            return UOCR_MEMORY_LOGITS_READBACK;
+        case UOCR_METAL_SCRATCH_TRANSIENT:
+        default:
+            return UOCR_MEMORY_TRANSIENT_BUFFERS;
     }
 }
 
@@ -3574,8 +3686,15 @@ int uocr_metal_context_ensure_scratch(uocr_metal_context *ctx,
                               scratch_slot_name(slot),
                               (unsigned long long)new_capacity);
         }
+        const uocr_memory_category category = scratch_slot_memory_category(slot);
+        if (!metal_memory_reserve(ctx, category, new_capacity, scratch_slot_name(slot), error, error_size)) {
+            [buffer release];
+            return 0;
+        }
+        const uint64_t old_capacity = scratch->capacity;
         buffer.label = [NSString stringWithFormat:@"uocr_scratch_%s", scratch_slot_name(slot)];
         [scratch->buffer release];
+        metal_memory_release(ctx, category, old_capacity);
         scratch->buffer = buffer;
         scratch->capacity = new_capacity;
         scratch->cpu_visible = wants_cpu_visible;
@@ -3592,10 +3711,12 @@ void uocr_metal_context_release_scratch(uocr_metal_context *ctx, uocr_metal_scra
     }
     @autoreleasepool {
         uocr_metal_scratch_buffer *scratch = &ctx->scratch[slot];
+        const uint64_t capacity = scratch->capacity;
         [scratch->buffer release];
         scratch->buffer = nil;
         scratch->capacity = 0u;
         scratch->cpu_visible = 0;
+        metal_memory_release(ctx, scratch_slot_memory_category(slot), capacity);
     }
 }
 
@@ -11047,6 +11168,14 @@ int uocr_metal_context_clip_mlp_f16(uocr_metal_context *ctx,
                           (unsigned long long)max_buffer_length);
     }
 
+    uint64_t host_scratch_bytes = 0u;
+    if (!checked_mul_u64(mid_bytes, 2u, &host_scratch_bytes)) {
+        return metal_fail(error, error_size, "Metal CLIP MLP host scratch byte-size overflow");
+    }
+    if (!metal_memory_reserve(ctx, UOCR_MEMORY_VISION_SCRATCH, host_scratch_bytes, "CLIP MLP host scratch", error, error_size)) {
+        return 0;
+    }
+
     int result = 0;
     uint16_t *fc1_out_f16 = (uint16_t *)malloc((size_t)mid_bytes);
     uint16_t *activated_f16 = (uint16_t *)malloc((size_t)mid_bytes);
@@ -11116,6 +11245,7 @@ int uocr_metal_context_clip_mlp_f16(uocr_metal_context *ctx,
 cleanup_clip_mlp:
     free(activated_f16);
     free(fc1_out_f16);
+    metal_memory_release(ctx, UOCR_MEMORY_VISION_SCRATCH, host_scratch_bytes);
     if (result) {
         metal_clear_error(error, error_size);
     }
@@ -11315,6 +11445,14 @@ int uocr_metal_context_clip_transformer_block_f16(uocr_metal_context *ctx,
     }
     (void)hidden_values;
 
+    uint64_t host_scratch_bytes = 0u;
+    if (!checked_mul_u64(hidden_bytes, 9u, &host_scratch_bytes)) {
+        return metal_fail(error, error_size, "Metal CLIP transformer block host scratch byte-size overflow");
+    }
+    if (!metal_memory_reserve(ctx, UOCR_MEMORY_VISION_SCRATCH, host_scratch_bytes, "CLIP transformer block host scratch", error, error_size)) {
+        return 0;
+    }
+
     int result = 0;
     uint16_t *norm1_f16 = (uint16_t *)malloc((size_t)hidden_bytes);
     uint16_t *q_f16 = (uint16_t *)malloc((size_t)hidden_bytes);
@@ -11438,6 +11576,7 @@ cleanup_clip_transformer_block:
     free(k_f16);
     free(q_f16);
     free(norm1_f16);
+    metal_memory_release(ctx, UOCR_MEMORY_VISION_SCRATCH, host_scratch_bytes);
     if (result) {
         metal_clear_error(error, error_size);
     }
@@ -11474,6 +11613,14 @@ int uocr_metal_context_clip_transformer_f16(uocr_metal_context *ctx,
 
     uint64_t hidden_bytes = 0u;
     if (!metal_clip_transformer_activation_bytes(token_count, NULL, &hidden_bytes, error, error_size)) {
+        return 0;
+    }
+
+    uint64_t host_scratch_bytes = 0u;
+    if (!checked_mul_u64(hidden_bytes, 2u, &host_scratch_bytes)) {
+        return metal_fail(error, error_size, "Metal CLIP transformer state host scratch byte-size overflow");
+    }
+    if (!metal_memory_reserve(ctx, UOCR_MEMORY_VISION_SCRATCH, host_scratch_bytes, "CLIP transformer state host scratch", error, error_size)) {
         return 0;
     }
 
@@ -11524,6 +11671,7 @@ int uocr_metal_context_clip_transformer_f16(uocr_metal_context *ctx,
 cleanup_clip_transformer:
     free(state_b_f16);
     free(state_a_f16);
+    metal_memory_release(ctx, UOCR_MEMORY_VISION_SCRATCH, host_scratch_bytes);
     if (result) {
         metal_clear_error(error, error_size);
     }
@@ -11828,6 +11976,18 @@ int uocr_metal_context_sam_transformer_block_f16(uocr_metal_context *ctx,
                           (unsigned long long)max_buffer_length);
     }
 
+    uint64_t hidden_host_scratch_bytes = 0u;
+    uint64_t attention_host_scratch_bytes = 0u;
+    uint64_t host_scratch_bytes = 0u;
+    if (!checked_mul_u64(hidden_bytes, 5u, &hidden_host_scratch_bytes) ||
+        !checked_mul_u64(attention_bytes, 6u, &attention_host_scratch_bytes) ||
+        !checked_add_u64(hidden_host_scratch_bytes, attention_host_scratch_bytes, &host_scratch_bytes)) {
+        return metal_fail(error, error_size, "Metal SAM transformer block host scratch byte-size overflow");
+    }
+    if (!metal_memory_reserve(ctx, UOCR_MEMORY_VISION_SCRATCH, host_scratch_bytes, "SAM transformer block host scratch", error, error_size)) {
+        return 0;
+    }
+
     int result = 0;
     uint16_t *norm1_f16 = (uint16_t *)malloc((size_t)hidden_bytes);
     uint16_t *window_tokens_f16 = (uint16_t *)malloc((size_t)attention_bytes);
@@ -12034,6 +12194,7 @@ cleanup_sam_transformer_block:
     free(q_f16);
     free(window_tokens_f16);
     free(norm1_f16);
+    metal_memory_release(ctx, UOCR_MEMORY_VISION_SCRATCH, host_scratch_bytes);
     if (result) {
         metal_clear_error(error, error_size);
     }
@@ -12068,6 +12229,14 @@ int uocr_metal_context_sam_transformer_f16(uocr_metal_context *ctx,
 
     uint64_t hidden_bytes = 0u;
     if (!metal_sam_transformer_activation_bytes(grid_w, grid_h, NULL, &hidden_bytes, error, error_size)) {
+        return 0;
+    }
+
+    uint64_t host_scratch_bytes = 0u;
+    if (!checked_mul_u64(hidden_bytes, 2u, &host_scratch_bytes)) {
+        return metal_fail(error, error_size, "Metal SAM transformer state host scratch byte-size overflow");
+    }
+    if (!metal_memory_reserve(ctx, UOCR_MEMORY_VISION_SCRATCH, host_scratch_bytes, "SAM transformer state host scratch", error, error_size)) {
         return 0;
     }
 
@@ -12120,6 +12289,7 @@ int uocr_metal_context_sam_transformer_f16(uocr_metal_context *ctx,
 cleanup_sam_transformer:
     free(state_b_f16);
     free(state_a_f16);
+    metal_memory_release(ctx, UOCR_MEMORY_VISION_SCRATCH, host_scratch_bytes);
     if (result) {
         metal_clear_error(error, error_size);
     }
@@ -18629,6 +18799,12 @@ int uocr_metal_context_write_kv_cache_f16(uocr_metal_context *ctx,
 void uocr_metal_context_set_profile(uocr_metal_context *ctx, uocr_profile_state *profile) {
     if (ctx != NULL) {
         ctx->profile = profile;
+    }
+}
+
+void uocr_metal_context_set_memory_tracker(uocr_metal_context *ctx, uocr_memory_tracker *memory_tracker) {
+    if (ctx != NULL) {
+        ctx->memory_tracker = memory_tracker;
     }
 }
 

@@ -65,7 +65,7 @@ Implementation status:
 - [x] Record wall timings for Python preprocessing, engine open, request validation, vision, prompt assembly, prefill, first token, decode loop, and Python decode.
 - [x] Record Metal timings for SAM patch/neck, SAM blocks, CLIP blocks, projector, formatter, prompt assembly, each decoder layer group, final norm, LM-head selection, no-repeat processing, and command-buffer waits.
 - [x] Record allocation/object counts for Metal buffers, command buffers, command encoders, MPS descriptors, MPS NDArrays, NSArrays, and transient-retain arrays.
-- [ ] Record memory by category: model views, runtime arenas, KV cache, host vision scratch, private/shared vision workspace, transient buffers, logits/selection scratch, and total live/peak bytes.
+- [x] Record memory by category: model views, runtime arenas, KV cache, host vision scratch, private/shared vision workspace, transient buffers, logits/selection scratch, and total live/peak bytes.
 - [ ] Produce baseline profiles for `docs/test.png` with `preset="base"`, `preset="gundam"`, `max_length=4096`, and default OCR settings.
 - [ ] Reject optimization PRs that do not include comparable before/after timing evidence.
 - [ ] Reject optimization PRs that keep fallback, duplicate, or unselected production paths after the optimized path is confirmed.
