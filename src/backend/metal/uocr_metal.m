@@ -24,6 +24,21 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 
+#define UOCR_METAL_MPS_DATA_TYPE_FLOAT16 (0x10000000U | 16U)
+#define UOCR_METAL_MPS_MATMUL_MIN_FLOPS 64000000ULL
+
+@interface NSObject (UOCRMetalMPSDynamic)
++ (id)descriptorWithDataType:(uint32_t)dataType shape:(NSArray<NSNumber *> *)shape;
+- (void)setPreferPackedRows:(BOOL)preferPackedRows;
+- (void)transposeDimension:(NSUInteger)dimension withDimension:(NSUInteger)otherDimension;
+- (id)initWithBuffer:(id<MTLBuffer>)buffer offset:(NSUInteger)offset descriptor:(id)descriptor;
+- (id)initWithDevice:(id<MTLDevice>)device sourceCount:(NSUInteger)sourceCount;
+- (void)encodeToCommandEncoder:(id<MTLComputeCommandEncoder>)encoder
+                  commandBuffer:(id<MTLCommandBuffer>)commandBuffer
+                   sourceArrays:(NSArray *)sourceArrays
+               destinationArray:(id)destinationArray;
+@end
+
 #ifndef UOCR_METAL_RUNTIME_COMPILE
 #define UOCR_METAL_RUNTIME_COMPILE 1
 #endif
@@ -113,6 +128,7 @@ struct uocr_metal_context {
     id<MTLDevice> device;
     id<MTLCommandQueue> queue;
     id<MTLCommandBuffer> active_command_buffer;
+    id mps_matmul_kernel;
     id<MTLLibrary> library;
     NSMutableDictionary<NSString *, id<MTLComputePipelineState>> *pipeline_cache;
     NSMutableArray *transient_retains;
@@ -4075,6 +4091,9 @@ static int metal_hot_path_alloc_guard_end(const uocr_metal_context *ctx,
     return 1;
 }
 
+static int metal_mps_framework_available(void);
+static id metal_ensure_mps_matmul_kernel(uocr_metal_context *ctx, char *error, size_t error_size);
+
 static int metal_prewarm_integrated_decoder_pipelines(uocr_metal_context *ctx, char *error, size_t error_size) {
     static const char *const pipeline_names[] = {
         "uocr_rmsnorm_f16_to_f16",
@@ -4086,6 +4105,7 @@ static int metal_prewarm_integrated_decoder_pipelines(uocr_metal_context *ctx, c
         "uocr_prefill_attention_f16_to_f16",
         "uocr_decode_attention_f16_to_f16",
         "uocr_attention_output_residual_f16_to_f16",
+        "uocr_clip_residual_add_f16_to_f16",
         "uocr_dense_swiglu_gate_up_f16",
         "uocr_dense_swiglu_down_f16_to_f16",
         "uocr_moe_router_logits_f16_to_f32",
@@ -4099,6 +4119,9 @@ static int metal_prewarm_integrated_decoder_pipelines(uocr_metal_context *ctx, c
             if (metal_get_pipeline(ctx, pipeline_names[i], error, error_size) == nil) {
                 return 0;
             }
+        }
+        if (metal_mps_framework_available() && metal_ensure_mps_matmul_kernel(ctx, error, error_size) == nil) {
+            return 0;
         }
     }
     return 1;
@@ -4170,6 +4193,11 @@ static void metal_command_batch_abort(uocr_metal_context *ctx) {
     }
     [ctx->active_command_buffer release];
     ctx->active_command_buffer = nil;
+    if (ctx->transient_retains != nil) {
+        @synchronized(ctx->transient_retains) {
+            [ctx->transient_retains removeAllObjects];
+        }
+    }
 }
 
 static int metal_command_batch_commit_and_wait(uocr_metal_context *ctx,
@@ -4226,6 +4254,200 @@ static int metal_finish_command_buffer_for_op(uocr_metal_context *ctx,
         return 1;
     }
     return metal_wait_for_command_buffer(cb, op_name, error, error_size);
+}
+
+typedef struct uocr_metal_mps_class_cache {
+    int attempted;
+    int available;
+    Class descriptor_class;
+    Class array_class;
+    Class matmul_class;
+} uocr_metal_mps_class_cache;
+
+static const uocr_metal_mps_class_cache *metal_mps_classes(void) {
+    static uocr_metal_mps_class_cache cache;
+    if (cache.attempted) {
+        return &cache;
+    }
+    cache.attempted = 1;
+    cache.matmul_class = NSClassFromString(@"MPSNDArrayMatrixMultiplication");
+    cache.descriptor_class = NSClassFromString(@"MPSNDArrayDescriptor");
+    cache.array_class = NSClassFromString(@"MPSNDArray");
+    if (cache.matmul_class == Nil || cache.descriptor_class == Nil || cache.array_class == Nil) {
+        NSBundle *bundle = [NSBundle bundleWithPath:@"/System/Library/Frameworks/MetalPerformanceShaders.framework"];
+        if (bundle != nil) {
+            (void)[bundle load];
+        }
+        cache.matmul_class = NSClassFromString(@"MPSNDArrayMatrixMultiplication");
+        cache.descriptor_class = NSClassFromString(@"MPSNDArrayDescriptor");
+        cache.array_class = NSClassFromString(@"MPSNDArray");
+    }
+    cache.available = cache.matmul_class != Nil && cache.descriptor_class != Nil && cache.array_class != Nil;
+    return &cache;
+}
+
+static int metal_env_flag_enabled(const char *name) {
+    const char *value = name != NULL ? getenv(name) : NULL;
+    if (value == NULL || value[0] == '\0' || strcmp(value, "0") == 0 || strcmp(value, "false") == 0 ||
+        strcmp(value, "FALSE") == 0 || strcmp(value, "no") == 0 || strcmp(value, "NO") == 0 ||
+        strcmp(value, "off") == 0 || strcmp(value, "OFF") == 0) {
+        return 0;
+    }
+    return 1;
+}
+
+static uint64_t metal_env_u64(const char *name, uint64_t fallback) {
+    const char *value = name != NULL ? getenv(name) : NULL;
+    if (value == NULL || value[0] == '\0') {
+        return fallback;
+    }
+    char *end = NULL;
+    unsigned long long parsed = strtoull(value, &end, 10);
+    if (end == value || *end != '\0') {
+        return fallback;
+    }
+    return (uint64_t)parsed;
+}
+
+static int metal_mps_framework_available(void) {
+    return !metal_env_flag_enabled("UOCR_METAL_DISABLE_MPS") && metal_mps_classes()->available;
+}
+
+static uint64_t metal_mps_matmul_min_flops(void) {
+    return metal_env_u64("UOCR_METAL_MPS_MATMUL_MIN_FLOPS", UOCR_METAL_MPS_MATMUL_MIN_FLOPS);
+}
+
+static int metal_mps_matmul_nt_f16_should_use(uint32_t rows, uint32_t in_features, uint32_t out_features) {
+    uint64_t tmp = 0u;
+    uint64_t flops = 0u;
+    if (rows == 0u || in_features == 0u || out_features == 0u || !metal_mps_framework_available() ||
+        !checked_mul_u64((uint64_t)rows, (uint64_t)in_features, &tmp) ||
+        !checked_mul_u64(tmp, (uint64_t)out_features, &flops) ||
+        !checked_mul_u64(flops, 2u, &flops)) {
+        return 0;
+    }
+    return flops >= metal_mps_matmul_min_flops();
+}
+
+static id metal_mps_matrix_array_from_slice(uocr_metal_buffer_slice slice,
+                                            uint32_t rows,
+                                            uint32_t cols,
+                                            int transpose) {
+    const uocr_metal_mps_class_cache *classes = metal_mps_classes();
+    if (!classes->available || slice.buffer == nil || rows == 0u || cols == 0u) {
+        return nil;
+    }
+    id desc = [classes->descriptor_class descriptorWithDataType:UOCR_METAL_MPS_DATA_TYPE_FLOAT16
+                                                          shape:@[ @((NSUInteger)rows), @((NSUInteger)cols) ]];
+    if (desc == nil) {
+        return nil;
+    }
+    [desc setPreferPackedRows:YES];
+    if (transpose) {
+        [desc transposeDimension:0u withDimension:1u];
+    }
+    return [[classes->array_class alloc] initWithBuffer:slice.buffer offset:slice.offset descriptor:desc];
+}
+
+static id metal_ensure_mps_matmul_kernel(uocr_metal_context *ctx, char *error, size_t error_size) {
+    if (ctx == NULL || ctx->device == nil) {
+        (void)metal_fail(error, error_size, "invalid MPS matmul context");
+        return nil;
+    }
+    if (!metal_mps_framework_available()) {
+        (void)metal_fail(error, error_size, "MetalPerformanceShaders NDArray matmul is unavailable");
+        return nil;
+    }
+    if (ctx->mps_matmul_kernel != nil) {
+        return ctx->mps_matmul_kernel;
+    }
+    Class kernel_class = metal_mps_classes()->matmul_class;
+    if (kernel_class == Nil) {
+        (void)metal_fail(error, error_size, "MPSNDArrayMatrixMultiplication class is unavailable");
+        return nil;
+    }
+    id kernel = [[kernel_class alloc] initWithDevice:ctx->device sourceCount:2u];
+    if (kernel == nil) {
+        (void)metal_fail(error, error_size, "failed to create MPS NDArray matmul kernel");
+        return nil;
+    }
+    ctx->mps_matmul_kernel = kernel;
+    return kernel;
+}
+
+static int metal_run_mps_matmul_nt_f16(uocr_metal_context *ctx,
+                                       uocr_metal_buffer_slice input,
+                                       uocr_metal_buffer_slice weight_nk,
+                                       uocr_metal_buffer_slice dst,
+                                       uint32_t rows,
+                                       uint32_t in_features,
+                                       uint32_t out_features,
+                                       const char *op_name,
+                                       char *error,
+                                       size_t error_size) {
+    const uint64_t input_bytes = (uint64_t)rows * (uint64_t)in_features * 2u;
+    const uint64_t weight_bytes = (uint64_t)out_features * (uint64_t)in_features * 2u;
+    const uint64_t dst_bytes = (uint64_t)rows * (uint64_t)out_features * 2u;
+    if (ctx == NULL || rows == 0u || in_features == 0u || out_features == 0u ||
+        !metal_slice_valid(input, input_bytes) || !metal_slice_valid(weight_nk, weight_bytes) ||
+        !metal_slice_valid(dst, dst_bytes)) {
+        return metal_fail(error, error_size, "invalid %s MPS matmul request", op_name != NULL ? op_name : "Metal");
+    }
+    @autoreleasepool {
+        id kernel = metal_ensure_mps_matmul_kernel(ctx, error, error_size);
+        if (kernel == nil) {
+            return 0;
+        }
+        id x_array = metal_mps_matrix_array_from_slice(input, rows, in_features, 0);
+        id w_array = metal_mps_matrix_array_from_slice(weight_nk, out_features, in_features, 1);
+        id y_array = metal_mps_matrix_array_from_slice(dst, rows, out_features, 0);
+        if (x_array == nil || w_array == nil || y_array == nil) {
+            [x_array release];
+            [w_array release];
+            [y_array release];
+            return metal_fail(error, error_size, "failed to create %s MPS NDArrays", op_name != NULL ? op_name : "Metal");
+        }
+        int owned_command_buffer = 0;
+        id<MTLCommandBuffer> cb = metal_command_buffer_for_op(ctx, &owned_command_buffer, op_name != NULL ? op_name : "MPS matmul", error, error_size);
+        if (cb == nil) {
+            [x_array release];
+            [w_array release];
+            [y_array release];
+            return 0;
+        }
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        if (enc == nil) {
+            [x_array release];
+            [w_array release];
+            [y_array release];
+            return metal_fail(error, error_size, "failed to create %s MPS matmul encoder", op_name != NULL ? op_name : "Metal");
+        }
+        NSArray *sources = [[NSArray alloc] initWithObjects:x_array, w_array, nil];
+        NSArray *retained_arrays = [[NSArray alloc] initWithObjects:x_array, w_array, y_array, nil];
+        if (sources == nil || retained_arrays == nil) {
+            [sources release];
+            [retained_arrays release];
+            [x_array release];
+            [w_array release];
+            [y_array release];
+            return metal_fail(error, error_size, "failed to create %s MPS retain arrays", op_name != NULL ? op_name : "Metal");
+        }
+        [kernel encodeToCommandEncoder:enc
+                          commandBuffer:cb
+                           sourceArrays:sources
+                       destinationArray:y_array];
+        [enc endEncoding];
+        [sources release];
+        const int retained = metal_retain_transient_until_completed(ctx, cb, retained_arrays, error, error_size);
+        [retained_arrays release];
+        [x_array release];
+        [w_array release];
+        [y_array release];
+        if (!retained) {
+            return 0;
+        }
+        return metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, op_name != NULL ? op_name : "MPS matmul", error, error_size);
+    }
 }
 
 static int metal_hidden_arena_segment_slice(const uocr_metal_context *ctx,
@@ -4539,6 +4761,48 @@ static int metal_copy_slice(uocr_metal_context *ctx,
     }
 }
 
+static int metal_run_residual_add_f16(uocr_metal_context *ctx,
+                                       uocr_metal_buffer_slice base,
+                                       uocr_metal_buffer_slice update,
+                                       uocr_metal_buffer_slice dst,
+                                       uint32_t value_count,
+                                       const char *op_name,
+                                       char *error,
+                                       size_t error_size) {
+    const uint64_t bytes = (uint64_t)value_count * 2u;
+    if (ctx == NULL || value_count == 0u || !metal_slice_valid(base, bytes) ||
+        !metal_slice_valid(update, bytes) || !metal_slice_valid(dst, bytes)) {
+        return metal_fail(error, error_size, "invalid %s residual-add request", op_name != NULL ? op_name : "Metal");
+    }
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, "uocr_clip_residual_add_f16_to_f16", error, error_size);
+        if (pipeline == nil) {
+            return 0;
+        }
+        int owned_command_buffer = 0;
+        id<MTLCommandBuffer> cb = metal_command_buffer_for_op(ctx, &owned_command_buffer, op_name != NULL ? op_name : "residual add", error, error_size);
+        if (cb == nil) {
+            return 0;
+        }
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        if (enc == nil) {
+            return metal_fail(error, error_size, "failed to create %s residual-add command encoder", op_name != NULL ? op_name : "Metal");
+        }
+        NSUInteger threads = pipeline.threadExecutionWidth;
+        if (threads == 0u) threads = 1u;
+        if (threads > 256u) threads = 256u;
+        [enc setComputePipelineState:pipeline];
+        [enc setBuffer:base.buffer offset:base.offset atIndex:0u];
+        [enc setBuffer:update.buffer offset:update.offset atIndex:1u];
+        [enc setBuffer:dst.buffer offset:dst.offset atIndex:2u];
+        [enc setBytes:&value_count length:sizeof(value_count) atIndex:3u];
+        [enc dispatchThreads:MTLSizeMake((NSUInteger)value_count, 1u, 1u)
+       threadsPerThreadgroup:MTLSizeMake(threads, 1u, 1u)];
+        [enc endEncoding];
+        return metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, op_name != NULL ? op_name : "residual add", error, error_size);
+    }
+}
+
 static const uocr_metal_decoder_binding *metal_require_decoder_binding(const uocr_metal_context *ctx,
                                                                        uint32_t tensor_id,
                                                                        const char *label,
@@ -4815,6 +5079,41 @@ static int metal_run_attention_qkv_buffer_f16(uocr_metal_context *ctx,
     if (!checked_mul_u64((uint64_t)n_tokens, (uint64_t)UOCR_HIDDEN_SIZE * 3u, &output_values) ||
         output_values > (uint64_t)UINT32_MAX) {
         return metal_fail(error, error_size, "integrated attention QKV dispatch size overflow");
+    }
+    if (metal_mps_matmul_nt_f16_should_use(n_tokens, UOCR_HIDDEN_SIZE, UOCR_HIDDEN_SIZE)) {
+        uocr_metal_buffer_slice q_weight_slice = { q_weight->buffer, q_weight->offset };
+        uocr_metal_buffer_slice k_weight_slice = { k_weight->buffer, k_weight->offset };
+        uocr_metal_buffer_slice v_weight_slice = { v_weight->buffer, v_weight->offset };
+        return metal_run_mps_matmul_nt_f16(ctx,
+                                           src,
+                                           q_weight_slice,
+                                           q_dst,
+                                           n_tokens,
+                                           UOCR_HIDDEN_SIZE,
+                                           UOCR_HIDDEN_SIZE,
+                                           "integrated attention Q MPS matmul",
+                                           error,
+                                           error_size) &&
+               metal_run_mps_matmul_nt_f16(ctx,
+                                           src,
+                                           k_weight_slice,
+                                           k_dst,
+                                           n_tokens,
+                                           UOCR_HIDDEN_SIZE,
+                                           UOCR_HIDDEN_SIZE,
+                                           "integrated attention K MPS matmul",
+                                           error,
+                                           error_size) &&
+               metal_run_mps_matmul_nt_f16(ctx,
+                                           src,
+                                           v_weight_slice,
+                                           v_dst,
+                                           n_tokens,
+                                           UOCR_HIDDEN_SIZE,
+                                           UOCR_HIDDEN_SIZE,
+                                           "integrated attention V MPS matmul",
+                                           error,
+                                           error_size);
     }
     @autoreleasepool {
         id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, "uocr_attention_qkvo_f16_to_f16", error, error_size);
@@ -5138,6 +5437,27 @@ static int metal_run_attention_output_residual_buffer_f16(uocr_metal_context *ct
         !metal_buffer_range_valid(o_weight->buffer, o_weight->offset, weight_bytes) || output_values > UINT32_MAX) {
         return metal_fail(error, error_size, "invalid integrated attention output request");
     }
+    if (metal_mps_matmul_nt_f16_should_use(n_tokens, UOCR_HIDDEN_SIZE, UOCR_HIDDEN_SIZE)) {
+        uocr_metal_buffer_slice weight_slice = { o_weight->buffer, o_weight->offset };
+        return metal_run_mps_matmul_nt_f16(ctx,
+                                           context,
+                                           weight_slice,
+                                           dst,
+                                           n_tokens,
+                                           UOCR_HIDDEN_SIZE,
+                                           UOCR_HIDDEN_SIZE,
+                                           "integrated attention output MPS matmul",
+                                           error,
+                                           error_size) &&
+               metal_run_residual_add_f16(ctx,
+                                          dst,
+                                          residual,
+                                          dst,
+                                          (uint32_t)output_values,
+                                          "integrated attention output MPS residual add",
+                                          error,
+                                          error_size);
+    }
     @autoreleasepool {
         id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, "uocr_attention_output_residual_f16_to_f16", error, error_size);
         if (pipeline == nil) {
@@ -5201,10 +5521,12 @@ static int metal_run_dense_swiglu_buffer_f16(uocr_metal_context *ctx,
         !metal_buffer_range_valid(down_weight->buffer, down_weight->offset, down_weight_bytes)) {
         return metal_fail(error, error_size, "invalid %s SwiGLU request", op_name);
     }
+    const int use_mps_down = metal_mps_matmul_nt_f16_should_use(n_tokens, intermediate_size, UOCR_HIDDEN_SIZE);
     @autoreleasepool {
         id<MTLComputePipelineState> gate_pipeline = metal_get_pipeline(ctx, "uocr_dense_swiglu_gate_up_f16", error, error_size);
-        id<MTLComputePipelineState> down_pipeline = metal_get_pipeline(ctx, "uocr_dense_swiglu_down_f16_to_f16", error, error_size);
-        if (gate_pipeline == nil || down_pipeline == nil) {
+        id<MTLComputePipelineState> down_pipeline = use_mps_down ? nil :
+            metal_get_pipeline(ctx, "uocr_dense_swiglu_down_f16_to_f16", error, error_size);
+        if (gate_pipeline == nil || (!use_mps_down && down_pipeline == nil)) {
             return 0;
         }
         int owned_command_buffer = 0;
@@ -5232,6 +5554,34 @@ static int metal_run_dense_swiglu_buffer_f16(uocr_metal_context *ctx,
         [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)gate_values, 1u, 1u)
              threadsPerThreadgroup:MTLSizeMake(gate_threads, 1u, 1u)];
         [enc endEncoding];
+
+        if (use_mps_down) {
+            uocr_metal_buffer_slice down_weight_slice = { down_weight->buffer, down_weight->offset };
+            if (!metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, op_name, error, error_size) ||
+                !metal_run_mps_matmul_nt_f16(ctx,
+                                             mid,
+                                             down_weight_slice,
+                                             dst,
+                                             n_tokens,
+                                             intermediate_size,
+                                             UOCR_HIDDEN_SIZE,
+                                             op_name,
+                                             error,
+                                             error_size)) {
+                return 0;
+            }
+            if (has_residual) {
+                return metal_run_residual_add_f16(ctx,
+                                                  dst,
+                                                  residual,
+                                                  dst,
+                                                  (uint32_t)down_values,
+                                                  op_name,
+                                                  error,
+                                                  error_size);
+            }
+            return 1;
+        }
 
         enc = [cb computeCommandEncoder];
         if (enc == nil) {
@@ -17985,6 +18335,7 @@ void uocr_metal_context_destroy(uocr_metal_context *ctx) {
     release_all_scratch(ctx);
     @autoreleasepool {
         [ctx->transient_retains release];
+        [ctx->mps_matmul_kernel release];
         [ctx->pipeline_cache release];
         [ctx->library release];
         [ctx->queue release];
