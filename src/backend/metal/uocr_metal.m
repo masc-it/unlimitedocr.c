@@ -17951,7 +17951,6 @@ int uocr_metal_context_dense_f16(uocr_metal_context *ctx,
             return metal_fail(error, error_size, "failed to allocate Metal dense output buffer");
         }
         dst.label = @"uocr_dense_output";
-        metal_zero_buffer_range(dst, dst_offset, (NSUInteger)output_bytes);
 
         if (output_type == UOCR_METAL_DENSE_OUTPUT_F16 &&
             metal_mps_matmul_nt_f16_should_use(input_rows, in_features, out_features)) {
@@ -17989,6 +17988,8 @@ int uocr_metal_context_dense_f16(uocr_metal_context *ctx,
             [src release];
             return ok;
         }
+
+        metal_zero_buffer_range(dst, dst_offset, (NSUInteger)output_bytes);
 
         id<MTLCommandBuffer> cb = metal_new_command_buffer(ctx);
         if (cb == nil) {
