@@ -271,3 +271,195 @@ int uocr_cpu_ref_causal_sdpa_f32(const float *q,
     }
     return 1;
 }
+
+static int checked_add_u32(uint32_t a, uint32_t b, uint32_t *out) {
+    if (out == NULL || a > UINT32_MAX - b) {
+        return 0;
+    }
+    *out = a + b;
+    return 1;
+}
+
+static int checked_mul_u64(uint64_t a, uint64_t b, uint64_t *out) {
+    if (out == NULL || (a != 0u && b > UINT64_MAX / a)) {
+        return 0;
+    }
+    *out = a * b;
+    return 1;
+}
+
+int uocr_cpu_ref_kv_cache_layout_init(uint32_t prompt_token_capacity,
+                                      uint32_t generated_ring_window,
+                                      uint32_t heads,
+                                      uint32_t head_dim,
+                                      uocr_cpu_ref_kv_cache_layout *out_layout) {
+    if (out_layout == NULL || prompt_token_capacity == 0u || generated_ring_window == 0u || heads == 0u ||
+        head_dim == 0u) {
+        return 0;
+    }
+
+    uint32_t cache_token_capacity = 0u;
+    if (!checked_add_u32(prompt_token_capacity, generated_ring_window, &cache_token_capacity)) {
+        return 0;
+    }
+
+    uint64_t token_stride = 0u;
+    if (!checked_mul_u64((uint64_t)heads, (uint64_t)head_dim, &token_stride)) {
+        return 0;
+    }
+    uint64_t total_floats = 0u;
+    if (!checked_mul_u64((uint64_t)cache_token_capacity, token_stride, &total_floats)) {
+        return 0;
+    }
+
+    memset(out_layout, 0, sizeof(*out_layout));
+    out_layout->prompt_token_capacity = prompt_token_capacity;
+    out_layout->generated_ring_window = generated_ring_window;
+    out_layout->heads = heads;
+    out_layout->head_dim = head_dim;
+    out_layout->cache_token_capacity = cache_token_capacity;
+    out_layout->token_stride_floats = token_stride;
+    out_layout->total_floats = total_floats;
+    return 1;
+}
+
+int uocr_cpu_ref_kv_cache_token_for_position(uint32_t prompt_length,
+                                             const uocr_cpu_ref_kv_cache_layout *layout,
+                                             uint32_t position,
+                                             uint32_t *out_cache_token) {
+    if (layout == NULL || out_cache_token == NULL || prompt_length == 0u ||
+        prompt_length > layout->prompt_token_capacity || layout->generated_ring_window == 0u) {
+        return 0;
+    }
+    if (position < prompt_length) {
+        *out_cache_token = position;
+        return 1;
+    }
+
+    const uint32_t generated_index = position - prompt_length;
+    uint32_t cache_token = 0u;
+    if (!checked_add_u32(prompt_length, generated_index % layout->generated_ring_window, &cache_token) ||
+        cache_token >= layout->cache_token_capacity) {
+        return 0;
+    }
+    *out_cache_token = cache_token;
+    return 1;
+}
+
+static int kv_cache_token_offset(const uocr_cpu_ref_kv_cache_layout *layout,
+                                 uint32_t cache_token,
+                                 uint64_t *out_offset) {
+    if (layout == NULL || out_offset == NULL || cache_token >= layout->cache_token_capacity ||
+        layout->token_stride_floats == 0u) {
+        return 0;
+    }
+    return checked_mul_u64((uint64_t)cache_token, layout->token_stride_floats, out_offset);
+}
+
+int uocr_cpu_ref_kv_cache_write_token_f32(float *k_cache,
+                                          float *v_cache,
+                                          const uocr_cpu_ref_kv_cache_layout *layout,
+                                          uint32_t prompt_length,
+                                          uint32_t position,
+                                          const float *k_token,
+                                          const float *v_token) {
+    if (k_cache == NULL || v_cache == NULL || layout == NULL || k_token == NULL || v_token == NULL) {
+        return 0;
+    }
+
+    uint32_t cache_token = 0u;
+    uint64_t offset = 0u;
+    if (!uocr_cpu_ref_kv_cache_token_for_position(prompt_length, layout, position, &cache_token) ||
+        !kv_cache_token_offset(layout, cache_token, &offset) ||
+        offset > UINT64_MAX - layout->token_stride_floats || offset + layout->token_stride_floats > layout->total_floats) {
+        return 0;
+    }
+
+    memcpy(k_cache + offset, k_token, (size_t)layout->token_stride_floats * sizeof(float));
+    memcpy(v_cache + offset, v_token, (size_t)layout->token_stride_floats * sizeof(float));
+    return 1;
+}
+
+int uocr_cpu_ref_kv_cache_read_token_f32(const float *k_cache,
+                                         const float *v_cache,
+                                         const uocr_cpu_ref_kv_cache_layout *layout,
+                                         uint32_t cache_token,
+                                         float *k_token_out,
+                                         float *v_token_out) {
+    if (k_cache == NULL || v_cache == NULL || layout == NULL || k_token_out == NULL || v_token_out == NULL) {
+        return 0;
+    }
+
+    uint64_t offset = 0u;
+    if (!kv_cache_token_offset(layout, cache_token, &offset) ||
+        offset > UINT64_MAX - layout->token_stride_floats || offset + layout->token_stride_floats > layout->total_floats) {
+        return 0;
+    }
+
+    memcpy(k_token_out, k_cache + offset, (size_t)layout->token_stride_floats * sizeof(float));
+    memcpy(v_token_out, v_cache + offset, (size_t)layout->token_stride_floats * sizeof(float));
+    return 1;
+}
+
+int uocr_cpu_ref_kv_cache_decode_attention_plan(uint32_t prompt_length,
+                                                const uocr_cpu_ref_kv_cache_layout *layout,
+                                                uint32_t generated_count,
+                                                uocr_cpu_ref_decode_attention_plan *out_plan) {
+    if (layout == NULL || out_plan == NULL || prompt_length == 0u || prompt_length > layout->prompt_token_capacity ||
+        layout->generated_ring_window == 0u || generated_count > UINT32_MAX - prompt_length) {
+        return 0;
+    }
+
+    const uint32_t live_generated = generated_count < layout->generated_ring_window ? generated_count
+                                                                                    : layout->generated_ring_window;
+    uint32_t attention_length = 0u;
+    if (!checked_add_u32(prompt_length, live_generated, &attention_length)) {
+        return 0;
+    }
+
+    const uint32_t first_generated_index = generated_count - live_generated;
+    uint32_t first_generated_position = 0u;
+    if (!checked_add_u32(prompt_length, first_generated_index, &first_generated_position)) {
+        return 0;
+    }
+    const uint32_t query_position = generated_count == 0u ? prompt_length : prompt_length + generated_count - 1u;
+
+    memset(out_plan, 0, sizeof(*out_plan));
+    out_plan->prompt_length = prompt_length;
+    out_plan->prompt_token_capacity = layout->prompt_token_capacity;
+    out_plan->cache_token_capacity = layout->cache_token_capacity;
+    out_plan->generated_count = generated_count;
+    out_plan->live_generated = live_generated;
+    out_plan->first_generated_index = first_generated_index;
+    out_plan->first_generated_position = first_generated_position;
+    out_plan->query_position = query_position;
+    out_plan->attention_length = attention_length;
+    out_plan->generated_ring_window = layout->generated_ring_window;
+    return 1;
+}
+
+int uocr_cpu_ref_kv_cache_decode_attention_index_to_token(const uocr_cpu_ref_decode_attention_plan *plan,
+                                                          uint32_t attention_index,
+                                                          uint32_t *out_cache_token) {
+    if (plan == NULL || out_cache_token == NULL || plan->prompt_length == 0u || plan->generated_ring_window == 0u ||
+        attention_index >= plan->attention_length) {
+        return 0;
+    }
+    if (attention_index < plan->prompt_length) {
+        *out_cache_token = attention_index;
+        return 1;
+    }
+
+    const uint32_t generated_offset = attention_index - plan->prompt_length;
+    if (generated_offset >= plan->live_generated) {
+        return 0;
+    }
+    const uint32_t logical_generated = plan->first_generated_index + generated_offset;
+    uint32_t cache_token = 0u;
+    if (!checked_add_u32(plan->prompt_length, logical_generated % plan->generated_ring_window, &cache_token) ||
+        cache_token >= plan->cache_token_capacity) {
+        return 0;
+    }
+    *out_cache_token = cache_token;
+    return 1;
+}

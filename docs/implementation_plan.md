@@ -600,7 +600,7 @@ Current priority slice, in order. The coding agent should take the first uncheck
 - [x] Implement CPU RMSNorm with fp32 variance and eps `1e-6`.
 - [x] Implement Llama/DeepSeek RoPE using split-half layout, not interleaved layout.
 - [x] Implement CPU causal SDPA for tiny text-only fixtures.
-- [ ] Implement CPU KV cache append/ring behavior for tiny fixtures.
+- [x] Implement CPU KV cache append/ring behavior for tiny fixtures.
 - [ ] Implement CPU dense SwiGLU for layer 0.
 - [ ] Implement CPU MoE router:
   - [ ] router matmul in fp32
@@ -975,7 +975,7 @@ Do not start the stable high-level OCR/PDF API until Gate E2E-0 passes: public f
   - [ ] `.uocr` synthetic loader/dumper
   - [ ] prepared-request validation
   - [ ] no-repeat-ngram processor
-  - [ ] KV ring index arithmetic
+  - [x] KV ring index arithmetic
 - [ ] Add native CTest tests:
   - [x] endian/alignment parsing
   - [x] tensor directory range validation

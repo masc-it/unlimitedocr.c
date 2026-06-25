@@ -175,10 +175,112 @@ static int test_causal_sdpa(void) {
     return 0;
 }
 
+static void fill_kv_token(float *k, float *v, uint32_t value, uint32_t stride) {
+    for (uint32_t index = 0u; index < stride; ++index) {
+        k[index] = (float)(value * 100u + index);
+        v[index] = (float)(value * 100u + 1000u + index);
+    }
+}
+
+static int check_kv_token_value(const float *k,
+                                const float *v,
+                                uint32_t value,
+                                uint32_t stride) {
+    for (uint32_t index = 0u; index < stride; ++index) {
+        CHECK(k[index] == (float)(value * 100u + index));
+        CHECK(v[index] == (float)(value * 100u + 1000u + index));
+    }
+    return 0;
+}
+
+static int test_kv_cache_ring(void) {
+    enum { PROMPT_CAP = 4u, RING = 3u, HEADS = 2u, HEAD_DIM = 2u, PROMPT_LEN = 3u, STRIDE = HEADS * HEAD_DIM };
+    uocr_cpu_ref_kv_cache_layout layout;
+    CHECK(uocr_cpu_ref_kv_cache_layout_init(PROMPT_CAP, RING, HEADS, HEAD_DIM, &layout) == 1);
+    CHECK(layout.cache_token_capacity == PROMPT_CAP + RING);
+    CHECK(layout.token_stride_floats == STRIDE);
+    CHECK(layout.total_floats == (PROMPT_CAP + RING) * STRIDE);
+    CHECK(uocr_cpu_ref_kv_cache_layout_init(0u, RING, HEADS, HEAD_DIM, &layout) == 0);
+    CHECK(uocr_cpu_ref_kv_cache_layout_init(PROMPT_CAP, 0u, HEADS, HEAD_DIM, &layout) == 0);
+
+    float k_cache[(PROMPT_CAP + RING) * STRIDE];
+    float v_cache[(PROMPT_CAP + RING) * STRIDE];
+    for (uint32_t index = 0u; index < (PROMPT_CAP + RING) * STRIDE; ++index) {
+        k_cache[index] = -1.0f;
+        v_cache[index] = -2.0f;
+    }
+
+    float k_token[STRIDE];
+    float v_token[STRIDE];
+    for (uint32_t position = 0u; position < 8u; ++position) {
+        fill_kv_token(k_token, v_token, position, STRIDE);
+        CHECK(uocr_cpu_ref_kv_cache_write_token_f32(k_cache, v_cache, &layout, PROMPT_LEN, position, k_token, v_token) == 1);
+    }
+
+    uint32_t cache_token = UINT32_MAX;
+    CHECK(uocr_cpu_ref_kv_cache_token_for_position(PROMPT_LEN, &layout, 0u, &cache_token) == 1);
+    CHECK(cache_token == 0u);
+    CHECK(uocr_cpu_ref_kv_cache_token_for_position(PROMPT_LEN, &layout, 2u, &cache_token) == 1);
+    CHECK(cache_token == 2u);
+    CHECK(uocr_cpu_ref_kv_cache_token_for_position(PROMPT_LEN, &layout, 3u, &cache_token) == 1);
+    CHECK(cache_token == 3u);
+    CHECK(uocr_cpu_ref_kv_cache_token_for_position(PROMPT_LEN, &layout, 4u, &cache_token) == 1);
+    CHECK(cache_token == 4u);
+    CHECK(uocr_cpu_ref_kv_cache_token_for_position(PROMPT_LEN, &layout, 5u, &cache_token) == 1);
+    CHECK(cache_token == 5u);
+    CHECK(uocr_cpu_ref_kv_cache_token_for_position(PROMPT_LEN, &layout, 6u, &cache_token) == 1);
+    CHECK(cache_token == 3u);
+    CHECK(uocr_cpu_ref_kv_cache_token_for_position(PROMPT_CAP + 1u, &layout, 0u, &cache_token) == 0);
+
+    float k_read[STRIDE];
+    float v_read[STRIDE];
+    CHECK(uocr_cpu_ref_kv_cache_read_token_f32(k_cache, v_cache, &layout, 0u, k_read, v_read) == 1);
+    CHECK(check_kv_token_value(k_read, v_read, 0u, STRIDE) == 0);
+    CHECK(uocr_cpu_ref_kv_cache_read_token_f32(k_cache, v_cache, &layout, 1u, k_read, v_read) == 1);
+    CHECK(check_kv_token_value(k_read, v_read, 1u, STRIDE) == 0);
+    CHECK(uocr_cpu_ref_kv_cache_read_token_f32(k_cache, v_cache, &layout, 2u, k_read, v_read) == 1);
+    CHECK(check_kv_token_value(k_read, v_read, 2u, STRIDE) == 0);
+    CHECK(uocr_cpu_ref_kv_cache_read_token_f32(k_cache, v_cache, &layout, 3u, k_read, v_read) == 1);
+    CHECK(check_kv_token_value(k_read, v_read, 6u, STRIDE) == 0);
+    CHECK(uocr_cpu_ref_kv_cache_read_token_f32(k_cache, v_cache, &layout, 4u, k_read, v_read) == 1);
+    CHECK(check_kv_token_value(k_read, v_read, 7u, STRIDE) == 0);
+    CHECK(uocr_cpu_ref_kv_cache_read_token_f32(k_cache, v_cache, &layout, 5u, k_read, v_read) == 1);
+    CHECK(check_kv_token_value(k_read, v_read, 5u, STRIDE) == 0);
+    CHECK(uocr_cpu_ref_kv_cache_read_token_f32(k_cache, v_cache, &layout, layout.cache_token_capacity, k_read, v_read) == 0);
+
+    uocr_cpu_ref_decode_attention_plan plan;
+    CHECK(uocr_cpu_ref_kv_cache_decode_attention_plan(PROMPT_LEN, &layout, 5u, &plan) == 1);
+    CHECK(plan.generated_count == 5u);
+    CHECK(plan.live_generated == RING);
+    CHECK(plan.first_generated_index == 2u);
+    CHECK(plan.first_generated_position == 5u);
+    CHECK(plan.query_position == 7u);
+    CHECK(plan.attention_length == PROMPT_LEN + RING);
+
+    const uint32_t expected_attention_tokens[PROMPT_LEN + RING] = {0u, 1u, 2u, 5u, 3u, 4u};
+    const uint32_t expected_attention_values[PROMPT_LEN + RING] = {0u, 1u, 2u, 5u, 6u, 7u};
+    for (uint32_t attention_index = 0u; attention_index < plan.attention_length; ++attention_index) {
+        CHECK(uocr_cpu_ref_kv_cache_decode_attention_index_to_token(&plan, attention_index, &cache_token) == 1);
+        CHECK(cache_token == expected_attention_tokens[attention_index]);
+        CHECK(uocr_cpu_ref_kv_cache_read_token_f32(k_cache, v_cache, &layout, cache_token, k_read, v_read) == 1);
+        CHECK(check_kv_token_value(k_read, v_read, expected_attention_values[attention_index], STRIDE) == 0);
+    }
+    CHECK(uocr_cpu_ref_kv_cache_decode_attention_index_to_token(&plan, plan.attention_length, &cache_token) == 0);
+
+    CHECK(uocr_cpu_ref_kv_cache_decode_attention_plan(PROMPT_LEN, &layout, 0u, &plan) == 1);
+    CHECK(plan.live_generated == 0u);
+    CHECK(plan.attention_length == PROMPT_LEN);
+    CHECK(plan.query_position == PROMPT_LEN);
+    CHECK(uocr_cpu_ref_kv_cache_decode_attention_plan(0u, &layout, 1u, &plan) == 0);
+    CHECK(uocr_cpu_ref_kv_cache_decode_attention_plan(PROMPT_CAP + 1u, &layout, 1u, &plan) == 0);
+    return 0;
+}
+
 int main(void) {
     if (test_dtype_conversions() != 0) return 1;
     if (test_rmsnorm() != 0) return 1;
     if (test_rope_split_half() != 0) return 1;
     if (test_causal_sdpa() != 0) return 1;
+    if (test_kv_cache_ring() != 0) return 1;
     return 0;
 }
