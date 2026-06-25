@@ -64,6 +64,11 @@ typedef struct uocr_metal_tensor_binding_internal {
     uint64_t payload_size;
 } uocr_metal_tensor_binding_internal;
 
+typedef struct uocr_metal_buffer_slice {
+    id<MTLBuffer> buffer;
+    NSUInteger offset;
+} uocr_metal_buffer_slice;
+
 #define UOCR_METAL_DECODER_REQUIRED_TENSOR_COUNT \
     (3u + (UOCR_DECODER_LAYERS * 6u) + 3u + ((UOCR_DECODER_LAYERS - 1u) * (1u + 3u + UOCR_ROUTED_EXPERTS * 3u)))
 #define UOCR_METAL_SAM_REQUIRED_TENSOR_COUNT (UOCR_SAM_BLOCKS * 14u + 11u)
@@ -133,6 +138,74 @@ typedef struct uocr_metal_vision_binding_cache {
     uocr_metal_vision_binding tensors[UOCR_METAL_VISION_REQUIRED_TENSOR_COUNT];
 } uocr_metal_vision_binding_cache;
 
+typedef struct uocr_metal_vision_tensor_f16 {
+    uocr_metal_buffer_slice slice;
+    uint64_t byte_length;
+    const uint16_t *host_f16;
+} uocr_metal_vision_tensor_f16;
+
+typedef struct uocr_metal_sam_transformer_block_slices_f16 {
+    uocr_metal_vision_tensor_f16 norm1_weight;
+    uocr_metal_vision_tensor_f16 norm1_bias;
+    uocr_metal_vision_tensor_f16 qkv_weight;
+    uocr_metal_vision_tensor_f16 qkv_bias;
+    uocr_metal_vision_tensor_f16 proj_weight;
+    uocr_metal_vision_tensor_f16 proj_bias;
+    uocr_metal_vision_tensor_f16 rel_pos_h;
+    uocr_metal_vision_tensor_f16 rel_pos_w;
+    uint32_t rel_pos_h_length;
+    uint32_t rel_pos_w_length;
+    uocr_metal_vision_tensor_f16 norm2_weight;
+    uocr_metal_vision_tensor_f16 norm2_bias;
+    uocr_metal_vision_tensor_f16 mlp_lin1_weight;
+    uocr_metal_vision_tensor_f16 mlp_lin1_bias;
+    uocr_metal_vision_tensor_f16 mlp_lin2_weight;
+    uocr_metal_vision_tensor_f16 mlp_lin2_bias;
+} uocr_metal_sam_transformer_block_slices_f16;
+
+typedef struct uocr_metal_clip_transformer_block_slices_f16 {
+    uocr_metal_vision_tensor_f16 ln1_weight;
+    uocr_metal_vision_tensor_f16 ln1_bias;
+    uocr_metal_vision_tensor_f16 qkv_weight;
+    uocr_metal_vision_tensor_f16 qkv_bias;
+    uocr_metal_vision_tensor_f16 out_proj_weight;
+    uocr_metal_vision_tensor_f16 out_proj_bias;
+    uocr_metal_vision_tensor_f16 ln2_weight;
+    uocr_metal_vision_tensor_f16 ln2_bias;
+    uocr_metal_vision_tensor_f16 mlp_fc1_weight;
+    uocr_metal_vision_tensor_f16 mlp_fc1_bias;
+    uocr_metal_vision_tensor_f16 mlp_fc2_weight;
+    uocr_metal_vision_tensor_f16 mlp_fc2_bias;
+} uocr_metal_clip_transformer_block_slices_f16;
+
+typedef struct uocr_metal_vision_weights_f16 {
+    int valid;
+    uint32_t count;
+    uocr_metal_vision_tensor_f16 image_newline;
+    uocr_metal_vision_tensor_f16 view_separator;
+    uocr_metal_vision_tensor_f16 projector_weight;
+    uocr_metal_vision_tensor_f16 projector_bias;
+    uocr_metal_vision_tensor_f16 sam_patch_weight;
+    uocr_metal_vision_tensor_f16 sam_patch_bias;
+    uocr_metal_vision_tensor_f16 sam_pos_embed;
+    uocr_metal_vision_tensor_f16 sam_neck_conv1x1_weight;
+    uocr_metal_vision_tensor_f16 sam_neck_norm1_weight;
+    uocr_metal_vision_tensor_f16 sam_neck_norm1_bias;
+    uocr_metal_vision_tensor_f16 sam_neck_conv3x3_weight;
+    uocr_metal_vision_tensor_f16 sam_neck_norm2_weight;
+    uocr_metal_vision_tensor_f16 sam_neck_norm2_bias;
+    uocr_metal_vision_tensor_f16 sam_net2_weight;
+    uocr_metal_vision_tensor_f16 sam_net3_weight;
+    uocr_metal_vision_tensor_f16 clip_class_embedding;
+    uocr_metal_vision_tensor_f16 clip_pos_embed;
+    uocr_metal_vision_tensor_f16 clip_pre_ln_weight;
+    uocr_metal_vision_tensor_f16 clip_pre_ln_bias;
+    uocr_metal_sam_transformer_block_slices_f16 sam_block_slices[UOCR_SAM_BLOCKS];
+    uocr_metal_clip_transformer_block_slices_f16 clip_block_slices[UOCR_CLIP_BLOCKS];
+    uocr_metal_sam_transformer_block_f16 sam_blocks[UOCR_SAM_BLOCKS];
+    uocr_metal_clip_transformer_block_f16 clip_blocks[UOCR_CLIP_BLOCKS];
+} uocr_metal_vision_weights_f16;
+
 typedef struct uocr_metal_payload_span {
     uint32_t tensor_index;
     uint32_t tensor_id;
@@ -178,6 +251,7 @@ struct uocr_metal_context {
     uocr_metal_decoder_binding_cache decoder_bindings;
     char decoder_binding_error[256];
     uocr_metal_vision_binding_cache vision_bindings;
+    uocr_metal_vision_weights_f16 vision_weights;
     char vision_binding_error[256];
     uocr_metal_kv_cache_layout kv_cache_layout;
     int has_kv_cache_layout;
@@ -1459,6 +1533,13 @@ static int metal_refresh_vision_binding_cache(uocr_metal_context *ctx,
                                               const uocr_model_file *model,
                                               char *error,
                                               size_t error_size);
+static int metal_vision_weight_cache_build_direct(const uocr_metal_vision_binding_cache *binding_cache,
+                                                  uocr_metal_vision_weights_f16 *out_weights,
+                                                  char *error,
+                                                  size_t error_size);
+static const uocr_metal_vision_weights_f16 *metal_require_vision_weights_f16(const uocr_metal_context *ctx,
+                                                                             char *error,
+                                                                             size_t error_size);
 static int metal_sam_transformer_block_has_weights(const uocr_metal_sam_transformer_block_f16 *block);
 static int metal_clip_transformer_block_has_weights(const uocr_metal_clip_transformer_block_f16 *block);
 static void metal_copy_error_detail(char *detail, size_t detail_size, const char *error);
@@ -2453,6 +2534,7 @@ static void metal_invalidate_vision_binding_cache(uocr_metal_context *ctx, const
         return;
     }
     memset(&ctx->vision_bindings, 0, sizeof(ctx->vision_bindings));
+    memset(&ctx->vision_weights, 0, sizeof(ctx->vision_weights));
     if (reason == NULL || reason[0] == '\0') {
         reason = "vision tensor bindings are not validated";
     }
@@ -2799,8 +2881,15 @@ static int metal_refresh_vision_binding_cache(uocr_metal_context *ctx,
                           cache.count,
                           (uint32_t)UOCR_METAL_VISION_REQUIRED_TENSOR_COUNT);
     }
+    uocr_metal_vision_weights_f16 weights;
+    const uint64_t direct_cache_start_ns = uocr_profile_now_ns();
+    if (!metal_vision_weight_cache_build_direct(&cache, &weights, error, error_size)) {
+        return 0;
+    }
+    metal_profile_add_event_now(ctx, "metal.vision_binding_cache.direct", direct_cache_start_ns);
     cache.valid = 1;
     ctx->vision_bindings = cache;
+    ctx->vision_weights = weights;
     ctx->vision_binding_error[0] = '\0';
     return 1;
 }
@@ -2810,8 +2899,9 @@ uint32_t uocr_metal_context_vision_binding_count(const uocr_metal_context *ctx) 
 }
 
 int uocr_metal_context_vision_bindings_ready(const uocr_metal_context *ctx) {
-    return ctx != NULL && ctx->vision_bindings.valid &&
-           ctx->vision_bindings.count == UOCR_METAL_VISION_REQUIRED_TENSOR_COUNT;
+    return ctx != NULL && ctx->vision_bindings.valid && ctx->vision_weights.valid &&
+           ctx->vision_bindings.count == UOCR_METAL_VISION_REQUIRED_TENSOR_COUNT &&
+           ctx->vision_weights.count == UOCR_METAL_VISION_REQUIRED_TENSOR_COUNT;
 }
 
 const char *uocr_metal_context_vision_binding_error(const uocr_metal_context *ctx) {
@@ -2821,49 +2911,17 @@ const char *uocr_metal_context_vision_binding_error(const uocr_metal_context *ct
     return ctx->vision_binding_error;
 }
 
-static const uocr_metal_vision_binding *metal_find_vision_binding(const uocr_metal_context *ctx,
-                                                                  uint32_t tensor_id) {
-    if (ctx == NULL || !ctx->vision_bindings.valid || tensor_id == 0u) {
+static const uocr_metal_vision_binding *metal_find_vision_binding_in_cache(const uocr_metal_vision_binding_cache *cache,
+                                                                           uint32_t tensor_id) {
+    if (cache == NULL || tensor_id == 0u) {
         return NULL;
     }
-    for (uint32_t i = 0u; i < ctx->vision_bindings.count; ++i) {
-        if (ctx->vision_bindings.tensors[i].tensor_id == tensor_id) {
-            return &ctx->vision_bindings.tensors[i];
+    for (uint32_t i = 0u; i < cache->count; ++i) {
+        if (cache->tensors[i].tensor_id == tensor_id) {
+            return &cache->tensors[i];
         }
     }
     return NULL;
-}
-
-static const uint16_t *metal_require_vision_tensor_f16(const uocr_metal_context *ctx,
-                                                       uint32_t tensor_id,
-                                                       const char *role,
-                                                       char *error,
-                                                       size_t error_size) {
-    const uocr_metal_vision_binding *binding = metal_find_vision_binding(ctx, tensor_id);
-    if (binding == NULL) {
-        if (role == NULL || role[0] == '\0') {
-            role = "vision tensor";
-        }
-        (void)metal_fail(error, error_size, "missing validated %s binding for tensor %u", role, tensor_id);
-        return NULL;
-    }
-    if ((binding->payload_size % 2u) != 0u || ((uint64_t)binding->offset % 2u) != 0u) {
-        if (role == NULL || role[0] == '\0') {
-            role = "vision tensor";
-        }
-        (void)metal_fail(error, error_size, "%s tensor %u has an unaligned fp16 payload", role, tensor_id);
-        return NULL;
-    }
-    if (binding->buffer == nil) {
-        (void)metal_fail(error, error_size, "vision tensor %u has a nil Metal buffer binding", tensor_id);
-        return NULL;
-    }
-    const uint8_t *contents = (const uint8_t *)[binding->buffer contents];
-    if (contents == NULL) {
-        (void)metal_fail(error, error_size, "vision tensor %u is not CPU-visible", tensor_id);
-        return NULL;
-    }
-    return (const uint16_t *)(const void *)(contents + binding->offset);
 }
 
 static uint32_t metal_sam_sorted_block_index_for_layer(uint32_t layer) {
@@ -2892,119 +2950,198 @@ static uint32_t metal_clip_sorted_layer_index_for_layer(uint32_t layer) {
     return 17u + (layer - 3u);
 }
 
-typedef struct uocr_metal_vision_weights_f16 {
-    const uint16_t *image_newline_f16;
-    const uint16_t *view_separator_f16;
-    const uint16_t *projector_weight_f16;
-    const uint16_t *projector_bias_f16;
-    const uint16_t *sam_patch_weight_f16;
-    const uint16_t *sam_patch_bias_f16;
-    const uint16_t *sam_pos_embed_f16;
-    const uint16_t *sam_neck_conv1x1_weight_f16;
-    const uint16_t *sam_neck_norm1_weight_f16;
-    const uint16_t *sam_neck_norm1_bias_f16;
-    const uint16_t *sam_neck_conv3x3_weight_f16;
-    const uint16_t *sam_neck_norm2_weight_f16;
-    const uint16_t *sam_neck_norm2_bias_f16;
-    const uint16_t *sam_net2_weight_f16;
-    const uint16_t *sam_net3_weight_f16;
-    const uint16_t *clip_class_embedding_f16;
-    const uint16_t *clip_pos_embed_f16;
-    const uint16_t *clip_pre_ln_weight_f16;
-    const uint16_t *clip_pre_ln_bias_f16;
-    uocr_metal_sam_transformer_block_f16 sam_blocks[UOCR_SAM_BLOCKS];
-    uocr_metal_clip_transformer_block_f16 clip_blocks[UOCR_CLIP_BLOCKS];
-} uocr_metal_vision_weights_f16;
+static int metal_vision_tensor_from_binding_cache_f16(const uocr_metal_vision_binding_cache *cache,
+                                                      uint32_t tensor_id,
+                                                      const char *role,
+                                                      uocr_metal_vision_tensor_f16 *out_tensor,
+                                                      char *error,
+                                                      size_t error_size) {
+    if (out_tensor == NULL) {
+        return metal_fail(error, error_size, "invalid Metal vision tensor slice output");
+    }
+    memset(out_tensor, 0, sizeof(*out_tensor));
+    if (role == NULL || role[0] == '\0') {
+        role = "vision tensor";
+    }
+    const uocr_metal_vision_binding *binding = metal_find_vision_binding_in_cache(cache, tensor_id);
+    if (binding == NULL) {
+        return metal_fail(error, error_size, "missing validated %s binding for tensor %u", role, tensor_id);
+    }
+    if ((binding->payload_size % 2u) != 0u || ((uint64_t)binding->offset % 2u) != 0u) {
+        return metal_fail(error, error_size, "%s tensor %u has an unaligned fp16 payload", role, tensor_id);
+    }
+    if (binding->buffer == nil) {
+        return metal_fail(error, error_size, "vision tensor %u has a nil Metal buffer binding", tensor_id);
+    }
+    if (!metal_buffer_range_valid(binding->buffer, binding->offset, binding->payload_size)) {
+        return metal_fail(error,
+                          error_size,
+                          "%s tensor %u range is outside its Metal model view",
+                          role,
+                          tensor_id);
+    }
+    const uint8_t *contents = (const uint8_t *)[binding->buffer contents];
+    if (contents == NULL) {
+        return metal_fail(error,
+                          error_size,
+                          "vision tensor %u is not CPU-visible for the current host-pointer vision helpers",
+                          tensor_id);
+    }
+    out_tensor->slice.buffer = binding->buffer;
+    out_tensor->slice.offset = binding->offset;
+    out_tensor->byte_length = binding->payload_size;
+    out_tensor->host_f16 = (const uint16_t *)(const void *)(contents + binding->offset);
+    return 1;
+}
 
-static int metal_load_vision_weights_from_bindings(uocr_metal_context *ctx,
-                                                   uocr_metal_vision_weights_f16 *out_weights,
-                                                   char *error,
-                                                   size_t error_size) {
-    if (ctx == NULL || out_weights == NULL) {
-        return metal_fail(error, error_size, "invalid Metal vision weight-loading request");
+static int metal_vision_weight_cache_build_direct(const uocr_metal_vision_binding_cache *binding_cache,
+                                                  uocr_metal_vision_weights_f16 *out_weights,
+                                                  char *error,
+                                                  size_t error_size) {
+    if (binding_cache == NULL || out_weights == NULL) {
+        return metal_fail(error, error_size, "invalid Metal vision direct weight-cache request");
+    }
+    if (binding_cache->count != UOCR_METAL_VISION_REQUIRED_TENSOR_COUNT) {
+        return metal_fail(error,
+                          error_size,
+                          "vision direct weight-cache count mismatch: got %u expected %u",
+                          binding_cache->count,
+                          (uint32_t)UOCR_METAL_VISION_REQUIRED_TENSOR_COUNT);
     }
     memset(out_weights, 0, sizeof(*out_weights));
 
-#define VISION_TENSOR_PTR(tensor_id, role) metal_require_vision_tensor_f16(ctx, (tensor_id), (role), error, error_size)
-#define ASSIGN_PTR(field, tensor_id, role)              \
-    do {                                                \
-        (out_weights->field) = VISION_TENSOR_PTR((tensor_id), (role)); \
-        if ((out_weights->field) == NULL) {             \
-            return 0;                                   \
-        }                                               \
+#define ASSIGN_VISION_TENSOR(field, tensor_id, role)                                                   \
+    do {                                                                                                \
+        if (!metal_vision_tensor_from_binding_cache_f16(binding_cache,                                  \
+                                                        (tensor_id),                                    \
+                                                        (role),                                         \
+                                                        &(out_weights->field),                          \
+                                                        error,                                          \
+                                                        error_size)) {                                  \
+            return 0;                                                                                   \
+        }                                                                                               \
     } while (0)
 
-    ASSIGN_PTR(image_newline_f16, UOCR_TENSOR_ID_IMAGE_NEWLINE, "image newline");
-    ASSIGN_PTR(view_separator_f16, UOCR_TENSOR_ID_VIEW_SEPARATOR, "view separator");
-    ASSIGN_PTR(projector_weight_f16, UOCR_TENSOR_ID_PROJECTOR_WEIGHT, "visual projector weight");
-    ASSIGN_PTR(projector_bias_f16, UOCR_TENSOR_ID_PROJECTOR_BIAS, "visual projector bias");
+    ASSIGN_VISION_TENSOR(image_newline, UOCR_TENSOR_ID_IMAGE_NEWLINE, "image newline");
+    ASSIGN_VISION_TENSOR(view_separator, UOCR_TENSOR_ID_VIEW_SEPARATOR, "view separator");
+    ASSIGN_VISION_TENSOR(projector_weight, UOCR_TENSOR_ID_PROJECTOR_WEIGHT, "visual projector weight");
+    ASSIGN_VISION_TENSOR(projector_bias, UOCR_TENSOR_ID_PROJECTOR_BIAS, "visual projector bias");
 
     const uint32_t sam_extra = UOCR_TENSOR_ID_VISION_SAM_BASE + UOCR_SAM_BLOCKS * 14u;
-    ASSIGN_PTR(sam_neck_conv1x1_weight_f16, sam_extra + 0u, "SAM neck 1x1 weight");
-    ASSIGN_PTR(sam_neck_norm1_bias_f16, sam_extra + 1u, "SAM neck norm1 bias");
-    ASSIGN_PTR(sam_neck_norm1_weight_f16, sam_extra + 2u, "SAM neck norm1 weight");
-    ASSIGN_PTR(sam_neck_conv3x3_weight_f16, sam_extra + 3u, "SAM neck 3x3 weight");
-    ASSIGN_PTR(sam_neck_norm2_bias_f16, sam_extra + 4u, "SAM neck norm2 bias");
-    ASSIGN_PTR(sam_neck_norm2_weight_f16, sam_extra + 5u, "SAM neck norm2 weight");
-    ASSIGN_PTR(sam_net2_weight_f16, sam_extra + 6u, "SAM net_2 weight");
-    ASSIGN_PTR(sam_net3_weight_f16, sam_extra + 7u, "SAM net_3 weight");
-    ASSIGN_PTR(sam_patch_bias_f16, sam_extra + 8u, "SAM patch bias");
-    ASSIGN_PTR(sam_patch_weight_f16, sam_extra + 9u, "SAM patch weight");
-    ASSIGN_PTR(sam_pos_embed_f16, sam_extra + 10u, "SAM absolute position embedding");
+    ASSIGN_VISION_TENSOR(sam_neck_conv1x1_weight, sam_extra + 0u, "SAM neck 1x1 weight");
+    ASSIGN_VISION_TENSOR(sam_neck_norm1_bias, sam_extra + 1u, "SAM neck norm1 bias");
+    ASSIGN_VISION_TENSOR(sam_neck_norm1_weight, sam_extra + 2u, "SAM neck norm1 weight");
+    ASSIGN_VISION_TENSOR(sam_neck_conv3x3_weight, sam_extra + 3u, "SAM neck 3x3 weight");
+    ASSIGN_VISION_TENSOR(sam_neck_norm2_bias, sam_extra + 4u, "SAM neck norm2 bias");
+    ASSIGN_VISION_TENSOR(sam_neck_norm2_weight, sam_extra + 5u, "SAM neck norm2 weight");
+    ASSIGN_VISION_TENSOR(sam_net2_weight, sam_extra + 6u, "SAM net_2 weight");
+    ASSIGN_VISION_TENSOR(sam_net3_weight, sam_extra + 7u, "SAM net_3 weight");
+    ASSIGN_VISION_TENSOR(sam_patch_bias, sam_extra + 8u, "SAM patch bias");
+    ASSIGN_VISION_TENSOR(sam_patch_weight, sam_extra + 9u, "SAM patch weight");
+    ASSIGN_VISION_TENSOR(sam_pos_embed, sam_extra + 10u, "SAM absolute position embedding");
 
-    ASSIGN_PTR(clip_class_embedding_f16, UOCR_TENSOR_ID_VISION_CLIP_BASE + 0u, "CLIP class embedding");
-    ASSIGN_PTR(clip_pos_embed_f16, UOCR_TENSOR_ID_VISION_CLIP_BASE + 2u, "CLIP position embedding");
-    ASSIGN_PTR(clip_pre_ln_bias_f16, UOCR_TENSOR_ID_VISION_CLIP_BASE + 3u, "CLIP pre-LayerNorm bias");
-    ASSIGN_PTR(clip_pre_ln_weight_f16, UOCR_TENSOR_ID_VISION_CLIP_BASE + 4u, "CLIP pre-LayerNorm weight");
+    ASSIGN_VISION_TENSOR(clip_class_embedding, UOCR_TENSOR_ID_VISION_CLIP_BASE + 0u, "CLIP class embedding");
+    ASSIGN_VISION_TENSOR(clip_pos_embed, UOCR_TENSOR_ID_VISION_CLIP_BASE + 2u, "CLIP position embedding");
+    ASSIGN_VISION_TENSOR(clip_pre_ln_bias, UOCR_TENSOR_ID_VISION_CLIP_BASE + 3u, "CLIP pre-LayerNorm bias");
+    ASSIGN_VISION_TENSOR(clip_pre_ln_weight, UOCR_TENSOR_ID_VISION_CLIP_BASE + 4u, "CLIP pre-LayerNorm weight");
+
+#undef ASSIGN_VISION_TENSOR
+
+#define ASSIGN_SAM_BLOCK_TENSOR(block_field, tensor_id, role, host_field)                              \
+    do {                                                                                                \
+        if (!metal_vision_tensor_from_binding_cache_f16(binding_cache,                                  \
+                                                        (tensor_id),                                    \
+                                                        (role),                                         \
+                                                        &(direct_block->block_field),                   \
+                                                        error,                                          \
+                                                        error_size)) {                                  \
+            return 0;                                                                                   \
+        }                                                                                               \
+        host_block->host_field = direct_block->block_field.host_f16;                                    \
+    } while (0)
 
     for (uint32_t layer = 0u; layer < UOCR_SAM_BLOCKS; ++layer) {
         const uint32_t base = UOCR_TENSOR_ID_VISION_SAM_BASE + metal_sam_sorted_block_index_for_layer(layer) * 14u;
-        uocr_metal_sam_transformer_block_f16 *block = &out_weights->sam_blocks[layer];
-        block->proj_bias_f16 = VISION_TENSOR_PTR(base + 0u, "SAM attention projection bias");
-        block->proj_weight_f16 = VISION_TENSOR_PTR(base + 1u, "SAM attention projection weight");
-        block->qkv_bias_f16 = VISION_TENSOR_PTR(base + 2u, "SAM attention qkv bias");
-        block->qkv_weight_f16 = VISION_TENSOR_PTR(base + 3u, "SAM attention qkv weight");
-        block->rel_pos_h_f16 = VISION_TENSOR_PTR(base + 4u, "SAM relative position H");
-        block->rel_pos_w_f16 = VISION_TENSOR_PTR(base + 5u, "SAM relative position W");
-        block->mlp_lin1_bias_f16 = VISION_TENSOR_PTR(base + 6u, "SAM MLP lin1 bias");
-        block->mlp_lin1_weight_f16 = VISION_TENSOR_PTR(base + 7u, "SAM MLP lin1 weight");
-        block->mlp_lin2_bias_f16 = VISION_TENSOR_PTR(base + 8u, "SAM MLP lin2 bias");
-        block->mlp_lin2_weight_f16 = VISION_TENSOR_PTR(base + 9u, "SAM MLP lin2 weight");
-        block->norm1_bias_f16 = VISION_TENSOR_PTR(base + 10u, "SAM norm1 bias");
-        block->norm1_weight_f16 = VISION_TENSOR_PTR(base + 11u, "SAM norm1 weight");
-        block->norm2_bias_f16 = VISION_TENSOR_PTR(base + 12u, "SAM norm2 bias");
-        block->norm2_weight_f16 = VISION_TENSOR_PTR(base + 13u, "SAM norm2 weight");
-        block->rel_pos_h_length = uocr_sam_block_uses_global_attention(layer) ? UOCR_SAM_MAX_REL_POS_SIZE : UOCR_SAM_WINDOW_REL_POS_SIZE;
-        block->rel_pos_w_length = block->rel_pos_h_length;
-        if (!metal_sam_transformer_block_has_weights(block)) {
-            return metal_fail(error, error_size, "incomplete SAM transformer block %u vision bindings", layer);
+        uocr_metal_sam_transformer_block_slices_f16 *direct_block = &out_weights->sam_block_slices[layer];
+        uocr_metal_sam_transformer_block_f16 *host_block = &out_weights->sam_blocks[layer];
+        ASSIGN_SAM_BLOCK_TENSOR(proj_bias, base + 0u, "SAM attention projection bias", proj_bias_f16);
+        ASSIGN_SAM_BLOCK_TENSOR(proj_weight, base + 1u, "SAM attention projection weight", proj_weight_f16);
+        ASSIGN_SAM_BLOCK_TENSOR(qkv_bias, base + 2u, "SAM attention qkv bias", qkv_bias_f16);
+        ASSIGN_SAM_BLOCK_TENSOR(qkv_weight, base + 3u, "SAM attention qkv weight", qkv_weight_f16);
+        ASSIGN_SAM_BLOCK_TENSOR(rel_pos_h, base + 4u, "SAM relative position H", rel_pos_h_f16);
+        ASSIGN_SAM_BLOCK_TENSOR(rel_pos_w, base + 5u, "SAM relative position W", rel_pos_w_f16);
+        ASSIGN_SAM_BLOCK_TENSOR(mlp_lin1_bias, base + 6u, "SAM MLP lin1 bias", mlp_lin1_bias_f16);
+        ASSIGN_SAM_BLOCK_TENSOR(mlp_lin1_weight, base + 7u, "SAM MLP lin1 weight", mlp_lin1_weight_f16);
+        ASSIGN_SAM_BLOCK_TENSOR(mlp_lin2_bias, base + 8u, "SAM MLP lin2 bias", mlp_lin2_bias_f16);
+        ASSIGN_SAM_BLOCK_TENSOR(mlp_lin2_weight, base + 9u, "SAM MLP lin2 weight", mlp_lin2_weight_f16);
+        ASSIGN_SAM_BLOCK_TENSOR(norm1_bias, base + 10u, "SAM norm1 bias", norm1_bias_f16);
+        ASSIGN_SAM_BLOCK_TENSOR(norm1_weight, base + 11u, "SAM norm1 weight", norm1_weight_f16);
+        ASSIGN_SAM_BLOCK_TENSOR(norm2_bias, base + 12u, "SAM norm2 bias", norm2_bias_f16);
+        ASSIGN_SAM_BLOCK_TENSOR(norm2_weight, base + 13u, "SAM norm2 weight", norm2_weight_f16);
+        direct_block->rel_pos_h_length = uocr_sam_block_uses_global_attention(layer) ? UOCR_SAM_MAX_REL_POS_SIZE : UOCR_SAM_WINDOW_REL_POS_SIZE;
+        direct_block->rel_pos_w_length = direct_block->rel_pos_h_length;
+        host_block->rel_pos_h_length = direct_block->rel_pos_h_length;
+        host_block->rel_pos_w_length = direct_block->rel_pos_w_length;
+        if (!metal_sam_transformer_block_has_weights(host_block)) {
+            return metal_fail(error, error_size, "incomplete SAM transformer block %u direct vision bindings", layer);
         }
     }
+
+#undef ASSIGN_SAM_BLOCK_TENSOR
+
+#define ASSIGN_CLIP_BLOCK_TENSOR(block_field, tensor_id, role, host_field)                             \
+    do {                                                                                                \
+        if (!metal_vision_tensor_from_binding_cache_f16(binding_cache,                                  \
+                                                        (tensor_id),                                    \
+                                                        (role),                                         \
+                                                        &(direct_block->block_field),                   \
+                                                        error,                                          \
+                                                        error_size)) {                                  \
+            return 0;                                                                                   \
+        }                                                                                               \
+        host_block->host_field = direct_block->block_field.host_f16;                                    \
+    } while (0)
 
     for (uint32_t layer = 0u; layer < UOCR_CLIP_BLOCKS; ++layer) {
         const uint32_t base = UOCR_TENSOR_ID_VISION_CLIP_BASE + 5u + metal_clip_sorted_layer_index_for_layer(layer) * 12u;
-        uocr_metal_clip_transformer_block_f16 *block = &out_weights->clip_blocks[layer];
-        block->ln1_bias_f16 = VISION_TENSOR_PTR(base + 0u, "CLIP layer_norm1 bias");
-        block->ln1_weight_f16 = VISION_TENSOR_PTR(base + 1u, "CLIP layer_norm1 weight");
-        block->ln2_bias_f16 = VISION_TENSOR_PTR(base + 2u, "CLIP layer_norm2 bias");
-        block->ln2_weight_f16 = VISION_TENSOR_PTR(base + 3u, "CLIP layer_norm2 weight");
-        block->mlp_fc1_bias_f16 = VISION_TENSOR_PTR(base + 4u, "CLIP MLP fc1 bias");
-        block->mlp_fc1_weight_f16 = VISION_TENSOR_PTR(base + 5u, "CLIP MLP fc1 weight");
-        block->mlp_fc2_bias_f16 = VISION_TENSOR_PTR(base + 6u, "CLIP MLP fc2 bias");
-        block->mlp_fc2_weight_f16 = VISION_TENSOR_PTR(base + 7u, "CLIP MLP fc2 weight");
-        block->out_proj_bias_f16 = VISION_TENSOR_PTR(base + 8u, "CLIP attention output bias");
-        block->out_proj_weight_f16 = VISION_TENSOR_PTR(base + 9u, "CLIP attention output weight");
-        block->qkv_bias_f16 = VISION_TENSOR_PTR(base + 10u, "CLIP attention qkv bias");
-        block->qkv_weight_f16 = VISION_TENSOR_PTR(base + 11u, "CLIP attention qkv weight");
-        if (!metal_clip_transformer_block_has_weights(block)) {
-            return metal_fail(error, error_size, "incomplete CLIP transformer block %u vision bindings", layer);
+        uocr_metal_clip_transformer_block_slices_f16 *direct_block = &out_weights->clip_block_slices[layer];
+        uocr_metal_clip_transformer_block_f16 *host_block = &out_weights->clip_blocks[layer];
+        ASSIGN_CLIP_BLOCK_TENSOR(ln1_bias, base + 0u, "CLIP layer_norm1 bias", ln1_bias_f16);
+        ASSIGN_CLIP_BLOCK_TENSOR(ln1_weight, base + 1u, "CLIP layer_norm1 weight", ln1_weight_f16);
+        ASSIGN_CLIP_BLOCK_TENSOR(ln2_bias, base + 2u, "CLIP layer_norm2 bias", ln2_bias_f16);
+        ASSIGN_CLIP_BLOCK_TENSOR(ln2_weight, base + 3u, "CLIP layer_norm2 weight", ln2_weight_f16);
+        ASSIGN_CLIP_BLOCK_TENSOR(mlp_fc1_bias, base + 4u, "CLIP MLP fc1 bias", mlp_fc1_bias_f16);
+        ASSIGN_CLIP_BLOCK_TENSOR(mlp_fc1_weight, base + 5u, "CLIP MLP fc1 weight", mlp_fc1_weight_f16);
+        ASSIGN_CLIP_BLOCK_TENSOR(mlp_fc2_bias, base + 6u, "CLIP MLP fc2 bias", mlp_fc2_bias_f16);
+        ASSIGN_CLIP_BLOCK_TENSOR(mlp_fc2_weight, base + 7u, "CLIP MLP fc2 weight", mlp_fc2_weight_f16);
+        ASSIGN_CLIP_BLOCK_TENSOR(out_proj_bias, base + 8u, "CLIP attention output bias", out_proj_bias_f16);
+        ASSIGN_CLIP_BLOCK_TENSOR(out_proj_weight, base + 9u, "CLIP attention output weight", out_proj_weight_f16);
+        ASSIGN_CLIP_BLOCK_TENSOR(qkv_bias, base + 10u, "CLIP attention qkv bias", qkv_bias_f16);
+        ASSIGN_CLIP_BLOCK_TENSOR(qkv_weight, base + 11u, "CLIP attention qkv weight", qkv_weight_f16);
+        if (!metal_clip_transformer_block_has_weights(host_block)) {
+            return metal_fail(error, error_size, "incomplete CLIP transformer block %u direct vision bindings", layer);
         }
     }
 
-#undef ASSIGN_PTR
-#undef VISION_TENSOR_PTR
+#undef ASSIGN_CLIP_BLOCK_TENSOR
 
+    out_weights->valid = 1;
+    out_weights->count = binding_cache->count;
     return 1;
+}
+
+static const uocr_metal_vision_weights_f16 *metal_require_vision_weights_f16(const uocr_metal_context *ctx,
+                                                                             char *error,
+                                                                             size_t error_size) {
+    if (ctx == NULL || !ctx->vision_weights.valid ||
+        ctx->vision_weights.count != UOCR_METAL_VISION_REQUIRED_TENSOR_COUNT) {
+        (void)metal_fail(error,
+                         error_size,
+                         "Metal vision encoding requires direct fp16 vision weight slices: %s",
+                         uocr_metal_context_vision_binding_error(ctx));
+        return NULL;
+    }
+    return &ctx->vision_weights;
 }
 
 typedef struct uocr_metal_vision_workspace_slice {
@@ -3277,8 +3414,8 @@ static int metal_encode_one_view_sam_features_f16(uocr_metal_vision_project_cont
                                                             view->format,
                                                             view->width,
                                                             view->height,
-                                                            weights->sam_patch_weight_f16,
-                                                            weights->sam_patch_bias_f16,
+                                                            weights->sam_patch_weight.host_f16,
+                                                            weights->sam_patch_bias.host_f16,
                                                             scratch->sam_patch_bhwc.f16,
                                                             &patch_grid_w,
                                                             &patch_grid_h,
@@ -3298,7 +3435,7 @@ static int metal_encode_one_view_sam_features_f16(uocr_metal_vision_project_cont
     RUN_VISION_STEP("SAM absolute position add",
                     uocr_metal_context_sam_add_abs_pos_f16(ctx,
                                                             scratch->sam_patch_bhwc.f16,
-                                                            weights->sam_pos_embed_f16,
+                                                            weights->sam_pos_embed.host_f16,
                                                             patch_grid_w,
                                                             patch_grid_h,
                                                             scratch->sam_pos_bhwc.f16,
@@ -3319,7 +3456,7 @@ static int metal_encode_one_view_sam_features_f16(uocr_metal_vision_project_cont
     RUN_VISION_STEP("SAM neck 1x1 convolution",
                     uocr_metal_context_sam_neck_conv1x1_f16(ctx,
                                                              scratch->sam_transformer_bhwc.f16,
-                                                             weights->sam_neck_conv1x1_weight_f16,
+                                                             weights->sam_neck_conv1x1_weight.host_f16,
                                                              patch_grid_w,
                                                              patch_grid_h,
                                                              UOCR_METAL_DENSE_OUTPUT_F16,
@@ -3329,8 +3466,8 @@ static int metal_encode_one_view_sam_features_f16(uocr_metal_vision_project_cont
     RUN_VISION_STEP("SAM neck LayerNorm2d-1",
                     uocr_metal_context_sam_layernorm2d_f16(ctx,
                                                             scratch->sam_neck_a_nchw.f16,
-                                                            weights->sam_neck_norm1_weight_f16,
-                                                            weights->sam_neck_norm1_bias_f16,
+                                                            weights->sam_neck_norm1_weight.host_f16,
+                                                            weights->sam_neck_norm1_bias.host_f16,
                                                             patch_grid_w,
                                                             patch_grid_h,
                                                             UOCR_METAL_DENSE_OUTPUT_F16,
@@ -3340,7 +3477,7 @@ static int metal_encode_one_view_sam_features_f16(uocr_metal_vision_project_cont
     RUN_VISION_STEP("SAM neck 3x3 convolution",
                     uocr_metal_context_sam_neck_conv3x3_f16(ctx,
                                                              scratch->sam_neck_b_nchw.f16,
-                                                             weights->sam_neck_conv3x3_weight_f16,
+                                                             weights->sam_neck_conv3x3_weight.host_f16,
                                                              patch_grid_w,
                                                              patch_grid_h,
                                                              UOCR_METAL_DENSE_OUTPUT_F16,
@@ -3350,8 +3487,8 @@ static int metal_encode_one_view_sam_features_f16(uocr_metal_vision_project_cont
     RUN_VISION_STEP("SAM neck LayerNorm2d-2",
                     uocr_metal_context_sam_layernorm2d_f16(ctx,
                                                             scratch->sam_neck_a_nchw.f16,
-                                                            weights->sam_neck_norm2_weight_f16,
-                                                            weights->sam_neck_norm2_bias_f16,
+                                                            weights->sam_neck_norm2_weight.host_f16,
+                                                            weights->sam_neck_norm2_bias.host_f16,
                                                             patch_grid_w,
                                                             patch_grid_h,
                                                             UOCR_METAL_DENSE_OUTPUT_F16,
@@ -3361,7 +3498,7 @@ static int metal_encode_one_view_sam_features_f16(uocr_metal_vision_project_cont
     RUN_VISION_STEP("SAM net_2 convolution",
                     uocr_metal_context_sam_net2_conv3x3_stride2_f16(ctx,
                                                                      scratch->sam_neck_b_nchw.f16,
-                                                                     weights->sam_net2_weight_f16,
+                                                                     weights->sam_net2_weight.host_f16,
                                                                      patch_grid_w,
                                                                      patch_grid_h,
                                                                      UOCR_METAL_DENSE_OUTPUT_F16,
@@ -3373,7 +3510,7 @@ static int metal_encode_one_view_sam_features_f16(uocr_metal_vision_project_cont
     RUN_VISION_STEP("SAM net_3 convolution",
                     uocr_metal_context_sam_net3_conv3x3_stride2_f16(ctx,
                                                                      scratch->sam_net2_nchw.f16,
-                                                                     weights->sam_net3_weight_f16,
+                                                                     weights->sam_net3_weight.host_f16,
                                                                      net2_grid_w,
                                                                      net2_grid_h,
                                                                      UOCR_METAL_DENSE_OUTPUT_F16,
@@ -3444,7 +3581,7 @@ static int metal_encode_one_view_clip_features_f16(uocr_metal_vision_project_con
     RUN_VISION_STEP("CLIP SAM embedding",
                     uocr_metal_context_clip_embed_sam_f16(ctx,
                                                            scratch->sam_net3_nchw.f16,
-                                                           weights->clip_class_embedding_f16,
+                                                           weights->clip_class_embedding.host_f16,
                                                            sam_grid_w,
                                                            sam_grid_h,
                                                            UOCR_METAL_DENSE_OUTPUT_F16,
@@ -3454,7 +3591,7 @@ static int metal_encode_one_view_clip_features_f16(uocr_metal_vision_project_con
     RUN_VISION_STEP("CLIP absolute position add",
                     uocr_metal_context_clip_add_abs_pos_f16(ctx,
                                                              scratch->clip_a.f16,
-                                                             weights->clip_pos_embed_f16,
+                                                             weights->clip_pos_embed.host_f16,
                                                              sam_grid_w,
                                                              sam_grid_h,
                                                              UOCR_METAL_DENSE_OUTPUT_F16,
@@ -3464,8 +3601,8 @@ static int metal_encode_one_view_clip_features_f16(uocr_metal_vision_project_con
     RUN_VISION_STEP("CLIP pre-LayerNorm",
                     uocr_metal_context_clip_pre_layernorm_f16(ctx,
                                                                scratch->clip_b.f16,
-                                                               weights->clip_pre_ln_weight_f16,
-                                                               weights->clip_pre_ln_bias_f16,
+                                                               weights->clip_pre_ln_weight.host_f16,
+                                                               weights->clip_pre_ln_bias.host_f16,
                                                                expected_clip_tokens,
                                                                UOCR_METAL_LAYERNORM_OUTPUT_F16,
                                                                scratch->clip_a.f16,
@@ -3553,8 +3690,8 @@ static int metal_encode_one_view_projected_f16(uocr_metal_vision_project_context
     RUN_VISION_STEP("visual projector",
                     uocr_metal_context_visual_projector_f16(ctx,
                                                              scratch->concat.f16,
-                                                             weights->projector_weight_f16,
-                                                             weights->projector_bias_f16,
+                                                             weights->projector_weight.host_f16,
+                                                             weights->projector_bias.host_f16,
                                                              sam_grid_w * sam_grid_h,
                                                              UOCR_METAL_DENSE_OUTPUT_F16,
                                                              out_projected_rows_f16,
@@ -3619,8 +3756,8 @@ static int metal_context_encode_visual_features_to_workspace_f16(uocr_metal_cont
         return metal_fail(error, error_size, "invalid Metal vision workspace encoding request");
     }
 
-    uocr_metal_vision_weights_f16 weights;
-    if (!metal_load_vision_weights_from_bindings(ctx, &weights, error, error_size)) {
+    const uocr_metal_vision_weights_f16 *weights = metal_require_vision_weights_f16(ctx, error, error_size);
+    if (weights == NULL) {
         return 0;
     }
 
@@ -3651,7 +3788,7 @@ static int metal_context_encode_visual_features_to_workspace_f16(uocr_metal_cont
     memset(&project, 0, sizeof(project));
     project.ctx = ctx;
     project.request = request;
-    project.weights = &weights;
+    project.weights = weights;
     project.scratch = scratch;
 
     const uint64_t chunk_processing_start_ns = uocr_profile_now_ns();
@@ -3661,8 +3798,8 @@ static int metal_context_encode_visual_features_to_workspace_f16(uocr_metal_cont
                                                               &project,
                                                               scratch->projected_rows.f16,
                                                               scratch->projected_row_capacity,
-                                                              weights.image_newline_f16,
-                                                              weights.view_separator_f16,
+                                                              weights->image_newline.host_f16,
+                                                              weights->view_separator.host_f16,
                                                               scratch->final_visual_rows.f16,
                                                               schedule->final_visual_tokens,
                                                               NULL,
@@ -3792,8 +3929,8 @@ int uocr_metal_context_encode_sam_features_f16(uocr_metal_context *ctx,
                           expected_grid);
     }
 
-    uocr_metal_vision_weights_f16 weights;
-    if (!metal_load_vision_weights_from_bindings(ctx, &weights, error, error_size)) {
+    const uocr_metal_vision_weights_f16 *weights = metal_require_vision_weights_f16(ctx, error, error_size);
+    if (weights == NULL) {
         return 0;
     }
 
@@ -3805,7 +3942,7 @@ int uocr_metal_context_encode_sam_features_f16(uocr_metal_context *ctx,
     uocr_metal_vision_project_context project;
     memset(&project, 0, sizeof(project));
     project.ctx = ctx;
-    project.weights = &weights;
+    project.weights = weights;
     project.scratch = &scratch;
 
     uint32_t actual_grid_w = 0u;
@@ -3875,8 +4012,8 @@ int uocr_metal_context_encode_clip_features_f16(uocr_metal_context *ctx,
                           expected_tokens);
     }
 
-    uocr_metal_vision_weights_f16 weights;
-    if (!metal_load_vision_weights_from_bindings(ctx, &weights, error, error_size)) {
+    const uocr_metal_vision_weights_f16 *weights = metal_require_vision_weights_f16(ctx, error, error_size);
+    if (weights == NULL) {
         return 0;
     }
 
@@ -3888,7 +4025,7 @@ int uocr_metal_context_encode_clip_features_f16(uocr_metal_context *ctx,
     uocr_metal_vision_project_context project;
     memset(&project, 0, sizeof(project));
     project.ctx = ctx;
-    project.weights = &weights;
+    project.weights = weights;
     project.scratch = &scratch;
 
     uint32_t actual_tokens = 0u;
@@ -3962,8 +4099,8 @@ int uocr_metal_context_encode_projected_features_f16(uocr_metal_context *ctx,
                           expected_rows);
     }
 
-    uocr_metal_vision_weights_f16 weights;
-    if (!metal_load_vision_weights_from_bindings(ctx, &weights, error, error_size)) {
+    const uocr_metal_vision_weights_f16 *weights = metal_require_vision_weights_f16(ctx, error, error_size);
+    if (weights == NULL) {
         return 0;
     }
 
@@ -3975,7 +4112,7 @@ int uocr_metal_context_encode_projected_features_f16(uocr_metal_context *ctx,
     uocr_metal_vision_project_context project;
     memset(&project, 0, sizeof(project));
     project.ctx = ctx;
-    project.weights = &weights;
+    project.weights = weights;
     project.scratch = &scratch;
 
     const int ok = metal_encode_one_view_projected_f16(&project,
@@ -4982,11 +5119,6 @@ static int metal_context_assemble_prompt_from_model_to_arena_f16(uocr_metal_cont
                                                                   uint32_t slot,
                                                                   char *error,
                                                                   size_t error_size);
-
-typedef struct uocr_metal_buffer_slice {
-    id<MTLBuffer> buffer;
-    NSUInteger offset;
-} uocr_metal_buffer_slice;
 
 static int metal_buffer_range_valid(id<MTLBuffer> buffer, NSUInteger offset, uint64_t bytes) {
     if (buffer == nil || bytes > (uint64_t)NSUIntegerMax) {

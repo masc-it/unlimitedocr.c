@@ -195,8 +195,8 @@ blocks a clean GPU-resident vision graph.
 
 Implementation status:
 
-- [ ] Change vision weight structs to store `uocr_metal_buffer_slice` directly.
-- [ ] Build all vision slices once during model binding validation.
+- [x] Change vision weight structs to store `uocr_metal_buffer_slice` directly.
+- [x] Build all vision slices once during model binding validation.
 - [ ] Update SAM, CLIP, projector, newline, and separator code to consume slices, not host pointers.
 - [ ] Remove hot-path weight `newBufferWithBytes` creation.
 - [ ] Cache any required packed/reordered vision weights at engine open only if timing proves the packed form is faster.
