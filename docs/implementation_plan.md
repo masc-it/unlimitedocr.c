@@ -88,7 +88,7 @@ through prompt arena assembly.
 Implementation status:
 
 - [x] Replace host vision scratch with reusable Metal slices for SAM, CLIP, concat, projector, and final formatted rows.
-- [ ] Encode the complete vision graph into Metal buffers without per-stage readback.
+- [x] Encode the complete vision graph into Metal buffers without per-stage readback.
 - [x] Write final formatted visual rows directly into a Metal visual-feature slice or directly into the prompt arena.
 - [ ] Keep only one production vision path after timing confirms the GPU-resident implementation; delete the host-scratch production path.
 - [ ] Preserve diagnostic parity entrypoints only if they are clearly out of the production path and do not keep slow fallback code alive.

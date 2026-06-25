@@ -194,85 +194,6 @@ static int add_aligned_f16_slice_bytes(uint64_t *total, uint64_t value_count) {
     return 1;
 }
 
-static int estimate_sam_attention_rows(uint32_t patch_grid, int use_global_attention, uint64_t *out_rows) {
-    if (out_rows == NULL || patch_grid == 0u) {
-        return 0;
-    }
-    if (use_global_attention) {
-        return checked_mul_u64((uint64_t)patch_grid, (uint64_t)patch_grid, out_rows);
-    }
-    uint64_t windows_per_side = ((uint64_t)patch_grid + (uint64_t)UOCR_SAM_WINDOW_SIZE - 1u) /
-                                (uint64_t)UOCR_SAM_WINDOW_SIZE;
-    uint64_t windows = 0u;
-    return checked_mul_u64(windows_per_side, windows_per_side, &windows) &&
-           checked_mul_u64(windows, (uint64_t)UOCR_SAM_WINDOW_TOKENS, out_rows);
-}
-
-static int estimate_vision_host_staging_bytes(uint32_t patch_grid,
-                                              uint32_t projected_grid,
-                                              uint64_t *out_bytes) {
-    if (out_bytes == NULL || patch_grid == 0u || projected_grid == 0u) {
-        return 0;
-    }
-
-    const uint64_t patch_tokens = (uint64_t)patch_grid * (uint64_t)patch_grid;
-    const uint64_t clip_tokens = (uint64_t)projected_grid * (uint64_t)projected_grid + (uint64_t)UOCR_CLIP_CLASS_TOKENS;
-    uint64_t sam_hidden_values = 0u;
-    uint64_t sam_hidden_bytes = 0u;
-    uint64_t sam_outer_bytes = 0u;
-    uint64_t sam_peak_bytes = 0u;
-    uint64_t clip_hidden_values = 0u;
-    uint64_t clip_hidden_bytes = 0u;
-    uint64_t clip_mid_values = 0u;
-    uint64_t clip_mid_bytes = 0u;
-    uint64_t clip_outer_bytes = 0u;
-    uint64_t clip_block_bytes = 0u;
-    uint64_t clip_mlp_bytes = 0u;
-    uint64_t clip_peak_bytes = 0u;
-
-    if (!checked_mul_u64(patch_tokens, (uint64_t)UOCR_SAM_HIDDEN_SIZE, &sam_hidden_values) ||
-        !checked_mul_u64(sam_hidden_values, 2u, &sam_hidden_bytes) ||
-        !checked_mul_u64(sam_hidden_bytes, 2u, &sam_outer_bytes)) {
-        return 0;
-    }
-    for (uint32_t use_global = 0u; use_global <= 1u; ++use_global) {
-        uint64_t attention_rows = 0u;
-        uint64_t attention_values = 0u;
-        uint64_t attention_bytes = 0u;
-        uint64_t hidden_part = 0u;
-        uint64_t attention_part = 0u;
-        uint64_t block_bytes = 0u;
-        uint64_t peak_bytes = 0u;
-        if (!estimate_sam_attention_rows(patch_grid, use_global != 0u, &attention_rows) ||
-            !checked_mul_u64(attention_rows, (uint64_t)UOCR_SAM_HIDDEN_SIZE, &attention_values) ||
-            !checked_mul_u64(attention_values, 2u, &attention_bytes) ||
-            !checked_mul_u64(sam_hidden_bytes, 5u, &hidden_part) ||
-            !checked_mul_u64(attention_bytes, 6u, &attention_part) ||
-            !checked_add_u64(hidden_part, attention_part, &block_bytes) ||
-            !checked_add_u64(sam_outer_bytes, block_bytes, &peak_bytes)) {
-            return 0;
-        }
-        if (peak_bytes > sam_peak_bytes) {
-            sam_peak_bytes = peak_bytes;
-        }
-    }
-
-    if (!checked_mul_u64(clip_tokens, (uint64_t)UOCR_CLIP_HIDDEN_SIZE, &clip_hidden_values) ||
-        !checked_mul_u64(clip_hidden_values, 2u, &clip_hidden_bytes) ||
-        !checked_mul_u64(clip_tokens, (uint64_t)UOCR_CLIP_MLP_INTERMEDIATE, &clip_mid_values) ||
-        !checked_mul_u64(clip_mid_values, 2u, &clip_mid_bytes) ||
-        !checked_mul_u64(clip_hidden_bytes, 2u, &clip_outer_bytes) ||
-        !checked_mul_u64(clip_hidden_bytes, 9u, &clip_block_bytes) ||
-        !checked_mul_u64(clip_mid_bytes, 2u, &clip_mlp_bytes) ||
-        !checked_add_u64(clip_outer_bytes, clip_block_bytes, &clip_peak_bytes) ||
-        !checked_add_to_total(&clip_peak_bytes, clip_mlp_bytes)) {
-        return 0;
-    }
-
-    *out_bytes = sam_peak_bytes > clip_peak_bytes ? sam_peak_bytes : clip_peak_bytes;
-    return 1;
-}
-
 int uocr_estimate_vision_memory_for_shape(uint32_t max_view_size,
                                           uint32_t final_visual_rows,
                                           uint32_t max_chunk_projected_rows,
@@ -296,9 +217,11 @@ int uocr_estimate_vision_memory_for_shape(uint32_t max_view_size,
 
     /* Exact reusable Metal vision workspace high-water estimate.  This mirrors
      * uocr_metal_vision_workspace: aligned fp16 slices for SAM patch/position/
-     * transformer state, SAM neck/net state, CLIP ping-pong/final tokens,
-     * one-view concat, chunk projected rows, and final formatted rows.  Host
-     * staging is estimated separately from the retained GPU workspace.
+     * transformer state, SAM/CLIP transformer block scratch, SAM neck/net
+     * state, CLIP ping-pong/final tokens, one-view concat, chunk projected
+     * rows, and final formatted rows. Production vision transformer scratch is
+     * GPU/workspace-resident; diagnostic host staging is not part of the public
+     * request-shaped workspace estimate.
      */
     const uint64_t patch_tokens = (uint64_t)patch_grid * (uint64_t)patch_grid;
     const uint64_t projected_tokens_per_view = (uint64_t)projected_grid * (uint64_t)projected_grid;
@@ -310,7 +233,12 @@ int uocr_estimate_vision_memory_for_shape(uint32_t max_view_size,
     uint64_t sam_neck_values = 0u;
     uint64_t sam_net2_values = 0u;
     uint64_t sam_net3_values = 0u;
+    uint64_t sam_window_count = 0u;
+    uint64_t sam_window_attention_tokens = 0u;
+    uint64_t sam_attention_tokens = patch_tokens;
+    uint64_t sam_attention_values = 0u;
     uint64_t clip_values = 0u;
+    uint64_t clip_mlp_values = 0u;
     uint64_t concat_values = 0u;
     uint64_t projected_values = 0u;
     uint64_t final_visual_values = 0u;
@@ -321,10 +249,31 @@ int uocr_estimate_vision_memory_for_shape(uint32_t max_view_size,
         !checked_mul_u64(sam_net2_values, net2_grid, &sam_net2_values) ||
         !checked_mul_u64((uint64_t)UOCR_SAM_NET3_CHANNELS, net3_grid, &sam_net3_values) ||
         !checked_mul_u64(sam_net3_values, net3_grid, &sam_net3_values) ||
+        !checked_mul_u64(((uint64_t)patch_grid + (uint64_t)UOCR_SAM_WINDOW_SIZE - 1u) /
+                             (uint64_t)UOCR_SAM_WINDOW_SIZE,
+                         ((uint64_t)patch_grid + (uint64_t)UOCR_SAM_WINDOW_SIZE - 1u) /
+                             (uint64_t)UOCR_SAM_WINDOW_SIZE,
+                         &sam_window_count) ||
+        !checked_mul_u64(sam_window_count, (uint64_t)UOCR_SAM_WINDOW_TOKENS, &sam_window_attention_tokens) ||
+        !checked_mul_u64(sam_attention_tokens > sam_window_attention_tokens ? sam_attention_tokens : sam_window_attention_tokens,
+                         (uint64_t)UOCR_SAM_HIDDEN_SIZE,
+                         &sam_attention_values) ||
         !checked_mul_u64(clip_tokens, (uint64_t)UOCR_CLIP_HIDDEN_SIZE, &clip_values) ||
+        !checked_mul_u64(clip_tokens, (uint64_t)UOCR_CLIP_MLP_INTERMEDIATE, &clip_mlp_values) ||
         !checked_mul_u64(projected_tokens_per_view, (uint64_t)UOCR_PROJECTOR_IN_SIZE, &concat_values) ||
         !checked_mul_u64((uint64_t)max_chunk_projected_rows, (uint64_t)UOCR_HIDDEN_SIZE, &projected_values) ||
         !checked_mul_u64((uint64_t)final_visual_rows, (uint64_t)UOCR_HIDDEN_SIZE, &final_visual_values) ||
+        !add_aligned_f16_slice_bytes(&total, sam_bhwc_values) ||
+        !add_aligned_f16_slice_bytes(&total, sam_bhwc_values) ||
+        !add_aligned_f16_slice_bytes(&total, sam_bhwc_values) ||
+        !add_aligned_f16_slice_bytes(&total, sam_bhwc_values) ||
+        !add_aligned_f16_slice_bytes(&total, sam_attention_values) ||
+        !add_aligned_f16_slice_bytes(&total, sam_attention_values) ||
+        !add_aligned_f16_slice_bytes(&total, sam_attention_values) ||
+        !add_aligned_f16_slice_bytes(&total, sam_attention_values) ||
+        !add_aligned_f16_slice_bytes(&total, sam_attention_values) ||
+        !add_aligned_f16_slice_bytes(&total, sam_attention_values) ||
+        !add_aligned_f16_slice_bytes(&total, sam_bhwc_values) ||
         !add_aligned_f16_slice_bytes(&total, sam_bhwc_values) ||
         !add_aligned_f16_slice_bytes(&total, sam_bhwc_values) ||
         !add_aligned_f16_slice_bytes(&total, sam_bhwc_values) ||
@@ -335,6 +284,17 @@ int uocr_estimate_vision_memory_for_shape(uint32_t max_view_size,
         !add_aligned_f16_slice_bytes(&total, clip_values) ||
         !add_aligned_f16_slice_bytes(&total, clip_values) ||
         !add_aligned_f16_slice_bytes(&total, clip_values) ||
+        !add_aligned_f16_slice_bytes(&total, clip_values) ||
+        !add_aligned_f16_slice_bytes(&total, clip_values) ||
+        !add_aligned_f16_slice_bytes(&total, clip_values) ||
+        !add_aligned_f16_slice_bytes(&total, clip_values) ||
+        !add_aligned_f16_slice_bytes(&total, clip_values) ||
+        !add_aligned_f16_slice_bytes(&total, clip_values) ||
+        !add_aligned_f16_slice_bytes(&total, clip_values) ||
+        !add_aligned_f16_slice_bytes(&total, clip_values) ||
+        !add_aligned_f16_slice_bytes(&total, clip_values) ||
+        !add_aligned_f16_slice_bytes(&total, clip_mlp_values) ||
+        !add_aligned_f16_slice_bytes(&total, clip_mlp_values) ||
         !add_aligned_f16_slice_bytes(&total, concat_values) ||
         !add_aligned_f16_slice_bytes(&total, projected_values) ||
         !add_aligned_f16_slice_bytes(&total, final_visual_values)) {
@@ -345,7 +305,6 @@ int uocr_estimate_vision_memory_for_shape(uint32_t max_view_size,
     uint64_t host_staging_bytes = 0u;
     uint64_t vision_total = 0u;
     if (!f16_slice_bytes(final_visual_values, &final_visual_bytes) || final_visual_bytes > total ||
-        !estimate_vision_host_staging_bytes(patch_grid, projected_grid, &host_staging_bytes) ||
         !checked_add_u64(total, host_staging_bytes, &vision_total)) {
         return UOCR_ERROR_OUT_OF_MEMORY;
     }

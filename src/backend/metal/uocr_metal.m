@@ -3182,6 +3182,17 @@ typedef struct uocr_metal_vision_workspace {
     uocr_metal_vision_workspace_slice sam_patch_bhwc;
     uocr_metal_vision_workspace_slice sam_pos_bhwc;
     uocr_metal_vision_workspace_slice sam_transformer_bhwc;
+    uocr_metal_vision_workspace_slice sam_block_norm1_bhwc;
+    uocr_metal_vision_workspace_slice sam_block_window_tokens;
+    uocr_metal_vision_workspace_slice sam_block_q;
+    uocr_metal_vision_workspace_slice sam_block_k;
+    uocr_metal_vision_workspace_slice sam_block_v;
+    uocr_metal_vision_workspace_slice sam_block_attention;
+    uocr_metal_vision_workspace_slice sam_block_projected_windows;
+    uocr_metal_vision_workspace_slice sam_block_attention_bhwc;
+    uocr_metal_vision_workspace_slice sam_block_residual1_bhwc;
+    uocr_metal_vision_workspace_slice sam_block_norm2_bhwc;
+    uocr_metal_vision_workspace_slice sam_block_mlp_bhwc;
     uocr_metal_vision_workspace_slice sam_neck_a_nchw;
     uocr_metal_vision_workspace_slice sam_neck_b_nchw;
     uocr_metal_vision_workspace_slice sam_net2_nchw;
@@ -3189,6 +3200,17 @@ typedef struct uocr_metal_vision_workspace {
     uocr_metal_vision_workspace_slice clip_a;
     uocr_metal_vision_workspace_slice clip_b;
     uocr_metal_vision_workspace_slice clip_final;
+    uocr_metal_vision_workspace_slice clip_block_norm1;
+    uocr_metal_vision_workspace_slice clip_block_q;
+    uocr_metal_vision_workspace_slice clip_block_k;
+    uocr_metal_vision_workspace_slice clip_block_v;
+    uocr_metal_vision_workspace_slice clip_block_attention;
+    uocr_metal_vision_workspace_slice clip_block_projected;
+    uocr_metal_vision_workspace_slice clip_block_residual1;
+    uocr_metal_vision_workspace_slice clip_block_norm2;
+    uocr_metal_vision_workspace_slice clip_block_mlp;
+    uocr_metal_vision_workspace_slice clip_mlp_fc1;
+    uocr_metal_vision_workspace_slice clip_mlp_activated;
     uocr_metal_vision_workspace_slice concat;
     uocr_metal_vision_workspace_slice projected_rows;
     uocr_metal_vision_workspace_slice final_visual_rows;
@@ -3300,10 +3322,26 @@ static int metal_vision_workspace_init(uocr_metal_context *ctx,
     const uint64_t max_net3_grid = (max_net2_grid + 1u) / 2u;
     const uint64_t sam_net2_values = (uint64_t)UOCR_SAM_NET2_CHANNELS * max_net2_grid * max_net2_grid;
     const uint64_t sam_net3_values = (uint64_t)UOCR_SAM_NET3_CHANNELS * max_net3_grid * max_net3_grid;
-    const uint64_t clip_values = (projected_tokens_per_view + (uint64_t)UOCR_CLIP_CLASS_TOKENS) * (uint64_t)UOCR_CLIP_HIDDEN_SIZE;
+    const uint64_t clip_tokens = projected_tokens_per_view + (uint64_t)UOCR_CLIP_CLASS_TOKENS;
+    const uint64_t clip_values = clip_tokens * (uint64_t)UOCR_CLIP_HIDDEN_SIZE;
     const uint64_t concat_values = projected_tokens_per_view * (uint64_t)UOCR_PROJECTOR_IN_SIZE;
+    uint64_t sam_window_count = 0u;
+    uint64_t sam_window_attention_tokens = 0u;
+    uint64_t sam_attention_tokens = patch_tokens;
+    uint64_t sam_attention_values = 0u;
+    uint64_t clip_mlp_values = 0u;
     uint64_t projected_values = 0u;
     uint64_t final_visual_values = 0u;
+    const uint64_t sam_windows_per_side = ((uint64_t)patch_grid + (uint64_t)UOCR_SAM_WINDOW_SIZE - 1u) /
+                                           (uint64_t)UOCR_SAM_WINDOW_SIZE;
+    if (!checked_mul_u64(sam_windows_per_side, sam_windows_per_side, &sam_window_count) ||
+        !checked_mul_u64(sam_window_count, (uint64_t)UOCR_SAM_WINDOW_TOKENS, &sam_window_attention_tokens) ||
+        !checked_mul_u64(sam_attention_tokens > sam_window_attention_tokens ? sam_attention_tokens : sam_window_attention_tokens,
+                         (uint64_t)UOCR_SAM_HIDDEN_SIZE,
+                         &sam_attention_values) ||
+        !checked_mul_u64(clip_tokens, (uint64_t)UOCR_CLIP_MLP_INTERMEDIATE, &clip_mlp_values)) {
+        return metal_fail(error, error_size, "Metal transformer vision workspace byte-size overflow");
+    }
     if (projected_row_capacity != 0u &&
         !checked_mul_u64((uint64_t)projected_row_capacity, (uint64_t)UOCR_HIDDEN_SIZE, &projected_values)) {
         return metal_fail(error, error_size, "Metal projected visual workspace byte-size overflow");
@@ -3328,6 +3366,17 @@ static int metal_vision_workspace_init(uocr_metal_context *ctx,
     ADD_WORKSPACE_SLICE(sam_bhwc_values, "SAM patch BHWC");
     ADD_WORKSPACE_SLICE(sam_bhwc_values, "SAM positioned BHWC");
     ADD_WORKSPACE_SLICE(sam_bhwc_values, "SAM transformer BHWC");
+    ADD_WORKSPACE_SLICE(sam_bhwc_values, "SAM block norm1 BHWC");
+    ADD_WORKSPACE_SLICE(sam_attention_values, "SAM block window tokens");
+    ADD_WORKSPACE_SLICE(sam_attention_values, "SAM block Q");
+    ADD_WORKSPACE_SLICE(sam_attention_values, "SAM block K");
+    ADD_WORKSPACE_SLICE(sam_attention_values, "SAM block V");
+    ADD_WORKSPACE_SLICE(sam_attention_values, "SAM block attention");
+    ADD_WORKSPACE_SLICE(sam_attention_values, "SAM block projected windows");
+    ADD_WORKSPACE_SLICE(sam_bhwc_values, "SAM block attention BHWC");
+    ADD_WORKSPACE_SLICE(sam_bhwc_values, "SAM block residual1 BHWC");
+    ADD_WORKSPACE_SLICE(sam_bhwc_values, "SAM block norm2 BHWC");
+    ADD_WORKSPACE_SLICE(sam_bhwc_values, "SAM block MLP BHWC");
     ADD_WORKSPACE_SLICE(sam_neck_values, "SAM neck A NCHW");
     ADD_WORKSPACE_SLICE(sam_neck_values, "SAM neck B NCHW");
     ADD_WORKSPACE_SLICE(sam_net2_values, "SAM net_2 NCHW");
@@ -3335,6 +3384,17 @@ static int metal_vision_workspace_init(uocr_metal_context *ctx,
     ADD_WORKSPACE_SLICE(clip_values, "CLIP token A");
     ADD_WORKSPACE_SLICE(clip_values, "CLIP token B");
     ADD_WORKSPACE_SLICE(clip_values, "CLIP transformer output");
+    ADD_WORKSPACE_SLICE(clip_values, "CLIP block norm1");
+    ADD_WORKSPACE_SLICE(clip_values, "CLIP block Q");
+    ADD_WORKSPACE_SLICE(clip_values, "CLIP block K");
+    ADD_WORKSPACE_SLICE(clip_values, "CLIP block V");
+    ADD_WORKSPACE_SLICE(clip_values, "CLIP block attention");
+    ADD_WORKSPACE_SLICE(clip_values, "CLIP block projected");
+    ADD_WORKSPACE_SLICE(clip_values, "CLIP block residual1");
+    ADD_WORKSPACE_SLICE(clip_values, "CLIP block norm2");
+    ADD_WORKSPACE_SLICE(clip_values, "CLIP block MLP");
+    ADD_WORKSPACE_SLICE(clip_mlp_values, "CLIP MLP fc1");
+    ADD_WORKSPACE_SLICE(clip_mlp_values, "CLIP MLP activated");
     ADD_WORKSPACE_SLICE(concat_values, "CLIP/SAM concat");
     if (projected_values != 0u) {
         ADD_WORKSPACE_SLICE(projected_values, "projected visual chunk rows");
@@ -3373,6 +3433,17 @@ static int metal_vision_workspace_init(uocr_metal_context *ctx,
     ASSIGN_WORKSPACE_SLICE(sam_patch_bhwc, sam_bhwc_values, "SAM patch BHWC");
     ASSIGN_WORKSPACE_SLICE(sam_pos_bhwc, sam_bhwc_values, "SAM positioned BHWC");
     ASSIGN_WORKSPACE_SLICE(sam_transformer_bhwc, sam_bhwc_values, "SAM transformer BHWC");
+    ASSIGN_WORKSPACE_SLICE(sam_block_norm1_bhwc, sam_bhwc_values, "SAM block norm1 BHWC");
+    ASSIGN_WORKSPACE_SLICE(sam_block_window_tokens, sam_attention_values, "SAM block window tokens");
+    ASSIGN_WORKSPACE_SLICE(sam_block_q, sam_attention_values, "SAM block Q");
+    ASSIGN_WORKSPACE_SLICE(sam_block_k, sam_attention_values, "SAM block K");
+    ASSIGN_WORKSPACE_SLICE(sam_block_v, sam_attention_values, "SAM block V");
+    ASSIGN_WORKSPACE_SLICE(sam_block_attention, sam_attention_values, "SAM block attention");
+    ASSIGN_WORKSPACE_SLICE(sam_block_projected_windows, sam_attention_values, "SAM block projected windows");
+    ASSIGN_WORKSPACE_SLICE(sam_block_attention_bhwc, sam_bhwc_values, "SAM block attention BHWC");
+    ASSIGN_WORKSPACE_SLICE(sam_block_residual1_bhwc, sam_bhwc_values, "SAM block residual1 BHWC");
+    ASSIGN_WORKSPACE_SLICE(sam_block_norm2_bhwc, sam_bhwc_values, "SAM block norm2 BHWC");
+    ASSIGN_WORKSPACE_SLICE(sam_block_mlp_bhwc, sam_bhwc_values, "SAM block MLP BHWC");
     ASSIGN_WORKSPACE_SLICE(sam_neck_a_nchw, sam_neck_values, "SAM neck A NCHW");
     ASSIGN_WORKSPACE_SLICE(sam_neck_b_nchw, sam_neck_values, "SAM neck B NCHW");
     ASSIGN_WORKSPACE_SLICE(sam_net2_nchw, sam_net2_values, "SAM net_2 NCHW");
@@ -3380,6 +3451,17 @@ static int metal_vision_workspace_init(uocr_metal_context *ctx,
     ASSIGN_WORKSPACE_SLICE(clip_a, clip_values, "CLIP token A");
     ASSIGN_WORKSPACE_SLICE(clip_b, clip_values, "CLIP token B");
     ASSIGN_WORKSPACE_SLICE(clip_final, clip_values, "CLIP transformer output");
+    ASSIGN_WORKSPACE_SLICE(clip_block_norm1, clip_values, "CLIP block norm1");
+    ASSIGN_WORKSPACE_SLICE(clip_block_q, clip_values, "CLIP block Q");
+    ASSIGN_WORKSPACE_SLICE(clip_block_k, clip_values, "CLIP block K");
+    ASSIGN_WORKSPACE_SLICE(clip_block_v, clip_values, "CLIP block V");
+    ASSIGN_WORKSPACE_SLICE(clip_block_attention, clip_values, "CLIP block attention");
+    ASSIGN_WORKSPACE_SLICE(clip_block_projected, clip_values, "CLIP block projected");
+    ASSIGN_WORKSPACE_SLICE(clip_block_residual1, clip_values, "CLIP block residual1");
+    ASSIGN_WORKSPACE_SLICE(clip_block_norm2, clip_values, "CLIP block norm2");
+    ASSIGN_WORKSPACE_SLICE(clip_block_mlp, clip_values, "CLIP block MLP");
+    ASSIGN_WORKSPACE_SLICE(clip_mlp_fc1, clip_mlp_values, "CLIP MLP fc1");
+    ASSIGN_WORKSPACE_SLICE(clip_mlp_activated, clip_mlp_values, "CLIP MLP activated");
     ASSIGN_WORKSPACE_SLICE(concat, concat_values, "CLIP/SAM concat");
     if (projected_values != 0u) {
         ASSIGN_WORKSPACE_SLICE(projected_rows, projected_values, "projected visual chunk rows");
@@ -3403,6 +3485,28 @@ typedef struct uocr_metal_vision_project_context {
     uocr_metal_vision_workspace *scratch;
     double chunk_encode_ms;
 } uocr_metal_vision_project_context;
+
+static int metal_context_sam_transformer_workspace_f16(uocr_metal_context *ctx,
+                                                       const uint16_t *input_bhwc_f16,
+                                                       const uocr_metal_sam_transformer_block_f16 *blocks,
+                                                       uint32_t block_count,
+                                                       uint32_t grid_w,
+                                                       uint32_t grid_h,
+                                                       uocr_metal_dense_output_type output_type,
+                                                       void *out_bhwc,
+                                                       uocr_metal_vision_workspace *scratch,
+                                                       char *error,
+                                                       size_t error_size);
+static int metal_context_clip_transformer_workspace_f16(uocr_metal_context *ctx,
+                                                        const uint16_t *input_f16,
+                                                        const uocr_metal_clip_transformer_block_f16 *blocks,
+                                                        uint32_t block_count,
+                                                        uint32_t token_count,
+                                                        uocr_metal_dense_output_type output_type,
+                                                        void *out,
+                                                        uocr_metal_vision_workspace *scratch,
+                                                        char *error,
+                                                        size_t error_size);
 
 static int metal_encode_one_view_sam_features_f16(uocr_metal_vision_project_context *project,
                                                   const uocr_image_view *view,
@@ -3469,16 +3573,17 @@ static int metal_encode_one_view_sam_features_f16(uocr_metal_vision_project_cont
                                                             error,
                                                             error_size));
     RUN_VISION_STEP("SAM transformer",
-                    uocr_metal_context_sam_transformer_f16(ctx,
-                                                            scratch->sam_pos_bhwc.f16,
-                                                            weights->sam_blocks,
-                                                            UOCR_SAM_BLOCKS,
-                                                            patch_grid_w,
-                                                            patch_grid_h,
-                                                            UOCR_METAL_DENSE_OUTPUT_F16,
-                                                            scratch->sam_transformer_bhwc.f16,
-                                                            error,
-                                                            error_size));
+                    metal_context_sam_transformer_workspace_f16(ctx,
+                                                                scratch->sam_pos_bhwc.f16,
+                                                                weights->sam_blocks,
+                                                                UOCR_SAM_BLOCKS,
+                                                                patch_grid_w,
+                                                                patch_grid_h,
+                                                                UOCR_METAL_DENSE_OUTPUT_F16,
+                                                                scratch->sam_transformer_bhwc.f16,
+                                                                scratch,
+                                                                error,
+                                                                error_size));
     const uint64_t sam_neck_start_ns = uocr_profile_now_ns();
     RUN_VISION_STEP("SAM neck 1x1 convolution",
                     uocr_metal_context_sam_neck_conv1x1_f16(ctx,
@@ -3636,15 +3741,16 @@ static int metal_encode_one_view_clip_features_f16(uocr_metal_vision_project_con
                                                                error,
                                                                error_size));
     RUN_VISION_STEP("CLIP transformer",
-                    uocr_metal_context_clip_transformer_f16(ctx,
-                                                             scratch->clip_a.f16,
-                                                             weights->clip_blocks,
-                                                             UOCR_CLIP_BLOCKS,
-                                                             expected_clip_tokens,
-                                                             UOCR_METAL_DENSE_OUTPUT_F16,
-                                                             out_clip_tokens_f16,
-                                                             error,
-                                                             error_size));
+                    metal_context_clip_transformer_workspace_f16(ctx,
+                                                                 scratch->clip_a.f16,
+                                                                 weights->clip_blocks,
+                                                                 UOCR_CLIP_BLOCKS,
+                                                                 expected_clip_tokens,
+                                                                 UOCR_METAL_DENSE_OUTPUT_F16,
+                                                                 out_clip_tokens_f16,
+                                                                 scratch,
+                                                                 error,
+                                                                 error_size));
 
 #undef RUN_VISION_STEP
 
@@ -10789,20 +10895,32 @@ int uocr_metal_context_sam_window_partition_f16(uocr_metal_context *ctx,
         id<MTLCommandBuffer> cb = nil;
         id<MTLComputeCommandEncoder> enc = nil;
 
-        src = metal_new_buffer_with_bytes(ctx, input_bhwc_f16, (NSUInteger)input_bytes, MTLResourceStorageModeShared);
+        NSUInteger src_offset = 0u;
+        src = metal_new_or_retain_vision_buffer_with_bytes(ctx,
+                                                           input_bhwc_f16,
+                                                           (NSUInteger)input_bytes,
+                                                           MTLResourceStorageModeShared,
+                                                           &src_offset);
         if (src == nil) {
             result = metal_fail(error, error_size, "failed to allocate Metal SAM window partition input buffer");
             goto cleanup_window_partition;
         }
         src.label = @"uocr_sam_window_partition_input_bhwc_f16";
 
-        dst = metal_new_buffer_with_length(ctx, (NSUInteger)window_bytes, MTLResourceStorageModeShared);
+        NSUInteger dst_offset = 0u;
+        int dst_needs_copy = 1;
+        dst = metal_new_or_retain_vision_output_buffer(ctx,
+                                                       out_windows_f16,
+                                                       (NSUInteger)window_bytes,
+                                                       MTLResourceStorageModeShared,
+                                                       &dst_offset,
+                                                       &dst_needs_copy);
         if (dst == nil) {
             result = metal_fail(error, error_size, "failed to allocate Metal SAM window partition output buffer");
             goto cleanup_window_partition;
         }
         dst.label = @"uocr_sam_window_partition_output_f16";
-        memset([dst contents], 0, (size_t)window_bytes);
+        metal_zero_buffer_range(dst, dst_offset, (NSUInteger)window_bytes);
 
         cb = metal_new_command_buffer(ctx);
         if (cb == nil) {
@@ -10829,8 +10947,8 @@ int uocr_metal_context_sam_window_partition_f16(uocr_metal_context *ctx,
 
         const NSUInteger threads_per_group = metal_power2_threadgroup_width(256u, pipeline.maxTotalThreadsPerThreadgroup);
         [enc setComputePipelineState:pipeline];
-        [enc setBuffer:src offset:0u atIndex:0u];
-        [enc setBuffer:dst offset:0u atIndex:1u];
+        [enc setBuffer:src offset:src_offset atIndex:0u];
+        [enc setBuffer:dst offset:dst_offset atIndex:1u];
         [enc setBytes:&params length:sizeof(params) atIndex:2u];
         [enc dispatchThreads:MTLSizeMake((NSUInteger)window_values, 1u, 1u)
              threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1u, 1u)];
@@ -10843,7 +10961,11 @@ int uocr_metal_context_sam_window_partition_f16(uocr_metal_context *ctx,
             goto cleanup_window_partition;
         }
 
-        memcpy(out_windows_f16, [dst contents], (size_t)window_bytes);
+        metal_copy_buffer_range_to_host_if_needed(out_windows_f16,
+                                                   dst,
+                                                   dst_offset,
+                                                   (NSUInteger)window_bytes,
+                                                   dst_needs_copy);
         *out_n_windows = n_windows;
         *out_padded_w = padded_w;
         *out_padded_h = padded_h;
@@ -10932,20 +11054,32 @@ int uocr_metal_context_sam_window_unpartition_f16(uocr_metal_context *ctx,
         id<MTLCommandBuffer> cb = nil;
         id<MTLComputeCommandEncoder> enc = nil;
 
-        src = metal_new_buffer_with_bytes(ctx, windows_f16, (NSUInteger)window_bytes, MTLResourceStorageModeShared);
+        NSUInteger src_offset = 0u;
+        src = metal_new_or_retain_vision_buffer_with_bytes(ctx,
+                                                           windows_f16,
+                                                           (NSUInteger)window_bytes,
+                                                           MTLResourceStorageModeShared,
+                                                           &src_offset);
         if (src == nil) {
             result = metal_fail(error, error_size, "failed to allocate Metal SAM window unpartition input buffer");
             goto cleanup_window_unpartition;
         }
         src.label = @"uocr_sam_window_unpartition_input_f16";
 
-        dst = metal_new_buffer_with_length(ctx, (NSUInteger)output_bytes, MTLResourceStorageModeShared);
+        NSUInteger dst_offset = 0u;
+        int dst_needs_copy = 1;
+        dst = metal_new_or_retain_vision_output_buffer(ctx,
+                                                       out_bhwc_f16,
+                                                       (NSUInteger)output_bytes,
+                                                       MTLResourceStorageModeShared,
+                                                       &dst_offset,
+                                                       &dst_needs_copy);
         if (dst == nil) {
             result = metal_fail(error, error_size, "failed to allocate Metal SAM window unpartition output buffer");
             goto cleanup_window_unpartition;
         }
         dst.label = @"uocr_sam_window_unpartition_output_bhwc_f16";
-        memset([dst contents], 0, (size_t)output_bytes);
+        metal_zero_buffer_range(dst, dst_offset, (NSUInteger)output_bytes);
 
         cb = metal_new_command_buffer(ctx);
         if (cb == nil) {
@@ -10972,8 +11106,8 @@ int uocr_metal_context_sam_window_unpartition_f16(uocr_metal_context *ctx,
 
         const NSUInteger threads_per_group = metal_power2_threadgroup_width(256u, pipeline.maxTotalThreadsPerThreadgroup);
         [enc setComputePipelineState:pipeline];
-        [enc setBuffer:src offset:0u atIndex:0u];
-        [enc setBuffer:dst offset:0u atIndex:1u];
+        [enc setBuffer:src offset:src_offset atIndex:0u];
+        [enc setBuffer:dst offset:dst_offset atIndex:1u];
         [enc setBytes:&params length:sizeof(params) atIndex:2u];
         [enc dispatchThreads:MTLSizeMake((NSUInteger)output_values, 1u, 1u)
              threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1u, 1u)];
@@ -10989,7 +11123,11 @@ int uocr_metal_context_sam_window_unpartition_f16(uocr_metal_context *ctx,
             goto cleanup_window_unpartition;
         }
 
-        memcpy(out_bhwc_f16, [dst contents], (size_t)output_bytes);
+        metal_copy_buffer_range_to_host_if_needed(out_bhwc_f16,
+                                                   dst,
+                                                   dst_offset,
+                                                   (NSUInteger)output_bytes,
+                                                   dst_needs_copy);
         result = 1;
 
     cleanup_window_unpartition:
@@ -12281,7 +12419,12 @@ int uocr_metal_context_clip_qkv_f16(uocr_metal_context *ctx,
         id<MTLBuffer> k_dst = nil;
         id<MTLBuffer> v_dst = nil;
 
-        src = metal_new_buffer_with_bytes(ctx, input_f16, (NSUInteger)input_bytes, MTLResourceStorageModeShared);
+        NSUInteger src_offset = 0u;
+        src = metal_new_or_retain_vision_buffer_with_bytes(ctx,
+                                                           input_f16,
+                                                           (NSUInteger)input_bytes,
+                                                           MTLResourceStorageModeShared,
+                                                           &src_offset);
         if (src == nil) {
             result = metal_fail(error, error_size, "failed to allocate Metal CLIP QKV input buffer");
             goto cleanup_clip_qkv;
@@ -12312,9 +12455,30 @@ int uocr_metal_context_clip_qkv_f16(uocr_metal_context *ctx,
         }
         bias.label = @"uocr_clip_qkv_bias_f16";
 
-        q_dst = metal_new_buffer_with_length(ctx, (NSUInteger)output_bytes, MTLResourceStorageModeShared);
-        k_dst = metal_new_buffer_with_length(ctx, (NSUInteger)output_bytes, MTLResourceStorageModeShared);
-        v_dst = metal_new_buffer_with_length(ctx, (NSUInteger)output_bytes, MTLResourceStorageModeShared);
+        NSUInteger q_offset = 0u;
+        NSUInteger k_offset = 0u;
+        NSUInteger v_offset = 0u;
+        int q_needs_copy = 1;
+        int k_needs_copy = 1;
+        int v_needs_copy = 1;
+        q_dst = metal_new_or_retain_vision_output_buffer(ctx,
+                                                         q_out,
+                                                         (NSUInteger)output_bytes,
+                                                         MTLResourceStorageModeShared,
+                                                         &q_offset,
+                                                         &q_needs_copy);
+        k_dst = metal_new_or_retain_vision_output_buffer(ctx,
+                                                         k_out,
+                                                         (NSUInteger)output_bytes,
+                                                         MTLResourceStorageModeShared,
+                                                         &k_offset,
+                                                         &k_needs_copy);
+        v_dst = metal_new_or_retain_vision_output_buffer(ctx,
+                                                         v_out,
+                                                         (NSUInteger)output_bytes,
+                                                         MTLResourceStorageModeShared,
+                                                         &v_offset,
+                                                         &v_needs_copy);
         if (q_dst == nil || k_dst == nil || v_dst == nil) {
             result = metal_fail(error, error_size, "failed to allocate Metal CLIP QKV output buffers");
             goto cleanup_clip_qkv;
@@ -12322,18 +12486,18 @@ int uocr_metal_context_clip_qkv_f16(uocr_metal_context *ctx,
         q_dst.label = @"uocr_clip_q_f16";
         k_dst.label = @"uocr_clip_k_f16";
         v_dst.label = @"uocr_clip_v_f16";
-        memset([q_dst contents], 0, (size_t)output_bytes);
-        memset([k_dst contents], 0, (size_t)output_bytes);
-        memset([v_dst contents], 0, (size_t)output_bytes);
+        metal_zero_buffer_range(q_dst, q_offset, (NSUInteger)output_bytes);
+        metal_zero_buffer_range(k_dst, k_offset, (NSUInteger)output_bytes);
+        metal_zero_buffer_range(v_dst, v_offset, (NSUInteger)output_bytes);
 
         if (output_type == UOCR_METAL_DENSE_OUTPUT_F16 &&
             metal_mps_matmul_nt_f16_should_use(token_count, UOCR_CLIP_HIDDEN_SIZE, UOCR_CLIP_HIDDEN_SIZE)) {
-            uocr_metal_buffer_slice src_slice = { src, 0u };
+            uocr_metal_buffer_slice src_slice = { src, src_offset };
             uocr_metal_buffer_slice weight_slice = { weight, weight_offset };
             uocr_metal_buffer_slice bias_slice = { bias, bias_offset };
-            uocr_metal_buffer_slice q_slice = { q_dst, 0u };
-            uocr_metal_buffer_slice k_slice = { k_dst, 0u };
-            uocr_metal_buffer_slice v_slice = { v_dst, 0u };
+            uocr_metal_buffer_slice q_slice = { q_dst, q_offset };
+            uocr_metal_buffer_slice k_slice = { k_dst, k_offset };
+            uocr_metal_buffer_slice v_slice = { v_dst, v_offset };
             if (!metal_run_packed_qkv_mps_f16(ctx,
                                               src_slice,
                                               weight_slice,
@@ -12349,9 +12513,9 @@ int uocr_metal_context_clip_qkv_f16(uocr_metal_context *ctx,
                 result = 0;
                 goto cleanup_clip_qkv;
             }
-            memcpy(q_out, [q_dst contents], (size_t)output_bytes);
-            memcpy(k_out, [k_dst contents], (size_t)output_bytes);
-            memcpy(v_out, [v_dst contents], (size_t)output_bytes);
+            metal_copy_buffer_range_to_host_if_needed(q_out, q_dst, q_offset, (NSUInteger)output_bytes, q_needs_copy);
+            metal_copy_buffer_range_to_host_if_needed(k_out, k_dst, k_offset, (NSUInteger)output_bytes, k_needs_copy);
+            metal_copy_buffer_range_to_host_if_needed(v_out, v_dst, v_offset, (NSUInteger)output_bytes, v_needs_copy);
             result = 1;
             goto cleanup_clip_qkv;
         }
@@ -12383,12 +12547,12 @@ int uocr_metal_context_clip_qkv_f16(uocr_metal_context *ctx,
         }
 
         [enc setComputePipelineState:pipeline];
-        [enc setBuffer:src offset:0u atIndex:0u];
+        [enc setBuffer:src offset:src_offset atIndex:0u];
         [enc setBuffer:weight offset:weight_offset atIndex:1u];
         [enc setBuffer:bias offset:bias_offset atIndex:2u];
-        [enc setBuffer:q_dst offset:0u atIndex:3u];
-        [enc setBuffer:k_dst offset:0u atIndex:4u];
-        [enc setBuffer:v_dst offset:0u atIndex:5u];
+        [enc setBuffer:q_dst offset:q_offset atIndex:3u];
+        [enc setBuffer:k_dst offset:k_offset atIndex:4u];
+        [enc setBuffer:v_dst offset:v_offset atIndex:5u];
         [enc setBytes:&params length:sizeof(params) atIndex:6u];
         [enc setThreadgroupMemoryLength:threads_per_group * sizeof(float) atIndex:0u];
         [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)output_values, 1u, 1u)
@@ -12402,9 +12566,9 @@ int uocr_metal_context_clip_qkv_f16(uocr_metal_context *ctx,
             goto cleanup_clip_qkv;
         }
 
-        memcpy(q_out, [q_dst contents], (size_t)output_bytes);
-        memcpy(k_out, [k_dst contents], (size_t)output_bytes);
-        memcpy(v_out, [v_dst contents], (size_t)output_bytes);
+        metal_copy_buffer_range_to_host_if_needed(q_out, q_dst, q_offset, (NSUInteger)output_bytes, q_needs_copy);
+        metal_copy_buffer_range_to_host_if_needed(k_out, k_dst, k_offset, (NSUInteger)output_bytes, k_needs_copy);
+        metal_copy_buffer_range_to_host_if_needed(v_out, v_dst, v_offset, (NSUInteger)output_bytes, v_needs_copy);
         result = 1;
 
     cleanup_clip_qkv:
@@ -12487,34 +12651,56 @@ int uocr_metal_context_clip_attention_f16(uocr_metal_context *ctx,
         id<MTLBuffer> v_src = nil;
         id<MTLBuffer> dst = nil;
 
-        q_src = metal_new_buffer_with_bytes(ctx, q_f16, (NSUInteger)input_bytes, MTLResourceStorageModeShared);
+        NSUInteger q_offset = 0u;
+        q_src = metal_new_or_retain_vision_buffer_with_bytes(ctx,
+                                                             q_f16,
+                                                             (NSUInteger)input_bytes,
+                                                             MTLResourceStorageModeShared,
+                                                             &q_offset);
         if (q_src == nil) {
             result = metal_fail(error, error_size, "failed to allocate Metal CLIP attention Q buffer");
             goto cleanup_clip_attention;
         }
         q_src.label = @"uocr_clip_attention_q_f16";
 
-        k_src = metal_new_buffer_with_bytes(ctx, k_f16, (NSUInteger)input_bytes, MTLResourceStorageModeShared);
+        NSUInteger k_offset = 0u;
+        k_src = metal_new_or_retain_vision_buffer_with_bytes(ctx,
+                                                             k_f16,
+                                                             (NSUInteger)input_bytes,
+                                                             MTLResourceStorageModeShared,
+                                                             &k_offset);
         if (k_src == nil) {
             result = metal_fail(error, error_size, "failed to allocate Metal CLIP attention K buffer");
             goto cleanup_clip_attention;
         }
         k_src.label = @"uocr_clip_attention_k_f16";
 
-        v_src = metal_new_buffer_with_bytes(ctx, v_f16, (NSUInteger)input_bytes, MTLResourceStorageModeShared);
+        NSUInteger v_offset = 0u;
+        v_src = metal_new_or_retain_vision_buffer_with_bytes(ctx,
+                                                             v_f16,
+                                                             (NSUInteger)input_bytes,
+                                                             MTLResourceStorageModeShared,
+                                                             &v_offset);
         if (v_src == nil) {
             result = metal_fail(error, error_size, "failed to allocate Metal CLIP attention V buffer");
             goto cleanup_clip_attention;
         }
         v_src.label = @"uocr_clip_attention_v_f16";
 
-        dst = metal_new_buffer_with_length(ctx, (NSUInteger)output_bytes, MTLResourceStorageModeShared);
+        NSUInteger dst_offset = 0u;
+        int dst_needs_copy = 1;
+        dst = metal_new_or_retain_vision_output_buffer(ctx,
+                                                       out,
+                                                       (NSUInteger)output_bytes,
+                                                       MTLResourceStorageModeShared,
+                                                       &dst_offset,
+                                                       &dst_needs_copy);
         if (dst == nil) {
             result = metal_fail(error, error_size, "failed to allocate Metal CLIP attention output buffer");
             goto cleanup_clip_attention;
         }
         dst.label = @"uocr_clip_attention_output";
-        memset([dst contents], 0, (size_t)output_bytes);
+        metal_zero_buffer_range(dst, dst_offset, (NSUInteger)output_bytes);
 
         uocr_metal_sam_window_attention_params params;
         params.windows = 1u;
@@ -12547,10 +12733,10 @@ int uocr_metal_context_clip_attention_f16(uocr_metal_context *ctx,
         }
 
         [enc setComputePipelineState:pipeline];
-        [enc setBuffer:q_src offset:0u atIndex:0u];
-        [enc setBuffer:k_src offset:0u atIndex:1u];
-        [enc setBuffer:v_src offset:0u atIndex:2u];
-        [enc setBuffer:dst offset:0u atIndex:3u];
+        [enc setBuffer:q_src offset:q_offset atIndex:0u];
+        [enc setBuffer:k_src offset:k_offset atIndex:1u];
+        [enc setBuffer:v_src offset:v_offset atIndex:2u];
+        [enc setBuffer:dst offset:dst_offset atIndex:3u];
         [enc setBytes:&params length:sizeof(params) atIndex:4u];
         [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)UOCR_CLIP_ATTENTION_HEADS, query_blocks, 1u)
              threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1u, 1u)];
@@ -12563,7 +12749,7 @@ int uocr_metal_context_clip_attention_f16(uocr_metal_context *ctx,
             goto cleanup_clip_attention;
         }
 
-        memcpy(out, [dst contents], (size_t)output_bytes);
+        metal_copy_buffer_range_to_host_if_needed(out, dst, dst_offset, (NSUInteger)output_bytes, dst_needs_copy);
         result = 1;
 
     cleanup_clip_attention:
@@ -12686,20 +12872,32 @@ int uocr_metal_context_clip_quickgelu_f16(uocr_metal_context *ctx,
         id<MTLCommandBuffer> cb = nil;
         id<MTLComputeCommandEncoder> enc = nil;
 
-        src = metal_new_buffer_with_bytes(ctx, input_f16, (NSUInteger)input_bytes, MTLResourceStorageModeShared);
+        NSUInteger src_offset = 0u;
+        src = metal_new_or_retain_vision_buffer_with_bytes(ctx,
+                                                           input_f16,
+                                                           (NSUInteger)input_bytes,
+                                                           MTLResourceStorageModeShared,
+                                                           &src_offset);
         if (src == nil) {
             result = metal_fail(error, error_size, "failed to allocate Metal CLIP QuickGELU input buffer");
             goto cleanup_clip_quickgelu;
         }
         src.label = @"uocr_clip_quickgelu_input_f16";
 
-        dst = metal_new_buffer_with_length(ctx, (NSUInteger)output_bytes, MTLResourceStorageModeShared);
+        NSUInteger dst_offset = 0u;
+        int dst_needs_copy = 1;
+        dst = metal_new_or_retain_vision_output_buffer(ctx,
+                                                       out,
+                                                       (NSUInteger)output_bytes,
+                                                       MTLResourceStorageModeShared,
+                                                       &dst_offset,
+                                                       &dst_needs_copy);
         if (dst == nil) {
             result = metal_fail(error, error_size, "failed to allocate Metal CLIP QuickGELU output buffer");
             goto cleanup_clip_quickgelu;
         }
         dst.label = @"uocr_clip_quickgelu_output";
-        memset([dst contents], 0, (size_t)output_bytes);
+        metal_zero_buffer_range(dst, dst_offset, (NSUInteger)output_bytes);
 
         cb = metal_new_command_buffer(ctx);
         if (cb == nil) {
@@ -12716,8 +12914,8 @@ int uocr_metal_context_clip_quickgelu_f16(uocr_metal_context *ctx,
 
         const NSUInteger threads_per_group = metal_power2_threadgroup_width(256u, pipeline.maxTotalThreadsPerThreadgroup);
         [enc setComputePipelineState:pipeline];
-        [enc setBuffer:src offset:0u atIndex:0u];
-        [enc setBuffer:dst offset:0u atIndex:1u];
+        [enc setBuffer:src offset:src_offset atIndex:0u];
+        [enc setBuffer:dst offset:dst_offset atIndex:1u];
         [enc setBytes:&value_count length:sizeof(value_count) atIndex:2u];
         [enc dispatchThreads:MTLSizeMake((NSUInteger)value_count, 1u, 1u)
        threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1u, 1u)];
@@ -12730,7 +12928,7 @@ int uocr_metal_context_clip_quickgelu_f16(uocr_metal_context *ctx,
             goto cleanup_clip_quickgelu;
         }
 
-        memcpy(out, [dst contents], (size_t)output_bytes);
+        metal_copy_buffer_range_to_host_if_needed(out, dst, dst_offset, (NSUInteger)output_bytes, dst_needs_copy);
         result = 1;
 
     cleanup_clip_quickgelu:
@@ -12955,27 +13153,44 @@ int uocr_metal_context_clip_residual_add_f16(uocr_metal_context *ctx,
         id<MTLCommandBuffer> cb = nil;
         id<MTLComputeCommandEncoder> enc = nil;
 
-        base = metal_new_buffer_with_bytes(ctx, base_f16, (NSUInteger)input_bytes, MTLResourceStorageModeShared);
+        NSUInteger base_offset = 0u;
+        base = metal_new_or_retain_vision_buffer_with_bytes(ctx,
+                                                            base_f16,
+                                                            (NSUInteger)input_bytes,
+                                                            MTLResourceStorageModeShared,
+                                                            &base_offset);
         if (base == nil) {
             result = metal_fail(error, error_size, "failed to allocate Metal CLIP residual base buffer");
             goto cleanup_clip_residual;
         }
         base.label = @"uocr_clip_residual_base_f16";
 
-        update = metal_new_buffer_with_bytes(ctx, update_f16, (NSUInteger)input_bytes, MTLResourceStorageModeShared);
+        NSUInteger update_offset = 0u;
+        update = metal_new_or_retain_vision_buffer_with_bytes(ctx,
+                                                              update_f16,
+                                                              (NSUInteger)input_bytes,
+                                                              MTLResourceStorageModeShared,
+                                                              &update_offset);
         if (update == nil) {
             result = metal_fail(error, error_size, "failed to allocate Metal CLIP residual update buffer");
             goto cleanup_clip_residual;
         }
         update.label = @"uocr_clip_residual_update_f16";
 
-        dst = metal_new_buffer_with_length(ctx, (NSUInteger)output_bytes, MTLResourceStorageModeShared);
+        NSUInteger dst_offset = 0u;
+        int dst_needs_copy = 1;
+        dst = metal_new_or_retain_vision_output_buffer(ctx,
+                                                       out,
+                                                       (NSUInteger)output_bytes,
+                                                       MTLResourceStorageModeShared,
+                                                       &dst_offset,
+                                                       &dst_needs_copy);
         if (dst == nil) {
             result = metal_fail(error, error_size, "failed to allocate Metal CLIP residual output buffer");
             goto cleanup_clip_residual;
         }
         dst.label = @"uocr_clip_residual_output";
-        memset([dst contents], 0, (size_t)output_bytes);
+        metal_zero_buffer_range(dst, dst_offset, (NSUInteger)output_bytes);
 
         cb = metal_new_command_buffer(ctx);
         if (cb == nil) {
@@ -12992,9 +13207,9 @@ int uocr_metal_context_clip_residual_add_f16(uocr_metal_context *ctx,
 
         const NSUInteger threads_per_group = metal_power2_threadgroup_width(256u, pipeline.maxTotalThreadsPerThreadgroup);
         [enc setComputePipelineState:pipeline];
-        [enc setBuffer:base offset:0u atIndex:0u];
-        [enc setBuffer:update offset:0u atIndex:1u];
-        [enc setBuffer:dst offset:0u atIndex:2u];
+        [enc setBuffer:base offset:base_offset atIndex:0u];
+        [enc setBuffer:update offset:update_offset atIndex:1u];
+        [enc setBuffer:dst offset:dst_offset atIndex:2u];
         [enc setBytes:&value_count length:sizeof(value_count) atIndex:3u];
         [enc dispatchThreads:MTLSizeMake((NSUInteger)value_count, 1u, 1u)
        threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1u, 1u)];
@@ -13007,7 +13222,7 @@ int uocr_metal_context_clip_residual_add_f16(uocr_metal_context *ctx,
             goto cleanup_clip_residual;
         }
 
-        memcpy(out, [dst contents], (size_t)output_bytes);
+        metal_copy_buffer_range_to_host_if_needed(out, dst, dst_offset, (NSUInteger)output_bytes, dst_needs_copy);
         result = 1;
 
     cleanup_clip_residual:
@@ -13320,6 +13535,279 @@ cleanup_clip_transformer:
         metal_clear_error(error, error_size);
     }
     return result;
+}
+
+static int metal_vision_slice_has_bytes(uocr_metal_vision_workspace_slice slice, uint64_t bytes) {
+    return slice.buffer != nil && slice.f16 != NULL && bytes != 0u && bytes <= slice.bytes;
+}
+
+static int metal_context_clip_mlp_workspace_f16(uocr_metal_context *ctx,
+                                                const uint16_t *input_f16,
+                                                const uocr_metal_clip_transformer_block_f16 *block,
+                                                uint32_t token_count,
+                                                uocr_metal_dense_output_type output_type,
+                                                void *out,
+                                                uocr_metal_vision_workspace *scratch,
+                                                char *error,
+                                                size_t error_size) {
+    uint64_t hidden_values = 0u;
+    uint64_t mid_values = 0u;
+    uint64_t hidden_bytes = 0u;
+    uint64_t mid_bytes = 0u;
+    if (ctx == NULL || input_f16 == NULL || !metal_clip_transformer_block_has_weights(block) || out == NULL ||
+        scratch == NULL) {
+        return metal_fail(error, error_size, "invalid Metal CLIP workspace MLP request");
+    }
+    if (!checked_mul_u64((uint64_t)token_count, (uint64_t)UOCR_CLIP_HIDDEN_SIZE, &hidden_values) ||
+        !checked_mul_u64((uint64_t)token_count, (uint64_t)UOCR_CLIP_MLP_INTERMEDIATE, &mid_values) ||
+        !checked_mul_u64(hidden_values, 2u, &hidden_bytes) || !checked_mul_u64(mid_values, 2u, &mid_bytes) ||
+        !metal_vision_slice_has_bytes(scratch->clip_mlp_fc1, mid_bytes) ||
+        !metal_vision_slice_has_bytes(scratch->clip_mlp_activated, mid_bytes)) {
+        return metal_fail(error, error_size, "Metal CLIP workspace MLP scratch is too small");
+    }
+    (void)hidden_bytes;
+    if (!uocr_metal_context_dense_f16(ctx,
+                                      input_f16,
+                                      block->mlp_fc1_weight_f16,
+                                      block->mlp_fc1_bias_f16,
+                                      token_count,
+                                      UOCR_CLIP_HIDDEN_SIZE,
+                                      UOCR_CLIP_MLP_INTERMEDIATE,
+                                      UOCR_METAL_DENSE_OUTPUT_F16,
+                                      scratch->clip_mlp_fc1.f16,
+                                      error,
+                                      error_size)) {
+        char detail[512];
+        metal_copy_error_detail(detail, sizeof(detail), error);
+        return metal_fail(error, error_size, "failed to compute Metal CLIP workspace MLP fc1: %s", detail);
+    }
+    if (!uocr_metal_context_clip_quickgelu_f16(ctx,
+                                               scratch->clip_mlp_fc1.f16,
+                                               token_count,
+                                               UOCR_METAL_DENSE_OUTPUT_F16,
+                                               scratch->clip_mlp_activated.f16,
+                                               error,
+                                               error_size)) {
+        char detail[512];
+        metal_copy_error_detail(detail, sizeof(detail), error);
+        return metal_fail(error, error_size, "failed to compute Metal CLIP workspace MLP QuickGELU: %s", detail);
+    }
+    if (!uocr_metal_context_dense_f16(ctx,
+                                      scratch->clip_mlp_activated.f16,
+                                      block->mlp_fc2_weight_f16,
+                                      block->mlp_fc2_bias_f16,
+                                      token_count,
+                                      UOCR_CLIP_MLP_INTERMEDIATE,
+                                      UOCR_CLIP_HIDDEN_SIZE,
+                                      output_type,
+                                      out,
+                                      error,
+                                      error_size)) {
+        char detail[512];
+        metal_copy_error_detail(detail, sizeof(detail), error);
+        return metal_fail(error, error_size, "failed to compute Metal CLIP workspace MLP fc2: %s", detail);
+    }
+    return 1;
+}
+
+static int metal_context_clip_transformer_block_workspace_f16(uocr_metal_context *ctx,
+                                                              const uint16_t *input_f16,
+                                                              const uocr_metal_clip_transformer_block_f16 *block,
+                                                              uint32_t token_count,
+                                                              uocr_metal_dense_output_type output_type,
+                                                              void *out,
+                                                              uocr_metal_vision_workspace *scratch,
+                                                              char *error,
+                                                              size_t error_size) {
+    uint64_t hidden_bytes = 0u;
+    if (ctx == NULL || input_f16 == NULL || !metal_clip_transformer_block_has_weights(block) || out == NULL ||
+        scratch == NULL) {
+        return metal_fail(error, error_size, "invalid Metal CLIP workspace transformer block request");
+    }
+    if (!metal_clip_transformer_activation_bytes(token_count, NULL, &hidden_bytes, error, error_size)) {
+        return 0;
+    }
+    if (!metal_vision_slice_has_bytes(scratch->clip_block_norm1, hidden_bytes) ||
+        !metal_vision_slice_has_bytes(scratch->clip_block_q, hidden_bytes) ||
+        !metal_vision_slice_has_bytes(scratch->clip_block_k, hidden_bytes) ||
+        !metal_vision_slice_has_bytes(scratch->clip_block_v, hidden_bytes) ||
+        !metal_vision_slice_has_bytes(scratch->clip_block_attention, hidden_bytes) ||
+        !metal_vision_slice_has_bytes(scratch->clip_block_projected, hidden_bytes) ||
+        !metal_vision_slice_has_bytes(scratch->clip_block_residual1, hidden_bytes) ||
+        !metal_vision_slice_has_bytes(scratch->clip_block_norm2, hidden_bytes) ||
+        !metal_vision_slice_has_bytes(scratch->clip_block_mlp, hidden_bytes)) {
+        return metal_fail(error, error_size, "Metal CLIP workspace transformer block scratch is too small");
+    }
+
+#define RUN_CLIP_WORKSPACE_BLOCK_STEP(step_name, call_expr)                                             \
+    do {                                                                                                \
+        if (!(call_expr)) {                                                                             \
+            char detail[512];                                                                           \
+            metal_copy_error_detail(detail, sizeof(detail), error);                                      \
+            return metal_fail(error, error_size, "failed to compute Metal CLIP workspace block %s: %s", step_name, detail); \
+        }                                                                                               \
+    } while (0)
+
+    RUN_CLIP_WORKSPACE_BLOCK_STEP("LayerNorm1",
+                                  uocr_metal_context_clip_layernorm_f16(ctx,
+                                                                        input_f16,
+                                                                        block->ln1_weight_f16,
+                                                                        block->ln1_bias_f16,
+                                                                        token_count,
+                                                                        UOCR_METAL_LAYERNORM_OUTPUT_F16,
+                                                                        scratch->clip_block_norm1.f16,
+                                                                        error,
+                                                                        error_size));
+    RUN_CLIP_WORKSPACE_BLOCK_STEP("QKV",
+                                  uocr_metal_context_clip_qkv_f16(ctx,
+                                                                   scratch->clip_block_norm1.f16,
+                                                                   block->qkv_weight_f16,
+                                                                   block->qkv_bias_f16,
+                                                                   token_count,
+                                                                   UOCR_METAL_DENSE_OUTPUT_F16,
+                                                                   scratch->clip_block_q.f16,
+                                                                   scratch->clip_block_k.f16,
+                                                                   scratch->clip_block_v.f16,
+                                                                   error,
+                                                                   error_size));
+    RUN_CLIP_WORKSPACE_BLOCK_STEP("attention",
+                                  uocr_metal_context_clip_attention_f16(ctx,
+                                                                        scratch->clip_block_q.f16,
+                                                                        scratch->clip_block_k.f16,
+                                                                        scratch->clip_block_v.f16,
+                                                                        token_count,
+                                                                        UOCR_METAL_DENSE_OUTPUT_F16,
+                                                                        scratch->clip_block_attention.f16,
+                                                                        error,
+                                                                        error_size));
+    RUN_CLIP_WORKSPACE_BLOCK_STEP("output projection",
+                                  uocr_metal_context_clip_output_projection_f16(ctx,
+                                                                                scratch->clip_block_attention.f16,
+                                                                                block->out_proj_weight_f16,
+                                                                                block->out_proj_bias_f16,
+                                                                                token_count,
+                                                                                UOCR_METAL_DENSE_OUTPUT_F16,
+                                                                                scratch->clip_block_projected.f16,
+                                                                                error,
+                                                                                error_size));
+    RUN_CLIP_WORKSPACE_BLOCK_STEP("attention residual",
+                                  uocr_metal_context_clip_residual_add_f16(ctx,
+                                                                           input_f16,
+                                                                           scratch->clip_block_projected.f16,
+                                                                           token_count,
+                                                                           UOCR_METAL_DENSE_OUTPUT_F16,
+                                                                           scratch->clip_block_residual1.f16,
+                                                                           error,
+                                                                           error_size));
+    RUN_CLIP_WORKSPACE_BLOCK_STEP("LayerNorm2",
+                                  uocr_metal_context_clip_layernorm_f16(ctx,
+                                                                        scratch->clip_block_residual1.f16,
+                                                                        block->ln2_weight_f16,
+                                                                        block->ln2_bias_f16,
+                                                                        token_count,
+                                                                        UOCR_METAL_LAYERNORM_OUTPUT_F16,
+                                                                        scratch->clip_block_norm2.f16,
+                                                                        error,
+                                                                        error_size));
+    RUN_CLIP_WORKSPACE_BLOCK_STEP("MLP",
+                                  metal_context_clip_mlp_workspace_f16(ctx,
+                                                                       scratch->clip_block_norm2.f16,
+                                                                       block,
+                                                                       token_count,
+                                                                       UOCR_METAL_DENSE_OUTPUT_F16,
+                                                                       scratch->clip_block_mlp.f16,
+                                                                       scratch,
+                                                                       error,
+                                                                       error_size));
+    RUN_CLIP_WORKSPACE_BLOCK_STEP("MLP residual",
+                                  uocr_metal_context_clip_residual_add_f16(ctx,
+                                                                           scratch->clip_block_residual1.f16,
+                                                                           scratch->clip_block_mlp.f16,
+                                                                           token_count,
+                                                                           output_type,
+                                                                           out,
+                                                                           error,
+                                                                           error_size));
+
+#undef RUN_CLIP_WORKSPACE_BLOCK_STEP
+
+    return 1;
+}
+
+static int metal_context_clip_transformer_workspace_f16(uocr_metal_context *ctx,
+                                                        const uint16_t *input_f16,
+                                                        const uocr_metal_clip_transformer_block_f16 *blocks,
+                                                        uint32_t block_count,
+                                                        uint32_t token_count,
+                                                        uocr_metal_dense_output_type output_type,
+                                                        void *out,
+                                                        uocr_metal_vision_workspace *scratch,
+                                                        char *error,
+                                                        size_t error_size) {
+    metal_clear_error(error, error_size);
+    if (ctx == NULL || input_f16 == NULL || blocks == NULL || out == NULL || scratch == NULL) {
+        return metal_fail(error, error_size, "invalid Metal CLIP workspace transformer request");
+    }
+    if (block_count != UOCR_CLIP_BLOCKS) {
+        return metal_fail(error, error_size, "invalid Metal CLIP workspace transformer block count %u", block_count);
+    }
+    if (token_count != UOCR_CLIP_GLOBAL_TOKENS && token_count != UOCR_CLIP_LOCAL_TOKENS) {
+        return metal_fail(error, error_size, "invalid Metal CLIP workspace transformer token count %u", token_count);
+    }
+    uint64_t hidden_bytes = 0u;
+    if (!metal_clip_transformer_activation_bytes(token_count, NULL, &hidden_bytes, error, error_size)) {
+        return 0;
+    }
+    if (!metal_vision_slice_has_bytes(scratch->clip_b, hidden_bytes) ||
+        !metal_vision_slice_has_bytes(scratch->clip_final, hidden_bytes)) {
+        return metal_fail(error, error_size, "Metal CLIP workspace transformer state scratch is too small");
+    }
+    for (uint32_t block_index = 0u; block_index < block_count; ++block_index) {
+        if (!metal_clip_transformer_block_has_weights(&blocks[block_index])) {
+            return metal_fail(error, error_size, "invalid Metal CLIP workspace transformer block %u weights", block_index);
+        }
+    }
+
+    const uint16_t *current_f16 = input_f16;
+    uint16_t *state_a_f16 = scratch->clip_b.f16;
+    uint16_t *state_b_f16 = scratch->clip_final.f16;
+    uint16_t *next_f16 = state_a_f16;
+    const uint64_t clip_blocks_start_ns = uocr_profile_now_ns();
+    for (uint32_t block_index = 0u; block_index < block_count; ++block_index) {
+        const uint64_t block_start_ns = uocr_profile_now_ns();
+        const int is_last = block_index + 1u == block_count;
+        const uocr_metal_dense_output_type block_output_type = is_last ? output_type : UOCR_METAL_DENSE_OUTPUT_F16;
+        void *block_out = is_last ? out : (void *)next_f16;
+        if (block_out == (const void *)current_f16) {
+            return metal_fail(error, error_size, "Metal CLIP workspace transformer attempted in-place block output");
+        }
+        if (!metal_context_clip_transformer_block_workspace_f16(ctx,
+                                                                current_f16,
+                                                                &blocks[block_index],
+                                                                token_count,
+                                                                block_output_type,
+                                                                block_out,
+                                                                scratch,
+                                                                error,
+                                                                error_size)) {
+            char detail[512];
+            metal_copy_error_detail(detail, sizeof(detail), error);
+            return metal_fail(error,
+                              error_size,
+                              "failed to compute Metal CLIP workspace transformer block %u: %s",
+                              block_index,
+                              detail);
+        }
+        if (!is_last) {
+            current_f16 = (const uint16_t *)block_out;
+            next_f16 = (block_out == (void *)state_a_f16) ? state_b_f16 : state_a_f16;
+        }
+        metal_profile_add_event_now(ctx, "metal.vision.clip_block", block_start_ns);
+        metal_profile_add_event_now_f(ctx, block_start_ns, "metal.vision.clip_block.%02u", block_index);
+    }
+    metal_profile_add_event_now(ctx, "metal.vision.clip_blocks", clip_blocks_start_ns);
+    metal_clear_error(error, error_size);
+    return 1;
 }
 
 int uocr_metal_context_clip_sam_concat_f16(uocr_metal_context *ctx,
@@ -13957,6 +14445,320 @@ cleanup_sam_transformer:
     return result;
 }
 
+static int metal_context_sam_transformer_block_workspace_f16(uocr_metal_context *ctx,
+                                                             const uint16_t *input_bhwc_f16,
+                                                             const uocr_metal_sam_transformer_block_f16 *block,
+                                                             uint32_t grid_w,
+                                                             uint32_t grid_h,
+                                                             int use_global_attention,
+                                                             uocr_metal_dense_output_type output_type,
+                                                             void *out_bhwc,
+                                                             uocr_metal_vision_workspace *scratch,
+                                                             char *error,
+                                                             size_t error_size) {
+    if (ctx == NULL || input_bhwc_f16 == NULL || !metal_sam_transformer_block_has_weights(block) || out_bhwc == NULL ||
+        scratch == NULL) {
+        return metal_fail(error, error_size, "invalid Metal SAM workspace transformer block request");
+    }
+
+    uint64_t row_count_u64 = 0u;
+    uint64_t hidden_bytes = 0u;
+    if (!metal_sam_transformer_activation_bytes(grid_w, grid_h, &row_count_u64, &hidden_bytes, error, error_size)) {
+        return 0;
+    }
+    const uint32_t row_count = (uint32_t)row_count_u64;
+
+    uint32_t n_windows = 1u;
+    uint32_t padded_w = grid_w;
+    uint32_t padded_h = grid_h;
+    uint64_t attention_rows_u64 = row_count_u64;
+    if (!use_global_attention) {
+        uint32_t windows_per_row = 0u;
+        uint32_t windows_per_col = 0u;
+        if (!sam_window_partition_geometry(grid_w,
+                                           grid_h,
+                                           &padded_w,
+                                           &padded_h,
+                                           &windows_per_row,
+                                           &windows_per_col,
+                                           &n_windows)) {
+            return metal_fail(error, error_size, "invalid Metal SAM workspace transformer window grid %ux%u", grid_w, grid_h);
+        }
+        if (!checked_mul_u64((uint64_t)n_windows, (uint64_t)UOCR_SAM_WINDOW_TOKENS, &attention_rows_u64)) {
+            return metal_fail(error, error_size, "Metal SAM workspace transformer window row-count overflow");
+        }
+    }
+    uint64_t attention_values = 0u;
+    uint64_t attention_bytes = 0u;
+    if (!checked_mul_u64(attention_rows_u64, (uint64_t)UOCR_SAM_HIDDEN_SIZE, &attention_values) ||
+        !checked_mul_u64(attention_values, 2u, &attention_bytes) || attention_rows_u64 > (uint64_t)UINT32_MAX) {
+        return metal_fail(error, error_size, "Metal SAM workspace transformer attention byte-size overflow");
+    }
+    const uint32_t attention_rows = (uint32_t)attention_rows_u64;
+    if (!metal_vision_slice_has_bytes(scratch->sam_block_norm1_bhwc, hidden_bytes) ||
+        !metal_vision_slice_has_bytes(scratch->sam_block_window_tokens, attention_bytes) ||
+        !metal_vision_slice_has_bytes(scratch->sam_block_q, attention_bytes) ||
+        !metal_vision_slice_has_bytes(scratch->sam_block_k, attention_bytes) ||
+        !metal_vision_slice_has_bytes(scratch->sam_block_v, attention_bytes) ||
+        !metal_vision_slice_has_bytes(scratch->sam_block_attention, attention_bytes) ||
+        !metal_vision_slice_has_bytes(scratch->sam_block_projected_windows, attention_bytes) ||
+        !metal_vision_slice_has_bytes(scratch->sam_block_attention_bhwc, hidden_bytes) ||
+        !metal_vision_slice_has_bytes(scratch->sam_block_residual1_bhwc, hidden_bytes) ||
+        !metal_vision_slice_has_bytes(scratch->sam_block_norm2_bhwc, hidden_bytes) ||
+        !metal_vision_slice_has_bytes(scratch->sam_block_mlp_bhwc, hidden_bytes)) {
+        return metal_fail(error, error_size, "Metal SAM workspace transformer block scratch is too small");
+    }
+
+#define RUN_SAM_WORKSPACE_BLOCK_STEP(step_name, call_expr)                                              \
+    do {                                                                                                \
+        if (!(call_expr)) {                                                                             \
+            char detail[512];                                                                           \
+            metal_copy_error_detail(detail, sizeof(detail), error);                                      \
+            return metal_fail(error, error_size, "failed to compute Metal SAM workspace block %s: %s", step_name, detail); \
+        }                                                                                               \
+    } while (0)
+
+    RUN_SAM_WORKSPACE_BLOCK_STEP("LayerNorm1",
+                                 uocr_metal_context_sam_layernorm_f16(ctx,
+                                                                       input_bhwc_f16,
+                                                                       block->norm1_weight_f16,
+                                                                       block->norm1_bias_f16,
+                                                                       row_count,
+                                                                       UOCR_METAL_LAYERNORM_OUTPUT_F16,
+                                                                       scratch->sam_block_norm1_bhwc.f16,
+                                                                       error,
+                                                                       error_size));
+
+    if (use_global_attention) {
+        RUN_SAM_WORKSPACE_BLOCK_STEP("QKV",
+                                     uocr_metal_context_sam_qkv_f16(ctx,
+                                                                     scratch->sam_block_norm1_bhwc.f16,
+                                                                     block->qkv_weight_f16,
+                                                                     block->qkv_bias_f16,
+                                                                     row_count,
+                                                                     UOCR_METAL_DENSE_OUTPUT_F16,
+                                                                     scratch->sam_block_q.f16,
+                                                                     scratch->sam_block_k.f16,
+                                                                     scratch->sam_block_v.f16,
+                                                                     error,
+                                                                     error_size));
+        RUN_SAM_WORKSPACE_BLOCK_STEP("relative-position attention",
+                                     uocr_metal_context_sam_rel_pos_attention_f16(ctx,
+                                                                                  scratch->sam_block_q.f16,
+                                                                                  scratch->sam_block_k.f16,
+                                                                                  scratch->sam_block_v.f16,
+                                                                                  block->rel_pos_h_f16,
+                                                                                  block->rel_pos_w_f16,
+                                                                                  1u,
+                                                                                  grid_w,
+                                                                                  grid_h,
+                                                                                  block->rel_pos_h_length,
+                                                                                  block->rel_pos_w_length,
+                                                                                  UOCR_METAL_DENSE_OUTPUT_F16,
+                                                                                  scratch->sam_block_attention.f16,
+                                                                                  error,
+                                                                                  error_size));
+        RUN_SAM_WORKSPACE_BLOCK_STEP("attention projection residual",
+                                     uocr_metal_context_sam_attention_project_residual_f16(ctx,
+                                                                                           scratch->sam_block_attention.f16,
+                                                                                           block->proj_weight_f16,
+                                                                                           block->proj_bias_f16,
+                                                                                           input_bhwc_f16,
+                                                                                           row_count,
+                                                                                           UOCR_METAL_DENSE_OUTPUT_F16,
+                                                                                           scratch->sam_block_residual1_bhwc.f16,
+                                                                                           error,
+                                                                                           error_size));
+    } else {
+        uint32_t actual_windows = 0u;
+        uint32_t actual_padded_w = 0u;
+        uint32_t actual_padded_h = 0u;
+        RUN_SAM_WORKSPACE_BLOCK_STEP("window partition",
+                                     uocr_metal_context_sam_window_partition_f16(ctx,
+                                                                                 scratch->sam_block_norm1_bhwc.f16,
+                                                                                 grid_w,
+                                                                                 grid_h,
+                                                                                 scratch->sam_block_window_tokens.f16,
+                                                                                 &actual_windows,
+                                                                                 &actual_padded_w,
+                                                                                 &actual_padded_h,
+                                                                                 error,
+                                                                                 error_size));
+        if (actual_windows != n_windows || actual_padded_w != padded_w || actual_padded_h != padded_h) {
+            return metal_fail(error, error_size, "Metal SAM workspace window geometry changed during partition");
+        }
+        RUN_SAM_WORKSPACE_BLOCK_STEP("window QKV",
+                                     uocr_metal_context_sam_qkv_f16(ctx,
+                                                                     scratch->sam_block_window_tokens.f16,
+                                                                     block->qkv_weight_f16,
+                                                                     block->qkv_bias_f16,
+                                                                     attention_rows,
+                                                                     UOCR_METAL_DENSE_OUTPUT_F16,
+                                                                     scratch->sam_block_q.f16,
+                                                                     scratch->sam_block_k.f16,
+                                                                     scratch->sam_block_v.f16,
+                                                                     error,
+                                                                     error_size));
+        RUN_SAM_WORKSPACE_BLOCK_STEP("window relative-position attention",
+                                     uocr_metal_context_sam_rel_pos_attention_f16(ctx,
+                                                                                  scratch->sam_block_q.f16,
+                                                                                  scratch->sam_block_k.f16,
+                                                                                  scratch->sam_block_v.f16,
+                                                                                  block->rel_pos_h_f16,
+                                                                                  block->rel_pos_w_f16,
+                                                                                  n_windows,
+                                                                                  UOCR_SAM_WINDOW_SIZE,
+                                                                                  UOCR_SAM_WINDOW_SIZE,
+                                                                                  block->rel_pos_h_length,
+                                                                                  block->rel_pos_w_length,
+                                                                                  UOCR_METAL_DENSE_OUTPUT_F16,
+                                                                                  scratch->sam_block_attention.f16,
+                                                                                  error,
+                                                                                  error_size));
+        RUN_SAM_WORKSPACE_BLOCK_STEP("window output projection",
+                                     uocr_metal_context_dense_f16(ctx,
+                                                                  scratch->sam_block_attention.f16,
+                                                                  block->proj_weight_f16,
+                                                                  block->proj_bias_f16,
+                                                                  attention_rows,
+                                                                  UOCR_SAM_HIDDEN_SIZE,
+                                                                  UOCR_SAM_HIDDEN_SIZE,
+                                                                  UOCR_METAL_DENSE_OUTPUT_F16,
+                                                                  scratch->sam_block_projected_windows.f16,
+                                                                  error,
+                                                                  error_size));
+        RUN_SAM_WORKSPACE_BLOCK_STEP("window unpartition",
+                                     uocr_metal_context_sam_window_unpartition_f16(ctx,
+                                                                                   scratch->sam_block_projected_windows.f16,
+                                                                                   grid_w,
+                                                                                   grid_h,
+                                                                                   scratch->sam_block_attention_bhwc.f16,
+                                                                                   error,
+                                                                                   error_size));
+        RUN_SAM_WORKSPACE_BLOCK_STEP("attention residual",
+                                     uocr_metal_context_sam_residual_add_f16(ctx,
+                                                                             input_bhwc_f16,
+                                                                             scratch->sam_block_attention_bhwc.f16,
+                                                                             row_count,
+                                                                             UOCR_METAL_DENSE_OUTPUT_F16,
+                                                                             scratch->sam_block_residual1_bhwc.f16,
+                                                                             error,
+                                                                             error_size));
+    }
+
+    RUN_SAM_WORKSPACE_BLOCK_STEP("LayerNorm2",
+                                 uocr_metal_context_sam_layernorm_f16(ctx,
+                                                                       scratch->sam_block_residual1_bhwc.f16,
+                                                                       block->norm2_weight_f16,
+                                                                       block->norm2_bias_f16,
+                                                                       row_count,
+                                                                       UOCR_METAL_LAYERNORM_OUTPUT_F16,
+                                                                       scratch->sam_block_norm2_bhwc.f16,
+                                                                       error,
+                                                                       error_size));
+    RUN_SAM_WORKSPACE_BLOCK_STEP("MLP",
+                                 uocr_metal_context_sam_mlp_f16(ctx,
+                                                                 scratch->sam_block_norm2_bhwc.f16,
+                                                                 block->mlp_lin1_weight_f16,
+                                                                 block->mlp_lin1_bias_f16,
+                                                                 block->mlp_lin2_weight_f16,
+                                                                 block->mlp_lin2_bias_f16,
+                                                                 row_count,
+                                                                 UOCR_METAL_DENSE_OUTPUT_F16,
+                                                                 scratch->sam_block_mlp_bhwc.f16,
+                                                                 error,
+                                                                 error_size));
+    RUN_SAM_WORKSPACE_BLOCK_STEP("MLP residual",
+                                 uocr_metal_context_sam_residual_add_f16(ctx,
+                                                                          scratch->sam_block_residual1_bhwc.f16,
+                                                                          scratch->sam_block_mlp_bhwc.f16,
+                                                                          row_count,
+                                                                          output_type,
+                                                                          out_bhwc,
+                                                                          error,
+                                                                          error_size));
+
+#undef RUN_SAM_WORKSPACE_BLOCK_STEP
+
+    return 1;
+}
+
+static int metal_context_sam_transformer_workspace_f16(uocr_metal_context *ctx,
+                                                       const uint16_t *input_bhwc_f16,
+                                                       const uocr_metal_sam_transformer_block_f16 *blocks,
+                                                       uint32_t block_count,
+                                                       uint32_t grid_w,
+                                                       uint32_t grid_h,
+                                                       uocr_metal_dense_output_type output_type,
+                                                       void *out_bhwc,
+                                                       uocr_metal_vision_workspace *scratch,
+                                                       char *error,
+                                                       size_t error_size) {
+    metal_clear_error(error, error_size);
+    if (ctx == NULL || input_bhwc_f16 == NULL || blocks == NULL || out_bhwc == NULL || scratch == NULL) {
+        return metal_fail(error, error_size, "invalid Metal SAM workspace transformer request");
+    }
+    if (block_count != UOCR_SAM_BLOCKS) {
+        return metal_fail(error, error_size, "invalid Metal SAM workspace transformer block count %u", block_count);
+    }
+    uint64_t hidden_bytes = 0u;
+    if (!metal_sam_transformer_activation_bytes(grid_w, grid_h, NULL, &hidden_bytes, error, error_size)) {
+        return 0;
+    }
+    if (!metal_vision_slice_has_bytes(scratch->sam_patch_bhwc, hidden_bytes) ||
+        !metal_vision_slice_has_bytes(scratch->sam_transformer_bhwc, hidden_bytes)) {
+        return metal_fail(error, error_size, "Metal SAM workspace transformer state scratch is too small");
+    }
+    for (uint32_t block_index = 0u; block_index < block_count; ++block_index) {
+        if (!metal_sam_transformer_block_has_weights(&blocks[block_index])) {
+            return metal_fail(error, error_size, "invalid Metal SAM workspace transformer block %u weights", block_index);
+        }
+    }
+
+    const uint16_t *current_f16 = input_bhwc_f16;
+    uint16_t *state_a_f16 = scratch->sam_patch_bhwc.f16;
+    uint16_t *state_b_f16 = scratch->sam_transformer_bhwc.f16;
+    uint16_t *next_f16 = state_a_f16;
+    const uint64_t sam_blocks_start_ns = uocr_profile_now_ns();
+    for (uint32_t block_index = 0u; block_index < block_count; ++block_index) {
+        const uint64_t block_start_ns = uocr_profile_now_ns();
+        const int is_last = block_index + 1u == block_count;
+        const uocr_metal_dense_output_type block_output_type = is_last ? output_type : UOCR_METAL_DENSE_OUTPUT_F16;
+        void *block_out = is_last ? out_bhwc : (void *)next_f16;
+        if (block_out == (const void *)current_f16) {
+            return metal_fail(error, error_size, "Metal SAM workspace transformer attempted in-place block output");
+        }
+        if (!metal_context_sam_transformer_block_workspace_f16(ctx,
+                                                               current_f16,
+                                                               &blocks[block_index],
+                                                               grid_w,
+                                                               grid_h,
+                                                               uocr_sam_block_uses_global_attention(block_index),
+                                                               block_output_type,
+                                                               block_out,
+                                                               scratch,
+                                                               error,
+                                                               error_size)) {
+            char detail[512];
+            metal_copy_error_detail(detail, sizeof(detail), error);
+            return metal_fail(error,
+                              error_size,
+                              "failed to compute Metal SAM workspace transformer block %u: %s",
+                              block_index,
+                              detail);
+        }
+        if (!is_last) {
+            current_f16 = (const uint16_t *)block_out;
+            next_f16 = (block_out == (void *)state_a_f16) ? state_b_f16 : state_a_f16;
+        }
+        metal_profile_add_event_now(ctx, "metal.vision.sam_block", block_start_ns);
+        metal_profile_add_event_now_f(ctx, block_start_ns, "metal.vision.sam_block.%02u", block_index);
+    }
+    metal_profile_add_event_now(ctx, "metal.vision.sam_blocks", sam_blocks_start_ns);
+    metal_clear_error(error, error_size);
+    return 1;
+}
+
 static int metal_context_sam_attention_f16(uocr_metal_context *ctx,
                                            const uint16_t *q_f16,
                                            const uint16_t *k_f16,
@@ -14002,20 +14804,35 @@ static int metal_context_sam_attention_f16(uocr_metal_context *ctx,
             return 0;
         }
 
-        id<MTLBuffer> q_src = metal_new_buffer_with_bytes(ctx, q_f16, (NSUInteger)input_bytes, MTLResourceStorageModeShared);
+        NSUInteger q_offset = 0u;
+        id<MTLBuffer> q_src = metal_new_or_retain_vision_buffer_with_bytes(ctx,
+                                                                           q_f16,
+                                                                           (NSUInteger)input_bytes,
+                                                                           MTLResourceStorageModeShared,
+                                                                           &q_offset);
         if (q_src == nil) {
             return metal_fail(error, error_size, "failed to allocate %s Q buffer", diagnostic_name);
         }
         q_src.label = @"uocr_sam_attention_q_f16";
 
-        id<MTLBuffer> k_src = metal_new_buffer_with_bytes(ctx, k_f16, (NSUInteger)input_bytes, MTLResourceStorageModeShared);
+        NSUInteger k_offset = 0u;
+        id<MTLBuffer> k_src = metal_new_or_retain_vision_buffer_with_bytes(ctx,
+                                                                           k_f16,
+                                                                           (NSUInteger)input_bytes,
+                                                                           MTLResourceStorageModeShared,
+                                                                           &k_offset);
         if (k_src == nil) {
             [q_src release];
             return metal_fail(error, error_size, "failed to allocate %s K buffer", diagnostic_name);
         }
         k_src.label = @"uocr_sam_attention_k_f16";
 
-        id<MTLBuffer> v_src = metal_new_buffer_with_bytes(ctx, v_f16, (NSUInteger)input_bytes, MTLResourceStorageModeShared);
+        NSUInteger v_offset = 0u;
+        id<MTLBuffer> v_src = metal_new_or_retain_vision_buffer_with_bytes(ctx,
+                                                                           v_f16,
+                                                                           (NSUInteger)input_bytes,
+                                                                           MTLResourceStorageModeShared,
+                                                                           &v_offset);
         if (v_src == nil) {
             [k_src release];
             [q_src release];
@@ -14023,7 +14840,14 @@ static int metal_context_sam_attention_f16(uocr_metal_context *ctx,
         }
         v_src.label = @"uocr_sam_attention_v_f16";
 
-        id<MTLBuffer> dst = metal_new_buffer_with_length(ctx, (NSUInteger)output_bytes, MTLResourceStorageModeShared);
+        NSUInteger dst_offset = 0u;
+        int dst_needs_copy = 1;
+        id<MTLBuffer> dst = metal_new_or_retain_vision_output_buffer(ctx,
+                                                                     out,
+                                                                     (NSUInteger)output_bytes,
+                                                                     MTLResourceStorageModeShared,
+                                                                     &dst_offset,
+                                                                     &dst_needs_copy);
         if (dst == nil) {
             [v_src release];
             [k_src release];
@@ -14031,7 +14855,7 @@ static int metal_context_sam_attention_f16(uocr_metal_context *ctx,
             return metal_fail(error, error_size, "failed to allocate %s output buffer", diagnostic_name);
         }
         dst.label = @"uocr_sam_attention_output";
-        memset([dst contents], 0, (size_t)output_bytes);
+        metal_zero_buffer_range(dst, dst_offset, (NSUInteger)output_bytes);
 
         id<MTLCommandBuffer> cb = metal_new_command_buffer(ctx);
         if (cb == nil) {
@@ -14073,10 +14897,10 @@ static int metal_context_sam_attention_f16(uocr_metal_context *ctx,
         }
 
         [enc setComputePipelineState:pipeline];
-        [enc setBuffer:q_src offset:0u atIndex:0u];
-        [enc setBuffer:k_src offset:0u atIndex:1u];
-        [enc setBuffer:v_src offset:0u atIndex:2u];
-        [enc setBuffer:dst offset:0u atIndex:3u];
+        [enc setBuffer:q_src offset:q_offset atIndex:0u];
+        [enc setBuffer:k_src offset:k_offset atIndex:1u];
+        [enc setBuffer:v_src offset:v_offset atIndex:2u];
+        [enc setBuffer:dst offset:dst_offset atIndex:3u];
         [enc setBytes:&params length:sizeof(params) atIndex:4u];
         [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)UOCR_SAM_ATTENTION_HEADS, query_blocks, (NSUInteger)windows)
              threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1u, 1u)];
@@ -14092,7 +14916,7 @@ static int metal_context_sam_attention_f16(uocr_metal_context *ctx,
             return metal_fail(error, error_size, "%s command failed: %s", diagnostic_name, [description UTF8String]);
         }
 
-        memcpy(out, [dst contents], (size_t)output_bytes);
+        metal_copy_buffer_range_to_host_if_needed(out, dst, dst_offset, (NSUInteger)output_bytes, dst_needs_copy);
         [dst release];
         [v_src release];
         [k_src release];
@@ -14276,20 +15100,35 @@ int uocr_metal_context_sam_rel_pos_attention_f16(uocr_metal_context *ctx,
             return 0;
         }
 
-        id<MTLBuffer> q_src = metal_new_buffer_with_bytes(ctx, q_f16, (NSUInteger)input_bytes, MTLResourceStorageModeShared);
+        NSUInteger q_offset = 0u;
+        id<MTLBuffer> q_src = metal_new_or_retain_vision_buffer_with_bytes(ctx,
+                                                                           q_f16,
+                                                                           (NSUInteger)input_bytes,
+                                                                           MTLResourceStorageModeShared,
+                                                                           &q_offset);
         if (q_src == nil) {
             return metal_fail(error, error_size, "failed to allocate Metal SAM relative-position attention Q buffer");
         }
         q_src.label = @"uocr_sam_rel_pos_attention_q_f16";
 
-        id<MTLBuffer> k_src = metal_new_buffer_with_bytes(ctx, k_f16, (NSUInteger)input_bytes, MTLResourceStorageModeShared);
+        NSUInteger k_offset = 0u;
+        id<MTLBuffer> k_src = metal_new_or_retain_vision_buffer_with_bytes(ctx,
+                                                                           k_f16,
+                                                                           (NSUInteger)input_bytes,
+                                                                           MTLResourceStorageModeShared,
+                                                                           &k_offset);
         if (k_src == nil) {
             [q_src release];
             return metal_fail(error, error_size, "failed to allocate Metal SAM relative-position attention K buffer");
         }
         k_src.label = @"uocr_sam_rel_pos_attention_k_f16";
 
-        id<MTLBuffer> v_src = metal_new_buffer_with_bytes(ctx, v_f16, (NSUInteger)input_bytes, MTLResourceStorageModeShared);
+        NSUInteger v_offset = 0u;
+        id<MTLBuffer> v_src = metal_new_or_retain_vision_buffer_with_bytes(ctx,
+                                                                           v_f16,
+                                                                           (NSUInteger)input_bytes,
+                                                                           MTLResourceStorageModeShared,
+                                                                           &v_offset);
         if (v_src == nil) {
             [k_src release];
             [q_src release];
@@ -14326,7 +15165,14 @@ int uocr_metal_context_sam_rel_pos_attention_f16(uocr_metal_context *ctx,
         }
         rel_w.label = @"uocr_sam_rel_pos_w_f16";
 
-        id<MTLBuffer> dst = metal_new_buffer_with_length(ctx, (NSUInteger)output_bytes, MTLResourceStorageModeShared);
+        NSUInteger dst_offset = 0u;
+        int dst_needs_copy = 1;
+        id<MTLBuffer> dst = metal_new_or_retain_vision_output_buffer(ctx,
+                                                                     out,
+                                                                     (NSUInteger)output_bytes,
+                                                                     MTLResourceStorageModeShared,
+                                                                     &dst_offset,
+                                                                     &dst_needs_copy);
         if (dst == nil) {
             [rel_w release];
             [rel_h release];
@@ -14336,7 +15182,7 @@ int uocr_metal_context_sam_rel_pos_attention_f16(uocr_metal_context *ctx,
             return metal_fail(error, error_size, "failed to allocate Metal SAM relative-position attention output buffer");
         }
         dst.label = @"uocr_sam_rel_pos_attention_output";
-        memset([dst contents], 0, (size_t)output_bytes);
+        metal_zero_buffer_range(dst, dst_offset, (NSUInteger)output_bytes);
 
         id<MTLCommandBuffer> cb = metal_new_command_buffer(ctx);
         if (cb == nil) {
@@ -14388,12 +15234,12 @@ int uocr_metal_context_sam_rel_pos_attention_f16(uocr_metal_context *ctx,
         }
 
         [enc setComputePipelineState:pipeline];
-        [enc setBuffer:q_src offset:0u atIndex:0u];
-        [enc setBuffer:k_src offset:0u atIndex:1u];
-        [enc setBuffer:v_src offset:0u atIndex:2u];
+        [enc setBuffer:q_src offset:q_offset atIndex:0u];
+        [enc setBuffer:k_src offset:k_offset atIndex:1u];
+        [enc setBuffer:v_src offset:v_offset atIndex:2u];
         [enc setBuffer:rel_h offset:rel_h_offset atIndex:3u];
         [enc setBuffer:rel_w offset:rel_w_offset atIndex:4u];
-        [enc setBuffer:dst offset:0u atIndex:5u];
+        [enc setBuffer:dst offset:dst_offset atIndex:5u];
         [enc setBytes:&params length:sizeof(params) atIndex:6u];
         [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)UOCR_SAM_ATTENTION_HEADS, query_blocks, (NSUInteger)n_windows)
              threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1u, 1u)];
@@ -14414,7 +15260,7 @@ int uocr_metal_context_sam_rel_pos_attention_f16(uocr_metal_context *ctx,
                               [description UTF8String]);
         }
 
-        memcpy(out, [dst contents], (size_t)output_bytes);
+        metal_copy_buffer_range_to_host_if_needed(out, dst, dst_offset, (NSUInteger)output_bytes, dst_needs_copy);
         [dst release];
         [rel_w release];
         [rel_h release];
@@ -14478,27 +15324,44 @@ int uocr_metal_context_sam_residual_add_f16(uocr_metal_context *ctx,
         id<MTLCommandBuffer> cb = nil;
         id<MTLComputeCommandEncoder> enc = nil;
 
-        base = metal_new_buffer_with_bytes(ctx, base_f16, (NSUInteger)input_bytes, MTLResourceStorageModeShared);
+        NSUInteger base_offset = 0u;
+        base = metal_new_or_retain_vision_buffer_with_bytes(ctx,
+                                                            base_f16,
+                                                            (NSUInteger)input_bytes,
+                                                            MTLResourceStorageModeShared,
+                                                            &base_offset);
         if (base == nil) {
             result = metal_fail(error, error_size, "failed to allocate Metal SAM residual base buffer");
             goto cleanup_residual_add;
         }
         base.label = @"uocr_sam_residual_base_f16";
 
-        update = metal_new_buffer_with_bytes(ctx, update_f16, (NSUInteger)input_bytes, MTLResourceStorageModeShared);
+        NSUInteger update_offset = 0u;
+        update = metal_new_or_retain_vision_buffer_with_bytes(ctx,
+                                                              update_f16,
+                                                              (NSUInteger)input_bytes,
+                                                              MTLResourceStorageModeShared,
+                                                              &update_offset);
         if (update == nil) {
             result = metal_fail(error, error_size, "failed to allocate Metal SAM residual update buffer");
             goto cleanup_residual_add;
         }
         update.label = @"uocr_sam_residual_update_f16";
 
-        dst = metal_new_buffer_with_length(ctx, (NSUInteger)output_bytes, MTLResourceStorageModeShared);
+        NSUInteger dst_offset = 0u;
+        int dst_needs_copy = 1;
+        dst = metal_new_or_retain_vision_output_buffer(ctx,
+                                                       out,
+                                                       (NSUInteger)output_bytes,
+                                                       MTLResourceStorageModeShared,
+                                                       &dst_offset,
+                                                       &dst_needs_copy);
         if (dst == nil) {
             result = metal_fail(error, error_size, "failed to allocate Metal SAM residual output buffer");
             goto cleanup_residual_add;
         }
         dst.label = @"uocr_sam_residual_output";
-        memset([dst contents], 0, (size_t)output_bytes);
+        metal_zero_buffer_range(dst, dst_offset, (NSUInteger)output_bytes);
 
         cb = metal_new_command_buffer(ctx);
         if (cb == nil) {
@@ -14521,9 +15384,9 @@ int uocr_metal_context_sam_residual_add_f16(uocr_metal_context *ctx,
 
         const NSUInteger threads_per_group = metal_power2_threadgroup_width(256u, pipeline.maxTotalThreadsPerThreadgroup);
         [enc setComputePipelineState:pipeline];
-        [enc setBuffer:base offset:0u atIndex:0u];
-        [enc setBuffer:update offset:0u atIndex:1u];
-        [enc setBuffer:dst offset:0u atIndex:2u];
+        [enc setBuffer:base offset:base_offset atIndex:0u];
+        [enc setBuffer:update offset:update_offset atIndex:1u];
+        [enc setBuffer:dst offset:dst_offset atIndex:2u];
         [enc setBytes:&params length:sizeof(params) atIndex:3u];
         [enc dispatchThreads:MTLSizeMake((NSUInteger)value_count, 1u, 1u)
              threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1u, 1u)];
@@ -14536,7 +15399,7 @@ int uocr_metal_context_sam_residual_add_f16(uocr_metal_context *ctx,
             goto cleanup_residual_add;
         }
 
-        memcpy(out, [dst contents], (size_t)output_bytes);
+        metal_copy_buffer_range_to_host_if_needed(out, dst, dst_offset, (NSUInteger)output_bytes, dst_needs_copy);
         result = 1;
 
     cleanup_residual_add:
@@ -14618,7 +15481,12 @@ int uocr_metal_context_sam_attention_project_residual_f16(uocr_metal_context *ct
         id<MTLCommandBuffer> cb = nil;
         id<MTLComputeCommandEncoder> enc = nil;
 
-        src = metal_new_buffer_with_bytes(ctx, attention_context_f16, (NSUInteger)activation_bytes, MTLResourceStorageModeShared);
+        NSUInteger src_offset = 0u;
+        src = metal_new_or_retain_vision_buffer_with_bytes(ctx,
+                                                           attention_context_f16,
+                                                           (NSUInteger)activation_bytes,
+                                                           MTLResourceStorageModeShared,
+                                                           &src_offset);
         if (src == nil) {
             result = metal_fail(error, error_size, "failed to allocate Metal SAM attention residual context buffer");
             goto cleanup_attention_residual;
@@ -14649,20 +15517,32 @@ int uocr_metal_context_sam_attention_project_residual_f16(uocr_metal_context *ct
         }
         bias.label = @"uocr_sam_attention_project_bias_f16";
 
-        residual = metal_new_buffer_with_bytes(ctx, residual_f16, (NSUInteger)activation_bytes, MTLResourceStorageModeShared);
+        NSUInteger residual_offset = 0u;
+        residual = metal_new_or_retain_vision_buffer_with_bytes(ctx,
+                                                                residual_f16,
+                                                                (NSUInteger)activation_bytes,
+                                                                MTLResourceStorageModeShared,
+                                                                &residual_offset);
         if (residual == nil) {
             result = metal_fail(error, error_size, "failed to allocate Metal SAM attention residual shortcut buffer");
             goto cleanup_attention_residual;
         }
         residual.label = @"uocr_sam_attention_project_residual_f16";
 
-        dst = metal_new_buffer_with_length(ctx, (NSUInteger)output_bytes, MTLResourceStorageModeShared);
+        NSUInteger dst_offset = 0u;
+        int dst_needs_copy = 1;
+        dst = metal_new_or_retain_vision_output_buffer(ctx,
+                                                       out,
+                                                       (NSUInteger)output_bytes,
+                                                       MTLResourceStorageModeShared,
+                                                       &dst_offset,
+                                                       &dst_needs_copy);
         if (dst == nil) {
             result = metal_fail(error, error_size, "failed to allocate Metal SAM attention residual output buffer");
             goto cleanup_attention_residual;
         }
         dst.label = @"uocr_sam_attention_project_residual_output";
-        memset([dst contents], 0, (size_t)output_bytes);
+        metal_zero_buffer_range(dst, dst_offset, (NSUInteger)output_bytes);
 
         cb = metal_new_command_buffer(ctx);
         if (cb == nil) {
@@ -14685,11 +15565,11 @@ int uocr_metal_context_sam_attention_project_residual_f16(uocr_metal_context *ct
 
         const NSUInteger threads_per_group = metal_power2_threadgroup_width(256u, pipeline.maxTotalThreadsPerThreadgroup);
         [enc setComputePipelineState:pipeline];
-        [enc setBuffer:src offset:0u atIndex:0u];
+        [enc setBuffer:src offset:src_offset atIndex:0u];
         [enc setBuffer:weight offset:weight_offset atIndex:1u];
         [enc setBuffer:bias offset:bias_offset atIndex:2u];
-        [enc setBuffer:residual offset:0u atIndex:3u];
-        [enc setBuffer:dst offset:0u atIndex:4u];
+        [enc setBuffer:residual offset:residual_offset atIndex:3u];
+        [enc setBuffer:dst offset:dst_offset atIndex:4u];
         [enc setBytes:&params length:sizeof(params) atIndex:5u];
         [enc setThreadgroupMemoryLength:threads_per_group * sizeof(float) atIndex:0u];
         [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)activation_values, 1u, 1u)
@@ -14706,7 +15586,7 @@ int uocr_metal_context_sam_attention_project_residual_f16(uocr_metal_context *ct
             goto cleanup_attention_residual;
         }
 
-        memcpy(out, [dst contents], (size_t)output_bytes);
+        metal_copy_buffer_range_to_host_if_needed(out, dst, dst_offset, (NSUInteger)output_bytes, dst_needs_copy);
         result = 1;
 
     cleanup_attention_residual:
@@ -14798,7 +15678,12 @@ int uocr_metal_context_sam_mlp_f16(uocr_metal_context *ctx,
             return 0;
         }
 
-        id<MTLBuffer> input = metal_new_buffer_with_bytes(ctx, input_f16, (NSUInteger)input_bytes, MTLResourceStorageModeShared);
+        NSUInteger input_offset = 0u;
+        id<MTLBuffer> input = metal_new_or_retain_vision_buffer_with_bytes(ctx,
+                                                                           input_f16,
+                                                                           (NSUInteger)input_bytes,
+                                                                           MTLResourceStorageModeShared,
+                                                                           &input_offset);
         if (input == nil) {
             return metal_fail(error, error_size, "failed to allocate Metal SAM MLP input buffer");
         }
@@ -14870,7 +15755,14 @@ int uocr_metal_context_sam_mlp_f16(uocr_metal_context *ctx,
         mid.label = @"uocr_sam_mlp_mid_f16";
         memset([mid contents], 0, (size_t)intermediate_bytes);
 
-        id<MTLBuffer> dst = metal_new_buffer_with_length(ctx, (NSUInteger)output_bytes, MTLResourceStorageModeShared);
+        NSUInteger dst_offset = 0u;
+        int dst_needs_copy = 1;
+        id<MTLBuffer> dst = metal_new_or_retain_vision_output_buffer(ctx,
+                                                                     out,
+                                                                     (NSUInteger)output_bytes,
+                                                                     MTLResourceStorageModeShared,
+                                                                     &dst_offset,
+                                                                     &dst_needs_copy);
         if (dst == nil) {
             [mid release];
             [lin2_bias release];
@@ -14881,7 +15773,7 @@ int uocr_metal_context_sam_mlp_f16(uocr_metal_context *ctx,
             return metal_fail(error, error_size, "failed to allocate Metal SAM MLP output buffer");
         }
         dst.label = @"uocr_sam_mlp_output";
-        memset([dst contents], 0, (size_t)output_bytes);
+        metal_zero_buffer_range(dst, dst_offset, (NSUInteger)output_bytes);
 
         id<MTLCommandBuffer> cb = metal_new_command_buffer(ctx);
         if (cb == nil) {
@@ -14915,7 +15807,7 @@ int uocr_metal_context_sam_mlp_f16(uocr_metal_context *ctx,
         }
         const NSUInteger lin1_threads = metal_power2_threadgroup_width(256u, lin1_pipeline.maxTotalThreadsPerThreadgroup);
         [enc setComputePipelineState:lin1_pipeline];
-        [enc setBuffer:input offset:0u atIndex:0u];
+        [enc setBuffer:input offset:input_offset atIndex:0u];
         [enc setBuffer:lin1_weight offset:lin1_weight_offset atIndex:1u];
         [enc setBuffer:lin1_bias offset:lin1_bias_offset atIndex:2u];
         [enc setBuffer:mid offset:0u atIndex:3u];
@@ -14941,7 +15833,7 @@ int uocr_metal_context_sam_mlp_f16(uocr_metal_context *ctx,
         [enc setBuffer:mid offset:0u atIndex:0u];
         [enc setBuffer:lin2_weight offset:lin2_weight_offset atIndex:1u];
         [enc setBuffer:lin2_bias offset:lin2_bias_offset atIndex:2u];
-        [enc setBuffer:dst offset:0u atIndex:3u];
+        [enc setBuffer:dst offset:dst_offset atIndex:3u];
         [enc setBytes:&params length:sizeof(params) atIndex:4u];
         [enc setThreadgroupMemoryLength:lin2_threads * sizeof(float) atIndex:0u];
         [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)input_values, 1u, 1u)
@@ -14961,7 +15853,7 @@ int uocr_metal_context_sam_mlp_f16(uocr_metal_context *ctx,
             return metal_fail(error, error_size, "Metal SAM MLP command failed: %s", [description UTF8String]);
         }
 
-        memcpy(out, [dst contents], (size_t)output_bytes);
+        metal_copy_buffer_range_to_host_if_needed(out, dst, dst_offset, (NSUInteger)output_bytes, dst_needs_copy);
         [dst release];
         [mid release];
         [lin2_bias release];
