@@ -130,7 +130,8 @@ if(UOCR_METAL_ENABLED)
     target_link_libraries(uocr_metal
         PUBLIC
             "-framework Foundation"
-            "-framework Metal")
+            "-framework Metal"
+            "-framework MetalPerformanceShaders")
     set_target_properties(uocr_metal PROPERTIES POSITION_INDEPENDENT_CODE ON)
     uocr_apply_common_warnings(uocr_metal)
     uocr_apply_sanitizers(uocr_metal)
