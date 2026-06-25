@@ -4026,6 +4026,16 @@ static void metal_decoder_result_reset(uocr_metal_decoder_result_f16 *result) {
     result->reserved0 = 0u;
 }
 
+static void metal_integrated_decoder_state_reset(uocr_metal_context *ctx, uint32_t slot) {
+    if (ctx == NULL) {
+        return;
+    }
+    ctx->has_integrated_prefill = 0;
+    ctx->integrated_prefill_slot = slot;
+    ctx->integrated_prefill_tokens = 0u;
+    ctx->integrated_prefill_final_segment = 0u;
+}
+
 static int metal_decoder_runtime_arenas_ready(const uocr_metal_context *ctx) {
     if (ctx == NULL || !ctx->has_kv_cache_layout) {
         return 0;
@@ -6434,6 +6444,8 @@ int uocr_metal_context_generate_f16(uocr_metal_context *ctx,
                           request->slot,
                           ctx->kv_cache_layout.batch_slots);
     }
+    metal_integrated_decoder_state_reset(ctx, request->slot);
+
     if (request->n_tokens > ctx->kv_cache_layout.prompt_token_capacity) {
         return metal_fail(error,
                           error_size,

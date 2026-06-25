@@ -719,6 +719,7 @@ int uocr_generate_prepared(uocr_engine *engine,
     if (engine == NULL) {
         return set_engine_errorf(NULL, UOCR_ERROR_INVALID_ARGUMENT, "engine is null");
     }
+    clear_engine_error(engine);
     if (out_result == NULL) {
         return set_engine_errorf(engine, UOCR_ERROR_INVALID_ARGUMENT, "out_result pointer is null");
     }
