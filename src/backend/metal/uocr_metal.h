@@ -162,6 +162,20 @@ int uocr_metal_context_encode_visual_features_f16(uocr_metal_context *ctx,
                                                   char *error,
                                                   size_t error_size);
 
+/* Diagnostic SAM-stage parity boundary. Runs the same production SAM path used
+ * by encode_visual_features for one public preprocessed view and writes the
+ * upstream sam_model(view) output without batch dimension as fp16 NCHW
+ * [1024,out_grid_h,out_grid_w]. This is intentionally internal/opt-in test
+ * surface, not a stable public OCR API.
+ */
+int uocr_metal_context_encode_sam_features_f16(uocr_metal_context *ctx,
+                                               const uocr_image_view *view,
+                                               uint16_t *out_sam_features_f16,
+                                               uint32_t out_grid_w,
+                                               uint32_t out_grid_h,
+                                               char *error,
+                                               size_t error_size);
+
 uint64_t uocr_metal_context_model_view_bytes(const uocr_metal_context *ctx);
 int uocr_metal_context_get_model_view_info(const uocr_metal_context *ctx,
                                            uint32_t view_index,

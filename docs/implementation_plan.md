@@ -786,7 +786,7 @@ Do not resume quantization, batching, CUDA, or high-level OCR/PDF/postprocess AP
   - [x] `LayerNorm2d(256, eps=1e-6)`
   - [x] `net_2`: `3x3` stride-2 `256 -> 512`, padding `1`
   - [x] `net_3`: `3x3` stride-2 `512 -> 1024`, padding `1`
-- [ ] Validate SAM output against Python dumps for `1024` and `640` views.
+- [x] Validate SAM output against Python dumps for `1024` and `640` views.
 
 ### 16.3 CLIP-like encoder
 

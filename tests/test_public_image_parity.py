@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 
 from unlimitedocr_c.ffi import (
+    CImageView,
     CPreparedRequest,
     Engine,
     EngineOptions,
@@ -28,8 +29,12 @@ from unlimitedocr_c.golden import (
     GENERATED_IDS_BIN,
     GENERATED_TEXT_TXT,
     HIDDEN_SIZE,
+    SAM_FEATURE_CHANNELS,
+    SAM_GLOBAL_GRID,
+    SAM_LOCAL_GRID,
     VISUAL_FEATURES_BIN,
     decode_generated_text,
+    load_sam_features_dump,
 )
 
 
@@ -79,6 +84,7 @@ def _bind_internal_metal_symbols(lib: ct.CDLL) -> None:
         lib.uocr_metal_context_destroy
         lib.uocr_metal_context_map_model
         lib.uocr_metal_context_encode_visual_features_f16
+        lib.uocr_metal_context_encode_sam_features_f16
     except AttributeError as exc:
         pytest.skip(f"Metal/internal model-file symbols are unavailable in this build: {exc}")
 
@@ -104,6 +110,16 @@ def _bind_internal_metal_symbols(lib: ct.CDLL) -> None:
         ct.c_size_t,
     ]
     lib.uocr_metal_context_encode_visual_features_f16.restype = ct.c_int
+    lib.uocr_metal_context_encode_sam_features_f16.argtypes = [
+        ct.c_void_p,
+        ct.POINTER(CImageView),
+        ct.POINTER(ct.c_uint16),
+        ct.c_uint32,
+        ct.c_uint32,
+        ct.c_char_p,
+        ct.c_size_t,
+    ]
+    lib.uocr_metal_context_encode_sam_features_f16.restype = ct.c_int
 
 
 def _require_large_metal_inputs() -> tuple[str, str]:
@@ -266,7 +282,70 @@ def _encode_metal_visual_features(model_path: str, resource_path: str, request: 
         lib.uocr_model_file_close(ct.byref(model))
 
 
-def _assert_visual_features_close(actual_bits: np.ndarray, expected_bits: np.ndarray, *, label: str) -> None:
+def _encode_metal_sam_features(
+    model_path: str,
+    resource_path: str,
+    request: PreparedRequest,
+    *,
+    view_index: int,
+    grid_size: int,
+) -> np.ndarray:
+    lib = load_library()
+    _bind_internal_metal_symbols(lib)
+    if lib.uocr_metal_is_available() == 0:
+        pytest.skip("Metal device is not available")
+
+    error = ct.create_string_buffer(2048)
+    model = CModelFile()
+    status = lib.uocr_model_file_open(model_path.encode("utf-8"), ct.byref(model), error, len(error))
+    if status != UOCR_OK:
+        pytest.fail(f"uocr_model_file_open failed ({status}): {error.value.decode('utf-8', errors='replace')}")
+
+    ctx = None
+    try:
+        ctx = lib.uocr_metal_context_create(resource_path.encode("utf-8"), error, len(error))
+        if not ctx:
+            pytest.fail(f"uocr_metal_context_create failed: {error.value.decode('utf-8', errors='replace')}")
+        if lib.uocr_metal_context_map_model(ctx, ct.byref(model), error, len(error)) != 1:
+            pytest.fail(f"uocr_metal_context_map_model failed: {error.value.decode('utf-8', errors='replace')}")
+
+        if view_index < 0 or view_index >= len(request.views):
+            pytest.fail(f"view_index {view_index} is outside request views")
+        out = np.empty((SAM_FEATURE_CHANNELS, grid_size, grid_size), dtype=np.dtype("<u2"))
+        keepalive = as_c_request(request)
+        assert keepalive.c_views is not None
+        ok = lib.uocr_metal_context_encode_sam_features_f16(
+            ctx,
+            ct.byref(keepalive.c_views[view_index]),
+            out.ctypes.data_as(ct.POINTER(ct.c_uint16)),
+            ct.c_uint32(grid_size),
+            ct.c_uint32(grid_size),
+            error,
+            len(error),
+        )
+        if ok != 1:
+            pytest.fail(
+                "uocr_metal_context_encode_sam_features_f16 failed: "
+                + error.value.decode("utf-8", errors="replace")
+            )
+        return out
+    finally:
+        if ctx:
+            lib.uocr_metal_context_destroy(ctx)
+        lib.uocr_model_file_close(ct.byref(model))
+
+
+def _assert_feature_bits_close(
+    actual_bits: np.ndarray,
+    expected_bits: np.ndarray,
+    *,
+    label: str,
+    env_prefix: str,
+    default_atol: float,
+    default_p99_atol: float,
+    default_mean_atol: float,
+    default_rtol: float,
+) -> None:
     actual = actual_bits.view(np.float16).astype(np.float32)
     expected = expected_bits.view(np.float16).astype(np.float32)
     if not np.all(np.isfinite(actual)) or not np.all(np.isfinite(expected)):
@@ -279,16 +358,42 @@ def _assert_visual_features_close(actual_bits: np.ndarray, expected_bits: np.nda
     p99_abs = float(np.quantile(diff, 0.99))
     max_rel = float(np.max(rel))
 
-    atol = float(os.environ.get("UOCR_IMAGE_VISUAL_ATOL", "0.08"))
-    p99_atol = float(os.environ.get("UOCR_IMAGE_VISUAL_P99_ATOL", "0.02"))
-    mean_atol = float(os.environ.get("UOCR_IMAGE_VISUAL_MEAN_ATOL", "0.004"))
-    rtol = float(os.environ.get("UOCR_IMAGE_VISUAL_RTOL", "0.08"))
+    atol = float(os.environ.get(f"{env_prefix}_ATOL", str(default_atol)))
+    p99_atol = float(os.environ.get(f"{env_prefix}_P99_ATOL", str(default_p99_atol)))
+    mean_atol = float(os.environ.get(f"{env_prefix}_MEAN_ATOL", str(default_mean_atol)))
+    rtol = float(os.environ.get(f"{env_prefix}_RTOL", str(default_rtol)))
     if max_abs > atol or p99_abs > p99_atol or mean_abs > mean_atol or max_rel > rtol:
         pytest.fail(
-            f"{label} visual feature mismatch: max_abs={max_abs:.6g} (limit {atol}), "
+            f"{label} feature mismatch: max_abs={max_abs:.6g} (limit {atol}), "
             f"p99_abs={p99_abs:.6g} (limit {p99_atol}), "
             f"mean_abs={mean_abs:.6g} (limit {mean_atol}), max_rel={max_rel:.6g} (limit {rtol})"
         )
+
+
+def _assert_visual_features_close(actual_bits: np.ndarray, expected_bits: np.ndarray, *, label: str) -> None:
+    _assert_feature_bits_close(
+        actual_bits,
+        expected_bits,
+        label=label,
+        env_prefix="UOCR_IMAGE_VISUAL",
+        default_atol=0.08,
+        default_p99_atol=0.02,
+        default_mean_atol=0.004,
+        default_rtol=0.08,
+    )
+
+
+def _assert_sam_features_close(actual_bits: np.ndarray, expected_bits: np.ndarray, *, label: str) -> None:
+    _assert_feature_bits_close(
+        actual_bits,
+        expected_bits,
+        label=label,
+        env_prefix="UOCR_SAM_FEATURE",
+        default_atol=0.08,
+        default_p99_atol=0.02,
+        default_mean_atol=0.004,
+        default_rtol=0.08,
+    )
 
 
 def _run_public_generation(model_path: str, resource_path: str, request: PreparedRequest) -> np.ndarray:
@@ -356,3 +461,66 @@ def test_public_metal_image_optional_gundam_parity_fixtures() -> None:
         )
     for label, root in selected:
         _run_image_parity_case(label, root)
+
+
+def _first_view_index_with_kind(request: PreparedRequest, kind: str) -> int:
+    for index, view in enumerate(request.views):
+        if view.kind == kind:
+            return index
+    pytest.fail(f"fixture has no {kind!r} view")
+
+
+def _run_sam_parity_case(
+    label: str,
+    root: Path,
+    *,
+    view_index: int,
+    expected_kind: str,
+    expected_grid: int,
+) -> None:
+    model_path, resource_path = _require_large_metal_inputs()
+    request = _prepared_request_from_fixture(root, max_new_tokens=1)
+    if view_index < 0 or view_index >= len(request.views):
+        pytest.fail(f"{label} SAM parity view index {view_index} is outside fixture views")
+    view = request.views[view_index]
+    if view.kind != expected_kind:
+        pytest.fail(f"{label} SAM parity requires a {expected_kind} view, got {view.kind!r} at index {view_index}")
+    expected_size = 640 if expected_kind == "local" else 1024
+    if view.width != expected_size or view.height != expected_size:
+        pytest.fail(f"{label} SAM parity view must be {expected_size}x{expected_size}, got {view.width}x{view.height}")
+
+    expected = load_sam_features_dump(root, view_index=view_index, grid_size=expected_grid)
+    actual = _encode_metal_sam_features(
+        model_path,
+        resource_path,
+        request,
+        view_index=view_index,
+        grid_size=expected_grid,
+    )
+    _assert_sam_features_close(actual, expected, label=label)
+    print(f"{label} SAM parity matched shape={actual.shape} view_index={view_index}")
+
+
+def test_public_metal_sam_global_1024_parity_fixture() -> None:
+    root = _fixture_dir_from_env("SAM global 1024", ("UOCR_SAM_PARITY_1024_DIR",))
+    view_index = int(os.environ.get("UOCR_SAM_PARITY_1024_VIEW_INDEX", "0"))
+    _run_sam_parity_case(
+        "SAM global 1024",
+        root,
+        view_index=view_index,
+        expected_kind="global",
+        expected_grid=SAM_GLOBAL_GRID,
+    )
+
+
+def test_public_metal_sam_local_640_parity_fixture() -> None:
+    root = _fixture_dir_from_env("SAM local 640", ("UOCR_SAM_PARITY_640_DIR",))
+    request = _prepared_request_from_fixture(root, max_new_tokens=1)
+    view_index = int(os.environ["UOCR_SAM_PARITY_640_VIEW_INDEX"]) if os.environ.get("UOCR_SAM_PARITY_640_VIEW_INDEX") else _first_view_index_with_kind(request, "local")
+    _run_sam_parity_case(
+        "SAM local 640",
+        root,
+        view_index=view_index,
+        expected_kind="local",
+        expected_grid=SAM_LOCAL_GRID,
+    )

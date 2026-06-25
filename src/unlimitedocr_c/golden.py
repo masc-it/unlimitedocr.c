@@ -35,6 +35,10 @@ LOGITS_TOPK_SCORES_BIN = "logits_topk_scores_f32.bin"
 GENERATED_IDS_BIN = "generated_ids_i32.bin"
 GENERATED_TEXT_TXT = "generated_text.txt"
 VISUAL_FEATURES_BIN = "visual_features_f16.bin"
+SAM_FEATURES_BIN = "sam_features_f16.bin"
+SAM_FEATURE_CHANNELS = 1024
+SAM_GLOBAL_GRID = 16
+SAM_LOCAL_GRID = 10
 TEXT_DECODER_LAYER_COUNT = 12
 DEFAULT_LOGITS_TOP_K = 16
 INPUT_IDS_BIN = "input_ids_i32.bin"
@@ -163,6 +167,12 @@ def router_top_weights_filename(layer: int) -> str:
     if layer <= 0 or layer >= TEXT_DECODER_LAYER_COUNT:
         raise ValueError(f"MoE router layer out of range: {layer}")
     return f"layer_{layer}_router_top_weights_f32.bin"
+
+
+def sam_features_filename(view_index: int) -> str:
+    if view_index < 0:
+        raise ValueError(f"view_index must be non-negative, got {view_index}")
+    return SAM_FEATURES_BIN if view_index == 0 else f"sam_features_view_{view_index}_f16.bin"
 
 
 def _read_json_if_exists(path: Path) -> dict[str, Any] | None:
@@ -1295,6 +1305,89 @@ def dump_text_generated_ids_fixture(
     }
     manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return out
+
+
+def _infer_sam_grid_from_manifest(manifest: dict[str, Any], view_index: int) -> int | None:
+    views = manifest.get("views") if isinstance(manifest, dict) else None
+    if not isinstance(views, list) or view_index < 0 or view_index >= len(views):
+        return None
+    meta = views[view_index]
+    if not isinstance(meta, dict):
+        return None
+    width = int(meta.get("width", 0))
+    height = int(meta.get("height", 0))
+    kind = str(meta.get("kind", ""))
+    if width == 1024 and height == 1024 and kind == "global":
+        return SAM_GLOBAL_GRID
+    if width == 640 and height == 640 and kind == "local":
+        return SAM_LOCAL_GRID
+    return None
+
+
+def _sam_feature_meta(manifest: dict[str, Any], view_index: int) -> dict[str, Any]:
+    golden = manifest.get("golden_tensors", {}).get("sam_features", {}) if isinstance(manifest, dict) else {}
+    if not isinstance(golden, dict):
+        return {}
+    views = golden.get("views")
+    if isinstance(views, list):
+        if view_index < 0 or view_index >= len(views):
+            raise ValueError(f"sam_features view index {view_index} is outside manifest view metadata")
+        meta = views[view_index]
+        if not isinstance(meta, dict):
+            raise ValueError(f"invalid sam_features metadata for view {view_index}")
+        return meta
+    return golden
+
+
+def load_sam_features_dump(
+    fixture_dir: str | Path,
+    *,
+    view_index: int = 0,
+    grid_size: int | None = None,
+) -> NDArray[np.uint16]:
+    """Load a Python/HF SAM output fixture as uint16 fp16 bits.
+
+    The tensor contract is the upstream ``sam_model(view)`` output without the
+    batch dimension: ``[1024, grid, grid]`` in NCHW order, where ``grid`` is
+    ``16`` for a global ``1024`` view and ``10`` for a local ``640`` view.
+    """
+
+    if view_index < 0:
+        raise ValueError(f"view_index must be non-negative, got {view_index}")
+    root = Path(fixture_dir)
+    manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+    if not isinstance(manifest, dict):
+        raise ValueError(f"expected manifest object in {root}")
+    meta = _sam_feature_meta(manifest, view_index)
+    filename = meta.get("file") if isinstance(meta, dict) else None
+    if not isinstance(filename, str):
+        default_name = sam_features_filename(view_index)
+        if not (root / default_name).exists() and view_index != 0:
+            default_name = SAM_FEATURES_BIN
+        filename = default_name
+
+    shape = meta.get("shape") if isinstance(meta, dict) else None
+    if isinstance(shape, list) and len(shape) == 3:
+        channels = int(shape[0])
+        grid_h = int(shape[1])
+        grid_w = int(shape[2])
+    else:
+        inferred = grid_size if grid_size is not None else _infer_sam_grid_from_manifest(manifest, view_index)
+        if inferred is None:
+            raise ValueError(f"missing sam_features shape metadata in {root}")
+        channels = SAM_FEATURE_CHANNELS
+        grid_h = int(inferred)
+        grid_w = int(inferred)
+
+    if channels != SAM_FEATURE_CHANNELS or grid_h <= 0 or grid_w <= 0:
+        raise ValueError(f"invalid sam_features shape [{channels}, {grid_h}, {grid_w}] in {root}")
+    if grid_size is not None and (grid_h != int(grid_size) or grid_w != int(grid_size)):
+        raise ValueError(f"sam_features shape grid {grid_h}x{grid_w} does not match expected {grid_size}x{grid_size}")
+    bits = np.fromfile(root / filename, dtype=np.dtype("<u2"))
+    expected_values = channels * grid_h * grid_w
+    if bits.size != expected_values:
+        raise ValueError(f"sam_features size mismatch: expected {expected_values} f16 values, got {bits.size}")
+    return bits.reshape((channels, grid_h, grid_w))
 
 
 def load_prompt_embedding_dump(fixture_dir: str | Path) -> PromptEmbeddingDump:

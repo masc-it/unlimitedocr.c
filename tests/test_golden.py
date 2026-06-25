@@ -7,6 +7,8 @@ import numpy as np
 
 from unlimitedocr_c.frontend import PreparedRequest, save_prepared_request
 from unlimitedocr_c.golden import (
+    SAM_FEATURES_BIN,
+    SAM_FEATURE_CHANNELS,
     dump_image_prompt_embedding_fixture,
     dump_prompt_embedding_fixture,
     load_image_decoder_layers_dump,
@@ -14,12 +16,14 @@ from unlimitedocr_c.golden import (
     load_image_generated_ids_dump,
     load_image_prompt_embedding_dump,
     load_prompt_embedding_dump,
+    load_sam_features_dump,
     load_text_decoder_layers_dump,
     load_text_generated_ids_dump,
     load_text_layer1_dump,
     load_text_logits_topk_dump,
     read_bf16_rows_as_f16_bits,
     read_bf16_tensor_as_f16_bits,
+    sam_features_filename,
 )
 
 
@@ -181,6 +185,31 @@ def test_dump_image_prompt_embedding_fixture_splices_visual_features(tmp_path) -
     assert loaded.image_span_start == 1
     assert loaded.image_span_length == 2
     assert loaded.manifest["image_embedding_fixture"]["bypasses_c_vision_encoder"] is True
+
+
+def test_load_sam_features_dump_reads_single_and_per_view_files(tmp_path) -> None:
+    manifest = {
+        "views": [
+            {"name": "global", "kind": "global", "width": 1024, "height": 1024},
+            {"name": "local", "kind": "local", "width": 640, "height": 640},
+        ],
+        "golden_tensors": {
+            "sam_features": {
+                "views": [
+                    {"file": SAM_FEATURES_BIN, "shape": [SAM_FEATURE_CHANNELS, 16, 16]},
+                    {"file": sam_features_filename(1), "shape": [SAM_FEATURE_CHANNELS, 10, 10]},
+                ]
+            }
+        },
+    }
+    (tmp_path / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    global_bits = np.arange(SAM_FEATURE_CHANNELS * 16 * 16, dtype=np.dtype("<u2")).reshape((SAM_FEATURE_CHANNELS, 16, 16))
+    local_bits = np.arange(SAM_FEATURE_CHANNELS * 10 * 10, dtype=np.dtype("<u2")).reshape((SAM_FEATURE_CHANNELS, 10, 10))
+    global_bits.tofile(tmp_path / SAM_FEATURES_BIN)
+    local_bits.tofile(tmp_path / sam_features_filename(1))
+
+    np.testing.assert_array_equal(load_sam_features_dump(tmp_path, view_index=0, grid_size=16), global_bits)
+    np.testing.assert_array_equal(load_sam_features_dump(tmp_path, view_index=1, grid_size=10), local_bits)
 
 
 def test_load_image_decoder_layers_dump_reads_native_hidden_files(tmp_path) -> None:
