@@ -243,7 +243,7 @@ Implementation status:
 - [x] Reject requests that exceed hard caps before allocating.
 - [x] Record current capacity and high-water usage in memory reports.
 - [x] Update admission errors with requested limits, configured limits, and current arena capacity.
-- [ ] Prove no arena growth occurs across prefill, decode, vision, and token-selection hot loops.
+- [x] Prove no arena growth occurs across prefill, decode, vision, and token-selection hot loops.
 
 Acceptance target:
 
@@ -302,7 +302,7 @@ Implementation status:
 - [x] Fuse prompt assembly into the prefill command graph.
 - [ ] Replace decode single-token matvec/MoE kernels with custom tiled kernels.
 - [ ] Add Python tokenizer/decode caching.
-- [ ] Implement request-sized lazy arenas.
+- [x] Implement request-sized lazy arenas.
 - [ ] Delete unselected fallback/duplicate production code after each stage passes gates.
 - [ ] Start q8 decoder compression work after the fp16 10x milestone.
 

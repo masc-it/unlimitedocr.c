@@ -252,6 +252,7 @@ struct uocr_metal_context {
     uint64_t last_model_warmup_bytes;
     uocr_metal_scratch_buffer scratch[UOCR_METAL_SCRATCH_COUNT];
     uocr_metal_runtime_arena runtime_arenas[UOCR_METAL_ARENA_COUNT];
+    uint64_t runtime_arena_generation;
     id<MTLBuffer> prompt_token_ids_buffer;
     uint64_t prompt_token_ids_capacity;
     uint32_t prompt_token_ids_batch_slots;
@@ -5219,9 +5220,13 @@ void uocr_metal_context_release_runtime_arenas(uocr_metal_context *ctx) {
         return;
     }
     @autoreleasepool {
+        int changed = ctx->prompt_token_ids_buffer != nil || ctx->has_kv_cache_layout != 0;
         metal_clear_mps_workspace_ndarray_cache(ctx);
         for (uint32_t i = 0u; i < (uint32_t)UOCR_METAL_ARENA_COUNT; ++i) {
             uocr_metal_runtime_arena *arena = &ctx->runtime_arenas[i];
+            if (arena->buffer != nil || arena->capacity != 0u) {
+                changed = 1;
+            }
             [arena->buffer release];
             arena->buffer = nil;
             arena->capacity = 0u;
@@ -5238,6 +5243,9 @@ void uocr_metal_context_release_runtime_arenas(uocr_metal_context *ctx) {
         ctx->integrated_prefill_slot = 0u;
         ctx->integrated_prefill_tokens = 0u;
         ctx->integrated_prefill_final_segment = 0u;
+        if (changed) {
+            ++ctx->runtime_arena_generation;
+        }
     }
 }
 
@@ -5249,6 +5257,11 @@ int uocr_metal_context_allocate_runtime_arenas(uocr_metal_context *ctx,
     metal_clear_error(error, error_size);
     if (ctx == NULL || batch_slots == 0u || prompt_token_capacity == 0u) {
         return metal_fail(error, error_size, "invalid Metal runtime arena allocation request");
+    }
+    if (ctx->active_command_buffer != nil) {
+        return metal_fail(error,
+                          error_size,
+                          "Metal runtime arenas must be grown before command encoding; active command batch is in progress");
     }
 
     uint64_t capacities[UOCR_METAL_ARENA_COUNT];
@@ -5328,6 +5341,7 @@ int uocr_metal_context_allocate_runtime_arenas(uocr_metal_context *ctx,
         ctx->prompt_token_ids_prompt_capacity = prompt_token_capacity;
         ctx->kv_cache_layout = kv_layout;
         ctx->has_kv_cache_layout = 1;
+        ++ctx->runtime_arena_generation;
     }
     return 1;
 }
@@ -5563,18 +5577,66 @@ static int metal_decoder_runtime_arenas_ready(const uocr_metal_context *ctx) {
            ctx->runtime_arenas[UOCR_METAL_ARENA_LOGITS_READBACK].buffer != nil;
 }
 
+typedef struct uocr_metal_runtime_arena_guard {
+    uint64_t generation;
+    uint64_t capacity;
+    uint32_t batch_slots;
+    uint32_t prompt_token_capacity;
+} uocr_metal_runtime_arena_guard;
+
 typedef struct uocr_metal_hot_path_alloc_guard {
     uocr_alloc_guard core_alloc_guard;
     uint64_t scratch_capacity;
-    uint64_t runtime_arena_capacity;
+    uocr_metal_runtime_arena_guard runtime_arena;
     NSUInteger pipeline_cache_count;
 } uocr_metal_hot_path_alloc_guard;
+
+static uocr_metal_runtime_arena_guard metal_runtime_arena_guard_begin(const uocr_metal_context *ctx) {
+    uocr_metal_runtime_arena_guard guard;
+    guard.generation = ctx != NULL ? ctx->runtime_arena_generation : 0u;
+    guard.capacity = uocr_metal_context_total_runtime_arena_capacity(ctx);
+    guard.batch_slots = uocr_metal_context_runtime_arena_batch_slots(ctx);
+    guard.prompt_token_capacity = uocr_metal_context_runtime_arena_prompt_token_capacity(ctx);
+    return guard;
+}
+
+static int metal_runtime_arena_guard_end(const uocr_metal_context *ctx,
+                                         const uocr_metal_runtime_arena_guard *guard,
+                                         const char *label,
+                                         char *error,
+                                         size_t error_size) {
+    if (ctx == NULL || guard == NULL) {
+        return metal_fail(error, error_size, "invalid %s runtime-arena guard", label != NULL ? label : "Metal hot path");
+    }
+    const uint64_t generation = ctx->runtime_arena_generation;
+    const uint64_t capacity = uocr_metal_context_total_runtime_arena_capacity(ctx);
+    const uint32_t batch_slots = uocr_metal_context_runtime_arena_batch_slots(ctx);
+    const uint32_t prompt_token_capacity = uocr_metal_context_runtime_arena_prompt_token_capacity(ctx);
+    if (generation != guard->generation || capacity != guard->capacity || batch_slots != guard->batch_slots ||
+        prompt_token_capacity != guard->prompt_token_capacity) {
+        return metal_fail(error,
+                          error_size,
+                          "%s changed runtime arena state "
+                          "(generation %llu->%llu, capacity %llu->%llu bytes, batch_slots %u->%u, prompt_capacity %u->%u)",
+                          label != NULL ? label : "Metal hot path",
+                          (unsigned long long)guard->generation,
+                          (unsigned long long)generation,
+                          (unsigned long long)guard->capacity,
+                          (unsigned long long)capacity,
+                          guard->batch_slots,
+                          batch_slots,
+                          guard->prompt_token_capacity,
+                          prompt_token_capacity);
+    }
+    metal_profile_add_event_ms(ctx, "metal.runtime_arena_guard.no_growth", 0.0);
+    return 1;
+}
 
 static uocr_metal_hot_path_alloc_guard metal_hot_path_alloc_guard_begin(const uocr_metal_context *ctx) {
     uocr_metal_hot_path_alloc_guard guard;
     guard.core_alloc_guard = uocr_alloc_guard_begin();
     guard.scratch_capacity = uocr_metal_context_total_scratch_capacity(ctx);
-    guard.runtime_arena_capacity = uocr_metal_context_total_runtime_arena_capacity(ctx);
+    guard.runtime_arena = metal_runtime_arena_guard_begin(ctx);
     guard.pipeline_cache_count = (ctx != NULL && ctx->pipeline_cache != nil) ? [ctx->pipeline_cache count] : 0u;
     return guard;
 }
@@ -5602,14 +5664,8 @@ static int metal_hot_path_alloc_guard_end(const uocr_metal_context *ctx,
                           (unsigned long long)guard->scratch_capacity,
                           (unsigned long long)scratch_capacity);
     }
-    const uint64_t runtime_arena_capacity = uocr_metal_context_total_runtime_arena_capacity(ctx);
-    if (runtime_arena_capacity != guard->runtime_arena_capacity) {
-        return metal_fail(error,
-                          error_size,
-                          "%s changed runtime arena capacity from %llu to %llu bytes",
-                          label != NULL ? label : "Metal hot path",
-                          (unsigned long long)guard->runtime_arena_capacity,
-                          (unsigned long long)runtime_arena_capacity);
+    if (!metal_runtime_arena_guard_end(ctx, &guard->runtime_arena, label, error, error_size)) {
+        return 0;
     }
     const NSUInteger pipeline_cache_count = ctx->pipeline_cache != nil ? [ctx->pipeline_cache count] : 0u;
     if (pipeline_cache_count != guard->pipeline_cache_count) {
@@ -9002,19 +9058,30 @@ static int metal_context_generate_f16(uocr_metal_context *ctx,
         metal_profile_add_event_now(ctx, "metal.no_repeat_state", no_repeat_state_start_ns);
         metal_profile_add_event_now(ctx, "metal.decode.no_repeat_state", no_repeat_state_start_ns);
         const uint64_t token_selection_start_ns = uocr_profile_now_ns();
-        if (!metal_select_next_token_from_hidden_slice_f16(ctx,
-                                                           hidden_for_selection,
-                                                           norm_scratch,
-                                                           logits,
-                                                           token_slot,
-                                                           no_repeat_config.sequence != NULL ? no_repeat_config.sequence : sequence_state.token_history,
-                                                           no_repeat_config.sequence != NULL ? no_repeat_config.sequence_len : sequence_state.token_history_count,
-                                                           no_repeat_config.ngram_size,
-                                                           no_repeat_config.window,
-                                                           &token_id,
-                                                           &score,
-                                                           error,
-                                                           error_size)) {
+        const uocr_metal_hot_path_alloc_guard token_selection_guard = metal_hot_path_alloc_guard_begin(ctx);
+        const int token_selection_ok = metal_select_next_token_from_hidden_slice_f16(ctx,
+                                                                                    hidden_for_selection,
+                                                                                    norm_scratch,
+                                                                                    logits,
+                                                                                    token_slot,
+                                                                                    no_repeat_config.sequence != NULL ? no_repeat_config.sequence : sequence_state.token_history,
+                                                                                    no_repeat_config.sequence != NULL ? no_repeat_config.sequence_len : sequence_state.token_history_count,
+                                                                                    no_repeat_config.ngram_size,
+                                                                                    no_repeat_config.window,
+                                                                                    &token_id,
+                                                                                    &score,
+                                                                                    error,
+                                                                                    error_size);
+        if (!metal_hot_path_alloc_guard_end(ctx,
+                                            &token_selection_guard,
+                                            "integrated Metal fp16 token-selection hot path",
+                                            error,
+                                            error_size)) {
+            char detail[512];
+            (void)snprintf(detail, sizeof(detail), "%s", (error != NULL && error[0] != '\0') ? error : "unknown error");
+            UOCR_METAL_DECODE_LOOP_FAIL("integrated Metal fp16 token-selection hot path guard failed: %s", detail);
+        }
+        if (!token_selection_ok) {
             char detail[512];
             (void)snprintf(detail, sizeof(detail), "%s", (error != NULL && error[0] != '\0') ? error : "unknown error");
             UOCR_METAL_DECODE_LOOP_FAIL("integrated Metal fp16 next-token selection failed: %s", detail);
@@ -9182,14 +9249,25 @@ int uocr_metal_context_generate_image_f16(uocr_metal_context *ctx,
     }
 
     uocr_metal_vision_workspace scratch;
+    memset(&scratch, 0, sizeof(scratch));
+    const uocr_metal_runtime_arena_guard vision_arena_guard = metal_runtime_arena_guard_begin(ctx);
     const uint64_t vision_start_ns = uocr_profile_now_ns();
-    if (!metal_context_encode_visual_features_to_workspace_f16(ctx,
-                                                               request,
-                                                               max_views_per_chunk,
-                                                               &schedule,
-                                                               &scratch,
-                                                               error,
-                                                               error_size)) {
+    const int vision_ok = metal_context_encode_visual_features_to_workspace_f16(ctx,
+                                                                                request,
+                                                                                max_views_per_chunk,
+                                                                                &schedule,
+                                                                                &scratch,
+                                                                                error,
+                                                                                error_size);
+    if (!metal_runtime_arena_guard_end(ctx,
+                                       &vision_arena_guard,
+                                       "Metal image vision hot path",
+                                       error,
+                                       error_size)) {
+        metal_vision_workspace_reset(&scratch);
+        return 0;
+    }
+    if (!vision_ok) {
         char vision_detail[512];
         metal_copy_error_detail(vision_detail, sizeof(vision_detail), error);
         return metal_fail(error, error_size, "Metal image vision encoding failed: %s", vision_detail);
