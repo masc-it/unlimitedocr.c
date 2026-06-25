@@ -348,6 +348,236 @@ int uocr_cpu_ref_dense_swiglu_f32(const float *input,
     return 1;
 }
 
+static int checked_product3_fits_size(uint64_t a, uint64_t b, uint64_t c) {
+    uint64_t ab = 0u;
+    uint64_t abc = 0u;
+    return checked_mul_u64(a, b, &ab) && checked_mul_u64(ab, c, &abc) && abc <= (uint64_t)SIZE_MAX;
+}
+
+static int moe_validate_common(const float *input,
+                               const float *router_weight,
+                               uint32_t rows,
+                               uint32_t hidden_dim,
+                               uint32_t n_experts,
+                               uint32_t top_k,
+                               float routed_scaling_factor,
+                               float *router_logits,
+                               float *router_probs,
+                               uint32_t *top_expert_ids,
+                               float *top_expert_weights) {
+    if (input == NULL || router_weight == NULL || router_logits == NULL || router_probs == NULL ||
+        top_expert_ids == NULL || top_expert_weights == NULL || rows == 0u || hidden_dim == 0u ||
+        n_experts == 0u || top_k == 0u || top_k > n_experts || routed_scaling_factor < 0.0f ||
+        !isfinite(routed_scaling_factor)) {
+        return 0;
+    }
+    return checked_product3_fits_size((uint64_t)rows, (uint64_t)n_experts, 1u) &&
+           checked_product3_fits_size((uint64_t)rows, (uint64_t)top_k, 1u) &&
+           checked_product3_fits_size((uint64_t)n_experts, (uint64_t)hidden_dim, 1u);
+}
+
+static int expert_already_selected(const uint32_t *ids, uint32_t count, uint32_t expert) {
+    for (uint32_t i = 0u; i < count; ++i) {
+        if (ids[i] == expert) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int uocr_cpu_ref_moe_router_f32(const float *input,
+                                const float *router_weight,
+                                uint32_t rows,
+                                uint32_t hidden_dim,
+                                uint32_t n_experts,
+                                uint32_t top_k,
+                                float routed_scaling_factor,
+                                float *router_logits,
+                                float *router_probs,
+                                uint32_t *top_expert_ids,
+                                float *top_expert_weights) {
+    if (!moe_validate_common(input,
+                             router_weight,
+                             rows,
+                             hidden_dim,
+                             n_experts,
+                             top_k,
+                             routed_scaling_factor,
+                             router_logits,
+                             router_probs,
+                             top_expert_ids,
+                             top_expert_weights)) {
+        return 0;
+    }
+
+    for (uint32_t row = 0u; row < rows; ++row) {
+        const float *input_row = input + (size_t)row * hidden_dim;
+        float *logits_row = router_logits + (size_t)row * n_experts;
+        float *probs_row = router_probs + (size_t)row * n_experts;
+        float max_logit = -INFINITY;
+        for (uint32_t expert = 0u; expert < n_experts; ++expert) {
+            const float *router_row = router_weight + (size_t)expert * hidden_dim;
+            const float logit = dense_dot_row_f32(input_row, router_row, hidden_dim);
+            logits_row[expert] = logit;
+            if (logit > max_logit) {
+                max_logit = logit;
+            }
+        }
+        if (!isfinite(max_logit)) {
+            return 0;
+        }
+
+        float denom = 0.0f;
+        for (uint32_t expert = 0u; expert < n_experts; ++expert) {
+            const float prob = expf(logits_row[expert] - max_logit);
+            probs_row[expert] = prob;
+            denom += prob;
+        }
+        if (!(denom > 0.0f) || !isfinite(denom)) {
+            return 0;
+        }
+        for (uint32_t expert = 0u; expert < n_experts; ++expert) {
+            probs_row[expert] /= denom;
+        }
+
+        uint32_t *ids_row = top_expert_ids + (size_t)row * top_k;
+        float *weights_row = top_expert_weights + (size_t)row * top_k;
+        for (uint32_t slot = 0u; slot < top_k; ++slot) {
+            uint32_t best_expert = UINT32_MAX;
+            float best_prob = -INFINITY;
+            for (uint32_t expert = 0u; expert < n_experts; ++expert) {
+                const float prob = probs_row[expert];
+                if (expert_already_selected(ids_row, slot, expert)) {
+                    continue;
+                }
+                if (prob > best_prob || (prob == best_prob && expert < best_expert)) {
+                    best_prob = prob;
+                    best_expert = expert;
+                }
+            }
+            if (best_expert == UINT32_MAX || !(best_prob >= 0.0f)) {
+                return 0;
+            }
+            ids_row[slot] = best_expert;
+            weights_row[slot] = best_prob * routed_scaling_factor;
+        }
+    }
+    return 1;
+}
+
+int uocr_cpu_ref_moe_swiglu_f32(const float *input,
+                                const float *router_weight,
+                                const float *expert_gate_weight,
+                                const float *expert_up_weight,
+                                const float *expert_down_weight,
+                                const float *shared_gate_weight,
+                                const float *shared_up_weight,
+                                const float *shared_down_weight,
+                                uint32_t rows,
+                                uint32_t hidden_dim,
+                                uint32_t n_experts,
+                                uint32_t top_k,
+                                uint32_t expert_intermediate_dim,
+                                uint32_t shared_intermediate_dim,
+                                float routed_scaling_factor,
+                                float *router_logits,
+                                float *router_probs,
+                                uint32_t *top_expert_ids,
+                                float *top_expert_weights,
+                                float *expert_workspace,
+                                float *shared_workspace,
+                                float *out) {
+    if (expert_gate_weight == NULL || expert_up_weight == NULL || expert_down_weight == NULL ||
+        shared_gate_weight == NULL || shared_up_weight == NULL || shared_down_weight == NULL ||
+        expert_workspace == NULL || shared_workspace == NULL || out == NULL || expert_intermediate_dim == 0u ||
+        shared_intermediate_dim == 0u) {
+        return 0;
+    }
+    if (!moe_validate_common(input,
+                             router_weight,
+                             rows,
+                             hidden_dim,
+                             n_experts,
+                             top_k,
+                             routed_scaling_factor,
+                             router_logits,
+                             router_probs,
+                             top_expert_ids,
+                             top_expert_weights)) {
+        return 0;
+    }
+    if (!checked_product3_fits_size((uint64_t)n_experts, (uint64_t)expert_intermediate_dim, (uint64_t)hidden_dim) ||
+        !checked_product3_fits_size((uint64_t)n_experts, (uint64_t)hidden_dim, (uint64_t)expert_intermediate_dim) ||
+        !checked_product3_fits_size((uint64_t)rows, (uint64_t)top_k, (uint64_t)expert_intermediate_dim) ||
+        !checked_product3_fits_size((uint64_t)rows, (uint64_t)shared_intermediate_dim, 1u) ||
+        !checked_product3_fits_size((uint64_t)shared_intermediate_dim, (uint64_t)hidden_dim, 1u) ||
+        !checked_product3_fits_size((uint64_t)hidden_dim, (uint64_t)shared_intermediate_dim, 1u)) {
+        return 0;
+    }
+
+    if (!uocr_cpu_ref_moe_router_f32(input,
+                                     router_weight,
+                                     rows,
+                                     hidden_dim,
+                                     n_experts,
+                                     top_k,
+                                     routed_scaling_factor,
+                                     router_logits,
+                                     router_probs,
+                                     top_expert_ids,
+                                     top_expert_weights)) {
+        return 0;
+    }
+
+    for (uint32_t row = 0u; row < rows; ++row) {
+        const float *input_row = input + (size_t)row * hidden_dim;
+        float *out_row = out + (size_t)row * hidden_dim;
+        for (uint32_t hidden = 0u; hidden < hidden_dim; ++hidden) {
+            out_row[hidden] = 0.0f;
+        }
+
+        for (uint32_t slot = 0u; slot < top_k; ++slot) {
+            const uint32_t expert = top_expert_ids[(size_t)row * top_k + slot];
+            const float route_weight = top_expert_weights[(size_t)row * top_k + slot];
+            if (expert >= n_experts) {
+                return 0;
+            }
+            float *expert_intermediate = expert_workspace + ((size_t)row * top_k + slot) * expert_intermediate_dim;
+            for (uint32_t inter = 0u; inter < expert_intermediate_dim; ++inter) {
+                const size_t expert_inter_offset = ((size_t)expert * expert_intermediate_dim + inter) * hidden_dim;
+                const float gate = dense_dot_row_f32(input_row, expert_gate_weight + expert_inter_offset, hidden_dim);
+                const float up = dense_dot_row_f32(input_row, expert_up_weight + expert_inter_offset, hidden_dim);
+                expert_intermediate[inter] = silu_f32(gate) * up;
+            }
+            for (uint32_t hidden = 0u; hidden < hidden_dim; ++hidden) {
+                const size_t down_offset = ((size_t)expert * hidden_dim + hidden) * expert_intermediate_dim;
+                const float down = dense_dot_row_f32(expert_intermediate,
+                                                     expert_down_weight + down_offset,
+                                                     expert_intermediate_dim);
+                out_row[hidden] = fmaf(route_weight, down, out_row[hidden]);
+            }
+        }
+
+        float *shared_intermediate = shared_workspace + (size_t)row * shared_intermediate_dim;
+        for (uint32_t inter = 0u; inter < shared_intermediate_dim; ++inter) {
+            const float gate = dense_dot_row_f32(input_row,
+                                                 shared_gate_weight + (size_t)inter * hidden_dim,
+                                                 hidden_dim);
+            const float up = dense_dot_row_f32(input_row,
+                                               shared_up_weight + (size_t)inter * hidden_dim,
+                                               hidden_dim);
+            shared_intermediate[inter] = silu_f32(gate) * up;
+        }
+        for (uint32_t hidden = 0u; hidden < hidden_dim; ++hidden) {
+            const float shared = dense_dot_row_f32(shared_intermediate,
+                                                   shared_down_weight + (size_t)hidden * shared_intermediate_dim,
+                                                   shared_intermediate_dim);
+            out_row[hidden] += shared;
+        }
+    }
+    return 1;
+}
+
 int uocr_cpu_ref_kv_cache_layout_init(uint32_t prompt_token_capacity,
                                       uint32_t generated_ring_window,
                                       uint32_t heads,

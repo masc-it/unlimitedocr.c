@@ -54,6 +54,41 @@ int uocr_cpu_ref_dense_swiglu_f32(const float *input,
                                   float *swiglu_workspace,
                                   float *out);
 
+int uocr_cpu_ref_moe_router_f32(const float *input,
+                                const float *router_weight,
+                                uint32_t rows,
+                                uint32_t hidden_dim,
+                                uint32_t n_experts,
+                                uint32_t top_k,
+                                float routed_scaling_factor,
+                                float *router_logits,
+                                float *router_probs,
+                                uint32_t *top_expert_ids,
+                                float *top_expert_weights);
+
+int uocr_cpu_ref_moe_swiglu_f32(const float *input,
+                                const float *router_weight,
+                                const float *expert_gate_weight,
+                                const float *expert_up_weight,
+                                const float *expert_down_weight,
+                                const float *shared_gate_weight,
+                                const float *shared_up_weight,
+                                const float *shared_down_weight,
+                                uint32_t rows,
+                                uint32_t hidden_dim,
+                                uint32_t n_experts,
+                                uint32_t top_k,
+                                uint32_t expert_intermediate_dim,
+                                uint32_t shared_intermediate_dim,
+                                float routed_scaling_factor,
+                                float *router_logits,
+                                float *router_probs,
+                                uint32_t *top_expert_ids,
+                                float *top_expert_weights,
+                                float *expert_workspace,
+                                float *shared_workspace,
+                                float *out);
+
 typedef struct uocr_cpu_ref_kv_cache_layout {
     uint32_t prompt_token_capacity;
     uint32_t generated_ring_window;

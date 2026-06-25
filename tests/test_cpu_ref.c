@@ -266,6 +266,230 @@ static int test_dense_swiglu(void) {
     return 0;
 }
 
+static float softmax_prob4(const float logits[4], uint32_t index) {
+    float max_logit = logits[0];
+    for (uint32_t i = 1u; i < 4u; ++i) {
+        if (logits[i] > max_logit) {
+            max_logit = logits[i];
+        }
+    }
+    float denom = 0.0f;
+    for (uint32_t i = 0u; i < 4u; ++i) {
+        denom += expf(logits[i] - max_logit);
+    }
+    return expf(logits[index] - max_logit) / denom;
+}
+
+static float expected_simple_expert_dim(float x0, float x1, uint32_t expert, uint32_t dim) {
+    const float scale = (float)(expert + 1u);
+    if (dim == 0u) {
+        return test_silu(x0) * scale * x0;
+    }
+    return test_silu(x1) * scale * x1;
+}
+
+static float expected_simple_shared_dim(float x0, float x1, uint32_t dim) {
+    if (dim == 0u) {
+        return test_silu(x0) * 2.0f * x0;
+    }
+    return test_silu(x1) * 3.0f * x1;
+}
+
+static int test_moe_router_and_swiglu(void) {
+    enum { ROWS = 2u, HIDDEN = 2u, EXPERTS = 4u, TOPK = 2u, EXPERT_INTER = 2u, SHARED_INTER = 2u };
+    const float input[ROWS * HIDDEN] = {
+        1.0f, 2.0f,
+        -1.0f, 0.5f,
+    };
+    const float router_weight[EXPERTS * HIDDEN] = {
+        1.0f, 0.0f,
+        0.0f, 1.0f,
+        1.0f, 1.0f,
+        -1.0f, 0.0f,
+    };
+
+    float expert_gate_weight[EXPERTS * EXPERT_INTER * HIDDEN];
+    float expert_up_weight[EXPERTS * EXPERT_INTER * HIDDEN];
+    float expert_down_weight[EXPERTS * HIDDEN * EXPERT_INTER];
+    for (uint32_t expert = 0u; expert < EXPERTS; ++expert) {
+        const float scale = (float)(expert + 1u);
+        const size_t gate_base = (size_t)expert * EXPERT_INTER * HIDDEN;
+        expert_gate_weight[gate_base + 0u] = 1.0f;
+        expert_gate_weight[gate_base + 1u] = 0.0f;
+        expert_gate_weight[gate_base + 2u] = 0.0f;
+        expert_gate_weight[gate_base + 3u] = 1.0f;
+        expert_up_weight[gate_base + 0u] = scale;
+        expert_up_weight[gate_base + 1u] = 0.0f;
+        expert_up_weight[gate_base + 2u] = 0.0f;
+        expert_up_weight[gate_base + 3u] = scale;
+
+        const size_t down_base = (size_t)expert * HIDDEN * EXPERT_INTER;
+        expert_down_weight[down_base + 0u] = 1.0f;
+        expert_down_weight[down_base + 1u] = 0.0f;
+        expert_down_weight[down_base + 2u] = 0.0f;
+        expert_down_weight[down_base + 3u] = 1.0f;
+    }
+
+    const float shared_gate_weight[SHARED_INTER * HIDDEN] = {
+        1.0f, 0.0f,
+        0.0f, 1.0f,
+    };
+    const float shared_up_weight[SHARED_INTER * HIDDEN] = {
+        2.0f, 0.0f,
+        0.0f, 3.0f,
+    };
+    const float shared_down_weight[HIDDEN * SHARED_INTER] = {
+        1.0f, 0.0f,
+        0.0f, 1.0f,
+    };
+
+    float logits[ROWS * EXPERTS] = {0.0f};
+    float probs[ROWS * EXPERTS] = {0.0f};
+    uint32_t top_ids[ROWS * TOPK] = {UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX};
+    float top_weights[ROWS * TOPK] = {0.0f};
+    float expert_workspace[ROWS * TOPK * EXPERT_INTER] = {0.0f};
+    float shared_workspace[ROWS * SHARED_INTER] = {0.0f};
+    float out[ROWS * HIDDEN] = {0.0f};
+
+    CHECK(uocr_cpu_ref_moe_swiglu_f32(input,
+                                      router_weight,
+                                      expert_gate_weight,
+                                      expert_up_weight,
+                                      expert_down_weight,
+                                      shared_gate_weight,
+                                      shared_up_weight,
+                                      shared_down_weight,
+                                      ROWS,
+                                      HIDDEN,
+                                      EXPERTS,
+                                      TOPK,
+                                      EXPERT_INTER,
+                                      SHARED_INTER,
+                                      1.0f,
+                                      logits,
+                                      probs,
+                                      top_ids,
+                                      top_weights,
+                                      expert_workspace,
+                                      shared_workspace,
+                                      out) == 1);
+
+    const float expected_logits[ROWS][EXPERTS] = {
+        {1.0f, 2.0f, 3.0f, -1.0f},
+        {-1.0f, 0.5f, -0.5f, 1.0f},
+    };
+    const uint32_t expected_ids[ROWS][TOPK] = {
+        {2u, 1u},
+        {3u, 1u},
+    };
+    for (uint32_t row = 0u; row < ROWS; ++row) {
+        for (uint32_t expert = 0u; expert < EXPERTS; ++expert) {
+            CHECK(nearly_equal(logits[(size_t)row * EXPERTS + expert], expected_logits[row][expert], 1.0e-6f));
+            CHECK(nearly_equal(probs[(size_t)row * EXPERTS + expert],
+                               softmax_prob4(expected_logits[row], expert),
+                               1.0e-6f));
+        }
+        float top_sum = 0.0f;
+        for (uint32_t slot = 0u; slot < TOPK; ++slot) {
+            const uint32_t expert = expected_ids[row][slot];
+            CHECK(top_ids[(size_t)row * TOPK + slot] == expert);
+            CHECK(nearly_equal(top_weights[(size_t)row * TOPK + slot],
+                               probs[(size_t)row * EXPERTS + expert],
+                               1.0e-6f));
+            top_sum += top_weights[(size_t)row * TOPK + slot];
+        }
+        CHECK(top_sum < 1.0f);
+    }
+
+    for (uint32_t row = 0u; row < ROWS; ++row) {
+        const float x0 = input[(size_t)row * HIDDEN];
+        const float x1 = input[(size_t)row * HIDDEN + 1u];
+        for (uint32_t dim = 0u; dim < HIDDEN; ++dim) {
+            float expected = expected_simple_shared_dim(x0, x1, dim);
+            for (uint32_t slot = 0u; slot < TOPK; ++slot) {
+                const uint32_t expert = expected_ids[row][slot];
+                expected += probs[(size_t)row * EXPERTS + expert] * expected_simple_expert_dim(x0, x1, expert, dim);
+            }
+            CHECK(nearly_equal(out[(size_t)row * HIDDEN + dim], expected, 1.0e-5f));
+        }
+    }
+
+    const float zero_input[HIDDEN] = {0.0f, 0.0f};
+    uint32_t tie_ids[TOPK] = {UINT32_MAX, UINT32_MAX};
+    CHECK(uocr_cpu_ref_moe_router_f32(zero_input,
+                                      router_weight,
+                                      1u,
+                                      HIDDEN,
+                                      EXPERTS,
+                                      TOPK,
+                                      1.0f,
+                                      logits,
+                                      probs,
+                                      tie_ids,
+                                      top_weights) == 1);
+    CHECK(tie_ids[0] == 0u);
+    CHECK(tie_ids[1] == 1u);
+    CHECK(nearly_equal(top_weights[0], 0.25f, 1.0e-6f));
+    CHECK(nearly_equal(top_weights[1], 0.25f, 1.0e-6f));
+
+    CHECK(uocr_cpu_ref_moe_router_f32(NULL,
+                                      router_weight,
+                                      ROWS,
+                                      HIDDEN,
+                                      EXPERTS,
+                                      TOPK,
+                                      1.0f,
+                                      logits,
+                                      probs,
+                                      top_ids,
+                                      top_weights) == 0);
+    CHECK(uocr_cpu_ref_moe_router_f32(input,
+                                      router_weight,
+                                      ROWS,
+                                      HIDDEN,
+                                      EXPERTS,
+                                      EXPERTS + 1u,
+                                      1.0f,
+                                      logits,
+                                      probs,
+                                      top_ids,
+                                      top_weights) == 0);
+    CHECK(uocr_cpu_ref_moe_router_f32(input,
+                                      router_weight,
+                                      ROWS,
+                                      HIDDEN,
+                                      EXPERTS,
+                                      TOPK,
+                                      -1.0f,
+                                      logits,
+                                      probs,
+                                      top_ids,
+                                      top_weights) == 0);
+    CHECK(uocr_cpu_ref_moe_swiglu_f32(input,
+                                      router_weight,
+                                      expert_gate_weight,
+                                      expert_up_weight,
+                                      expert_down_weight,
+                                      shared_gate_weight,
+                                      shared_up_weight,
+                                      shared_down_weight,
+                                      ROWS,
+                                      HIDDEN,
+                                      EXPERTS,
+                                      TOPK,
+                                      EXPERT_INTER,
+                                      SHARED_INTER,
+                                      1.0f,
+                                      logits,
+                                      probs,
+                                      top_ids,
+                                      top_weights,
+                                      NULL,
+                                      shared_workspace,
+                                      out) == 0);
+    return 0;
+}
+
 static void fill_kv_token(float *k, float *v, uint32_t value, uint32_t stride) {
     for (uint32_t index = 0u; index < stride; ++index) {
         k[index] = (float)(value * 100u + index);
@@ -373,6 +597,7 @@ int main(void) {
     if (test_rope_split_half() != 0) return 1;
     if (test_causal_sdpa() != 0) return 1;
     if (test_dense_swiglu() != 0) return 1;
+    if (test_moe_router_and_swiglu() != 0) return 1;
     if (test_kv_cache_ring() != 0) return 1;
     return 0;
 }

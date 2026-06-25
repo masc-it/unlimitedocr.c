@@ -602,12 +602,12 @@ Current priority slice, in order. The coding agent should take the first uncheck
 - [x] Implement CPU causal SDPA for tiny text-only fixtures.
 - [x] Implement CPU KV cache append/ring behavior for tiny fixtures.
 - [x] Implement CPU dense SwiGLU for layer 0.
-- [ ] Implement CPU MoE router:
-  - [ ] router matmul in fp32
-  - [ ] softmax in fp32
-  - [ ] top-6 greedy
-  - [ ] no top-k renormalization
-  - [ ] shared expert added after routed sum
+- [x] Implement CPU MoE router:
+  - [x] router matmul in fp32
+  - [x] softmax in fp32
+  - [x] top-6 greedy
+  - [x] no top-k renormalization
+  - [x] shared expert added after routed sum
 - [x] Implement no-repeat-ngram processor matching upstream `SlidingWindowNoRepeatNgramProcessor`.
 - [ ] Copy/adapt DS4 CPU quant dot helpers for `Q8_0` and `Q4_K` once quantization starts.
 - [ ] Add CPU reference tests against Python dumped tiny tensors.
