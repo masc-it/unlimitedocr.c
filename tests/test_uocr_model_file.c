@@ -70,6 +70,67 @@ static void fill_hash(uint8_t hash[32], uint8_t seed) {
     }
 }
 
+static int make_virtual_full_fp16_model(uocr_model_file *model,
+                                        uocr_file_header *header,
+                                        uocr_section_entry *tensor_data,
+                                        uocr_provenance_record *provenance,
+                                        uocr_tensor_entry **owned_tensors) {
+    if (model == NULL || header == NULL || tensor_data == NULL || provenance == NULL || owned_tensors == NULL) {
+        return 1;
+    }
+    memset(model, 0, sizeof(*model));
+    memset(header, 0, sizeof(*header));
+    memset(tensor_data, 0, sizeof(*tensor_data));
+    memset(provenance, 0, sizeof(*provenance));
+#if !defined(_WIN32)
+    model->fd = -1;
+#endif
+
+    uocr_tensor_entry *tensors = (uocr_tensor_entry *)calloc(UOCR_SOURCE_TENSOR_COUNT, sizeof(*tensors));
+    if (tensors == NULL) {
+        return 1;
+    }
+
+    const uint64_t base_payload = UOCR_FP16_TENSOR_PAYLOAD_BYTES / UOCR_SOURCE_TENSOR_COUNT;
+    const uint64_t payload_remainder = UOCR_FP16_TENSOR_PAYLOAD_BYTES % UOCR_SOURCE_TENSOR_COUNT;
+    for (uint32_t i = 0u; i < UOCR_SOURCE_TENSOR_COUNT; ++i) {
+        tensors[i].id = i + 1u;
+        tensors[i].family = UOCR_TENSOR_FAMILY_FINAL_NORM;
+        tensors[i].layer = -1;
+        tensors[i].expert = -1;
+        tensors[i].projection = UOCR_TENSOR_PROJ_WEIGHT;
+        tensors[i].usage = UOCR_TENSOR_USAGE_RUNTIME;
+        tensors[i].qtype = UOCR_TENSOR_F16;
+        tensors[i].rank = 1u;
+        tensors[i].logical_shape[0] = 1u;
+        tensors[i].physical_shape[0] = 1u;
+        tensors[i].payload_offset = i * base_payload;
+        tensors[i].payload_size = base_payload;
+    }
+    tensors[UOCR_SOURCE_TENSOR_COUNT - 1u].id = UOCR_TENSOR_ID_VISION_CLIP_UNUSED_PATCH_EMBED_WEIGHT;
+    tensors[UOCR_SOURCE_TENSOR_COUNT - 1u].family = UOCR_TENSOR_FAMILY_VISION_CLIP;
+    tensors[UOCR_SOURCE_TENSOR_COUNT - 1u].usage = UOCR_TENSOR_USAGE_PRESERVED_UNUSED;
+    tensors[UOCR_SOURCE_TENSOR_COUNT - 1u].payload_size = base_payload + payload_remainder;
+
+    header->qprofile = UOCR_QPROFILE_FP16;
+    header->section_count = 1u;
+    tensor_data->type = UOCR_SECTION_TENSOR_DATA;
+    tensor_data->size = UOCR_FP16_TENSOR_PAYLOAD_BYTES;
+    provenance->source_tensor_count = UOCR_SOURCE_TENSOR_COUNT;
+    provenance->runtime_tensor_count = UOCR_FP16_RUNTIME_TENSOR_COUNT;
+    provenance->preserved_unused_tensor_count = UOCR_FP16_PRESERVED_UNUSED_TENSOR_COUNT;
+    provenance->omitted_tensor_count = UOCR_FP16_OMITTED_TENSOR_COUNT;
+    provenance->qprofile = UOCR_QPROFILE_FP16;
+
+    model->header = header;
+    model->sections = tensor_data;
+    model->provenance = provenance;
+    model->tensors = tensors;
+    model->tensor_count = UOCR_SOURCE_TENSOR_COUNT;
+    *owned_tensors = tensors;
+    return 0;
+}
+
 typedef enum synthetic_tensor_corruption {
     SYNTHETIC_OK = 0,
     SYNTHETIC_CORRUPT_TENSOR_PAYLOAD = 1,
@@ -437,6 +498,67 @@ static int test_rejects_bad_tensor_data_alignment(void) {
     return 0;
 }
 
+static int test_full_fp16_accounting_validator_accepts_current_contract(void) {
+    uocr_model_file model;
+    uocr_file_header header;
+    uocr_section_entry tensor_data;
+    uocr_provenance_record provenance;
+    uocr_tensor_entry *tensors = NULL;
+    CHECK(make_virtual_full_fp16_model(&model, &header, &tensor_data, &provenance, &tensors) == 0);
+
+    char error[512];
+    CHECK(uocr_model_file_validate_full_fp16_accounting(&model, error, sizeof(error)) == 0);
+    free(tensors);
+    return 0;
+}
+
+static int test_full_fp16_accounting_validator_rejects_incomplete_model(void) {
+    char path[128];
+    CHECK(make_temp_path(path, sizeof(path)) == 0);
+    CHECK(write_synthetic_uocr_with_tensors(path, SYNTHETIC_OK) == 0);
+
+    char error[512];
+    uocr_model_file model;
+    CHECK(uocr_model_file_open(path, &model, error, sizeof(error)) == 0);
+    CHECK(uocr_model_file_validate_full_fp16_accounting(&model, error, sizeof(error)) != 0);
+    CHECK(strstr(error, "full fp16 source tensor count mismatch") != NULL);
+    uocr_model_file_close(&model);
+    unlink(path);
+    return 0;
+}
+
+static int test_full_fp16_accounting_validator_rejects_wrong_preserved_tensor(void) {
+    uocr_model_file model;
+    uocr_file_header header;
+    uocr_section_entry tensor_data;
+    uocr_provenance_record provenance;
+    uocr_tensor_entry *tensors = NULL;
+    CHECK(make_virtual_full_fp16_model(&model, &header, &tensor_data, &provenance, &tensors) == 0);
+    tensors[UOCR_SOURCE_TENSOR_COUNT - 1u].id = UOCR_TENSOR_ID_VISION_CLIP_BASE;
+
+    char error[512];
+    CHECK(uocr_model_file_validate_full_fp16_accounting(&model, error, sizeof(error)) != 0);
+    CHECK(strstr(error, "preserved-unused tensor mismatch") != NULL);
+    free(tensors);
+    return 0;
+}
+
+static int test_full_fp16_accounting_validator_rejects_payload_drift(void) {
+    uocr_model_file model;
+    uocr_file_header header;
+    uocr_section_entry tensor_data;
+    uocr_provenance_record provenance;
+    uocr_tensor_entry *tensors = NULL;
+    CHECK(make_virtual_full_fp16_model(&model, &header, &tensor_data, &provenance, &tensors) == 0);
+    tensors[0].payload_size += 2u;
+
+    char error[512];
+    CHECK(uocr_model_file_validate_full_fp16_accounting(&model, error, sizeof(error)) != 0);
+    CHECK(strstr(error, "tensor payload byte mismatch") != NULL);
+    free(tensors);
+    return 0;
+}
+
 static int test_valid_quantized_tensor_directory(void) {
     char path[128];
     CHECK(make_temp_path(path, sizeof(path)) == 0);
@@ -542,12 +664,17 @@ static int test_rejects_bad_config(void) {
 int main(void) {
     CHECK(uocr_tensor_id_layer_attn(3u, UOCR_TENSOR_PROJ_Q) == 13010u);
     CHECK(uocr_tensor_id_moe_expert(1u, 7u, UOCR_TENSOR_PROJ_DOWN) == 11123u);
+    CHECK(UOCR_TENSOR_ID_VISION_CLIP_UNUSED_PATCH_EMBED_WEIGHT == 200001u);
 
     if (test_valid_synthetic_file() != 0) return 1;
     if (test_valid_tensor_directory() != 0) return 1;
     if (test_rejects_tensor_payload_out_of_range() != 0) return 1;
     if (test_rejects_transposed_tensor_layout() != 0) return 1;
     if (test_rejects_bad_tensor_data_alignment() != 0) return 1;
+    if (test_full_fp16_accounting_validator_accepts_current_contract() != 0) return 1;
+    if (test_full_fp16_accounting_validator_rejects_incomplete_model() != 0) return 1;
+    if (test_full_fp16_accounting_validator_rejects_wrong_preserved_tensor() != 0) return 1;
+    if (test_full_fp16_accounting_validator_rejects_payload_drift() != 0) return 1;
     if (test_valid_quantized_tensor_directory() != 0) return 1;
     if (test_rejects_bad_quantized_row_size() != 0) return 1;
     if (test_valid_padded_q8_tensor_directory() != 0) return 1;

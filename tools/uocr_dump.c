@@ -116,6 +116,14 @@ int main(int argc, char **argv) {
         printf("... safetensors_index=");
         print_hash_prefix(model.provenance->safetensors_index_hash);
         printf("...\n");
+        if (model.header->qprofile == UOCR_QPROFILE_FP16) {
+            char exact_error[256];
+            if (uocr_model_file_validate_full_fp16_accounting(&model, exact_error, sizeof(exact_error)) == 0) {
+                printf("  full_fp16_accounting: ok\n");
+            } else {
+                printf("  full_fp16_accounting: not-current-full-model (%s)\n", exact_error);
+            }
+        }
     }
 
     if (model.tensor_count > 0u && model.tensors != NULL) {

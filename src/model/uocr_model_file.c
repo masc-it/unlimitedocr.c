@@ -1,6 +1,7 @@
 #include "model/uocr_model_file.h"
 
 #include "core/uocr_alloc.h"
+#include "model/uocr_tensor_registry.h"
 #include "quant/uocr_quant.h"
 
 #include <errno.h>
@@ -228,6 +229,113 @@ const uocr_tensor_entry *uocr_model_file_find_tensor(const uocr_model_file *file
         }
     }
     return NULL;
+}
+
+int uocr_model_file_validate_full_fp16_accounting(const uocr_model_file *file, char *error, size_t error_size) {
+    if (file == NULL || file->header == NULL || file->provenance == NULL || file->tensors == NULL) {
+        return fail(error, error_size, "full fp16 accounting requires a loaded model with provenance and tensor directory");
+    }
+    if (file->header->qprofile != UOCR_QPROFILE_FP16 || file->provenance->qprofile != UOCR_QPROFILE_FP16) {
+        return fail(error,
+                    error_size,
+                    "full fp16 accounting requires qprofile fp16, got header=%u provenance=%u",
+                    file->header->qprofile,
+                    file->provenance->qprofile);
+    }
+    if (file->provenance->source_tensor_count != UOCR_SOURCE_TENSOR_COUNT) {
+        return fail(error,
+                    error_size,
+                    "full fp16 source tensor count mismatch: got %u expected %u",
+                    file->provenance->source_tensor_count,
+                    UOCR_SOURCE_TENSOR_COUNT);
+    }
+    if (file->tensor_count != UOCR_SOURCE_TENSOR_COUNT) {
+        return fail(error,
+                    error_size,
+                    "full fp16 tensor directory count mismatch: got %u expected %u",
+                    file->tensor_count,
+                    UOCR_SOURCE_TENSOR_COUNT);
+    }
+    if (file->provenance->runtime_tensor_count != UOCR_FP16_RUNTIME_TENSOR_COUNT ||
+        file->provenance->preserved_unused_tensor_count != UOCR_FP16_PRESERVED_UNUSED_TENSOR_COUNT ||
+        file->provenance->omitted_tensor_count != UOCR_FP16_OMITTED_TENSOR_COUNT) {
+        return fail(error,
+                    error_size,
+                    "full fp16 usage accounting mismatch: runtime=%u preserved-unused=%u omitted=%u expected=%u/%u/%u",
+                    file->provenance->runtime_tensor_count,
+                    file->provenance->preserved_unused_tensor_count,
+                    file->provenance->omitted_tensor_count,
+                    UOCR_FP16_RUNTIME_TENSOR_COUNT,
+                    UOCR_FP16_PRESERVED_UNUSED_TENSOR_COUNT,
+                    UOCR_FP16_OMITTED_TENSOR_COUNT);
+    }
+
+    const uocr_section_entry *tensor_data = uocr_model_file_find_section(file, UOCR_SECTION_TENSOR_DATA);
+    if (tensor_data == NULL) {
+        return fail(error, error_size, "full fp16 accounting requires a tensor-data section");
+    }
+    if (tensor_data->size != UOCR_FP16_TENSOR_PAYLOAD_BYTES) {
+        return fail(error,
+                    error_size,
+                    "full fp16 tensor-data byte mismatch: got %llu expected %llu",
+                    (unsigned long long)tensor_data->size,
+                    (unsigned long long)UOCR_FP16_TENSOR_PAYLOAD_BYTES);
+    }
+
+    uint32_t runtime = 0u;
+    uint32_t preserved = 0u;
+    uint32_t omitted = 0u;
+    uint64_t payload_bytes = 0u;
+    const uocr_tensor_entry *preserved_tensor = NULL;
+    for (uint32_t i = 0u; i < file->tensor_count; ++i) {
+        const uocr_tensor_entry *tensor = &file->tensors[i];
+        if (tensor->qtype != UOCR_TENSOR_F16) {
+            return fail(error,
+                        error_size,
+                        "full fp16 tensor %u id=%u has non-fp16 qtype %u",
+                        i,
+                        tensor->id,
+                        tensor->qtype);
+        }
+        if (tensor->usage == UOCR_TENSOR_USAGE_RUNTIME) {
+            ++runtime;
+        } else if (tensor->usage == UOCR_TENSOR_USAGE_PRESERVED_UNUSED) {
+            ++preserved;
+            preserved_tensor = tensor;
+        } else if (tensor->usage == UOCR_TENSOR_USAGE_OMITTED_WITH_REASON) {
+            ++omitted;
+        } else {
+            return fail(error, error_size, "full fp16 tensor %u id=%u has unknown usage %u", i, tensor->id, tensor->usage);
+        }
+        payload_bytes += tensor->payload_size;
+    }
+    if (runtime != UOCR_FP16_RUNTIME_TENSOR_COUNT || preserved != UOCR_FP16_PRESERVED_UNUSED_TENSOR_COUNT ||
+        omitted != UOCR_FP16_OMITTED_TENSOR_COUNT) {
+        return fail(error,
+                    error_size,
+                    "full fp16 tensor usage count mismatch: runtime=%u preserved-unused=%u omitted=%u expected=%u/%u/%u",
+                    runtime,
+                    preserved,
+                    omitted,
+                    UOCR_FP16_RUNTIME_TENSOR_COUNT,
+                    UOCR_FP16_PRESERVED_UNUSED_TENSOR_COUNT,
+                    UOCR_FP16_OMITTED_TENSOR_COUNT);
+    }
+    if (payload_bytes != UOCR_FP16_TENSOR_PAYLOAD_BYTES) {
+        return fail(error,
+                    error_size,
+                    "full fp16 tensor payload byte mismatch: got %llu expected %llu",
+                    (unsigned long long)payload_bytes,
+                    (unsigned long long)UOCR_FP16_TENSOR_PAYLOAD_BYTES);
+    }
+    if (preserved_tensor == NULL || preserved_tensor->id != UOCR_TENSOR_ID_VISION_CLIP_UNUSED_PATCH_EMBED_WEIGHT ||
+        preserved_tensor->family != UOCR_TENSOR_FAMILY_VISION_CLIP) {
+        return fail(error,
+                    error_size,
+                    "full fp16 preserved-unused tensor mismatch: expected CLIP patch embedding id %u",
+                    UOCR_TENSOR_ID_VISION_CLIP_UNUSED_PATCH_EMBED_WEIGHT);
+    }
+    return 0;
 }
 
 static int validate_config(const uocr_config_record *cfg, char *error, size_t error_size) {

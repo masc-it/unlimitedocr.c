@@ -29,6 +29,7 @@ typedef struct uocr_model_file {
 
 int uocr_model_file_open(const char *path, uocr_model_file *out, char *error, size_t error_size);
 int uocr_model_file_validate_memory(const void *data, size_t size, uocr_model_file *out, char *error, size_t error_size);
+int uocr_model_file_validate_full_fp16_accounting(const uocr_model_file *file, char *error, size_t error_size);
 void uocr_model_file_close(uocr_model_file *file);
 
 const uocr_section_entry *uocr_model_file_find_section(const uocr_model_file *file, uint32_t section_type);

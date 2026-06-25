@@ -41,7 +41,8 @@ enum {
     UOCR_TENSOR_ID_LAYER_MOE_EXPERT_DOWN = 2u,
 
     UOCR_TENSOR_ID_VISION_SAM_BASE = 100000u,
-    UOCR_TENSOR_ID_VISION_CLIP_BASE = 200000u
+    UOCR_TENSOR_ID_VISION_CLIP_BASE = 200000u,
+    UOCR_TENSOR_ID_VISION_CLIP_UNUSED_PATCH_EMBED_WEIGHT = 200001u
 };
 
 static inline uocr_tensor_id uocr_tensor_id_layer(uint32_t layer, uint32_t local_id) {
