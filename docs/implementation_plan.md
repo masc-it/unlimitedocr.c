@@ -45,7 +45,7 @@ Implementation status:
 
 ## Highest-impact next work
 
-1. [ ] Add mandatory stage timing and memory profiling.
+1. [x] Add mandatory stage timing and memory profiling.
 2. [ ] Make vision GPU-resident end-to-end: no per-stage host scratch, readback, or rematerialized weight buffers.
 3. [ ] Optimize decoder token kernels beyond LM head: attention projections, dense MLP, routed/shared MoE, and binding lookup overhead.
 4. [ ] Correct runtime memory accounting and switch arenas to request-sized lazy/grow-on-demand allocation.
@@ -66,7 +66,7 @@ Implementation status:
 - [x] Record Metal timings for SAM patch/neck, SAM blocks, CLIP blocks, projector, formatter, prompt assembly, each decoder layer group, final norm, LM-head selection, no-repeat processing, and command-buffer waits.
 - [x] Record allocation/object counts for Metal buffers, command buffers, command encoders, MPS descriptors, MPS NDArrays, NSArrays, and transient-retain arrays.
 - [x] Record memory by category: model views, runtime arenas, KV cache, host vision scratch, private/shared vision workspace, transient buffers, logits/selection scratch, and total live/peak bytes.
-- [ ] Produce baseline profiles for `docs/test.png` with `preset="base"`, `preset="gundam"`, `max_length=4096`, and default OCR settings.
+- [x] Produce baseline profiles for `docs/test.png` with `preset="base"`, `preset="gundam"`, `max_length=4096`, and default OCR settings.
 - [ ] Reject optimization PRs that do not include comparable before/after timing evidence.
 - [ ] Reject optimization PRs that keep fallback, duplicate, or unselected production paths after the optimized path is confirmed.
 
@@ -370,7 +370,7 @@ host-residency issue, then attacks decode throughput and memory pressure.
 
 Implementation status:
 
-- [ ] Land profiling/timing/memory instrumentation and capture baselines.
+- [x] Land profiling/timing/memory instrumentation and capture baselines.
 - [ ] Rewrite vision to be GPU-resident through prompt splice; remove host-scratch production path.
 - [ ] Fix vision memory accounting to match the new GPU-resident workspace.
 - [ ] Cache decoder bindings and MoE expert slabs to remove hot-loop CPU lookup/validation.
