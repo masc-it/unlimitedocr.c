@@ -101,9 +101,7 @@ static int test_minimal_runtime_estimate(void) {
     uint64_t expected_logits = 0u;
     CHECK(uocr_estimate_kv_cache_bytes(batch, prompt_tokens, &expected_kv) == UOCR_OK);
     CHECK(uocr_estimate_prompt_embedding_bytes(batch, prompt_tokens, &expected_prompt) == UOCR_OK);
-    CHECK(uocr_estimate_vision_scratch_bytes_for_rows(prompt_tokens,
-                                                       UOCR_GLOBAL_GRID_QUERIES * UOCR_GLOBAL_GRID_QUERIES,
-                                                       &expected_vision) == UOCR_OK);
+    CHECK(uocr_estimate_vision_scratch_bytes_for_rows(0u, 0u, &expected_vision) == UOCR_OK);
     CHECK(uocr_estimate_decoder_scratch_bytes(batch, prompt_tokens, &expected_decoder) == UOCR_OK);
     CHECK(uocr_estimate_moe_scratch_bytes(batch, prompt_tokens, &expected_moe) == UOCR_OK);
     uint64_t expected_moe_router_topk = 0u;

@@ -198,7 +198,7 @@ static int test_engine_memory_report(void) {
     CHECK(report.total_live_bytes == 0u);
     CHECK(report.estimated_kv_cache_bytes > 0u);
     CHECK(report.estimated_prompt_embeddings_bytes == 16u * 1280u * 2u);
-    CHECK(report.estimated_vision_scratch_bytes > 0u);
+    CHECK(report.estimated_vision_scratch_bytes == 0u);
     CHECK(report.estimated_decoder_scratch_bytes > 0u);
     CHECK(report.estimated_moe_scratch_bytes > 0u);
     CHECK(report.estimated_logits_readback_bytes == 129280u * 4u + 4u);

@@ -15188,16 +15188,13 @@ static int test_metal_runtime_arenas(void) {
     uint64_t expected_decoder = 0u;
     uint64_t expected_router_topk = 0u;
     uint64_t expected_moe_intermediate = 0u;
-    uint64_t expected_vision = 0u;
+    const uint64_t expected_vision = 0u;
     uint64_t expected_logits = 0u;
     CHECK(uocr_estimate_kv_cache_bytes(1u, 16u, &expected_kv) == UOCR_OK);
     CHECK(uocr_estimate_prompt_embedding_bytes(1u, 16u, &expected_prompt) == UOCR_OK);
     CHECK(uocr_estimate_decoder_scratch_bytes(1u, 16u, &expected_decoder) == UOCR_OK);
     CHECK(uocr_estimate_moe_router_topk_bytes(1u, 16u, &expected_router_topk) == UOCR_OK);
     CHECK(uocr_estimate_moe_intermediate_bytes(1u, 16u, &expected_moe_intermediate) == UOCR_OK);
-    CHECK(uocr_estimate_vision_scratch_bytes_for_rows(16u,
-                                                       UOCR_GLOBAL_GRID_QUERIES * UOCR_GLOBAL_GRID_QUERIES,
-                                                       &expected_vision) == UOCR_OK);
     CHECK(uocr_estimate_logits_readback_bytes(1u, &expected_logits) == UOCR_OK);
 
     CHECK(uocr_metal_context_runtime_arena_capacity(ctx, UOCR_METAL_ARENA_KV_CACHE) == expected_kv);

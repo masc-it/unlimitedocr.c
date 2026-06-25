@@ -39,7 +39,7 @@ Implementation status:
 - [x] Public image generation now calls `uocr_metal_context_generate_image_f16()`, which encodes formatted visual rows into a reusable Metal vision workspace and passes that slice into prompt assembly without a host visual-feature allocation.
 - [x] The production vision path uses reusable top-level Metal workspace slices for SAM/CLIP/concat/projector/final rows; many per-block host buffers still remain inside transformer helpers (`src/backend/metal/uocr_metal.m`).
 - [x] Many vision helpers allocate `newBufferWithBytes` / `newBufferWithLength`, commit, wait, and `memcpy` back to host for each stage.
-- [x] `UOCR_METAL_ARENA_VISION_SCRATCH` is allocated from stale estimates but is not used by the current production vision path except for allocation/accounting (`src/backend/metal/uocr_metal.m:3770`; estimator `src/runtime/uocr_memory.c:150`).
+- [x] `UOCR_METAL_ARENA_VISION_SCRATCH` is no longer allocated from stale prompt-token estimates at engine open; production vision workspace now grows through the request-shaped Metal vision scratch buffer.
 - [x] Integrated decode already uses a fused GPU LM-head argmax kernel (`uocr_lm_head_argmax_f16`) for the public `uocr_metal_context_generate_f16()` path (`src/backend/metal/uocr_metal.m:5222`, `src/backend/metal/kernels/uocr_smoke.metal:2024`).
 - [x] The old full-logits LM-head path still exists in helper/diagnostic code (`uocr_metal_context_lm_head_f16`, `src/backend/metal/uocr_metal.m:13084`) and should not be treated as the public decode path.
 
@@ -98,10 +98,10 @@ Implementation status:
 
 Current finding:
 
-- [x] `runtime_arena_capacities()` sizes `UOCR_METAL_ARENA_VISION_SCRATCH` with `uocr_estimate_vision_scratch_bytes_for_rows(prompt_token_capacity, 256, ...)` (`src/backend/metal/uocr_metal.m:3770`).
-- [x] The current production vision path does not use that arena.
-- [x] The estimator mixes input, SAM, CLIP, concat, projected chunk, and final visual bytes under one stale “vision scratch” category (`src/runtime/uocr_memory.c:150`).
-- [x] A 4096-token default engine reserves about 24.6 MiB for this stale category; final base visual features need about 0.67 MiB.
+- [x] `runtime_arena_capacities()` now leaves `UOCR_METAL_ARENA_VISION_SCRATCH` empty; request-shaped vision workspace allocation is handled by `UOCR_METAL_SCRATCH_VISION`.
+- [x] The current production vision path does not use that runtime arena.
+- [x] The estimator still groups input, SAM, CLIP, concat, projected chunk, and final visual bytes under one “vision scratch” category (`src/runtime/uocr_memory.c`).
+- [x] A 4096-token default engine no longer reserves a stale prompt-sized vision arena at open; final visual/workspace estimates are now attached to accepted image requests.
 
 Impact: memory reports and admission decisions are wrong. They over-reserve an
 unused arena, under-describe actual host/transient vision allocations, and make
@@ -109,9 +109,9 @@ it harder to run small requests on constrained machines.
 
 Implementation status:
 
-- [ ] Remove unused `UOCR_METAL_ARENA_VISION_SCRATCH` from production allocation or repurpose it as the confirmed GPU-resident visual workspace.
+- [x] Remove unused `UOCR_METAL_ARENA_VISION_SCRATCH` from production allocation or repurpose it as the confirmed GPU-resident visual workspace.
 - [ ] Separate memory categories for final visual features, GPU vision workspace, host staging, and transient buffers.
-- [ ] Size final visual features from actual visual rows and hidden size, not prompt token capacity.
+- [x] Size final visual features from actual visual rows and hidden size, not prompt token capacity.
 - [ ] Size vision workspace from actual view shape and chunk size.
 - [ ] Include vision workspace high-water marks in `uocr_engine_memory_report()`.
 - [ ] Update OOM diagnostics to show requested views, visual rows, workspace bytes, and configured budget.

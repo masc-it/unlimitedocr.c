@@ -411,10 +411,15 @@ int uocr_estimate_minimal_runtime_memory(uint32_t batch_slots,
                                          uint32_t prompt_token_capacity,
                                          uint64_t model_view_bytes,
                                          uocr_runtime_memory_estimate *out_estimate) {
+    /* Engine-open estimates cover only always-live runtime arenas. Vision
+     * workspace is request-shaped and allocated by the Metal scratch allocator
+     * when an image request is accepted, so no prompt-sized placeholder is
+     * reserved here.
+     */
     return uocr_estimate_runtime_memory_with_vision(batch_slots,
                                                    prompt_token_capacity,
                                                    model_view_bytes,
-                                                   prompt_token_capacity,
-                                                   UOCR_GLOBAL_GRID_QUERIES * UOCR_GLOBAL_GRID_QUERIES,
+                                                   0u,
+                                                   0u,
                                                    out_estimate);
 }

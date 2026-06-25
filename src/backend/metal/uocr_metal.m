@@ -4054,12 +4054,11 @@ static int runtime_arena_capacities(uint32_t batch_slots,
     if (status != UOCR_OK) {
         return status;
     }
-    status = uocr_estimate_vision_scratch_bytes_for_rows(prompt_token_capacity,
-                                                         UOCR_GLOBAL_GRID_QUERIES * UOCR_GLOBAL_GRID_QUERIES,
-                                                         &capacities[UOCR_METAL_ARENA_VISION_SCRATCH]);
-    if (status != UOCR_OK) {
-        return status;
-    }
+    /* Vision workspace is request-shaped and grow-on-demand via
+     * UOCR_METAL_SCRATCH_VISION.  Do not reserve a stale prompt-sized
+     * runtime arena at engine open.
+     */
+    capacities[UOCR_METAL_ARENA_VISION_SCRATCH] = 0u;
     status = uocr_estimate_logits_readback_bytes(batch_slots, &capacities[UOCR_METAL_ARENA_LOGITS_READBACK]);
     if (status != UOCR_OK) {
         return status;
