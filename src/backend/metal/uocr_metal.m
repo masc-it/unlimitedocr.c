@@ -401,22 +401,45 @@ static id<MTLBuffer> metal_new_buffer_with_bytes_no_copy(uocr_metal_context *ctx
     return buffer;
 }
 
+/* Legacy helpers still allocate their own command buffer and call the wait
+ * macro directly.  When a higher-level stage has opened active_command_buffer,
+ * metal_new_command_buffer() returns that batch buffer and this macro records a
+ * deferred wait instead of committing in the middle of the command graph.
+ */
 #define UOCR_METAL_COMMIT_AND_WAIT_PROFILED(ctx_, cb_)                                  \
     do {                                                                                 \
-        const uint64_t uocr_metal_wait_start_ns__ = uocr_profile_now_ns();                \
-        [(cb_) commit];                                                                  \
-        [(cb_) waitUntilCompleted];                                                      \
-        if (metal_profile_enabled((ctx_))) {                                              \
-            uocr_profile_add_metal_command_buffer_wait((ctx_)->profile);                  \
-            uocr_profile_add_event_now((ctx_)->profile,                                  \
-                                       "metal.command_buffer_wait",                      \
-                                       uocr_metal_wait_start_ns__);                       \
+        uocr_metal_context *uocr_metal_wait_ctx__ = (ctx_);                              \
+        id<MTLCommandBuffer> uocr_metal_wait_cb__ = (cb_);                               \
+        if (uocr_metal_wait_cb__ != nil && uocr_metal_wait_ctx__ != NULL &&               \
+            uocr_metal_wait_ctx__->active_command_buffer == uocr_metal_wait_cb__) {       \
+            if (metal_profile_enabled(uocr_metal_wait_ctx__)) {                           \
+                uocr_profile_add_event_ms(uocr_metal_wait_ctx__->profile,                 \
+                                          "metal.command_buffer_wait_deferred",           \
+                                          0.0);                                           \
+            }                                                                            \
+        } else {                                                                         \
+            const uint64_t uocr_metal_wait_start_ns__ = uocr_profile_now_ns();            \
+            [uocr_metal_wait_cb__ commit];                                               \
+            [uocr_metal_wait_cb__ waitUntilCompleted];                                   \
+            if (metal_profile_enabled(uocr_metal_wait_ctx__)) {                           \
+                uocr_profile_add_metal_command_buffer_wait(uocr_metal_wait_ctx__->profile); \
+                uocr_profile_add_event_now(uocr_metal_wait_ctx__->profile,                \
+                                           "metal.command_buffer_wait",                  \
+                                           uocr_metal_wait_start_ns__);                   \
+            }                                                                            \
         }                                                                                \
     } while (0)
 
 static id<MTLCommandBuffer> metal_new_command_buffer(uocr_metal_context *ctx);
 static id<MTLComputeCommandEncoder> metal_compute_command_encoder(uocr_metal_context *ctx, id<MTLCommandBuffer> cb);
 static id<MTLBlitCommandEncoder> metal_blit_command_encoder(uocr_metal_context *ctx, id<MTLCommandBuffer> cb);
+static int metal_command_batch_active(const uocr_metal_context *ctx);
+static int metal_command_batch_begin(uocr_metal_context *ctx, char *error, size_t error_size);
+static void metal_command_batch_abort(uocr_metal_context *ctx);
+static int metal_command_batch_commit_and_wait(uocr_metal_context *ctx,
+                                               const char *op_name,
+                                               char *error,
+                                               size_t error_size);
 
 static int metal_fail(char *error, size_t error_size, const char *fmt, ...) {
     if (error != NULL && error_size > 0u) {
@@ -4268,59 +4291,91 @@ static int metal_context_encode_visual_features_to_workspace_f16(uocr_metal_cont
     const uint64_t chunk_processing_start_ns = uocr_profile_now_ns();
     uint64_t formatter_ns = 0u;
     int process_status = UOCR_OK;
-    if (schedule->local_view_count != 0u) {
-        const uint64_t formatter_start_ns = uocr_profile_now_ns();
-        if (!metal_fill_local_visual_newlines_f16(ctx,
-                                                  weights->image_newline,
-                                                  scratch->final_visual_rows,
-                                                  request->crop_grid_w,
-                                                  request->crop_grid_h,
-                                                  error,
-                                                  error_size)) {
-            process_status = UOCR_ERROR_INTERNAL;
-        }
-        formatter_ns += uocr_profile_now_ns() - formatter_start_ns;
-    }
+    uint32_t local_newlines_encoded = 0u;
     for (uint32_t chunk_index = 0u; process_status == UOCR_OK && chunk_index < schedule->chunk_count; ++chunk_index) {
         const uocr_vision_chunk *chunk = &chunks[chunk_index];
-        process_status = metal_project_vision_chunk_f16(chunk,
-                                                        scratch->projected_rows,
-                                                        scratch->projected_row_capacity,
-                                                        &project,
-                                                        error,
-                                                        error_size);
-        if (process_status != UOCR_OK) {
+        const int had_active_batch = metal_command_batch_active(ctx);
+        const char *shape_group_op = chunk->kind == UOCR_VISION_CHUNK_LOCAL ?
+                                         "Metal local vision shape-group graph" :
+                                         "Metal global vision shape-group graph";
+        if (!had_active_batch && !metal_command_batch_begin(ctx, error, error_size)) {
+            process_status = UOCR_ERROR_INTERNAL;
             break;
         }
-        const uint64_t formatter_start_ns = uocr_profile_now_ns();
-        if (chunk->kind == UOCR_VISION_CHUNK_LOCAL) {
-            if (!metal_format_local_visual_rows_f16(ctx,
-                                                    chunk,
-                                                    scratch->projected_rows,
-                                                    scratch->final_visual_rows,
-                                                    request->crop_grid_w,
-                                                    error,
-                                                    error_size)) {
+
+        if (chunk->kind == UOCR_VISION_CHUNK_LOCAL && !local_newlines_encoded) {
+            const uint64_t formatter_start_ns = uocr_profile_now_ns();
+            if (!metal_fill_local_visual_newlines_f16(ctx,
+                                                      weights->image_newline,
+                                                      scratch->final_visual_rows,
+                                                      request->crop_grid_w,
+                                                      request->crop_grid_h,
+                                                      error,
+                                                      error_size)) {
                 process_status = UOCR_ERROR_INTERNAL;
+            } else {
+                local_newlines_encoded = 1u;
             }
-        } else {
-            const uint32_t dst_base = schedule->local_view_count == 0u ?
-                                          chunk->first_view * UOCR_GLOBAL_VISUAL_TOKENS :
-                                          uocr_local_visual_token_count(request->crop_grid_w, request->crop_grid_h);
-            if (!metal_format_global_visual_rows_f16(ctx,
-                                                     scratch->projected_rows,
-                                                     weights->image_newline,
-                                                     weights->view_separator,
-                                                     scratch->final_visual_rows,
-                                                     chunk->projected_grid_w,
-                                                     chunk->view_count,
-                                                     dst_base,
-                                                     error,
-                                                     error_size)) {
-                process_status = UOCR_ERROR_INTERNAL;
+            formatter_ns += uocr_profile_now_ns() - formatter_start_ns;
+        }
+
+        if (process_status == UOCR_OK) {
+            process_status = metal_project_vision_chunk_f16(chunk,
+                                                            scratch->projected_rows,
+                                                            scratch->projected_row_capacity,
+                                                            &project,
+                                                            error,
+                                                            error_size);
+        }
+
+        if (process_status == UOCR_OK) {
+            const uint64_t formatter_start_ns = uocr_profile_now_ns();
+            if (chunk->kind == UOCR_VISION_CHUNK_LOCAL) {
+                if (!metal_format_local_visual_rows_f16(ctx,
+                                                        chunk,
+                                                        scratch->projected_rows,
+                                                        scratch->final_visual_rows,
+                                                        request->crop_grid_w,
+                                                        error,
+                                                        error_size)) {
+                    process_status = UOCR_ERROR_INTERNAL;
+                }
+            } else {
+                const uint32_t dst_base = schedule->local_view_count == 0u ?
+                                              chunk->first_view * UOCR_GLOBAL_VISUAL_TOKENS :
+                                              uocr_local_visual_token_count(request->crop_grid_w, request->crop_grid_h);
+                if (!metal_format_global_visual_rows_f16(ctx,
+                                                         scratch->projected_rows,
+                                                         weights->image_newline,
+                                                         weights->view_separator,
+                                                         scratch->final_visual_rows,
+                                                         chunk->projected_grid_w,
+                                                         chunk->view_count,
+                                                         dst_base,
+                                                         error,
+                                                         error_size)) {
+                    process_status = UOCR_ERROR_INTERNAL;
+                }
+            }
+            formatter_ns += uocr_profile_now_ns() - formatter_start_ns;
+        }
+
+        if (!had_active_batch) {
+            if (process_status == UOCR_OK) {
+                const uint64_t shape_group_wait_start_ns = uocr_profile_now_ns();
+                if (!metal_command_batch_commit_and_wait(ctx, shape_group_op, error, error_size)) {
+                    process_status = UOCR_ERROR_INTERNAL;
+                } else {
+                    metal_profile_add_event_now(ctx,
+                                                chunk->kind == UOCR_VISION_CHUNK_LOCAL ?
+                                                    "metal.vision.local_shape_group_command_wait" :
+                                                    "metal.vision.global_shape_group_command_wait",
+                                                shape_group_wait_start_ns);
+                }
+            } else {
+                metal_command_batch_abort(ctx);
             }
         }
-        formatter_ns += uocr_profile_now_ns() - formatter_start_ns;
     }
     free(chunks);
 
@@ -6009,6 +6064,9 @@ static int metal_wait_for_command_buffer_profiled(uocr_metal_context *ctx,
 static id<MTLCommandBuffer> metal_new_command_buffer(uocr_metal_context *ctx) {
     if (ctx == NULL || ctx->queue == nil) {
         return nil;
+    }
+    if (ctx->active_command_buffer != nil) {
+        return ctx->active_command_buffer;
     }
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wobjc-method-access"
