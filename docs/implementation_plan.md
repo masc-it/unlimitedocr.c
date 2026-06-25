@@ -977,9 +977,9 @@ Do not start the stable high-level OCR/PDF API until Gate E2E-0 passes: public f
   - [ ] no-repeat-ngram processor
   - [ ] KV ring index arithmetic
 - [ ] Add native CTest tests:
-  - [ ] endian/alignment parsing
-  - [ ] tensor directory range validation
-  - [ ] qtype row-size math
+  - [x] endian/alignment parsing
+  - [x] tensor directory range validation
+  - [x] qtype row-size math
   - [x] tensor id lookup
   - [x] allocation wrapper accounting/overflow/guard tests
   - [x] runtime memory accounting and KV formula tests

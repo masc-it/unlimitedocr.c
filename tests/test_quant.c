@@ -1,5 +1,6 @@
 #include "quant/uocr_quant.h"
 
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -73,18 +74,27 @@ static int test_quant_type_traits(void) {
 }
 
 static int test_quant_row_sizes(void) {
-    uint64_t row_size = 0u;
+    uint64_t row_size = 123u;
     CHECK(uocr_quant_row_size(UOCR_TENSOR_Q8_0, 32u, &row_size) == 1);
     CHECK(row_size == 34u);
     CHECK(uocr_quant_row_size(UOCR_TENSOR_Q8_0, 64u, &row_size) == 1);
     CHECK(row_size == 68u);
     CHECK(uocr_quant_row_size(UOCR_TENSOR_Q8_0, 33u, &row_size) == 0);
+    CHECK(row_size == 0u);
+    CHECK(uocr_quant_row_size(UOCR_TENSOR_Q8_0, 0u, &row_size) == 0);
+    CHECK(row_size == 0u);
+    CHECK(uocr_quant_row_size(UOCR_TENSOR_Q8_0, 32u, NULL) == 0);
+    CHECK(uocr_quant_row_size(9999u, 32u, &row_size) == 0);
+    CHECK(row_size == 0u);
+    CHECK(uocr_quant_row_size(UOCR_TENSOR_Q8_0, UINT64_MAX - 31u, &row_size) == 0);
+    CHECK(row_size == 0u);
 
     CHECK(uocr_quant_row_size(UOCR_TENSOR_Q4_K, 256u, &row_size) == 1);
     CHECK(row_size == 144u);
     CHECK(uocr_quant_row_size(UOCR_TENSOR_Q4_K, 512u, &row_size) == 1);
     CHECK(row_size == 288u);
     CHECK(uocr_quant_row_size(UOCR_TENSOR_Q4_K, 128u, &row_size) == 0);
+    CHECK(row_size == 0u);
 
     uint32_t shape[UOCR_TENSOR_MAX_DIMS] = {3u, 512u, 0u, 0u};
     uint64_t payload_size = 0u;
@@ -92,6 +102,20 @@ static int test_quant_row_sizes(void) {
     CHECK(payload_size == 3u * 288u);
     shape[1] = 384u;
     CHECK(uocr_quant_tensor_payload_size(UOCR_TENSOR_Q4_K, shape, 2u, &payload_size) == 0);
+    CHECK(payload_size == 0u);
+    shape[0] = 2u;
+    shape[1] = 3u;
+    shape[2] = 64u;
+    CHECK(uocr_quant_tensor_payload_size(UOCR_TENSOR_Q8_0, shape, 3u, &payload_size) == 1);
+    CHECK(payload_size == 2u * 3u * 68u);
+    shape[1] = 0u;
+    CHECK(uocr_quant_tensor_payload_size(UOCR_TENSOR_Q8_0, shape, 3u, &payload_size) == 0);
+    CHECK(payload_size == 0u);
+    CHECK(uocr_quant_tensor_payload_size(UOCR_TENSOR_Q8_0, shape, 1u, &payload_size) == 0);
+    CHECK(payload_size == 0u);
+    CHECK(uocr_quant_tensor_payload_size(UOCR_TENSOR_Q8_0, NULL, 2u, &payload_size) == 0);
+    CHECK(payload_size == 0u);
+    CHECK(uocr_quant_tensor_payload_size(UOCR_TENSOR_Q8_0, shape, 2u, NULL) == 0);
     return 0;
 }
 

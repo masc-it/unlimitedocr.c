@@ -15,24 +15,33 @@
         }                                                                           \
     } while (0)
 
-static int write_synthetic_uocr(const char *path, int corrupt_config) {
-    const uint64_t header_offset = 0u;
+typedef enum synthetic_header_corruption {
+    SYNTHETIC_HEADER_OK = 0,
+    SYNTHETIC_HEADER_BAD_ENDIAN = 1,
+    SYNTHETIC_HEADER_ZERO_ALIGNMENT = 2,
+    SYNTHETIC_HEADER_UNALIGNED_SECTION_DIR = 3
+} synthetic_header_corruption;
+
+static int write_synthetic_uocr_header_case(const char *path,
+                                            int corrupt_config,
+                                            synthetic_header_corruption corruption) {
     const uint64_t section_dir_offset = sizeof(uocr_file_header);
-    const uint64_t config_offset = section_dir_offset + sizeof(uocr_section_entry);
+    const uint64_t written_section_dir_offset = section_dir_offset;
+    const uint64_t config_offset = written_section_dir_offset + sizeof(uocr_section_entry);
     const uint64_t file_size = config_offset + sizeof(uocr_config_record);
 
-    (void)header_offset;
     uocr_file_header header;
     memset(&header, 0, sizeof(header));
     memcpy(header.magic, UOCR_FILE_MAGIC, 4u);
     header.version = UOCR_FORMAT_VERSION;
     header.header_size = (uint32_t)sizeof(uocr_file_header);
-    header.endian_marker = UOCR_ENDIAN_MARKER;
-    header.required_alignment = 8u;
+    header.endian_marker = corruption == SYNTHETIC_HEADER_BAD_ENDIAN ? 0x04030201u : UOCR_ENDIAN_MARKER;
+    header.required_alignment = corruption == SYNTHETIC_HEADER_ZERO_ALIGNMENT ? 0u : 8u;
     header.qprofile = UOCR_QPROFILE_FP16;
     header.section_count = 1u;
     header.file_size = file_size;
-    header.section_dir_offset = section_dir_offset;
+    header.section_dir_offset = corruption == SYNTHETIC_HEADER_UNALIGNED_SECTION_DIR ? section_dir_offset + 4u
+                                                                                     : section_dir_offset;
 
     uocr_section_entry section;
     memset(&section, 0, sizeof(section));
@@ -57,6 +66,10 @@ static int write_synthetic_uocr(const char *path, int corrupt_config) {
     failed |= fwrite(&config, 1u, sizeof(config), f) != sizeof(config);
     failed |= fclose(f) != 0;
     return failed ? 1 : 0;
+}
+
+static int write_synthetic_uocr(const char *path, int corrupt_config) {
+    return write_synthetic_uocr_header_case(path, corrupt_config, SYNTHETIC_HEADER_OK);
 }
 
 static uint64_t align_up_u64(uint64_t value, uint64_t align) {
@@ -138,7 +151,8 @@ typedef enum synthetic_tensor_corruption {
     SYNTHETIC_CORRUPT_TENSOR_DATA_ALIGNMENT = 3,
     SYNTHETIC_CORRUPT_TOKENIZER = 4,
     SYNTHETIC_CORRUPT_PROVENANCE = 5,
-    SYNTHETIC_CORRUPT_TENSOR_TRANSPOSE_FLAG = 6
+    SYNTHETIC_CORRUPT_TENSOR_TRANSPOSE_FLAG = 6,
+    SYNTHETIC_CORRUPT_TENSOR_DATA_SECTION_TOO_SMALL = 7
 } synthetic_tensor_corruption;
 
 static int write_synthetic_uocr_with_tensors(const char *path, synthetic_tensor_corruption corruption) {
@@ -191,7 +205,7 @@ static int write_synthetic_uocr_with_tensors(const char *path, synthetic_tensor_
     sections[3].alignment = 8u;
     sections[4].type = UOCR_SECTION_TENSOR_DATA;
     sections[4].offset = tensor_data_offset;
-    sections[4].size = tensor_data_size;
+    sections[4].size = corruption == SYNTHETIC_CORRUPT_TENSOR_DATA_SECTION_TOO_SMALL ? 16u : tensor_data_size;
     sections[4].alignment = corruption == SYNTHETIC_CORRUPT_TENSOR_DATA_ALIGNMENT ? 8u : UOCR_TENSOR_DATA_ALIGNMENT;
 
     uocr_config_record config = uocr_default_config_record();
@@ -395,6 +409,45 @@ static int make_temp_path(char *path, size_t path_size) {
     return 0;
 }
 
+static int test_rejects_bad_endian_marker(void) {
+    char path[128];
+    CHECK(make_temp_path(path, sizeof(path)) == 0);
+    CHECK(write_synthetic_uocr_header_case(path, 0, SYNTHETIC_HEADER_BAD_ENDIAN) == 0);
+
+    char error[512];
+    uocr_model_file model;
+    CHECK(uocr_model_file_open(path, &model, error, sizeof(error)) != 0);
+    CHECK(strstr(error, "unsupported endian marker") != NULL);
+    unlink(path);
+    return 0;
+}
+
+static int test_rejects_zero_required_alignment(void) {
+    char path[128];
+    CHECK(make_temp_path(path, sizeof(path)) == 0);
+    CHECK(write_synthetic_uocr_header_case(path, 0, SYNTHETIC_HEADER_ZERO_ALIGNMENT) == 0);
+
+    char error[512];
+    uocr_model_file model;
+    CHECK(uocr_model_file_open(path, &model, error, sizeof(error)) != 0);
+    CHECK(strstr(error, "required alignment must be non-zero") != NULL);
+    unlink(path);
+    return 0;
+}
+
+static int test_rejects_unaligned_section_directory(void) {
+    char path[128];
+    CHECK(make_temp_path(path, sizeof(path)) == 0);
+    CHECK(write_synthetic_uocr_header_case(path, 0, SYNTHETIC_HEADER_UNALIGNED_SECTION_DIR) == 0);
+
+    char error[512];
+    uocr_model_file model;
+    CHECK(uocr_model_file_open(path, &model, error, sizeof(error)) != 0);
+    CHECK(strstr(error, "section directory offset must be 8-byte aligned") != NULL);
+    unlink(path);
+    return 0;
+}
+
 static int test_valid_synthetic_file(void) {
     char path[128];
     CHECK(make_temp_path(path, sizeof(path)) == 0);
@@ -441,6 +494,9 @@ static int test_valid_tensor_directory(void) {
     CHECK(model.tensors[0].family == UOCR_TENSOR_FAMILY_TOK_EMBED);
     CHECK(model.tensors[0].flags == UOCR_TENSOR_FLAG_ROW_MAJOR);
     CHECK(model.tensors[0].payload_size == 16u);
+    const uocr_section_entry *tensor_data = uocr_model_file_find_section(&model, UOCR_SECTION_TENSOR_DATA);
+    CHECK(tensor_data != NULL);
+    CHECK(model.tensors[1].payload_offset + model.tensors[1].payload_size == tensor_data->offset + tensor_data->size);
     CHECK(uocr_model_file_find_tensor(&model, UOCR_TENSOR_ID_TOK_EMBED) == &model.tensors[0]);
     CHECK(uocr_model_file_find_tensor(&model, 999999u) == NULL);
     CHECK(strcmp(uocr_tensor_qtype_name(model.tensors[0].qtype), "f16") == 0);
@@ -468,6 +524,19 @@ static int test_rejects_tensor_payload_out_of_range(void) {
     uocr_model_file model;
     CHECK(uocr_model_file_open(path, &model, error, sizeof(error)) != 0);
     CHECK(strstr(error, "payload is out of range") != NULL);
+    unlink(path);
+    return 0;
+}
+
+static int test_rejects_tensor_payload_outside_tensor_data_section(void) {
+    char path[128];
+    CHECK(make_temp_path(path, sizeof(path)) == 0);
+    CHECK(write_synthetic_uocr_with_tensors(path, SYNTHETIC_CORRUPT_TENSOR_DATA_SECTION_TOO_SMALL) == 0);
+
+    char error[512];
+    uocr_model_file model;
+    CHECK(uocr_model_file_open(path, &model, error, sizeof(error)) != 0);
+    CHECK(strstr(error, "payload is outside tensor-data section") != NULL);
     unlink(path);
     return 0;
 }
@@ -666,9 +735,13 @@ int main(void) {
     CHECK(uocr_tensor_id_moe_expert(1u, 7u, UOCR_TENSOR_PROJ_DOWN) == 11123u);
     CHECK(UOCR_TENSOR_ID_VISION_CLIP_UNUSED_PATCH_EMBED_WEIGHT == 200001u);
 
+    if (test_rejects_bad_endian_marker() != 0) return 1;
+    if (test_rejects_zero_required_alignment() != 0) return 1;
+    if (test_rejects_unaligned_section_directory() != 0) return 1;
     if (test_valid_synthetic_file() != 0) return 1;
     if (test_valid_tensor_directory() != 0) return 1;
     if (test_rejects_tensor_payload_out_of_range() != 0) return 1;
+    if (test_rejects_tensor_payload_outside_tensor_data_section() != 0) return 1;
     if (test_rejects_transposed_tensor_layout() != 0) return 1;
     if (test_rejects_bad_tensor_data_alignment() != 0) return 1;
     if (test_full_fp16_accounting_validator_accepts_current_contract() != 0) return 1;
