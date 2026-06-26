@@ -10,6 +10,15 @@
 #include "runtime/uocr_profile.h"
 #include "unlimitedocr.h"
 
+/* Diagnostic CPU-pointer helpers allocate/copy/wait/read back for parity and
+ * probes. Production translation units must not see those prototypes unless
+ * they explicitly opt in, which keeps public OCR dispatch on integrated
+ * GPU-resident entry points.
+ */
+#ifndef UOCR_METAL_ENABLE_DIAGNOSTIC_API
+#define UOCR_METAL_ENABLE_DIAGNOSTIC_API 0
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -152,6 +161,7 @@ uint32_t uocr_metal_context_vision_binding_count(const uocr_metal_context *ctx);
 int uocr_metal_context_vision_bindings_ready(const uocr_metal_context *ctx);
 const char *uocr_metal_context_vision_binding_error(const uocr_metal_context *ctx);
 
+#if UOCR_METAL_ENABLE_DIAGNOSTIC_API
 /* Diagnostic final-visual parity boundary. Production public OCR must call
  * uocr_metal_context_generate_image_f16() so final visual rows stay in the
  * reusable Metal vision workspace and are spliced directly into the prompt
@@ -207,6 +217,7 @@ int uocr_metal_context_diagnostic_encode_projected_features_f16(uocr_metal_conte
                                                      uint32_t out_projected_rows,
                                                      char *error,
                                                      size_t error_size);
+#endif /* UOCR_METAL_ENABLE_DIAGNOSTIC_API */
 
 uint64_t uocr_metal_context_model_view_bytes(const uocr_metal_context *ctx);
 int uocr_metal_context_get_model_view_info(const uocr_metal_context *ctx,
@@ -303,6 +314,7 @@ int uocr_metal_context_generate_image_f16(uocr_metal_context *ctx,
                                           char *error,
                                           size_t error_size);
 
+#if UOCR_METAL_ENABLE_DIAGNOSTIC_API
 /* Diagnostic get-rows entry point used by synthetic tests. Runtime prompt
  * assembly should bind mmap-backed model buffers directly and reuse the same
  * kernels without uploading the embedding table through this helper.
@@ -351,6 +363,7 @@ int uocr_metal_context_diagnostic_assemble_prompt_f16(uocr_metal_context *ctx,
                                            uint16_t *out_prompt_f16,
                                            char *error,
                                            size_t error_size);
+#endif /* UOCR_METAL_ENABLE_DIAGNOSTIC_API */
 
 /* Runtime prompt assembly helper. Binds the mmap-backed TOK_EMBED tensor from
  * mapped .uocr model views, uses fixed Unlimited-OCR vocab/hidden sizes, and
@@ -366,6 +379,7 @@ int uocr_metal_context_assemble_prompt_from_model_f16(uocr_metal_context *ctx,
                                                       char *error,
                                                       size_t error_size);
 
+#if UOCR_METAL_ENABLE_DIAGNOSTIC_API
 /* Diagnostic SAM patch-embedding helper for the Metal vision bring-up path.
  * Computes Conv2d weight [768,3,16,16], optional bias [768], stride 16, and
  * writes BHWC fp16 output [height/16,width/16,768], matching upstream
@@ -911,6 +925,7 @@ int uocr_metal_context_diagnostic_sam_mlp_f16(uocr_metal_context *ctx,
                                    void *out,
                                    char *error,
                                    size_t error_size);
+#endif /* UOCR_METAL_ENABLE_DIAGNOSTIC_API */
 
 /* Runtime prompt assembly into the persistent Metal prompt-embedding arena.
  * The arena must have been allocated with uocr_metal_context_allocate_runtime_arenas().
@@ -939,6 +954,7 @@ int uocr_metal_context_read_decoder_final_hidden_f16(uocr_metal_context *ctx,
                                                      char *error,
                                                      size_t error_size);
 
+#if UOCR_METAL_ENABLE_DIAGNOSTIC_API
 /* Diagnostic RMSNorm helper for synthetic tests. The kernel accumulates the
  * row variance in fp32 and applies fp16 learned weights.
  */
@@ -952,6 +968,7 @@ int uocr_metal_context_diagnostic_rmsnorm_f16(uocr_metal_context *ctx,
                                    void *out,
                                    char *error,
                                    size_t error_size);
+#endif /* UOCR_METAL_ENABLE_DIAGNOSTIC_API */
 
 /* Final decoder RMSNorm helper. Binds the mmap-backed FINAL_NORM tensor from
  * mapped .uocr model views, applies the fixed Unlimited-OCR hidden size and
@@ -1035,6 +1052,7 @@ int uocr_metal_context_select_next_token_f16(uocr_metal_context *ctx,
                                              char *error,
                                              size_t error_size);
 
+#if UOCR_METAL_ENABLE_DIAGNOSTIC_API
 /* Diagnostic fp16 dense helper for synthetic tests. Computes
  * out[row, out_col] = dot(input[row, :], weight[out_col, :]) + optional bias,
  * where weights are row-major [out_features, in_features]. Dot products are
@@ -1478,6 +1496,7 @@ int uocr_metal_context_diagnostic_write_kv_cache_f16(uocr_metal_context *ctx,
                                           uint16_t *v_cache_out_f16,
                                           char *error,
                                           size_t error_size);
+#endif /* UOCR_METAL_ENABLE_DIAGNOSTIC_API */
 
 int uocr_metal_smoke_test(const char *resource_path, char *error, size_t error_size);
 

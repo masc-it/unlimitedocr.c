@@ -284,7 +284,7 @@ Current finding:
 Implementation status:
 
 - [x] Mark diagnostic-only APIs with `diagnostic` in the function name and comment header.
-- [ ] Keep diagnostic APIs out of `uocr_generate_prepared()` and public OCR dispatch.
+- [x] Keep diagnostic APIs out of `uocr_generate_prepared()` and public OCR dispatch.
 - [ ] Delete unused slow production helpers as optimized replacements land.
 - [ ] Remove runtime fallback toggles after the chosen implementation passes timing gates.
 - [ ] Keep tests on the confirmed path; parity-only behavior must use offline fixtures.

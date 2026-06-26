@@ -1,3 +1,4 @@
+#define UOCR_METAL_ENABLE_DIAGNOSTIC_API 1
 #include "backend/metal/uocr_metal.h"
 #include "model/uocr_constants.h"
 #include "model/uocr_model_file.h"
