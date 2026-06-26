@@ -1304,72 +1304,50 @@ struct UocrSamNeckConv1x1Params {
     uint out_channels;
 };
 
-static inline float uocr_sam_neck_conv1x1_dot_f16(device const half *src_bhwc,
-                                                  device const half *weight,
-                                                  constant UocrSamNeckConv1x1Params &params,
-                                                  uint spatial,
-                                                  uint out_channel,
-                                                  uint tid,
-                                                  uint ntg,
-                                                  threadgroup float *partials) {
+static inline float uocr_sam_neck_conv1x1_tile_value_f16(device const half *src_bhwc,
+                                                         device const half *weight,
+                                                         constant UocrSamNeckConv1x1Params &params,
+                                                         uint spatial,
+                                                         uint out_channel) {
     float sum = 0.0f;
     const uint src_base = spatial * params.in_channels;
     const uint weight_base = out_channel * params.in_channels;
-    for (uint c = tid; c < params.in_channels; c += ntg) {
+    for (uint c = 0u; c < params.in_channels; ++c) {
         sum += float(src_bhwc[src_base + c]) * float(weight[weight_base + c]);
     }
-    partials[tid] = sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint stride = ntg >> 1; stride > 0u; stride >>= 1u) {
-        if (tid < stride) {
-            partials[tid] += partials[tid + stride];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    return partials[0];
+    return sum;
 }
 
 kernel void uocr_sam_neck_conv1x1_f16_to_f16(device const half *src_bhwc [[buffer(0)]],
                                              device const half *weight [[buffer(1)]],
                                              device half *dst_nchw [[buffer(2)]],
                                              constant UocrSamNeckConv1x1Params &params [[buffer(3)]],
-                                             threadgroup float *partials [[threadgroup(0)]],
-                                             uint output_index [[threadgroup_position_in_grid]],
-                                             uint tid [[thread_index_in_threadgroup]],
-                                             uint ntg [[threads_per_threadgroup]]) {
+                                             uint2 gid [[thread_position_in_grid]]) {
     const uint spatial_size = params.grid_width * params.grid_height;
-    const uint out_channel = output_index / spatial_size;
-    const uint spatial = output_index - out_channel * spatial_size;
+    const uint spatial = gid.x;
+    const uint out_channel = gid.y;
     if (out_channel >= params.out_channels || spatial >= spatial_size) {
         return;
     }
 
-    const float value = uocr_sam_neck_conv1x1_dot_f16(src_bhwc, weight, params, spatial, out_channel, tid, ntg, partials);
-    if (tid == 0u) {
-        dst_nchw[output_index] = half(value);
-    }
+    const float value = uocr_sam_neck_conv1x1_tile_value_f16(src_bhwc, weight, params, spatial, out_channel);
+    dst_nchw[out_channel * spatial_size + spatial] = half(value);
 }
 
 kernel void uocr_sam_neck_conv1x1_f16_to_f32(device const half *src_bhwc [[buffer(0)]],
                                              device const half *weight [[buffer(1)]],
                                              device float *dst_nchw [[buffer(2)]],
                                              constant UocrSamNeckConv1x1Params &params [[buffer(3)]],
-                                             threadgroup float *partials [[threadgroup(0)]],
-                                             uint output_index [[threadgroup_position_in_grid]],
-                                             uint tid [[thread_index_in_threadgroup]],
-                                             uint ntg [[threads_per_threadgroup]]) {
+                                             uint2 gid [[thread_position_in_grid]]) {
     const uint spatial_size = params.grid_width * params.grid_height;
-    const uint out_channel = output_index / spatial_size;
-    const uint spatial = output_index - out_channel * spatial_size;
+    const uint spatial = gid.x;
+    const uint out_channel = gid.y;
     if (out_channel >= params.out_channels || spatial >= spatial_size) {
         return;
     }
 
-    const float value = uocr_sam_neck_conv1x1_dot_f16(src_bhwc, weight, params, spatial, out_channel, tid, ntg, partials);
-    if (tid == 0u) {
-        dst_nchw[output_index] = value;
-    }
+    const float value = uocr_sam_neck_conv1x1_tile_value_f16(src_bhwc, weight, params, spatial, out_channel);
+    dst_nchw[out_channel * spatial_size + spatial] = value;
 }
 
 struct UocrSamNeckConv3x3Params {
@@ -1379,20 +1357,17 @@ struct UocrSamNeckConv3x3Params {
     uint kernel_size;
 };
 
-static inline float uocr_sam_neck_conv3x3_dot_f16(device const half *src_nchw,
-                                                  device const half *weight,
-                                                  constant UocrSamNeckConv3x3Params &params,
-                                                  uint spatial,
-                                                  uint out_channel,
-                                                  uint tid,
-                                                  uint ntg,
-                                                  threadgroup float *partials) {
+static inline float uocr_sam_neck_conv3x3_tile_value_f16(device const half *src_nchw,
+                                                         device const half *weight,
+                                                         constant UocrSamNeckConv3x3Params &params,
+                                                         uint spatial,
+                                                         uint out_channel) {
     const uint x = spatial % params.grid_width;
     const uint y = spatial / params.grid_width;
     const uint spatial_size = params.grid_width * params.grid_height;
     const int kernel_radius = int(params.kernel_size >> 1u);
     float sum = 0.0f;
-    for (uint in_channel = tid; in_channel < params.channels; in_channel += ntg) {
+    for (uint in_channel = 0u; in_channel < params.channels; ++in_channel) {
         for (uint ky = 0u; ky < params.kernel_size; ++ky) {
             const int sy = int(y) + int(ky) - kernel_radius;
             if (sy < 0 || sy >= int(params.grid_height)) {
@@ -1412,58 +1387,39 @@ static inline float uocr_sam_neck_conv3x3_dot_f16(device const half *src_nchw,
             }
         }
     }
-    partials[tid] = sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint stride = ntg >> 1; stride > 0u; stride >>= 1u) {
-        if (tid < stride) {
-            partials[tid] += partials[tid + stride];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    return partials[0];
+    return sum;
 }
 
 kernel void uocr_sam_neck_conv3x3_f16_to_f16(device const half *src_nchw [[buffer(0)]],
                                              device const half *weight [[buffer(1)]],
                                              device half *dst_nchw [[buffer(2)]],
                                              constant UocrSamNeckConv3x3Params &params [[buffer(3)]],
-                                             threadgroup float *partials [[threadgroup(0)]],
-                                             uint output_index [[threadgroup_position_in_grid]],
-                                             uint tid [[thread_index_in_threadgroup]],
-                                             uint ntg [[threads_per_threadgroup]]) {
+                                             uint2 gid [[thread_position_in_grid]]) {
     const uint spatial_size = params.grid_width * params.grid_height;
-    const uint out_channel = output_index / spatial_size;
-    const uint spatial = output_index - out_channel * spatial_size;
+    const uint spatial = gid.x;
+    const uint out_channel = gid.y;
     if (out_channel >= params.channels || spatial >= spatial_size) {
         return;
     }
 
-    const float value = uocr_sam_neck_conv3x3_dot_f16(src_nchw, weight, params, spatial, out_channel, tid, ntg, partials);
-    if (tid == 0u) {
-        dst_nchw[output_index] = half(value);
-    }
+    const float value = uocr_sam_neck_conv3x3_tile_value_f16(src_nchw, weight, params, spatial, out_channel);
+    dst_nchw[out_channel * spatial_size + spatial] = half(value);
 }
 
 kernel void uocr_sam_neck_conv3x3_f16_to_f32(device const half *src_nchw [[buffer(0)]],
                                              device const half *weight [[buffer(1)]],
                                              device float *dst_nchw [[buffer(2)]],
                                              constant UocrSamNeckConv3x3Params &params [[buffer(3)]],
-                                             threadgroup float *partials [[threadgroup(0)]],
-                                             uint output_index [[threadgroup_position_in_grid]],
-                                             uint tid [[thread_index_in_threadgroup]],
-                                             uint ntg [[threads_per_threadgroup]]) {
+                                             uint2 gid [[thread_position_in_grid]]) {
     const uint spatial_size = params.grid_width * params.grid_height;
-    const uint out_channel = output_index / spatial_size;
-    const uint spatial = output_index - out_channel * spatial_size;
+    const uint spatial = gid.x;
+    const uint out_channel = gid.y;
     if (out_channel >= params.channels || spatial >= spatial_size) {
         return;
     }
 
-    const float value = uocr_sam_neck_conv3x3_dot_f16(src_nchw, weight, params, spatial, out_channel, tid, ntg, partials);
-    if (tid == 0u) {
-        dst_nchw[output_index] = value;
-    }
+    const float value = uocr_sam_neck_conv3x3_tile_value_f16(src_nchw, weight, params, spatial, out_channel);
+    dst_nchw[out_channel * spatial_size + spatial] = value;
 }
 
 struct UocrSamConv3x3Stride2Params {
@@ -1477,20 +1433,17 @@ struct UocrSamConv3x3Stride2Params {
     uint stride;
 };
 
-static inline float uocr_sam_conv3x3_stride2_dot_f16(device const half *src_nchw,
-                                                     device const half *weight,
-                                                     constant UocrSamConv3x3Stride2Params &params,
-                                                     uint output_spatial,
-                                                     uint out_channel,
-                                                     uint tid,
-                                                     uint ntg,
-                                                     threadgroup float *partials) {
+static inline float uocr_sam_conv3x3_stride2_tile_value_f16(device const half *src_nchw,
+                                                            device const half *weight,
+                                                            constant UocrSamConv3x3Stride2Params &params,
+                                                            uint output_spatial,
+                                                            uint out_channel) {
     const uint out_x = output_spatial % params.output_width;
     const uint out_y = output_spatial / params.output_width;
     const uint input_spatial_size = params.input_width * params.input_height;
     const int kernel_radius = int(params.kernel_size >> 1u);
     float sum = 0.0f;
-    for (uint in_channel = tid; in_channel < params.in_channels; in_channel += ntg) {
+    for (uint in_channel = 0u; in_channel < params.in_channels; ++in_channel) {
         for (uint ky = 0u; ky < params.kernel_size; ++ky) {
             const int sy = int(out_y * params.stride) + int(ky) - kernel_radius;
             if (sy < 0 || sy >= int(params.input_height)) {
@@ -1510,72 +1463,39 @@ static inline float uocr_sam_conv3x3_stride2_dot_f16(device const half *src_nchw
             }
         }
     }
-    partials[tid] = sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint stride = ntg >> 1; stride > 0u; stride >>= 1u) {
-        if (tid < stride) {
-            partials[tid] += partials[tid + stride];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    return partials[0];
+    return sum;
 }
 
 kernel void uocr_sam_conv3x3_stride2_f16_to_f16(device const half *src_nchw [[buffer(0)]],
                                                 device const half *weight [[buffer(1)]],
                                                 device half *dst_nchw [[buffer(2)]],
                                                 constant UocrSamConv3x3Stride2Params &params [[buffer(3)]],
-                                                threadgroup float *partials [[threadgroup(0)]],
-                                                uint output_index [[threadgroup_position_in_grid]],
-                                                uint tid [[thread_index_in_threadgroup]],
-                                                uint ntg [[threads_per_threadgroup]]) {
+                                                uint2 gid [[thread_position_in_grid]]) {
     const uint output_spatial_size = params.output_width * params.output_height;
-    const uint out_channel = output_index / output_spatial_size;
-    const uint output_spatial = output_index - out_channel * output_spatial_size;
+    const uint output_spatial = gid.x;
+    const uint out_channel = gid.y;
     if (out_channel >= params.out_channels || output_spatial >= output_spatial_size) {
         return;
     }
 
-    const float value = uocr_sam_conv3x3_stride2_dot_f16(src_nchw,
-                                                        weight,
-                                                        params,
-                                                        output_spatial,
-                                                        out_channel,
-                                                        tid,
-                                                        ntg,
-                                                        partials);
-    if (tid == 0u) {
-        dst_nchw[output_index] = half(value);
-    }
+    const float value = uocr_sam_conv3x3_stride2_tile_value_f16(src_nchw, weight, params, output_spatial, out_channel);
+    dst_nchw[out_channel * output_spatial_size + output_spatial] = half(value);
 }
 
 kernel void uocr_sam_conv3x3_stride2_f16_to_f32(device const half *src_nchw [[buffer(0)]],
                                                 device const half *weight [[buffer(1)]],
                                                 device float *dst_nchw [[buffer(2)]],
                                                 constant UocrSamConv3x3Stride2Params &params [[buffer(3)]],
-                                                threadgroup float *partials [[threadgroup(0)]],
-                                                uint output_index [[threadgroup_position_in_grid]],
-                                                uint tid [[thread_index_in_threadgroup]],
-                                                uint ntg [[threads_per_threadgroup]]) {
+                                                uint2 gid [[thread_position_in_grid]]) {
     const uint output_spatial_size = params.output_width * params.output_height;
-    const uint out_channel = output_index / output_spatial_size;
-    const uint output_spatial = output_index - out_channel * output_spatial_size;
+    const uint output_spatial = gid.x;
+    const uint out_channel = gid.y;
     if (out_channel >= params.out_channels || output_spatial >= output_spatial_size) {
         return;
     }
 
-    const float value = uocr_sam_conv3x3_stride2_dot_f16(src_nchw,
-                                                        weight,
-                                                        params,
-                                                        output_spatial,
-                                                        out_channel,
-                                                        tid,
-                                                        ntg,
-                                                        partials);
-    if (tid == 0u) {
-        dst_nchw[output_index] = value;
-    }
+    const float value = uocr_sam_conv3x3_stride2_tile_value_f16(src_nchw, weight, params, output_spatial, out_channel);
+    dst_nchw[out_channel * output_spatial_size + output_spatial] = value;
 }
 
 struct UocrClipEmbedSamParams {

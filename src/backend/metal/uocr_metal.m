@@ -1335,6 +1335,29 @@ static NSUInteger metal_power2_threadgroup_width(NSUInteger preferred, NSUIntege
     return width;
 }
 
+static void metal_output_tile_threadgroup_2d(NSUInteger max_total_threads,
+                                             NSUInteger *out_spatial_threads,
+                                             NSUInteger *out_channel_threads) {
+    const NSUInteger preferred_spatial = 16u;
+    const NSUInteger preferred_channels = 16u;
+    const NSUInteger max_threads = max_total_threads == 0u ? 1u : max_total_threads;
+    NSUInteger spatial_threads = preferred_spatial <= max_threads ? preferred_spatial : max_threads;
+    if (spatial_threads == 0u) {
+        spatial_threads = 1u;
+    }
+    NSUInteger channel_limit = max_threads / spatial_threads;
+    if (channel_limit == 0u) {
+        channel_limit = 1u;
+    }
+    const NSUInteger channel_threads = metal_power2_threadgroup_width(preferred_channels, channel_limit);
+    if (out_spatial_threads != NULL) {
+        *out_spatial_threads = spatial_threads;
+    }
+    if (out_channel_threads != NULL) {
+        *out_channel_threads = channel_threads;
+    }
+}
+
 int uocr_metal_is_available(void) {
     @autoreleasepool {
         id<MTLDevice> device = MTLCreateSystemDefaultDevice();
@@ -13340,14 +13363,10 @@ int uocr_metal_context_sam_neck_conv1x1_f16(uocr_metal_context *ctx,
             goto cleanup_sam_neck_conv1x1;
         }
         dst.label = @"uocr_sam_neck_conv1x1_output_nchw";
-        metal_zero_buffer_range(dst, dst_offset, (NSUInteger)output_bytes);
 
-        const NSUInteger threads_per_group = metal_power2_threadgroup_width(256u, pipeline.maxTotalThreadsPerThreadgroup);
-        const uint64_t threadgroup_bytes = (uint64_t)threads_per_group * (uint64_t)sizeof(float);
-        if (threadgroup_bytes > (uint64_t)ctx->device.maxThreadgroupMemoryLength) {
-            result = metal_fail(error, error_size, "Metal SAM neck 1x1 threadgroup memory exceeds device limit");
-            goto cleanup_sam_neck_conv1x1;
-        }
+        NSUInteger spatial_threads = 1u;
+        NSUInteger channel_threads = 1u;
+        metal_output_tile_threadgroup_2d(pipeline.maxTotalThreadsPerThreadgroup, &spatial_threads, &channel_threads);
 
         cb = metal_new_command_buffer(ctx);
         if (cb == nil) {
@@ -13373,9 +13392,10 @@ int uocr_metal_context_sam_neck_conv1x1_f16(uocr_metal_context *ctx,
         [enc setBuffer:weight offset:weight_offset atIndex:1u];
         [enc setBuffer:dst offset:dst_offset atIndex:2u];
         [enc setBytes:&params length:sizeof(params) atIndex:3u];
-        [enc setThreadgroupMemoryLength:threads_per_group * sizeof(float) atIndex:0u];
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)output_values, 1u, 1u)
-             threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1u, 1u)];
+        [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)spatial + spatial_threads - 1u) / spatial_threads,
+                                              ((NSUInteger)UOCR_SAM_NECK_CHANNELS + channel_threads - 1u) / channel_threads,
+                                              1u)
+             threadsPerThreadgroup:MTLSizeMake(spatial_threads, channel_threads, 1u)];
         [enc endEncoding];
 
         UOCR_METAL_COMMIT_AND_WAIT_PROFILED(ctx, cb);
@@ -13503,14 +13523,10 @@ int uocr_metal_context_sam_neck_conv3x3_f16(uocr_metal_context *ctx,
             goto cleanup_sam_neck_conv3x3;
         }
         dst.label = @"uocr_sam_neck_conv3x3_output_nchw";
-        metal_zero_buffer_range(dst, dst_offset, (NSUInteger)output_bytes);
 
-        const NSUInteger threads_per_group = metal_power2_threadgroup_width(256u, pipeline.maxTotalThreadsPerThreadgroup);
-        const uint64_t threadgroup_bytes = (uint64_t)threads_per_group * (uint64_t)sizeof(float);
-        if (threadgroup_bytes > (uint64_t)ctx->device.maxThreadgroupMemoryLength) {
-            result = metal_fail(error, error_size, "Metal SAM neck 3x3 threadgroup memory exceeds device limit");
-            goto cleanup_sam_neck_conv3x3;
-        }
+        NSUInteger spatial_threads = 1u;
+        NSUInteger channel_threads = 1u;
+        metal_output_tile_threadgroup_2d(pipeline.maxTotalThreadsPerThreadgroup, &spatial_threads, &channel_threads);
 
         cb = metal_new_command_buffer(ctx);
         if (cb == nil) {
@@ -13536,9 +13552,10 @@ int uocr_metal_context_sam_neck_conv3x3_f16(uocr_metal_context *ctx,
         [enc setBuffer:weight offset:weight_offset atIndex:1u];
         [enc setBuffer:dst offset:dst_offset atIndex:2u];
         [enc setBytes:&params length:sizeof(params) atIndex:3u];
-        [enc setThreadgroupMemoryLength:threads_per_group * sizeof(float) atIndex:0u];
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)value_count, 1u, 1u)
-             threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1u, 1u)];
+        [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)spatial + spatial_threads - 1u) / spatial_threads,
+                                              ((NSUInteger)UOCR_SAM_NECK_CHANNELS + channel_threads - 1u) / channel_threads,
+                                              1u)
+             threadsPerThreadgroup:MTLSizeMake(spatial_threads, channel_threads, 1u)];
         [enc endEncoding];
 
         UOCR_METAL_COMMIT_AND_WAIT_PROFILED(ctx, cb);
@@ -13865,14 +13882,10 @@ static int metal_context_sam_conv3x3_stride2_nchw_f16(uocr_metal_context *ctx,
             goto cleanup_sam_conv3x3_stride2;
         }
         dst.label = @"uocr_sam_conv3x3_stride2_output_nchw";
-        metal_zero_buffer_range(dst, dst_offset, (NSUInteger)output_bytes);
 
-        const NSUInteger threads_per_group = metal_power2_threadgroup_width(256u, pipeline.maxTotalThreadsPerThreadgroup);
-        const uint64_t threadgroup_bytes = (uint64_t)threads_per_group * (uint64_t)sizeof(float);
-        if (threadgroup_bytes > (uint64_t)ctx->device.maxThreadgroupMemoryLength) {
-            result = metal_fail(error, error_size, "%s threadgroup memory exceeds device limit", diagnostic_name);
-            goto cleanup_sam_conv3x3_stride2;
-        }
+        NSUInteger spatial_threads = 1u;
+        NSUInteger channel_threads = 1u;
+        metal_output_tile_threadgroup_2d(pipeline.maxTotalThreadsPerThreadgroup, &spatial_threads, &channel_threads);
 
         cb = metal_new_command_buffer(ctx);
         if (cb == nil) {
@@ -13902,9 +13915,10 @@ static int metal_context_sam_conv3x3_stride2_nchw_f16(uocr_metal_context *ctx,
         [enc setBuffer:weight offset:weight_offset atIndex:1u];
         [enc setBuffer:dst offset:dst_offset atIndex:2u];
         [enc setBytes:&params length:sizeof(params) atIndex:3u];
-        [enc setThreadgroupMemoryLength:threads_per_group * sizeof(float) atIndex:0u];
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)output_values, 1u, 1u)
-             threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1u, 1u)];
+        [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)output_spatial + spatial_threads - 1u) / spatial_threads,
+                                              ((NSUInteger)out_channels + channel_threads - 1u) / channel_threads,
+                                              1u)
+             threadsPerThreadgroup:MTLSizeMake(spatial_threads, channel_threads, 1u)];
         [enc endEncoding];
 
         UOCR_METAL_COMMIT_AND_WAIT_PROFILED(ctx, cb);
