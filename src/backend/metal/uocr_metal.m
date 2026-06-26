@@ -5507,153 +5507,138 @@ static int metal_project_vision_chunk_f16(const uocr_vision_chunk *chunk,
     const uint64_t chunk_encode_start_ns = uocr_profile_now_ns();
     uint32_t batched_patch_grid_w = 0u;
     uint32_t batched_patch_grid_h = 0u;
-    if (chunk->view_count > 1u) {
-        const uint64_t sam_patch_batch_start_ns = uocr_profile_now_ns();
-        if (!metal_context_sam_patch_embed_batch_f16_to_slice(project,
-                                                             chunk,
-                                                             project->scratch->sam_patch_bhwc,
-                                                             &batched_patch_grid_w,
-                                                             &batched_patch_grid_h,
-                                                             error,
-                                                             error_size)) {
-            return UOCR_ERROR_INTERNAL;
-        }
-        metal_profile_add_event_now(project->ctx, "metal.vision.sam_patch_batch", sam_patch_batch_start_ns);
+    const uint64_t sam_patch_batch_start_ns = uocr_profile_now_ns();
+    if (!metal_context_sam_patch_embed_batch_f16_to_slice(project,
+                                                         chunk,
+                                                         project->scratch->sam_patch_bhwc,
+                                                         &batched_patch_grid_w,
+                                                         &batched_patch_grid_h,
+                                                         error,
+                                                         error_size)) {
+        return UOCR_ERROR_INTERNAL;
     }
-    if (chunk->view_count > 1u) {
-        const uint32_t projected_tokens_per_view = chunk->projected_tokens_per_view;
-        const uint32_t clip_tokens_per_view = projected_tokens_per_view + UOCR_CLIP_CLASS_TOKENS;
-        if (clip_tokens_per_view == 0u || chunk->view_count > UINT32_MAX / clip_tokens_per_view) {
-            (void)metal_fail(error, error_size, "Metal batched CLIP token count overflow");
-            return UOCR_ERROR_INTERNAL;
-        }
-        const uint32_t batch_clip_tokens = clip_tokens_per_view * chunk->view_count;
-        const uint32_t patch_grid_w = batched_patch_grid_w;
-        const uint32_t patch_grid_h = batched_patch_grid_h;
-        const uint64_t sam_transformer_batch_start_ns = uocr_profile_now_ns();
-        if (!metal_context_sam_add_abs_pos_batch_f16_to_slice(project->ctx,
-                                                             project->scratch->sam_patch_bhwc,
-                                                             project->weights->sam_pos_embed,
-                                                             patch_grid_w,
-                                                             patch_grid_h,
-                                                             chunk->view_count,
-                                                             project->scratch->sam_pos_bhwc,
-                                                             error,
-                                                             error_size) ||
-            !metal_context_sam_transformer_batch_workspace_f16_to_slice(project->ctx,
-                                                                        project->scratch->sam_pos_bhwc,
-                                                                        project->weights->sam_block_slices,
-                                                                        UOCR_SAM_BLOCKS,
-                                                                        patch_grid_w,
-                                                                        patch_grid_h,
-                                                                        chunk->view_count,
-                                                                        project->scratch->sam_transformer_batch_bhwc,
-                                                                        project->scratch,
-                                                                        error,
-                                                                        error_size)) {
-            return UOCR_ERROR_INTERNAL;
-        }
-        metal_profile_add_event_now(project->ctx, "metal.vision.sam_transformer_batch", sam_transformer_batch_start_ns);
-        uint32_t sam_grid_w = 0u;
-        uint32_t sam_grid_h = 0u;
-        if (!metal_context_sam_neck_batch_f16_to_slice(project,
-                                                       project->scratch->sam_transformer_batch_bhwc,
-                                                       patch_grid_w,
-                                                       patch_grid_h,
-                                                       chunk->view_count,
-                                                       project->scratch->sam_net3_nchw,
-                                                       &sam_grid_w,
-                                                       &sam_grid_h,
+    metal_profile_add_event_now(project->ctx, "metal.vision.sam_patch_batch", sam_patch_batch_start_ns);
+
+    const uint32_t projected_tokens_per_view = chunk->projected_tokens_per_view;
+    const uint32_t clip_tokens_per_view = projected_tokens_per_view + UOCR_CLIP_CLASS_TOKENS;
+    if (clip_tokens_per_view == 0u || chunk->view_count > UINT32_MAX / clip_tokens_per_view) {
+        (void)metal_fail(error, error_size, "Metal batched CLIP token count overflow");
+        return UOCR_ERROR_INTERNAL;
+    }
+    const uint32_t batch_clip_tokens = clip_tokens_per_view * chunk->view_count;
+    const uint32_t patch_grid_w = batched_patch_grid_w;
+    const uint32_t patch_grid_h = batched_patch_grid_h;
+    const uint64_t sam_transformer_batch_start_ns = uocr_profile_now_ns();
+    if (!metal_context_sam_add_abs_pos_batch_f16_to_slice(project->ctx,
+                                                         project->scratch->sam_patch_bhwc,
+                                                         project->weights->sam_pos_embed,
+                                                         patch_grid_w,
+                                                         patch_grid_h,
+                                                         chunk->view_count,
+                                                         project->scratch->sam_pos_bhwc,
+                                                         error,
+                                                         error_size) ||
+        !metal_context_sam_transformer_batch_workspace_f16_to_slice(project->ctx,
+                                                                    project->scratch->sam_pos_bhwc,
+                                                                    project->weights->sam_block_slices,
+                                                                    UOCR_SAM_BLOCKS,
+                                                                    patch_grid_w,
+                                                                    patch_grid_h,
+                                                                    chunk->view_count,
+                                                                    project->scratch->sam_transformer_batch_bhwc,
+                                                                    project->scratch,
+                                                                    error,
+                                                                    error_size)) {
+        return UOCR_ERROR_INTERNAL;
+    }
+    metal_profile_add_event_now(project->ctx, "metal.vision.sam_transformer_batch", sam_transformer_batch_start_ns);
+    uint32_t sam_grid_w = 0u;
+    uint32_t sam_grid_h = 0u;
+    if (!metal_context_sam_neck_batch_f16_to_slice(project,
+                                                   project->scratch->sam_transformer_batch_bhwc,
+                                                   patch_grid_w,
+                                                   patch_grid_h,
+                                                   chunk->view_count,
+                                                   project->scratch->sam_net3_nchw,
+                                                   &sam_grid_w,
+                                                   &sam_grid_h,
+                                                   error,
+                                                   error_size)) {
+        return UOCR_ERROR_INTERNAL;
+    }
+    if (sam_grid_w * sam_grid_h != projected_tokens_per_view) {
+        (void)metal_fail(error, error_size, "Metal batched SAM neck grid does not match projected token count");
+        return UOCR_ERROR_INTERNAL;
+    }
+    const uint64_t clip_frontend_start_ns = uocr_profile_now_ns();
+    if (!metal_context_clip_embed_sam_batch_f16_to_slice(project->ctx,
+                                                        project->scratch->sam_net3_nchw,
+                                                        project->weights->clip_class_embedding,
+                                                        sam_grid_w,
+                                                        sam_grid_h,
+                                                        chunk->view_count,
+                                                        project->scratch->clip_a,
+                                                        error,
+                                                        error_size) ||
+        !metal_context_clip_add_abs_pos_batch_f16_to_slice(project->ctx,
+                                                          project->scratch->clip_a,
+                                                          project->weights->clip_pos_embed,
+                                                          sam_grid_w,
+                                                          sam_grid_h,
+                                                          chunk->view_count,
+                                                          project->scratch->clip_b,
+                                                          error,
+                                                          error_size) ||
+        !metal_context_clip_pre_layernorm_f16_to_slice(project->ctx,
+                                                       project->scratch->clip_b,
+                                                       project->weights->clip_pre_ln_weight,
+                                                       project->weights->clip_pre_ln_bias,
+                                                       batch_clip_tokens,
+                                                       project->scratch->clip_a,
                                                        error,
                                                        error_size)) {
-            return UOCR_ERROR_INTERNAL;
-        }
-        if (sam_grid_w * sam_grid_h != projected_tokens_per_view) {
-            (void)metal_fail(error, error_size, "Metal batched SAM neck grid does not match projected token count");
-            return UOCR_ERROR_INTERNAL;
-        }
-        const uint64_t clip_frontend_start_ns = uocr_profile_now_ns();
-        if (!metal_context_clip_embed_sam_batch_f16_to_slice(project->ctx,
-                                                            project->scratch->sam_net3_nchw,
-                                                            project->weights->clip_class_embedding,
-                                                            sam_grid_w,
-                                                            sam_grid_h,
-                                                            chunk->view_count,
-                                                            project->scratch->clip_a,
-                                                            error,
-                                                            error_size) ||
-            !metal_context_clip_add_abs_pos_batch_f16_to_slice(project->ctx,
-                                                              project->scratch->clip_a,
-                                                              project->weights->clip_pos_embed,
-                                                              sam_grid_w,
-                                                              sam_grid_h,
-                                                              chunk->view_count,
-                                                              project->scratch->clip_b,
-                                                              error,
-                                                              error_size) ||
-            !metal_context_clip_pre_layernorm_f16_to_slice(project->ctx,
-                                                           project->scratch->clip_b,
-                                                           project->weights->clip_pre_ln_weight,
-                                                           project->weights->clip_pre_ln_bias,
-                                                           batch_clip_tokens,
-                                                           project->scratch->clip_a,
-                                                           error,
-                                                           error_size)) {
-            return UOCR_ERROR_INTERNAL;
-        }
-        metal_profile_add_event_now(project->ctx, "metal.vision.clip_frontend_batch", clip_frontend_start_ns);
-        const uint64_t clip_transformer_start_ns = uocr_profile_now_ns();
-        if (!metal_context_clip_transformer_batch_workspace_f16_to_slice(project->ctx,
-                                                                         project->scratch->clip_a,
-                                                                         project->weights->clip_block_slices,
-                                                                         UOCR_CLIP_BLOCKS,
-                                                                         clip_tokens_per_view,
-                                                                         chunk->view_count,
-                                                                         project->scratch->clip_final,
-                                                                         project->scratch,
-                                                                         error,
-                                                                         error_size)) {
-            return UOCR_ERROR_INTERNAL;
-        }
-        metal_profile_add_event_now(project->ctx, "metal.vision.clip_transformer_batch", clip_transformer_start_ns);
-        const uint64_t concat_start_ns = uocr_profile_now_ns();
-        if (!metal_context_clip_sam_concat_batch_f16_to_slice(project->ctx,
-                                                             project->scratch->clip_final,
-                                                             project->scratch->sam_net3_nchw,
-                                                             sam_grid_w,
-                                                             sam_grid_h,
-                                                             chunk->view_count,
-                                                             project->scratch->concat,
-                                                             error,
-                                                             error_size)) {
-            return UOCR_ERROR_INTERNAL;
-        }
-        metal_profile_add_event_now(project->ctx, "metal.vision.concat_batch", concat_start_ns);
-        const uint64_t projector_start_ns = uocr_profile_now_ns();
-        if (!metal_context_visual_projector_f16_to_slice(project->ctx,
-                                                        project->scratch->concat,
-                                                        project->weights->projector_weight,
-                                                        project->weights->projector_bias,
-                                                        chunk->projected_token_count,
-                                                        projected_rows,
-                                                        error,
-                                                        error_size)) {
-            return UOCR_ERROR_INTERNAL;
-        }
-        metal_profile_add_event_now(project->ctx, "metal.vision.projector_batch", projector_start_ns);
-    } else {
-        const uocr_image_view *view = &project->request->views[chunk->first_view];
-        if (!metal_encode_one_view_projected_f16(project,
-                                                 view,
-                                                 (uocr_metal_vision_workspace_slice){0},
-                                                 0u,
-                                                 0u,
-                                                 projected_rows,
-                                                 error,
-                                                 error_size)) {
-            return UOCR_ERROR_INTERNAL;
-        }
+        return UOCR_ERROR_INTERNAL;
     }
+    metal_profile_add_event_now(project->ctx, "metal.vision.clip_frontend_batch", clip_frontend_start_ns);
+    const uint64_t clip_transformer_start_ns = uocr_profile_now_ns();
+    if (!metal_context_clip_transformer_batch_workspace_f16_to_slice(project->ctx,
+                                                                     project->scratch->clip_a,
+                                                                     project->weights->clip_block_slices,
+                                                                     UOCR_CLIP_BLOCKS,
+                                                                     clip_tokens_per_view,
+                                                                     chunk->view_count,
+                                                                     project->scratch->clip_final,
+                                                                     project->scratch,
+                                                                     error,
+                                                                     error_size)) {
+        return UOCR_ERROR_INTERNAL;
+    }
+    metal_profile_add_event_now(project->ctx, "metal.vision.clip_transformer_batch", clip_transformer_start_ns);
+    const uint64_t concat_start_ns = uocr_profile_now_ns();
+    if (!metal_context_clip_sam_concat_batch_f16_to_slice(project->ctx,
+                                                         project->scratch->clip_final,
+                                                         project->scratch->sam_net3_nchw,
+                                                         sam_grid_w,
+                                                         sam_grid_h,
+                                                         chunk->view_count,
+                                                         project->scratch->concat,
+                                                         error,
+                                                         error_size)) {
+        return UOCR_ERROR_INTERNAL;
+    }
+    metal_profile_add_event_now(project->ctx, "metal.vision.concat_batch", concat_start_ns);
+    const uint64_t projector_start_ns = uocr_profile_now_ns();
+    if (!metal_context_visual_projector_f16_to_slice(project->ctx,
+                                                    project->scratch->concat,
+                                                    project->weights->projector_weight,
+                                                    project->weights->projector_bias,
+                                                    chunk->projected_token_count,
+                                                    projected_rows,
+                                                    error,
+                                                    error_size)) {
+        return UOCR_ERROR_INTERNAL;
+    }
+    metal_profile_add_event_now(project->ctx, "metal.vision.projector_batch", projector_start_ns);
     const uint64_t chunk_encode_end_ns = uocr_profile_now_ns();
     project->chunk_encode_ms += uocr_profile_elapsed_ms(chunk_encode_start_ns, chunk_encode_end_ns);
     metal_profile_add_event_now(project->ctx, "metal.vision.chunk_encode", chunk_encode_start_ns);

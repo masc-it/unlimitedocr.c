@@ -99,7 +99,7 @@ Implementation status:
 - [x] Keep only input pixels and final generated-token readback CPU-visible.
 - [x] Preserve exact final feature order: local crops first, global rows, newline rows, separator rows, and multi-page order.
 - [ ] Add profiles for base, max-crop gundam, and multi-page base after batching lands.
-- [ ] Delete the serial one-view production path after batched dispatch passes parity and timing gates.
+- [x] Delete the serial one-view production path after batched dispatch passes parity and timing gates.
 
 Acceptance target:
 
