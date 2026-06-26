@@ -28,6 +28,11 @@
 #define UOCR_METAL_MPS_DATA_TYPE_FLOAT16 (0x10000000U | 16U)
 #define UOCR_METAL_MPS_DATA_TYPE_FLOAT32 (0x10000000U | 32U)
 #define UOCR_METAL_MPS_MATMUL_MIN_FLOPS 64000000ULL
+#if UINTPTR_MAX > 0xffffffffu
+#define UOCR_METAL_PRIVATE_WORKSPACE_PTR_BASE ((uintptr_t)0x4000000000000000ULL)
+#else
+#define UOCR_METAL_PRIVATE_WORKSPACE_PTR_BASE ((uintptr_t)0x40000000UL)
+#endif
 
 @interface NSObject (UOCRMetalMPSDynamic)
 + (id)descriptorWithDataType:(uint32_t)dataType shape:(NSArray<NSNumber *> *)shape;
@@ -3424,6 +3429,20 @@ static int metal_vision_workspace_add_slice_size(uint64_t *cursor,
     return 1;
 }
 
+/* Legacy diagnostic helpers still accept host pointers, but production vision
+ * now keeps workspace scratch private.  For private scratch, f16 fields carry
+ * opaque offset tokens that metal_vision_scratch_pointer_slice() maps back to
+ * the retained MTLBuffer without ever dereferencing them.
+ */
+static uint16_t *metal_private_workspace_token(NSUInteger offset) {
+    const uintptr_t base = UOCR_METAL_PRIVATE_WORKSPACE_PTR_BASE;
+    const uintptr_t offset_value = (uintptr_t)offset;
+    if (offset_value > UINTPTR_MAX - base) {
+        return NULL;
+    }
+    return (uint16_t *)(void *)(base + offset_value);
+}
+
 static int metal_vision_workspace_assign_slice(uocr_metal_vision_workspace_slice *slice,
                                                id<MTLBuffer> buffer,
                                                uint8_t *base,
@@ -3432,7 +3451,7 @@ static int metal_vision_workspace_assign_slice(uocr_metal_vision_workspace_slice
                                                const char *label,
                                                char *error,
                                                size_t error_size) {
-    if (slice == NULL || buffer == nil || base == NULL || cursor == NULL || value_count == 0u) {
+    if (slice == NULL || buffer == nil || cursor == NULL || value_count == 0u) {
         return metal_fail(error, error_size, "invalid Metal vision workspace slice assignment");
     }
     uint64_t bytes = 0u;
@@ -3449,7 +3468,14 @@ static int metal_vision_workspace_assign_slice(uocr_metal_vision_workspace_slice
     slice->buffer = buffer;
     slice->offset = (NSUInteger)offset;
     slice->bytes = bytes;
-    slice->f16 = (uint16_t *)(void *)(base + (size_t)offset);
+    if (base != NULL) {
+        slice->f16 = (uint16_t *)(void *)(base + (size_t)offset);
+    } else {
+        slice->f16 = metal_private_workspace_token((NSUInteger)offset);
+        if (slice->f16 == NULL) {
+            return metal_fail(error, error_size, "Metal private vision workspace token overflow for %s", label != NULL ? label : "buffer");
+        }
+    }
     return 1;
 }
 
@@ -3484,6 +3510,7 @@ static int metal_vision_workspace_init(uocr_metal_context *ctx,
                                        uint32_t max_view_size,
                                        uint32_t projected_row_capacity,
                                        uint32_t final_visual_row_capacity,
+                                       int cpu_visible,
                                        char *error,
                                        size_t error_size) {
     if (ctx == NULL || workspace == NULL) {
@@ -3592,7 +3619,7 @@ static int metal_vision_workspace_init(uocr_metal_context *ctx,
     if (!metal_context_ensure_scratch_accounted(ctx,
                                                 UOCR_METAL_SCRATCH_VISION,
                                                 required_bytes,
-                                                1,
+                                                cpu_visible,
                                                 UOCR_MEMORY_VISION_FINAL_FEATURES,
                                                 final_visual_bytes,
                                                 error,
@@ -3600,9 +3627,12 @@ static int metal_vision_workspace_init(uocr_metal_context *ctx,
         return 0;
     }
     id<MTLBuffer> buffer = ctx->scratch[UOCR_METAL_SCRATCH_VISION].buffer;
-    uint8_t *base = buffer != nil ? (uint8_t *)[buffer contents] : NULL;
-    if (buffer == nil || base == NULL) {
-        return metal_fail(error, error_size, "Metal vision workspace scratch buffer is not CPU-visible");
+    uint8_t *base = (cpu_visible && buffer != nil) ? (uint8_t *)[buffer contents] : NULL;
+    if (buffer == nil || (cpu_visible && base == NULL)) {
+        return metal_fail(error,
+                          error_size,
+                          "Metal vision workspace scratch buffer is not %s",
+                          cpu_visible ? "CPU-visible" : "allocated");
     }
 
     uint64_t cursor = 0u;
@@ -4471,7 +4501,11 @@ static int metal_vision_workspace_slice_rows(uocr_metal_vision_workspace_slice s
     out->buffer = slice.buffer;
     out->offset = (NSUInteger)absolute_offset;
     out->bytes = byte_count;
-    out->f16 = &slice.f16[first_value];
+    const uintptr_t base = (uintptr_t)(const void *)slice.f16;
+    if (base > UINTPTR_MAX - (uintptr_t)byte_offset) {
+        return metal_fail(error, error_size, "Metal vision row-slice host token overflow");
+    }
+    out->f16 = (uint16_t *)(void *)(base + (uintptr_t)byte_offset);
     return 1;
 }
 
@@ -4823,6 +4857,7 @@ static int metal_context_encode_visual_features_to_workspace_f16(uocr_metal_cont
                                                                  uint32_t max_views_per_chunk,
                                                                  const uocr_vision_schedule *schedule,
                                                                  uocr_metal_vision_workspace *scratch,
+                                                                 int cpu_visible_workspace,
                                                                  char *error,
                                                                  size_t error_size) {
     if (ctx == NULL || request == NULL || schedule == NULL || scratch == NULL || schedule->final_visual_tokens == 0u) {
@@ -4847,6 +4882,7 @@ static int metal_context_encode_visual_features_to_workspace_f16(uocr_metal_cont
                                      max_view_size,
                                      schedule->max_chunk_projected_tokens,
                                      schedule->final_visual_tokens,
+                                     cpu_visible_workspace,
                                      error,
                                      error_size)) {
         return 0;
@@ -5062,6 +5098,7 @@ int uocr_metal_context_diagnostic_encode_visual_features_f16(uocr_metal_context 
                                                                max_views_per_chunk,
                                                                &schedule,
                                                                &scratch,
+                                                               1,
                                                                error,
                                                                error_size)) {
         return 0;
@@ -5126,7 +5163,7 @@ int uocr_metal_context_diagnostic_encode_sam_features_f16(uocr_metal_context *ct
     }
 
     uocr_metal_vision_workspace scratch;
-    if (!metal_vision_workspace_init(ctx, &scratch, expected_size, 0u, 0u, error, error_size)) {
+    if (!metal_vision_workspace_init(ctx, &scratch, expected_size, 0u, 0u, 1, error, error_size)) {
         return 0;
     }
 
@@ -5213,7 +5250,7 @@ int uocr_metal_context_diagnostic_encode_clip_features_f16(uocr_metal_context *c
     }
 
     uocr_metal_vision_workspace scratch;
-    if (!metal_vision_workspace_init(ctx, &scratch, expected_size, 0u, 0u, error, error_size)) {
+    if (!metal_vision_workspace_init(ctx, &scratch, expected_size, 0u, 0u, 1, error, error_size)) {
         return 0;
     }
 
@@ -5304,7 +5341,7 @@ int uocr_metal_context_diagnostic_encode_projected_features_f16(uocr_metal_conte
     }
 
     uocr_metal_vision_workspace scratch;
-    if (!metal_vision_workspace_init(ctx, &scratch, expected_size, expected_rows, 0u, error, error_size)) {
+    if (!metal_vision_workspace_init(ctx, &scratch, expected_size, expected_rows, 0u, 1, error, error_size)) {
         return 0;
     }
 
@@ -6569,8 +6606,27 @@ static int metal_vision_scratch_pointer_slice(const uocr_metal_context *ctx,
         return 0;
     }
     const uocr_metal_scratch_buffer *vision_scratch = &ctx->scratch[UOCR_METAL_SCRATCH_VISION];
-    return vision_scratch->cpu_visible &&
-           metal_host_range_to_slice(vision_scratch->buffer, 0u, vision_scratch->capacity, bytes, byte_length, out_slice);
+    if (vision_scratch->buffer == nil || vision_scratch->capacity == 0u) {
+        return 0;
+    }
+    if (vision_scratch->cpu_visible) {
+        return metal_host_range_to_slice(vision_scratch->buffer, 0u, vision_scratch->capacity, bytes, byte_length, out_slice);
+    }
+
+    const uintptr_t token = (uintptr_t)bytes;
+    const uintptr_t base = UOCR_METAL_PRIVATE_WORKSPACE_PTR_BASE;
+    if (token < base) {
+        return 0;
+    }
+    const uint64_t inner_offset = (uint64_t)(token - base);
+    uint64_t end = 0u;
+    if (inner_offset > vision_scratch->capacity || !checked_add_u64(inner_offset, byte_length, &end) ||
+        end > vision_scratch->capacity || inner_offset > (uint64_t)NSUIntegerMax) {
+        return 0;
+    }
+    out_slice->buffer = vision_scratch->buffer;
+    out_slice->offset = (NSUInteger)inner_offset;
+    return 1;
 }
 
 static int metal_vision_host_pointer_slice(const uocr_metal_context *ctx,
@@ -10759,6 +10815,7 @@ static int metal_context_generate_image_f16_impl(uocr_metal_context *ctx,
                                                                                 max_views_per_chunk,
                                                                                 &schedule,
                                                                                 &scratch,
+                                                                                0,
                                                                                 error,
                                                                                 error_size);
     if (!metal_runtime_arena_guard_end(ctx,

@@ -90,7 +90,7 @@ Implementation status:
 - [x] Encode the entire global shape group in one command buffer.
 - [x] Make production vision helpers accept `uocr_metal_buffer_slice` inputs and outputs, not host pointers.
 - [x] Route production per-view projected-row output through Metal workspace slices so chunk formatting consumes the reusable workspace slice directly.
-- [ ] Allocate vision intermediates from GPU-private workspace slices.
+- [x] Allocate vision intermediates from GPU-private workspace slices.
 - [ ] Keep only input pixels and final generated-token readback CPU-visible.
 - [ ] Preserve exact final feature order: local crops first, global rows, newline rows, separator rows, and multi-page order.
 - [ ] Add profiles for base, max-crop gundam, and multi-page base after batching lands.
