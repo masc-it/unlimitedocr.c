@@ -1331,18 +1331,21 @@ struct UocrSamNeckConv1x1Params {
     uint grid_height;
     uint in_channels;
     uint out_channels;
+    uint batch_size;
 };
 
 static inline float uocr_sam_neck_conv1x1_tile_value_f16(device const half *src_bhwc,
                                                          device const half *weight,
                                                          constant UocrSamNeckConv1x1Params &params,
                                                          uint spatial,
-                                                         uint out_channel) {
+                                                         uint out_channel,
+                                                         uint batch) {
     float sum = 0.0f;
-    const uint src_base = spatial * params.in_channels;
+    const uint spatial_size = params.grid_width * params.grid_height;
+    const ulong src_base = (ulong(batch) * ulong(spatial_size) + ulong(spatial)) * ulong(params.in_channels);
     const uint weight_base = out_channel * params.in_channels;
     for (uint c = 0u; c < params.in_channels; ++c) {
-        sum += float(src_bhwc[src_base + c]) * float(weight[weight_base + c]);
+        sum += float(src_bhwc[src_base + ulong(c)]) * float(weight[weight_base + c]);
     }
     return sum;
 }
@@ -1351,32 +1354,34 @@ kernel void uocr_sam_neck_conv1x1_f16_to_f16(device const half *src_bhwc [[buffe
                                              device const half *weight [[buffer(1)]],
                                              device half *dst_nchw [[buffer(2)]],
                                              constant UocrSamNeckConv1x1Params &params [[buffer(3)]],
-                                             uint2 gid [[thread_position_in_grid]]) {
+                                             uint3 gid [[thread_position_in_grid]]) {
     const uint spatial_size = params.grid_width * params.grid_height;
     const uint spatial = gid.x;
     const uint out_channel = gid.y;
-    if (out_channel >= params.out_channels || spatial >= spatial_size) {
+    const uint batch = gid.z;
+    if (out_channel >= params.out_channels || spatial >= spatial_size || batch >= params.batch_size) {
         return;
     }
 
-    const float value = uocr_sam_neck_conv1x1_tile_value_f16(src_bhwc, weight, params, spatial, out_channel);
-    dst_nchw[out_channel * spatial_size + spatial] = half(value);
+    const float value = uocr_sam_neck_conv1x1_tile_value_f16(src_bhwc, weight, params, spatial, out_channel, batch);
+    dst_nchw[(ulong(batch) * ulong(params.out_channels) + ulong(out_channel)) * ulong(spatial_size) + ulong(spatial)] = half(value);
 }
 
 kernel void uocr_sam_neck_conv1x1_f16_to_f32(device const half *src_bhwc [[buffer(0)]],
                                              device const half *weight [[buffer(1)]],
                                              device float *dst_nchw [[buffer(2)]],
                                              constant UocrSamNeckConv1x1Params &params [[buffer(3)]],
-                                             uint2 gid [[thread_position_in_grid]]) {
+                                             uint3 gid [[thread_position_in_grid]]) {
     const uint spatial_size = params.grid_width * params.grid_height;
     const uint spatial = gid.x;
     const uint out_channel = gid.y;
-    if (out_channel >= params.out_channels || spatial >= spatial_size) {
+    const uint batch = gid.z;
+    if (out_channel >= params.out_channels || spatial >= spatial_size || batch >= params.batch_size) {
         return;
     }
 
-    const float value = uocr_sam_neck_conv1x1_tile_value_f16(src_bhwc, weight, params, spatial, out_channel);
-    dst_nchw[out_channel * spatial_size + spatial] = value;
+    const float value = uocr_sam_neck_conv1x1_tile_value_f16(src_bhwc, weight, params, spatial, out_channel, batch);
+    dst_nchw[(ulong(batch) * ulong(params.out_channels) + ulong(out_channel)) * ulong(spatial_size) + ulong(spatial)] = value;
 }
 
 struct UocrSamNeckConv3x3Params {
@@ -1384,13 +1389,15 @@ struct UocrSamNeckConv3x3Params {
     uint grid_height;
     uint channels;
     uint kernel_size;
+    uint batch_size;
 };
 
 static inline float uocr_sam_neck_conv3x3_tile_value_f16(device const half *src_nchw,
                                                          device const half *weight,
                                                          constant UocrSamNeckConv3x3Params &params,
                                                          uint spatial,
-                                                         uint out_channel) {
+                                                         uint out_channel,
+                                                         uint batch) {
     const uint x = spatial % params.grid_width;
     const uint y = spatial / params.grid_width;
     const uint spatial_size = params.grid_width * params.grid_height;
@@ -1407,7 +1414,7 @@ static inline float uocr_sam_neck_conv3x3_tile_value_f16(device const half *src_
                 if (sx < 0 || sx >= int(params.grid_width)) {
                     continue;
                 }
-                const ulong src_index = ulong(in_channel) * ulong(spatial_size) +
+                const ulong src_index = (ulong(batch) * ulong(params.channels) + ulong(in_channel)) * ulong(spatial_size) +
                                         ulong(uint(sy)) * ulong(params.grid_width) + ulong(uint(sx));
                 const ulong weight_index = ((ulong(out_channel) * ulong(params.channels) + ulong(in_channel)) *
                                                 ulong(params.kernel_size) + ulong(ky)) *
@@ -1423,32 +1430,34 @@ kernel void uocr_sam_neck_conv3x3_f16_to_f16(device const half *src_nchw [[buffe
                                              device const half *weight [[buffer(1)]],
                                              device half *dst_nchw [[buffer(2)]],
                                              constant UocrSamNeckConv3x3Params &params [[buffer(3)]],
-                                             uint2 gid [[thread_position_in_grid]]) {
+                                             uint3 gid [[thread_position_in_grid]]) {
     const uint spatial_size = params.grid_width * params.grid_height;
     const uint spatial = gid.x;
     const uint out_channel = gid.y;
-    if (out_channel >= params.channels || spatial >= spatial_size) {
+    const uint batch = gid.z;
+    if (out_channel >= params.channels || spatial >= spatial_size || batch >= params.batch_size) {
         return;
     }
 
-    const float value = uocr_sam_neck_conv3x3_tile_value_f16(src_nchw, weight, params, spatial, out_channel);
-    dst_nchw[out_channel * spatial_size + spatial] = half(value);
+    const float value = uocr_sam_neck_conv3x3_tile_value_f16(src_nchw, weight, params, spatial, out_channel, batch);
+    dst_nchw[(ulong(batch) * ulong(params.channels) + ulong(out_channel)) * ulong(spatial_size) + ulong(spatial)] = half(value);
 }
 
 kernel void uocr_sam_neck_conv3x3_f16_to_f32(device const half *src_nchw [[buffer(0)]],
                                              device const half *weight [[buffer(1)]],
                                              device float *dst_nchw [[buffer(2)]],
                                              constant UocrSamNeckConv3x3Params &params [[buffer(3)]],
-                                             uint2 gid [[thread_position_in_grid]]) {
+                                             uint3 gid [[thread_position_in_grid]]) {
     const uint spatial_size = params.grid_width * params.grid_height;
     const uint spatial = gid.x;
     const uint out_channel = gid.y;
-    if (out_channel >= params.channels || spatial >= spatial_size) {
+    const uint batch = gid.z;
+    if (out_channel >= params.channels || spatial >= spatial_size || batch >= params.batch_size) {
         return;
     }
 
-    const float value = uocr_sam_neck_conv3x3_tile_value_f16(src_nchw, weight, params, spatial, out_channel);
-    dst_nchw[out_channel * spatial_size + spatial] = value;
+    const float value = uocr_sam_neck_conv3x3_tile_value_f16(src_nchw, weight, params, spatial, out_channel, batch);
+    dst_nchw[(ulong(batch) * ulong(params.channels) + ulong(out_channel)) * ulong(spatial_size) + ulong(spatial)] = value;
 }
 
 struct UocrSamConv3x3Stride2Params {
@@ -1460,13 +1469,15 @@ struct UocrSamConv3x3Stride2Params {
     uint out_channels;
     uint kernel_size;
     uint stride;
+    uint batch_size;
 };
 
 static inline float uocr_sam_conv3x3_stride2_tile_value_f16(device const half *src_nchw,
                                                             device const half *weight,
                                                             constant UocrSamConv3x3Stride2Params &params,
                                                             uint output_spatial,
-                                                            uint out_channel) {
+                                                            uint out_channel,
+                                                            uint batch) {
     const uint out_x = output_spatial % params.output_width;
     const uint out_y = output_spatial / params.output_width;
     const uint input_spatial_size = params.input_width * params.input_height;
@@ -1483,7 +1494,7 @@ static inline float uocr_sam_conv3x3_stride2_tile_value_f16(device const half *s
                 if (sx < 0 || sx >= int(params.input_width)) {
                     continue;
                 }
-                const ulong src_index = ulong(in_channel) * ulong(input_spatial_size) +
+                const ulong src_index = (ulong(batch) * ulong(params.in_channels) + ulong(in_channel)) * ulong(input_spatial_size) +
                                         ulong(uint(sy)) * ulong(params.input_width) + ulong(uint(sx));
                 const ulong weight_index = ((ulong(out_channel) * ulong(params.in_channels) + ulong(in_channel)) *
                                                 ulong(params.kernel_size) + ulong(ky)) *
@@ -1499,32 +1510,34 @@ kernel void uocr_sam_conv3x3_stride2_f16_to_f16(device const half *src_nchw [[bu
                                                 device const half *weight [[buffer(1)]],
                                                 device half *dst_nchw [[buffer(2)]],
                                                 constant UocrSamConv3x3Stride2Params &params [[buffer(3)]],
-                                                uint2 gid [[thread_position_in_grid]]) {
+                                                uint3 gid [[thread_position_in_grid]]) {
     const uint output_spatial_size = params.output_width * params.output_height;
     const uint output_spatial = gid.x;
     const uint out_channel = gid.y;
-    if (out_channel >= params.out_channels || output_spatial >= output_spatial_size) {
+    const uint batch = gid.z;
+    if (out_channel >= params.out_channels || output_spatial >= output_spatial_size || batch >= params.batch_size) {
         return;
     }
 
-    const float value = uocr_sam_conv3x3_stride2_tile_value_f16(src_nchw, weight, params, output_spatial, out_channel);
-    dst_nchw[out_channel * output_spatial_size + output_spatial] = half(value);
+    const float value = uocr_sam_conv3x3_stride2_tile_value_f16(src_nchw, weight, params, output_spatial, out_channel, batch);
+    dst_nchw[(ulong(batch) * ulong(params.out_channels) + ulong(out_channel)) * ulong(output_spatial_size) + ulong(output_spatial)] = half(value);
 }
 
 kernel void uocr_sam_conv3x3_stride2_f16_to_f32(device const half *src_nchw [[buffer(0)]],
                                                 device const half *weight [[buffer(1)]],
                                                 device float *dst_nchw [[buffer(2)]],
                                                 constant UocrSamConv3x3Stride2Params &params [[buffer(3)]],
-                                                uint2 gid [[thread_position_in_grid]]) {
+                                                uint3 gid [[thread_position_in_grid]]) {
     const uint output_spatial_size = params.output_width * params.output_height;
     const uint output_spatial = gid.x;
     const uint out_channel = gid.y;
-    if (out_channel >= params.out_channels || output_spatial >= output_spatial_size) {
+    const uint batch = gid.z;
+    if (out_channel >= params.out_channels || output_spatial >= output_spatial_size || batch >= params.batch_size) {
         return;
     }
 
-    const float value = uocr_sam_conv3x3_stride2_tile_value_f16(src_nchw, weight, params, output_spatial, out_channel);
-    dst_nchw[out_channel * output_spatial_size + output_spatial] = value;
+    const float value = uocr_sam_conv3x3_stride2_tile_value_f16(src_nchw, weight, params, output_spatial, out_channel, batch);
+    dst_nchw[(ulong(batch) * ulong(params.out_channels) + ulong(out_channel)) * ulong(output_spatial_size) + ulong(output_spatial)] = value;
 }
 
 struct UocrClipEmbedSamParams {
@@ -1676,6 +1689,7 @@ struct UocrSamLayerNorm2dParams {
     uint grid_height;
     uint channels;
     float eps;
+    uint batch_size;
 };
 
 static inline float uocr_sam_layernorm2d_value(device const half *src_nchw,
@@ -1684,13 +1698,14 @@ static inline float uocr_sam_layernorm2d_value(device const half *src_nchw,
                                                constant UocrSamLayerNorm2dParams &params,
                                                uint spatial,
                                                uint channel,
+                                               uint batch,
                                                threadgroup float *partials,
                                                uint tid,
                                                uint ntg) {
     const uint spatial_size = params.grid_width * params.grid_height;
     float value = 0.0f;
     if (tid < params.channels) {
-        value = float(src_nchw[tid * spatial_size + spatial]);
+        value = float(src_nchw[(ulong(batch) * ulong(params.channels) + ulong(tid)) * ulong(spatial_size) + ulong(spatial)]);
     }
     partials[tid] = tid < params.channels ? value : 0.0f;
     partials[ntg + tid] = tid < params.channels ? value * value : 0.0f;
@@ -1716,15 +1731,18 @@ kernel void uocr_sam_layernorm2d_f16_to_f16(device const half *src_nchw [[buffer
                                             device half *dst_nchw [[buffer(3)]],
                                             constant UocrSamLayerNorm2dParams &params [[buffer(4)]],
                                             threadgroup float *partials [[threadgroup(0)]],
-                                            uint spatial [[threadgroup_position_in_grid]],
+                                            uint3 block [[threadgroup_position_in_grid]],
                                             uint tid [[thread_index_in_threadgroup]],
-                                            uint ntg [[threads_per_threadgroup]]) {
+                                            uint3 ntg3 [[threads_per_threadgroup]]) {
+    const uint ntg = ntg3.x;
     const uint spatial_size = params.grid_width * params.grid_height;
-    if (spatial >= spatial_size || tid >= params.channels) {
+    const uint spatial = block.x;
+    const uint batch = block.z;
+    if (spatial >= spatial_size || tid >= params.channels || batch >= params.batch_size) {
         return;
     }
-    const float value = uocr_sam_layernorm2d_value(src_nchw, weight, bias, params, spatial, tid, partials, tid, ntg);
-    dst_nchw[tid * spatial_size + spatial] = half(value);
+    const float value = uocr_sam_layernorm2d_value(src_nchw, weight, bias, params, spatial, tid, batch, partials, tid, ntg);
+    dst_nchw[(ulong(batch) * ulong(params.channels) + ulong(tid)) * ulong(spatial_size) + ulong(spatial)] = half(value);
 }
 
 kernel void uocr_sam_layernorm2d_f16_to_f32(device const half *src_nchw [[buffer(0)]],
@@ -1733,15 +1751,18 @@ kernel void uocr_sam_layernorm2d_f16_to_f32(device const half *src_nchw [[buffer
                                             device float *dst_nchw [[buffer(3)]],
                                             constant UocrSamLayerNorm2dParams &params [[buffer(4)]],
                                             threadgroup float *partials [[threadgroup(0)]],
-                                            uint spatial [[threadgroup_position_in_grid]],
+                                            uint3 block [[threadgroup_position_in_grid]],
                                             uint tid [[thread_index_in_threadgroup]],
-                                            uint ntg [[threads_per_threadgroup]]) {
+                                            uint3 ntg3 [[threads_per_threadgroup]]) {
+    const uint ntg = ntg3.x;
     const uint spatial_size = params.grid_width * params.grid_height;
-    if (spatial >= spatial_size || tid >= params.channels) {
+    const uint spatial = block.x;
+    const uint batch = block.z;
+    if (spatial >= spatial_size || tid >= params.channels || batch >= params.batch_size) {
         return;
     }
-    const float value = uocr_sam_layernorm2d_value(src_nchw, weight, bias, params, spatial, tid, partials, tid, ntg);
-    dst_nchw[tid * spatial_size + spatial] = value;
+    const float value = uocr_sam_layernorm2d_value(src_nchw, weight, bias, params, spatial, tid, batch, partials, tid, ntg);
+    dst_nchw[(ulong(batch) * ulong(params.channels) + ulong(tid)) * ulong(spatial_size) + ulong(spatial)] = value;
 }
 
 struct UocrSamResidualParams {

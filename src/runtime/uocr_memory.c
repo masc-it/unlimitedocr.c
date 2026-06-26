@@ -217,8 +217,9 @@ int uocr_estimate_vision_memory_for_shape(uint32_t max_view_size,
 
     /* Exact reusable Metal vision workspace high-water estimate.  This mirrors
      * uocr_metal_vision_workspace: aligned fp16 slices for SAM patch/position/
-     * transformer state, SAM/CLIP transformer block scratch, SAM neck/net
-     * state, chunk-batched SAM patch/net3 outputs, chunk-batched CLIP final
+     * transformer state, SAM/CLIP transformer block scratch, chunk-batched
+     * SAM transformer/neck/net state, chunk-batched SAM patch/net3 outputs,
+     * chunk-batched CLIP final
      * tokens, chunk concat, projected rows, and final formatted rows.
      * Production vision transformer scratch is GPU/workspace-resident;
      * diagnostic host staging is not part of the public request-shaped
@@ -237,7 +238,10 @@ int uocr_estimate_vision_memory_for_shape(uint32_t max_view_size,
 
     uint64_t sam_bhwc_values = 0u;
     uint64_t sam_patch_bhwc_values = 0u;
+    uint64_t sam_transformer_batch_values = 0u;
+    uint64_t sam_neck_values_per_view = 0u;
     uint64_t sam_neck_values = 0u;
+    uint64_t sam_net2_values_per_view = 0u;
     uint64_t sam_net2_values = 0u;
     uint64_t sam_net3_values_per_view = 0u;
     uint64_t sam_net3_values = 0u;
@@ -255,9 +259,12 @@ int uocr_estimate_vision_memory_for_shape(uint32_t max_view_size,
     uint64_t total = 0u;
     if (!checked_mul_u64(patch_tokens, (uint64_t)UOCR_SAM_HIDDEN_SIZE, &sam_bhwc_values) ||
         !checked_mul_u64(sam_bhwc_values, chunk_view_capacity, &sam_patch_bhwc_values) ||
-        !checked_mul_u64(patch_tokens, (uint64_t)UOCR_SAM_NECK_CHANNELS, &sam_neck_values) ||
-        !checked_mul_u64((uint64_t)UOCR_SAM_NET2_CHANNELS, net2_grid, &sam_net2_values) ||
-        !checked_mul_u64(sam_net2_values, net2_grid, &sam_net2_values) ||
+        !checked_mul_u64(sam_bhwc_values, chunk_view_capacity, &sam_transformer_batch_values) ||
+        !checked_mul_u64(patch_tokens, (uint64_t)UOCR_SAM_NECK_CHANNELS, &sam_neck_values_per_view) ||
+        !checked_mul_u64(sam_neck_values_per_view, chunk_view_capacity, &sam_neck_values) ||
+        !checked_mul_u64((uint64_t)UOCR_SAM_NET2_CHANNELS, net2_grid, &sam_net2_values_per_view) ||
+        !checked_mul_u64(sam_net2_values_per_view, net2_grid, &sam_net2_values_per_view) ||
+        !checked_mul_u64(sam_net2_values_per_view, chunk_view_capacity, &sam_net2_values) ||
         !checked_mul_u64((uint64_t)UOCR_SAM_NET3_CHANNELS, net3_grid, &sam_net3_values_per_view) ||
         !checked_mul_u64(sam_net3_values_per_view, net3_grid, &sam_net3_values_per_view) ||
         !checked_mul_u64(sam_net3_values_per_view, chunk_view_capacity, &sam_net3_values) ||
@@ -280,6 +287,7 @@ int uocr_estimate_vision_memory_for_shape(uint32_t max_view_size,
         !add_aligned_f16_slice_bytes(&total, sam_patch_bhwc_values) ||
         !add_aligned_f16_slice_bytes(&total, sam_bhwc_values) ||
         !add_aligned_f16_slice_bytes(&total, sam_bhwc_values) ||
+        !add_aligned_f16_slice_bytes(&total, sam_transformer_batch_values) ||
         !add_aligned_f16_slice_bytes(&total, sam_bhwc_values) ||
         !add_aligned_f16_slice_bytes(&total, sam_attention_values) ||
         !add_aligned_f16_slice_bytes(&total, sam_attention_values) ||
