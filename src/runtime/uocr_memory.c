@@ -296,8 +296,8 @@ int uocr_estimate_vision_memory_for_shape(uint32_t max_view_size,
         !add_aligned_f16_slice_bytes(&total, sam_neck_values) ||
         !add_aligned_f16_slice_bytes(&total, sam_net2_values) ||
         !add_aligned_f16_slice_bytes(&total, sam_net3_values) ||
-        !add_aligned_f16_slice_bytes(&total, clip_values) ||
-        !add_aligned_f16_slice_bytes(&total, clip_values) ||
+        !add_aligned_f16_slice_bytes(&total, clip_final_values) ||
+        !add_aligned_f16_slice_bytes(&total, clip_final_values) ||
         !add_aligned_f16_slice_bytes(&total, clip_final_values) ||
         !add_aligned_f16_slice_bytes(&total, clip_values) ||
         !add_aligned_f16_slice_bytes(&total, clip_values) ||

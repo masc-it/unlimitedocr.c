@@ -1532,13 +1532,15 @@ struct UocrClipEmbedSamParams {
     uint grid_height;
     uint hidden_size;
     uint token_count;
+    uint batch_size;
 };
 
 static inline float uocr_clip_embedding_from_sam_value(device const half *sam_nchw,
                                                        device const half *class_embedding,
                                                        constant UocrClipEmbedSamParams &params,
                                                        uint token,
-                                                       uint channel) {
+                                                       uint channel,
+                                                       uint batch) {
     if (token == 0u) {
         return float(class_embedding[channel]);
     }
@@ -1546,7 +1548,8 @@ static inline float uocr_clip_embedding_from_sam_value(device const half *sam_nc
     const uint y = spatial / params.grid_width;
     const uint x = spatial - y * params.grid_width;
     const ulong spatial_size = ulong(params.grid_width) * ulong(params.grid_height);
-    const ulong src_index = ulong(channel) * spatial_size + ulong(y) * ulong(params.grid_width) + ulong(x);
+    const ulong src_index = ulong(batch) * spatial_size * ulong(params.hidden_size) +
+                            ulong(channel) * spatial_size + ulong(y) * ulong(params.grid_width) + ulong(x);
     return float(sam_nchw[src_index]);
 }
 
@@ -1554,28 +1557,30 @@ kernel void uocr_clip_embed_sam_f16_to_f16(device const half *sam_nchw [[buffer(
                                            device const half *class_embedding [[buffer(1)]],
                                            device half *dst_tokens [[buffer(2)]],
                                            constant UocrClipEmbedSamParams &params [[buffer(3)]],
-                                           uint2 gid [[thread_position_in_grid]]) {
+                                           uint3 gid [[thread_position_in_grid]]) {
     const uint channel = gid.x;
     const uint token = gid.y;
-    if (channel >= params.hidden_size || token >= params.token_count) {
+    const uint batch = gid.z;
+    if (channel >= params.hidden_size || token >= params.token_count || batch >= params.batch_size) {
         return;
     }
-    const float value = uocr_clip_embedding_from_sam_value(sam_nchw, class_embedding, params, token, channel);
-    dst_tokens[ulong(token) * ulong(params.hidden_size) + ulong(channel)] = half(value);
+    const float value = uocr_clip_embedding_from_sam_value(sam_nchw, class_embedding, params, token, channel, batch);
+    dst_tokens[(ulong(batch) * ulong(params.token_count) + ulong(token)) * ulong(params.hidden_size) + ulong(channel)] = half(value);
 }
 
 kernel void uocr_clip_embed_sam_f16_to_f32(device const half *sam_nchw [[buffer(0)]],
                                            device const half *class_embedding [[buffer(1)]],
                                            device float *dst_tokens [[buffer(2)]],
                                            constant UocrClipEmbedSamParams &params [[buffer(3)]],
-                                           uint2 gid [[thread_position_in_grid]]) {
+                                           uint3 gid [[thread_position_in_grid]]) {
     const uint channel = gid.x;
     const uint token = gid.y;
-    if (channel >= params.hidden_size || token >= params.token_count) {
+    const uint batch = gid.z;
+    if (channel >= params.hidden_size || token >= params.token_count || batch >= params.batch_size) {
         return;
     }
-    dst_tokens[ulong(token) * ulong(params.hidden_size) + ulong(channel)] =
-        uocr_clip_embedding_from_sam_value(sam_nchw, class_embedding, params, token, channel);
+    dst_tokens[(ulong(batch) * ulong(params.token_count) + ulong(token)) * ulong(params.hidden_size) + ulong(channel)] =
+        uocr_clip_embedding_from_sam_value(sam_nchw, class_embedding, params, token, channel, batch);
 }
 
 struct UocrClipAbsPosParams {
@@ -1583,6 +1588,7 @@ struct UocrClipAbsPosParams {
     uint target_width;
     uint target_height;
     uint hidden_size;
+    uint batch_size;
 };
 
 static float uocr_clip_abs_pos_bicubic_antialias(device const half *pos_embed,
@@ -1635,12 +1641,14 @@ kernel void uocr_clip_add_abs_pos_f16_to_f16(device const half *tokens [[buffer(
                                              constant UocrClipAbsPosParams &params [[buffer(3)]],
                                              uint gid [[thread_position_in_grid]]) {
     const uint token_count = 1u + params.target_width * params.target_height;
-    const uint total = token_count * params.hidden_size;
+    const uint values_per_view = token_count * params.hidden_size;
+    const uint total = values_per_view * params.batch_size;
     if (gid >= total) {
         return;
     }
-    const uint channel = gid % params.hidden_size;
-    const uint token = gid / params.hidden_size;
+    const uint view_value = gid % values_per_view;
+    const uint channel = view_value % params.hidden_size;
+    const uint token = view_value / params.hidden_size;
     const float pos = uocr_clip_abs_pos_bicubic_antialias(pos_embed, params, token, channel);
     dst_tokens[gid] = half(float(tokens[gid]) + pos);
 }
@@ -1651,12 +1659,14 @@ kernel void uocr_clip_add_abs_pos_f16_to_f32(device const half *tokens [[buffer(
                                              constant UocrClipAbsPosParams &params [[buffer(3)]],
                                              uint gid [[thread_position_in_grid]]) {
     const uint token_count = 1u + params.target_width * params.target_height;
-    const uint total = token_count * params.hidden_size;
+    const uint values_per_view = token_count * params.hidden_size;
+    const uint total = values_per_view * params.batch_size;
     if (gid >= total) {
         return;
     }
-    const uint channel = gid % params.hidden_size;
-    const uint token = gid / params.hidden_size;
+    const uint view_value = gid % values_per_view;
+    const uint channel = view_value % params.hidden_size;
+    const uint token = view_value / params.hidden_size;
     const float pos = uocr_clip_abs_pos_bicubic_antialias(pos_embed, params, token, channel);
     dst_tokens[gid] = float(tokens[gid]) + pos;
 }

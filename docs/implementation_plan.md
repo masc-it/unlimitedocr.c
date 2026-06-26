@@ -87,7 +87,8 @@ Implementation status:
 - [x] Partition each request into exactly two shape groups: all local `640x640` views, then all global `1024x1024` views.
 - [x] Add a batch dimension to SAM patch embedding and visual formatter dispatch.
 - [x] Add a batch dimension to CLIP/SAM concat and visual projector dispatch.
-- [ ] Add a batch dimension to SAM transformer, SAM neck, CLIP embedding, and CLIP transformer dispatch.
+- [x] Add a batch dimension to CLIP embedding front-end dispatch.
+- [ ] Add a batch dimension to SAM transformer, SAM neck, and CLIP transformer dispatch.
 - [x] Encode the entire local shape group in one command buffer.
 - [x] Encode the entire global shape group in one command buffer.
 - [x] Make production vision helpers accept `uocr_metal_buffer_slice` inputs and outputs, not host pointers.
