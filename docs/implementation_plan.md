@@ -92,7 +92,7 @@ Implementation status:
 - [x] Route production per-view projected-row output through Metal workspace slices so chunk formatting consumes the reusable workspace slice directly.
 - [x] Allocate vision intermediates from GPU-private workspace slices.
 - [x] Keep only input pixels and final generated-token readback CPU-visible.
-- [ ] Preserve exact final feature order: local crops first, global rows, newline rows, separator rows, and multi-page order.
+- [x] Preserve exact final feature order: local crops first, global rows, newline rows, separator rows, and multi-page order.
 - [ ] Add profiles for base, max-crop gundam, and multi-page base after batching lands.
 - [ ] Delete the serial one-view production path after batched dispatch passes parity and timing gates.
 

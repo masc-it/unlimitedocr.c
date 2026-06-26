@@ -290,7 +290,7 @@ struct UocrVisualFormatLocalParams {
     uint crop_grid_w;
     uint chunk_first_view;
     uint chunk_view_count;
-    uint reserved0;
+    uint dst_token_base;
     uint reserved1;
     uint reserved2;
 };
@@ -305,7 +305,7 @@ kernel void uocr_fill_local_visual_newlines_f16(device const half *image_newline
         return;
     }
     const uint stitched_row_stride = params.crop_grid_w * params.grid_size + 1u;
-    const uint dst_row = local_row * stitched_row_stride + params.crop_grid_w * params.grid_size;
+    const uint dst_row = params.dst_token_base + local_row * stitched_row_stride + params.crop_grid_w * params.grid_size;
     dst_rows[dst_row * params.hidden_size + col] = image_newline[col];
 }
 
@@ -329,7 +329,9 @@ kernel void uocr_format_local_visual_rows_f16(device const half *projected_rows 
     const uint row_in_view = token_in_view / grid;
     const uint col_in_view = token_in_view - row_in_view * grid;
     const uint stitched_row_stride = params.crop_grid_w * grid + 1u;
-    const uint dst_row = (crop_y * grid + row_in_view) * stitched_row_stride + crop_x * grid + col_in_view;
+    const uint dst_row = params.dst_token_base +
+                         (crop_y * grid + row_in_view) * stitched_row_stride +
+                         crop_x * grid + col_in_view;
     dst_rows[dst_row * params.hidden_size + col] = projected_rows[src_row * params.hidden_size + col];
 }
 

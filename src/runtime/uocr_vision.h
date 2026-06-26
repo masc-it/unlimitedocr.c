@@ -24,6 +24,15 @@ typedef struct uocr_vision_chunk {
     uint32_t projected_tokens_per_view;
     uint32_t projected_token_start;
     uint32_t projected_token_count;
+    /*
+     * Destination range in the final visual-feature tensor.  Global chunks map
+     * to an exact contiguous range.  Local-crop chunks write a row-major subset
+     * of the stitched local block, so the range covers the whole local block;
+     * preserving this explicit placement lets local/global shape groups be
+     * encoded independently without changing decoder-visible feature order.
+     */
+    uint32_t final_token_start;
+    uint32_t final_token_count;
 } uocr_vision_chunk;
 
 typedef struct uocr_vision_schedule {

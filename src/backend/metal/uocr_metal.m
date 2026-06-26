@@ -747,7 +747,7 @@ typedef struct uocr_metal_visual_format_local_params {
     uint32_t crop_grid_w;
     uint32_t chunk_first_view;
     uint32_t chunk_view_count;
-    uint32_t reserved0;
+    uint32_t dst_token_base;
     uint32_t reserved1;
     uint32_t reserved2;
 } uocr_metal_visual_format_local_params;
@@ -4714,6 +4714,7 @@ static int metal_fill_local_visual_newlines_f16(uocr_metal_context *ctx,
                                                 uocr_metal_vision_workspace_slice dst_rows,
                                                 uint32_t crop_grid_w,
                                                 uint32_t crop_grid_h,
+                                                uint32_t dst_token_base,
                                                 char *error,
                                                 size_t error_size) {
     if (crop_grid_w == 0u || crop_grid_h == 0u) {
@@ -4721,9 +4722,10 @@ static int metal_fill_local_visual_newlines_f16(uocr_metal_context *ctx,
     }
     const uint32_t local_rows = crop_grid_h * UOCR_LOCAL_GRID_QUERIES;
     const uint32_t local_visual_tokens = uocr_local_visual_token_count(crop_grid_w, crop_grid_h);
-    const uint64_t dst_bytes = (uint64_t)local_visual_tokens * (uint64_t)UOCR_HIDDEN_SIZE * 2u;
+    const uint64_t dst_end_bytes = ((uint64_t)dst_token_base + (uint64_t)local_visual_tokens) *
+                                   (uint64_t)UOCR_HIDDEN_SIZE * 2u;
     if (!metal_slice_valid(image_newline.slice, (uint64_t)UOCR_HIDDEN_SIZE * 2u) ||
-        !metal_slice_valid((uocr_metal_buffer_slice){dst_rows.buffer, dst_rows.offset}, dst_bytes)) {
+        !metal_slice_valid((uocr_metal_buffer_slice){dst_rows.buffer, dst_rows.offset}, dst_end_bytes)) {
         return metal_fail(error, error_size, "invalid Metal local newline formatter slices");
     }
     uocr_metal_visual_format_local_params params;
@@ -4732,6 +4734,7 @@ static int metal_fill_local_visual_newlines_f16(uocr_metal_context *ctx,
     params.grid_size = UOCR_LOCAL_GRID_QUERIES;
     params.crop_grid_w = crop_grid_w;
     params.chunk_view_count = crop_grid_h;
+    params.dst_token_base = dst_token_base;
     return metal_dispatch_visual_format_kernel(ctx,
                                                "uocr_fill_local_visual_newlines_f16",
                                                "Metal local newline formatter",
@@ -4765,9 +4768,13 @@ static int metal_format_local_visual_rows_f16(uocr_metal_context *ctx,
     const uint64_t projected_bytes = (uint64_t)projected_rows_count * (uint64_t)UOCR_HIDDEN_SIZE * 2u;
     const uint32_t last_local_view = chunk->first_view + chunk->view_count - 1u;
     const uint64_t dst_min_rows = (uint64_t)uocr_local_visual_token_count(crop_grid_w, 1u + last_local_view / crop_grid_w);
-    const uint64_t dst_bytes = dst_min_rows * (uint64_t)UOCR_HIDDEN_SIZE * 2u;
+    if ((uint64_t)chunk->final_token_count < dst_min_rows) {
+        return metal_fail(error, error_size, "Metal local visual formatter final range is too small");
+    }
+    const uint64_t dst_end_bytes = ((uint64_t)chunk->final_token_start + (uint64_t)chunk->final_token_count) *
+                                   (uint64_t)UOCR_HIDDEN_SIZE * 2u;
     if (!metal_slice_valid((uocr_metal_buffer_slice){projected_rows.buffer, projected_rows.offset}, projected_bytes) ||
-        !metal_slice_valid((uocr_metal_buffer_slice){dst_rows.buffer, dst_rows.offset}, dst_bytes)) {
+        !metal_slice_valid((uocr_metal_buffer_slice){dst_rows.buffer, dst_rows.offset}, dst_end_bytes)) {
         return metal_fail(error, error_size, "invalid Metal local visual formatter slices");
     }
     uocr_metal_visual_format_local_params params;
@@ -4777,6 +4784,7 @@ static int metal_format_local_visual_rows_f16(uocr_metal_context *ctx,
     params.crop_grid_w = crop_grid_w;
     params.chunk_first_view = chunk->first_view;
     params.chunk_view_count = chunk->view_count;
+    params.dst_token_base = chunk->final_token_start;
     return metal_dispatch_visual_format_kernel(ctx,
                                                "uocr_format_local_visual_rows_f16",
                                                "Metal local visual formatter",
@@ -4954,6 +4962,7 @@ static int metal_context_encode_visual_features_to_workspace_f16(uocr_metal_cont
                                                       scratch->final_visual_rows,
                                                       request->crop_grid_w,
                                                       request->crop_grid_h,
+                                                      chunk->final_token_start,
                                                       error,
                                                       error_size)) {
                 process_status = UOCR_ERROR_INTERNAL;
@@ -4985,19 +4994,19 @@ static int metal_context_encode_visual_features_to_workspace_f16(uocr_metal_cont
                     process_status = UOCR_ERROR_INTERNAL;
                 }
             } else {
-                const uint32_t dst_base = schedule->local_view_count == 0u ?
-                                              chunk->first_view * UOCR_GLOBAL_VISUAL_TOKENS :
-                                              uocr_local_visual_token_count(request->crop_grid_w, request->crop_grid_h);
-                if (!metal_format_global_visual_rows_f16(ctx,
-                                                         scratch->projected_rows,
-                                                         weights->image_newline,
-                                                         weights->view_separator,
-                                                         scratch->final_visual_rows,
-                                                         chunk->projected_grid_w,
-                                                         chunk->view_count,
-                                                         dst_base,
-                                                         error,
-                                                         error_size)) {
+                if (chunk->final_token_count != chunk->view_count * UOCR_GLOBAL_VISUAL_TOKENS) {
+                    process_status = UOCR_ERROR_INTERNAL;
+                    (void)metal_fail(error, error_size, "Metal global visual formatter final range is invalid");
+                } else if (!metal_format_global_visual_rows_f16(ctx,
+                                                                 scratch->projected_rows,
+                                                                 weights->image_newline,
+                                                                 weights->view_separator,
+                                                                 scratch->final_visual_rows,
+                                                                 chunk->projected_grid_w,
+                                                                 chunk->view_count,
+                                                                 chunk->final_token_start,
+                                                                 error,
+                                                                 error_size)) {
                     process_status = UOCR_ERROR_INTERNAL;
                 }
             }

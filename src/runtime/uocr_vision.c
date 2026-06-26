@@ -32,7 +32,9 @@ static void make_chunk(uocr_vision_chunk *chunk,
                        uocr_vision_chunk_kind kind,
                        uint32_t first_view,
                        uint32_t view_count,
-                       uint32_t projected_token_start) {
+                       uint32_t projected_token_start,
+                       uint32_t final_token_start,
+                       uint32_t final_token_count) {
     const uint32_t tokens_per_view = kind == UOCR_VISION_CHUNK_LOCAL ?
                                          UOCR_LOCAL_GRID_QUERIES * UOCR_LOCAL_GRID_QUERIES :
                                          UOCR_GLOBAL_GRID_QUERIES * UOCR_GLOBAL_GRID_QUERIES;
@@ -46,6 +48,8 @@ static void make_chunk(uocr_vision_chunk *chunk,
     chunk->projected_tokens_per_view = tokens_per_view;
     chunk->projected_token_start = projected_token_start;
     chunk->projected_token_count = view_count * tokens_per_view;
+    chunk->final_token_start = final_token_start;
+    chunk->final_token_count = final_token_count;
 }
 
 static int add_chunk(uocr_vision_chunk *chunks,
@@ -55,9 +59,11 @@ static int add_chunk(uocr_vision_chunk *chunks,
                      uocr_vision_chunk_kind kind,
                      uint32_t first_view,
                      uint32_t view_count,
-                     uint32_t projected_token_start) {
+                     uint32_t projected_token_start,
+                     uint32_t final_token_start,
+                     uint32_t final_token_count) {
     uocr_vision_chunk chunk;
-    make_chunk(&chunk, kind, first_view, view_count, projected_token_start);
+    make_chunk(&chunk, kind, first_view, view_count, projected_token_start, final_token_start, final_token_count);
 
     if (view_count > summary->max_chunk_views) {
         summary->max_chunk_views = view_count;
@@ -144,12 +150,13 @@ int uocr_plan_vision_schedule(const uocr_prepared_request *request,
     out_schedule->local_view_count = local_views;
     out_schedule->global_view_count = global_views;
 
+    uint32_t local_visual_tokens = 0u;
     if (local_views == 0u) {
         out_schedule->final_visual_tokens = global_views * UOCR_GLOBAL_VISUAL_TOKENS;
         out_schedule->projected_tokens_total = global_views * UOCR_GLOBAL_GRID_QUERIES * UOCR_GLOBAL_GRID_QUERIES;
     } else {
-        const uint32_t local_visual = uocr_local_visual_token_count(request->crop_grid_w, request->crop_grid_h);
-        out_schedule->final_visual_tokens = local_visual + UOCR_GLOBAL_VISUAL_TOKENS;
+        local_visual_tokens = uocr_local_visual_token_count(request->crop_grid_w, request->crop_grid_h);
+        out_schedule->final_visual_tokens = local_visual_tokens + UOCR_GLOBAL_VISUAL_TOKENS;
         out_schedule->projected_tokens_total =
             local_views * UOCR_LOCAL_GRID_QUERIES * UOCR_LOCAL_GRID_QUERIES +
             UOCR_GLOBAL_GRID_QUERIES * UOCR_GLOBAL_GRID_QUERIES;
@@ -167,7 +174,9 @@ int uocr_plan_vision_schedule(const uocr_prepared_request *request,
                             UOCR_VISION_CHUNK_GLOBAL,
                             first,
                             count,
-                            projected_start);
+                            projected_start,
+                            first * UOCR_GLOBAL_VISUAL_TOKENS,
+                            count * UOCR_GLOBAL_VISUAL_TOKENS);
             projected_start += count * UOCR_GLOBAL_GRID_QUERIES * UOCR_GLOBAL_GRID_QUERIES;
         }
     } else {
@@ -180,7 +189,9 @@ int uocr_plan_vision_schedule(const uocr_prepared_request *request,
                             UOCR_VISION_CHUNK_LOCAL,
                             first,
                             count,
-                            projected_start);
+                            projected_start,
+                            0u,
+                            local_visual_tokens);
             projected_start += count * UOCR_LOCAL_GRID_QUERIES * UOCR_LOCAL_GRID_QUERIES;
         }
         (void)add_chunk(chunks,
@@ -190,7 +201,9 @@ int uocr_plan_vision_schedule(const uocr_prepared_request *request,
                         UOCR_VISION_CHUNK_GLOBAL,
                         local_views,
                         1u,
-                        projected_start);
+                        projected_start,
+                        local_visual_tokens,
+                        UOCR_GLOBAL_VISUAL_TOKENS);
     }
 
     out_schedule->chunk_count = chunk_index;
@@ -276,7 +289,8 @@ static void format_local_projected_view(const uocr_vision_chunk *chunk,
     const uint32_t scratch_view_base = chunk_view_index * chunk->projected_tokens_per_view;
 
     for (uint32_t row = 0u; row < UOCR_LOCAL_GRID_QUERIES; ++row) {
-        const uint32_t dst_row_base = (crop_y * UOCR_LOCAL_GRID_QUERIES + row) * stitched_row_stride +
+        const uint32_t dst_row_base = chunk->final_token_start +
+                                      (crop_y * UOCR_LOCAL_GRID_QUERIES + row) * stitched_row_stride +
                                       crop_x * UOCR_LOCAL_GRID_QUERIES;
         const uint32_t src_row_base = scratch_view_base + row * UOCR_LOCAL_GRID_QUERIES;
         for (uint32_t col = 0u; col < UOCR_LOCAL_GRID_QUERIES; ++col) {
@@ -374,7 +388,13 @@ int uocr_process_vision_chunks_f16(const uocr_prepared_request *request,
         for (uint32_t first = 0u; first < schedule.global_view_count; first += chunk_limit) {
             const uint32_t count = min_u32(chunk_limit, schedule.global_view_count - first);
             uocr_vision_chunk chunk;
-            make_chunk(&chunk, UOCR_VISION_CHUNK_GLOBAL, first, count, projected_start);
+            make_chunk(&chunk,
+                       UOCR_VISION_CHUNK_GLOBAL,
+                       first,
+                       count,
+                       projected_start,
+                       first * UOCR_GLOBAL_VISUAL_TOKENS,
+                       count * UOCR_GLOBAL_VISUAL_TOKENS);
             const int status = run_projector_for_chunk(&chunk,
                                                        project_chunk,
                                                        project_user_data,
@@ -387,7 +407,7 @@ int uocr_process_vision_chunks_f16(const uocr_prepared_request *request,
             }
             for (uint32_t view = 0u; view < count; ++view) {
                 const uint32_t scratch_base = view * chunk.projected_tokens_per_view;
-                const uint32_t dst_base = (first + view) * UOCR_GLOBAL_VISUAL_TOKENS;
+                const uint32_t dst_base = chunk.final_token_start + view * UOCR_GLOBAL_VISUAL_TOKENS;
                 format_global_projected_view(scratch_row_const(projected_scratch_f16, scratch_base),
                                              image_newline_f16,
                                              view_separator_f16,
@@ -409,7 +429,13 @@ int uocr_process_vision_chunks_f16(const uocr_prepared_request *request,
     for (uint32_t first = 0u; first < schedule.local_view_count; first += chunk_limit) {
         const uint32_t count = min_u32(chunk_limit, schedule.local_view_count - first);
         uocr_vision_chunk chunk;
-        make_chunk(&chunk, UOCR_VISION_CHUNK_LOCAL, first, count, projected_start);
+        make_chunk(&chunk,
+                   UOCR_VISION_CHUNK_LOCAL,
+                   first,
+                   count,
+                   projected_start,
+                   0u,
+                   local_visual_tokens);
         const int status = run_projector_for_chunk(&chunk,
                                                    project_chunk,
                                                    project_user_data,
@@ -427,7 +453,13 @@ int uocr_process_vision_chunks_f16(const uocr_prepared_request *request,
     }
 
     uocr_vision_chunk global_chunk;
-    make_chunk(&global_chunk, UOCR_VISION_CHUNK_GLOBAL, schedule.local_view_count, 1u, projected_start);
+    make_chunk(&global_chunk,
+               UOCR_VISION_CHUNK_GLOBAL,
+               schedule.local_view_count,
+               1u,
+               projected_start,
+               local_visual_tokens,
+               UOCR_GLOBAL_VISUAL_TOKENS);
     const int status = run_projector_for_chunk(&global_chunk,
                                                project_chunk,
                                                project_user_data,
@@ -442,6 +474,6 @@ int uocr_process_vision_chunks_f16(const uocr_prepared_request *request,
                                  image_newline_f16,
                                  view_separator_f16,
                                  out_visual_features_f16,
-                                 local_visual_tokens);
+                                 global_chunk.final_token_start);
     return UOCR_OK;
 }
