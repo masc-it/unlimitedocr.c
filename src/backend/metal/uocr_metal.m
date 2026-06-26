@@ -207,6 +207,8 @@ typedef struct uocr_metal_vision_weights_f16 {
     uocr_metal_vision_tensor_f16 sam_net3_weight;
     uocr_metal_vision_tensor_f16 clip_class_embedding;
     uocr_metal_vision_tensor_f16 clip_pos_embed;
+    uocr_metal_vision_tensor_f16 clip_pos_embed_global;
+    uocr_metal_vision_tensor_f16 clip_pos_embed_local;
     uocr_metal_vision_tensor_f16 clip_pre_ln_weight;
     uocr_metal_vision_tensor_f16 clip_pre_ln_bias;
     uocr_metal_sam_transformer_block_slices_f16 sam_block_slices[UOCR_SAM_BLOCKS];
@@ -283,6 +285,7 @@ struct uocr_metal_context {
     uocr_metal_vision_binding_cache vision_bindings;
     uocr_metal_vision_weights_f16 vision_weights;
     id<MTLBuffer> sam_abs_pos_local_buffer;
+    id<MTLBuffer> clip_abs_pos_local_buffer;
     char vision_binding_error[256];
     uocr_metal_kv_cache_layout kv_cache_layout;
     int has_kv_cache_layout;
@@ -1746,6 +1749,10 @@ static int metal_precompute_sam_abs_pos_tables(uocr_metal_context *ctx,
                                                uocr_metal_vision_weights_f16 *weights,
                                                char *error,
                                                size_t error_size);
+static int metal_precompute_clip_abs_pos_tables(uocr_metal_context *ctx,
+                                                uocr_metal_vision_weights_f16 *weights,
+                                                char *error,
+                                                size_t error_size);
 static const uocr_metal_vision_weights_f16 *metal_require_vision_weights_f16(const uocr_metal_context *ctx,
                                                                              char *error,
                                                                              size_t error_size);
@@ -2779,6 +2786,8 @@ static void metal_release_precomputed_vision_tables(uocr_metal_context *ctx) {
     @autoreleasepool {
         [ctx->sam_abs_pos_local_buffer release];
         ctx->sam_abs_pos_local_buffer = nil;
+        [ctx->clip_abs_pos_local_buffer release];
+        ctx->clip_abs_pos_local_buffer = nil;
     }
 }
 
@@ -3138,7 +3147,9 @@ static int metal_refresh_vision_binding_cache(uocr_metal_context *ctx,
     uocr_metal_vision_weights_f16 weights;
     const uint64_t direct_cache_start_ns = uocr_profile_now_ns();
     if (!metal_vision_weight_cache_build_direct(&cache, &weights, error, error_size) ||
-        !metal_precompute_sam_abs_pos_tables(ctx, &weights, error, error_size)) {
+        !metal_precompute_sam_abs_pos_tables(ctx, &weights, error, error_size) ||
+        !metal_precompute_clip_abs_pos_tables(ctx, &weights, error, error_size)) {
+        metal_release_precomputed_vision_tables(ctx);
         return 0;
     }
     metal_profile_add_event_now(ctx, "metal.vision_binding_cache.direct", direct_cache_start_ns);
@@ -3298,6 +3309,7 @@ static int metal_vision_weight_cache_build_direct(const uocr_metal_vision_bindin
 
     ASSIGN_VISION_TENSOR(clip_class_embedding, UOCR_TENSOR_ID_VISION_CLIP_BASE + 0u, "CLIP class embedding");
     ASSIGN_VISION_TENSOR(clip_pos_embed, UOCR_TENSOR_ID_VISION_CLIP_BASE + 2u, "CLIP position embedding");
+    out_weights->clip_pos_embed_global = out_weights->clip_pos_embed;
     ASSIGN_VISION_TENSOR(clip_pre_ln_bias, UOCR_TENSOR_ID_VISION_CLIP_BASE + 3u, "CLIP pre-LayerNorm bias");
     ASSIGN_VISION_TENSOR(clip_pre_ln_weight, UOCR_TENSOR_ID_VISION_CLIP_BASE + 4u, "CLIP pre-LayerNorm weight");
 
@@ -4032,6 +4044,143 @@ static int metal_precompute_sam_abs_pos_tables(uocr_metal_context *ctx,
     return 1;
 }
 
+static int metal_clip_abs_pos_table_values(uint32_t grid, uint64_t *out_values) {
+    if (out_values == NULL) {
+        return 0;
+    }
+    uint64_t spatial = 0u;
+    uint64_t tokens = 0u;
+    return checked_mul_u64((uint64_t)grid, (uint64_t)grid, &spatial) &&
+           checked_add_u64(spatial, (uint64_t)UOCR_CLIP_CLASS_TOKENS, &tokens) &&
+           checked_mul_u64(tokens, (uint64_t)UOCR_CLIP_HIDDEN_SIZE, out_values);
+}
+
+static uint32_t metal_clip_abs_pos_source_grid_for_tensor(uocr_metal_vision_tensor_f16 pos_embed) {
+    uint64_t local_values = 0u;
+    uint64_t local_bytes = 0u;
+    uint64_t global_values = 0u;
+    uint64_t global_bytes = 0u;
+    if (metal_clip_abs_pos_table_values(UOCR_LOCAL_GRID_QUERIES, &local_values) &&
+        metal_vision_f16_bytes(local_values, &local_bytes) && pos_embed.byte_length == local_bytes) {
+        return UOCR_LOCAL_GRID_QUERIES;
+    }
+    if (metal_clip_abs_pos_table_values(UOCR_CLIP_POSITION_GRID, &global_values) &&
+        metal_vision_f16_bytes(global_values, &global_bytes) && pos_embed.byte_length == global_bytes) {
+        return UOCR_CLIP_POSITION_GRID;
+    }
+    return 0u;
+}
+
+static uocr_metal_vision_tensor_f16 metal_clip_abs_pos_table_for_grid(const uocr_metal_vision_weights_f16 *weights,
+                                                                      uint32_t grid_w,
+                                                                      uint32_t grid_h) {
+    if (weights == NULL || grid_w != grid_h) {
+        uocr_metal_vision_tensor_f16 empty;
+        memset(&empty, 0, sizeof(empty));
+        return empty;
+    }
+    if (grid_w == UOCR_LOCAL_GRID_QUERIES && weights->clip_pos_embed_local.slice.buffer != nil) {
+        return weights->clip_pos_embed_local;
+    }
+    if (grid_w == UOCR_CLIP_POSITION_GRID && weights->clip_pos_embed_global.slice.buffer != nil) {
+        return weights->clip_pos_embed_global;
+    }
+    return weights->clip_pos_embed;
+}
+
+static int metal_precompute_clip_abs_pos_tables(uocr_metal_context *ctx,
+                                                uocr_metal_vision_weights_f16 *weights,
+                                                char *error,
+                                                size_t error_size) {
+    if (ctx == NULL || weights == NULL || weights->clip_pos_embed.slice.buffer == nil || weights->clip_pos_embed.host_f16 == NULL) {
+        return metal_fail(error, error_size, "invalid Metal CLIP absolute-position precompute request");
+    }
+    @autoreleasepool {
+        [ctx->clip_abs_pos_local_buffer release];
+        ctx->clip_abs_pos_local_buffer = nil;
+    }
+    weights->clip_pos_embed_global = weights->clip_pos_embed;
+
+    const uint32_t source_grid = UOCR_CLIP_POSITION_GRID;
+    const uint32_t target_grid = UOCR_LOCAL_GRID_QUERIES;
+    uint64_t source_values = 0u;
+    uint64_t source_bytes = 0u;
+    uint64_t target_values = 0u;
+    uint64_t target_bytes = 0u;
+    if (!metal_clip_abs_pos_table_values(source_grid, &source_values) ||
+        !metal_vision_f16_bytes(source_values, &source_bytes) ||
+        !metal_clip_abs_pos_table_values(target_grid, &target_values) ||
+        !metal_vision_f16_bytes(target_values, &target_bytes) || target_values > (uint64_t)UINT32_MAX ||
+        !metal_vision_require_tensor_slice_f16(weights->clip_pos_embed,
+                                               source_bytes,
+                                               "CLIP absolute-position source table",
+                                               error,
+                                               error_size)) {
+        return 0;
+    }
+    if (target_bytes > (uint64_t)NSUIntegerMax) {
+        return metal_fail(error, error_size, "Metal CLIP absolute-position precompute byte-size overflow");
+    }
+
+    @autoreleasepool {
+        id<MTLBuffer> local_buffer = metal_new_buffer_with_length(ctx, (NSUInteger)target_bytes, MTLResourceStorageModeShared);
+        if (local_buffer == nil || [local_buffer contents] == NULL) {
+            [local_buffer release];
+            return metal_fail(error, error_size, "failed to allocate Metal CLIP local absolute-position table");
+        }
+        local_buffer.label = @"uocr_clip_abs_pos_local_10x10";
+        memset([local_buffer contents], 0, (size_t)target_bytes);
+
+        id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, "uocr_clip_add_abs_pos_f16_to_f16", error, error_size);
+        if (pipeline == nil) {
+            [local_buffer release];
+            return 0;
+        }
+        id<MTLCommandBuffer> cb = metal_new_command_buffer(ctx);
+        if (cb == nil) {
+            [local_buffer release];
+            return metal_fail(error, error_size, "failed to create Metal CLIP absolute-position precompute command buffer");
+        }
+        cb.label = @"uocr_clip_abs_pos_precompute_command_buffer";
+        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
+        if (enc == nil) {
+            [local_buffer release];
+            return metal_fail(error, error_size, "failed to create Metal CLIP absolute-position precompute encoder");
+        }
+
+        uocr_metal_clip_abs_pos_params params;
+        params.source_grid = source_grid;
+        params.target_width = target_grid;
+        params.target_height = target_grid;
+        params.hidden_size = UOCR_CLIP_HIDDEN_SIZE;
+        params.batch_size = 1u;
+
+        NSUInteger threads = pipeline.threadExecutionWidth;
+        if (threads == 0u) threads = 1u;
+        if (threads > 256u) threads = 256u;
+        [enc setComputePipelineState:pipeline];
+        [enc setBuffer:local_buffer offset:0u atIndex:0u];
+        [enc setBuffer:weights->clip_pos_embed.slice.buffer offset:weights->clip_pos_embed.slice.offset atIndex:1u];
+        [enc setBuffer:local_buffer offset:0u atIndex:2u];
+        [enc setBytes:&params length:sizeof(params) atIndex:3u];
+        [enc dispatchThreads:MTLSizeMake((NSUInteger)target_values, 1u, 1u)
+       threadsPerThreadgroup:MTLSizeMake(threads, 1u, 1u)];
+        [enc endEncoding];
+        if (!metal_wait_for_command_buffer_profiled(ctx, cb, "Metal CLIP absolute-position precompute", error, error_size)) {
+            [local_buffer release];
+            return 0;
+        }
+
+        ctx->clip_abs_pos_local_buffer = local_buffer;
+        weights->clip_pos_embed_local.slice.buffer = local_buffer;
+        weights->clip_pos_embed_local.slice.offset = 0u;
+        weights->clip_pos_embed_local.byte_length = target_bytes;
+        weights->clip_pos_embed_local.host_f16 = (const uint16_t *)[local_buffer contents];
+        metal_profile_add_event_ms(ctx, "metal.vision.clip_abs_pos_precompute.local", 0.0);
+    }
+    return 1;
+}
+
 static int metal_context_sam_patch_embed_f16_to_slice(uocr_metal_context *ctx,
                                                       const uocr_image_view *view,
                                                       uocr_metal_vision_tensor_f16 patch_weight,
@@ -4728,9 +4877,16 @@ static int metal_context_clip_add_abs_pos_batch_f16_to_slice(uocr_metal_context 
     uint64_t token_values_per_view = 0u;
     uint64_t token_values = 0u;
     uint64_t token_bytes = 0u;
-    const uint64_t pos_bytes = (uint64_t)UOCR_CLIP_GLOBAL_TOKENS * (uint64_t)UOCR_CLIP_HIDDEN_SIZE * 2u;
+    uint64_t pos_values = 0u;
+    uint64_t pos_bytes = 0u;
+    const uint32_t source_grid = metal_clip_abs_pos_source_grid_for_tensor(pos_embed);
+    if (source_grid == 0u) {
+        return metal_fail(error, error_size, "Metal CLIP abs-pos table has unsupported cached shape");
+    }
     if (view_count == 0u || !checked_mul_u64((uint64_t)grid_w, (uint64_t)grid_h, &spatial) ||
         !checked_add_u64(spatial, (uint64_t)UOCR_CLIP_CLASS_TOKENS, &token_count) ||
+        !metal_clip_abs_pos_table_values(source_grid, &pos_values) ||
+        !metal_vision_f16_bytes(pos_values, &pos_bytes) ||
         !checked_mul_u64(token_count, (uint64_t)UOCR_CLIP_HIDDEN_SIZE, &token_values_per_view) ||
         !checked_mul_u64(token_values_per_view, (uint64_t)view_count, &token_values) ||
         !metal_vision_f16_bytes(token_values, &token_bytes) ||
@@ -4761,7 +4917,7 @@ static int metal_context_clip_add_abs_pos_batch_f16_to_slice(uocr_metal_context 
             return metal_fail(error, error_size, "failed to create Metal CLIP abs pos command encoder");
         }
         uocr_metal_clip_abs_pos_params params;
-        params.source_grid = UOCR_CLIP_POSITION_GRID;
+        params.source_grid = source_grid;
         params.target_width = grid_w;
         params.target_height = grid_h;
         params.hidden_size = UOCR_CLIP_HIDDEN_SIZE;
@@ -5784,7 +5940,7 @@ static int metal_project_vision_chunk_f16(const uocr_vision_chunk *chunk,
                                                         error_size) ||
         !metal_context_clip_add_abs_pos_batch_f16_to_slice(project->ctx,
                                                           project->scratch->clip_a,
-                                                          project->weights->clip_pos_embed,
+                                                          metal_clip_abs_pos_table_for_grid(project->weights, sam_grid_w, sam_grid_h),
                                                           sam_grid_w,
                                                           sam_grid_h,
                                                           chunk->view_count,
