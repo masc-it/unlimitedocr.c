@@ -1877,6 +1877,19 @@ static inline float uocr_gelu_erf(float x) {
     return 0.5f * x * (1.0f + uocr_erf_approx(x * 0.70710678118654752440f));
 }
 
+kernel void uocr_bias_gelu_f16_inplace(device half *dst [[buffer(0)]],
+                                       device const half *bias [[buffer(1)]],
+                                       constant UocrBiasAddParams &params [[buffer(2)]],
+                                       uint gid [[thread_position_in_grid]]) {
+    const uint value_count = params.rows * params.cols;
+    if (gid >= value_count) {
+        return;
+    }
+    const uint col = gid - (gid / params.cols) * params.cols;
+    const float value = float(dst[gid]) + float(bias[col]);
+    dst[gid] = half(uocr_gelu_erf(value));
+}
+
 kernel void uocr_sam_mlp_lin1_gelu_f16(device const half *src [[buffer(0)]],
                                        device const half *weight [[buffer(1)]],
                                        device const half *bias [[buffer(2)]],

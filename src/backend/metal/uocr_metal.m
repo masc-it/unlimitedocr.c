@@ -3348,6 +3348,7 @@ typedef struct uocr_metal_vision_workspace {
     uocr_metal_vision_workspace_slice sam_block_attention_bhwc;
     uocr_metal_vision_workspace_slice sam_block_residual1_bhwc;
     uocr_metal_vision_workspace_slice sam_block_norm2_bhwc;
+    uocr_metal_vision_workspace_slice sam_block_mlp_intermediate;
     uocr_metal_vision_workspace_slice sam_block_mlp_bhwc;
     uocr_metal_vision_workspace_slice sam_neck_a_nchw;
     uocr_metal_vision_workspace_slice sam_neck_b_nchw;
@@ -3485,6 +3486,7 @@ static int metal_vision_workspace_init(uocr_metal_context *ctx,
     uint64_t sam_window_attention_tokens = 0u;
     uint64_t sam_attention_tokens = patch_tokens;
     uint64_t sam_attention_values = 0u;
+    uint64_t sam_mlp_values = 0u;
     uint64_t clip_mlp_values = 0u;
     uint64_t projected_values = 0u;
     uint64_t final_visual_values = 0u;
@@ -3495,6 +3497,7 @@ static int metal_vision_workspace_init(uocr_metal_context *ctx,
         !checked_mul_u64(sam_attention_tokens > sam_window_attention_tokens ? sam_attention_tokens : sam_window_attention_tokens,
                          (uint64_t)UOCR_SAM_HIDDEN_SIZE,
                          &sam_attention_values) ||
+        !checked_mul_u64(patch_tokens, (uint64_t)UOCR_SAM_MLP_INTERMEDIATE, &sam_mlp_values) ||
         !checked_mul_u64(clip_tokens, (uint64_t)UOCR_CLIP_MLP_INTERMEDIATE, &clip_mlp_values)) {
         return metal_fail(error, error_size, "Metal transformer vision workspace byte-size overflow");
     }
@@ -3532,6 +3535,7 @@ static int metal_vision_workspace_init(uocr_metal_context *ctx,
     ADD_WORKSPACE_SLICE(sam_bhwc_values, "SAM block attention BHWC");
     ADD_WORKSPACE_SLICE(sam_bhwc_values, "SAM block residual1 BHWC");
     ADD_WORKSPACE_SLICE(sam_bhwc_values, "SAM block norm2 BHWC");
+    ADD_WORKSPACE_SLICE(sam_mlp_values, "SAM block MLP intermediate");
     ADD_WORKSPACE_SLICE(sam_bhwc_values, "SAM block MLP BHWC");
     ADD_WORKSPACE_SLICE(sam_neck_values, "SAM neck A NCHW");
     ADD_WORKSPACE_SLICE(sam_neck_values, "SAM neck B NCHW");
@@ -3599,6 +3603,7 @@ static int metal_vision_workspace_init(uocr_metal_context *ctx,
     ASSIGN_WORKSPACE_SLICE(sam_block_attention_bhwc, sam_bhwc_values, "SAM block attention BHWC");
     ASSIGN_WORKSPACE_SLICE(sam_block_residual1_bhwc, sam_bhwc_values, "SAM block residual1 BHWC");
     ASSIGN_WORKSPACE_SLICE(sam_block_norm2_bhwc, sam_bhwc_values, "SAM block norm2 BHWC");
+    ASSIGN_WORKSPACE_SLICE(sam_block_mlp_intermediate, sam_mlp_values, "SAM block MLP intermediate");
     ASSIGN_WORKSPACE_SLICE(sam_block_mlp_bhwc, sam_bhwc_values, "SAM block MLP BHWC");
     ASSIGN_WORKSPACE_SLICE(sam_neck_a_nchw, sam_neck_values, "SAM neck A NCHW");
     ASSIGN_WORKSPACE_SLICE(sam_neck_b_nchw, sam_neck_values, "SAM neck B NCHW");
@@ -7177,7 +7182,10 @@ static int metal_prebuild_mps_vision_shape_ndarrays(uocr_metal_context *ctx,
     PREBUILD_VISION_IO(workspace->sam_block_window_tokens, workspace->sam_block_q, window_rows, UOCR_SAM_HIDDEN_SIZE, UOCR_SAM_HIDDEN_SIZE, "SAM window Q workspace");
     PREBUILD_VISION_IO(workspace->sam_block_window_tokens, workspace->sam_block_k, window_rows, UOCR_SAM_HIDDEN_SIZE, UOCR_SAM_HIDDEN_SIZE, "SAM window K workspace");
     PREBUILD_VISION_IO(workspace->sam_block_window_tokens, workspace->sam_block_v, window_rows, UOCR_SAM_HIDDEN_SIZE, UOCR_SAM_HIDDEN_SIZE, "SAM window V workspace");
+    PREBUILD_VISION_IO(workspace->sam_block_attention, workspace->sam_block_residual1_bhwc, patch_tokens, UOCR_SAM_HIDDEN_SIZE, UOCR_SAM_HIDDEN_SIZE, "SAM global projection workspace");
     PREBUILD_VISION_IO(workspace->sam_block_attention, workspace->sam_block_projected_windows, window_rows, UOCR_SAM_HIDDEN_SIZE, UOCR_SAM_HIDDEN_SIZE, "SAM window projection workspace");
+    PREBUILD_VISION_IO(workspace->sam_block_norm2_bhwc, workspace->sam_block_mlp_intermediate, patch_tokens, UOCR_SAM_HIDDEN_SIZE, UOCR_SAM_MLP_INTERMEDIATE, "SAM MLP lin1 workspace");
+    PREBUILD_VISION_IO(workspace->sam_block_mlp_intermediate, workspace->sam_block_mlp_bhwc, patch_tokens, UOCR_SAM_MLP_INTERMEDIATE, UOCR_SAM_HIDDEN_SIZE, "SAM MLP lin2 workspace");
     PREBUILD_VISION_IO(workspace->clip_block_norm1, workspace->clip_block_q, clip_tokens, UOCR_CLIP_HIDDEN_SIZE, UOCR_CLIP_HIDDEN_SIZE, "CLIP Q workspace");
     PREBUILD_VISION_IO(workspace->clip_block_norm1, workspace->clip_block_k, clip_tokens, UOCR_CLIP_HIDDEN_SIZE, UOCR_CLIP_HIDDEN_SIZE, "CLIP K workspace");
     PREBUILD_VISION_IO(workspace->clip_block_norm1, workspace->clip_block_v, clip_tokens, UOCR_CLIP_HIDDEN_SIZE, UOCR_CLIP_HIDDEN_SIZE, "CLIP V workspace");
@@ -8194,6 +8202,58 @@ static int metal_run_bias_add_f16_inplace(uocr_metal_context *ctx,
        threadsPerThreadgroup:MTLSizeMake(threads, 1u, 1u)];
         [enc endEncoding];
         return metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, op_name != NULL ? op_name : "bias add", error, error_size);
+    }
+}
+
+static int metal_run_bias_gelu_f16_inplace(uocr_metal_context *ctx,
+                                            uocr_metal_buffer_slice dst,
+                                            uocr_metal_buffer_slice bias,
+                                            uint32_t rows,
+                                            uint32_t cols,
+                                            const char *op_name,
+                                            char *error,
+                                            size_t error_size) {
+    uint64_t value_count = 0u;
+    uint64_t dst_bytes = 0u;
+    uint64_t bias_bytes = 0u;
+    if (ctx == NULL || rows == 0u || cols == 0u ||
+        !checked_mul_u64((uint64_t)rows, (uint64_t)cols, &value_count) ||
+        !checked_mul_u64(value_count, 2u, &dst_bytes) ||
+        !checked_mul_u64((uint64_t)cols, 2u, &bias_bytes) ||
+        value_count > (uint64_t)UINT32_MAX || !metal_slice_valid(dst, dst_bytes) ||
+        !metal_slice_valid(bias, bias_bytes)) {
+        return metal_fail(error, error_size, "invalid %s bias-GELU request", op_name != NULL ? op_name : "Metal");
+    }
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, "uocr_bias_gelu_f16_inplace", error, error_size);
+        if (pipeline == nil) {
+            return 0;
+        }
+        int owned_command_buffer = 0;
+        id<MTLCommandBuffer> cb = metal_command_buffer_for_op(ctx, &owned_command_buffer, op_name != NULL ? op_name : "bias GELU", error, error_size);
+        if (cb == nil) {
+            return 0;
+        }
+        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
+        if (enc == nil) {
+            return metal_fail(error, error_size, "failed to create %s bias-GELU command encoder", op_name != NULL ? op_name : "Metal");
+        }
+        uocr_metal_bias_add_params params;
+        params.rows = rows;
+        params.cols = cols;
+        params.reserved0 = 0u;
+        params.reserved1 = 0u;
+        NSUInteger threads = pipeline.threadExecutionWidth;
+        if (threads == 0u) threads = 1u;
+        if (threads > 256u) threads = 256u;
+        [enc setComputePipelineState:pipeline];
+        [enc setBuffer:dst.buffer offset:dst.offset atIndex:0u];
+        [enc setBuffer:bias.buffer offset:bias.offset atIndex:1u];
+        [enc setBytes:&params length:sizeof(params) atIndex:2u];
+        [enc dispatchThreads:MTLSizeMake((NSUInteger)value_count, 1u, 1u)
+       threadsPerThreadgroup:MTLSizeMake(threads, 1u, 1u)];
+        [enc endEncoding];
+        return metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, op_name != NULL ? op_name : "bias GELU", error, error_size);
     }
 }
 
@@ -16493,6 +16553,182 @@ cleanup_sam_transformer:
     return result;
 }
 
+static int metal_context_sam_mlp_workspace_f16(uocr_metal_context *ctx,
+                                               uocr_metal_vision_workspace_slice input,
+                                               const uocr_metal_sam_transformer_block_f16 *block,
+                                               uint32_t n_rows,
+                                               uocr_metal_vision_workspace_slice intermediate,
+                                               uocr_metal_vision_workspace_slice out,
+                                               char *error,
+                                               size_t error_size) {
+    const uint64_t hidden_bytes = (uint64_t)n_rows * (uint64_t)UOCR_SAM_HIDDEN_SIZE * 2u;
+    const uint64_t intermediate_bytes = (uint64_t)n_rows * (uint64_t)UOCR_SAM_MLP_INTERMEDIATE * 2u;
+    const uint64_t lin1_weight_bytes = (uint64_t)UOCR_SAM_MLP_INTERMEDIATE * (uint64_t)UOCR_SAM_HIDDEN_SIZE * 2u;
+    const uint64_t lin2_weight_bytes = (uint64_t)UOCR_SAM_HIDDEN_SIZE * (uint64_t)UOCR_SAM_MLP_INTERMEDIATE * 2u;
+    const uint64_t lin1_bias_bytes = (uint64_t)UOCR_SAM_MLP_INTERMEDIATE * 2u;
+    const uint64_t lin2_bias_bytes = (uint64_t)UOCR_SAM_HIDDEN_SIZE * 2u;
+    if (ctx == NULL || !metal_sam_transformer_block_has_weights(block) || n_rows == 0u ||
+        !metal_vision_require_workspace_slice_f16(input, hidden_bytes, "SAM MLP input", error, error_size) ||
+        !metal_vision_require_workspace_slice_f16(intermediate, intermediate_bytes, "SAM MLP intermediate", error, error_size) ||
+        !metal_vision_require_workspace_slice_f16(out, hidden_bytes, "SAM MLP output", error, error_size)) {
+        return 0;
+    }
+
+    const int use_mps_lin1 = metal_mps_matmul_nt_f16_should_use(n_rows,
+                                                                UOCR_SAM_HIDDEN_SIZE,
+                                                                UOCR_SAM_MLP_INTERMEDIATE);
+    const int use_mps_lin2 = metal_mps_matmul_nt_f16_should_use(n_rows,
+                                                                UOCR_SAM_MLP_INTERMEDIATE,
+                                                                UOCR_SAM_HIDDEN_SIZE);
+    if (!use_mps_lin1 || !use_mps_lin2) {
+        if ((!use_mps_lin1 &&
+             !metal_public_mps_matmul_fallback_allowed(ctx,
+                                                       n_rows,
+                                                       UOCR_SAM_HIDDEN_SIZE,
+                                                       UOCR_SAM_MLP_INTERMEDIATE,
+                                                       "Metal SAM MLP lin1",
+                                                       error,
+                                                       error_size)) ||
+            (!use_mps_lin2 &&
+             !metal_public_mps_matmul_fallback_allowed(ctx,
+                                                       n_rows,
+                                                       UOCR_SAM_MLP_INTERMEDIATE,
+                                                       UOCR_SAM_HIDDEN_SIZE,
+                                                       "Metal SAM MLP lin2",
+                                                       error,
+                                                       error_size))) {
+            return 0;
+        }
+        return uocr_metal_context_sam_mlp_f16(ctx,
+                                              input.f16,
+                                              block->mlp_lin1_weight_f16,
+                                              block->mlp_lin1_bias_f16,
+                                              block->mlp_lin2_weight_f16,
+                                              block->mlp_lin2_bias_f16,
+                                              n_rows,
+                                              UOCR_METAL_DENSE_OUTPUT_F16,
+                                              out.f16,
+                                              error,
+                                              error_size);
+    }
+
+    int result = 0;
+    @autoreleasepool {
+        id<MTLBuffer> lin1_weight = nil;
+        id<MTLBuffer> lin1_bias = nil;
+        id<MTLBuffer> lin2_weight = nil;
+        id<MTLBuffer> lin2_bias = nil;
+        NSUInteger lin1_weight_offset = 0u;
+        NSUInteger lin1_bias_offset = 0u;
+        NSUInteger lin2_weight_offset = 0u;
+        NSUInteger lin2_bias_offset = 0u;
+
+        lin1_weight = metal_new_or_retain_vision_buffer_with_bytes(ctx,
+                                                                   block->mlp_lin1_weight_f16,
+                                                                   (NSUInteger)lin1_weight_bytes,
+                                                                   MTLResourceStorageModeShared,
+                                                                   &lin1_weight_offset);
+        if (lin1_weight == nil) {
+            result = metal_fail(error, error_size, "failed to bind Metal SAM MLP lin1 weight buffer");
+            goto cleanup_sam_mlp_workspace;
+        }
+        lin1_weight.label = @"uocr_sam_mlp_workspace_lin1_weight_f16";
+
+        lin1_bias = metal_new_or_retain_vision_buffer_with_bytes(ctx,
+                                                                 block->mlp_lin1_bias_f16,
+                                                                 (NSUInteger)lin1_bias_bytes,
+                                                                 MTLResourceStorageModeShared,
+                                                                 &lin1_bias_offset);
+        if (lin1_bias == nil) {
+            result = metal_fail(error, error_size, "failed to bind Metal SAM MLP lin1 bias buffer");
+            goto cleanup_sam_mlp_workspace;
+        }
+        lin1_bias.label = @"uocr_sam_mlp_workspace_lin1_bias_f16";
+
+        lin2_weight = metal_new_or_retain_vision_buffer_with_bytes(ctx,
+                                                                   block->mlp_lin2_weight_f16,
+                                                                   (NSUInteger)lin2_weight_bytes,
+                                                                   MTLResourceStorageModeShared,
+                                                                   &lin2_weight_offset);
+        if (lin2_weight == nil) {
+            result = metal_fail(error, error_size, "failed to bind Metal SAM MLP lin2 weight buffer");
+            goto cleanup_sam_mlp_workspace;
+        }
+        lin2_weight.label = @"uocr_sam_mlp_workspace_lin2_weight_f16";
+
+        lin2_bias = metal_new_or_retain_vision_buffer_with_bytes(ctx,
+                                                                 block->mlp_lin2_bias_f16,
+                                                                 (NSUInteger)lin2_bias_bytes,
+                                                                 MTLResourceStorageModeShared,
+                                                                 &lin2_bias_offset);
+        if (lin2_bias == nil) {
+            result = metal_fail(error, error_size, "failed to bind Metal SAM MLP lin2 bias buffer");
+            goto cleanup_sam_mlp_workspace;
+        }
+        lin2_bias.label = @"uocr_sam_mlp_workspace_lin2_bias_f16";
+
+        uocr_metal_buffer_slice input_slice = { input.buffer, input.offset };
+        uocr_metal_buffer_slice intermediate_slice = { intermediate.buffer, intermediate.offset };
+        uocr_metal_buffer_slice out_slice = { out.buffer, out.offset };
+        uocr_metal_buffer_slice lin1_weight_slice = { lin1_weight, lin1_weight_offset };
+        uocr_metal_buffer_slice lin1_bias_slice = { lin1_bias, lin1_bias_offset };
+        uocr_metal_buffer_slice lin2_weight_slice = { lin2_weight, lin2_weight_offset };
+        uocr_metal_buffer_slice lin2_bias_slice = { lin2_bias, lin2_bias_offset };
+
+        if (!metal_run_mps_matmul_nt_f16(ctx,
+                                         input_slice,
+                                         lin1_weight_slice,
+                                         intermediate_slice,
+                                         n_rows,
+                                         UOCR_SAM_HIDDEN_SIZE,
+                                         UOCR_SAM_MLP_INTERMEDIATE,
+                                         "Metal SAM MLP lin1 MPS matmul",
+                                         error,
+                                         error_size) ||
+            !metal_run_bias_gelu_f16_inplace(ctx,
+                                             intermediate_slice,
+                                             lin1_bias_slice,
+                                             n_rows,
+                                             UOCR_SAM_MLP_INTERMEDIATE,
+                                             "Metal SAM MLP lin1 MPS bias GELU",
+                                             error,
+                                             error_size) ||
+            !metal_run_mps_matmul_nt_f16(ctx,
+                                         intermediate_slice,
+                                         lin2_weight_slice,
+                                         out_slice,
+                                         n_rows,
+                                         UOCR_SAM_MLP_INTERMEDIATE,
+                                         UOCR_SAM_HIDDEN_SIZE,
+                                         "Metal SAM MLP lin2 MPS matmul",
+                                         error,
+                                         error_size) ||
+            !metal_run_bias_add_f16_inplace(ctx,
+                                            out_slice,
+                                            lin2_bias_slice,
+                                            n_rows,
+                                            UOCR_SAM_HIDDEN_SIZE,
+                                            "Metal SAM MLP lin2 MPS bias add",
+                                            error,
+                                            error_size)) {
+            result = 0;
+            goto cleanup_sam_mlp_workspace;
+        }
+        result = 1;
+
+    cleanup_sam_mlp_workspace:
+        [lin2_bias release];
+        [lin2_weight release];
+        [lin1_bias release];
+        [lin1_weight release];
+    }
+
+    if (result) {
+        metal_clear_error(error, error_size);
+    }
+    return result;
+}
+
 static int metal_context_sam_transformer_block_workspace_f16(uocr_metal_context *ctx,
                                                              const uint16_t *input_bhwc_f16,
                                                              const uocr_metal_sam_transformer_block_f16 *block,
@@ -16553,6 +16789,8 @@ static int metal_context_sam_transformer_block_workspace_f16(uocr_metal_context 
         !metal_vision_slice_has_bytes(scratch->sam_block_attention_bhwc, hidden_bytes) ||
         !metal_vision_slice_has_bytes(scratch->sam_block_residual1_bhwc, hidden_bytes) ||
         !metal_vision_slice_has_bytes(scratch->sam_block_norm2_bhwc, hidden_bytes) ||
+        !metal_vision_slice_has_bytes(scratch->sam_block_mlp_intermediate,
+                                      (uint64_t)row_count * (uint64_t)UOCR_SAM_MLP_INTERMEDIATE * 2u) ||
         !metal_vision_slice_has_bytes(scratch->sam_block_mlp_bhwc, hidden_bytes)) {
         return metal_fail(error, error_size, "Metal SAM workspace transformer block scratch is too small");
     }
@@ -16705,17 +16943,14 @@ static int metal_context_sam_transformer_block_workspace_f16(uocr_metal_context 
                                                                        error,
                                                                        error_size));
     RUN_SAM_WORKSPACE_BLOCK_STEP("MLP",
-                                 uocr_metal_context_sam_mlp_f16(ctx,
-                                                                 scratch->sam_block_norm2_bhwc.f16,
-                                                                 block->mlp_lin1_weight_f16,
-                                                                 block->mlp_lin1_bias_f16,
-                                                                 block->mlp_lin2_weight_f16,
-                                                                 block->mlp_lin2_bias_f16,
-                                                                 row_count,
-                                                                 UOCR_METAL_DENSE_OUTPUT_F16,
-                                                                 scratch->sam_block_mlp_bhwc.f16,
-                                                                 error,
-                                                                 error_size));
+                                 metal_context_sam_mlp_workspace_f16(ctx,
+                                                                     scratch->sam_block_norm2_bhwc,
+                                                                     block,
+                                                                     row_count,
+                                                                     scratch->sam_block_mlp_intermediate,
+                                                                     scratch->sam_block_mlp_bhwc,
+                                                                     error,
+                                                                     error_size));
     RUN_SAM_WORKSPACE_BLOCK_STEP("MLP residual",
                                  uocr_metal_context_sam_residual_add_f16(ctx,
                                                                           scratch->sam_block_residual1_bhwc.f16,
@@ -17590,6 +17825,59 @@ int uocr_metal_context_sam_attention_project_residual_f16(uocr_metal_context *ct
             goto cleanup_attention_residual;
         }
         dst.label = @"uocr_sam_attention_project_residual_output";
+
+        if (output_type == UOCR_METAL_DENSE_OUTPUT_F16 &&
+            metal_mps_matmul_nt_f16_should_use(n_rows, UOCR_SAM_HIDDEN_SIZE, UOCR_SAM_HIDDEN_SIZE)) {
+            uocr_metal_buffer_slice src_slice = { src, src_offset };
+            uocr_metal_buffer_slice weight_slice = { weight, weight_offset };
+            uocr_metal_buffer_slice bias_slice = { bias, bias_offset };
+            uocr_metal_buffer_slice residual_slice = { residual, residual_offset };
+            uocr_metal_buffer_slice dst_slice = { dst, dst_offset };
+            if (!metal_run_mps_matmul_nt_f16(ctx,
+                                             src_slice,
+                                             weight_slice,
+                                             dst_slice,
+                                             n_rows,
+                                             UOCR_SAM_HIDDEN_SIZE,
+                                             UOCR_SAM_HIDDEN_SIZE,
+                                             "Metal SAM attention projection MPS matmul",
+                                             error,
+                                             error_size) ||
+                !metal_run_bias_add_f16_inplace(ctx,
+                                                dst_slice,
+                                                bias_slice,
+                                                n_rows,
+                                                UOCR_SAM_HIDDEN_SIZE,
+                                                "Metal SAM attention projection MPS bias add",
+                                                error,
+                                                error_size) ||
+                !metal_run_residual_add_f16(ctx,
+                                            residual_slice,
+                                            dst_slice,
+                                            dst_slice,
+                                            (uint32_t)activation_values,
+                                            "Metal SAM attention projection MPS residual add",
+                                            error,
+                                            error_size)) {
+                result = 0;
+                goto cleanup_attention_residual;
+            }
+            metal_copy_buffer_range_to_host_if_needed(out, dst, dst_offset, (NSUInteger)output_bytes, dst_needs_copy);
+            result = 1;
+            goto cleanup_attention_residual;
+        }
+        if (output_type == UOCR_METAL_DENSE_OUTPUT_F16 &&
+            !metal_public_mps_matmul_fallback_allowed(ctx,
+                                                      n_rows,
+                                                      UOCR_SAM_HIDDEN_SIZE,
+                                                      UOCR_SAM_HIDDEN_SIZE,
+                                                      "Metal SAM attention projection",
+                                                      error,
+                                                      error_size)) {
+            result = 0;
+            goto cleanup_attention_residual;
+        }
+
         metal_zero_buffer_range(dst, dst_offset, (NSUInteger)output_bytes);
 
         cb = metal_new_command_buffer(ctx);

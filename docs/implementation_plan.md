@@ -123,7 +123,7 @@ Implementation status:
 - [ ] Precompute SAM relative-position bias tables during conversion for `64x64`, `40x40`, and `14x14` attention shapes.
 - [ ] Precompute SAM absolute position tables during conversion for `64x64` and `40x40` patch grids.
 - [ ] Precompute CLIP absolute position tables during conversion for `16x16` and `10x10` patch grids.
-- [ ] Use MPSNDArray matrix multiplication for SAM QKV, SAM output projection, SAM MLP, CLIP QKV, CLIP output projection, CLIP MLP, and projector dense GEMMs.
+- [x] Use MPSNDArray matrix multiplication for SAM QKV, SAM output projection, SAM MLP, CLIP QKV, CLIP output projection, CLIP MLP, and projector dense GEMMs.
 - [x] Cache all MPS descriptors and weight NDArrays at model map time.
 - [ ] Replace SAM patch embed with a custom tiled patch kernel.
 - [ ] Replace SAM neck 1x1, neck 3x3, net_2, and net_3 with custom tiled convolution kernels.
