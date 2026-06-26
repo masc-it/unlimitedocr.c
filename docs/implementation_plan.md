@@ -213,7 +213,7 @@ Implementation status:
 
 - [x] Add MPS allocation/object counters and per-call timings.
 - [x] Cache stable descriptors and long-lived weight NDArrays by shape/layout/transpose.
-- [ ] Cache workspace input/output NDArrays for every reusable vision and decoder prefill slice.
+- [x] Cache workspace input/output NDArrays for every reusable vision and decoder prefill slice.
 - [x] Prebuild all MPS descriptors and weight NDArrays during model map/binding validation.
 - [ ] Use stack/static small Objective-C arrays for fixed two-input matmul encoding where supported by the API boundary.
 - [x] Remove destination zero-fill blits from MPS matmul calls after parity confirms all destinations are fully overwritten.

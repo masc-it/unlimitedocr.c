@@ -243,6 +243,14 @@ struct uocr_metal_context {
     NSMutableDictionary<NSString *, id> *mps_descriptor_cache;
     NSMutableDictionary<NSString *, id> *mps_weight_ndarray_cache;
     NSMutableDictionary<NSString *, id> *mps_workspace_ndarray_cache;
+    uint64_t mps_workspace_cache_generation;
+    uint64_t mps_runtime_workspace_prebuild_generation;
+    uint32_t mps_runtime_workspace_prebuild_token_count;
+    uint64_t mps_vision_workspace_prebuild_generation;
+    uint32_t mps_vision_workspace_prebuild_shape_mask;
+    uint32_t mps_vision_workspace_prebuild_projected_row_capacity;
+    uint32_t mps_vision_workspace_prebuild_local_view_count;
+    uint32_t mps_vision_workspace_prebuild_global_view_count;
     NSMutableArray *transient_retains;
     uocr_metal_model_view *model_views;
     uint32_t model_view_count;
@@ -295,6 +303,10 @@ static int metal_context_ensure_scratch_accounted(uocr_metal_context *ctx,
                                                   size_t error_size);
 static void metal_clear_mps_weight_ndarray_cache(uocr_metal_context *ctx);
 static void metal_clear_mps_workspace_ndarray_cache(uocr_metal_context *ctx);
+static int metal_prebuild_mps_runtime_workspace_ndarrays(uocr_metal_context *ctx,
+                                                         uint32_t n_tokens,
+                                                         char *error,
+                                                         size_t error_size);
 
 static int metal_profile_enabled(const uocr_metal_context *ctx) {
     return ctx != NULL && uocr_profile_is_enabled(ctx->profile);
@@ -1688,9 +1700,20 @@ static void metal_clear_mps_weight_ndarray_cache(uocr_metal_context *ctx) {
 }
 
 static void metal_clear_mps_workspace_ndarray_cache(uocr_metal_context *ctx) {
-    if (ctx != NULL && ctx->mps_workspace_ndarray_cache != nil) {
+    if (ctx == NULL) {
+        return;
+    }
+    if (ctx->mps_workspace_ndarray_cache != nil) {
         [ctx->mps_workspace_ndarray_cache removeAllObjects];
     }
+    ++ctx->mps_workspace_cache_generation;
+    ctx->mps_runtime_workspace_prebuild_generation = 0u;
+    ctx->mps_runtime_workspace_prebuild_token_count = 0u;
+    ctx->mps_vision_workspace_prebuild_generation = 0u;
+    ctx->mps_vision_workspace_prebuild_shape_mask = 0u;
+    ctx->mps_vision_workspace_prebuild_projected_row_capacity = 0u;
+    ctx->mps_vision_workspace_prebuild_local_view_count = 0u;
+    ctx->mps_vision_workspace_prebuild_global_view_count = 0u;
 }
 
 void uocr_metal_context_unmap_model(uocr_metal_context *ctx) {
@@ -3578,6 +3601,12 @@ typedef struct uocr_metal_vision_project_context {
     double chunk_encode_ms;
 } uocr_metal_vision_project_context;
 
+static int metal_prebuild_mps_vision_workspace_ndarrays(uocr_metal_context *ctx,
+                                                        const uocr_metal_vision_workspace *workspace,
+                                                        uint32_t local_view_count,
+                                                        uint32_t global_view_count,
+                                                        char *error,
+                                                        size_t error_size);
 static int metal_context_sam_transformer_workspace_f16(uocr_metal_context *ctx,
                                                        const uint16_t *input_bhwc_f16,
                                                        const uocr_metal_sam_transformer_block_f16 *blocks,
@@ -4756,6 +4785,15 @@ static int metal_context_encode_visual_features_to_workspace_f16(uocr_metal_cont
         scratch->final_visual_rows.f16 == NULL || scratch->final_visual_row_capacity < schedule->final_visual_tokens) {
         metal_vision_workspace_reset(scratch);
         return metal_fail(error, error_size, "Metal vision workspace did not provide required projected/final slices");
+    }
+    if (!metal_prebuild_mps_vision_workspace_ndarrays(ctx,
+                                                       scratch,
+                                                       schedule->local_view_count,
+                                                       schedule->global_view_count,
+                                                       error,
+                                                       error_size)) {
+        metal_vision_workspace_reset(scratch);
+        return 0;
     }
 
     uocr_metal_vision_project_context project;
@@ -5957,6 +5995,10 @@ int uocr_metal_context_allocate_runtime_arenas(uocr_metal_context *ctx,
         ctx->kv_cache_layout = kv_layout;
         ctx->has_kv_cache_layout = 1;
         ++ctx->runtime_arena_generation;
+        if (!metal_prebuild_mps_runtime_workspace_ndarrays(ctx, prompt_token_capacity, error, error_size)) {
+            uocr_metal_context_release_runtime_arenas(ctx);
+            return 0;
+        }
     }
     return 1;
 }
@@ -6872,6 +6914,317 @@ static id metal_mps_matrix_array_from_slice(uocr_metal_context *ctx,
     return array;
 }
 
+static int metal_matrix_subslice(uocr_metal_buffer_slice base,
+                                  uint64_t base_bytes,
+                                  uint32_t row_offset,
+                                  uint32_t rows,
+                                  uint32_t cols,
+                                  uint64_t element_bytes,
+                                  uocr_metal_buffer_slice *out_slice,
+                                  uint64_t *out_bytes) {
+    if (out_slice == NULL || out_bytes == NULL || base.buffer == nil || rows == 0u || cols == 0u ||
+        element_bytes == 0u) {
+        return 0;
+    }
+    uint64_t row_bytes = 0u;
+    uint64_t relative_offset = 0u;
+    uint64_t bytes = 0u;
+    uint64_t end = 0u;
+    uint64_t absolute_offset = 0u;
+    if (!checked_mul_u64((uint64_t)cols, element_bytes, &row_bytes) ||
+        !checked_mul_u64((uint64_t)row_offset, row_bytes, &relative_offset) ||
+        !checked_mul_u64((uint64_t)rows, row_bytes, &bytes) ||
+        !checked_add_u64(relative_offset, bytes, &end) || end > base_bytes ||
+        !checked_add_u64((uint64_t)base.offset, relative_offset, &absolute_offset) ||
+        absolute_offset > (uint64_t)NSUIntegerMax) {
+        return 0;
+    }
+    out_slice->buffer = base.buffer;
+    out_slice->offset = (NSUInteger)absolute_offset;
+    *out_bytes = bytes;
+    return metal_slice_valid(*out_slice, bytes);
+}
+
+static int metal_prebuild_mps_workspace_matrix_ndarray(uocr_metal_context *ctx,
+                                                       uocr_metal_buffer_slice slice,
+                                                       uint64_t slice_bytes,
+                                                       uint32_t rows,
+                                                       uint32_t cols,
+                                                       uint32_t data_type,
+                                                       const char *label,
+                                                       char *error,
+                                                       size_t error_size) {
+    if (ctx == NULL || rows == 0u || cols == 0u ||
+        (data_type != UOCR_METAL_MPS_DATA_TYPE_FLOAT16 && data_type != UOCR_METAL_MPS_DATA_TYPE_FLOAT32) ||
+        !metal_slice_valid(slice, slice_bytes)) {
+        return metal_fail(error, error_size, "invalid Metal MPS workspace NDArray prebuild request for %s", label != NULL ? label : "workspace");
+    }
+    id array = metal_mps_matrix_array_from_slice(ctx,
+                                                  slice,
+                                                  rows,
+                                                  cols,
+                                                  0,
+                                                  data_type,
+                                                  0,
+                                                  1,
+                                                  slice_bytes);
+    if (array == nil) {
+        return metal_fail(error,
+                          error_size,
+                          "failed to prebuild Metal MPS workspace NDArray for %s",
+                          label != NULL ? label : "workspace");
+    }
+    [array release];
+    return 1;
+}
+
+static int metal_prebuild_mps_workspace_matmul_io(uocr_metal_context *ctx,
+                                                  uocr_metal_buffer_slice input_base,
+                                                  uint64_t input_base_bytes,
+                                                  uint32_t input_row_offset,
+                                                  uocr_metal_buffer_slice dst_base,
+                                                  uint64_t dst_base_bytes,
+                                                  uint32_t dst_row_offset,
+                                                  uint32_t rows,
+                                                  uint32_t in_features,
+                                                  uint32_t out_features,
+                                                  uint32_t dst_data_type,
+                                                  const char *label,
+                                                  char *error,
+                                                  size_t error_size) {
+    if (!metal_mps_matmul_nt_f16_should_use(rows, in_features, out_features)) {
+        return 1;
+    }
+    const uint64_t dst_element_bytes = dst_data_type == UOCR_METAL_MPS_DATA_TYPE_FLOAT32 ? (uint64_t)sizeof(float) : 2u;
+    uocr_metal_buffer_slice input_slice;
+    uocr_metal_buffer_slice dst_slice;
+    uint64_t input_bytes = 0u;
+    uint64_t dst_bytes = 0u;
+    if (!metal_matrix_subslice(input_base,
+                               input_base_bytes,
+                               input_row_offset,
+                               rows,
+                               in_features,
+                               2u,
+                               &input_slice,
+                               &input_bytes) ||
+        !metal_matrix_subslice(dst_base,
+                               dst_base_bytes,
+                               dst_row_offset,
+                               rows,
+                               out_features,
+                               dst_element_bytes,
+                               &dst_slice,
+                               &dst_bytes)) {
+        return metal_fail(error,
+                          error_size,
+                          "invalid Metal MPS workspace matmul slice prebuild for %s",
+                          label != NULL ? label : "workspace");
+    }
+    if (!metal_prebuild_mps_workspace_matrix_ndarray(ctx,
+                                                     input_slice,
+                                                     input_bytes,
+                                                     rows,
+                                                     in_features,
+                                                     UOCR_METAL_MPS_DATA_TYPE_FLOAT16,
+                                                     label,
+                                                     error,
+                                                     error_size)) {
+        return 0;
+    }
+    return metal_prebuild_mps_workspace_matrix_ndarray(ctx,
+                                                       dst_slice,
+                                                       dst_bytes,
+                                                       rows,
+                                                       out_features,
+                                                       dst_data_type,
+                                                       label,
+                                                       error,
+                                                       error_size);
+}
+
+static int metal_prebuild_mps_vision_matmul_io(uocr_metal_context *ctx,
+                                               uocr_metal_vision_workspace_slice input,
+                                               uint32_t input_row_offset,
+                                               uocr_metal_vision_workspace_slice dst,
+                                               uint32_t dst_row_offset,
+                                               uint32_t rows,
+                                               uint32_t in_features,
+                                               uint32_t out_features,
+                                               const char *label,
+                                               char *error,
+                                               size_t error_size) {
+    uocr_metal_buffer_slice input_base = { input.buffer, input.offset };
+    uocr_metal_buffer_slice dst_base = { dst.buffer, dst.offset };
+    return metal_prebuild_mps_workspace_matmul_io(ctx,
+                                                  input_base,
+                                                  input.bytes,
+                                                  input_row_offset,
+                                                  dst_base,
+                                                  dst.bytes,
+                                                  dst_row_offset,
+                                                  rows,
+                                                  in_features,
+                                                  out_features,
+                                                  UOCR_METAL_MPS_DATA_TYPE_FLOAT16,
+                                                  label,
+                                                  error,
+                                                  error_size);
+}
+
+static int metal_prebuild_mps_vision_shape_ndarrays(uocr_metal_context *ctx,
+                                                    const uocr_metal_vision_workspace *workspace,
+                                                    uint32_t patch_grid,
+                                                    uint32_t projected_grid,
+                                                    uint32_t view_count,
+                                                    char *error,
+                                                    size_t error_size) {
+    if (ctx == NULL || workspace == NULL || patch_grid == 0u || projected_grid == 0u || view_count == 0u) {
+        return metal_fail(error, error_size, "invalid Metal MPS vision workspace shape prebuild request");
+    }
+    const uint32_t patch_tokens = patch_grid * patch_grid;
+    const uint32_t projected_tokens = projected_grid * projected_grid;
+    const uint32_t clip_tokens = projected_tokens + UOCR_CLIP_CLASS_TOKENS;
+    const uint32_t windows_per_side = (patch_grid + UOCR_SAM_WINDOW_SIZE - 1u) / UOCR_SAM_WINDOW_SIZE;
+    const uint32_t window_rows = windows_per_side * windows_per_side * UOCR_SAM_WINDOW_TOKENS;
+
+#define PREBUILD_VISION_IO(input_slice, dst_slice, rows_, in_features_, out_features_, label_) \
+    do {                                                                                       \
+        if (!metal_prebuild_mps_vision_matmul_io(ctx,                                             \
+                                                 (input_slice),                                  \
+                                                 0u,                                             \
+                                                 (dst_slice),                                    \
+                                                 0u,                                             \
+                                                 (rows_),                                        \
+                                                 (in_features_),                                 \
+                                                 (out_features_),                                \
+                                                 (label_),                                       \
+                                                 error,                                          \
+                                                 error_size)) {                                  \
+            return 0;                                                                           \
+        }                                                                                       \
+    } while (0)
+
+    PREBUILD_VISION_IO(workspace->sam_block_norm1_bhwc, workspace->sam_block_q, patch_tokens, UOCR_SAM_HIDDEN_SIZE, UOCR_SAM_HIDDEN_SIZE, "SAM global Q workspace");
+    PREBUILD_VISION_IO(workspace->sam_block_norm1_bhwc, workspace->sam_block_k, patch_tokens, UOCR_SAM_HIDDEN_SIZE, UOCR_SAM_HIDDEN_SIZE, "SAM global K workspace");
+    PREBUILD_VISION_IO(workspace->sam_block_norm1_bhwc, workspace->sam_block_v, patch_tokens, UOCR_SAM_HIDDEN_SIZE, UOCR_SAM_HIDDEN_SIZE, "SAM global V workspace");
+    PREBUILD_VISION_IO(workspace->sam_block_window_tokens, workspace->sam_block_q, window_rows, UOCR_SAM_HIDDEN_SIZE, UOCR_SAM_HIDDEN_SIZE, "SAM window Q workspace");
+    PREBUILD_VISION_IO(workspace->sam_block_window_tokens, workspace->sam_block_k, window_rows, UOCR_SAM_HIDDEN_SIZE, UOCR_SAM_HIDDEN_SIZE, "SAM window K workspace");
+    PREBUILD_VISION_IO(workspace->sam_block_window_tokens, workspace->sam_block_v, window_rows, UOCR_SAM_HIDDEN_SIZE, UOCR_SAM_HIDDEN_SIZE, "SAM window V workspace");
+    PREBUILD_VISION_IO(workspace->sam_block_attention, workspace->sam_block_projected_windows, window_rows, UOCR_SAM_HIDDEN_SIZE, UOCR_SAM_HIDDEN_SIZE, "SAM window projection workspace");
+    PREBUILD_VISION_IO(workspace->clip_block_norm1, workspace->clip_block_q, clip_tokens, UOCR_CLIP_HIDDEN_SIZE, UOCR_CLIP_HIDDEN_SIZE, "CLIP Q workspace");
+    PREBUILD_VISION_IO(workspace->clip_block_norm1, workspace->clip_block_k, clip_tokens, UOCR_CLIP_HIDDEN_SIZE, UOCR_CLIP_HIDDEN_SIZE, "CLIP K workspace");
+    PREBUILD_VISION_IO(workspace->clip_block_norm1, workspace->clip_block_v, clip_tokens, UOCR_CLIP_HIDDEN_SIZE, UOCR_CLIP_HIDDEN_SIZE, "CLIP V workspace");
+    PREBUILD_VISION_IO(workspace->clip_block_attention, workspace->clip_block_projected, clip_tokens, UOCR_CLIP_HIDDEN_SIZE, UOCR_CLIP_HIDDEN_SIZE, "CLIP output projection workspace");
+    PREBUILD_VISION_IO(workspace->clip_block_norm2, workspace->clip_mlp_fc1, clip_tokens, UOCR_CLIP_HIDDEN_SIZE, UOCR_CLIP_MLP_INTERMEDIATE, "CLIP MLP fc1 workspace");
+    PREBUILD_VISION_IO(workspace->clip_mlp_activated, workspace->clip_block_mlp, clip_tokens, UOCR_CLIP_MLP_INTERMEDIATE, UOCR_CLIP_HIDDEN_SIZE, "CLIP MLP fc2 workspace");
+    if (workspace->projected_row_capacity >= projected_tokens && workspace->projected_rows.buffer != nil) {
+        PREBUILD_VISION_IO(workspace->concat, workspace->projected_rows, projected_tokens, UOCR_PROJECTOR_IN_SIZE, UOCR_HIDDEN_SIZE, "visual projector workspace");
+    }
+
+#undef PREBUILD_VISION_IO
+
+    if (workspace->projected_row_capacity >= projected_tokens && workspace->projected_rows.buffer != nil) {
+        uint32_t view_capacity = workspace->projected_row_capacity / projected_tokens;
+        if (view_capacity > view_count) {
+            view_capacity = view_count;
+        }
+        for (uint32_t view = 1u; view < view_capacity; ++view) {
+            uocr_metal_buffer_slice input_base = { workspace->concat.buffer, workspace->concat.offset };
+            uocr_metal_buffer_slice dst_base = { workspace->projected_rows.buffer, workspace->projected_rows.offset };
+            if (!metal_prebuild_mps_workspace_matmul_io(ctx,
+                                                        input_base,
+                                                        workspace->concat.bytes,
+                                                        0u,
+                                                        dst_base,
+                                                        workspace->projected_rows.bytes,
+                                                        view * projected_tokens,
+                                                        projected_tokens,
+                                                        UOCR_PROJECTOR_IN_SIZE,
+                                                        UOCR_HIDDEN_SIZE,
+                                                        UOCR_METAL_MPS_DATA_TYPE_FLOAT16,
+                                                        "visual projector workspace view",
+                                                        error,
+                                                        error_size)) {
+                return 0;
+            }
+        }
+    }
+    return 1;
+}
+
+enum {
+    UOCR_METAL_MPS_VISION_PREBUILD_LOCAL = 1u,
+    UOCR_METAL_MPS_VISION_PREBUILD_GLOBAL = 2u
+};
+
+static int metal_prebuild_mps_vision_workspace_ndarrays(uocr_metal_context *ctx,
+                                                        const uocr_metal_vision_workspace *workspace,
+                                                        uint32_t local_view_count,
+                                                        uint32_t global_view_count,
+                                                        char *error,
+                                                        size_t error_size) {
+    if (ctx == NULL || workspace == NULL) {
+        return metal_fail(error, error_size, "invalid Metal MPS vision workspace prebuild request");
+    }
+    if (!metal_mps_framework_available()) {
+        return 1;
+    }
+    uint32_t shape_mask = 0u;
+    if (local_view_count != 0u) {
+        shape_mask |= UOCR_METAL_MPS_VISION_PREBUILD_LOCAL;
+    }
+    if (global_view_count != 0u) {
+        shape_mask |= UOCR_METAL_MPS_VISION_PREBUILD_GLOBAL;
+    }
+    if (shape_mask == 0u) {
+        return 1;
+    }
+    if (ctx->mps_vision_workspace_prebuild_generation == ctx->mps_workspace_cache_generation &&
+        (ctx->mps_vision_workspace_prebuild_shape_mask & shape_mask) == shape_mask &&
+        ctx->mps_vision_workspace_prebuild_projected_row_capacity >= workspace->projected_row_capacity &&
+        ctx->mps_vision_workspace_prebuild_local_view_count >= local_view_count &&
+        ctx->mps_vision_workspace_prebuild_global_view_count >= global_view_count) {
+        metal_profile_add_event_ms(ctx, "metal.mps.workspace_prebuild.vision.cached", 0.0);
+        return 1;
+    }
+
+    const uint64_t start_ns = uocr_profile_now_ns();
+    if (local_view_count != 0u &&
+        !metal_prebuild_mps_vision_shape_ndarrays(ctx,
+                                                  workspace,
+                                                  UOCR_LOCAL_VIEW_SIZE / UOCR_VISION_PATCH_SIZE,
+                                                  UOCR_LOCAL_GRID_QUERIES,
+                                                  local_view_count,
+                                                  error,
+                                                  error_size)) {
+        return 0;
+    }
+    if (global_view_count != 0u &&
+        !metal_prebuild_mps_vision_shape_ndarrays(ctx,
+                                                  workspace,
+                                                  UOCR_GLOBAL_VIEW_SIZE / UOCR_VISION_PATCH_SIZE,
+                                                  UOCR_GLOBAL_GRID_QUERIES,
+                                                  global_view_count,
+                                                  error,
+                                                  error_size)) {
+        return 0;
+    }
+    ctx->mps_vision_workspace_prebuild_generation = ctx->mps_workspace_cache_generation;
+    ctx->mps_vision_workspace_prebuild_shape_mask |= shape_mask;
+    if (ctx->mps_vision_workspace_prebuild_projected_row_capacity < workspace->projected_row_capacity) {
+        ctx->mps_vision_workspace_prebuild_projected_row_capacity = workspace->projected_row_capacity;
+    }
+    if (ctx->mps_vision_workspace_prebuild_local_view_count < local_view_count) {
+        ctx->mps_vision_workspace_prebuild_local_view_count = local_view_count;
+    }
+    if (ctx->mps_vision_workspace_prebuild_global_view_count < global_view_count) {
+        ctx->mps_vision_workspace_prebuild_global_view_count = global_view_count;
+    }
+    metal_profile_add_event_now(ctx, "metal.mps.workspace_prebuild.vision", start_ns);
+    return 1;
+}
+
 static int metal_tensor_shape2_is(const uocr_tensor_entry *tensor, uint32_t rows, uint32_t cols) {
     return tensor != NULL && tensor->rank == 2u && tensor->logical_shape[0] == rows &&
            tensor->logical_shape[1] == cols && tensor->physical_shape[0] == rows &&
@@ -7368,6 +7721,166 @@ static int metal_logits_arena_slices(const uocr_metal_context *ctx,
     next_token->offset = (NSUInteger)next_offset;
     return metal_slice_valid(*logits, logits_bytes_per_slot) &&
            metal_slice_valid(*next_token, (uint64_t)sizeof(int32_t));
+}
+
+static int metal_prebuild_mps_runtime_workspace_ndarrays(uocr_metal_context *ctx,
+                                                         uint32_t n_tokens,
+                                                         char *error,
+                                                         size_t error_size) {
+    if (ctx == NULL) {
+        return metal_fail(error, error_size, "invalid Metal MPS runtime workspace prebuild request");
+    }
+    if (!metal_mps_framework_available()) {
+        return 1;
+    }
+    if (!ctx->has_kv_cache_layout || ctx->kv_cache_layout.batch_slots == 0u ||
+        ctx->kv_cache_layout.prompt_token_capacity == 0u || n_tokens == 0u ||
+        n_tokens > ctx->kv_cache_layout.prompt_token_capacity) {
+        return metal_fail(error, error_size, "Metal MPS runtime workspace prebuild requires allocated runtime arenas");
+    }
+    if (ctx->mps_runtime_workspace_prebuild_generation == ctx->mps_workspace_cache_generation &&
+        ctx->mps_runtime_workspace_prebuild_token_count == n_tokens) {
+        metal_profile_add_event_ms(ctx, "metal.mps.workspace_prebuild.runtime.cached", 0.0);
+        return 1;
+    }
+
+    const uint64_t start_ns = uocr_profile_now_ns();
+    const int use_attention_mps = metal_mps_matmul_nt_f16_should_use(n_tokens, UOCR_HIDDEN_SIZE, UOCR_HIDDEN_SIZE);
+    const int use_dense_down_mps = metal_mps_matmul_nt_f16_should_use(n_tokens,
+                                                                      UOCR_DENSE_LAYER0_INTERMEDIATE,
+                                                                      UOCR_HIDDEN_SIZE);
+    const int use_shared_down_mps = metal_mps_matmul_nt_f16_should_use(n_tokens,
+                                                                       UOCR_MOE_SHARED_INTERMEDIATE,
+                                                                       UOCR_HIDDEN_SIZE);
+    const int use_router_mps = metal_mps_matmul_nt_f16_should_use(n_tokens, UOCR_HIDDEN_SIZE, UOCR_ROUTED_EXPERTS);
+    if (!use_attention_mps && !use_dense_down_mps && !use_shared_down_mps && !use_router_mps) {
+        ctx->mps_runtime_workspace_prebuild_generation = ctx->mps_workspace_cache_generation;
+        ctx->mps_runtime_workspace_prebuild_token_count = n_tokens;
+        metal_profile_add_event_ms(ctx, "metal.mps.workspace_prebuild.runtime.not_used", 0.0);
+        return 1;
+    }
+
+    for (uint32_t slot = 0u; slot < ctx->kv_cache_layout.batch_slots; ++slot) {
+        if (use_attention_mps) {
+            uocr_metal_buffer_slice prompt;
+            uint64_t prompt_bytes = 0u;
+            if (!metal_prompt_arena_slice(ctx, slot, n_tokens, &prompt, &prompt_bytes)) {
+                return metal_fail(error, error_size, "failed to prebuild Metal MPS prompt workspace NDArray for slot %u", slot);
+            }
+            if (!metal_prebuild_mps_workspace_matrix_ndarray(ctx,
+                                                             prompt,
+                                                             prompt_bytes,
+                                                             n_tokens,
+                                                             UOCR_HIDDEN_SIZE,
+                                                             UOCR_METAL_MPS_DATA_TYPE_FLOAT16,
+                                                             "decoder prompt workspace",
+                                                             error,
+                                                             error_size)) {
+                return 0;
+            }
+        }
+
+        if (use_attention_mps || use_dense_down_mps || use_shared_down_mps || use_router_mps) {
+            for (uint32_t segment = 0u; segment < UOCR_METAL_HIDDEN_SCRATCH_SEGMENTS; ++segment) {
+                uocr_metal_buffer_slice hidden;
+                uint64_t hidden_bytes = 0u;
+                if (!metal_hidden_arena_segment_slice(ctx, slot, segment, n_tokens, &hidden, &hidden_bytes)) {
+                    return metal_fail(error,
+                                      error_size,
+                                      "failed to prebuild Metal MPS hidden workspace NDArray for slot %u segment %u",
+                                      slot,
+                                      segment);
+                }
+                if (!metal_prebuild_mps_workspace_matrix_ndarray(ctx,
+                                                                 hidden,
+                                                                 hidden_bytes,
+                                                                 n_tokens,
+                                                                 UOCR_HIDDEN_SIZE,
+                                                                 UOCR_METAL_MPS_DATA_TYPE_FLOAT16,
+                                                                 "decoder hidden workspace",
+                                                                 error,
+                                                                 error_size)) {
+                    return 0;
+                }
+            }
+        }
+
+        uocr_metal_buffer_slice mid;
+        if (use_dense_down_mps) {
+            const uint64_t dense_mid_bytes = (uint64_t)n_tokens * (uint64_t)UOCR_DENSE_LAYER0_INTERMEDIATE * 2u;
+            if (!metal_moe_intermediate_slice(ctx, slot, dense_mid_bytes, &mid)) {
+                return metal_fail(error, error_size, "failed to prebuild Metal MPS dense-MLP intermediate workspace for slot %u", slot);
+            }
+            if (!metal_prebuild_mps_workspace_matrix_ndarray(ctx,
+                                                             mid,
+                                                             dense_mid_bytes,
+                                                             n_tokens,
+                                                             UOCR_DENSE_LAYER0_INTERMEDIATE,
+                                                             UOCR_METAL_MPS_DATA_TYPE_FLOAT16,
+                                                             "decoder dense MLP intermediate workspace",
+                                                             error,
+                                                             error_size)) {
+                return 0;
+            }
+        }
+        if (use_shared_down_mps) {
+            const uint64_t shared_mid_bytes = (uint64_t)n_tokens * (uint64_t)UOCR_MOE_SHARED_INTERMEDIATE * 2u;
+            if (!metal_moe_intermediate_slice(ctx, slot, shared_mid_bytes, &mid)) {
+                return metal_fail(error, error_size, "failed to prebuild Metal MPS shared-expert intermediate workspace for slot %u", slot);
+            }
+            if (!metal_prebuild_mps_workspace_matrix_ndarray(ctx,
+                                                             mid,
+                                                             shared_mid_bytes,
+                                                             n_tokens,
+                                                             UOCR_MOE_SHARED_INTERMEDIATE,
+                                                             UOCR_METAL_MPS_DATA_TYPE_FLOAT16,
+                                                             "decoder shared-expert intermediate workspace",
+                                                             error,
+                                                             error_size)) {
+                return 0;
+            }
+        }
+
+        if (use_router_mps) {
+            uocr_metal_buffer_slice router_logits;
+            uocr_metal_buffer_slice top_ids;
+            uocr_metal_buffer_slice top_weights;
+            uint64_t router_logits_bytes = 0u;
+            uint64_t top_ids_bytes = 0u;
+            uint64_t top_weights_bytes = 0u;
+            if (!metal_router_arena_slices(ctx,
+                                           slot,
+                                           n_tokens,
+                                           &router_logits,
+                                           &top_ids,
+                                           &top_weights,
+                                           &router_logits_bytes,
+                                           &top_ids_bytes,
+                                           &top_weights_bytes)) {
+                return metal_fail(error, error_size, "failed to prebuild Metal MPS router-logit workspace for slot %u", slot);
+            }
+            (void)top_ids;
+            (void)top_weights;
+            (void)top_ids_bytes;
+            (void)top_weights_bytes;
+            if (!metal_prebuild_mps_workspace_matrix_ndarray(ctx,
+                                                             router_logits,
+                                                             router_logits_bytes,
+                                                             n_tokens,
+                                                             UOCR_ROUTED_EXPERTS,
+                                                             UOCR_METAL_MPS_DATA_TYPE_FLOAT32,
+                                                             "decoder router-logit workspace",
+                                                             error,
+                                                             error_size)) {
+                return 0;
+            }
+        }
+    }
+
+    ctx->mps_runtime_workspace_prebuild_generation = ctx->mps_workspace_cache_generation;
+    ctx->mps_runtime_workspace_prebuild_token_count = n_tokens;
+    metal_profile_add_event_now(ctx, "metal.mps.workspace_prebuild.runtime", start_ns);
+    return 1;
 }
 
 typedef struct uocr_metal_decode_selection_slices {
@@ -9604,6 +10117,10 @@ static int metal_context_generate_f16(uocr_metal_context *ctx,
         return metal_fail(error, error_size, "failed to prepare integrated Metal fp16 decoder pipelines: %s", detail);
     }
     metal_profile_add_event_now(ctx, "metal.pipeline_prewarm", pipeline_prewarm_start_ns);
+
+    if (!metal_prebuild_mps_runtime_workspace_ndarrays(ctx, request->n_tokens, error, error_size)) {
+        return 0;
+    }
 
     if (!metal_command_batch_begin(ctx, error, error_size)) {
         return 0;
