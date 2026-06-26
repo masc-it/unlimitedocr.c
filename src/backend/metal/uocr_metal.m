@@ -7213,7 +7213,7 @@ static int metal_prebuild_mps_vision_shape_ndarrays(uocr_metal_context *ctx,
     PREBUILD_VISION_IO(workspace->clip_block_norm1, workspace->clip_block_k, clip_tokens, UOCR_CLIP_HIDDEN_SIZE, UOCR_CLIP_HIDDEN_SIZE, "CLIP K workspace");
     PREBUILD_VISION_IO(workspace->clip_block_norm1, workspace->clip_block_v, clip_tokens, UOCR_CLIP_HIDDEN_SIZE, UOCR_CLIP_HIDDEN_SIZE, "CLIP V workspace");
     PREBUILD_VISION_IO(workspace->clip_block_attention, workspace->clip_block_projected, clip_tokens, UOCR_CLIP_HIDDEN_SIZE, UOCR_CLIP_HIDDEN_SIZE, "CLIP output projection workspace");
-    PREBUILD_VISION_IO(workspace->clip_block_norm2, workspace->clip_mlp_fc1, clip_tokens, UOCR_CLIP_HIDDEN_SIZE, UOCR_CLIP_MLP_INTERMEDIATE, "CLIP MLP fc1 workspace");
+    PREBUILD_VISION_IO(workspace->clip_block_norm2, workspace->clip_mlp_activated, clip_tokens, UOCR_CLIP_HIDDEN_SIZE, UOCR_CLIP_MLP_INTERMEDIATE, "CLIP fused MLP fc1 workspace");
     PREBUILD_VISION_IO(workspace->clip_mlp_activated, workspace->clip_block_mlp, clip_tokens, UOCR_CLIP_MLP_INTERMEDIATE, UOCR_CLIP_HIDDEN_SIZE, "CLIP MLP fc2 workspace");
     if (workspace->projected_row_capacity >= projected_tokens && workspace->projected_rows.buffer != nil) {
         PREBUILD_VISION_IO(workspace->concat, workspace->projected_rows, projected_tokens, UOCR_PROJECTOR_IN_SIZE, UOCR_HIDDEN_SIZE, "visual projector workspace");
@@ -8277,6 +8277,70 @@ static int metal_run_bias_gelu_f16_inplace(uocr_metal_context *ctx,
        threadsPerThreadgroup:MTLSizeMake(threads, 1u, 1u)];
         [enc endEncoding];
         return metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, op_name != NULL ? op_name : "bias GELU", error, error_size);
+    }
+}
+
+static int metal_run_bias_quickgelu_f16_inplace(uocr_metal_context *ctx,
+                                                 uocr_metal_buffer_slice dst,
+                                                 uocr_metal_buffer_slice bias,
+                                                 uint32_t rows,
+                                                 uint32_t cols,
+                                                 const char *op_name,
+                                                 char *error,
+                                                 size_t error_size) {
+    uint64_t value_count = 0u;
+    uint64_t dst_bytes = 0u;
+    uint64_t bias_bytes = 0u;
+    if (ctx == NULL || rows == 0u || cols == 0u ||
+        !checked_mul_u64((uint64_t)rows, (uint64_t)cols, &value_count) ||
+        !checked_mul_u64(value_count, 2u, &dst_bytes) ||
+        !checked_mul_u64((uint64_t)cols, 2u, &bias_bytes) ||
+        value_count > (uint64_t)UINT32_MAX || !metal_slice_valid(dst, dst_bytes) ||
+        !metal_slice_valid(bias, bias_bytes)) {
+        return metal_fail(error, error_size, "invalid %s bias-QuickGELU request", op_name != NULL ? op_name : "Metal");
+    }
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, "uocr_bias_quickgelu_f16_inplace", error, error_size);
+        if (pipeline == nil) {
+            return 0;
+        }
+        int owned_command_buffer = 0;
+        id<MTLCommandBuffer> cb = metal_command_buffer_for_op(ctx,
+                                                              &owned_command_buffer,
+                                                              op_name != NULL ? op_name : "bias QuickGELU",
+                                                              error,
+                                                              error_size);
+        if (cb == nil) {
+            return 0;
+        }
+        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
+        if (enc == nil) {
+            return metal_fail(error,
+                              error_size,
+                              "failed to create %s bias-QuickGELU command encoder",
+                              op_name != NULL ? op_name : "Metal");
+        }
+        uocr_metal_bias_add_params params;
+        params.rows = rows;
+        params.cols = cols;
+        params.reserved0 = 0u;
+        params.reserved1 = 0u;
+        NSUInteger threads = pipeline.threadExecutionWidth;
+        if (threads == 0u) threads = 1u;
+        if (threads > 256u) threads = 256u;
+        [enc setComputePipelineState:pipeline];
+        [enc setBuffer:dst.buffer offset:dst.offset atIndex:0u];
+        [enc setBuffer:bias.buffer offset:bias.offset atIndex:1u];
+        [enc setBytes:&params length:sizeof(params) atIndex:2u];
+        [enc dispatchThreads:MTLSizeMake((NSUInteger)value_count, 1u, 1u)
+       threadsPerThreadgroup:MTLSizeMake(threads, 1u, 1u)];
+        [enc endEncoding];
+        return metal_finish_command_buffer_for_op(ctx,
+                                                  cb,
+                                                  owned_command_buffer,
+                                                  op_name != NULL ? op_name : "bias QuickGELU",
+                                                  error,
+                                                  error_size);
     }
 }
 
@@ -15676,6 +15740,8 @@ static int metal_context_clip_mlp_workspace_f16(uocr_metal_context *ctx,
     uint64_t mid_values = 0u;
     uint64_t hidden_bytes = 0u;
     uint64_t mid_bytes = 0u;
+    uint64_t fc1_weight_bytes = 0u;
+    uint64_t fc1_bias_bytes = 0u;
     if (ctx == NULL || input_f16 == NULL || !metal_clip_transformer_block_has_weights(block) || out == NULL ||
         scratch == NULL) {
         return metal_fail(error, error_size, "invalid Metal CLIP workspace MLP request");
@@ -15683,36 +15749,42 @@ static int metal_context_clip_mlp_workspace_f16(uocr_metal_context *ctx,
     if (!checked_mul_u64((uint64_t)token_count, (uint64_t)UOCR_CLIP_HIDDEN_SIZE, &hidden_values) ||
         !checked_mul_u64((uint64_t)token_count, (uint64_t)UOCR_CLIP_MLP_INTERMEDIATE, &mid_values) ||
         !checked_mul_u64(hidden_values, 2u, &hidden_bytes) || !checked_mul_u64(mid_values, 2u, &mid_bytes) ||
-        !metal_vision_slice_has_bytes(scratch->clip_mlp_fc1, mid_bytes) ||
+        !checked_mul_u64((uint64_t)UOCR_CLIP_HIDDEN_SIZE, (uint64_t)UOCR_CLIP_MLP_INTERMEDIATE, &fc1_weight_bytes) ||
+        !checked_mul_u64(fc1_weight_bytes, 2u, &fc1_weight_bytes) ||
+        !checked_mul_u64((uint64_t)UOCR_CLIP_MLP_INTERMEDIATE, 2u, &fc1_bias_bytes) ||
         !metal_vision_slice_has_bytes(scratch->clip_mlp_activated, mid_bytes)) {
         return metal_fail(error, error_size, "Metal CLIP workspace MLP scratch is too small");
     }
-    (void)hidden_bytes;
-    if (!uocr_metal_context_dense_f16(ctx,
-                                      input_f16,
-                                      block->mlp_fc1_weight_f16,
-                                      block->mlp_fc1_bias_f16,
-                                      token_count,
-                                      UOCR_CLIP_HIDDEN_SIZE,
-                                      UOCR_CLIP_MLP_INTERMEDIATE,
-                                      UOCR_METAL_DENSE_OUTPUT_F16,
-                                      scratch->clip_mlp_fc1.f16,
-                                      error,
-                                      error_size)) {
-        char detail[512];
-        metal_copy_error_detail(detail, sizeof(detail), error);
-        return metal_fail(error, error_size, "failed to compute Metal CLIP workspace MLP fc1: %s", detail);
+    uocr_metal_buffer_slice input_slice;
+    uocr_metal_buffer_slice fc1_weight_slice;
+    uocr_metal_buffer_slice fc1_bias_slice;
+    if (!metal_vision_host_pointer_slice(ctx, input_f16, hidden_bytes, &input_slice) ||
+        !metal_vision_host_pointer_slice(ctx, block->mlp_fc1_weight_f16, fc1_weight_bytes, &fc1_weight_slice) ||
+        !metal_vision_host_pointer_slice(ctx, block->mlp_fc1_bias_f16, fc1_bias_bytes, &fc1_bias_slice)) {
+        return metal_fail(error, error_size, "Metal CLIP workspace MLP fc1 requires direct Metal slices");
     }
-    if (!uocr_metal_context_clip_quickgelu_f16(ctx,
-                                               scratch->clip_mlp_fc1.f16,
-                                               token_count,
-                                               UOCR_METAL_DENSE_OUTPUT_F16,
-                                               scratch->clip_mlp_activated.f16,
-                                               error,
-                                               error_size)) {
+    uocr_metal_buffer_slice fc1_dst_slice = { scratch->clip_mlp_activated.buffer, scratch->clip_mlp_activated.offset };
+    if (!metal_run_mps_matmul_nt_f16(ctx,
+                                     input_slice,
+                                     fc1_weight_slice,
+                                     fc1_dst_slice,
+                                     token_count,
+                                     UOCR_CLIP_HIDDEN_SIZE,
+                                     UOCR_CLIP_MLP_INTERMEDIATE,
+                                     "Metal CLIP workspace MLP fc1 MPS matmul",
+                                     error,
+                                     error_size) ||
+        !metal_run_bias_quickgelu_f16_inplace(ctx,
+                                              fc1_dst_slice,
+                                              fc1_bias_slice,
+                                              token_count,
+                                              UOCR_CLIP_MLP_INTERMEDIATE,
+                                              "Metal CLIP workspace MLP fused bias QuickGELU",
+                                              error,
+                                              error_size)) {
         char detail[512];
         metal_copy_error_detail(detail, sizeof(detail), error);
-        return metal_fail(error, error_size, "failed to compute Metal CLIP workspace MLP QuickGELU: %s", detail);
+        return metal_fail(error, error_size, "failed to compute Metal CLIP workspace MLP fused fc1: %s", detail);
     }
     if (!uocr_metal_context_dense_f16(ctx,
                                       scratch->clip_mlp_activated.f16,

@@ -127,7 +127,7 @@ Implementation status:
 - [x] Cache all MPS descriptors and weight NDArrays at model map time.
 - [x] Replace SAM patch embed with a custom tiled patch kernel.
 - [x] Replace SAM neck 1x1, neck 3x3, net_2, and net_3 with custom tiled convolution kernels.
-- [ ] Fuse vision epilogues into fixed kernels: bias, GELU, QuickGELU, residual add, and layout conversion.
+- [x] Fuse vision epilogues into fixed kernels: bias, GELU, QuickGELU, residual add, and layout conversion.
 - [ ] Validate base/global and local-crop parity against current fixture/golden outputs.
 - [ ] Delete scalar production kernels after tiled kernels and MPS GEMMs pass parity and timing gates.
 

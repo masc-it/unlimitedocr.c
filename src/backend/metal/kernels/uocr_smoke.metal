@@ -1079,6 +1079,19 @@ static inline float uocr_quickgelu(float x) {
     return x / (1.0f + exp(-1.702f * x));
 }
 
+kernel void uocr_bias_quickgelu_f16_inplace(device half *dst [[buffer(0)]],
+                                            device const half *bias [[buffer(1)]],
+                                            constant UocrBiasAddParams &params [[buffer(2)]],
+                                            uint gid [[thread_position_in_grid]]) {
+    const uint value_count = params.rows * params.cols;
+    if (gid >= value_count) {
+        return;
+    }
+    const uint col = gid - (gid / params.cols) * params.cols;
+    const float value = float(dst[gid]) + float(bias[col]);
+    dst[gid] = half(uocr_quickgelu(value));
+}
+
 kernel void uocr_clip_quickgelu_f16_to_f16(device const half *src [[buffer(0)]],
                                            device half *dst [[buffer(1)]],
                                            constant uint &value_count [[buffer(2)]],
