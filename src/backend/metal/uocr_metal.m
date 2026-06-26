@@ -3399,6 +3399,7 @@ typedef struct uocr_metal_vision_workspace {
     uocr_metal_vision_workspace_slice concat;
     uocr_metal_vision_workspace_slice projected_rows;
     uocr_metal_vision_workspace_slice final_visual_rows;
+    uint32_t sam_patch_view_capacity;
     uint32_t projected_row_capacity;
     uint32_t final_visual_row_capacity;
     uint64_t required_bytes;
@@ -3507,6 +3508,7 @@ static int metal_vision_workspace_shape_for_view_size(uint32_t max_view_size,
 static int metal_vision_workspace_init(uocr_metal_context *ctx,
                                        uocr_metal_vision_workspace *workspace,
                                        uint32_t max_view_size,
+                                       uint32_t sam_patch_view_capacity,
                                        uint32_t projected_row_capacity,
                                        uint32_t final_visual_row_capacity,
                                        int cpu_visible,
@@ -3521,9 +3523,14 @@ static int metal_vision_workspace_init(uocr_metal_context *ctx,
     if (!metal_vision_workspace_shape_for_view_size(max_view_size, &patch_grid, &projected_grid, error, error_size)) {
         return 0;
     }
+    const uint32_t patch_view_capacity = sam_patch_view_capacity == 0u ? 1u : sam_patch_view_capacity;
     const uint64_t patch_tokens = (uint64_t)patch_grid * (uint64_t)patch_grid;
     const uint64_t projected_tokens_per_view = (uint64_t)projected_grid * (uint64_t)projected_grid;
     const uint64_t sam_bhwc_values = patch_tokens * (uint64_t)UOCR_SAM_HIDDEN_SIZE;
+    uint64_t sam_patch_bhwc_values = 0u;
+    if (!checked_mul_u64(sam_bhwc_values, (uint64_t)patch_view_capacity, &sam_patch_bhwc_values)) {
+        return metal_fail(error, error_size, "Metal batched SAM patch workspace byte-size overflow");
+    }
     const uint64_t sam_neck_values = (uint64_t)UOCR_SAM_NECK_CHANNELS * patch_tokens;
     const uint64_t max_net2_grid = ((uint64_t)patch_grid + 1u) / 2u;
     const uint64_t max_net3_grid = (max_net2_grid + 1u) / 2u;
@@ -3572,7 +3579,7 @@ static int metal_vision_workspace_init(uocr_metal_context *ctx,
         }                                  \
     } while (0)
 
-    ADD_WORKSPACE_SLICE(sam_bhwc_values, "SAM patch BHWC");
+    ADD_WORKSPACE_SLICE(sam_patch_bhwc_values, "SAM patch BHWC batch");
     ADD_WORKSPACE_SLICE(sam_bhwc_values, "SAM positioned BHWC");
     ADD_WORKSPACE_SLICE(sam_bhwc_values, "SAM transformer BHWC");
     ADD_WORKSPACE_SLICE(sam_bhwc_values, "SAM block norm1 BHWC");
@@ -3643,7 +3650,7 @@ static int metal_vision_workspace_init(uocr_metal_context *ctx,
         }                                            \
     } while (0)
 
-    ASSIGN_WORKSPACE_SLICE(sam_patch_bhwc, sam_bhwc_values, "SAM patch BHWC");
+    ASSIGN_WORKSPACE_SLICE(sam_patch_bhwc, sam_patch_bhwc_values, "SAM patch BHWC batch");
     ASSIGN_WORKSPACE_SLICE(sam_pos_bhwc, sam_bhwc_values, "SAM positioned BHWC");
     ASSIGN_WORKSPACE_SLICE(sam_transformer_bhwc, sam_bhwc_values, "SAM transformer BHWC");
     ASSIGN_WORKSPACE_SLICE(sam_block_norm1_bhwc, sam_bhwc_values, "SAM block norm1 BHWC");
@@ -3686,6 +3693,7 @@ static int metal_vision_workspace_init(uocr_metal_context *ctx,
 
 #undef ASSIGN_WORKSPACE_SLICE
 
+    workspace->sam_patch_view_capacity = patch_view_capacity;
     workspace->projected_row_capacity = projected_row_capacity;
     workspace->final_visual_row_capacity = final_visual_row_capacity;
     workspace->required_bytes = required_bytes;
@@ -4227,6 +4235,9 @@ static int metal_context_visual_projector_f16_to_slice(uocr_metal_context *ctx,
 
 static int metal_encode_one_view_sam_features_f16(uocr_metal_vision_project_context *project,
                                                   const uocr_image_view *view,
+                                                  uocr_metal_vision_workspace_slice precomputed_patch_bhwc,
+                                                  uint32_t precomputed_patch_grid_w,
+                                                  uint32_t precomputed_patch_grid_h,
                                                   uocr_metal_vision_workspace_slice out_sam_nchw,
                                                   uint32_t *out_grid_w,
                                                   uint32_t *out_grid_h,
@@ -4253,20 +4264,24 @@ static int metal_encode_one_view_sam_features_f16(uocr_metal_vision_project_cont
         metal_profile_add_event_now_f(ctx, vision_step_start_ns__, "metal.vision.%s", step_name);    \
     } while (0)
 
-    uint32_t patch_grid_w = 0u;
-    uint32_t patch_grid_h = 0u;
-    const uint64_t sam_patch_start_ns = uocr_profile_now_ns();
-    RUN_VISION_STEP("SAM patch embedding",
-                    metal_context_sam_patch_embed_f16_to_slice(ctx,
-                                                                view,
-                                                                weights->sam_patch_weight,
-                                                                weights->sam_patch_bias,
-                                                                scratch->sam_patch_bhwc,
-                                                                &patch_grid_w,
-                                                                &patch_grid_h,
-                                                                error,
-                                                                error_size));
-    metal_profile_add_event_now(ctx, "metal.vision.sam_patch", sam_patch_start_ns);
+    uint32_t patch_grid_w = precomputed_patch_grid_w;
+    uint32_t patch_grid_h = precomputed_patch_grid_h;
+    uocr_metal_vision_workspace_slice patch_bhwc = precomputed_patch_bhwc;
+    if (patch_bhwc.buffer == nil) {
+        patch_bhwc = scratch->sam_patch_bhwc;
+        const uint64_t sam_patch_start_ns = uocr_profile_now_ns();
+        RUN_VISION_STEP("SAM patch embedding",
+                        metal_context_sam_patch_embed_f16_to_slice(ctx,
+                                                                    view,
+                                                                    weights->sam_patch_weight,
+                                                                    weights->sam_patch_bias,
+                                                                    patch_bhwc,
+                                                                    &patch_grid_w,
+                                                                    &patch_grid_h,
+                                                                    error,
+                                                                    error_size));
+        metal_profile_add_event_now(ctx, "metal.vision.sam_patch", sam_patch_start_ns);
+    }
     if (patch_grid_w != expected_patch_grid || patch_grid_h != expected_patch_grid) {
         return metal_fail(error,
                           error_size,
@@ -4279,7 +4294,7 @@ static int metal_encode_one_view_sam_features_f16(uocr_metal_vision_project_cont
 
     RUN_VISION_STEP("SAM absolute position add",
                     metal_context_sam_add_abs_pos_f16_to_slice(ctx,
-                                                                scratch->sam_patch_bhwc,
+                                                                patch_bhwc,
                                                                 weights->sam_pos_embed,
                                                                 patch_grid_w,
                                                                 patch_grid_h,
@@ -4384,6 +4399,9 @@ static int metal_encode_one_view_sam_features_f16(uocr_metal_vision_project_cont
 
 static int metal_encode_one_view_clip_features_f16(uocr_metal_vision_project_context *project,
                                                     const uocr_image_view *view,
+                                                    uocr_metal_vision_workspace_slice precomputed_patch_bhwc,
+                                                    uint32_t precomputed_patch_grid_w,
+                                                    uint32_t precomputed_patch_grid_h,
                                                     uocr_metal_vision_workspace_slice out_clip_tokens,
                                                     uint32_t *out_token_count,
                                                     uint32_t *out_grid_w,
@@ -4404,6 +4422,9 @@ static int metal_encode_one_view_clip_features_f16(uocr_metal_vision_project_con
 
     if (!metal_encode_one_view_sam_features_f16(project,
                                                 view,
+                                                precomputed_patch_bhwc,
+                                                precomputed_patch_grid_w,
+                                                precomputed_patch_grid_h,
                                                 scratch->sam_net3_nchw,
                                                 &sam_grid_w,
                                                 &sam_grid_h,
@@ -4469,47 +4490,206 @@ static int metal_encode_one_view_clip_features_f16(uocr_metal_vision_project_con
     return 1;
 }
 
-static int metal_vision_workspace_slice_rows(uocr_metal_vision_workspace_slice slice,
-                                             uint32_t first_row,
-                                             uint32_t row_count,
-                                             uocr_metal_vision_workspace_slice *out,
-                                             char *error,
-                                             size_t error_size) {
-    if (out == NULL || slice.buffer == nil || slice.f16 == NULL || row_count == 0u) {
-        return metal_fail(error, error_size, "invalid Metal vision row-slice request");
+static int metal_vision_workspace_slice_values(uocr_metal_vision_workspace_slice slice,
+                                               uint64_t first_value,
+                                               uint64_t value_count,
+                                               const char *label,
+                                               uocr_metal_vision_workspace_slice *out,
+                                               char *error,
+                                               size_t error_size) {
+    if (out == NULL || slice.buffer == nil || slice.f16 == NULL || value_count == 0u) {
+        return metal_fail(error, error_size, "invalid Metal vision %s slice request", label != NULL ? label : "value");
     }
-    uint64_t first_value = 0u;
-    uint64_t value_count = 0u;
     uint64_t byte_offset = 0u;
     uint64_t byte_count = 0u;
-    if (!checked_mul_u64((uint64_t)first_row, (uint64_t)UOCR_HIDDEN_SIZE, &first_value) ||
-        !checked_mul_u64((uint64_t)row_count, (uint64_t)UOCR_HIDDEN_SIZE, &value_count) ||
-        !checked_mul_u64(first_value, 2u, &byte_offset) || !checked_mul_u64(value_count, 2u, &byte_count)) {
-        return metal_fail(error, error_size, "Metal vision row-slice byte-size overflow");
+    if (!checked_mul_u64(first_value, 2u, &byte_offset) || !checked_mul_u64(value_count, 2u, &byte_count)) {
+        return metal_fail(error, error_size, "Metal vision %s slice byte-size overflow", label != NULL ? label : "value");
     }
     uint64_t byte_end = 0u;
     uint64_t absolute_offset = 0u;
     if (!checked_add_u64(byte_offset, byte_count, &byte_end) || byte_end > slice.bytes ||
         !checked_add_u64((uint64_t)slice.offset, byte_offset, &absolute_offset) || absolute_offset > (uint64_t)NSUIntegerMax) {
-        return metal_fail(error,
-                          error_size,
-                          "Metal vision row-slice range %u+%u exceeds backing rows",
-                          first_row,
-                          row_count);
+        return metal_fail(error, error_size, "Metal vision %s slice exceeds backing range", label != NULL ? label : "value");
     }
     out->buffer = slice.buffer;
     out->offset = (NSUInteger)absolute_offset;
     out->bytes = byte_count;
     const uintptr_t base = (uintptr_t)(const void *)slice.f16;
     if (base > UINTPTR_MAX - (uintptr_t)byte_offset) {
-        return metal_fail(error, error_size, "Metal vision row-slice host token overflow");
+        return metal_fail(error, error_size, "Metal vision %s slice host token overflow", label != NULL ? label : "value");
     }
     out->f16 = (uint16_t *)(void *)(base + (uintptr_t)byte_offset);
     return 1;
 }
 
+static int metal_vision_workspace_slice_rows(uocr_metal_vision_workspace_slice slice,
+                                             uint32_t first_row,
+                                             uint32_t row_count,
+                                             uocr_metal_vision_workspace_slice *out,
+                                             char *error,
+                                             size_t error_size) {
+    uint64_t first_value = 0u;
+    uint64_t value_count = 0u;
+    if (!checked_mul_u64((uint64_t)first_row, (uint64_t)UOCR_HIDDEN_SIZE, &first_value) ||
+        !checked_mul_u64((uint64_t)row_count, (uint64_t)UOCR_HIDDEN_SIZE, &value_count)) {
+        return metal_fail(error, error_size, "Metal vision row-slice byte-size overflow");
+    }
+    return metal_vision_workspace_slice_values(slice, first_value, value_count, "row", out, error, error_size);
+}
+
+static int metal_context_sam_patch_embed_batch_f16_to_slice(uocr_metal_vision_project_context *project,
+                                                            const uocr_vision_chunk *chunk,
+                                                            uocr_metal_vision_workspace_slice out_bhwc,
+                                                            uint32_t *out_grid_w,
+                                                            uint32_t *out_grid_h,
+                                                            char *error,
+                                                            size_t error_size) {
+    if (project == NULL || project->ctx == NULL || project->request == NULL || project->weights == NULL || chunk == NULL ||
+        out_grid_w == NULL || out_grid_h == NULL || chunk->view_count == 0u || out_bhwc.buffer == nil || out_bhwc.f16 == NULL) {
+        return metal_fail(error, error_size, "invalid Metal batched SAM patch request");
+    }
+    if (project->scratch == NULL || chunk->view_count > project->scratch->sam_patch_view_capacity) {
+        return metal_fail(error, error_size, "Metal batched SAM patch view count exceeds workspace capacity");
+    }
+    if (chunk->first_view > project->request->n_views || chunk->view_count > project->request->n_views - chunk->first_view) {
+        return metal_fail(error, error_size, "Metal batched SAM patch view range is invalid");
+    }
+
+    const uocr_image_view *first = &project->request->views[chunk->first_view];
+    if (first->kind != (chunk->kind == UOCR_VISION_CHUNK_LOCAL ? UOCR_VIEW_LOCAL : UOCR_VIEW_GLOBAL) ||
+        (first->format != UOCR_PIXEL_F16_NCHW && first->format != UOCR_PIXEL_F32_NCHW) ||
+        first->width == 0u || first->height == 0u ||
+        (first->width % UOCR_VISION_PATCH_SIZE) != 0u || (first->height % UOCR_VISION_PATCH_SIZE) != 0u) {
+        return metal_fail(error, error_size, "Metal batched SAM patch first view is invalid");
+    }
+    for (uint32_t view_index = 1u; view_index < chunk->view_count; ++view_index) {
+        const uocr_image_view *view = &project->request->views[chunk->first_view + view_index];
+        if (view->kind != first->kind || view->format != first->format || view->width != first->width || view->height != first->height) {
+            return metal_fail(error,
+                              error_size,
+                              "Metal batched SAM patch requires same kind/format/shape within a shape group");
+        }
+    }
+
+    const uint32_t grid_w = first->width / UOCR_VISION_PATCH_SIZE;
+    const uint32_t grid_h = first->height / UOCR_VISION_PATCH_SIZE;
+    const uint64_t element_size = first->format == UOCR_PIXEL_F16_NCHW ? 2u : 4u;
+    uint64_t pixel_values = 0u;
+    uint64_t pixel_bytes_per_view = 0u;
+    uint64_t pixel_bytes = 0u;
+    uint64_t output_patches = 0u;
+    uint64_t output_values_per_view = 0u;
+    uint64_t output_values = 0u;
+    uint64_t output_bytes = 0u;
+    uint64_t weight_values = 0u;
+    uint64_t weight_bytes = 0u;
+    const uint64_t bias_bytes = (uint64_t)UOCR_SAM_HIDDEN_SIZE * 2u;
+    if (!checked_mul_u64(3u, (uint64_t)first->width, &pixel_values) ||
+        !checked_mul_u64(pixel_values, (uint64_t)first->height, &pixel_values) ||
+        !checked_mul_u64(pixel_values, element_size, &pixel_bytes_per_view) ||
+        !checked_mul_u64(pixel_bytes_per_view, (uint64_t)chunk->view_count, &pixel_bytes) ||
+        !checked_mul_u64((uint64_t)grid_w, (uint64_t)grid_h, &output_patches) ||
+        !checked_mul_u64(output_patches, (uint64_t)UOCR_SAM_HIDDEN_SIZE, &output_values_per_view) ||
+        !checked_mul_u64(output_values_per_view, (uint64_t)chunk->view_count, &output_values) ||
+        !metal_vision_f16_bytes(output_values, &output_bytes) ||
+        !checked_mul_u64((uint64_t)UOCR_SAM_HIDDEN_SIZE,
+                         3u * (uint64_t)UOCR_VISION_PATCH_SIZE * (uint64_t)UOCR_VISION_PATCH_SIZE,
+                         &weight_values) ||
+        !metal_vision_f16_bytes(weight_values, &weight_bytes) ||
+        pixel_bytes > (uint64_t)SIZE_MAX ||
+        !metal_vision_require_workspace_slice_f16(out_bhwc, output_bytes, "batched SAM patch output", error, error_size) ||
+        !metal_vision_require_tensor_slice_f16(project->weights->sam_patch_weight, weight_bytes, "SAM patch weight", error, error_size) ||
+        !metal_vision_require_tensor_slice_f16(project->weights->sam_patch_bias, bias_bytes, "SAM patch bias", error, error_size)) {
+        return 0;
+    }
+
+    @autoreleasepool {
+        id<MTLBuffer> pixel_buffer = metal_new_buffer_with_length(project->ctx, (NSUInteger)pixel_bytes, MTLResourceStorageModeShared);
+        if (pixel_buffer == nil || [pixel_buffer contents] == NULL) {
+            if (pixel_buffer != nil) [pixel_buffer release];
+            return metal_fail(error, error_size, "failed to allocate Metal batched SAM patch pixel buffer");
+        }
+        pixel_buffer.label = @"uocr_sam_patch_pixels_batch";
+        uint8_t *dst_pixels = (uint8_t *)[pixel_buffer contents];
+        for (uint32_t view_index = 0u; view_index < chunk->view_count; ++view_index) {
+            const uocr_image_view *view = &project->request->views[chunk->first_view + view_index];
+            memcpy(dst_pixels + (size_t)view_index * (size_t)pixel_bytes_per_view,
+                   view->pixels,
+                   (size_t)pixel_bytes_per_view);
+        }
+
+        const char *function_name = first->format == UOCR_PIXEL_F16_NCHW ?
+                                        "uocr_sam_patch_embed_f16_input" :
+                                        "uocr_sam_patch_embed_f32_input";
+        id<MTLComputePipelineState> pipeline = metal_get_pipeline(project->ctx, function_name, error, error_size);
+        if (pipeline == nil) {
+            [pixel_buffer release];
+            return 0;
+        }
+        const NSUInteger threads_x = metal_power2_threadgroup_width(256u, pipeline.maxTotalThreadsPerThreadgroup);
+        const uint64_t partial_bytes = (uint64_t)threads_x * (uint64_t)sizeof(float);
+        if (partial_bytes > (uint64_t)project->ctx->device.maxThreadgroupMemoryLength) {
+            [pixel_buffer release];
+            return metal_fail(error, error_size, "Metal batched SAM patch tiled reduction exceeds threadgroup memory limit");
+        }
+
+        id<MTLCommandBuffer> cb = metal_new_command_buffer(project->ctx);
+        if (cb == nil) {
+            [pixel_buffer release];
+            return metal_fail(error, error_size, "failed to create Metal batched SAM patch command buffer");
+        }
+        cb.label = @"uocr_sam_patch_embed_batch_command_buffer";
+        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(project->ctx, cb);
+        if (enc == nil) {
+            [pixel_buffer release];
+            return metal_fail(error, error_size, "failed to create Metal batched SAM patch encoder");
+        }
+
+        uocr_metal_sam_patch_embed_params params;
+        memset(&params, 0, sizeof(params));
+        params.width = first->width;
+        params.height = first->height;
+        params.out_width = grid_w;
+        params.out_height = grid_h;
+        params.has_bias = 1u;
+
+        [enc setComputePipelineState:pipeline];
+        [enc setBuffer:pixel_buffer offset:0u atIndex:0u];
+        [enc setBuffer:project->weights->sam_patch_weight.slice.buffer offset:project->weights->sam_patch_weight.slice.offset atIndex:1u];
+        [enc setBuffer:project->weights->sam_patch_bias.slice.buffer offset:project->weights->sam_patch_bias.slice.offset atIndex:2u];
+        [enc setBuffer:out_bhwc.buffer offset:out_bhwc.offset atIndex:3u];
+        [enc setBytes:&params length:sizeof(params) atIndex:4u];
+        [enc setThreadgroupMemoryLength:(NSUInteger)partial_bytes atIndex:0u];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)UOCR_SAM_HIDDEN_SIZE,
+                                              (NSUInteger)output_patches,
+                                              (NSUInteger)chunk->view_count)
+             threadsPerThreadgroup:MTLSizeMake(threads_x, 1u, 1u)];
+        [enc endEncoding];
+        if (project->ctx->active_command_buffer == cb &&
+            !metal_retain_transient_until_completed(project->ctx, cb, pixel_buffer, error, error_size)) {
+            [pixel_buffer release];
+            return 0;
+        }
+        UOCR_METAL_COMMIT_AND_WAIT_PROFILED(project->ctx, cb);
+        int ok = 1;
+        if (cb.status == MTLCommandBufferStatusError) {
+            NSString *description = cb.error != nil ? [cb.error localizedDescription] : @"unknown command-buffer error";
+            ok = metal_fail(error, error_size, "Metal batched SAM patch command failed: %s", [description UTF8String]);
+        } else {
+            *out_grid_w = grid_w;
+            *out_grid_h = grid_h;
+            metal_clear_error(error, error_size);
+        }
+        [pixel_buffer release];
+        return ok;
+    }
+}
+
 static int metal_encode_one_view_projected_f16(uocr_metal_vision_project_context *project,
                                                const uocr_image_view *view,
+                                               uocr_metal_vision_workspace_slice precomputed_patch_bhwc,
+                                               uint32_t precomputed_patch_grid_w,
+                                               uint32_t precomputed_patch_grid_h,
                                                uocr_metal_vision_workspace_slice out_projected_rows,
                                                char *error,
                                                size_t error_size) {
@@ -4534,6 +4714,9 @@ static int metal_encode_one_view_projected_f16(uocr_metal_vision_project_context
 
     if (!metal_encode_one_view_clip_features_f16(project,
                                                  view,
+                                                 precomputed_patch_bhwc,
+                                                 precomputed_patch_grid_w,
+                                                 precomputed_patch_grid_h,
                                                  scratch->clip_final,
                                                  &clip_token_count,
                                                  &sam_grid_w,
@@ -4837,6 +5020,31 @@ static int metal_project_vision_chunk_f16(const uocr_vision_chunk *chunk,
     }
 
     const uint64_t chunk_encode_start_ns = uocr_profile_now_ns();
+    int has_batched_patch = 0;
+    uint32_t batched_patch_grid_w = 0u;
+    uint32_t batched_patch_grid_h = 0u;
+    uint64_t batched_patch_values_per_view = 0u;
+    if (chunk->view_count > 1u) {
+        const uint64_t sam_patch_batch_start_ns = uocr_profile_now_ns();
+        if (!metal_context_sam_patch_embed_batch_f16_to_slice(project,
+                                                             chunk,
+                                                             project->scratch->sam_patch_bhwc,
+                                                             &batched_patch_grid_w,
+                                                             &batched_patch_grid_h,
+                                                             error,
+                                                             error_size)) {
+            return UOCR_ERROR_INTERNAL;
+        }
+        if (!metal_vision_square_grid_values(batched_patch_grid_w,
+                                             batched_patch_grid_h,
+                                             UOCR_SAM_HIDDEN_SIZE,
+                                             &batched_patch_values_per_view)) {
+            (void)metal_fail(error, error_size, "Metal batched SAM patch value-count overflow");
+            return UOCR_ERROR_INTERNAL;
+        }
+        has_batched_patch = 1;
+        metal_profile_add_event_now(project->ctx, "metal.vision.sam_patch_batch", sam_patch_batch_start_ns);
+    }
     for (uint32_t view_index = 0u; view_index < chunk->view_count; ++view_index) {
         const uocr_image_view *view = &project->request->views[chunk->first_view + view_index];
         uocr_metal_vision_workspace_slice projected_out;
@@ -4848,7 +5056,25 @@ static int metal_project_vision_chunk_f16(const uocr_vision_chunk *chunk,
                                                error_size)) {
             return UOCR_ERROR_OUT_OF_MEMORY;
         }
-        if (!metal_encode_one_view_projected_f16(project, view, projected_out, error, error_size)) {
+        uocr_metal_vision_workspace_slice patch_in = {0};
+        if (has_batched_patch &&
+            !metal_vision_workspace_slice_values(project->scratch->sam_patch_bhwc,
+                                                 (uint64_t)view_index * batched_patch_values_per_view,
+                                                 batched_patch_values_per_view,
+                                                 "batched SAM patch view",
+                                                 &patch_in,
+                                                 error,
+                                                 error_size)) {
+            return UOCR_ERROR_OUT_OF_MEMORY;
+        }
+        if (!metal_encode_one_view_projected_f16(project,
+                                                 view,
+                                                 patch_in,
+                                                 has_batched_patch ? batched_patch_grid_w : 0u,
+                                                 has_batched_patch ? batched_patch_grid_h : 0u,
+                                                 projected_out,
+                                                 error,
+                                                 error_size)) {
             return UOCR_ERROR_INTERNAL;
         }
     }
@@ -4887,6 +5113,7 @@ static int metal_context_encode_visual_features_to_workspace_f16(uocr_metal_cont
     if (!metal_vision_workspace_init(ctx,
                                      scratch,
                                      max_view_size,
+                                     schedule->max_chunk_views,
                                      schedule->max_chunk_projected_tokens,
                                      schedule->final_visual_tokens,
                                      cpu_visible_workspace,
@@ -5171,7 +5398,7 @@ int uocr_metal_context_diagnostic_encode_sam_features_f16(uocr_metal_context *ct
     }
 
     uocr_metal_vision_workspace scratch;
-    if (!metal_vision_workspace_init(ctx, &scratch, expected_size, 0u, 0u, 1, error, error_size)) {
+    if (!metal_vision_workspace_init(ctx, &scratch, expected_size, 1u, 0u, 0u, 1, error, error_size)) {
         return 0;
     }
 
@@ -5185,6 +5412,9 @@ int uocr_metal_context_diagnostic_encode_sam_features_f16(uocr_metal_context *ct
     uint32_t actual_grid_h = 0u;
     const int ok = metal_encode_one_view_sam_features_f16(&project,
                                                           view,
+                                                          (uocr_metal_vision_workspace_slice){0},
+                                                          0u,
+                                                          0u,
                                                           scratch.sam_net3_nchw,
                                                           &actual_grid_w,
                                                           &actual_grid_h,
@@ -5258,7 +5488,7 @@ int uocr_metal_context_diagnostic_encode_clip_features_f16(uocr_metal_context *c
     }
 
     uocr_metal_vision_workspace scratch;
-    if (!metal_vision_workspace_init(ctx, &scratch, expected_size, 0u, 0u, 1, error, error_size)) {
+    if (!metal_vision_workspace_init(ctx, &scratch, expected_size, 1u, 0u, 0u, 1, error, error_size)) {
         return 0;
     }
 
@@ -5273,6 +5503,9 @@ int uocr_metal_context_diagnostic_encode_clip_features_f16(uocr_metal_context *c
     uint32_t actual_grid_h = 0u;
     const int ok = metal_encode_one_view_clip_features_f16(&project,
                                                            view,
+                                                           (uocr_metal_vision_workspace_slice){0},
+                                                           0u,
+                                                           0u,
                                                            scratch.clip_final,
                                                            &actual_tokens,
                                                            &actual_grid_w,
@@ -5349,7 +5582,7 @@ int uocr_metal_context_diagnostic_encode_projected_features_f16(uocr_metal_conte
     }
 
     uocr_metal_vision_workspace scratch;
-    if (!metal_vision_workspace_init(ctx, &scratch, expected_size, expected_rows, 0u, 1, error, error_size)) {
+    if (!metal_vision_workspace_init(ctx, &scratch, expected_size, 1u, expected_rows, 0u, 1, error, error_size)) {
         return 0;
     }
 
@@ -5361,6 +5594,9 @@ int uocr_metal_context_diagnostic_encode_projected_features_f16(uocr_metal_conte
 
     const int ok = metal_encode_one_view_projected_f16(&project,
                                                        view,
+                                                       (uocr_metal_vision_workspace_slice){0},
+                                                       0u,
+                                                       0u,
                                                        scratch.projected_rows,
                                                        error,
                                                        error_size);

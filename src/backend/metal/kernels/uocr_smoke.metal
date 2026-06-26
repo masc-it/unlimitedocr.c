@@ -356,14 +356,16 @@ kernel void uocr_sam_patch_embed_f16_input(device const half *pixels [[buffer(0)
                                            device half *dst_bhwc [[buffer(3)]],
                                            constant UocrSamPatchEmbedParams &params [[buffer(4)]],
                                            threadgroup float *partials [[threadgroup(0)]],
-                                           uint2 block [[threadgroup_position_in_grid]],
-                                           uint2 tid2 [[thread_position_in_threadgroup]],
-                                           uint2 ntg2 [[threads_per_threadgroup]]) {
-    const uint tid = tid2.x;
-    const uint ntg = ntg2.x;
+                                           uint3 block [[threadgroup_position_in_grid]],
+                                           uint3 tid3 [[thread_position_in_threadgroup]],
+                                           uint3 ntg3 [[threads_per_threadgroup]]) {
+    const uint tid = tid3.x;
+    const uint ntg = ntg3.x;
     const uint out_channel = block.x;
     const uint patch_index = block.y;
-    if (out_channel >= 768u || patch_index >= params.out_width * params.out_height) {
+    const uint batch_index = block.z;
+    const uint patch_count = params.out_width * params.out_height;
+    if (out_channel >= 768u || patch_index >= patch_count) {
         return;
     }
 
@@ -378,7 +380,9 @@ kernel void uocr_sam_patch_embed_f16_input(device const half *pixels [[buffer(0)
         const uint rem = linear - c * 16u * 16u;
         const uint ky = rem / 16u;
         const uint kx = rem - ky * 16u;
-        const uint pixel_index = c * params.height * params.width + (input_y0 + ky) * params.width + input_x0 + kx;
+        const uint pixel_index = batch_index * (3u * params.height * params.width) +
+                                 c * params.height * params.width +
+                                 (input_y0 + ky) * params.width + input_x0 + kx;
         const float x = float(pixels[pixel_index]);
         const float w = float(weight[uocr_sam_patch_weight_index(out_channel, c, ky, kx)]);
         acc += x * w;
@@ -394,7 +398,7 @@ kernel void uocr_sam_patch_embed_f16_input(device const half *pixels [[buffer(0)
     }
     if (tid == 0u) {
         const float value = partials[0] + (params.has_bias != 0u ? float(bias[out_channel]) : 0.0f);
-        dst_bhwc[patch_index * 768u + out_channel] = half(value);
+        dst_bhwc[(batch_index * patch_count + patch_index) * 768u + out_channel] = half(value);
     }
 }
 
@@ -404,14 +408,16 @@ kernel void uocr_sam_patch_embed_f32_input(device const float *pixels [[buffer(0
                                            device half *dst_bhwc [[buffer(3)]],
                                            constant UocrSamPatchEmbedParams &params [[buffer(4)]],
                                            threadgroup float *partials [[threadgroup(0)]],
-                                           uint2 block [[threadgroup_position_in_grid]],
-                                           uint2 tid2 [[thread_position_in_threadgroup]],
-                                           uint2 ntg2 [[threads_per_threadgroup]]) {
-    const uint tid = tid2.x;
-    const uint ntg = ntg2.x;
+                                           uint3 block [[threadgroup_position_in_grid]],
+                                           uint3 tid3 [[thread_position_in_threadgroup]],
+                                           uint3 ntg3 [[threads_per_threadgroup]]) {
+    const uint tid = tid3.x;
+    const uint ntg = ntg3.x;
     const uint out_channel = block.x;
     const uint patch_index = block.y;
-    if (out_channel >= 768u || patch_index >= params.out_width * params.out_height) {
+    const uint batch_index = block.z;
+    const uint patch_count = params.out_width * params.out_height;
+    if (out_channel >= 768u || patch_index >= patch_count) {
         return;
     }
 
@@ -426,7 +432,9 @@ kernel void uocr_sam_patch_embed_f32_input(device const float *pixels [[buffer(0
         const uint rem = linear - c * 16u * 16u;
         const uint ky = rem / 16u;
         const uint kx = rem - ky * 16u;
-        const uint pixel_index = c * params.height * params.width + (input_y0 + ky) * params.width + input_x0 + kx;
+        const uint pixel_index = batch_index * (3u * params.height * params.width) +
+                                 c * params.height * params.width +
+                                 (input_y0 + ky) * params.width + input_x0 + kx;
         const float x = pixels[pixel_index];
         const float w = float(weight[uocr_sam_patch_weight_index(out_channel, c, ky, kx)]);
         acc += x * w;
@@ -442,7 +450,7 @@ kernel void uocr_sam_patch_embed_f32_input(device const float *pixels [[buffer(0
     }
     if (tid == 0u) {
         const float value = partials[0] + (params.has_bias != 0u ? float(bias[out_channel]) : 0.0f);
-        dst_bhwc[patch_index * 768u + out_channel] = half(value);
+        dst_bhwc[(batch_index * patch_count + patch_index) * 768u + out_channel] = half(value);
     }
 }
 
