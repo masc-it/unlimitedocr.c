@@ -102,10 +102,10 @@ def _bind_internal_metal_symbols(lib: ct.CDLL) -> None:
         lib.uocr_metal_context_create
         lib.uocr_metal_context_destroy
         lib.uocr_metal_context_map_model
-        lib.uocr_metal_context_encode_visual_features_f16
-        lib.uocr_metal_context_encode_sam_features_f16
-        lib.uocr_metal_context_encode_clip_features_f16
-        lib.uocr_metal_context_encode_projected_features_f16
+        lib.uocr_metal_context_diagnostic_encode_visual_features_f16
+        lib.uocr_metal_context_diagnostic_encode_sam_features_f16
+        lib.uocr_metal_context_diagnostic_encode_clip_features_f16
+        lib.uocr_metal_context_diagnostic_encode_projected_features_f16
     except AttributeError as exc:
         pytest.skip(f"Metal/internal model-file symbols are unavailable in this build: {exc}")
 
@@ -121,7 +121,7 @@ def _bind_internal_metal_symbols(lib: ct.CDLL) -> None:
     lib.uocr_metal_context_destroy.restype = None
     lib.uocr_metal_context_map_model.argtypes = [ct.c_void_p, ct.POINTER(CModelFile), ct.c_char_p, ct.c_size_t]
     lib.uocr_metal_context_map_model.restype = ct.c_int
-    lib.uocr_metal_context_encode_visual_features_f16.argtypes = [
+    lib.uocr_metal_context_diagnostic_encode_visual_features_f16.argtypes = [
         ct.c_void_p,
         ct.POINTER(CPreparedRequest),
         ct.c_uint32,
@@ -130,8 +130,8 @@ def _bind_internal_metal_symbols(lib: ct.CDLL) -> None:
         ct.c_char_p,
         ct.c_size_t,
     ]
-    lib.uocr_metal_context_encode_visual_features_f16.restype = ct.c_int
-    lib.uocr_metal_context_encode_sam_features_f16.argtypes = [
+    lib.uocr_metal_context_diagnostic_encode_visual_features_f16.restype = ct.c_int
+    lib.uocr_metal_context_diagnostic_encode_sam_features_f16.argtypes = [
         ct.c_void_p,
         ct.POINTER(CImageView),
         ct.POINTER(ct.c_uint16),
@@ -140,8 +140,8 @@ def _bind_internal_metal_symbols(lib: ct.CDLL) -> None:
         ct.c_char_p,
         ct.c_size_t,
     ]
-    lib.uocr_metal_context_encode_sam_features_f16.restype = ct.c_int
-    lib.uocr_metal_context_encode_clip_features_f16.argtypes = [
+    lib.uocr_metal_context_diagnostic_encode_sam_features_f16.restype = ct.c_int
+    lib.uocr_metal_context_diagnostic_encode_clip_features_f16.argtypes = [
         ct.c_void_p,
         ct.POINTER(CImageView),
         ct.POINTER(ct.c_uint16),
@@ -149,8 +149,8 @@ def _bind_internal_metal_symbols(lib: ct.CDLL) -> None:
         ct.c_char_p,
         ct.c_size_t,
     ]
-    lib.uocr_metal_context_encode_clip_features_f16.restype = ct.c_int
-    lib.uocr_metal_context_encode_projected_features_f16.argtypes = [
+    lib.uocr_metal_context_diagnostic_encode_clip_features_f16.restype = ct.c_int
+    lib.uocr_metal_context_diagnostic_encode_projected_features_f16.argtypes = [
         ct.c_void_p,
         ct.POINTER(CImageView),
         ct.POINTER(ct.c_uint16),
@@ -158,7 +158,7 @@ def _bind_internal_metal_symbols(lib: ct.CDLL) -> None:
         ct.c_char_p,
         ct.c_size_t,
     ]
-    lib.uocr_metal_context_encode_projected_features_f16.restype = ct.c_int
+    lib.uocr_metal_context_diagnostic_encode_projected_features_f16.restype = ct.c_int
 
 
 def _require_large_metal_inputs() -> tuple[str, str]:
@@ -306,7 +306,7 @@ def _encode_metal_visual_features(
         rows = int(request.expected_visual_tokens)
         out = np.empty((rows, HIDDEN_SIZE), dtype=np.dtype("<u2"))
         keepalive = as_c_request(request)
-        ok = lib.uocr_metal_context_encode_visual_features_f16(
+        ok = lib.uocr_metal_context_diagnostic_encode_visual_features_f16(
             ctx,
             ct.byref(keepalive.c_request),
             ct.c_uint32(max_views_per_chunk),
@@ -317,7 +317,7 @@ def _encode_metal_visual_features(
         )
         if ok != 1:
             pytest.fail(
-                "uocr_metal_context_encode_visual_features_f16 failed: "
+                "uocr_metal_context_diagnostic_encode_visual_features_f16 failed: "
                 + error.value.decode("utf-8", errors="replace")
             )
         return out
@@ -359,7 +359,7 @@ def _encode_metal_sam_features(
         out = np.empty((SAM_FEATURE_CHANNELS, grid_size, grid_size), dtype=np.dtype("<u2"))
         keepalive = as_c_request(request)
         assert keepalive.c_views is not None
-        ok = lib.uocr_metal_context_encode_sam_features_f16(
+        ok = lib.uocr_metal_context_diagnostic_encode_sam_features_f16(
             ctx,
             ct.byref(keepalive.c_views[view_index]),
             out.ctypes.data_as(ct.POINTER(ct.c_uint16)),
@@ -370,7 +370,7 @@ def _encode_metal_sam_features(
         )
         if ok != 1:
             pytest.fail(
-                "uocr_metal_context_encode_sam_features_f16 failed: "
+                "uocr_metal_context_diagnostic_encode_sam_features_f16 failed: "
                 + error.value.decode("utf-8", errors="replace")
             )
         return out
@@ -412,7 +412,7 @@ def _encode_metal_clip_features(
         out = np.empty((token_count, CLIP_HIDDEN_SIZE), dtype=np.dtype("<u2"))
         keepalive = as_c_request(request)
         assert keepalive.c_views is not None
-        ok = lib.uocr_metal_context_encode_clip_features_f16(
+        ok = lib.uocr_metal_context_diagnostic_encode_clip_features_f16(
             ctx,
             ct.byref(keepalive.c_views[view_index]),
             out.ctypes.data_as(ct.POINTER(ct.c_uint16)),
@@ -422,7 +422,7 @@ def _encode_metal_clip_features(
         )
         if ok != 1:
             pytest.fail(
-                "uocr_metal_context_encode_clip_features_f16 failed: "
+                "uocr_metal_context_diagnostic_encode_clip_features_f16 failed: "
                 + error.value.decode("utf-8", errors="replace")
             )
         return out
@@ -464,7 +464,7 @@ def _encode_metal_projected_features(
         out = np.empty((row_count, HIDDEN_SIZE), dtype=np.dtype("<u2"))
         keepalive = as_c_request(request)
         assert keepalive.c_views is not None
-        ok = lib.uocr_metal_context_encode_projected_features_f16(
+        ok = lib.uocr_metal_context_diagnostic_encode_projected_features_f16(
             ctx,
             ct.byref(keepalive.c_views[view_index]),
             out.ctypes.data_as(ct.POINTER(ct.c_uint16)),
@@ -474,7 +474,7 @@ def _encode_metal_projected_features(
         )
         if ok != 1:
             pytest.fail(
-                "uocr_metal_context_encode_projected_features_f16 failed: "
+                "uocr_metal_context_diagnostic_encode_projected_features_f16 failed: "
                 + error.value.decode("utf-8", errors="replace")
             )
         return out

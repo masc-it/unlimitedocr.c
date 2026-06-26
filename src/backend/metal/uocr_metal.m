@@ -3771,7 +3771,7 @@ static int metal_context_sam_patch_embed_f16_to_slice(uocr_metal_context *ctx,
         !metal_vision_require_tensor_slice_f16(patch_bias, bias_bytes, "SAM patch bias", error, error_size)) {
         return 0;
     }
-    return uocr_metal_context_sam_patch_embed_f16(ctx,
+    return uocr_metal_context_diagnostic_sam_patch_embed_f16(ctx,
                                                   view->pixels,
                                                   view->format,
                                                   view->width,
@@ -3807,7 +3807,7 @@ static int metal_context_sam_add_abs_pos_f16_to_slice(uocr_metal_context *ctx,
         !metal_vision_require_tensor_slice_f16(pos_embed, pos_bytes, "SAM abs-pos table", error, error_size)) {
         return 0;
     }
-    return uocr_metal_context_sam_add_abs_pos_f16(ctx,
+    return uocr_metal_context_diagnostic_sam_add_abs_pos_f16(ctx,
                                                   patch_bhwc.f16,
                                                   pos_embed.host_f16,
                                                   grid_w,
@@ -3868,7 +3868,7 @@ static int metal_context_sam_neck_conv1x1_f16_to_slice(uocr_metal_context *ctx,
         !metal_vision_require_tensor_slice_f16(weight, weight_bytes, "SAM neck 1x1 weight", error, error_size)) {
         return 0;
     }
-    return uocr_metal_context_sam_neck_conv1x1_f16(ctx,
+    return uocr_metal_context_diagnostic_sam_neck_conv1x1_f16(ctx,
                                                    input_bhwc.f16,
                                                    weight.host_f16,
                                                    grid_w,
@@ -3899,7 +3899,7 @@ static int metal_context_sam_layernorm2d_f16_to_slice(uocr_metal_context *ctx,
         !metal_vision_require_tensor_slice_f16(bias, parameter_bytes, "SAM LayerNorm2d bias", error, error_size)) {
         return 0;
     }
-    return uocr_metal_context_sam_layernorm2d_f16(ctx,
+    return uocr_metal_context_diagnostic_sam_layernorm2d_f16(ctx,
                                                   input_nchw.f16,
                                                   weight.host_f16,
                                                   bias.host_f16,
@@ -3930,7 +3930,7 @@ static int metal_context_sam_neck_conv3x3_f16_to_slice(uocr_metal_context *ctx,
         !metal_vision_require_tensor_slice_f16(weight, weight_bytes, "SAM neck 3x3 weight", error, error_size)) {
         return 0;
     }
-    return uocr_metal_context_sam_neck_conv3x3_f16(ctx,
+    return uocr_metal_context_diagnostic_sam_neck_conv3x3_f16(ctx,
                                                    input_nchw.f16,
                                                    weight.host_f16,
                                                    grid_w,
@@ -3970,7 +3970,7 @@ static int metal_context_sam_stride2_conv_f16_to_slice(uocr_metal_context *ctx,
         return 0;
     }
     if (net3) {
-        return uocr_metal_context_sam_net3_conv3x3_stride2_f16(ctx,
+        return uocr_metal_context_diagnostic_sam_net3_conv3x3_stride2_f16(ctx,
                                                                input_nchw.f16,
                                                                weight.host_f16,
                                                                grid_w,
@@ -3980,7 +3980,7 @@ static int metal_context_sam_stride2_conv_f16_to_slice(uocr_metal_context *ctx,
                                                                error,
                                                                error_size);
     }
-    return uocr_metal_context_sam_net2_conv3x3_stride2_f16(ctx,
+    return uocr_metal_context_diagnostic_sam_net2_conv3x3_stride2_f16(ctx,
                                                            input_nchw.f16,
                                                            weight.host_f16,
                                                            grid_w,
@@ -4017,7 +4017,7 @@ static int metal_context_clip_embed_sam_f16_to_slice(uocr_metal_context *ctx,
         !metal_vision_require_tensor_slice_f16(class_embedding, class_bytes, "CLIP class embedding", error, error_size)) {
         return 0;
     }
-    return uocr_metal_context_clip_embed_sam_f16(ctx,
+    return uocr_metal_context_diagnostic_clip_embed_sam_f16(ctx,
                                                  sam_nchw.f16,
                                                  class_embedding.host_f16,
                                                  grid_w,
@@ -4050,7 +4050,7 @@ static int metal_context_clip_add_abs_pos_f16_to_slice(uocr_metal_context *ctx,
         !metal_vision_require_tensor_slice_f16(pos_embed, pos_bytes, "CLIP abs-pos table", error, error_size)) {
         return 0;
     }
-    return uocr_metal_context_clip_add_abs_pos_f16(ctx,
+    return uocr_metal_context_diagnostic_clip_add_abs_pos_f16(ctx,
                                                    tokens.f16,
                                                    pos_embed.host_f16,
                                                    grid_w,
@@ -4080,7 +4080,7 @@ static int metal_context_clip_pre_layernorm_f16_to_slice(uocr_metal_context *ctx
         !metal_vision_require_tensor_slice_f16(bias, parameter_bytes, "CLIP pre-LayerNorm bias", error, error_size)) {
         return 0;
     }
-    return uocr_metal_context_clip_pre_layernorm_f16(ctx,
+    return uocr_metal_context_diagnostic_clip_pre_layernorm_f16(ctx,
                                                      input_tokens.f16,
                                                      weight.host_f16,
                                                      bias.host_f16,
@@ -4149,7 +4149,7 @@ static int metal_context_clip_sam_concat_f16_to_slice(uocr_metal_context *ctx,
         !metal_vision_require_workspace_slice_f16(out_concat, output_bytes, "CLIP/SAM concat output", error, error_size)) {
         return 0;
     }
-    return uocr_metal_context_clip_sam_concat_f16(ctx,
+    return uocr_metal_context_diagnostic_clip_sam_concat_f16(ctx,
                                                   clip_tokens.f16,
                                                   sam_nchw.f16,
                                                   grid_w,
@@ -4184,7 +4184,7 @@ static int metal_context_visual_projector_f16_to_slice(uocr_metal_context *ctx,
         !metal_vision_require_tensor_slice_f16(bias, bias_bytes, "visual projector bias", error, error_size)) {
         return 0;
     }
-    return uocr_metal_context_visual_projector_f16(ctx,
+    return uocr_metal_context_diagnostic_visual_projector_f16(ctx,
                                                    input.f16,
                                                    weight.host_f16,
                                                    bias.host_f16,
@@ -5007,7 +5007,7 @@ static int metal_context_encode_visual_features_to_workspace_f16(uocr_metal_cont
  * buffers for parity probes only; profile markers make accidental production
  * use visible.
  */
-int uocr_metal_context_encode_visual_features_f16(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_encode_visual_features_f16(uocr_metal_context *ctx,
                                                   const uocr_prepared_request *request,
                                                   uint32_t max_views_per_chunk,
                                                   uint16_t *out_visual_features_f16,
@@ -5076,7 +5076,7 @@ int uocr_metal_context_encode_visual_features_f16(uocr_metal_context *ctx,
     return 1;
 }
 
-int uocr_metal_context_encode_sam_features_f16(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_encode_sam_features_f16(uocr_metal_context *ctx,
                                                const uocr_image_view *view,
                                                uint16_t *out_sam_features_f16,
                                                uint32_t out_grid_w,
@@ -5165,7 +5165,7 @@ int uocr_metal_context_encode_sam_features_f16(uocr_metal_context *ctx,
     return 1;
 }
 
-int uocr_metal_context_encode_clip_features_f16(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_encode_clip_features_f16(uocr_metal_context *ctx,
                                                 const uocr_image_view *view,
                                                 uint16_t *out_clip_features_f16,
                                                 uint32_t out_token_count,
@@ -5256,7 +5256,7 @@ int uocr_metal_context_encode_clip_features_f16(uocr_metal_context *ctx,
     return 1;
 }
 
-int uocr_metal_context_encode_projected_features_f16(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_encode_projected_features_f16(uocr_metal_context *ctx,
                                                      const uocr_image_view *view,
                                                      uint16_t *out_projected_features_f16,
                                                      uint32_t out_projected_rows,
@@ -10822,7 +10822,7 @@ int uocr_metal_context_generate_image_f16(uocr_metal_context *ctx,
     return ok;
 }
 
-int uocr_metal_context_get_rows_f16(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_get_rows_f16(uocr_metal_context *ctx,
                                     const uint16_t *table_f16,
                                     uint32_t table_rows,
                                     uint32_t row_width,
@@ -10965,7 +10965,7 @@ int uocr_metal_context_get_rows_f16(uocr_metal_context *ctx,
     return 1;
 }
 
-int uocr_metal_context_get_rows_q8_0(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_get_rows_q8_0(uocr_metal_context *ctx,
                                      const void *table_q8_0,
                                      uint32_t table_rows,
                                      uint32_t logical_width,
@@ -11514,7 +11514,7 @@ static int metal_context_assemble_prompt_f16_with_table_buffer(uocr_metal_contex
     }
 }
 
-int uocr_metal_context_assemble_prompt_f16(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_assemble_prompt_f16(uocr_metal_context *ctx,
                                            const uint16_t *embedding_table_f16,
                                            uint32_t table_rows,
                                            uint32_t hidden_size,
@@ -11614,7 +11614,7 @@ int uocr_metal_context_assemble_prompt_from_model_f16(uocr_metal_context *ctx,
                                                                error_size);
 }
 
-int uocr_metal_context_sam_patch_embed_f16(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_sam_patch_embed_f16(uocr_metal_context *ctx,
                                            const void *pixels,
                                            uocr_pixel_format pixel_format,
                                            uint32_t width,
@@ -11813,7 +11813,7 @@ int uocr_metal_context_sam_patch_embed_f16(uocr_metal_context *ctx,
     }
 }
 
-int uocr_metal_context_sam_add_abs_pos_f16(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_sam_add_abs_pos_f16(uocr_metal_context *ctx,
                                            const uint16_t *patch_bhwc_f16,
                                            const uint16_t *pos_embed_f16,
                                            uint32_t grid_w,
@@ -12415,7 +12415,7 @@ static int metal_context_rmsnorm_f16_with_weight_buffer(uocr_metal_context *ctx,
     return 1;
 }
 
-int uocr_metal_context_rmsnorm_f16(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_rmsnorm_f16(uocr_metal_context *ctx,
                                    const uint16_t *input_f16,
                                    const uint16_t *weight_f16,
                                    uint32_t n_rows,
@@ -12625,7 +12625,7 @@ static int metal_context_layernorm_f16_with_parameter_buffers(uocr_metal_context
     return 1;
 }
 
-int uocr_metal_context_sam_layernorm_f16(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_sam_layernorm_f16(uocr_metal_context *ctx,
                                          const uint16_t *input_f16,
                                          const uint16_t *weight_f16,
                                          const uint16_t *bias_f16,
@@ -12692,7 +12692,7 @@ int uocr_metal_context_sam_layernorm_f16(uocr_metal_context *ctx,
     }
 }
 
-int uocr_metal_context_sam_qkv_f16(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_sam_qkv_f16(uocr_metal_context *ctx,
                                    const uint16_t *input_f16,
                                    const uint16_t *qkv_weight_f16,
                                    const uint16_t *qkv_bias_f16,
@@ -13003,7 +13003,7 @@ static int sam_window_partition_geometry(uint32_t grid_w,
     return 1;
 }
 
-int uocr_metal_context_sam_window_partition_f16(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_sam_window_partition_f16(uocr_metal_context *ctx,
                                                 const uint16_t *input_bhwc_f16,
                                                 uint32_t grid_w,
                                                 uint32_t grid_h,
@@ -13166,7 +13166,7 @@ int uocr_metal_context_sam_window_partition_f16(uocr_metal_context *ctx,
     return result;
 }
 
-int uocr_metal_context_sam_window_unpartition_f16(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_sam_window_unpartition_f16(uocr_metal_context *ctx,
                                                   const uint16_t *windows_f16,
                                                   uint32_t grid_w,
                                                   uint32_t grid_h,
@@ -13325,7 +13325,7 @@ int uocr_metal_context_sam_window_unpartition_f16(uocr_metal_context *ctx,
     return result;
 }
 
-int uocr_metal_context_sam_neck_conv1x1_f16(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_sam_neck_conv1x1_f16(uocr_metal_context *ctx,
                                             const uint16_t *input_bhwc_f16,
                                             const uint16_t *weight_f16,
                                             uint32_t grid_w,
@@ -13484,7 +13484,7 @@ int uocr_metal_context_sam_neck_conv1x1_f16(uocr_metal_context *ctx,
     return result;
 }
 
-int uocr_metal_context_sam_neck_conv3x3_f16(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_sam_neck_conv3x3_f16(uocr_metal_context *ctx,
                                             const uint16_t *input_nchw_f16,
                                             const uint16_t *weight_f16,
                                             uint32_t grid_w,
@@ -13644,7 +13644,7 @@ int uocr_metal_context_sam_neck_conv3x3_f16(uocr_metal_context *ctx,
     return result;
 }
 
-int uocr_metal_context_sam_layernorm2d_f16(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_sam_layernorm2d_f16(uocr_metal_context *ctx,
                                            const uint16_t *input_nchw_f16,
                                            const uint16_t *weight_f16,
                                            const uint16_t *bias_f16,
@@ -14007,7 +14007,7 @@ static int metal_context_sam_conv3x3_stride2_nchw_f16(uocr_metal_context *ctx,
     return result;
 }
 
-int uocr_metal_context_sam_net2_conv3x3_stride2_f16(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_sam_net2_conv3x3_stride2_f16(uocr_metal_context *ctx,
                                                     const uint16_t *input_nchw_f16,
                                                     const uint16_t *weight_f16,
                                                     uint32_t grid_w,
@@ -14034,7 +14034,7 @@ int uocr_metal_context_sam_net2_conv3x3_stride2_f16(uocr_metal_context *ctx,
                                                       error_size);
 }
 
-int uocr_metal_context_sam_net3_conv3x3_stride2_f16(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_sam_net3_conv3x3_stride2_f16(uocr_metal_context *ctx,
                                                     const uint16_t *input_nchw_f16,
                                                     const uint16_t *weight_f16,
                                                     uint32_t grid_w,
@@ -14062,7 +14062,7 @@ int uocr_metal_context_sam_net3_conv3x3_stride2_f16(uocr_metal_context *ctx,
                                                       error_size);
 }
 
-int uocr_metal_context_clip_embed_sam_f16(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_clip_embed_sam_f16(uocr_metal_context *ctx,
                                           const uint16_t *sam_nchw_f16,
                                           const uint16_t *class_embedding_f16,
                                           uint32_t grid_w,
@@ -14225,7 +14225,7 @@ int uocr_metal_context_clip_embed_sam_f16(uocr_metal_context *ctx,
     return result;
 }
 
-int uocr_metal_context_clip_add_abs_pos_f16(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_clip_add_abs_pos_f16(uocr_metal_context *ctx,
                                             const uint16_t *tokens_f16,
                                             const uint16_t *pos_embed_f16,
                                             uint32_t grid_w,
@@ -14465,7 +14465,7 @@ static int metal_context_clip_token_layernorm_f16(uocr_metal_context *ctx,
     }
 }
 
-int uocr_metal_context_clip_pre_layernorm_f16(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_clip_pre_layernorm_f16(uocr_metal_context *ctx,
                                               const uint16_t *input_f16,
                                               const uint16_t *weight_f16,
                                               const uint16_t *bias_f16,
@@ -14490,7 +14490,7 @@ int uocr_metal_context_clip_pre_layernorm_f16(uocr_metal_context *ctx,
                                                   error_size);
 }
 
-int uocr_metal_context_clip_layernorm_f16(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_clip_layernorm_f16(uocr_metal_context *ctx,
                                           const uint16_t *input_f16,
                                           const uint16_t *weight_f16,
                                           const uint16_t *bias_f16,
@@ -14515,7 +14515,7 @@ int uocr_metal_context_clip_layernorm_f16(uocr_metal_context *ctx,
                                                   error_size);
 }
 
-int uocr_metal_context_clip_qkv_f16(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_clip_qkv_f16(uocr_metal_context *ctx,
                                     const uint16_t *input_f16,
                                     const uint16_t *qkv_weight_f16,
                                     const uint16_t *qkv_bias_f16,
@@ -14772,7 +14772,7 @@ int uocr_metal_context_clip_qkv_f16(uocr_metal_context *ctx,
     return result;
 }
 
-int uocr_metal_context_clip_attention_f16(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_clip_attention_f16(uocr_metal_context *ctx,
                                           const uint16_t *q_f16,
                                           const uint16_t *k_f16,
                                           const uint16_t *v_f16,
@@ -14951,7 +14951,7 @@ int uocr_metal_context_clip_attention_f16(uocr_metal_context *ctx,
     return result;
 }
 
-int uocr_metal_context_clip_output_projection_f16(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_clip_output_projection_f16(uocr_metal_context *ctx,
                                                   const uint16_t *input_f16,
                                                   const uint16_t *weight_f16,
                                                   const uint16_t *bias_f16,
@@ -14977,7 +14977,7 @@ int uocr_metal_context_clip_output_projection_f16(uocr_metal_context *ctx,
         return metal_fail(error, error_size, "Metal CLIP output projection constants are inconsistent");
     }
 
-    if (!uocr_metal_context_dense_f16(ctx,
+    if (!uocr_metal_context_diagnostic_dense_f16(ctx,
                                       input_f16,
                                       weight_f16,
                                       bias_f16,
@@ -15000,7 +15000,7 @@ int uocr_metal_context_clip_output_projection_f16(uocr_metal_context *ctx,
     return 1;
 }
 
-int uocr_metal_context_clip_quickgelu_f16(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_clip_quickgelu_f16(uocr_metal_context *ctx,
                                           const uint16_t *input_f16,
                                           uint32_t token_count,
                                           uocr_metal_dense_output_type output_type,
@@ -15128,7 +15128,7 @@ int uocr_metal_context_clip_quickgelu_f16(uocr_metal_context *ctx,
     return result;
 }
 
-int uocr_metal_context_clip_mlp_f16(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_clip_mlp_f16(uocr_metal_context *ctx,
                                     const uint16_t *input_f16,
                                     const uint16_t *fc1_weight_f16,
                                     const uint16_t *fc1_bias_f16,
@@ -15212,7 +15212,7 @@ int uocr_metal_context_clip_mlp_f16(uocr_metal_context *ctx,
         goto cleanup_clip_mlp;
     }
 
-    if (!uocr_metal_context_dense_f16(ctx,
+    if (!uocr_metal_context_diagnostic_dense_f16(ctx,
                                       input_f16,
                                       fc1_weight_f16,
                                       fc1_bias_f16,
@@ -15232,7 +15232,7 @@ int uocr_metal_context_clip_mlp_f16(uocr_metal_context *ctx,
         goto cleanup_clip_mlp;
     }
 
-    if (!uocr_metal_context_clip_quickgelu_f16(ctx,
+    if (!uocr_metal_context_diagnostic_clip_quickgelu_f16(ctx,
                                                fc1_out_f16,
                                                token_count,
                                                UOCR_METAL_DENSE_OUTPUT_F16,
@@ -15248,7 +15248,7 @@ int uocr_metal_context_clip_mlp_f16(uocr_metal_context *ctx,
         goto cleanup_clip_mlp;
     }
 
-    if (!uocr_metal_context_dense_f16(ctx,
+    if (!uocr_metal_context_diagnostic_dense_f16(ctx,
                                       activated_f16,
                                       fc2_weight_f16,
                                       fc2_bias_f16,
@@ -15280,7 +15280,7 @@ cleanup_clip_mlp:
     return result;
 }
 
-int uocr_metal_context_clip_residual_add_f16(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_clip_residual_add_f16(uocr_metal_context *ctx,
                                              const uint16_t *base_f16,
                                              const uint16_t *update_f16,
                                              uint32_t token_count,
@@ -15459,7 +15459,7 @@ static int metal_clip_transformer_activation_bytes(uint32_t token_count,
     return 1;
 }
 
-int uocr_metal_context_clip_transformer_block_f16(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_clip_transformer_block_f16(uocr_metal_context *ctx,
                                                   const uint16_t *input_f16,
                                                   const uocr_metal_clip_transformer_block_f16 *block,
                                                   uint32_t token_count,
@@ -15525,7 +15525,7 @@ int uocr_metal_context_clip_transformer_block_f16(uocr_metal_context *ctx,
     } while (0)
 
     RUN_CLIP_BLOCK_STEP("LayerNorm1",
-                        uocr_metal_context_clip_layernorm_f16(ctx,
+                        uocr_metal_context_diagnostic_clip_layernorm_f16(ctx,
                                                               input_f16,
                                                               block->ln1_weight_f16,
                                                               block->ln1_bias_f16,
@@ -15535,7 +15535,7 @@ int uocr_metal_context_clip_transformer_block_f16(uocr_metal_context *ctx,
                                                               error,
                                                               error_size));
     RUN_CLIP_BLOCK_STEP("QKV",
-                        uocr_metal_context_clip_qkv_f16(ctx,
+                        uocr_metal_context_diagnostic_clip_qkv_f16(ctx,
                                                          norm1_f16,
                                                          block->qkv_weight_f16,
                                                          block->qkv_bias_f16,
@@ -15547,7 +15547,7 @@ int uocr_metal_context_clip_transformer_block_f16(uocr_metal_context *ctx,
                                                          error,
                                                          error_size));
     RUN_CLIP_BLOCK_STEP("attention",
-                        uocr_metal_context_clip_attention_f16(ctx,
+                        uocr_metal_context_diagnostic_clip_attention_f16(ctx,
                                                               q_f16,
                                                               k_f16,
                                                               v_f16,
@@ -15557,7 +15557,7 @@ int uocr_metal_context_clip_transformer_block_f16(uocr_metal_context *ctx,
                                                               error,
                                                               error_size));
     RUN_CLIP_BLOCK_STEP("output projection",
-                        uocr_metal_context_clip_output_projection_f16(ctx,
+                        uocr_metal_context_diagnostic_clip_output_projection_f16(ctx,
                                                                       attention_f16,
                                                                       block->out_proj_weight_f16,
                                                                       block->out_proj_bias_f16,
@@ -15567,7 +15567,7 @@ int uocr_metal_context_clip_transformer_block_f16(uocr_metal_context *ctx,
                                                                       error,
                                                                       error_size));
     RUN_CLIP_BLOCK_STEP("attention residual",
-                        uocr_metal_context_clip_residual_add_f16(ctx,
+                        uocr_metal_context_diagnostic_clip_residual_add_f16(ctx,
                                                                  input_f16,
                                                                  projected_f16,
                                                                  token_count,
@@ -15576,7 +15576,7 @@ int uocr_metal_context_clip_transformer_block_f16(uocr_metal_context *ctx,
                                                                  error,
                                                                  error_size));
     RUN_CLIP_BLOCK_STEP("LayerNorm2",
-                        uocr_metal_context_clip_layernorm_f16(ctx,
+                        uocr_metal_context_diagnostic_clip_layernorm_f16(ctx,
                                                               residual1_f16,
                                                               block->ln2_weight_f16,
                                                               block->ln2_bias_f16,
@@ -15586,7 +15586,7 @@ int uocr_metal_context_clip_transformer_block_f16(uocr_metal_context *ctx,
                                                               error,
                                                               error_size));
     RUN_CLIP_BLOCK_STEP("MLP",
-                        uocr_metal_context_clip_mlp_f16(ctx,
+                        uocr_metal_context_diagnostic_clip_mlp_f16(ctx,
                                                         norm2_f16,
                                                         block->mlp_fc1_weight_f16,
                                                         block->mlp_fc1_bias_f16,
@@ -15598,7 +15598,7 @@ int uocr_metal_context_clip_transformer_block_f16(uocr_metal_context *ctx,
                                                         error,
                                                         error_size));
     RUN_CLIP_BLOCK_STEP("MLP residual",
-                        uocr_metal_context_clip_residual_add_f16(ctx,
+                        uocr_metal_context_diagnostic_clip_residual_add_f16(ctx,
                                                                  residual1_f16,
                                                                  mlp_f16,
                                                                  token_count,
@@ -15628,7 +15628,7 @@ cleanup_clip_transformer_block:
     return result;
 }
 
-int uocr_metal_context_clip_transformer_f16(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_clip_transformer_f16(uocr_metal_context *ctx,
                                             const uint16_t *input_f16,
                                             const uocr_metal_clip_transformer_block_f16 *blocks,
                                             uint32_t block_count,
@@ -15685,7 +15685,7 @@ int uocr_metal_context_clip_transformer_f16(uocr_metal_context *ctx,
         const int is_last = block_index + 1u == block_count;
         const uocr_metal_dense_output_type block_output_type = is_last ? output_type : UOCR_METAL_DENSE_OUTPUT_F16;
         void *block_out = is_last ? out : (void *)next_f16;
-        if (!uocr_metal_context_clip_transformer_block_f16(ctx,
+        if (!uocr_metal_context_diagnostic_clip_transformer_block_f16(ctx,
                                                            current_f16,
                                                            &blocks[block_index],
                                                            token_count,
@@ -15786,7 +15786,7 @@ static int metal_context_clip_mlp_workspace_f16(uocr_metal_context *ctx,
         metal_copy_error_detail(detail, sizeof(detail), error);
         return metal_fail(error, error_size, "failed to compute Metal CLIP workspace MLP fused fc1: %s", detail);
     }
-    if (!uocr_metal_context_dense_f16(ctx,
+    if (!uocr_metal_context_diagnostic_dense_f16(ctx,
                                       scratch->clip_mlp_activated.f16,
                                       block->mlp_fc2_weight_f16,
                                       block->mlp_fc2_bias_f16,
@@ -15843,7 +15843,7 @@ static int metal_context_clip_transformer_block_workspace_f16(uocr_metal_context
     } while (0)
 
     RUN_CLIP_WORKSPACE_BLOCK_STEP("LayerNorm1",
-                                  uocr_metal_context_clip_layernorm_f16(ctx,
+                                  uocr_metal_context_diagnostic_clip_layernorm_f16(ctx,
                                                                         input_f16,
                                                                         block->ln1_weight_f16,
                                                                         block->ln1_bias_f16,
@@ -15853,7 +15853,7 @@ static int metal_context_clip_transformer_block_workspace_f16(uocr_metal_context
                                                                         error,
                                                                         error_size));
     RUN_CLIP_WORKSPACE_BLOCK_STEP("QKV",
-                                  uocr_metal_context_clip_qkv_f16(ctx,
+                                  uocr_metal_context_diagnostic_clip_qkv_f16(ctx,
                                                                    scratch->clip_block_norm1.f16,
                                                                    block->qkv_weight_f16,
                                                                    block->qkv_bias_f16,
@@ -15865,7 +15865,7 @@ static int metal_context_clip_transformer_block_workspace_f16(uocr_metal_context
                                                                    error,
                                                                    error_size));
     RUN_CLIP_WORKSPACE_BLOCK_STEP("attention",
-                                  uocr_metal_context_clip_attention_f16(ctx,
+                                  uocr_metal_context_diagnostic_clip_attention_f16(ctx,
                                                                         scratch->clip_block_q.f16,
                                                                         scratch->clip_block_k.f16,
                                                                         scratch->clip_block_v.f16,
@@ -15875,7 +15875,7 @@ static int metal_context_clip_transformer_block_workspace_f16(uocr_metal_context
                                                                         error,
                                                                         error_size));
     RUN_CLIP_WORKSPACE_BLOCK_STEP("output projection",
-                                  uocr_metal_context_clip_output_projection_f16(ctx,
+                                  uocr_metal_context_diagnostic_clip_output_projection_f16(ctx,
                                                                                 scratch->clip_block_attention.f16,
                                                                                 block->out_proj_weight_f16,
                                                                                 block->out_proj_bias_f16,
@@ -15885,7 +15885,7 @@ static int metal_context_clip_transformer_block_workspace_f16(uocr_metal_context
                                                                                 error,
                                                                                 error_size));
     RUN_CLIP_WORKSPACE_BLOCK_STEP("attention residual",
-                                  uocr_metal_context_clip_residual_add_f16(ctx,
+                                  uocr_metal_context_diagnostic_clip_residual_add_f16(ctx,
                                                                            input_f16,
                                                                            scratch->clip_block_projected.f16,
                                                                            token_count,
@@ -15894,7 +15894,7 @@ static int metal_context_clip_transformer_block_workspace_f16(uocr_metal_context
                                                                            error,
                                                                            error_size));
     RUN_CLIP_WORKSPACE_BLOCK_STEP("LayerNorm2",
-                                  uocr_metal_context_clip_layernorm_f16(ctx,
+                                  uocr_metal_context_diagnostic_clip_layernorm_f16(ctx,
                                                                         scratch->clip_block_residual1.f16,
                                                                         block->ln2_weight_f16,
                                                                         block->ln2_bias_f16,
@@ -15914,7 +15914,7 @@ static int metal_context_clip_transformer_block_workspace_f16(uocr_metal_context
                                                                        error,
                                                                        error_size));
     RUN_CLIP_WORKSPACE_BLOCK_STEP("MLP residual",
-                                  uocr_metal_context_clip_residual_add_f16(ctx,
+                                  uocr_metal_context_diagnostic_clip_residual_add_f16(ctx,
                                                                            scratch->clip_block_residual1.f16,
                                                                            scratch->clip_block_mlp.f16,
                                                                            token_count,
@@ -16004,7 +16004,7 @@ static int metal_context_clip_transformer_workspace_f16(uocr_metal_context *ctx,
     return 1;
 }
 
-int uocr_metal_context_clip_sam_concat_f16(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_clip_sam_concat_f16(uocr_metal_context *ctx,
                                            const uint16_t *clip_tokens_f16,
                                            const uint16_t *sam_nchw_f16,
                                            uint32_t grid_w,
@@ -16175,7 +16175,7 @@ int uocr_metal_context_clip_sam_concat_f16(uocr_metal_context *ctx,
     return result;
 }
 
-int uocr_metal_context_visual_projector_f16(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_visual_projector_f16(uocr_metal_context *ctx,
                                             const uint16_t *input_f16,
                                             const uint16_t *weight_f16,
                                             const uint16_t *bias_f16,
@@ -16195,7 +16195,7 @@ int uocr_metal_context_visual_projector_f16(uocr_metal_context *ctx,
         return metal_fail(error, error_size, "Metal visual projector constants are inconsistent");
     }
 
-    if (!uocr_metal_context_dense_f16(ctx,
+    if (!uocr_metal_context_diagnostic_dense_f16(ctx,
                                       input_f16,
                                       weight_f16,
                                       bias_f16,
@@ -16252,7 +16252,7 @@ static int metal_sam_transformer_activation_bytes(uint32_t grid_w,
     return 1;
 }
 
-int uocr_metal_context_sam_transformer_block_f16(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_sam_transformer_block_f16(uocr_metal_context *ctx,
                                                  const uint16_t *input_bhwc_f16,
                                                  const uocr_metal_sam_transformer_block_f16 *block,
                                                  uint32_t grid_w,
@@ -16361,7 +16361,7 @@ int uocr_metal_context_sam_transformer_block_f16(uocr_metal_context *ctx,
     } while (0)
 
     RUN_SAM_BLOCK_STEP("LayerNorm1",
-                       uocr_metal_context_sam_layernorm_f16(ctx,
+                       uocr_metal_context_diagnostic_sam_layernorm_f16(ctx,
                                                              input_bhwc_f16,
                                                              block->norm1_weight_f16,
                                                              block->norm1_bias_f16,
@@ -16373,7 +16373,7 @@ int uocr_metal_context_sam_transformer_block_f16(uocr_metal_context *ctx,
 
     if (use_global_attention) {
         RUN_SAM_BLOCK_STEP("QKV",
-                           uocr_metal_context_sam_qkv_f16(ctx,
+                           uocr_metal_context_diagnostic_sam_qkv_f16(ctx,
                                                            norm1_f16,
                                                            block->qkv_weight_f16,
                                                            block->qkv_bias_f16,
@@ -16385,7 +16385,7 @@ int uocr_metal_context_sam_transformer_block_f16(uocr_metal_context *ctx,
                                                            error,
                                                            error_size));
         RUN_SAM_BLOCK_STEP("relative-position attention",
-                           uocr_metal_context_sam_rel_pos_attention_f16(ctx,
+                           uocr_metal_context_diagnostic_sam_rel_pos_attention_f16(ctx,
                                                                         q_f16,
                                                                         k_f16,
                                                                         v_f16,
@@ -16401,7 +16401,7 @@ int uocr_metal_context_sam_transformer_block_f16(uocr_metal_context *ctx,
                                                                         error,
                                                                         error_size));
         RUN_SAM_BLOCK_STEP("attention projection residual",
-                           uocr_metal_context_sam_attention_project_residual_f16(ctx,
+                           uocr_metal_context_diagnostic_sam_attention_project_residual_f16(ctx,
                                                                                  attention_f16,
                                                                                  block->proj_weight_f16,
                                                                                  block->proj_bias_f16,
@@ -16416,7 +16416,7 @@ int uocr_metal_context_sam_transformer_block_f16(uocr_metal_context *ctx,
         uint32_t actual_padded_w = 0u;
         uint32_t actual_padded_h = 0u;
         RUN_SAM_BLOCK_STEP("window partition",
-                           uocr_metal_context_sam_window_partition_f16(ctx,
+                           uocr_metal_context_diagnostic_sam_window_partition_f16(ctx,
                                                                        norm1_f16,
                                                                        grid_w,
                                                                        grid_h,
@@ -16431,7 +16431,7 @@ int uocr_metal_context_sam_transformer_block_f16(uocr_metal_context *ctx,
             goto cleanup_sam_transformer_block;
         }
         RUN_SAM_BLOCK_STEP("window QKV",
-                           uocr_metal_context_sam_qkv_f16(ctx,
+                           uocr_metal_context_diagnostic_sam_qkv_f16(ctx,
                                                            window_tokens_f16,
                                                            block->qkv_weight_f16,
                                                            block->qkv_bias_f16,
@@ -16443,7 +16443,7 @@ int uocr_metal_context_sam_transformer_block_f16(uocr_metal_context *ctx,
                                                            error,
                                                            error_size));
         RUN_SAM_BLOCK_STEP("window relative-position attention",
-                           uocr_metal_context_sam_rel_pos_attention_f16(ctx,
+                           uocr_metal_context_diagnostic_sam_rel_pos_attention_f16(ctx,
                                                                         q_f16,
                                                                         k_f16,
                                                                         v_f16,
@@ -16459,7 +16459,7 @@ int uocr_metal_context_sam_transformer_block_f16(uocr_metal_context *ctx,
                                                                         error,
                                                                         error_size));
         RUN_SAM_BLOCK_STEP("window output projection",
-                           uocr_metal_context_dense_f16(ctx,
+                           uocr_metal_context_diagnostic_dense_f16(ctx,
                                                         attention_f16,
                                                         block->proj_weight_f16,
                                                         block->proj_bias_f16,
@@ -16471,7 +16471,7 @@ int uocr_metal_context_sam_transformer_block_f16(uocr_metal_context *ctx,
                                                         error,
                                                         error_size));
         RUN_SAM_BLOCK_STEP("window unpartition",
-                           uocr_metal_context_sam_window_unpartition_f16(ctx,
+                           uocr_metal_context_diagnostic_sam_window_unpartition_f16(ctx,
                                                                          projected_windows_f16,
                                                                          grid_w,
                                                                          grid_h,
@@ -16479,7 +16479,7 @@ int uocr_metal_context_sam_transformer_block_f16(uocr_metal_context *ctx,
                                                                          error,
                                                                          error_size));
         RUN_SAM_BLOCK_STEP("attention residual",
-                           uocr_metal_context_sam_residual_add_f16(ctx,
+                           uocr_metal_context_diagnostic_sam_residual_add_f16(ctx,
                                                                     input_bhwc_f16,
                                                                     attention_bhwc_f16,
                                                                     row_count,
@@ -16490,7 +16490,7 @@ int uocr_metal_context_sam_transformer_block_f16(uocr_metal_context *ctx,
     }
 
     RUN_SAM_BLOCK_STEP("LayerNorm2",
-                       uocr_metal_context_sam_layernorm_f16(ctx,
+                       uocr_metal_context_diagnostic_sam_layernorm_f16(ctx,
                                                              residual1_f16,
                                                              block->norm2_weight_f16,
                                                              block->norm2_bias_f16,
@@ -16500,7 +16500,7 @@ int uocr_metal_context_sam_transformer_block_f16(uocr_metal_context *ctx,
                                                              error,
                                                              error_size));
     RUN_SAM_BLOCK_STEP("MLP",
-                       uocr_metal_context_sam_mlp_f16(ctx,
+                       uocr_metal_context_diagnostic_sam_mlp_f16(ctx,
                                                        norm2_f16,
                                                        block->mlp_lin1_weight_f16,
                                                        block->mlp_lin1_bias_f16,
@@ -16512,7 +16512,7 @@ int uocr_metal_context_sam_transformer_block_f16(uocr_metal_context *ctx,
                                                        error,
                                                        error_size));
     RUN_SAM_BLOCK_STEP("MLP residual",
-                       uocr_metal_context_sam_residual_add_f16(ctx,
+                       uocr_metal_context_diagnostic_sam_residual_add_f16(ctx,
                                                                 residual1_f16,
                                                                 mlp_f16,
                                                                 row_count,
@@ -16544,7 +16544,7 @@ cleanup_sam_transformer_block:
     return result;
 }
 
-int uocr_metal_context_sam_transformer_f16(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_sam_transformer_f16(uocr_metal_context *ctx,
                                            const uint16_t *input_bhwc_f16,
                                            const uocr_metal_sam_transformer_block_f16 *blocks,
                                            uint32_t block_count,
@@ -16599,7 +16599,7 @@ int uocr_metal_context_sam_transformer_f16(uocr_metal_context *ctx,
         const int is_last = block_index + 1u == block_count;
         const uocr_metal_dense_output_type block_output_type = is_last ? output_type : UOCR_METAL_DENSE_OUTPUT_F16;
         void *block_out = is_last ? out_bhwc : (void *)next_f16;
-        if (!uocr_metal_context_sam_transformer_block_f16(ctx,
+        if (!uocr_metal_context_diagnostic_sam_transformer_block_f16(ctx,
                                                           current_f16,
                                                           &blocks[block_index],
                                                           grid_w,
@@ -16685,7 +16685,7 @@ static int metal_context_sam_mlp_workspace_f16(uocr_metal_context *ctx,
                                                        error_size))) {
             return 0;
         }
-        return uocr_metal_context_sam_mlp_f16(ctx,
+        return uocr_metal_context_diagnostic_sam_mlp_f16(ctx,
                                               input.f16,
                                               block->mlp_lin1_weight_f16,
                                               block->mlp_lin1_bias_f16,
@@ -16891,7 +16891,7 @@ static int metal_context_sam_transformer_block_workspace_f16(uocr_metal_context 
     } while (0)
 
     RUN_SAM_WORKSPACE_BLOCK_STEP("LayerNorm1",
-                                 uocr_metal_context_sam_layernorm_f16(ctx,
+                                 uocr_metal_context_diagnostic_sam_layernorm_f16(ctx,
                                                                        input_bhwc_f16,
                                                                        block->norm1_weight_f16,
                                                                        block->norm1_bias_f16,
@@ -16903,7 +16903,7 @@ static int metal_context_sam_transformer_block_workspace_f16(uocr_metal_context 
 
     if (use_global_attention) {
         RUN_SAM_WORKSPACE_BLOCK_STEP("QKV",
-                                     uocr_metal_context_sam_qkv_f16(ctx,
+                                     uocr_metal_context_diagnostic_sam_qkv_f16(ctx,
                                                                      scratch->sam_block_norm1_bhwc.f16,
                                                                      block->qkv_weight_f16,
                                                                      block->qkv_bias_f16,
@@ -16915,7 +16915,7 @@ static int metal_context_sam_transformer_block_workspace_f16(uocr_metal_context 
                                                                      error,
                                                                      error_size));
         RUN_SAM_WORKSPACE_BLOCK_STEP("relative-position attention",
-                                     uocr_metal_context_sam_rel_pos_attention_f16(ctx,
+                                     uocr_metal_context_diagnostic_sam_rel_pos_attention_f16(ctx,
                                                                                   scratch->sam_block_q.f16,
                                                                                   scratch->sam_block_k.f16,
                                                                                   scratch->sam_block_v.f16,
@@ -16931,7 +16931,7 @@ static int metal_context_sam_transformer_block_workspace_f16(uocr_metal_context 
                                                                                   error,
                                                                                   error_size));
         RUN_SAM_WORKSPACE_BLOCK_STEP("attention projection residual",
-                                     uocr_metal_context_sam_attention_project_residual_f16(ctx,
+                                     uocr_metal_context_diagnostic_sam_attention_project_residual_f16(ctx,
                                                                                            scratch->sam_block_attention.f16,
                                                                                            block->proj_weight_f16,
                                                                                            block->proj_bias_f16,
@@ -16946,7 +16946,7 @@ static int metal_context_sam_transformer_block_workspace_f16(uocr_metal_context 
         uint32_t actual_padded_w = 0u;
         uint32_t actual_padded_h = 0u;
         RUN_SAM_WORKSPACE_BLOCK_STEP("window partition",
-                                     uocr_metal_context_sam_window_partition_f16(ctx,
+                                     uocr_metal_context_diagnostic_sam_window_partition_f16(ctx,
                                                                                  scratch->sam_block_norm1_bhwc.f16,
                                                                                  grid_w,
                                                                                  grid_h,
@@ -16960,7 +16960,7 @@ static int metal_context_sam_transformer_block_workspace_f16(uocr_metal_context 
             return metal_fail(error, error_size, "Metal SAM workspace window geometry changed during partition");
         }
         RUN_SAM_WORKSPACE_BLOCK_STEP("window QKV",
-                                     uocr_metal_context_sam_qkv_f16(ctx,
+                                     uocr_metal_context_diagnostic_sam_qkv_f16(ctx,
                                                                      scratch->sam_block_window_tokens.f16,
                                                                      block->qkv_weight_f16,
                                                                      block->qkv_bias_f16,
@@ -16972,7 +16972,7 @@ static int metal_context_sam_transformer_block_workspace_f16(uocr_metal_context 
                                                                      error,
                                                                      error_size));
         RUN_SAM_WORKSPACE_BLOCK_STEP("window relative-position attention",
-                                     uocr_metal_context_sam_rel_pos_attention_f16(ctx,
+                                     uocr_metal_context_diagnostic_sam_rel_pos_attention_f16(ctx,
                                                                                   scratch->sam_block_q.f16,
                                                                                   scratch->sam_block_k.f16,
                                                                                   scratch->sam_block_v.f16,
@@ -16988,7 +16988,7 @@ static int metal_context_sam_transformer_block_workspace_f16(uocr_metal_context 
                                                                                   error,
                                                                                   error_size));
         RUN_SAM_WORKSPACE_BLOCK_STEP("window output projection",
-                                     uocr_metal_context_dense_f16(ctx,
+                                     uocr_metal_context_diagnostic_dense_f16(ctx,
                                                                   scratch->sam_block_attention.f16,
                                                                   block->proj_weight_f16,
                                                                   block->proj_bias_f16,
@@ -17000,7 +17000,7 @@ static int metal_context_sam_transformer_block_workspace_f16(uocr_metal_context 
                                                                   error,
                                                                   error_size));
         RUN_SAM_WORKSPACE_BLOCK_STEP("window unpartition",
-                                     uocr_metal_context_sam_window_unpartition_f16(ctx,
+                                     uocr_metal_context_diagnostic_sam_window_unpartition_f16(ctx,
                                                                                    scratch->sam_block_projected_windows.f16,
                                                                                    grid_w,
                                                                                    grid_h,
@@ -17008,7 +17008,7 @@ static int metal_context_sam_transformer_block_workspace_f16(uocr_metal_context 
                                                                                    error,
                                                                                    error_size));
         RUN_SAM_WORKSPACE_BLOCK_STEP("attention residual",
-                                     uocr_metal_context_sam_residual_add_f16(ctx,
+                                     uocr_metal_context_diagnostic_sam_residual_add_f16(ctx,
                                                                              input_bhwc_f16,
                                                                              scratch->sam_block_attention_bhwc.f16,
                                                                              row_count,
@@ -17019,7 +17019,7 @@ static int metal_context_sam_transformer_block_workspace_f16(uocr_metal_context 
     }
 
     RUN_SAM_WORKSPACE_BLOCK_STEP("LayerNorm2",
-                                 uocr_metal_context_sam_layernorm_f16(ctx,
+                                 uocr_metal_context_diagnostic_sam_layernorm_f16(ctx,
                                                                        scratch->sam_block_residual1_bhwc.f16,
                                                                        block->norm2_weight_f16,
                                                                        block->norm2_bias_f16,
@@ -17038,7 +17038,7 @@ static int metal_context_sam_transformer_block_workspace_f16(uocr_metal_context 
                                                                      error,
                                                                      error_size));
     RUN_SAM_WORKSPACE_BLOCK_STEP("MLP residual",
-                                 uocr_metal_context_sam_residual_add_f16(ctx,
+                                 uocr_metal_context_diagnostic_sam_residual_add_f16(ctx,
                                                                           scratch->sam_block_residual1_bhwc.f16,
                                                                           scratch->sam_block_mlp_bhwc.f16,
                                                                           row_count,
@@ -17296,7 +17296,7 @@ static int metal_context_sam_attention_f16(uocr_metal_context *ctx,
     return 1;
 }
 
-int uocr_metal_context_sam_window_attention_f16(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_sam_window_attention_f16(uocr_metal_context *ctx,
                                                 const uint16_t *q_f16,
                                                 const uint16_t *k_f16,
                                                 const uint16_t *v_f16,
@@ -17330,7 +17330,7 @@ int uocr_metal_context_sam_window_attention_f16(uocr_metal_context *ctx,
                                            error_size);
 }
 
-int uocr_metal_context_sam_global_attention_f16(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_sam_global_attention_f16(uocr_metal_context *ctx,
                                                 const uint16_t *q_f16,
                                                 const uint16_t *k_f16,
                                                 const uint16_t *v_f16,
@@ -17380,7 +17380,7 @@ int uocr_metal_context_sam_global_attention_f16(uocr_metal_context *ctx,
                                            error_size);
 }
 
-int uocr_metal_context_sam_rel_pos_attention_f16(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_sam_rel_pos_attention_f16(uocr_metal_context *ctx,
                                                  const uint16_t *q_f16,
                                                  const uint16_t *k_f16,
                                                  const uint16_t *v_f16,
@@ -17642,7 +17642,7 @@ int uocr_metal_context_sam_rel_pos_attention_f16(uocr_metal_context *ctx,
     return 1;
 }
 
-int uocr_metal_context_sam_residual_add_f16(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_sam_residual_add_f16(uocr_metal_context *ctx,
                                             const uint16_t *base_f16,
                                             const uint16_t *update_f16,
                                             uint32_t n_rows,
@@ -17783,7 +17783,7 @@ int uocr_metal_context_sam_residual_add_f16(uocr_metal_context *ctx,
     return result;
 }
 
-int uocr_metal_context_sam_attention_project_residual_f16(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_sam_attention_project_residual_f16(uocr_metal_context *ctx,
                                                           const uint16_t *attention_context_f16,
                                                           const uint16_t *proj_weight_f16,
                                                           const uint16_t *proj_bias_f16,
@@ -18025,7 +18025,7 @@ int uocr_metal_context_sam_attention_project_residual_f16(uocr_metal_context *ct
     return result;
 }
 
-int uocr_metal_context_sam_mlp_f16(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_sam_mlp_f16(uocr_metal_context *ctx,
                                    const uint16_t *input_f16,
                                    const uint16_t *lin1_weight_f16,
                                    const uint16_t *lin1_bias_f16,
@@ -19003,7 +19003,7 @@ int uocr_metal_context_select_next_token_f16(uocr_metal_context *ctx,
     return 1;
 }
 
-int uocr_metal_context_dense_f16(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_dense_f16(uocr_metal_context *ctx,
                                  const uint16_t *input_f16,
                                  const uint16_t *weight_f16,
                                  const uint16_t *bias_f16_or_null,
@@ -19229,7 +19229,7 @@ int uocr_metal_context_dense_f16(uocr_metal_context *ctx,
     return 1;
 }
 
-int uocr_metal_context_dense_q8_0(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_dense_q8_0(uocr_metal_context *ctx,
                                   const uint16_t *input_f16,
                                   const void *weight_q8_0,
                                   const uint16_t *bias_f16_or_null,
@@ -19395,7 +19395,7 @@ int uocr_metal_context_dense_q8_0(uocr_metal_context *ctx,
     return 1;
 }
 
-int uocr_metal_context_dense_q4_k(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_dense_q4_k(uocr_metal_context *ctx,
                                   const uint16_t *input_f16,
                                   const void *weight_q4_k,
                                   const uint16_t *bias_f16_or_null,
@@ -19564,7 +19564,7 @@ int uocr_metal_context_dense_q4_k(uocr_metal_context *ctx,
     return 1;
 }
 
-int uocr_metal_context_attention_qkvo_f16(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_attention_qkvo_f16(uocr_metal_context *ctx,
                                           const uint16_t *input_f16,
                                           const uint16_t *q_weight_f16,
                                           const uint16_t *k_weight_f16,
@@ -19774,7 +19774,7 @@ int uocr_metal_context_attention_qkvo_f16(uocr_metal_context *ctx,
     return 1;
 }
 
-int uocr_metal_context_attention_output_residual_f16(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_attention_output_residual_f16(uocr_metal_context *ctx,
                                                      const uint16_t *attention_context_f16,
                                                      const uint16_t *o_weight_f16,
                                                      const uint16_t *residual_f16,
@@ -20145,7 +20145,7 @@ static int metal_context_swiglu_f16(uocr_metal_context *ctx,
     return 1;
 }
 
-int uocr_metal_context_dense_swiglu_f16(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_dense_swiglu_f16(uocr_metal_context *ctx,
                                         const uint16_t *input_f16,
                                         const uint16_t *gate_weight_f16,
                                         const uint16_t *up_weight_f16,
@@ -20171,7 +20171,7 @@ int uocr_metal_context_dense_swiglu_f16(uocr_metal_context *ctx,
                                     error_size);
 }
 
-int uocr_metal_context_moe_shared_experts_f16(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_moe_shared_experts_f16(uocr_metal_context *ctx,
                                               const uint16_t *input_f16,
                                               const uint16_t *shared_gate_weight_f16,
                                               const uint16_t *shared_up_weight_f16,
@@ -20196,7 +20196,7 @@ int uocr_metal_context_moe_shared_experts_f16(uocr_metal_context *ctx,
                                     error_size);
 }
 
-int uocr_metal_context_moe_shared_experts_q8_0(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_moe_shared_experts_q8_0(uocr_metal_context *ctx,
                                                const uint16_t *input_f16,
                                                const void *shared_gate_weight_q8_0,
                                                const void *shared_up_weight_q8_0,
@@ -20433,7 +20433,7 @@ int uocr_metal_context_moe_shared_experts_q8_0(uocr_metal_context *ctx,
     return 1;
 }
 
-int uocr_metal_context_moe_router_f16(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_moe_router_f16(uocr_metal_context *ctx,
                                       const uint16_t *input_f16,
                                       const uint16_t *router_weight_f16,
                                       uint32_t n_tokens,
@@ -20636,7 +20636,7 @@ int uocr_metal_context_moe_router_f16(uocr_metal_context *ctx,
     return 1;
 }
 
-int uocr_metal_context_moe_selected_experts_decode_f16(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_moe_selected_experts_decode_f16(uocr_metal_context *ctx,
                                                        const uint16_t *input_f16,
                                                        const uint32_t *top_expert_ids,
                                                        const float *top_weights_f32,
@@ -20861,7 +20861,7 @@ int uocr_metal_context_moe_selected_experts_decode_f16(uocr_metal_context *ctx,
     return 1;
 }
 
-int uocr_metal_context_moe_selected_experts_decode_q4_k(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_moe_selected_experts_decode_q4_k(uocr_metal_context *ctx,
                                                         const uint16_t *input_f16,
                                                         const uint32_t *top_expert_ids,
                                                         const float *top_weights_f32,
@@ -21112,7 +21112,7 @@ int uocr_metal_context_moe_selected_experts_decode_q4_k(uocr_metal_context *ctx,
     return 1;
 }
 
-int uocr_metal_context_moe_selected_experts_decode_q4_k_q8_0(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_moe_selected_experts_decode_q4_k_q8_0(uocr_metal_context *ctx,
                                                              const uint16_t *input_f16,
                                                              const uint32_t *top_expert_ids,
                                                              const float *top_weights_f32,
@@ -21384,7 +21384,7 @@ int uocr_metal_context_moe_selected_experts_decode_q4_k_q8_0(uocr_metal_context 
     return 1;
 }
 
-int uocr_metal_context_moe_selected_experts_decode_q4_k_padded(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_moe_selected_experts_decode_q4_k_padded(uocr_metal_context *ctx,
                                                                const uint16_t *input_f16,
                                                                const uint32_t *top_expert_ids,
                                                                const float *top_weights_f32,
@@ -21659,7 +21659,7 @@ int uocr_metal_context_moe_selected_experts_decode_q4_k_padded(uocr_metal_contex
     return 1;
 }
 
-int uocr_metal_context_moe_selected_experts_prefill_f16(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_moe_selected_experts_prefill_f16(uocr_metal_context *ctx,
                                                         const uint16_t *input_f16,
                                                         const uint32_t *top_expert_ids,
                                                         const float *top_weights_f32,
@@ -21929,7 +21929,7 @@ int uocr_metal_context_moe_selected_experts_prefill_f16(uocr_metal_context *ctx,
     return 1;
 }
 
-int uocr_metal_context_moe_selected_experts_prefill_q4_k(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_moe_selected_experts_prefill_q4_k(uocr_metal_context *ctx,
                                                          const uint16_t *input_f16,
                                                          const uint32_t *top_expert_ids,
                                                          const float *top_weights_f32,
@@ -22225,7 +22225,7 @@ int uocr_metal_context_moe_selected_experts_prefill_q4_k(uocr_metal_context *ctx
     return 1;
 }
 
-int uocr_metal_context_moe_selected_experts_prefill_q4_k_q8_0(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_moe_selected_experts_prefill_q4_k_q8_0(uocr_metal_context *ctx,
                                                               const uint16_t *input_f16,
                                                               const uint32_t *top_expert_ids,
                                                               const float *top_weights_f32,
@@ -22536,7 +22536,7 @@ int uocr_metal_context_moe_selected_experts_prefill_q4_k_q8_0(uocr_metal_context
     return 1;
 }
 
-int uocr_metal_context_moe_selected_experts_prefill_q4_k_padded(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_moe_selected_experts_prefill_q4_k_padded(uocr_metal_context *ctx,
                                                                 const uint16_t *input_f16,
                                                                 const uint32_t *top_expert_ids,
                                                                 const float *top_weights_f32,
@@ -22850,7 +22850,7 @@ int uocr_metal_context_moe_selected_experts_prefill_q4_k_padded(uocr_metal_conte
     return 1;
 }
 
-int uocr_metal_context_moe_combine_f16(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_moe_combine_f16(uocr_metal_context *ctx,
                                        const uint16_t *routed_f16,
                                        const uint16_t *shared_f16,
                                        const uint16_t *residual_f16_or_null,
@@ -22989,7 +22989,7 @@ int uocr_metal_context_moe_combine_f16(uocr_metal_context *ctx,
     return 1;
 }
 
-int uocr_metal_context_rope_qk_f16(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_rope_qk_f16(uocr_metal_context *ctx,
                                    const uint16_t *q_f16,
                                    const uint16_t *k_f16,
                                    uint32_t n_tokens,
@@ -23142,7 +23142,7 @@ int uocr_metal_context_rope_qk_f16(uocr_metal_context *ctx,
     return 1;
 }
 
-int uocr_metal_context_prefill_attention_f16(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_prefill_attention_f16(uocr_metal_context *ctx,
                                              const uint16_t *q_f16,
                                              const uint16_t *k_f16,
                                              const uint16_t *v_f16,
@@ -23289,7 +23289,7 @@ int uocr_metal_context_prefill_attention_f16(uocr_metal_context *ctx,
     return 1;
 }
 
-int uocr_metal_context_prefill_attention_varlen_f16(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_prefill_attention_varlen_f16(uocr_metal_context *ctx,
                                                     const uint16_t *q_f16,
                                                     const uint16_t *k_f16,
                                                     const uint16_t *v_f16,
@@ -23486,7 +23486,7 @@ int uocr_metal_context_prefill_attention_varlen_f16(uocr_metal_context *ctx,
     return 1;
 }
 
-int uocr_metal_context_decode_attention_f16(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_decode_attention_f16(uocr_metal_context *ctx,
                                             const uint16_t *q_f16,
                                             const uint16_t *k_cache_f16,
                                             const uint16_t *v_cache_f16,
@@ -23679,7 +23679,7 @@ int uocr_metal_context_decode_attention_f16(uocr_metal_context *ctx,
     return 1;
 }
 
-int uocr_metal_context_write_kv_cache_f16(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_write_kv_cache_f16(uocr_metal_context *ctx,
                                           const uint16_t *k_f16,
                                           const uint16_t *v_f16,
                                           const uint16_t *initial_k_cache_f16_or_null,
