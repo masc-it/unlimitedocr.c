@@ -126,7 +126,7 @@ Implementation status:
 - [ ] Rewrite SAM global attention with a tiled FlashAttention-style kernel processing multiple queries per threadgroup and reusing K/V tiles.
 - [ ] Rewrite SAM window attention with the same tiled attention kernel specialized for `14x14` windows.
 - [ ] Precompute SAM relative-position bias tables during conversion for `64x64`, `40x40`, and `14x14` attention shapes.
-- [ ] Precompute SAM absolute position tables during conversion for `64x64` and `40x40` patch grids.
+- [x] Precompute/cache SAM absolute position tables before production vision for `64x64` and `40x40` patch grids.
 - [ ] Precompute CLIP absolute position tables during conversion for `16x16` and `10x10` patch grids.
 - [x] Use MPSNDArray matrix multiplication for SAM QKV, SAM output projection, SAM MLP, CLIP QKV, CLIP output projection, CLIP MLP, and projector dense GEMMs.
 - [x] Cache all MPS descriptors and weight NDArrays at model map time.

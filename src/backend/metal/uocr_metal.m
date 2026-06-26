@@ -195,6 +195,8 @@ typedef struct uocr_metal_vision_weights_f16 {
     uocr_metal_vision_tensor_f16 sam_patch_weight;
     uocr_metal_vision_tensor_f16 sam_patch_bias;
     uocr_metal_vision_tensor_f16 sam_pos_embed;
+    uocr_metal_vision_tensor_f16 sam_pos_embed_global;
+    uocr_metal_vision_tensor_f16 sam_pos_embed_local;
     uocr_metal_vision_tensor_f16 sam_neck_conv1x1_weight;
     uocr_metal_vision_tensor_f16 sam_neck_norm1_weight;
     uocr_metal_vision_tensor_f16 sam_neck_norm1_bias;
@@ -280,6 +282,7 @@ struct uocr_metal_context {
     char decoder_binding_error[256];
     uocr_metal_vision_binding_cache vision_bindings;
     uocr_metal_vision_weights_f16 vision_weights;
+    id<MTLBuffer> sam_abs_pos_local_buffer;
     char vision_binding_error[256];
     uocr_metal_kv_cache_layout kv_cache_layout;
     int has_kv_cache_layout;
@@ -458,6 +461,11 @@ static int metal_command_batch_commit_and_wait(uocr_metal_context *ctx,
                                                const char *op_name,
                                                char *error,
                                                size_t error_size);
+static int metal_wait_for_command_buffer_profiled(uocr_metal_context *ctx,
+                                                  id<MTLCommandBuffer> cb,
+                                                  const char *op_name,
+                                                  char *error,
+                                                  size_t error_size);
 static id<MTLCommandBuffer> metal_command_buffer_for_op(uocr_metal_context *ctx,
                                                         int *out_owned,
                                                         const char *op_name,
@@ -1729,10 +1737,15 @@ static int metal_prebuild_mps_model_objects(uocr_metal_context *ctx,
                                             const uocr_model_file *model,
                                             char *error,
                                             size_t error_size);
+static void metal_release_precomputed_vision_tables(uocr_metal_context *ctx);
 static int metal_vision_weight_cache_build_direct(const uocr_metal_vision_binding_cache *binding_cache,
                                                   uocr_metal_vision_weights_f16 *out_weights,
                                                   char *error,
                                                   size_t error_size);
+static int metal_precompute_sam_abs_pos_tables(uocr_metal_context *ctx,
+                                               uocr_metal_vision_weights_f16 *weights,
+                                               char *error,
+                                               size_t error_size);
 static const uocr_metal_vision_weights_f16 *metal_require_vision_weights_f16(const uocr_metal_context *ctx,
                                                                              char *error,
                                                                              size_t error_size);
@@ -2759,10 +2772,21 @@ int uocr_metal_context_decoder_bindings_ready(const uocr_metal_context *ctx) {
            ctx->decoder_bindings.count == UOCR_METAL_DECODER_REQUIRED_TENSOR_COUNT;
 }
 
+static void metal_release_precomputed_vision_tables(uocr_metal_context *ctx) {
+    if (ctx == NULL) {
+        return;
+    }
+    @autoreleasepool {
+        [ctx->sam_abs_pos_local_buffer release];
+        ctx->sam_abs_pos_local_buffer = nil;
+    }
+}
+
 static void metal_invalidate_vision_binding_cache(uocr_metal_context *ctx, const char *reason) {
     if (ctx == NULL) {
         return;
     }
+    metal_release_precomputed_vision_tables(ctx);
     memset(&ctx->vision_bindings, 0, sizeof(ctx->vision_bindings));
     memset(&ctx->vision_weights, 0, sizeof(ctx->vision_weights));
     if (reason == NULL || reason[0] == '\0') {
@@ -3113,7 +3137,8 @@ static int metal_refresh_vision_binding_cache(uocr_metal_context *ctx,
     }
     uocr_metal_vision_weights_f16 weights;
     const uint64_t direct_cache_start_ns = uocr_profile_now_ns();
-    if (!metal_vision_weight_cache_build_direct(&cache, &weights, error, error_size)) {
+    if (!metal_vision_weight_cache_build_direct(&cache, &weights, error, error_size) ||
+        !metal_precompute_sam_abs_pos_tables(ctx, &weights, error, error_size)) {
         return 0;
     }
     metal_profile_add_event_now(ctx, "metal.vision_binding_cache.direct", direct_cache_start_ns);
@@ -3269,6 +3294,7 @@ static int metal_vision_weight_cache_build_direct(const uocr_metal_vision_bindin
     ASSIGN_VISION_TENSOR(sam_patch_bias, sam_extra + 8u, "SAM patch bias");
     ASSIGN_VISION_TENSOR(sam_patch_weight, sam_extra + 9u, "SAM patch weight");
     ASSIGN_VISION_TENSOR(sam_pos_embed, sam_extra + 10u, "SAM absolute position embedding");
+    out_weights->sam_pos_embed_global = out_weights->sam_pos_embed;
 
     ASSIGN_VISION_TENSOR(clip_class_embedding, UOCR_TENSOR_ID_VISION_CLIP_BASE + 0u, "CLIP class embedding");
     ASSIGN_VISION_TENSOR(clip_pos_embed, UOCR_TENSOR_ID_VISION_CLIP_BASE + 2u, "CLIP position embedding");
@@ -3875,6 +3901,137 @@ static int metal_vision_square_grid_values(uint32_t grid_w,
            checked_mul_u64(spatial, (uint64_t)channels, out_values);
 }
 
+static uint32_t metal_sam_abs_pos_source_grid_for_tensor(uocr_metal_vision_tensor_f16 pos_embed) {
+    uint64_t local_values = 0u;
+    uint64_t local_bytes = 0u;
+    uint64_t global_values = 0u;
+    uint64_t global_bytes = 0u;
+    if (metal_vision_square_grid_values(UOCR_LOCAL_VIEW_SIZE / UOCR_VISION_PATCH_SIZE,
+                                        UOCR_LOCAL_VIEW_SIZE / UOCR_VISION_PATCH_SIZE,
+                                        UOCR_SAM_HIDDEN_SIZE,
+                                        &local_values) &&
+        metal_vision_f16_bytes(local_values, &local_bytes) && pos_embed.byte_length == local_bytes) {
+        return UOCR_LOCAL_VIEW_SIZE / UOCR_VISION_PATCH_SIZE;
+    }
+    if (metal_vision_square_grid_values(UOCR_GLOBAL_VIEW_SIZE / UOCR_VISION_PATCH_SIZE,
+                                        UOCR_GLOBAL_VIEW_SIZE / UOCR_VISION_PATCH_SIZE,
+                                        UOCR_SAM_HIDDEN_SIZE,
+                                        &global_values) &&
+        metal_vision_f16_bytes(global_values, &global_bytes) && pos_embed.byte_length == global_bytes) {
+        return UOCR_GLOBAL_VIEW_SIZE / UOCR_VISION_PATCH_SIZE;
+    }
+    return 0u;
+}
+
+static uocr_metal_vision_tensor_f16 metal_sam_abs_pos_table_for_grid(const uocr_metal_vision_weights_f16 *weights,
+                                                                     uint32_t grid_w,
+                                                                     uint32_t grid_h) {
+    if (weights == NULL || grid_w != grid_h) {
+        uocr_metal_vision_tensor_f16 empty;
+        memset(&empty, 0, sizeof(empty));
+        return empty;
+    }
+    const uint32_t local_grid = UOCR_LOCAL_VIEW_SIZE / UOCR_VISION_PATCH_SIZE;
+    const uint32_t global_grid = UOCR_GLOBAL_VIEW_SIZE / UOCR_VISION_PATCH_SIZE;
+    if (grid_w == local_grid && weights->sam_pos_embed_local.slice.buffer != nil) {
+        return weights->sam_pos_embed_local;
+    }
+    if (grid_w == global_grid && weights->sam_pos_embed_global.slice.buffer != nil) {
+        return weights->sam_pos_embed_global;
+    }
+    return weights->sam_pos_embed;
+}
+
+static int metal_precompute_sam_abs_pos_tables(uocr_metal_context *ctx,
+                                               uocr_metal_vision_weights_f16 *weights,
+                                               char *error,
+                                               size_t error_size) {
+    if (ctx == NULL || weights == NULL || weights->sam_pos_embed.slice.buffer == nil || weights->sam_pos_embed.host_f16 == NULL) {
+        return metal_fail(error, error_size, "invalid Metal SAM absolute-position precompute request");
+    }
+    metal_release_precomputed_vision_tables(ctx);
+    weights->sam_pos_embed_global = weights->sam_pos_embed;
+
+    const uint32_t source_grid = UOCR_GLOBAL_VIEW_SIZE / UOCR_VISION_PATCH_SIZE;
+    const uint32_t target_grid = UOCR_LOCAL_VIEW_SIZE / UOCR_VISION_PATCH_SIZE;
+    uint64_t source_values = 0u;
+    uint64_t source_bytes = 0u;
+    uint64_t target_values = 0u;
+    uint64_t target_bytes = 0u;
+    if (!metal_vision_square_grid_values(source_grid, source_grid, UOCR_SAM_HIDDEN_SIZE, &source_values) ||
+        !metal_vision_f16_bytes(source_values, &source_bytes) ||
+        !metal_vision_square_grid_values(target_grid, target_grid, UOCR_SAM_HIDDEN_SIZE, &target_values) ||
+        !metal_vision_f16_bytes(target_values, &target_bytes) || target_values > (uint64_t)UINT32_MAX ||
+        !metal_vision_require_tensor_slice_f16(weights->sam_pos_embed,
+                                               source_bytes,
+                                               "SAM absolute-position source table",
+                                               error,
+                                               error_size)) {
+        return 0;
+    }
+    if (target_bytes > (uint64_t)NSUIntegerMax) {
+        return metal_fail(error, error_size, "Metal SAM absolute-position precompute byte-size overflow");
+    }
+
+    @autoreleasepool {
+        id<MTLBuffer> local_buffer = metal_new_buffer_with_length(ctx, (NSUInteger)target_bytes, MTLResourceStorageModeShared);
+        if (local_buffer == nil || [local_buffer contents] == NULL) {
+            [local_buffer release];
+            return metal_fail(error, error_size, "failed to allocate Metal SAM local absolute-position table");
+        }
+        local_buffer.label = @"uocr_sam_abs_pos_local_40x40";
+        memset([local_buffer contents], 0, (size_t)target_bytes);
+
+        id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, "uocr_sam_add_abs_pos_f16", error, error_size);
+        if (pipeline == nil) {
+            [local_buffer release];
+            return 0;
+        }
+        id<MTLCommandBuffer> cb = metal_new_command_buffer(ctx);
+        if (cb == nil) {
+            [local_buffer release];
+            return metal_fail(error, error_size, "failed to create Metal SAM absolute-position precompute command buffer");
+        }
+        cb.label = @"uocr_sam_abs_pos_precompute_command_buffer";
+        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
+        if (enc == nil) {
+            [local_buffer release];
+            return metal_fail(error, error_size, "failed to create Metal SAM absolute-position precompute encoder");
+        }
+
+        uocr_metal_sam_abs_pos_params params;
+        params.source_grid = source_grid;
+        params.target_width = target_grid;
+        params.target_height = target_grid;
+        params.channels = UOCR_SAM_HIDDEN_SIZE;
+        params.batch_size = 1u;
+
+        NSUInteger threads = pipeline.threadExecutionWidth;
+        if (threads == 0u) threads = 1u;
+        if (threads > 256u) threads = 256u;
+        [enc setComputePipelineState:pipeline];
+        [enc setBuffer:local_buffer offset:0u atIndex:0u];
+        [enc setBuffer:weights->sam_pos_embed.slice.buffer offset:weights->sam_pos_embed.slice.offset atIndex:1u];
+        [enc setBuffer:local_buffer offset:0u atIndex:2u];
+        [enc setBytes:&params length:sizeof(params) atIndex:3u];
+        [enc dispatchThreads:MTLSizeMake((NSUInteger)target_values, 1u, 1u)
+       threadsPerThreadgroup:MTLSizeMake(threads, 1u, 1u)];
+        [enc endEncoding];
+        if (!metal_wait_for_command_buffer_profiled(ctx, cb, "Metal SAM absolute-position precompute", error, error_size)) {
+            [local_buffer release];
+            return 0;
+        }
+
+        ctx->sam_abs_pos_local_buffer = local_buffer;
+        weights->sam_pos_embed_local.slice.buffer = local_buffer;
+        weights->sam_pos_embed_local.slice.offset = 0u;
+        weights->sam_pos_embed_local.byte_length = target_bytes;
+        weights->sam_pos_embed_local.host_f16 = (const uint16_t *)[local_buffer contents];
+        metal_profile_add_event_ms(ctx, "metal.vision.sam_abs_pos_precompute.local", 0.0);
+    }
+    return 1;
+}
+
 static int metal_context_sam_patch_embed_f16_to_slice(uocr_metal_context *ctx,
                                                       const uocr_image_view *view,
                                                       uocr_metal_vision_tensor_f16 patch_weight,
@@ -3933,7 +4090,10 @@ static int metal_context_sam_add_abs_pos_batch_f16_to_slice(uocr_metal_context *
     uint64_t target_bytes = 0u;
     uint64_t pos_values = 0u;
     uint64_t pos_bytes = 0u;
-    const uint32_t source_grid = UOCR_GLOBAL_VIEW_SIZE / UOCR_VISION_PATCH_SIZE;
+    const uint32_t source_grid = metal_sam_abs_pos_source_grid_for_tensor(pos_embed);
+    if (source_grid == 0u) {
+        return metal_fail(error, error_size, "Metal SAM abs-pos table has unsupported cached shape");
+    }
     if (view_count == 0u ||
         !metal_vision_square_grid_values(grid_w, grid_h, UOCR_SAM_HIDDEN_SIZE, &values_per_view) ||
         !checked_mul_u64(values_per_view, (uint64_t)view_count, &values) ||
@@ -5528,10 +5688,13 @@ static int metal_project_vision_chunk_f16(const uocr_vision_chunk *chunk,
     const uint32_t batch_clip_tokens = clip_tokens_per_view * chunk->view_count;
     const uint32_t patch_grid_w = batched_patch_grid_w;
     const uint32_t patch_grid_h = batched_patch_grid_h;
+    const uocr_metal_vision_tensor_f16 sam_pos_embed = metal_sam_abs_pos_table_for_grid(project->weights,
+                                                                                        patch_grid_w,
+                                                                                        patch_grid_h);
     const uint64_t sam_transformer_batch_start_ns = uocr_profile_now_ns();
     if (!metal_context_sam_add_abs_pos_batch_f16_to_slice(project->ctx,
                                                          project->scratch->sam_patch_bhwc,
-                                                         project->weights->sam_pos_embed,
+                                                         sam_pos_embed,
                                                          patch_grid_w,
                                                          patch_grid_h,
                                                          chunk->view_count,
