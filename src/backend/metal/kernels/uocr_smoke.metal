@@ -1282,6 +1282,31 @@ static inline float uocr_sam_rel_pos_table_value(device const half *rel_pos,
     return v0 * (1.0f - t) + v1 * t;
 }
 
+struct UocrSamRelPosInterpolateParams {
+    uint source_length;
+    uint target_length;
+    uint head_dim;
+    uint reserved;
+};
+
+kernel void uocr_sam_interpolate_rel_pos_f16(device const half *src [[buffer(0)]],
+                                             device half *dst [[buffer(1)]],
+                                             constant UocrSamRelPosInterpolateParams &params [[buffer(2)]],
+                                             uint gid [[thread_position_in_grid]]) {
+    const uint total = params.target_length * params.head_dim;
+    if (gid >= total || params.source_length == 0u || params.target_length == 0u || params.head_dim == 0u) {
+        return;
+    }
+    const uint target_index = gid / params.head_dim;
+    const uint dim = gid - target_index * params.head_dim;
+    dst[gid] = half(uocr_sam_rel_pos_table_value(src,
+                                                 params.source_length,
+                                                 params.target_length,
+                                                 target_index,
+                                                 dim,
+                                                 params.head_dim));
+}
+
 struct UocrSamWindowPartitionParams {
     uint grid_width;
     uint grid_height;

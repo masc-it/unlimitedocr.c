@@ -162,6 +162,10 @@ typedef struct uocr_metal_sam_transformer_block_slices_f16 {
     uocr_metal_vision_tensor_f16 rel_pos_w;
     uint32_t rel_pos_h_length;
     uint32_t rel_pos_w_length;
+    uocr_metal_vision_tensor_f16 rel_pos_h_local;
+    uocr_metal_vision_tensor_f16 rel_pos_w_local;
+    uint32_t rel_pos_h_local_length;
+    uint32_t rel_pos_w_local_length;
     uocr_metal_vision_tensor_f16 norm2_weight;
     uocr_metal_vision_tensor_f16 norm2_bias;
     uocr_metal_vision_tensor_f16 mlp_lin1_weight;
@@ -285,6 +289,7 @@ struct uocr_metal_context {
     uocr_metal_vision_binding_cache vision_bindings;
     uocr_metal_vision_weights_f16 vision_weights;
     id<MTLBuffer> sam_abs_pos_local_buffer;
+    id<MTLBuffer> sam_rel_pos_local_buffer;
     id<MTLBuffer> clip_abs_pos_local_buffer;
     char vision_binding_error[256];
     uocr_metal_kv_cache_layout kv_cache_layout;
@@ -933,6 +938,13 @@ typedef struct uocr_metal_sam_rel_pos_attention_params {
     uint32_t reserved2;
 } uocr_metal_sam_rel_pos_attention_params;
 
+typedef struct uocr_metal_sam_rel_pos_interpolate_params {
+    uint32_t source_length;
+    uint32_t target_length;
+    uint32_t head_dim;
+    uint32_t reserved;
+} uocr_metal_sam_rel_pos_interpolate_params;
+
 typedef struct uocr_metal_sam_residual_params {
     uint32_t n_rows;
     uint32_t hidden_size;
@@ -971,6 +983,8 @@ _Static_assert(sizeof(uocr_metal_sam_layernorm2d_params) == 20u,
                "uocr_metal_sam_layernorm2d_params ABI mismatch");
 _Static_assert(sizeof(uocr_metal_sam_rel_pos_attention_params) == 48u,
                "uocr_metal_sam_rel_pos_attention_params ABI mismatch");
+_Static_assert(sizeof(uocr_metal_sam_rel_pos_interpolate_params) == 16u,
+               "uocr_metal_sam_rel_pos_interpolate_params ABI mismatch");
 _Static_assert(sizeof(uocr_metal_sam_residual_params) == 16u,
                "uocr_metal_sam_residual_params ABI mismatch");
 _Static_assert(sizeof(uocr_metal_sam_mlp_params) == 16u,
@@ -1746,6 +1760,10 @@ static int metal_vision_weight_cache_build_direct(const uocr_metal_vision_bindin
                                                   char *error,
                                                   size_t error_size);
 static int metal_precompute_sam_abs_pos_tables(uocr_metal_context *ctx,
+                                               uocr_metal_vision_weights_f16 *weights,
+                                               char *error,
+                                               size_t error_size);
+static int metal_precompute_sam_rel_pos_tables(uocr_metal_context *ctx,
                                                uocr_metal_vision_weights_f16 *weights,
                                                char *error,
                                                size_t error_size);
@@ -2786,6 +2804,8 @@ static void metal_release_precomputed_vision_tables(uocr_metal_context *ctx) {
     @autoreleasepool {
         [ctx->sam_abs_pos_local_buffer release];
         ctx->sam_abs_pos_local_buffer = nil;
+        [ctx->sam_rel_pos_local_buffer release];
+        ctx->sam_rel_pos_local_buffer = nil;
         [ctx->clip_abs_pos_local_buffer release];
         ctx->clip_abs_pos_local_buffer = nil;
     }
@@ -3148,6 +3168,7 @@ static int metal_refresh_vision_binding_cache(uocr_metal_context *ctx,
     const uint64_t direct_cache_start_ns = uocr_profile_now_ns();
     if (!metal_vision_weight_cache_build_direct(&cache, &weights, error, error_size) ||
         !metal_precompute_sam_abs_pos_tables(ctx, &weights, error, error_size) ||
+        !metal_precompute_sam_rel_pos_tables(ctx, &weights, error, error_size) ||
         !metal_precompute_clip_abs_pos_tables(ctx, &weights, error, error_size)) {
         metal_release_precomputed_vision_tables(ctx);
         return 0;
@@ -4040,6 +4061,216 @@ static int metal_precompute_sam_abs_pos_tables(uocr_metal_context *ctx,
         weights->sam_pos_embed_local.byte_length = target_bytes;
         weights->sam_pos_embed_local.host_f16 = (const uint16_t *)[local_buffer contents];
         metal_profile_add_event_ms(ctx, "metal.vision.sam_abs_pos_precompute.local", 0.0);
+    }
+    return 1;
+}
+
+typedef struct uocr_metal_sam_rel_pos_table_pair_f16 {
+    uocr_metal_vision_tensor_f16 h;
+    uocr_metal_vision_tensor_f16 w;
+    uint32_t h_length;
+    uint32_t w_length;
+} uocr_metal_sam_rel_pos_table_pair_f16;
+
+static int metal_sam_rel_pos_target_length_for_grid(uint32_t grid, uint32_t *out_length) {
+    if (grid == 0u || out_length == NULL || grid > (UINT32_MAX - 1u) / 2u) {
+        return 0;
+    }
+    *out_length = 2u * grid - 1u;
+    return 1;
+}
+
+static int metal_sam_rel_pos_table_values(uint32_t rel_pos_length, uint64_t *out_values) {
+    if (out_values == NULL || rel_pos_length == 0u) {
+        return 0;
+    }
+    return checked_mul_u64((uint64_t)rel_pos_length, (uint64_t)UOCR_SAM_HEAD_DIM, out_values);
+}
+
+static uocr_metal_sam_rel_pos_table_pair_f16 metal_sam_rel_pos_table_for_grid(
+    const uocr_metal_sam_transformer_block_slices_f16 *block,
+    uint32_t grid_w,
+    uint32_t grid_h) {
+    uocr_metal_sam_rel_pos_table_pair_f16 table;
+    memset(&table, 0, sizeof(table));
+    if (block == NULL || grid_w != grid_h) {
+        return table;
+    }
+    uint32_t target_length = 0u;
+    if (!metal_sam_rel_pos_target_length_for_grid(grid_w, &target_length)) {
+        return table;
+    }
+    if (target_length == block->rel_pos_h_local_length && target_length == block->rel_pos_w_local_length &&
+        block->rel_pos_h_local.slice.buffer != nil && block->rel_pos_w_local.slice.buffer != nil) {
+        table.h = block->rel_pos_h_local;
+        table.w = block->rel_pos_w_local;
+        table.h_length = block->rel_pos_h_local_length;
+        table.w_length = block->rel_pos_w_local_length;
+        return table;
+    }
+    table.h = block->rel_pos_h;
+    table.w = block->rel_pos_w;
+    table.h_length = block->rel_pos_h_length;
+    table.w_length = block->rel_pos_w_length;
+    return table;
+}
+
+static int metal_precompute_sam_rel_pos_tables(uocr_metal_context *ctx,
+                                               uocr_metal_vision_weights_f16 *weights,
+                                               char *error,
+                                               size_t error_size) {
+    if (ctx == NULL || weights == NULL || !weights->valid) {
+        return metal_fail(error, error_size, "invalid Metal SAM relative-position precompute request");
+    }
+    @autoreleasepool {
+        [ctx->sam_rel_pos_local_buffer release];
+        ctx->sam_rel_pos_local_buffer = nil;
+    }
+    for (uint32_t layer = 0u; layer < UOCR_SAM_BLOCKS; ++layer) {
+        memset(&weights->sam_block_slices[layer].rel_pos_h_local, 0, sizeof(weights->sam_block_slices[layer].rel_pos_h_local));
+        memset(&weights->sam_block_slices[layer].rel_pos_w_local, 0, sizeof(weights->sam_block_slices[layer].rel_pos_w_local));
+        weights->sam_block_slices[layer].rel_pos_h_local_length = 0u;
+        weights->sam_block_slices[layer].rel_pos_w_local_length = 0u;
+    }
+
+    const uint32_t local_grid = UOCR_LOCAL_VIEW_SIZE / UOCR_VISION_PATCH_SIZE;
+    uint32_t target_length = 0u;
+    if (!metal_sam_rel_pos_target_length_for_grid(local_grid, &target_length)) {
+        return metal_fail(error, error_size, "invalid Metal SAM local relative-position target grid");
+    }
+    if (target_length == UOCR_SAM_MAX_REL_POS_SIZE) {
+        return 1;
+    }
+
+    uint32_t global_attention_blocks = 0u;
+    for (uint32_t layer = 0u; layer < UOCR_SAM_BLOCKS; ++layer) {
+        if (uocr_sam_block_uses_global_attention(layer)) {
+            ++global_attention_blocks;
+        }
+    }
+    if (global_attention_blocks == 0u) {
+        return 1;
+    }
+
+    uint64_t source_values = 0u;
+    uint64_t source_bytes = 0u;
+    uint64_t table_values = 0u;
+    uint64_t table_bytes = 0u;
+    uint64_t total_bytes_u64 = 0u;
+    if (!metal_sam_rel_pos_table_values(UOCR_SAM_MAX_REL_POS_SIZE, &source_values) ||
+        !metal_vision_f16_bytes(source_values, &source_bytes) ||
+        !metal_sam_rel_pos_table_values(target_length, &table_values) ||
+        !metal_vision_f16_bytes(table_values, &table_bytes) || table_values > (uint64_t)UINT32_MAX ||
+        !checked_mul_u64(table_bytes, 2u * (uint64_t)global_attention_blocks, &total_bytes_u64)) {
+        return metal_fail(error, error_size, "Metal SAM relative-position precompute byte-size overflow");
+    }
+    if (total_bytes_u64 > (uint64_t)NSUIntegerMax) {
+        return metal_fail(error, error_size, "Metal SAM relative-position precompute buffer-size overflow");
+    }
+
+    NSUInteger rel_h_offsets[UOCR_SAM_BLOCKS];
+    NSUInteger rel_w_offsets[UOCR_SAM_BLOCKS];
+    memset(rel_h_offsets, 0, sizeof(rel_h_offsets));
+    memset(rel_w_offsets, 0, sizeof(rel_w_offsets));
+
+    @autoreleasepool {
+        id<MTLBuffer> local_buffer = metal_new_buffer_with_length(ctx, (NSUInteger)total_bytes_u64, MTLResourceStorageModeShared);
+        if (local_buffer == nil || [local_buffer contents] == NULL) {
+            [local_buffer release];
+            return metal_fail(error, error_size, "failed to allocate Metal SAM local relative-position tables");
+        }
+        local_buffer.label = @"uocr_sam_rel_pos_local_40x40";
+        memset([local_buffer contents], 0, (size_t)total_bytes_u64);
+
+        id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, "uocr_sam_interpolate_rel_pos_f16", error, error_size);
+        if (pipeline == nil) {
+            [local_buffer release];
+            return 0;
+        }
+        id<MTLCommandBuffer> cb = metal_new_command_buffer(ctx);
+        if (cb == nil) {
+            [local_buffer release];
+            return metal_fail(error, error_size, "failed to create Metal SAM relative-position precompute command buffer");
+        }
+        cb.label = @"uocr_sam_rel_pos_precompute_command_buffer";
+        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
+        if (enc == nil) {
+            [local_buffer release];
+            return metal_fail(error, error_size, "failed to create Metal SAM relative-position precompute encoder");
+        }
+
+        uocr_metal_sam_rel_pos_interpolate_params params;
+        params.source_length = UOCR_SAM_MAX_REL_POS_SIZE;
+        params.target_length = target_length;
+        params.head_dim = UOCR_SAM_HEAD_DIM;
+        params.reserved = 0u;
+        const NSUInteger threads = metal_power2_threadgroup_width(256u, pipeline.maxTotalThreadsPerThreadgroup);
+        NSUInteger dst_offset = 0u;
+        for (uint32_t layer = 0u; layer < UOCR_SAM_BLOCKS; ++layer) {
+            if (!uocr_sam_block_uses_global_attention(layer)) {
+                continue;
+            }
+            uocr_metal_sam_transformer_block_slices_f16 *block = &weights->sam_block_slices[layer];
+            if (block->rel_pos_h_length != UOCR_SAM_MAX_REL_POS_SIZE ||
+                block->rel_pos_w_length != UOCR_SAM_MAX_REL_POS_SIZE ||
+                !metal_vision_require_tensor_slice_f16(block->rel_pos_h,
+                                                       source_bytes,
+                                                       "SAM global relative-position H source table",
+                                                       error,
+                                                       error_size) ||
+                !metal_vision_require_tensor_slice_f16(block->rel_pos_w,
+                                                       source_bytes,
+                                                       "SAM global relative-position W source table",
+                                                       error,
+                                                       error_size)) {
+                [enc endEncoding];
+                [local_buffer release];
+                return 0;
+            }
+
+            rel_h_offsets[layer] = dst_offset;
+            [enc setComputePipelineState:pipeline];
+            [enc setBuffer:block->rel_pos_h.slice.buffer offset:block->rel_pos_h.slice.offset atIndex:0u];
+            [enc setBuffer:local_buffer offset:dst_offset atIndex:1u];
+            [enc setBytes:&params length:sizeof(params) atIndex:2u];
+            [enc dispatchThreads:MTLSizeMake((NSUInteger)table_values, 1u, 1u)
+           threadsPerThreadgroup:MTLSizeMake(threads, 1u, 1u)];
+            dst_offset += (NSUInteger)table_bytes;
+
+            rel_w_offsets[layer] = dst_offset;
+            [enc setComputePipelineState:pipeline];
+            [enc setBuffer:block->rel_pos_w.slice.buffer offset:block->rel_pos_w.slice.offset atIndex:0u];
+            [enc setBuffer:local_buffer offset:dst_offset atIndex:1u];
+            [enc setBytes:&params length:sizeof(params) atIndex:2u];
+            [enc dispatchThreads:MTLSizeMake((NSUInteger)table_values, 1u, 1u)
+           threadsPerThreadgroup:MTLSizeMake(threads, 1u, 1u)];
+            dst_offset += (NSUInteger)table_bytes;
+        }
+        [enc endEncoding];
+        if (!metal_wait_for_command_buffer_profiled(ctx, cb, "Metal SAM relative-position precompute", error, error_size)) {
+            [local_buffer release];
+            return 0;
+        }
+
+        ctx->sam_rel_pos_local_buffer = local_buffer;
+        const uint8_t *contents = (const uint8_t *)[local_buffer contents];
+        for (uint32_t layer = 0u; layer < UOCR_SAM_BLOCKS; ++layer) {
+            if (!uocr_sam_block_uses_global_attention(layer)) {
+                continue;
+            }
+            uocr_metal_sam_transformer_block_slices_f16 *block = &weights->sam_block_slices[layer];
+            block->rel_pos_h_local.slice.buffer = local_buffer;
+            block->rel_pos_h_local.slice.offset = rel_h_offsets[layer];
+            block->rel_pos_h_local.byte_length = table_bytes;
+            block->rel_pos_h_local.host_f16 = (const uint16_t *)(const void *)(contents + rel_h_offsets[layer]);
+            block->rel_pos_h_local_length = target_length;
+            block->rel_pos_w_local.slice.buffer = local_buffer;
+            block->rel_pos_w_local.slice.offset = rel_w_offsets[layer];
+            block->rel_pos_w_local.byte_length = table_bytes;
+            block->rel_pos_w_local.host_f16 = (const uint16_t *)(const void *)(contents + rel_w_offsets[layer]);
+            block->rel_pos_w_local_length = target_length;
+        }
+        metal_profile_add_event_ms(ctx, "metal.vision.sam_rel_pos_precompute.local", 0.0);
     }
     return 1;
 }
@@ -18621,19 +18852,20 @@ static int metal_context_sam_transformer_batch_block_workspace_f16_to_slice(uocr
                                                                "Metal SAM batch global QKV MPS matmul",
                                                                error,
                                                                error_size));
+        const uocr_metal_sam_rel_pos_table_pair_f16 rel_pos = metal_sam_rel_pos_table_for_grid(block, grid_w, grid_h);
         RUN_SAM_BATCH_BLOCK_STEP("relative-position attention",
                                  metal_context_sam_rel_pos_attention_batch_f16_to_slice(ctx,
                                                                                        scratch->sam_block_q,
                                                                                        scratch->sam_block_k,
                                                                                        scratch->sam_block_v,
-                                                                                       block->rel_pos_h,
-                                                                                       block->rel_pos_w,
+                                                                                       rel_pos.h,
+                                                                                       rel_pos.w,
                                                                                        1u,
                                                                                        grid_w,
                                                                                        grid_h,
                                                                                        view_count,
-                                                                                       block->rel_pos_h_length,
-                                                                                       block->rel_pos_w_length,
+                                                                                       rel_pos.h_length,
+                                                                                       rel_pos.w_length,
                                                                                        scratch->sam_block_attention,
                                                                                        error,
                                                                                        error_size));
@@ -18697,19 +18929,22 @@ static int metal_context_sam_transformer_batch_block_workspace_f16_to_slice(uocr
                                                                "Metal SAM batch window QKV MPS matmul",
                                                                error,
                                                                error_size));
+        const uocr_metal_sam_rel_pos_table_pair_f16 rel_pos = metal_sam_rel_pos_table_for_grid(block,
+                                                                                                  UOCR_SAM_WINDOW_SIZE,
+                                                                                                  UOCR_SAM_WINDOW_SIZE);
         RUN_SAM_BATCH_BLOCK_STEP("window relative-position attention",
                                  metal_context_sam_rel_pos_attention_batch_f16_to_slice(ctx,
                                                                                        scratch->sam_block_q,
                                                                                        scratch->sam_block_k,
                                                                                        scratch->sam_block_v,
-                                                                                       block->rel_pos_h,
-                                                                                       block->rel_pos_w,
+                                                                                       rel_pos.h,
+                                                                                       rel_pos.w,
                                                                                        n_windows,
                                                                                        UOCR_SAM_WINDOW_SIZE,
                                                                                        UOCR_SAM_WINDOW_SIZE,
                                                                                        view_count,
-                                                                                       block->rel_pos_h_length,
-                                                                                       block->rel_pos_w_length,
+                                                                                       rel_pos.h_length,
+                                                                                       rel_pos.w_length,
                                                                                        scratch->sam_block_attention,
                                                                                        error,
                                                                                        error_size));
