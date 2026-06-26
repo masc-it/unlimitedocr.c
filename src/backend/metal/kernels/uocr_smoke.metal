@@ -4408,9 +4408,9 @@ kernel void uocr_sam_rel_pos_attention_flash_f16_to_f32(device const half *q_src
     uocr_sam_rel_pos_attention_flash_impl(q_src, k_src, v_src, rel_pos_h, rel_pos_w, dst, params, tg, lane, simdgroup);
 }
 
-#define UOCR_SAM_GLOBAL_REL_POS_TILE_KEYS 16u
+#define UOCR_SAM_REL_POS_TILE_KEYS 16u
 
-kernel void uocr_sam_global_rel_pos_attention_tiled_f16_to_f16(device const half *q_src [[buffer(0)]],
+kernel void uocr_sam_rel_pos_attention_tiled_f16_to_f16(device const half *q_src [[buffer(0)]],
                                                                device const half *k_src [[buffer(1)]],
                                                                device const half *v_src [[buffer(2)]],
                                                                device const half *rel_pos_h [[buffer(3)]],
@@ -4463,8 +4463,8 @@ kernel void uocr_sam_global_rel_pos_attention_tiled_f16_to_f16(device const half
 
     float m = UOCR_FLASH_NEG_INF;
     float l = 0.0f;
-    for (uint tile_start = 0u; tile_start < params.tokens_per_window; tile_start += UOCR_SAM_GLOBAL_REL_POS_TILE_KEYS) {
-        const uint tile_count = min(UOCR_SAM_GLOBAL_REL_POS_TILE_KEYS, params.tokens_per_window - tile_start);
+    for (uint tile_start = 0u; tile_start < params.tokens_per_window; tile_start += UOCR_SAM_REL_POS_TILE_KEYS) {
+        const uint tile_count = min(UOCR_SAM_REL_POS_TILE_KEYS, params.tokens_per_window - tile_start);
         const uint tile_values = tile_count * params.head_dim;
         for (uint tile_index = tid; tile_index < tile_values; tile_index += ntg) {
             const uint key_offset = tile_index / params.head_dim;

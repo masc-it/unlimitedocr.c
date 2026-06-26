@@ -18586,11 +18586,16 @@ static int metal_context_sam_rel_pos_attention_batch_f16_to_slice(uocr_metal_con
     }
     const uint32_t target_h_length = 2u * grid_h - 1u;
     const uint32_t target_w_length = 2u * grid_w - 1u;
-    const int use_tiled_global = n_windows == 1u && rel_pos_h_length == target_h_length && rel_pos_w_length == target_w_length;
-    const char *kernel_name = use_tiled_global ?
-                              "uocr_sam_global_rel_pos_attention_tiled_f16_to_f16" :
+    const int rel_pos_tables_match_target = rel_pos_h_length == target_h_length && rel_pos_w_length == target_w_length;
+    const int use_tiled_global = n_windows == 1u && rel_pos_tables_match_target;
+    const int use_tiled_window = n_windows > 1u && grid_w == UOCR_SAM_WINDOW_SIZE && grid_h == UOCR_SAM_WINDOW_SIZE &&
+                                 rel_pos_tables_match_target;
+    const int use_tiled_attention = use_tiled_global || use_tiled_window;
+    const char *kernel_name = use_tiled_attention ?
+                              "uocr_sam_rel_pos_attention_tiled_f16_to_f16" :
                               "uocr_sam_rel_pos_attention_flash_f16_to_f16";
-    const char *op_name = use_tiled_global ? "Metal SAM global tiled rel-pos attention" : "Metal SAM rel-pos batch attention";
+    const char *op_name = use_tiled_global ? "Metal SAM global tiled rel-pos attention" :
+                          (use_tiled_window ? "Metal SAM window tiled rel-pos attention" : "Metal SAM rel-pos batch attention");
 
     @autoreleasepool {
         id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, kernel_name, error, error_size);
@@ -18634,7 +18639,7 @@ static int metal_context_sam_rel_pos_attention_batch_f16_to_slice(uocr_metal_con
         [enc setBuffer:rel_pos_w.slice.buffer offset:rel_pos_w.slice.offset atIndex:4u];
         [enc setBuffer:out.buffer offset:out.offset atIndex:5u];
         [enc setBytes:&params length:sizeof(params) atIndex:6u];
-        if (use_tiled_global) {
+        if (use_tiled_attention) {
             const NSUInteger tile_keys = 16u;
             const NSUInteger tile_bytes = tile_keys * (NSUInteger)UOCR_SAM_HEAD_DIM * sizeof(uint16_t);
             [enc setThreadgroupMemoryLength:tile_bytes atIndex:0u];
