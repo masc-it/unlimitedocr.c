@@ -11650,6 +11650,15 @@ int uocr_metal_context_sam_patch_embed_f16(uocr_metal_context *ctx,
             [pixel_buffer release];
             return 0;
         }
+        const NSUInteger threads_x = metal_power2_threadgroup_width(256u, pipeline.maxTotalThreadsPerThreadgroup);
+        const uint64_t partial_bytes = (uint64_t)threads_x * (uint64_t)sizeof(float);
+        if (partial_bytes > (uint64_t)ctx->device.maxThreadgroupMemoryLength) {
+            [output_buffer release];
+            [bias_buffer release];
+            [weight_buffer release];
+            [pixel_buffer release];
+            return metal_fail(error, error_size, "Metal SAM patch-embed tiled reduction exceeds threadgroup memory limit");
+        }
 
         id<MTLCommandBuffer> cb = metal_new_command_buffer(ctx);
         if (cb == nil) {
@@ -11684,18 +11693,9 @@ int uocr_metal_context_sam_patch_embed_f16(uocr_metal_context *ctx,
         [enc setBuffer:output_buffer offset:output_offset atIndex:3u];
         [enc setBytes:&params length:sizeof(params) atIndex:4u];
 
-        NSUInteger threads_x = pipeline.threadExecutionWidth;
-        if (threads_x == 0u || threads_x > (NSUInteger)UOCR_SAM_HIDDEN_SIZE) {
-            threads_x = 32u;
-        }
-        if (threads_x > pipeline.maxTotalThreadsPerThreadgroup) {
-            threads_x = pipeline.maxTotalThreadsPerThreadgroup;
-        }
-        if (threads_x == 0u) {
-            threads_x = 1u;
-        }
-        [enc dispatchThreads:MTLSizeMake((NSUInteger)UOCR_SAM_HIDDEN_SIZE, (NSUInteger)output_patches, 1u)
-       threadsPerThreadgroup:MTLSizeMake(threads_x, 1u, 1u)];
+        [enc setThreadgroupMemoryLength:(NSUInteger)partial_bytes atIndex:0u];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)UOCR_SAM_HIDDEN_SIZE, (NSUInteger)output_patches, 1u)
+             threadsPerThreadgroup:MTLSizeMake(threads_x, 1u, 1u)];
         [enc endEncoding];
         UOCR_METAL_COMMIT_AND_WAIT_PROFILED(ctx, cb);
 

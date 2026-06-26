@@ -353,9 +353,14 @@ kernel void uocr_sam_patch_embed_f16_input(device const half *pixels [[buffer(0)
                                            device const half *bias [[buffer(2)]],
                                            device half *dst_bhwc [[buffer(3)]],
                                            constant UocrSamPatchEmbedParams &params [[buffer(4)]],
-                                           uint2 gid [[thread_position_in_grid]]) {
-    const uint out_channel = gid.x;
-    const uint patch_index = gid.y;
+                                           threadgroup float *partials [[threadgroup(0)]],
+                                           uint2 block [[threadgroup_position_in_grid]],
+                                           uint2 tid2 [[thread_position_in_threadgroup]],
+                                           uint2 ntg2 [[threads_per_threadgroup]]) {
+    const uint tid = tid2.x;
+    const uint ntg = ntg2.x;
+    const uint out_channel = block.x;
+    const uint patch_index = block.y;
     if (out_channel >= 768u || patch_index >= params.out_width * params.out_height) {
         return;
     }
@@ -365,19 +370,30 @@ kernel void uocr_sam_patch_embed_f16_input(device const half *pixels [[buffer(0)
     const uint input_y0 = patch_y * 16u;
     const uint input_x0 = patch_x * 16u;
 
-    float acc = params.has_bias != 0u ? float(bias[out_channel]) : 0.0f;
-    for (uint c = 0u; c < 3u; ++c) {
-        const uint channel_base = c * params.height * params.width;
-        for (uint ky = 0u; ky < 16u; ++ky) {
-            const uint input_row = channel_base + (input_y0 + ky) * params.width + input_x0;
-            for (uint kx = 0u; kx < 16u; ++kx) {
-                const float x = float(pixels[input_row + kx]);
-                const float w = float(weight[uocr_sam_patch_weight_index(out_channel, c, ky, kx)]);
-                acc += x * w;
-            }
-        }
+    float acc = 0.0f;
+    for (uint linear = tid; linear < 3u * 16u * 16u; linear += ntg) {
+        const uint c = linear / (16u * 16u);
+        const uint rem = linear - c * 16u * 16u;
+        const uint ky = rem / 16u;
+        const uint kx = rem - ky * 16u;
+        const uint pixel_index = c * params.height * params.width + (input_y0 + ky) * params.width + input_x0 + kx;
+        const float x = float(pixels[pixel_index]);
+        const float w = float(weight[uocr_sam_patch_weight_index(out_channel, c, ky, kx)]);
+        acc += x * w;
     }
-    dst_bhwc[patch_index * 768u + out_channel] = half(acc);
+    partials[tid] = acc;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = ntg >> 1; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            partials[tid] += partials[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0u) {
+        const float value = partials[0] + (params.has_bias != 0u ? float(bias[out_channel]) : 0.0f);
+        dst_bhwc[patch_index * 768u + out_channel] = half(value);
+    }
 }
 
 kernel void uocr_sam_patch_embed_f32_input(device const float *pixels [[buffer(0)]],
@@ -385,9 +401,14 @@ kernel void uocr_sam_patch_embed_f32_input(device const float *pixels [[buffer(0
                                            device const half *bias [[buffer(2)]],
                                            device half *dst_bhwc [[buffer(3)]],
                                            constant UocrSamPatchEmbedParams &params [[buffer(4)]],
-                                           uint2 gid [[thread_position_in_grid]]) {
-    const uint out_channel = gid.x;
-    const uint patch_index = gid.y;
+                                           threadgroup float *partials [[threadgroup(0)]],
+                                           uint2 block [[threadgroup_position_in_grid]],
+                                           uint2 tid2 [[thread_position_in_threadgroup]],
+                                           uint2 ntg2 [[threads_per_threadgroup]]) {
+    const uint tid = tid2.x;
+    const uint ntg = ntg2.x;
+    const uint out_channel = block.x;
+    const uint patch_index = block.y;
     if (out_channel >= 768u || patch_index >= params.out_width * params.out_height) {
         return;
     }
@@ -397,19 +418,30 @@ kernel void uocr_sam_patch_embed_f32_input(device const float *pixels [[buffer(0
     const uint input_y0 = patch_y * 16u;
     const uint input_x0 = patch_x * 16u;
 
-    float acc = params.has_bias != 0u ? float(bias[out_channel]) : 0.0f;
-    for (uint c = 0u; c < 3u; ++c) {
-        const uint channel_base = c * params.height * params.width;
-        for (uint ky = 0u; ky < 16u; ++ky) {
-            const uint input_row = channel_base + (input_y0 + ky) * params.width + input_x0;
-            for (uint kx = 0u; kx < 16u; ++kx) {
-                const float x = pixels[input_row + kx];
-                const float w = float(weight[uocr_sam_patch_weight_index(out_channel, c, ky, kx)]);
-                acc += x * w;
-            }
-        }
+    float acc = 0.0f;
+    for (uint linear = tid; linear < 3u * 16u * 16u; linear += ntg) {
+        const uint c = linear / (16u * 16u);
+        const uint rem = linear - c * 16u * 16u;
+        const uint ky = rem / 16u;
+        const uint kx = rem - ky * 16u;
+        const uint pixel_index = c * params.height * params.width + (input_y0 + ky) * params.width + input_x0 + kx;
+        const float x = pixels[pixel_index];
+        const float w = float(weight[uocr_sam_patch_weight_index(out_channel, c, ky, kx)]);
+        acc += x * w;
     }
-    dst_bhwc[patch_index * 768u + out_channel] = half(acc);
+    partials[tid] = acc;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = ntg >> 1; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            partials[tid] += partials[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0u) {
+        const float value = partials[0] + (params.has_bias != 0u ? float(bias[out_channel]) : 0.0f);
+        dst_bhwc[patch_index * 768u + out_channel] = half(value);
+    }
 }
 
 struct UocrSamAbsPosParams {

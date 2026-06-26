@@ -125,7 +125,7 @@ Implementation status:
 - [ ] Precompute CLIP absolute position tables during conversion for `16x16` and `10x10` patch grids.
 - [x] Use MPSNDArray matrix multiplication for SAM QKV, SAM output projection, SAM MLP, CLIP QKV, CLIP output projection, CLIP MLP, and projector dense GEMMs.
 - [x] Cache all MPS descriptors and weight NDArrays at model map time.
-- [ ] Replace SAM patch embed with a custom tiled patch kernel.
+- [x] Replace SAM patch embed with a custom tiled patch kernel.
 - [ ] Replace SAM neck 1x1, neck 3x3, net_2, and net_3 with custom tiled convolution kernels.
 - [ ] Fuse vision epilogues into fixed kernels: bias, GELU, QuickGELU, residual add, and layout conversion.
 - [ ] Validate base/global and local-crop parity against current fixture/golden outputs.
