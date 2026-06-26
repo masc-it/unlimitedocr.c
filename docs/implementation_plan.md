@@ -43,7 +43,7 @@ alternate implementations in the public OCR path.
 Implementation status:
 
 - [ ] Use **same-shape batched vision command graphs**: one command buffer for the full local `640x640` batch and one command buffer for the global `1024x1024` batch.
-- [ ] Use **GPU-private vision workspace** for all intermediate SAM, CLIP, concat, projector, and formatted visual rows.
+- [x] Use **GPU-private vision workspace** for all intermediate SAM, CLIP, concat, projector, and formatted visual rows.
 - [ ] Use **MPSNDArray matrix multiplication** for large dense GEMMs in SAM, CLIP, projector, and decoder prefill.
 - [ ] Use **custom tiled Metal kernels** for SAM attention, SAM patch/neck/stride convolutions, visual formatting, decode single-token matvecs, routed/shared MoE, and LM-head argmax.
 - [x] Use **persistent GPU token-id buffers** and fold prompt assembly into the prefill command graph.
@@ -91,7 +91,7 @@ Implementation status:
 - [x] Make production vision helpers accept `uocr_metal_buffer_slice` inputs and outputs, not host pointers.
 - [x] Route production per-view projected-row output through Metal workspace slices so chunk formatting consumes the reusable workspace slice directly.
 - [x] Allocate vision intermediates from GPU-private workspace slices.
-- [ ] Keep only input pixels and final generated-token readback CPU-visible.
+- [x] Keep only input pixels and final generated-token readback CPU-visible.
 - [ ] Preserve exact final feature order: local crops first, global rows, newline rows, separator rows, and multi-page order.
 - [ ] Add profiles for base, max-crop gundam, and multi-page base after batching lands.
 - [ ] Delete the serial one-view production path after batched dispatch passes parity and timing gates.

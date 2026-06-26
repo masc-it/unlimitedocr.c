@@ -201,7 +201,7 @@ static int test_engine_memory_report(void) {
     CHECK(report.estimated_vision_scratch_bytes == 0u);
     CHECK(report.estimated_decoder_scratch_bytes > 0u);
     CHECK(report.estimated_moe_scratch_bytes > 0u);
-    CHECK(report.estimated_logits_readback_bytes == 129280u * 4u + 4u);
+    CHECK(report.estimated_logits_readback_bytes == sizeof(int32_t) + sizeof(float));
     CHECK(report.estimated_safety_margin_bytes > 0u);
     CHECK(report.estimated_total_bytes == report.estimated_kv_cache_bytes +
                                             report.estimated_prompt_embeddings_bytes +

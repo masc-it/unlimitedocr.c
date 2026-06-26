@@ -441,13 +441,11 @@ int uocr_estimate_logits_readback_bytes(uint32_t batch_slots, uint64_t *out_byte
         return UOCR_ERROR_INVALID_ARGUMENT;
     }
 
-    uint64_t logits_values = 0u;
-    uint64_t logits_bytes = 0u;
     uint64_t next_token_bytes = 0u;
-    if (!checked_mul_u64((uint64_t)batch_slots, (uint64_t)UOCR_VOCAB_SIZE, &logits_values) ||
-        !checked_mul_u64(logits_values, (uint64_t)sizeof(float), &logits_bytes) ||
-        !checked_mul_u64((uint64_t)batch_slots, (uint64_t)sizeof(int32_t), &next_token_bytes) ||
-        !checked_add_u64(logits_bytes, next_token_bytes, out_bytes)) {
+    uint64_t score_bytes = 0u;
+    if (!checked_mul_u64((uint64_t)batch_slots, (uint64_t)sizeof(int32_t), &next_token_bytes) ||
+        !checked_mul_u64((uint64_t)batch_slots, (uint64_t)sizeof(float), &score_bytes) ||
+        !checked_add_u64(next_token_bytes, score_bytes, out_bytes)) {
         return UOCR_ERROR_OUT_OF_MEMORY;
     }
 
