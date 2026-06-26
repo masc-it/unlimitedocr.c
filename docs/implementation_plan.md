@@ -89,7 +89,8 @@ Implementation status:
 - [x] Add a batch dimension to CLIP/SAM concat and visual projector dispatch.
 - [x] Add a batch dimension to CLIP embedding front-end dispatch.
 - [x] Add a batch dimension to SAM neck/net dispatch.
-- [ ] Add a batch dimension to SAM transformer and CLIP transformer dispatch.
+- [x] Add a batch dimension to CLIP transformer dispatch.
+- [ ] Add a batch dimension to SAM transformer dispatch.
 - [x] Encode the entire local shape group in one command buffer.
 - [x] Encode the entire global shape group in one command buffer.
 - [x] Make production vision helpers accept `uocr_metal_buffer_slice` inputs and outputs, not host pointers.

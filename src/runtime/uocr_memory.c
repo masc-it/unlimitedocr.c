@@ -219,8 +219,8 @@ int uocr_estimate_vision_memory_for_shape(uint32_t max_view_size,
      * uocr_metal_vision_workspace: aligned fp16 slices for SAM patch/position/
      * transformer state, SAM/CLIP transformer block scratch, chunk-batched
      * SAM transformer/neck/net state, chunk-batched SAM patch/net3 outputs,
-     * chunk-batched CLIP final
-     * tokens, chunk concat, projected rows, and final formatted rows.
+     * chunk-batched CLIP transformer/final tokens, chunk concat, projected
+     * rows, and final formatted rows.
      * Production vision transformer scratch is GPU/workspace-resident;
      * diagnostic host staging is not part of the public request-shaped
      * workspace estimate.
@@ -253,6 +253,7 @@ int uocr_estimate_vision_memory_for_shape(uint32_t max_view_size,
     uint64_t clip_values = 0u;
     uint64_t clip_final_values = 0u;
     uint64_t clip_mlp_values = 0u;
+    uint64_t clip_mlp_batch_values = 0u;
     uint64_t concat_values = 0u;
     uint64_t projected_values = 0u;
     uint64_t final_visual_values = 0u;
@@ -281,6 +282,7 @@ int uocr_estimate_vision_memory_for_shape(uint32_t max_view_size,
         !checked_mul_u64(clip_tokens, (uint64_t)UOCR_CLIP_HIDDEN_SIZE, &clip_values) ||
         !checked_mul_u64(clip_values, chunk_view_capacity, &clip_final_values) ||
         !checked_mul_u64(clip_tokens, (uint64_t)UOCR_CLIP_MLP_INTERMEDIATE, &clip_mlp_values) ||
+        !checked_mul_u64(clip_mlp_values, chunk_view_capacity, &clip_mlp_batch_values) ||
         !checked_mul_u64((uint64_t)max_chunk_projected_rows, (uint64_t)UOCR_PROJECTOR_IN_SIZE, &concat_values) ||
         !checked_mul_u64((uint64_t)max_chunk_projected_rows, (uint64_t)UOCR_HIDDEN_SIZE, &projected_values) ||
         !checked_mul_u64((uint64_t)final_visual_rows, (uint64_t)UOCR_HIDDEN_SIZE, &final_visual_values) ||
@@ -307,17 +309,17 @@ int uocr_estimate_vision_memory_for_shape(uint32_t max_view_size,
         !add_aligned_f16_slice_bytes(&total, clip_final_values) ||
         !add_aligned_f16_slice_bytes(&total, clip_final_values) ||
         !add_aligned_f16_slice_bytes(&total, clip_final_values) ||
-        !add_aligned_f16_slice_bytes(&total, clip_values) ||
-        !add_aligned_f16_slice_bytes(&total, clip_values) ||
-        !add_aligned_f16_slice_bytes(&total, clip_values) ||
-        !add_aligned_f16_slice_bytes(&total, clip_values) ||
-        !add_aligned_f16_slice_bytes(&total, clip_values) ||
-        !add_aligned_f16_slice_bytes(&total, clip_values) ||
-        !add_aligned_f16_slice_bytes(&total, clip_values) ||
-        !add_aligned_f16_slice_bytes(&total, clip_values) ||
-        !add_aligned_f16_slice_bytes(&total, clip_values) ||
-        !add_aligned_f16_slice_bytes(&total, clip_mlp_values) ||
-        !add_aligned_f16_slice_bytes(&total, clip_mlp_values) ||
+        !add_aligned_f16_slice_bytes(&total, clip_final_values) ||
+        !add_aligned_f16_slice_bytes(&total, clip_final_values) ||
+        !add_aligned_f16_slice_bytes(&total, clip_final_values) ||
+        !add_aligned_f16_slice_bytes(&total, clip_final_values) ||
+        !add_aligned_f16_slice_bytes(&total, clip_final_values) ||
+        !add_aligned_f16_slice_bytes(&total, clip_final_values) ||
+        !add_aligned_f16_slice_bytes(&total, clip_final_values) ||
+        !add_aligned_f16_slice_bytes(&total, clip_final_values) ||
+        !add_aligned_f16_slice_bytes(&total, clip_final_values) ||
+        !add_aligned_f16_slice_bytes(&total, clip_mlp_batch_values) ||
+        !add_aligned_f16_slice_bytes(&total, clip_mlp_batch_values) ||
         !add_aligned_f16_slice_bytes(&total, concat_values) ||
         !add_aligned_f16_slice_bytes(&total, projected_values) ||
         !add_aligned_f16_slice_bytes(&total, final_visual_values)) {

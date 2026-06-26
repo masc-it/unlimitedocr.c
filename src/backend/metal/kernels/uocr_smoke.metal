@@ -1203,19 +1203,26 @@ struct UocrSamWindowAttentionParams {
     uint heads;
     uint head_dim;
     float scale;
-    uint reserved0;
+    uint batch_size;
     uint reserved1;
     uint reserved2;
 };
 
+static inline uint uocr_sam_window_attention_batch_size(constant UocrSamWindowAttentionParams &params) {
+    return params.batch_size == 0u ? 1u : params.batch_size;
+}
+
 static inline ulong uocr_sam_window_attention_index(constant UocrSamWindowAttentionParams &params,
+                                                    uint batch,
                                                     uint window,
                                                     uint token,
                                                     uint head,
                                                     uint dim) {
-    return (((ulong(window) * ulong(params.tokens_per_window) + ulong(token)) * ulong(params.heads) + ulong(head)) *
-            ulong(params.head_dim)) +
-           ulong(dim);
+    return (((((ulong(batch) * ulong(params.windows) + ulong(window)) * ulong(params.tokens_per_window) + ulong(token)) *
+              ulong(params.heads) +
+              ulong(head)) *
+             ulong(params.head_dim)) +
+            ulong(dim));
 }
 
 struct UocrSamRelPosAttentionParams {
@@ -4148,8 +4155,11 @@ static inline void uocr_sam_window_attention_flash_impl(device const half *q_src
     const uint query_in_block = uint(simdgroup_u16);
     const uint head = tg.x;
     const uint query_token = tg.y * UOCR_FLASH_Q_PER_TG + query_in_block;
-    const uint window = tg.z;
-    if (query_in_block >= UOCR_FLASH_Q_PER_TG || window >= params.windows ||
+    const uint batch_size = uocr_sam_window_attention_batch_size(params);
+    const uint logical_window = tg.z;
+    const uint batch = params.windows == 0u ? 0u : logical_window / params.windows;
+    const uint window = params.windows == 0u ? 0u : logical_window - batch * params.windows;
+    if (query_in_block >= UOCR_FLASH_Q_PER_TG || params.windows == 0u || batch >= batch_size || window >= params.windows ||
         query_token >= params.tokens_per_window || head >= params.heads ||
         params.head_dim == 0u || params.head_dim > UOCR_FLASH_SIMD_WIDTH * UOCR_FLASH_MAX_LANE_VALUES) {
         return;
@@ -4160,7 +4170,7 @@ static inline void uocr_sam_window_attention_flash_impl(device const half *q_src
     for (uint i = 0u; i < UOCR_FLASH_MAX_LANE_VALUES; ++i) {
         const uint dim = uocr_flash_lane_dim(lane, i);
         if (dim < params.head_dim) {
-            const ulong q_index = uocr_sam_window_attention_index(params, window, query_token, head, dim);
+            const ulong q_index = uocr_sam_window_attention_index(params, batch, window, query_token, head, dim);
             qv[i] = float(q_src[q_index]);
         } else {
             qv[i] = 0.0f;
@@ -4175,7 +4185,7 @@ static inline void uocr_sam_window_attention_flash_impl(device const half *q_src
         for (uint i = 0u; i < UOCR_FLASH_MAX_LANE_VALUES; ++i) {
             const uint dim = uocr_flash_lane_dim(lane, i);
             if (dim < params.head_dim) {
-                const ulong k_index = uocr_sam_window_attention_index(params, window, key_token, head, dim);
+                const ulong k_index = uocr_sam_window_attention_index(params, batch, window, key_token, head, dim);
                 local_dot += qv[i] * float(k_src[k_index]);
             }
         }
@@ -4186,7 +4196,7 @@ static inline void uocr_sam_window_attention_flash_impl(device const half *q_src
         for (uint i = 0u; i < UOCR_FLASH_MAX_LANE_VALUES; ++i) {
             const uint dim = uocr_flash_lane_dim(lane, i);
             if (dim < params.head_dim) {
-                const ulong v_index = uocr_sam_window_attention_index(params, window, key_token, head, dim);
+                const ulong v_index = uocr_sam_window_attention_index(params, batch, window, key_token, head, dim);
                 acc[i] = acc[i] * corr + e * float(v_src[v_index]);
             }
         }
@@ -4198,7 +4208,7 @@ static inline void uocr_sam_window_attention_flash_impl(device const half *q_src
     for (uint i = 0u; i < UOCR_FLASH_MAX_LANE_VALUES; ++i) {
         const uint dim = uocr_flash_lane_dim(lane, i);
         if (dim < params.head_dim) {
-            const ulong dst_index = uocr_sam_window_attention_index(params, window, query_token, head, dim);
+            const ulong dst_index = uocr_sam_window_attention_index(params, batch, window, query_token, head, dim);
             dst[dst_index] = out_t(acc[i] * inv_l);
         }
     }

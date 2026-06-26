@@ -819,7 +819,7 @@ typedef struct uocr_metal_sam_window_attention_params {
     uint32_t heads;
     uint32_t head_dim;
     float scale;
-    uint32_t reserved0;
+    uint32_t batch_size;
     uint32_t reserved1;
     uint32_t reserved2;
 } uocr_metal_sam_window_attention_params;
@@ -3579,6 +3579,7 @@ static int metal_vision_workspace_init(uocr_metal_context *ctx,
     uint64_t sam_net3_values = 0u;
     uint64_t clip_values = 0u;
     uint64_t clip_final_values = 0u;
+    uint64_t clip_mlp_batch_values = 0u;
     uint64_t concat_values = 0u;
     if (!checked_mul_u64(clip_tokens, (uint64_t)UOCR_CLIP_HIDDEN_SIZE, &clip_values) ||
         !checked_mul_u64(sam_transformer_batch_values_per_view, clip_view_capacity, &sam_transformer_batch_values) ||
@@ -3605,7 +3606,8 @@ static int metal_vision_workspace_init(uocr_metal_context *ctx,
                          (uint64_t)UOCR_SAM_HIDDEN_SIZE,
                          &sam_attention_values) ||
         !checked_mul_u64(patch_tokens, (uint64_t)UOCR_SAM_MLP_INTERMEDIATE, &sam_mlp_values) ||
-        !checked_mul_u64(clip_tokens, (uint64_t)UOCR_CLIP_MLP_INTERMEDIATE, &clip_mlp_values)) {
+        !checked_mul_u64(clip_tokens, (uint64_t)UOCR_CLIP_MLP_INTERMEDIATE, &clip_mlp_values) ||
+        !checked_mul_u64(clip_mlp_values, clip_view_capacity, &clip_mlp_batch_values)) {
         return metal_fail(error, error_size, "Metal transformer vision workspace byte-size overflow");
     }
     if (projected_row_capacity != 0u &&
@@ -3652,17 +3654,17 @@ static int metal_vision_workspace_init(uocr_metal_context *ctx,
     ADD_WORKSPACE_SLICE(clip_final_values, "CLIP token A");
     ADD_WORKSPACE_SLICE(clip_final_values, "CLIP token B");
     ADD_WORKSPACE_SLICE(clip_final_values, "CLIP transformer output");
-    ADD_WORKSPACE_SLICE(clip_values, "CLIP block norm1");
-    ADD_WORKSPACE_SLICE(clip_values, "CLIP block Q");
-    ADD_WORKSPACE_SLICE(clip_values, "CLIP block K");
-    ADD_WORKSPACE_SLICE(clip_values, "CLIP block V");
-    ADD_WORKSPACE_SLICE(clip_values, "CLIP block attention");
-    ADD_WORKSPACE_SLICE(clip_values, "CLIP block projected");
-    ADD_WORKSPACE_SLICE(clip_values, "CLIP block residual1");
-    ADD_WORKSPACE_SLICE(clip_values, "CLIP block norm2");
-    ADD_WORKSPACE_SLICE(clip_values, "CLIP block MLP");
-    ADD_WORKSPACE_SLICE(clip_mlp_values, "CLIP MLP fc1");
-    ADD_WORKSPACE_SLICE(clip_mlp_values, "CLIP MLP activated");
+    ADD_WORKSPACE_SLICE(clip_final_values, "CLIP block norm1");
+    ADD_WORKSPACE_SLICE(clip_final_values, "CLIP block Q");
+    ADD_WORKSPACE_SLICE(clip_final_values, "CLIP block K");
+    ADD_WORKSPACE_SLICE(clip_final_values, "CLIP block V");
+    ADD_WORKSPACE_SLICE(clip_final_values, "CLIP block attention");
+    ADD_WORKSPACE_SLICE(clip_final_values, "CLIP block projected");
+    ADD_WORKSPACE_SLICE(clip_final_values, "CLIP block residual1");
+    ADD_WORKSPACE_SLICE(clip_final_values, "CLIP block norm2");
+    ADD_WORKSPACE_SLICE(clip_final_values, "CLIP block MLP");
+    ADD_WORKSPACE_SLICE(clip_mlp_batch_values, "CLIP MLP fc1");
+    ADD_WORKSPACE_SLICE(clip_mlp_batch_values, "CLIP MLP activated");
     ADD_WORKSPACE_SLICE(concat_values, "CLIP/SAM concat");
     if (projected_values != 0u) {
         ADD_WORKSPACE_SLICE(projected_values, "projected visual chunk rows");
@@ -3724,17 +3726,17 @@ static int metal_vision_workspace_init(uocr_metal_context *ctx,
     ASSIGN_WORKSPACE_SLICE(clip_a, clip_final_values, "CLIP token A");
     ASSIGN_WORKSPACE_SLICE(clip_b, clip_final_values, "CLIP token B");
     ASSIGN_WORKSPACE_SLICE(clip_final, clip_final_values, "CLIP transformer output");
-    ASSIGN_WORKSPACE_SLICE(clip_block_norm1, clip_values, "CLIP block norm1");
-    ASSIGN_WORKSPACE_SLICE(clip_block_q, clip_values, "CLIP block Q");
-    ASSIGN_WORKSPACE_SLICE(clip_block_k, clip_values, "CLIP block K");
-    ASSIGN_WORKSPACE_SLICE(clip_block_v, clip_values, "CLIP block V");
-    ASSIGN_WORKSPACE_SLICE(clip_block_attention, clip_values, "CLIP block attention");
-    ASSIGN_WORKSPACE_SLICE(clip_block_projected, clip_values, "CLIP block projected");
-    ASSIGN_WORKSPACE_SLICE(clip_block_residual1, clip_values, "CLIP block residual1");
-    ASSIGN_WORKSPACE_SLICE(clip_block_norm2, clip_values, "CLIP block norm2");
-    ASSIGN_WORKSPACE_SLICE(clip_block_mlp, clip_values, "CLIP block MLP");
-    ASSIGN_WORKSPACE_SLICE(clip_mlp_fc1, clip_mlp_values, "CLIP MLP fc1");
-    ASSIGN_WORKSPACE_SLICE(clip_mlp_activated, clip_mlp_values, "CLIP MLP activated");
+    ASSIGN_WORKSPACE_SLICE(clip_block_norm1, clip_final_values, "CLIP block norm1");
+    ASSIGN_WORKSPACE_SLICE(clip_block_q, clip_final_values, "CLIP block Q");
+    ASSIGN_WORKSPACE_SLICE(clip_block_k, clip_final_values, "CLIP block K");
+    ASSIGN_WORKSPACE_SLICE(clip_block_v, clip_final_values, "CLIP block V");
+    ASSIGN_WORKSPACE_SLICE(clip_block_attention, clip_final_values, "CLIP block attention");
+    ASSIGN_WORKSPACE_SLICE(clip_block_projected, clip_final_values, "CLIP block projected");
+    ASSIGN_WORKSPACE_SLICE(clip_block_residual1, clip_final_values, "CLIP block residual1");
+    ASSIGN_WORKSPACE_SLICE(clip_block_norm2, clip_final_values, "CLIP block norm2");
+    ASSIGN_WORKSPACE_SLICE(clip_block_mlp, clip_final_values, "CLIP block MLP");
+    ASSIGN_WORKSPACE_SLICE(clip_mlp_fc1, clip_mlp_batch_values, "CLIP MLP fc1");
+    ASSIGN_WORKSPACE_SLICE(clip_mlp_activated, clip_mlp_batch_values, "CLIP MLP activated");
     ASSIGN_WORKSPACE_SLICE(concat, concat_values, "CLIP/SAM concat");
     if (projected_values != 0u) {
         ASSIGN_WORKSPACE_SLICE(projected_rows, projected_values, "projected visual chunk rows");
@@ -3777,16 +3779,16 @@ static int metal_context_sam_transformer_workspace_f16(uocr_metal_context *ctx,
                                                        uocr_metal_vision_workspace *scratch,
                                                        char *error,
                                                        size_t error_size);
-static int metal_context_clip_transformer_workspace_f16(uocr_metal_context *ctx,
-                                                        const uint16_t *input_f16,
-                                                        const uocr_metal_clip_transformer_block_f16 *blocks,
-                                                        uint32_t block_count,
-                                                        uint32_t token_count,
-                                                        uocr_metal_dense_output_type output_type,
-                                                        void *out,
-                                                        uocr_metal_vision_workspace *scratch,
-                                                        char *error,
-                                                        size_t error_size);
+static int metal_context_clip_transformer_batch_workspace_f16_to_slice(uocr_metal_context *ctx,
+                                                                       uocr_metal_vision_workspace_slice input_tokens,
+                                                                       const uocr_metal_clip_transformer_block_slices_f16 *blocks,
+                                                                       uint32_t block_count,
+                                                                       uint32_t token_count,
+                                                                       uint32_t view_count,
+                                                                       uocr_metal_vision_workspace_slice out_tokens,
+                                                                       uocr_metal_vision_workspace *scratch,
+                                                                       char *error,
+                                                                       size_t error_size);
 static int metal_context_layernorm_f16_with_parameter_buffers(uocr_metal_context *ctx,
                                                               const uint16_t *input_f16,
                                                               id<MTLBuffer> weight_buffer,
@@ -4562,35 +4564,6 @@ static int metal_context_clip_pre_layernorm_f16_to_slice(uocr_metal_context *ctx
                                                              error_size);
 }
 
-static int metal_context_clip_transformer_workspace_f16_to_slice(uocr_metal_context *ctx,
-                                                                 uocr_metal_vision_workspace_slice input_tokens,
-                                                                 const uocr_metal_clip_transformer_block_f16 *blocks,
-                                                                 uint32_t block_count,
-                                                                 uint32_t token_count,
-                                                                 uocr_metal_vision_workspace_slice out_tokens,
-                                                                 uocr_metal_vision_workspace *scratch,
-                                                                 char *error,
-                                                                 size_t error_size) {
-    uint64_t values = 0u;
-    uint64_t bytes = 0u;
-    if (!checked_mul_u64((uint64_t)token_count, (uint64_t)UOCR_CLIP_HIDDEN_SIZE, &values) ||
-        !metal_vision_f16_bytes(values, &bytes) ||
-        !metal_vision_require_workspace_slice_f16(input_tokens, bytes, "CLIP transformer input", error, error_size) ||
-        !metal_vision_require_workspace_slice_f16(out_tokens, bytes, "CLIP transformer output", error, error_size)) {
-        return 0;
-    }
-    return metal_context_clip_transformer_workspace_f16(ctx,
-                                                        input_tokens.f16,
-                                                        blocks,
-                                                        block_count,
-                                                        token_count,
-                                                        UOCR_METAL_DENSE_OUTPUT_F16,
-                                                        out_tokens.f16,
-                                                        scratch,
-                                                        error,
-                                                        error_size);
-}
-
 static int metal_context_clip_sam_concat_batch_f16_to_slice(uocr_metal_context *ctx,
                                                             uocr_metal_vision_workspace_slice clip_tokens,
                                                             uocr_metal_vision_workspace_slice sam_nchw,
@@ -4942,15 +4915,16 @@ static int metal_encode_one_view_clip_features_f16(uocr_metal_vision_project_con
                                                                   error,
                                                                   error_size));
     RUN_VISION_STEP("CLIP transformer",
-                    metal_context_clip_transformer_workspace_f16_to_slice(ctx,
-                                                                         scratch->clip_a,
-                                                                         weights->clip_blocks,
-                                                                         UOCR_CLIP_BLOCKS,
-                                                                         expected_clip_tokens,
-                                                                         out_clip_tokens,
-                                                                         scratch,
-                                                                         error,
-                                                                         error_size));
+                    metal_context_clip_transformer_batch_workspace_f16_to_slice(ctx,
+                                                                               scratch->clip_a,
+                                                                               weights->clip_block_slices,
+                                                                               UOCR_CLIP_BLOCKS,
+                                                                               expected_clip_tokens,
+                                                                               1u,
+                                                                               out_clip_tokens,
+                                                                               scratch,
+                                                                               error,
+                                                                               error_size));
 
 #undef RUN_VISION_STEP
 
@@ -5507,11 +5481,6 @@ static int metal_project_vision_chunk_f16(const uocr_vision_chunk *chunk,
             return UOCR_ERROR_INTERNAL;
         }
         const uint32_t batch_clip_tokens = clip_tokens_per_view * chunk->view_count;
-        uint64_t clip_values_per_view = 0u;
-        if (!checked_mul_u64((uint64_t)clip_tokens_per_view, (uint64_t)UOCR_CLIP_HIDDEN_SIZE, &clip_values_per_view)) {
-            (void)metal_fail(error, error_size, "Metal batched CLIP feature value-count overflow");
-            return UOCR_ERROR_INTERNAL;
-        }
         uint32_t patch_grid_w = 0u;
         uint32_t patch_grid_h = 0u;
         for (uint32_t view_index = 0u; view_index < chunk->view_count; ++view_index) {
@@ -5604,37 +5573,20 @@ static int metal_project_vision_chunk_f16(const uocr_vision_chunk *chunk,
             return UOCR_ERROR_INTERNAL;
         }
         metal_profile_add_event_now(project->ctx, "metal.vision.clip_frontend_batch", clip_frontend_start_ns);
-        for (uint32_t view_index = 0u; view_index < chunk->view_count; ++view_index) {
-            uocr_metal_vision_workspace_slice clip_input;
-            uocr_metal_vision_workspace_slice clip_out;
-            if (!metal_vision_workspace_slice_values(project->scratch->clip_a,
-                                                     (uint64_t)view_index * clip_values_per_view,
-                                                     clip_values_per_view,
-                                                     "batched CLIP transformer input view",
-                                                     &clip_input,
-                                                     error,
-                                                     error_size) ||
-                !metal_vision_workspace_slice_values(project->scratch->clip_final,
-                                                     (uint64_t)view_index * clip_values_per_view,
-                                                     clip_values_per_view,
-                                                     "batched CLIP final view",
-                                                     &clip_out,
-                                                     error,
-                                                     error_size)) {
-                return UOCR_ERROR_OUT_OF_MEMORY;
-            }
-            if (!metal_context_clip_transformer_workspace_f16_to_slice(project->ctx,
-                                                                      clip_input,
-                                                                      project->weights->clip_blocks,
-                                                                      UOCR_CLIP_BLOCKS,
-                                                                      clip_tokens_per_view,
-                                                                      clip_out,
-                                                                      project->scratch,
-                                                                      error,
-                                                                      error_size)) {
-                return UOCR_ERROR_INTERNAL;
-            }
+        const uint64_t clip_transformer_start_ns = uocr_profile_now_ns();
+        if (!metal_context_clip_transformer_batch_workspace_f16_to_slice(project->ctx,
+                                                                         project->scratch->clip_a,
+                                                                         project->weights->clip_block_slices,
+                                                                         UOCR_CLIP_BLOCKS,
+                                                                         clip_tokens_per_view,
+                                                                         chunk->view_count,
+                                                                         project->scratch->clip_final,
+                                                                         project->scratch,
+                                                                         error,
+                                                                         error_size)) {
+            return UOCR_ERROR_INTERNAL;
         }
+        metal_profile_add_event_now(project->ctx, "metal.vision.clip_transformer_batch", clip_transformer_start_ns);
         const uint64_t concat_start_ns = uocr_profile_now_ns();
         if (!metal_context_clip_sam_concat_batch_f16_to_slice(project->ctx,
                                                              project->scratch->clip_final,
@@ -8117,6 +8069,21 @@ static int metal_prebuild_mps_vision_shape_ndarrays(uocr_metal_context *ctx,
     PREBUILD_VISION_IO(workspace->clip_block_attention, workspace->clip_block_projected, clip_tokens, UOCR_CLIP_HIDDEN_SIZE, UOCR_CLIP_HIDDEN_SIZE, "CLIP output projection workspace");
     PREBUILD_VISION_IO(workspace->clip_block_norm2, workspace->clip_mlp_activated, clip_tokens, UOCR_CLIP_HIDDEN_SIZE, UOCR_CLIP_MLP_INTERMEDIATE, "CLIP fused MLP fc1 workspace");
     PREBUILD_VISION_IO(workspace->clip_mlp_activated, workspace->clip_block_mlp, clip_tokens, UOCR_CLIP_MLP_INTERMEDIATE, UOCR_CLIP_HIDDEN_SIZE, "CLIP MLP fc2 workspace");
+    if (view_count > 1u && workspace->projected_row_capacity >= projected_tokens) {
+        uint32_t clip_view_capacity = workspace->projected_row_capacity / projected_tokens;
+        if (clip_view_capacity > view_count) {
+            clip_view_capacity = view_count;
+        }
+        if (clip_view_capacity > 1u) {
+            const uint32_t batch_clip_rows = clip_view_capacity * clip_tokens;
+            PREBUILD_VISION_IO(workspace->clip_block_norm1, workspace->clip_block_q, batch_clip_rows, UOCR_CLIP_HIDDEN_SIZE, UOCR_CLIP_HIDDEN_SIZE, "CLIP Q batch workspace");
+            PREBUILD_VISION_IO(workspace->clip_block_norm1, workspace->clip_block_k, batch_clip_rows, UOCR_CLIP_HIDDEN_SIZE, UOCR_CLIP_HIDDEN_SIZE, "CLIP K batch workspace");
+            PREBUILD_VISION_IO(workspace->clip_block_norm1, workspace->clip_block_v, batch_clip_rows, UOCR_CLIP_HIDDEN_SIZE, UOCR_CLIP_HIDDEN_SIZE, "CLIP V batch workspace");
+            PREBUILD_VISION_IO(workspace->clip_block_attention, workspace->clip_block_projected, batch_clip_rows, UOCR_CLIP_HIDDEN_SIZE, UOCR_CLIP_HIDDEN_SIZE, "CLIP output projection batch workspace");
+            PREBUILD_VISION_IO(workspace->clip_block_norm2, workspace->clip_mlp_activated, batch_clip_rows, UOCR_CLIP_HIDDEN_SIZE, UOCR_CLIP_MLP_INTERMEDIATE, "CLIP fused MLP fc1 batch workspace");
+            PREBUILD_VISION_IO(workspace->clip_mlp_activated, workspace->clip_block_mlp, batch_clip_rows, UOCR_CLIP_MLP_INTERMEDIATE, UOCR_CLIP_HIDDEN_SIZE, "CLIP MLP fc2 batch workspace");
+        }
+    }
     if (workspace->projected_row_capacity >= projected_tokens && workspace->projected_rows.buffer != nil) {
         PREBUILD_VISION_IO(workspace->concat, workspace->projected_rows, projected_tokens, UOCR_PROJECTOR_IN_SIZE, UOCR_HIDDEN_SIZE, "visual projector workspace");
     }
@@ -15873,7 +15840,7 @@ int uocr_metal_context_diagnostic_clip_attention_f16(uocr_metal_context *ctx,
         params.heads = UOCR_CLIP_ATTENTION_HEADS;
         params.head_dim = UOCR_CLIP_HEAD_DIM;
         params.scale = 1.0f / sqrtf((float)UOCR_CLIP_HEAD_DIM);
-        params.reserved0 = 0u;
+        params.batch_size = 1u;
         params.reserved1 = 0u;
         params.reserved2 = 0u;
 
@@ -16438,6 +16405,405 @@ static int metal_clip_transformer_activation_bytes(uint32_t token_count,
     return 1;
 }
 
+static int metal_context_clip_attention_batch_f16_to_slice(uocr_metal_context *ctx,
+                                                            uocr_metal_vision_workspace_slice q_tokens,
+                                                            uocr_metal_vision_workspace_slice k_tokens,
+                                                            uocr_metal_vision_workspace_slice v_tokens,
+                                                            uint32_t token_count,
+                                                            uint32_t view_count,
+                                                            uocr_metal_vision_workspace_slice out_tokens,
+                                                            char *error,
+                                                            size_t error_size) {
+    uint64_t values_per_view = 0u;
+    uint64_t values = 0u;
+    uint64_t bytes = 0u;
+    if (ctx == NULL || view_count == 0u ||
+        (token_count != UOCR_CLIP_GLOBAL_TOKENS && token_count != UOCR_CLIP_LOCAL_TOKENS) ||
+        !checked_mul_u64((uint64_t)token_count, (uint64_t)UOCR_CLIP_HIDDEN_SIZE, &values_per_view) ||
+        !checked_mul_u64(values_per_view, (uint64_t)view_count, &values) ||
+        !metal_vision_f16_bytes(values, &bytes) ||
+        !metal_vision_require_workspace_slice_f16(q_tokens, bytes, "CLIP batch attention Q", error, error_size) ||
+        !metal_vision_require_workspace_slice_f16(k_tokens, bytes, "CLIP batch attention K", error, error_size) ||
+        !metal_vision_require_workspace_slice_f16(v_tokens, bytes, "CLIP batch attention V", error, error_size) ||
+        !metal_vision_require_workspace_slice_f16(out_tokens, bytes, "CLIP batch attention output", error, error_size)) {
+        return 0;
+    }
+    if (UOCR_CLIP_HIDDEN_SIZE != 1024u || UOCR_CLIP_ATTENTION_HEADS != 16u || UOCR_CLIP_HEAD_DIM != 64u ||
+        UOCR_CLIP_ATTENTION_HEADS * UOCR_CLIP_HEAD_DIM != UOCR_CLIP_HIDDEN_SIZE) {
+        return metal_fail(error, error_size, "Metal CLIP batch attention constants are inconsistent");
+    }
+
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, "uocr_sam_window_attention_flash_f16_to_f16", error, error_size);
+        if (pipeline == nil) {
+            return 0;
+        }
+        const NSUInteger threads_per_group = 128u;
+        if (pipeline.maxTotalThreadsPerThreadgroup < threads_per_group) {
+            return metal_fail(error, error_size, "Metal CLIP batch flash attention cannot run four simdgroups per block");
+        }
+        int owned_command_buffer = 0;
+        id<MTLCommandBuffer> cb = metal_command_buffer_for_op(ctx, &owned_command_buffer, "Metal CLIP batch attention", error, error_size);
+        if (cb == nil) {
+            return 0;
+        }
+        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
+        if (enc == nil) {
+            return metal_fail(error, error_size, "failed to create Metal CLIP batch attention command encoder");
+        }
+
+        uocr_metal_sam_window_attention_params params;
+        params.windows = 1u;
+        params.tokens_per_window = token_count;
+        params.heads = UOCR_CLIP_ATTENTION_HEADS;
+        params.head_dim = UOCR_CLIP_HEAD_DIM;
+        params.scale = 1.0f / sqrtf((float)UOCR_CLIP_HEAD_DIM);
+        params.batch_size = view_count;
+        params.reserved1 = 0u;
+        params.reserved2 = 0u;
+
+        const NSUInteger query_blocks = (NSUInteger)((token_count + 3u) / 4u);
+        [enc setComputePipelineState:pipeline];
+        [enc setBuffer:q_tokens.buffer offset:q_tokens.offset atIndex:0u];
+        [enc setBuffer:k_tokens.buffer offset:k_tokens.offset atIndex:1u];
+        [enc setBuffer:v_tokens.buffer offset:v_tokens.offset atIndex:2u];
+        [enc setBuffer:out_tokens.buffer offset:out_tokens.offset atIndex:3u];
+        [enc setBytes:&params length:sizeof(params) atIndex:4u];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)UOCR_CLIP_ATTENTION_HEADS, query_blocks, (NSUInteger)view_count)
+             threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1u, 1u)];
+        [enc endEncoding];
+        return metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, "Metal CLIP batch attention", error, error_size);
+    }
+}
+
+static int metal_context_clip_mlp_batch_workspace_f16_to_slice(uocr_metal_context *ctx,
+                                                               uocr_metal_vision_workspace_slice input_tokens,
+                                                               const uocr_metal_clip_transformer_block_slices_f16 *block,
+                                                               uint32_t rows,
+                                                               uocr_metal_vision_workspace_slice out_tokens,
+                                                               uocr_metal_vision_workspace *scratch,
+                                                               char *error,
+                                                               size_t error_size) {
+    uint64_t hidden_values = 0u;
+    uint64_t hidden_bytes = 0u;
+    uint64_t mid_values = 0u;
+    uint64_t mid_bytes = 0u;
+    const uint64_t fc1_weight_bytes = (uint64_t)UOCR_CLIP_MLP_INTERMEDIATE * (uint64_t)UOCR_CLIP_HIDDEN_SIZE * 2u;
+    const uint64_t fc1_bias_bytes = (uint64_t)UOCR_CLIP_MLP_INTERMEDIATE * 2u;
+    const uint64_t fc2_weight_bytes = (uint64_t)UOCR_CLIP_HIDDEN_SIZE * (uint64_t)UOCR_CLIP_MLP_INTERMEDIATE * 2u;
+    const uint64_t fc2_bias_bytes = (uint64_t)UOCR_CLIP_HIDDEN_SIZE * 2u;
+    if (ctx == NULL || block == NULL || rows == 0u || scratch == NULL ||
+        !checked_mul_u64((uint64_t)rows, (uint64_t)UOCR_CLIP_HIDDEN_SIZE, &hidden_values) ||
+        !metal_vision_f16_bytes(hidden_values, &hidden_bytes) ||
+        !checked_mul_u64((uint64_t)rows, (uint64_t)UOCR_CLIP_MLP_INTERMEDIATE, &mid_values) ||
+        !metal_vision_f16_bytes(mid_values, &mid_bytes) ||
+        !metal_vision_require_workspace_slice_f16(input_tokens, hidden_bytes, "CLIP batch MLP input", error, error_size) ||
+        !metal_vision_require_workspace_slice_f16(out_tokens, hidden_bytes, "CLIP batch MLP output", error, error_size) ||
+        !metal_vision_require_workspace_slice_f16(scratch->clip_mlp_activated, mid_bytes, "CLIP batch MLP activation", error, error_size) ||
+        !metal_vision_require_tensor_slice_f16(block->mlp_fc1_weight, fc1_weight_bytes, "CLIP MLP fc1 weight", error, error_size) ||
+        !metal_vision_require_tensor_slice_f16(block->mlp_fc1_bias, fc1_bias_bytes, "CLIP MLP fc1 bias", error, error_size) ||
+        !metal_vision_require_tensor_slice_f16(block->mlp_fc2_weight, fc2_weight_bytes, "CLIP MLP fc2 weight", error, error_size) ||
+        !metal_vision_require_tensor_slice_f16(block->mlp_fc2_bias, fc2_bias_bytes, "CLIP MLP fc2 bias", error, error_size)) {
+        return 0;
+    }
+
+    uocr_metal_buffer_slice input_slice = { input_tokens.buffer, input_tokens.offset };
+    uocr_metal_buffer_slice fc1_dst_slice = { scratch->clip_mlp_activated.buffer, scratch->clip_mlp_activated.offset };
+    uocr_metal_buffer_slice out_slice = { out_tokens.buffer, out_tokens.offset };
+    if (!metal_run_mps_matmul_nt_f16(ctx,
+                                     input_slice,
+                                     block->mlp_fc1_weight.slice,
+                                     fc1_dst_slice,
+                                     rows,
+                                     UOCR_CLIP_HIDDEN_SIZE,
+                                     UOCR_CLIP_MLP_INTERMEDIATE,
+                                     "Metal CLIP batch MLP fc1 MPS matmul",
+                                     error,
+                                     error_size) ||
+        !metal_run_bias_quickgelu_f16_inplace(ctx,
+                                              fc1_dst_slice,
+                                              block->mlp_fc1_bias.slice,
+                                              rows,
+                                              UOCR_CLIP_MLP_INTERMEDIATE,
+                                              "Metal CLIP batch MLP fused bias QuickGELU",
+                                              error,
+                                              error_size) ||
+        !metal_run_mps_matmul_nt_f16(ctx,
+                                     fc1_dst_slice,
+                                     block->mlp_fc2_weight.slice,
+                                     out_slice,
+                                     rows,
+                                     UOCR_CLIP_MLP_INTERMEDIATE,
+                                     UOCR_CLIP_HIDDEN_SIZE,
+                                     "Metal CLIP batch MLP fc2 MPS matmul",
+                                     error,
+                                     error_size) ||
+        !metal_run_bias_add_f16_inplace(ctx,
+                                        out_slice,
+                                        block->mlp_fc2_bias.slice,
+                                        rows,
+                                        UOCR_CLIP_HIDDEN_SIZE,
+                                        "Metal CLIP batch MLP fc2 bias",
+                                        error,
+                                        error_size)) {
+        char detail[512];
+        metal_copy_error_detail(detail, sizeof(detail), error);
+        return metal_fail(error, error_size, "failed to compute Metal CLIP batch MLP: %s", detail);
+    }
+    return 1;
+}
+
+static int metal_context_clip_transformer_batch_block_workspace_f16_to_slice(uocr_metal_context *ctx,
+                                                                             uocr_metal_vision_workspace_slice input_tokens,
+                                                                             const uocr_metal_clip_transformer_block_slices_f16 *block,
+                                                                             uint32_t token_count,
+                                                                             uint32_t view_count,
+                                                                             uocr_metal_vision_workspace_slice out_tokens,
+                                                                             uocr_metal_vision_workspace *scratch,
+                                                                             char *error,
+                                                                             size_t error_size) {
+    if (ctx == NULL || block == NULL || view_count == 0u || scratch == NULL) {
+        return metal_fail(error, error_size, "invalid Metal CLIP batch transformer block request");
+    }
+    if (token_count != UOCR_CLIP_GLOBAL_TOKENS && token_count != UOCR_CLIP_LOCAL_TOKENS) {
+        return metal_fail(error, error_size, "invalid Metal CLIP batch transformer token count %u", token_count);
+    }
+    if (UOCR_CLIP_HIDDEN_SIZE != 1024u || UOCR_CLIP_BLOCKS != 24u || UOCR_CLIP_ATTENTION_HEADS != 16u ||
+        UOCR_CLIP_HEAD_DIM != 64u || UOCR_CLIP_QKV_SIZE != 3072u || UOCR_CLIP_MLP_INTERMEDIATE != 4096u ||
+        UOCR_CLIP_GLOBAL_TOKENS != 257u || UOCR_CLIP_LOCAL_TOKENS != 101u) {
+        return metal_fail(error, error_size, "Metal CLIP batch transformer block constants are inconsistent");
+    }
+    if (view_count > UINT32_MAX / token_count) {
+        return metal_fail(error, error_size, "Metal CLIP batch transformer row count overflow");
+    }
+    const uint32_t rows = token_count * view_count;
+    uint64_t hidden_values = 0u;
+    uint64_t hidden_bytes = 0u;
+    if (!checked_mul_u64((uint64_t)rows, (uint64_t)UOCR_CLIP_HIDDEN_SIZE, &hidden_values) ||
+        hidden_values > (uint64_t)UINT32_MAX || !metal_vision_f16_bytes(hidden_values, &hidden_bytes) ||
+        !metal_vision_require_workspace_slice_f16(input_tokens, hidden_bytes, "CLIP batch block input", error, error_size) ||
+        !metal_vision_require_workspace_slice_f16(out_tokens, hidden_bytes, "CLIP batch block output", error, error_size) ||
+        !metal_vision_require_workspace_slice_f16(scratch->clip_block_norm1, hidden_bytes, "CLIP batch block norm1", error, error_size) ||
+        !metal_vision_require_workspace_slice_f16(scratch->clip_block_q, hidden_bytes, "CLIP batch block Q", error, error_size) ||
+        !metal_vision_require_workspace_slice_f16(scratch->clip_block_k, hidden_bytes, "CLIP batch block K", error, error_size) ||
+        !metal_vision_require_workspace_slice_f16(scratch->clip_block_v, hidden_bytes, "CLIP batch block V", error, error_size) ||
+        !metal_vision_require_workspace_slice_f16(scratch->clip_block_attention, hidden_bytes, "CLIP batch block attention", error, error_size) ||
+        !metal_vision_require_workspace_slice_f16(scratch->clip_block_projected, hidden_bytes, "CLIP batch block projection", error, error_size) ||
+        !metal_vision_require_workspace_slice_f16(scratch->clip_block_residual1, hidden_bytes, "CLIP batch block residual1", error, error_size) ||
+        !metal_vision_require_workspace_slice_f16(scratch->clip_block_norm2, hidden_bytes, "CLIP batch block norm2", error, error_size) ||
+        !metal_vision_require_workspace_slice_f16(scratch->clip_block_mlp, hidden_bytes, "CLIP batch block MLP", error, error_size)) {
+        return 0;
+    }
+
+    const uint64_t hidden_parameter_bytes = (uint64_t)UOCR_CLIP_HIDDEN_SIZE * 2u;
+    const uint64_t qkv_weight_bytes = (uint64_t)UOCR_CLIP_QKV_SIZE * (uint64_t)UOCR_CLIP_HIDDEN_SIZE * 2u;
+    const uint64_t qkv_bias_bytes = (uint64_t)UOCR_CLIP_QKV_SIZE * 2u;
+    const uint64_t projection_weight_bytes = (uint64_t)UOCR_CLIP_HIDDEN_SIZE * (uint64_t)UOCR_CLIP_HIDDEN_SIZE * 2u;
+    if (!metal_vision_require_tensor_slice_f16(block->ln1_weight, hidden_parameter_bytes, "CLIP block ln1 weight", error, error_size) ||
+        !metal_vision_require_tensor_slice_f16(block->ln1_bias, hidden_parameter_bytes, "CLIP block ln1 bias", error, error_size) ||
+        !metal_vision_require_tensor_slice_f16(block->qkv_weight, qkv_weight_bytes, "CLIP block QKV weight", error, error_size) ||
+        !metal_vision_require_tensor_slice_f16(block->qkv_bias, qkv_bias_bytes, "CLIP block QKV bias", error, error_size) ||
+        !metal_vision_require_tensor_slice_f16(block->out_proj_weight, projection_weight_bytes, "CLIP block output projection weight", error, error_size) ||
+        !metal_vision_require_tensor_slice_f16(block->out_proj_bias, hidden_parameter_bytes, "CLIP block output projection bias", error, error_size) ||
+        !metal_vision_require_tensor_slice_f16(block->ln2_weight, hidden_parameter_bytes, "CLIP block ln2 weight", error, error_size) ||
+        !metal_vision_require_tensor_slice_f16(block->ln2_bias, hidden_parameter_bytes, "CLIP block ln2 bias", error, error_size)) {
+        return 0;
+    }
+
+#define RUN_CLIP_BATCH_BLOCK_STEP(step_name, call_expr)                                                \
+    do {                                                                                                \
+        if (!(call_expr)) {                                                                             \
+            char detail[512];                                                                           \
+            metal_copy_error_detail(detail, sizeof(detail), error);                                      \
+            return metal_fail(error, error_size, "failed to compute Metal CLIP batch block %s: %s", step_name, detail); \
+        }                                                                                               \
+    } while (0)
+
+    RUN_CLIP_BATCH_BLOCK_STEP("LayerNorm1",
+                              metal_context_layernorm_f16_with_parameter_buffers(ctx,
+                                                                                 input_tokens.f16,
+                                                                                 block->ln1_weight.slice.buffer,
+                                                                                 block->ln1_weight.slice.offset,
+                                                                                 block->ln1_bias.slice.buffer,
+                                                                                 block->ln1_bias.slice.offset,
+                                                                                 rows,
+                                                                                 UOCR_CLIP_HIDDEN_SIZE,
+                                                                                 UOCR_CLIP_LAYERNORM_EPS,
+                                                                                 UOCR_METAL_LAYERNORM_OUTPUT_F16,
+                                                                                 scratch->clip_block_norm1.f16,
+                                                                                 "Metal CLIP batch LayerNorm1",
+                                                                                 error,
+                                                                                 error_size));
+    RUN_CLIP_BATCH_BLOCK_STEP("QKV",
+                              metal_run_packed_qkv_mps_f16(ctx,
+                                                            (uocr_metal_buffer_slice){scratch->clip_block_norm1.buffer, scratch->clip_block_norm1.offset},
+                                                            block->qkv_weight.slice,
+                                                            block->qkv_bias.slice,
+                                                            (uocr_metal_buffer_slice){scratch->clip_block_q.buffer, scratch->clip_block_q.offset},
+                                                            (uocr_metal_buffer_slice){scratch->clip_block_k.buffer, scratch->clip_block_k.offset},
+                                                            (uocr_metal_buffer_slice){scratch->clip_block_v.buffer, scratch->clip_block_v.offset},
+                                                            rows,
+                                                            UOCR_CLIP_HIDDEN_SIZE,
+                                                            "Metal CLIP batch QKV MPS matmul",
+                                                            error,
+                                                            error_size));
+    RUN_CLIP_BATCH_BLOCK_STEP("attention",
+                              metal_context_clip_attention_batch_f16_to_slice(ctx,
+                                                                             scratch->clip_block_q,
+                                                                             scratch->clip_block_k,
+                                                                             scratch->clip_block_v,
+                                                                             token_count,
+                                                                             view_count,
+                                                                             scratch->clip_block_attention,
+                                                                             error,
+                                                                             error_size));
+    RUN_CLIP_BATCH_BLOCK_STEP("output projection",
+                              metal_run_mps_matmul_nt_f16(ctx,
+                                                          (uocr_metal_buffer_slice){scratch->clip_block_attention.buffer, scratch->clip_block_attention.offset},
+                                                          block->out_proj_weight.slice,
+                                                          (uocr_metal_buffer_slice){scratch->clip_block_projected.buffer, scratch->clip_block_projected.offset},
+                                                          rows,
+                                                          UOCR_CLIP_HIDDEN_SIZE,
+                                                          UOCR_CLIP_HIDDEN_SIZE,
+                                                          "Metal CLIP batch output projection MPS matmul",
+                                                          error,
+                                                          error_size) &&
+                              metal_run_bias_add_f16_inplace(ctx,
+                                                             (uocr_metal_buffer_slice){scratch->clip_block_projected.buffer, scratch->clip_block_projected.offset},
+                                                             block->out_proj_bias.slice,
+                                                             rows,
+                                                             UOCR_CLIP_HIDDEN_SIZE,
+                                                             "Metal CLIP batch output projection bias",
+                                                             error,
+                                                             error_size));
+    RUN_CLIP_BATCH_BLOCK_STEP("attention residual",
+                              metal_run_residual_add_f16(ctx,
+                                                         (uocr_metal_buffer_slice){input_tokens.buffer, input_tokens.offset},
+                                                         (uocr_metal_buffer_slice){scratch->clip_block_projected.buffer, scratch->clip_block_projected.offset},
+                                                         (uocr_metal_buffer_slice){scratch->clip_block_residual1.buffer, scratch->clip_block_residual1.offset},
+                                                         (uint32_t)hidden_values,
+                                                         "Metal CLIP batch attention residual",
+                                                         error,
+                                                         error_size));
+    RUN_CLIP_BATCH_BLOCK_STEP("LayerNorm2",
+                              metal_context_layernorm_f16_with_parameter_buffers(ctx,
+                                                                                 scratch->clip_block_residual1.f16,
+                                                                                 block->ln2_weight.slice.buffer,
+                                                                                 block->ln2_weight.slice.offset,
+                                                                                 block->ln2_bias.slice.buffer,
+                                                                                 block->ln2_bias.slice.offset,
+                                                                                 rows,
+                                                                                 UOCR_CLIP_HIDDEN_SIZE,
+                                                                                 UOCR_CLIP_LAYERNORM_EPS,
+                                                                                 UOCR_METAL_LAYERNORM_OUTPUT_F16,
+                                                                                 scratch->clip_block_norm2.f16,
+                                                                                 "Metal CLIP batch LayerNorm2",
+                                                                                 error,
+                                                                                 error_size));
+    RUN_CLIP_BATCH_BLOCK_STEP("MLP",
+                              metal_context_clip_mlp_batch_workspace_f16_to_slice(ctx,
+                                                                                  scratch->clip_block_norm2,
+                                                                                  block,
+                                                                                  rows,
+                                                                                  scratch->clip_block_mlp,
+                                                                                  scratch,
+                                                                                  error,
+                                                                                  error_size));
+    RUN_CLIP_BATCH_BLOCK_STEP("MLP residual",
+                              metal_run_residual_add_f16(ctx,
+                                                         (uocr_metal_buffer_slice){scratch->clip_block_residual1.buffer, scratch->clip_block_residual1.offset},
+                                                         (uocr_metal_buffer_slice){scratch->clip_block_mlp.buffer, scratch->clip_block_mlp.offset},
+                                                         (uocr_metal_buffer_slice){out_tokens.buffer, out_tokens.offset},
+                                                         (uint32_t)hidden_values,
+                                                         "Metal CLIP batch MLP residual",
+                                                         error,
+                                                         error_size));
+
+#undef RUN_CLIP_BATCH_BLOCK_STEP
+
+    return 1;
+}
+
+static int metal_context_clip_transformer_batch_workspace_f16_to_slice(uocr_metal_context *ctx,
+                                                                       uocr_metal_vision_workspace_slice input_tokens,
+                                                                       const uocr_metal_clip_transformer_block_slices_f16 *blocks,
+                                                                       uint32_t block_count,
+                                                                       uint32_t token_count,
+                                                                       uint32_t view_count,
+                                                                       uocr_metal_vision_workspace_slice out_tokens,
+                                                                       uocr_metal_vision_workspace *scratch,
+                                                                       char *error,
+                                                                       size_t error_size) {
+    metal_clear_error(error, error_size);
+    if (ctx == NULL || input_tokens.buffer == nil || input_tokens.f16 == NULL || blocks == NULL || out_tokens.buffer == nil ||
+        out_tokens.f16 == NULL || scratch == NULL || view_count == 0u) {
+        return metal_fail(error, error_size, "invalid Metal CLIP batch transformer request");
+    }
+    if (block_count != UOCR_CLIP_BLOCKS) {
+        return metal_fail(error, error_size, "invalid Metal CLIP batch transformer block count %u", block_count);
+    }
+    if (token_count != UOCR_CLIP_GLOBAL_TOKENS && token_count != UOCR_CLIP_LOCAL_TOKENS) {
+        return metal_fail(error, error_size, "invalid Metal CLIP batch transformer token count %u", token_count);
+    }
+    if (view_count > UINT32_MAX / token_count) {
+        return metal_fail(error, error_size, "Metal CLIP batch transformer row count overflow");
+    }
+    const uint32_t rows = token_count * view_count;
+    uint64_t hidden_values = 0u;
+    uint64_t hidden_bytes = 0u;
+    if (!checked_mul_u64((uint64_t)rows, (uint64_t)UOCR_CLIP_HIDDEN_SIZE, &hidden_values) ||
+        !metal_vision_f16_bytes(hidden_values, &hidden_bytes) ||
+        !metal_vision_require_workspace_slice_f16(input_tokens, hidden_bytes, "CLIP batch transformer input", error, error_size) ||
+        !metal_vision_require_workspace_slice_f16(out_tokens, hidden_bytes, "CLIP batch transformer output", error, error_size) ||
+        !metal_vision_require_workspace_slice_f16(scratch->clip_a, hidden_bytes, "CLIP batch transformer state A", error, error_size) ||
+        !metal_vision_require_workspace_slice_f16(scratch->clip_b, hidden_bytes, "CLIP batch transformer state B", error, error_size)) {
+        return 0;
+    }
+
+    uocr_metal_vision_workspace_slice current = input_tokens;
+    uocr_metal_vision_workspace_slice state_a = scratch->clip_b;
+    uocr_metal_vision_workspace_slice state_b = scratch->clip_a;
+    uocr_metal_vision_workspace_slice next = state_a;
+    const uint64_t clip_blocks_start_ns = uocr_profile_now_ns();
+    for (uint32_t block_index = 0u; block_index < block_count; ++block_index) {
+        const uint64_t block_start_ns = uocr_profile_now_ns();
+        const int is_last = block_index + 1u == block_count;
+        uocr_metal_vision_workspace_slice block_out = is_last ? out_tokens : next;
+        if (block_out.buffer == current.buffer && block_out.offset == current.offset) {
+            return metal_fail(error, error_size, "Metal CLIP batch transformer attempted in-place block output");
+        }
+        if (!metal_context_clip_transformer_batch_block_workspace_f16_to_slice(ctx,
+                                                                               current,
+                                                                               &blocks[block_index],
+                                                                               token_count,
+                                                                               view_count,
+                                                                               block_out,
+                                                                               scratch,
+                                                                               error,
+                                                                               error_size)) {
+            char detail[512];
+            metal_copy_error_detail(detail, sizeof(detail), error);
+            return metal_fail(error,
+                              error_size,
+                              "failed to compute Metal CLIP batch transformer block %u: %s",
+                              block_index,
+                              detail);
+        }
+        if (!is_last) {
+            current = block_out;
+            next = (block_out.buffer == state_a.buffer && block_out.offset == state_a.offset) ? state_b : state_a;
+        }
+        metal_profile_add_event_now(ctx, view_count > 1u ? "metal.vision.clip_block_batch" : "metal.vision.clip_block", block_start_ns);
+        metal_profile_add_event_now_f(ctx,
+                                      block_start_ns,
+                                      view_count > 1u ? "metal.vision.clip_block_batch.%02u" : "metal.vision.clip_block.%02u",
+                                      block_index);
+    }
+    metal_profile_add_event_now(ctx, view_count > 1u ? "metal.vision.clip_blocks_batch" : "metal.vision.clip_blocks", clip_blocks_start_ns);
+    metal_clear_error(error, error_size);
+    return 1;
+}
+
 int uocr_metal_context_diagnostic_clip_transformer_block_f16(uocr_metal_context *ctx,
                                                   const uint16_t *input_f16,
                                                   const uocr_metal_clip_transformer_block_f16 *block,
@@ -16704,283 +17070,6 @@ cleanup_clip_transformer:
 
 static int metal_vision_slice_has_bytes(uocr_metal_vision_workspace_slice slice, uint64_t bytes) {
     return slice.buffer != nil && slice.f16 != NULL && bytes != 0u && bytes <= slice.bytes;
-}
-
-static int metal_context_clip_mlp_workspace_f16(uocr_metal_context *ctx,
-                                                const uint16_t *input_f16,
-                                                const uocr_metal_clip_transformer_block_f16 *block,
-                                                uint32_t token_count,
-                                                uocr_metal_dense_output_type output_type,
-                                                void *out,
-                                                uocr_metal_vision_workspace *scratch,
-                                                char *error,
-                                                size_t error_size) {
-    uint64_t hidden_values = 0u;
-    uint64_t mid_values = 0u;
-    uint64_t hidden_bytes = 0u;
-    uint64_t mid_bytes = 0u;
-    uint64_t fc1_weight_bytes = 0u;
-    uint64_t fc1_bias_bytes = 0u;
-    if (ctx == NULL || input_f16 == NULL || !metal_clip_transformer_block_has_weights(block) || out == NULL ||
-        scratch == NULL) {
-        return metal_fail(error, error_size, "invalid Metal CLIP workspace MLP request");
-    }
-    if (!checked_mul_u64((uint64_t)token_count, (uint64_t)UOCR_CLIP_HIDDEN_SIZE, &hidden_values) ||
-        !checked_mul_u64((uint64_t)token_count, (uint64_t)UOCR_CLIP_MLP_INTERMEDIATE, &mid_values) ||
-        !checked_mul_u64(hidden_values, 2u, &hidden_bytes) || !checked_mul_u64(mid_values, 2u, &mid_bytes) ||
-        !checked_mul_u64((uint64_t)UOCR_CLIP_HIDDEN_SIZE, (uint64_t)UOCR_CLIP_MLP_INTERMEDIATE, &fc1_weight_bytes) ||
-        !checked_mul_u64(fc1_weight_bytes, 2u, &fc1_weight_bytes) ||
-        !checked_mul_u64((uint64_t)UOCR_CLIP_MLP_INTERMEDIATE, 2u, &fc1_bias_bytes) ||
-        !metal_vision_slice_has_bytes(scratch->clip_mlp_activated, mid_bytes)) {
-        return metal_fail(error, error_size, "Metal CLIP workspace MLP scratch is too small");
-    }
-    uocr_metal_buffer_slice input_slice;
-    uocr_metal_buffer_slice fc1_weight_slice;
-    uocr_metal_buffer_slice fc1_bias_slice;
-    if (!metal_vision_host_pointer_slice(ctx, input_f16, hidden_bytes, &input_slice) ||
-        !metal_vision_host_pointer_slice(ctx, block->mlp_fc1_weight_f16, fc1_weight_bytes, &fc1_weight_slice) ||
-        !metal_vision_host_pointer_slice(ctx, block->mlp_fc1_bias_f16, fc1_bias_bytes, &fc1_bias_slice)) {
-        return metal_fail(error, error_size, "Metal CLIP workspace MLP fc1 requires direct Metal slices");
-    }
-    uocr_metal_buffer_slice fc1_dst_slice = { scratch->clip_mlp_activated.buffer, scratch->clip_mlp_activated.offset };
-    if (!metal_run_mps_matmul_nt_f16(ctx,
-                                     input_slice,
-                                     fc1_weight_slice,
-                                     fc1_dst_slice,
-                                     token_count,
-                                     UOCR_CLIP_HIDDEN_SIZE,
-                                     UOCR_CLIP_MLP_INTERMEDIATE,
-                                     "Metal CLIP workspace MLP fc1 MPS matmul",
-                                     error,
-                                     error_size) ||
-        !metal_run_bias_quickgelu_f16_inplace(ctx,
-                                              fc1_dst_slice,
-                                              fc1_bias_slice,
-                                              token_count,
-                                              UOCR_CLIP_MLP_INTERMEDIATE,
-                                              "Metal CLIP workspace MLP fused bias QuickGELU",
-                                              error,
-                                              error_size)) {
-        char detail[512];
-        metal_copy_error_detail(detail, sizeof(detail), error);
-        return metal_fail(error, error_size, "failed to compute Metal CLIP workspace MLP fused fc1: %s", detail);
-    }
-    if (!uocr_metal_context_diagnostic_dense_f16(ctx,
-                                      scratch->clip_mlp_activated.f16,
-                                      block->mlp_fc2_weight_f16,
-                                      block->mlp_fc2_bias_f16,
-                                      token_count,
-                                      UOCR_CLIP_MLP_INTERMEDIATE,
-                                      UOCR_CLIP_HIDDEN_SIZE,
-                                      output_type,
-                                      out,
-                                      error,
-                                      error_size)) {
-        char detail[512];
-        metal_copy_error_detail(detail, sizeof(detail), error);
-        return metal_fail(error, error_size, "failed to compute Metal CLIP workspace MLP fc2: %s", detail);
-    }
-    return 1;
-}
-
-static int metal_context_clip_transformer_block_workspace_f16(uocr_metal_context *ctx,
-                                                              const uint16_t *input_f16,
-                                                              const uocr_metal_clip_transformer_block_f16 *block,
-                                                              uint32_t token_count,
-                                                              uocr_metal_dense_output_type output_type,
-                                                              void *out,
-                                                              uocr_metal_vision_workspace *scratch,
-                                                              char *error,
-                                                              size_t error_size) {
-    uint64_t hidden_bytes = 0u;
-    if (ctx == NULL || input_f16 == NULL || !metal_clip_transformer_block_has_weights(block) || out == NULL ||
-        scratch == NULL) {
-        return metal_fail(error, error_size, "invalid Metal CLIP workspace transformer block request");
-    }
-    if (!metal_clip_transformer_activation_bytes(token_count, NULL, &hidden_bytes, error, error_size)) {
-        return 0;
-    }
-    if (!metal_vision_slice_has_bytes(scratch->clip_block_norm1, hidden_bytes) ||
-        !metal_vision_slice_has_bytes(scratch->clip_block_q, hidden_bytes) ||
-        !metal_vision_slice_has_bytes(scratch->clip_block_k, hidden_bytes) ||
-        !metal_vision_slice_has_bytes(scratch->clip_block_v, hidden_bytes) ||
-        !metal_vision_slice_has_bytes(scratch->clip_block_attention, hidden_bytes) ||
-        !metal_vision_slice_has_bytes(scratch->clip_block_projected, hidden_bytes) ||
-        !metal_vision_slice_has_bytes(scratch->clip_block_residual1, hidden_bytes) ||
-        !metal_vision_slice_has_bytes(scratch->clip_block_norm2, hidden_bytes) ||
-        !metal_vision_slice_has_bytes(scratch->clip_block_mlp, hidden_bytes)) {
-        return metal_fail(error, error_size, "Metal CLIP workspace transformer block scratch is too small");
-    }
-
-#define RUN_CLIP_WORKSPACE_BLOCK_STEP(step_name, call_expr)                                             \
-    do {                                                                                                \
-        if (!(call_expr)) {                                                                             \
-            char detail[512];                                                                           \
-            metal_copy_error_detail(detail, sizeof(detail), error);                                      \
-            return metal_fail(error, error_size, "failed to compute Metal CLIP workspace block %s: %s", step_name, detail); \
-        }                                                                                               \
-    } while (0)
-
-    RUN_CLIP_WORKSPACE_BLOCK_STEP("LayerNorm1",
-                                  uocr_metal_context_diagnostic_clip_layernorm_f16(ctx,
-                                                                        input_f16,
-                                                                        block->ln1_weight_f16,
-                                                                        block->ln1_bias_f16,
-                                                                        token_count,
-                                                                        UOCR_METAL_LAYERNORM_OUTPUT_F16,
-                                                                        scratch->clip_block_norm1.f16,
-                                                                        error,
-                                                                        error_size));
-    RUN_CLIP_WORKSPACE_BLOCK_STEP("QKV",
-                                  uocr_metal_context_diagnostic_clip_qkv_f16(ctx,
-                                                                   scratch->clip_block_norm1.f16,
-                                                                   block->qkv_weight_f16,
-                                                                   block->qkv_bias_f16,
-                                                                   token_count,
-                                                                   UOCR_METAL_DENSE_OUTPUT_F16,
-                                                                   scratch->clip_block_q.f16,
-                                                                   scratch->clip_block_k.f16,
-                                                                   scratch->clip_block_v.f16,
-                                                                   error,
-                                                                   error_size));
-    RUN_CLIP_WORKSPACE_BLOCK_STEP("attention",
-                                  uocr_metal_context_diagnostic_clip_attention_f16(ctx,
-                                                                        scratch->clip_block_q.f16,
-                                                                        scratch->clip_block_k.f16,
-                                                                        scratch->clip_block_v.f16,
-                                                                        token_count,
-                                                                        UOCR_METAL_DENSE_OUTPUT_F16,
-                                                                        scratch->clip_block_attention.f16,
-                                                                        error,
-                                                                        error_size));
-    RUN_CLIP_WORKSPACE_BLOCK_STEP("output projection",
-                                  uocr_metal_context_diagnostic_clip_output_projection_f16(ctx,
-                                                                                scratch->clip_block_attention.f16,
-                                                                                block->out_proj_weight_f16,
-                                                                                block->out_proj_bias_f16,
-                                                                                token_count,
-                                                                                UOCR_METAL_DENSE_OUTPUT_F16,
-                                                                                scratch->clip_block_projected.f16,
-                                                                                error,
-                                                                                error_size));
-    RUN_CLIP_WORKSPACE_BLOCK_STEP("attention residual",
-                                  uocr_metal_context_diagnostic_clip_residual_add_f16(ctx,
-                                                                           input_f16,
-                                                                           scratch->clip_block_projected.f16,
-                                                                           token_count,
-                                                                           UOCR_METAL_DENSE_OUTPUT_F16,
-                                                                           scratch->clip_block_residual1.f16,
-                                                                           error,
-                                                                           error_size));
-    RUN_CLIP_WORKSPACE_BLOCK_STEP("LayerNorm2",
-                                  uocr_metal_context_diagnostic_clip_layernorm_f16(ctx,
-                                                                        scratch->clip_block_residual1.f16,
-                                                                        block->ln2_weight_f16,
-                                                                        block->ln2_bias_f16,
-                                                                        token_count,
-                                                                        UOCR_METAL_LAYERNORM_OUTPUT_F16,
-                                                                        scratch->clip_block_norm2.f16,
-                                                                        error,
-                                                                        error_size));
-    RUN_CLIP_WORKSPACE_BLOCK_STEP("MLP",
-                                  metal_context_clip_mlp_workspace_f16(ctx,
-                                                                       scratch->clip_block_norm2.f16,
-                                                                       block,
-                                                                       token_count,
-                                                                       UOCR_METAL_DENSE_OUTPUT_F16,
-                                                                       scratch->clip_block_mlp.f16,
-                                                                       scratch,
-                                                                       error,
-                                                                       error_size));
-    RUN_CLIP_WORKSPACE_BLOCK_STEP("MLP residual",
-                                  uocr_metal_context_diagnostic_clip_residual_add_f16(ctx,
-                                                                           scratch->clip_block_residual1.f16,
-                                                                           scratch->clip_block_mlp.f16,
-                                                                           token_count,
-                                                                           output_type,
-                                                                           out,
-                                                                           error,
-                                                                           error_size));
-
-#undef RUN_CLIP_WORKSPACE_BLOCK_STEP
-
-    return 1;
-}
-
-static int metal_context_clip_transformer_workspace_f16(uocr_metal_context *ctx,
-                                                        const uint16_t *input_f16,
-                                                        const uocr_metal_clip_transformer_block_f16 *blocks,
-                                                        uint32_t block_count,
-                                                        uint32_t token_count,
-                                                        uocr_metal_dense_output_type output_type,
-                                                        void *out,
-                                                        uocr_metal_vision_workspace *scratch,
-                                                        char *error,
-                                                        size_t error_size) {
-    metal_clear_error(error, error_size);
-    if (ctx == NULL || input_f16 == NULL || blocks == NULL || out == NULL || scratch == NULL) {
-        return metal_fail(error, error_size, "invalid Metal CLIP workspace transformer request");
-    }
-    if (block_count != UOCR_CLIP_BLOCKS) {
-        return metal_fail(error, error_size, "invalid Metal CLIP workspace transformer block count %u", block_count);
-    }
-    if (token_count != UOCR_CLIP_GLOBAL_TOKENS && token_count != UOCR_CLIP_LOCAL_TOKENS) {
-        return metal_fail(error, error_size, "invalid Metal CLIP workspace transformer token count %u", token_count);
-    }
-    uint64_t hidden_bytes = 0u;
-    if (!metal_clip_transformer_activation_bytes(token_count, NULL, &hidden_bytes, error, error_size)) {
-        return 0;
-    }
-    if (!metal_vision_slice_has_bytes(scratch->clip_a, hidden_bytes) ||
-        !metal_vision_slice_has_bytes(scratch->clip_b, hidden_bytes)) {
-        return metal_fail(error, error_size, "Metal CLIP workspace transformer state scratch is too small");
-    }
-    for (uint32_t block_index = 0u; block_index < block_count; ++block_index) {
-        if (!metal_clip_transformer_block_has_weights(&blocks[block_index])) {
-            return metal_fail(error, error_size, "invalid Metal CLIP workspace transformer block %u weights", block_index);
-        }
-    }
-
-    const uint16_t *current_f16 = input_f16;
-    uint16_t *state_a_f16 = scratch->clip_b.f16;
-    uint16_t *state_b_f16 = scratch->clip_a.f16;
-    uint16_t *next_f16 = state_a_f16;
-    const uint64_t clip_blocks_start_ns = uocr_profile_now_ns();
-    for (uint32_t block_index = 0u; block_index < block_count; ++block_index) {
-        const uint64_t block_start_ns = uocr_profile_now_ns();
-        const int is_last = block_index + 1u == block_count;
-        const uocr_metal_dense_output_type block_output_type = is_last ? output_type : UOCR_METAL_DENSE_OUTPUT_F16;
-        void *block_out = is_last ? out : (void *)next_f16;
-        if (block_out == (const void *)current_f16) {
-            return metal_fail(error, error_size, "Metal CLIP workspace transformer attempted in-place block output");
-        }
-        if (!metal_context_clip_transformer_block_workspace_f16(ctx,
-                                                                current_f16,
-                                                                &blocks[block_index],
-                                                                token_count,
-                                                                block_output_type,
-                                                                block_out,
-                                                                scratch,
-                                                                error,
-                                                                error_size)) {
-            char detail[512];
-            metal_copy_error_detail(detail, sizeof(detail), error);
-            return metal_fail(error,
-                              error_size,
-                              "failed to compute Metal CLIP workspace transformer block %u: %s",
-                              block_index,
-                              detail);
-        }
-        if (!is_last) {
-            current_f16 = (const uint16_t *)block_out;
-            next_f16 = (block_out == (void *)state_a_f16) ? state_b_f16 : state_a_f16;
-        }
-        metal_profile_add_event_now(ctx, "metal.vision.clip_block", block_start_ns);
-        metal_profile_add_event_now_f(ctx, block_start_ns, "metal.vision.clip_block.%02u", block_index);
-    }
-    metal_profile_add_event_now(ctx, "metal.vision.clip_blocks", clip_blocks_start_ns);
-    metal_clear_error(error, error_size);
-    return 1;
 }
 
 int uocr_metal_context_diagnostic_clip_sam_concat_f16(uocr_metal_context *ctx,
@@ -18230,7 +18319,7 @@ static int metal_context_sam_attention_f16(uocr_metal_context *ctx,
         params.heads = UOCR_SAM_ATTENTION_HEADS;
         params.head_dim = UOCR_SAM_HEAD_DIM;
         params.scale = 1.0f / sqrtf((float)UOCR_SAM_HEAD_DIM);
-        params.reserved0 = 0u;
+        params.batch_size = 1u;
         params.reserved1 = 0u;
         params.reserved2 = 0u;
 
