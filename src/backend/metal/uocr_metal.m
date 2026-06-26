@@ -251,6 +251,7 @@ struct uocr_metal_context {
     uint32_t mps_vision_workspace_prebuild_projected_row_capacity;
     uint32_t mps_vision_workspace_prebuild_local_view_count;
     uint32_t mps_vision_workspace_prebuild_global_view_count;
+    uint32_t public_mps_large_gemm_required_depth;
     NSMutableArray *transient_retains;
     uocr_metal_model_view *model_views;
     uint32_t model_view_count;
@@ -6837,16 +6838,83 @@ static uint64_t metal_mps_matmul_min_flops(void) {
     return metal_env_u64("UOCR_METAL_MPS_MATMUL_MIN_FLOPS", UOCR_METAL_MPS_MATMUL_MIN_FLOPS);
 }
 
-static int metal_mps_matmul_nt_f16_should_use(uint32_t rows, uint32_t in_features, uint32_t out_features) {
+static int metal_mps_matmul_nt_f16_flops(uint32_t rows,
+                                         uint32_t in_features,
+                                         uint32_t out_features,
+                                         uint64_t *out_flops) {
     uint64_t tmp = 0u;
     uint64_t flops = 0u;
-    if (rows == 0u || in_features == 0u || out_features == 0u || !metal_mps_framework_available() ||
+    if (out_flops == NULL || rows == 0u || in_features == 0u || out_features == 0u ||
         !checked_mul_u64((uint64_t)rows, (uint64_t)in_features, &tmp) ||
         !checked_mul_u64(tmp, (uint64_t)out_features, &flops) ||
         !checked_mul_u64(flops, 2u, &flops)) {
         return 0;
     }
+    *out_flops = flops;
+    return 1;
+}
+
+static int metal_mps_matmul_nt_f16_is_large(uint32_t rows, uint32_t in_features, uint32_t out_features) {
+    uint64_t flops = 0u;
+    return metal_mps_matmul_nt_f16_flops(rows, in_features, out_features, &flops) &&
+           flops >= UOCR_METAL_MPS_MATMUL_MIN_FLOPS;
+}
+
+static int metal_mps_matmul_nt_f16_should_use(uint32_t rows, uint32_t in_features, uint32_t out_features) {
+    uint64_t flops = 0u;
+    if (!metal_mps_framework_available() ||
+        !metal_mps_matmul_nt_f16_flops(rows, in_features, out_features, &flops)) {
+        return 0;
+    }
     return flops >= metal_mps_matmul_min_flops();
+}
+
+static void metal_public_mps_large_gemm_require_begin(uocr_metal_context *ctx) {
+    if (ctx != NULL && ctx->public_mps_large_gemm_required_depth != UINT32_MAX) {
+        ++ctx->public_mps_large_gemm_required_depth;
+    }
+}
+
+static void metal_public_mps_large_gemm_require_end(uocr_metal_context *ctx) {
+    if (ctx != NULL && ctx->public_mps_large_gemm_required_depth != 0u) {
+        --ctx->public_mps_large_gemm_required_depth;
+    }
+}
+
+static int metal_public_mps_matmul_fallback_allowed(uocr_metal_context *ctx,
+                                                    uint32_t rows,
+                                                    uint32_t in_features,
+                                                    uint32_t out_features,
+                                                    const char *op_name,
+                                                    char *error,
+                                                    size_t error_size) {
+    if (ctx == NULL || ctx->public_mps_large_gemm_required_depth == 0u ||
+        !metal_mps_matmul_nt_f16_is_large(rows, in_features, out_features)) {
+        return 1;
+    }
+    uint64_t flops = 0u;
+    (void)metal_mps_matmul_nt_f16_flops(rows, in_features, out_features, &flops);
+    if (!metal_mps_framework_available()) {
+        return metal_fail(error,
+                          error_size,
+                          "public Metal OCR requires MPSNDArray matmul for large %s (%ux%u x %u, %llu FLOPs), but MPS is unavailable or disabled",
+                          op_name != NULL ? op_name : "GEMM",
+                          rows,
+                          in_features,
+                          out_features,
+                          (unsigned long long)flops);
+    }
+    if (!metal_mps_matmul_nt_f16_should_use(rows, in_features, out_features)) {
+        return metal_fail(error,
+                          error_size,
+                          "public Metal OCR requires the chosen MPSNDArray matmul path for large %s (%ux%u x %u, %llu FLOPs), but the MPS threshold policy disabled it",
+                          op_name != NULL ? op_name : "GEMM",
+                          rows,
+                          in_features,
+                          out_features,
+                          (unsigned long long)flops);
+    }
+    return 1;
 }
 
 static id metal_mps_descriptor_for_shape(uocr_metal_context *ctx,
@@ -8771,6 +8839,15 @@ static int metal_run_attention_qkv_buffer_f16(uocr_metal_context *ctx,
                                            error,
                                            error_size);
     }
+    if (!metal_public_mps_matmul_fallback_allowed(ctx,
+                                                  n_tokens,
+                                                  UOCR_HIDDEN_SIZE,
+                                                  UOCR_HIDDEN_SIZE,
+                                                  "integrated attention QKV",
+                                                  error,
+                                                  error_size)) {
+        return 0;
+    }
     @autoreleasepool {
         id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, "uocr_attention_qkvo_f16_to_f16", error, error_size);
         if (pipeline == nil) {
@@ -9102,6 +9179,15 @@ static int metal_run_attention_output_residual_buffer_f16(uocr_metal_context *ct
                                           error,
                                           error_size);
     }
+    if (!metal_public_mps_matmul_fallback_allowed(ctx,
+                                                  n_tokens,
+                                                  UOCR_HIDDEN_SIZE,
+                                                  UOCR_HIDDEN_SIZE,
+                                                  "integrated attention output",
+                                                  error,
+                                                  error_size)) {
+        return 0;
+    }
     @autoreleasepool {
         id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, "uocr_attention_output_residual_f16_to_f16", error, error_size);
         if (pipeline == nil) {
@@ -9166,6 +9252,16 @@ static int metal_run_dense_swiglu_buffer_f16(uocr_metal_context *ctx,
         return metal_fail(error, error_size, "invalid %s SwiGLU request", op_name);
     }
     const int use_mps_down = metal_mps_matmul_nt_f16_should_use(n_tokens, intermediate_size, UOCR_HIDDEN_SIZE);
+    if (!use_mps_down &&
+        !metal_public_mps_matmul_fallback_allowed(ctx,
+                                                  n_tokens,
+                                                  intermediate_size,
+                                                  UOCR_HIDDEN_SIZE,
+                                                  op_name,
+                                                  error,
+                                                  error_size)) {
+        return 0;
+    }
     @autoreleasepool {
         id<MTLComputePipelineState> gate_pipeline = metal_get_pipeline(ctx, "uocr_dense_swiglu_gate_up_f16", error, error_size);
         id<MTLComputePipelineState> down_pipeline = use_mps_down ? nil :
@@ -9275,6 +9371,16 @@ static int metal_run_moe_router_buffer_f16(uocr_metal_context *ctx,
     (void)top_ids_bytes;
     (void)top_weights_bytes;
     const int use_mps_logits = metal_mps_matmul_nt_f16_should_use(n_tokens, UOCR_HIDDEN_SIZE, UOCR_ROUTED_EXPERTS);
+    if (!use_mps_logits &&
+        !metal_public_mps_matmul_fallback_allowed(ctx,
+                                                  n_tokens,
+                                                  UOCR_HIDDEN_SIZE,
+                                                  UOCR_ROUTED_EXPERTS,
+                                                  "integrated MoE router logits",
+                                                  error,
+                                                  error_size)) {
+        return 0;
+    }
     @autoreleasepool {
         id<MTLComputePipelineState> logits_pipeline = use_mps_logits ? nil :
             metal_get_pipeline(ctx, "uocr_moe_router_logits_f16_to_f32", error, error_size);
@@ -10030,13 +10136,13 @@ static int metal_run_decoder_prefill_text_f16(uocr_metal_context *ctx,
     return 1;
 }
 
-static int metal_context_generate_f16(uocr_metal_context *ctx,
-                                      const uocr_metal_decoder_request_f16 *request,
-                                      id<MTLBuffer> image_features_buffer,
-                                      NSUInteger image_features_offset,
-                                      uocr_metal_decoder_result_f16 *result,
-                                      char *error,
-                                      size_t error_size) {
+static int metal_context_generate_f16_impl(uocr_metal_context *ctx,
+                                           const uocr_metal_decoder_request_f16 *request,
+                                           id<MTLBuffer> image_features_buffer,
+                                           NSUInteger image_features_offset,
+                                           uocr_metal_decoder_result_f16 *result,
+                                           char *error,
+                                           size_t error_size) {
     metal_clear_error(error, error_size);
     if (ctx == NULL || request == NULL || result == NULL) {
         return metal_fail(error, error_size, "invalid Metal integrated decoder request");
@@ -10475,16 +10581,19 @@ int uocr_metal_context_generate_f16(uocr_metal_context *ctx,
                                     uocr_metal_decoder_result_f16 *result,
                                     char *error,
                                     size_t error_size) {
-    return metal_context_generate_f16(ctx,
-                                      request,
-                                      nil,
-                                      0u,
-                                      result,
-                                      error,
-                                      error_size);
+    metal_public_mps_large_gemm_require_begin(ctx);
+    const int ok = metal_context_generate_f16_impl(ctx,
+                                                  request,
+                                                  nil,
+                                                  0u,
+                                                  result,
+                                                  error,
+                                                  error_size);
+    metal_public_mps_large_gemm_require_end(ctx);
+    return ok;
 }
 
-int uocr_metal_context_generate_image_f16(uocr_metal_context *ctx,
+static int metal_context_generate_image_f16_impl(uocr_metal_context *ctx,
                                           const uocr_prepared_request *request,
                                           uint32_t max_views_per_chunk,
                                           uint32_t slot,
@@ -10575,17 +10684,36 @@ int uocr_metal_context_generate_image_f16(uocr_metal_context *ctx,
     decoder_request.no_repeat_window = request->no_repeat_window;
 
     const uint64_t generate_start_ns = uocr_profile_now_ns();
-    const int ok = metal_context_generate_f16(ctx,
-                                              &decoder_request,
-                                              scratch.final_visual_rows.buffer,
-                                              scratch.final_visual_rows.offset,
-                                              result,
-                                              error,
-                                              error_size);
+    const int ok = metal_context_generate_f16_impl(ctx,
+                                                   &decoder_request,
+                                                   scratch.final_visual_rows.buffer,
+                                                   scratch.final_visual_rows.offset,
+                                                   result,
+                                                   error,
+                                                   error_size);
     if (ok) {
         metal_profile_add_event_now(ctx, "metal.image_generate", generate_start_ns);
     }
     metal_vision_workspace_reset(&scratch);
+    return ok;
+}
+
+int uocr_metal_context_generate_image_f16(uocr_metal_context *ctx,
+                                          const uocr_prepared_request *request,
+                                          uint32_t max_views_per_chunk,
+                                          uint32_t slot,
+                                          uocr_metal_decoder_result_f16 *result,
+                                          char *error,
+                                          size_t error_size) {
+    metal_public_mps_large_gemm_require_begin(ctx);
+    const int ok = metal_context_generate_image_f16_impl(ctx,
+                                                        request,
+                                                        max_views_per_chunk,
+                                                        slot,
+                                                        result,
+                                                        error,
+                                                        error_size);
+    metal_public_mps_large_gemm_require_end(ctx);
     return ok;
 }
 
@@ -12640,6 +12768,22 @@ int uocr_metal_context_sam_qkv_f16(uocr_metal_context *ctx,
             metal_clear_error(error, error_size);
             return 1;
         }
+        if (output_type == UOCR_METAL_DENSE_OUTPUT_F16 &&
+            !metal_public_mps_matmul_fallback_allowed(ctx,
+                                                      n_rows,
+                                                      UOCR_SAM_HIDDEN_SIZE,
+                                                      UOCR_SAM_HIDDEN_SIZE,
+                                                      "Metal SAM QKV",
+                                                      error,
+                                                      error_size)) {
+            [v_dst release];
+            [k_dst release];
+            [q_dst release];
+            [bias release];
+            [weight release];
+            [src release];
+            return 0;
+        }
 
         id<MTLCommandBuffer> cb = metal_new_command_buffer(ctx);
         if (cb == nil) {
@@ -14452,6 +14596,17 @@ int uocr_metal_context_clip_qkv_f16(uocr_metal_context *ctx,
             metal_copy_buffer_range_to_host_if_needed(k_out, k_dst, k_offset, (NSUInteger)output_bytes, k_needs_copy);
             metal_copy_buffer_range_to_host_if_needed(v_out, v_dst, v_offset, (NSUInteger)output_bytes, v_needs_copy);
             result = 1;
+            goto cleanup_clip_qkv;
+        }
+        if (output_type == UOCR_METAL_DENSE_OUTPUT_F16 &&
+            !metal_public_mps_matmul_fallback_allowed(ctx,
+                                                      token_count,
+                                                      UOCR_CLIP_HIDDEN_SIZE,
+                                                      UOCR_CLIP_HIDDEN_SIZE,
+                                                      "Metal CLIP QKV",
+                                                      error,
+                                                      error_size)) {
+            result = 0;
             goto cleanup_clip_qkv;
         }
 
@@ -17925,6 +18080,17 @@ int uocr_metal_context_lm_head_f16(uocr_metal_context *ctx,
             }
             metal_profile_add_event_now(ctx, "metal.lm_head.mps_matmul", lm_mps_start_ns);
         } else {
+            if (!metal_public_mps_matmul_fallback_allowed(ctx,
+                                                          n_rows,
+                                                          UOCR_HIDDEN_SIZE,
+                                                          UOCR_VOCAB_SIZE,
+                                                          "Metal LM-head logits",
+                                                          error,
+                                                          error_size)) {
+                [dst release];
+                [src release];
+                return 0;
+            }
             id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, "uocr_dense_f16_to_f32", error, error_size);
             if (pipeline == nil) {
                 [dst release];
@@ -18655,6 +18821,20 @@ int uocr_metal_context_dense_f16(uocr_metal_context *ctx,
             [weight release];
             [src release];
             return ok;
+        }
+        if (output_type == UOCR_METAL_DENSE_OUTPUT_F16 &&
+            !metal_public_mps_matmul_fallback_allowed(ctx,
+                                                      input_rows,
+                                                      in_features,
+                                                      out_features,
+                                                      "Metal dense",
+                                                      error,
+                                                      error_size)) {
+            [dst release];
+            [bias release];
+            [weight release];
+            [src release];
+            return 0;
         }
 
         metal_zero_buffer_range(dst, dst_offset, (NSUInteger)output_bytes);
