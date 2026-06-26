@@ -249,7 +249,9 @@ int uocr_estimate_vision_memory_for_shape(uint32_t max_view_size,
     uint64_t sam_window_attention_tokens = 0u;
     uint64_t sam_attention_tokens = patch_tokens;
     uint64_t sam_attention_values = 0u;
+    uint64_t sam_attention_batch_values = 0u;
     uint64_t sam_mlp_values = 0u;
+    uint64_t sam_mlp_batch_values = 0u;
     uint64_t clip_values = 0u;
     uint64_t clip_final_values = 0u;
     uint64_t clip_mlp_values = 0u;
@@ -278,7 +280,9 @@ int uocr_estimate_vision_memory_for_shape(uint32_t max_view_size,
         !checked_mul_u64(sam_attention_tokens > sam_window_attention_tokens ? sam_attention_tokens : sam_window_attention_tokens,
                          (uint64_t)UOCR_SAM_HIDDEN_SIZE,
                          &sam_attention_values) ||
+        !checked_mul_u64(sam_attention_values, chunk_view_capacity, &sam_attention_batch_values) ||
         !checked_mul_u64(patch_tokens, (uint64_t)UOCR_SAM_MLP_INTERMEDIATE, &sam_mlp_values) ||
+        !checked_mul_u64(sam_mlp_values, chunk_view_capacity, &sam_mlp_batch_values) ||
         !checked_mul_u64(clip_tokens, (uint64_t)UOCR_CLIP_HIDDEN_SIZE, &clip_values) ||
         !checked_mul_u64(clip_values, chunk_view_capacity, &clip_final_values) ||
         !checked_mul_u64(clip_tokens, (uint64_t)UOCR_CLIP_MLP_INTERMEDIATE, &clip_mlp_values) ||
@@ -287,21 +291,21 @@ int uocr_estimate_vision_memory_for_shape(uint32_t max_view_size,
         !checked_mul_u64((uint64_t)max_chunk_projected_rows, (uint64_t)UOCR_HIDDEN_SIZE, &projected_values) ||
         !checked_mul_u64((uint64_t)final_visual_rows, (uint64_t)UOCR_HIDDEN_SIZE, &final_visual_values) ||
         !add_aligned_f16_slice_bytes(&total, sam_patch_bhwc_values) ||
-        !add_aligned_f16_slice_bytes(&total, sam_bhwc_values) ||
-        !add_aligned_f16_slice_bytes(&total, sam_bhwc_values) ||
         !add_aligned_f16_slice_bytes(&total, sam_transformer_batch_values) ||
         !add_aligned_f16_slice_bytes(&total, sam_bhwc_values) ||
-        !add_aligned_f16_slice_bytes(&total, sam_attention_values) ||
-        !add_aligned_f16_slice_bytes(&total, sam_attention_values) ||
-        !add_aligned_f16_slice_bytes(&total, sam_attention_values) ||
-        !add_aligned_f16_slice_bytes(&total, sam_attention_values) ||
-        !add_aligned_f16_slice_bytes(&total, sam_attention_values) ||
-        !add_aligned_f16_slice_bytes(&total, sam_attention_values) ||
-        !add_aligned_f16_slice_bytes(&total, sam_bhwc_values) ||
-        !add_aligned_f16_slice_bytes(&total, sam_bhwc_values) ||
-        !add_aligned_f16_slice_bytes(&total, sam_bhwc_values) ||
-        !add_aligned_f16_slice_bytes(&total, sam_mlp_values) ||
-        !add_aligned_f16_slice_bytes(&total, sam_bhwc_values) ||
+        !add_aligned_f16_slice_bytes(&total, sam_transformer_batch_values) ||
+        !add_aligned_f16_slice_bytes(&total, sam_transformer_batch_values) ||
+        !add_aligned_f16_slice_bytes(&total, sam_attention_batch_values) ||
+        !add_aligned_f16_slice_bytes(&total, sam_attention_batch_values) ||
+        !add_aligned_f16_slice_bytes(&total, sam_attention_batch_values) ||
+        !add_aligned_f16_slice_bytes(&total, sam_attention_batch_values) ||
+        !add_aligned_f16_slice_bytes(&total, sam_attention_batch_values) ||
+        !add_aligned_f16_slice_bytes(&total, sam_attention_batch_values) ||
+        !add_aligned_f16_slice_bytes(&total, sam_transformer_batch_values) ||
+        !add_aligned_f16_slice_bytes(&total, sam_transformer_batch_values) ||
+        !add_aligned_f16_slice_bytes(&total, sam_transformer_batch_values) ||
+        !add_aligned_f16_slice_bytes(&total, sam_mlp_batch_values) ||
+        !add_aligned_f16_slice_bytes(&total, sam_transformer_batch_values) ||
         !add_aligned_f16_slice_bytes(&total, sam_neck_values) ||
         !add_aligned_f16_slice_bytes(&total, sam_neck_values) ||
         !add_aligned_f16_slice_bytes(&total, sam_net2_values) ||

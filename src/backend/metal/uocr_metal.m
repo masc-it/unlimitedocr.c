@@ -458,6 +458,17 @@ static int metal_command_batch_commit_and_wait(uocr_metal_context *ctx,
                                                const char *op_name,
                                                char *error,
                                                size_t error_size);
+static id<MTLCommandBuffer> metal_command_buffer_for_op(uocr_metal_context *ctx,
+                                                        int *out_owned,
+                                                        const char *op_name,
+                                                        char *error,
+                                                        size_t error_size);
+static int metal_finish_command_buffer_for_op(uocr_metal_context *ctx,
+                                              id<MTLCommandBuffer> cb,
+                                              int owned,
+                                              const char *op_name,
+                                              char *error,
+                                              size_t error_size);
 
 static int metal_fail(char *error, size_t error_size, const char *fmt, ...) {
     if (error != NULL && error_size > 0u) {
@@ -811,6 +822,7 @@ typedef struct uocr_metal_sam_abs_pos_params {
     uint32_t target_width;
     uint32_t target_height;
     uint32_t channels;
+    uint32_t batch_size;
 } uocr_metal_sam_abs_pos_params;
 
 typedef struct uocr_metal_sam_window_attention_params {
@@ -833,6 +845,7 @@ typedef struct uocr_metal_sam_window_partition_params {
     uint32_t windows_per_col;
     uint32_t window_size;
     uint32_t hidden_size;
+    uint32_t batch_size;
 } uocr_metal_sam_window_partition_params;
 
 typedef struct uocr_metal_sam_neck_conv1x1_params {
@@ -904,7 +917,7 @@ typedef struct uocr_metal_sam_rel_pos_attention_params {
     uint32_t rel_pos_h_length;
     uint32_t rel_pos_w_length;
     float scale;
-    uint32_t reserved0;
+    uint32_t batch_size;
     uint32_t reserved1;
     uint32_t reserved2;
 } uocr_metal_sam_rel_pos_attention_params;
@@ -929,7 +942,7 @@ _Static_assert(sizeof(uocr_metal_visual_format_local_params) == 32u,
                "uocr_metal_visual_format_local_params ABI mismatch");
 _Static_assert(sizeof(uocr_metal_sam_window_attention_params) == 32u,
                "uocr_metal_sam_window_attention_params ABI mismatch");
-_Static_assert(sizeof(uocr_metal_sam_window_partition_params) == 32u,
+_Static_assert(sizeof(uocr_metal_sam_window_partition_params) == 36u,
                "uocr_metal_sam_window_partition_params ABI mismatch");
 _Static_assert(sizeof(uocr_metal_sam_neck_conv1x1_params) == 20u,
                "uocr_metal_sam_neck_conv1x1_params ABI mismatch");
@@ -3594,7 +3607,9 @@ static int metal_vision_workspace_init(uocr_metal_context *ctx,
     uint64_t sam_window_attention_tokens = 0u;
     uint64_t sam_attention_tokens = patch_tokens;
     uint64_t sam_attention_values = 0u;
+    uint64_t sam_attention_batch_values = 0u;
     uint64_t sam_mlp_values = 0u;
+    uint64_t sam_mlp_batch_values = 0u;
     uint64_t clip_mlp_values = 0u;
     uint64_t projected_values = 0u;
     uint64_t final_visual_values = 0u;
@@ -3605,7 +3620,9 @@ static int metal_vision_workspace_init(uocr_metal_context *ctx,
         !checked_mul_u64(sam_attention_tokens > sam_window_attention_tokens ? sam_attention_tokens : sam_window_attention_tokens,
                          (uint64_t)UOCR_SAM_HIDDEN_SIZE,
                          &sam_attention_values) ||
+        !checked_mul_u64(sam_attention_values, clip_view_capacity, &sam_attention_batch_values) ||
         !checked_mul_u64(patch_tokens, (uint64_t)UOCR_SAM_MLP_INTERMEDIATE, &sam_mlp_values) ||
+        !checked_mul_u64(sam_mlp_values, clip_view_capacity, &sam_mlp_batch_values) ||
         !checked_mul_u64(clip_tokens, (uint64_t)UOCR_CLIP_MLP_INTERMEDIATE, &clip_mlp_values) ||
         !checked_mul_u64(clip_mlp_values, clip_view_capacity, &clip_mlp_batch_values)) {
         return metal_fail(error, error_size, "Metal transformer vision workspace byte-size overflow");
@@ -3632,21 +3649,21 @@ static int metal_vision_workspace_init(uocr_metal_context *ctx,
     } while (0)
 
     ADD_WORKSPACE_SLICE(sam_patch_bhwc_values, "SAM patch BHWC batch");
-    ADD_WORKSPACE_SLICE(sam_bhwc_values, "SAM positioned BHWC");
+    ADD_WORKSPACE_SLICE(sam_transformer_batch_values, "SAM positioned BHWC");
     ADD_WORKSPACE_SLICE(sam_bhwc_values, "SAM transformer BHWC");
     ADD_WORKSPACE_SLICE(sam_transformer_batch_values, "SAM transformer BHWC batch");
-    ADD_WORKSPACE_SLICE(sam_bhwc_values, "SAM block norm1 BHWC");
-    ADD_WORKSPACE_SLICE(sam_attention_values, "SAM block window tokens");
-    ADD_WORKSPACE_SLICE(sam_attention_values, "SAM block Q");
-    ADD_WORKSPACE_SLICE(sam_attention_values, "SAM block K");
-    ADD_WORKSPACE_SLICE(sam_attention_values, "SAM block V");
-    ADD_WORKSPACE_SLICE(sam_attention_values, "SAM block attention");
-    ADD_WORKSPACE_SLICE(sam_attention_values, "SAM block projected windows");
-    ADD_WORKSPACE_SLICE(sam_bhwc_values, "SAM block attention BHWC");
-    ADD_WORKSPACE_SLICE(sam_bhwc_values, "SAM block residual1 BHWC");
-    ADD_WORKSPACE_SLICE(sam_bhwc_values, "SAM block norm2 BHWC");
-    ADD_WORKSPACE_SLICE(sam_mlp_values, "SAM block MLP intermediate");
-    ADD_WORKSPACE_SLICE(sam_bhwc_values, "SAM block MLP BHWC");
+    ADD_WORKSPACE_SLICE(sam_transformer_batch_values, "SAM block norm1 BHWC");
+    ADD_WORKSPACE_SLICE(sam_attention_batch_values, "SAM block window tokens");
+    ADD_WORKSPACE_SLICE(sam_attention_batch_values, "SAM block Q");
+    ADD_WORKSPACE_SLICE(sam_attention_batch_values, "SAM block K");
+    ADD_WORKSPACE_SLICE(sam_attention_batch_values, "SAM block V");
+    ADD_WORKSPACE_SLICE(sam_attention_batch_values, "SAM block attention");
+    ADD_WORKSPACE_SLICE(sam_attention_batch_values, "SAM block projected windows");
+    ADD_WORKSPACE_SLICE(sam_transformer_batch_values, "SAM block attention BHWC");
+    ADD_WORKSPACE_SLICE(sam_transformer_batch_values, "SAM block residual1 BHWC");
+    ADD_WORKSPACE_SLICE(sam_transformer_batch_values, "SAM block norm2 BHWC");
+    ADD_WORKSPACE_SLICE(sam_mlp_batch_values, "SAM block MLP intermediate");
+    ADD_WORKSPACE_SLICE(sam_transformer_batch_values, "SAM block MLP BHWC");
     ADD_WORKSPACE_SLICE(sam_neck_values, "SAM neck A NCHW");
     ADD_WORKSPACE_SLICE(sam_neck_values, "SAM neck B NCHW");
     ADD_WORKSPACE_SLICE(sam_net2_values, "SAM net_2 NCHW");
@@ -3704,21 +3721,21 @@ static int metal_vision_workspace_init(uocr_metal_context *ctx,
     } while (0)
 
     ASSIGN_WORKSPACE_SLICE(sam_patch_bhwc, sam_patch_bhwc_values, "SAM patch BHWC batch");
-    ASSIGN_WORKSPACE_SLICE(sam_pos_bhwc, sam_bhwc_values, "SAM positioned BHWC");
+    ASSIGN_WORKSPACE_SLICE(sam_pos_bhwc, sam_transformer_batch_values, "SAM positioned BHWC");
     ASSIGN_WORKSPACE_SLICE(sam_transformer_bhwc, sam_bhwc_values, "SAM transformer BHWC");
     ASSIGN_WORKSPACE_SLICE(sam_transformer_batch_bhwc, sam_transformer_batch_values, "SAM transformer BHWC batch");
-    ASSIGN_WORKSPACE_SLICE(sam_block_norm1_bhwc, sam_bhwc_values, "SAM block norm1 BHWC");
-    ASSIGN_WORKSPACE_SLICE(sam_block_window_tokens, sam_attention_values, "SAM block window tokens");
-    ASSIGN_WORKSPACE_SLICE(sam_block_q, sam_attention_values, "SAM block Q");
-    ASSIGN_WORKSPACE_SLICE(sam_block_k, sam_attention_values, "SAM block K");
-    ASSIGN_WORKSPACE_SLICE(sam_block_v, sam_attention_values, "SAM block V");
-    ASSIGN_WORKSPACE_SLICE(sam_block_attention, sam_attention_values, "SAM block attention");
-    ASSIGN_WORKSPACE_SLICE(sam_block_projected_windows, sam_attention_values, "SAM block projected windows");
-    ASSIGN_WORKSPACE_SLICE(sam_block_attention_bhwc, sam_bhwc_values, "SAM block attention BHWC");
-    ASSIGN_WORKSPACE_SLICE(sam_block_residual1_bhwc, sam_bhwc_values, "SAM block residual1 BHWC");
-    ASSIGN_WORKSPACE_SLICE(sam_block_norm2_bhwc, sam_bhwc_values, "SAM block norm2 BHWC");
-    ASSIGN_WORKSPACE_SLICE(sam_block_mlp_intermediate, sam_mlp_values, "SAM block MLP intermediate");
-    ASSIGN_WORKSPACE_SLICE(sam_block_mlp_bhwc, sam_bhwc_values, "SAM block MLP BHWC");
+    ASSIGN_WORKSPACE_SLICE(sam_block_norm1_bhwc, sam_transformer_batch_values, "SAM block norm1 BHWC");
+    ASSIGN_WORKSPACE_SLICE(sam_block_window_tokens, sam_attention_batch_values, "SAM block window tokens");
+    ASSIGN_WORKSPACE_SLICE(sam_block_q, sam_attention_batch_values, "SAM block Q");
+    ASSIGN_WORKSPACE_SLICE(sam_block_k, sam_attention_batch_values, "SAM block K");
+    ASSIGN_WORKSPACE_SLICE(sam_block_v, sam_attention_batch_values, "SAM block V");
+    ASSIGN_WORKSPACE_SLICE(sam_block_attention, sam_attention_batch_values, "SAM block attention");
+    ASSIGN_WORKSPACE_SLICE(sam_block_projected_windows, sam_attention_batch_values, "SAM block projected windows");
+    ASSIGN_WORKSPACE_SLICE(sam_block_attention_bhwc, sam_transformer_batch_values, "SAM block attention BHWC");
+    ASSIGN_WORKSPACE_SLICE(sam_block_residual1_bhwc, sam_transformer_batch_values, "SAM block residual1 BHWC");
+    ASSIGN_WORKSPACE_SLICE(sam_block_norm2_bhwc, sam_transformer_batch_values, "SAM block norm2 BHWC");
+    ASSIGN_WORKSPACE_SLICE(sam_block_mlp_intermediate, sam_mlp_batch_values, "SAM block MLP intermediate");
+    ASSIGN_WORKSPACE_SLICE(sam_block_mlp_bhwc, sam_transformer_batch_values, "SAM block MLP BHWC");
     ASSIGN_WORKSPACE_SLICE(sam_neck_a_nchw, sam_neck_values, "SAM neck A NCHW");
     ASSIGN_WORKSPACE_SLICE(sam_neck_b_nchw, sam_neck_values, "SAM neck B NCHW");
     ASSIGN_WORKSPACE_SLICE(sam_net2_nchw, sam_net2_values, "SAM net_2 NCHW");
@@ -3779,6 +3796,17 @@ static int metal_context_sam_transformer_workspace_f16(uocr_metal_context *ctx,
                                                        uocr_metal_vision_workspace *scratch,
                                                        char *error,
                                                        size_t error_size);
+static int metal_context_sam_transformer_batch_workspace_f16_to_slice(uocr_metal_context *ctx,
+                                                                      uocr_metal_vision_workspace_slice input_bhwc,
+                                                                      const uocr_metal_sam_transformer_block_slices_f16 *blocks,
+                                                                      uint32_t block_count,
+                                                                      uint32_t grid_w,
+                                                                      uint32_t grid_h,
+                                                                      uint32_t view_count,
+                                                                      uocr_metal_vision_workspace_slice out_bhwc,
+                                                                      uocr_metal_vision_workspace *scratch,
+                                                                      char *error,
+                                                                      size_t error_size);
 static int metal_context_clip_transformer_batch_workspace_f16_to_slice(uocr_metal_context *ctx,
                                                                        uocr_metal_vision_workspace_slice input_tokens,
                                                                        const uocr_metal_clip_transformer_block_slices_f16 *blocks,
@@ -3891,6 +3919,77 @@ static int metal_context_sam_patch_embed_f16_to_slice(uocr_metal_context *ctx,
                                                   error_size);
 }
 
+static int metal_context_sam_add_abs_pos_batch_f16_to_slice(uocr_metal_context *ctx,
+                                                             uocr_metal_vision_workspace_slice patch_bhwc,
+                                                             uocr_metal_vision_tensor_f16 pos_embed,
+                                                             uint32_t grid_w,
+                                                             uint32_t grid_h,
+                                                             uint32_t view_count,
+                                                             uocr_metal_vision_workspace_slice out_bhwc,
+                                                             char *error,
+                                                             size_t error_size) {
+    uint64_t values_per_view = 0u;
+    uint64_t values = 0u;
+    uint64_t target_bytes = 0u;
+    uint64_t pos_values = 0u;
+    uint64_t pos_bytes = 0u;
+    const uint32_t source_grid = UOCR_GLOBAL_VIEW_SIZE / UOCR_VISION_PATCH_SIZE;
+    if (view_count == 0u ||
+        !metal_vision_square_grid_values(grid_w, grid_h, UOCR_SAM_HIDDEN_SIZE, &values_per_view) ||
+        !checked_mul_u64(values_per_view, (uint64_t)view_count, &values) ||
+        !metal_vision_f16_bytes(values, &target_bytes) ||
+        !metal_vision_square_grid_values(source_grid, source_grid, UOCR_SAM_HIDDEN_SIZE, &pos_values) ||
+        !metal_vision_f16_bytes(pos_values, &pos_bytes) ||
+        !metal_vision_require_workspace_slice_f16(patch_bhwc, target_bytes, "SAM abs-pos batch input", error, error_size) ||
+        !metal_vision_require_workspace_slice_f16(out_bhwc, target_bytes, "SAM abs-pos batch output", error, error_size) ||
+        !metal_vision_require_tensor_slice_f16(pos_embed, pos_bytes, "SAM abs-pos table", error, error_size)) {
+        return 0;
+    }
+    if (values > (uint64_t)UINT32_MAX) {
+        return metal_fail(error, error_size, "Metal SAM abs-pos batch value-count overflow");
+    }
+
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, "uocr_sam_add_abs_pos_f16", error, error_size);
+        if (pipeline == nil) {
+            return 0;
+        }
+        int owned_command_buffer = 0;
+        id<MTLCommandBuffer> cb = metal_command_buffer_for_op(ctx, &owned_command_buffer, "Metal SAM abs-pos batch", error, error_size);
+        if (cb == nil) {
+            return 0;
+        }
+        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
+        if (enc == nil) {
+            return metal_fail(error, error_size, "failed to create Metal SAM abs-pos batch command encoder");
+        }
+
+        uocr_metal_sam_abs_pos_params params;
+        params.source_grid = source_grid;
+        params.target_width = grid_w;
+        params.target_height = grid_h;
+        params.channels = UOCR_SAM_HIDDEN_SIZE;
+        params.batch_size = view_count;
+
+        NSUInteger threads = pipeline.threadExecutionWidth;
+        if (threads == 0u) {
+            threads = 1u;
+        }
+        if (threads > 256u) {
+            threads = 256u;
+        }
+        [enc setComputePipelineState:pipeline];
+        [enc setBuffer:patch_bhwc.buffer offset:patch_bhwc.offset atIndex:0u];
+        [enc setBuffer:pos_embed.slice.buffer offset:pos_embed.slice.offset atIndex:1u];
+        [enc setBuffer:out_bhwc.buffer offset:out_bhwc.offset atIndex:2u];
+        [enc setBytes:&params length:sizeof(params) atIndex:3u];
+        [enc dispatchThreads:MTLSizeMake((NSUInteger)values, 1u, 1u)
+       threadsPerThreadgroup:MTLSizeMake(threads, 1u, 1u)];
+        [enc endEncoding];
+        return metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, "Metal SAM abs-pos batch", error, error_size);
+    }
+}
+
 static int metal_context_sam_add_abs_pos_f16_to_slice(uocr_metal_context *ctx,
                                                        uocr_metal_vision_workspace_slice patch_bhwc,
                                                        uocr_metal_vision_tensor_f16 pos_embed,
@@ -3899,31 +3998,18 @@ static int metal_context_sam_add_abs_pos_f16_to_slice(uocr_metal_context *ctx,
                                                        uocr_metal_vision_workspace_slice out_bhwc,
                                                        char *error,
                                                        size_t error_size) {
-    uint64_t target_values = 0u;
-    uint64_t target_bytes = 0u;
-    uint64_t pos_values = 0u;
-    uint64_t pos_bytes = 0u;
-    const uint32_t source_grid = UOCR_GLOBAL_VIEW_SIZE / UOCR_VISION_PATCH_SIZE;
-    if (!metal_vision_square_grid_values(grid_w, grid_h, UOCR_SAM_HIDDEN_SIZE, &target_values) ||
-        !metal_vision_f16_bytes(target_values, &target_bytes) ||
-        !metal_vision_square_grid_values(source_grid, source_grid, UOCR_SAM_HIDDEN_SIZE, &pos_values) ||
-        !metal_vision_f16_bytes(pos_values, &pos_bytes) ||
-        !metal_vision_require_workspace_slice_f16(patch_bhwc, target_bytes, "SAM abs-pos input", error, error_size) ||
-        !metal_vision_require_workspace_slice_f16(out_bhwc, target_bytes, "SAM abs-pos output", error, error_size) ||
-        !metal_vision_require_tensor_slice_f16(pos_embed, pos_bytes, "SAM abs-pos table", error, error_size)) {
-        return 0;
-    }
-    return uocr_metal_context_diagnostic_sam_add_abs_pos_f16(ctx,
-                                                  patch_bhwc.f16,
-                                                  pos_embed.host_f16,
-                                                  grid_w,
-                                                  grid_h,
-                                                  out_bhwc.f16,
-                                                  error,
-                                                  error_size);
+    return metal_context_sam_add_abs_pos_batch_f16_to_slice(ctx,
+                                                            patch_bhwc,
+                                                            pos_embed,
+                                                            grid_w,
+                                                            grid_h,
+                                                            1u,
+                                                            out_bhwc,
+                                                            error,
+                                                            error_size);
 }
 
-static int metal_context_sam_transformer_workspace_f16_to_slice(uocr_metal_context *ctx,
+static int __attribute__((unused)) metal_context_sam_transformer_workspace_f16_to_slice(uocr_metal_context *ctx,
                                                                 uocr_metal_vision_workspace_slice input_bhwc,
                                                                 const uocr_metal_sam_transformer_block_f16 *blocks,
                                                                 uint32_t block_count,
@@ -4769,16 +4855,17 @@ static int metal_encode_one_view_sam_transformer_f16(uocr_metal_vision_project_c
                                                                 error,
                                                                 error_size));
     RUN_VISION_STEP("SAM transformer",
-                    metal_context_sam_transformer_workspace_f16_to_slice(ctx,
-                                                                         scratch->sam_pos_bhwc,
-                                                                         weights->sam_blocks,
-                                                                         UOCR_SAM_BLOCKS,
-                                                                         patch_grid_w,
-                                                                         patch_grid_h,
-                                                                         out_transformer_bhwc,
-                                                                         scratch,
-                                                                         error,
-                                                                         error_size));
+                    metal_context_sam_transformer_batch_workspace_f16_to_slice(ctx,
+                                                                              scratch->sam_pos_bhwc,
+                                                                              weights->sam_block_slices,
+                                                                              UOCR_SAM_BLOCKS,
+                                                                              patch_grid_w,
+                                                                              patch_grid_h,
+                                                                              1u,
+                                                                              out_transformer_bhwc,
+                                                                              scratch,
+                                                                              error,
+                                                                              error_size));
     *out_patch_grid_w = patch_grid_w;
     *out_patch_grid_h = patch_grid_h;
 
@@ -4931,38 +5018,6 @@ static int metal_encode_one_view_clip_features_f16(uocr_metal_vision_project_con
     *out_token_count = expected_clip_tokens;
     *out_grid_w = sam_grid_w;
     *out_grid_h = sam_grid_h;
-    return 1;
-}
-
-static int metal_vision_workspace_slice_values(uocr_metal_vision_workspace_slice slice,
-                                               uint64_t first_value,
-                                               uint64_t value_count,
-                                               const char *label,
-                                               uocr_metal_vision_workspace_slice *out,
-                                               char *error,
-                                               size_t error_size) {
-    if (out == NULL || slice.buffer == nil || slice.f16 == NULL || value_count == 0u) {
-        return metal_fail(error, error_size, "invalid Metal vision %s slice request", label != NULL ? label : "value");
-    }
-    uint64_t byte_offset = 0u;
-    uint64_t byte_count = 0u;
-    if (!checked_mul_u64(first_value, 2u, &byte_offset) || !checked_mul_u64(value_count, 2u, &byte_count)) {
-        return metal_fail(error, error_size, "Metal vision %s slice byte-size overflow", label != NULL ? label : "value");
-    }
-    uint64_t byte_end = 0u;
-    uint64_t absolute_offset = 0u;
-    if (!checked_add_u64(byte_offset, byte_count, &byte_end) || byte_end > slice.bytes ||
-        !checked_add_u64((uint64_t)slice.offset, byte_offset, &absolute_offset) || absolute_offset > (uint64_t)NSUIntegerMax) {
-        return metal_fail(error, error_size, "Metal vision %s slice exceeds backing range", label != NULL ? label : "value");
-    }
-    out->buffer = slice.buffer;
-    out->offset = (NSUInteger)absolute_offset;
-    out->bytes = byte_count;
-    const uintptr_t base = (uintptr_t)(const void *)slice.f16;
-    if (base > UINTPTR_MAX - (uintptr_t)byte_offset) {
-        return metal_fail(error, error_size, "Metal vision %s slice host token overflow", label != NULL ? label : "value");
-    }
-    out->f16 = (uint16_t *)(void *)(base + (uintptr_t)byte_offset);
     return 1;
 }
 
@@ -5452,7 +5507,6 @@ static int metal_project_vision_chunk_f16(const uocr_vision_chunk *chunk,
     const uint64_t chunk_encode_start_ns = uocr_profile_now_ns();
     uint32_t batched_patch_grid_w = 0u;
     uint32_t batched_patch_grid_h = 0u;
-    uint64_t batched_patch_values_per_view = 0u;
     if (chunk->view_count > 1u) {
         const uint64_t sam_patch_batch_start_ns = uocr_profile_now_ns();
         if (!metal_context_sam_patch_embed_batch_f16_to_slice(project,
@@ -5462,13 +5516,6 @@ static int metal_project_vision_chunk_f16(const uocr_vision_chunk *chunk,
                                                              &batched_patch_grid_h,
                                                              error,
                                                              error_size)) {
-            return UOCR_ERROR_INTERNAL;
-        }
-        if (!metal_vision_square_grid_values(batched_patch_grid_w,
-                                             batched_patch_grid_h,
-                                             UOCR_SAM_HIDDEN_SIZE,
-                                             &batched_patch_values_per_view)) {
-            (void)metal_fail(error, error_size, "Metal batched SAM patch value-count overflow");
             return UOCR_ERROR_INTERNAL;
         }
         metal_profile_add_event_now(project->ctx, "metal.vision.sam_patch_batch", sam_patch_batch_start_ns);
@@ -5481,50 +5528,32 @@ static int metal_project_vision_chunk_f16(const uocr_vision_chunk *chunk,
             return UOCR_ERROR_INTERNAL;
         }
         const uint32_t batch_clip_tokens = clip_tokens_per_view * chunk->view_count;
-        uint32_t patch_grid_w = 0u;
-        uint32_t patch_grid_h = 0u;
-        for (uint32_t view_index = 0u; view_index < chunk->view_count; ++view_index) {
-            const uocr_image_view *view = &project->request->views[chunk->first_view + view_index];
-            uocr_metal_vision_workspace_slice patch_in = {0};
-            uocr_metal_vision_workspace_slice transformer_out;
-            if (!metal_vision_workspace_slice_values(project->scratch->sam_patch_bhwc,
-                                                     (uint64_t)view_index * batched_patch_values_per_view,
-                                                     batched_patch_values_per_view,
-                                                     "batched SAM patch view",
-                                                     &patch_in,
-                                                     error,
-                                                     error_size) ||
-                !metal_vision_workspace_slice_values(project->scratch->sam_transformer_batch_bhwc,
-                                                     (uint64_t)view_index * batched_patch_values_per_view,
-                                                     batched_patch_values_per_view,
-                                                     "batched SAM transformer view",
-                                                     &transformer_out,
-                                                     error,
-                                                     error_size)) {
-                return UOCR_ERROR_OUT_OF_MEMORY;
-            }
-            uint32_t view_patch_grid_w = 0u;
-            uint32_t view_patch_grid_h = 0u;
-            if (!metal_encode_one_view_sam_transformer_f16(project,
-                                                           view,
-                                                           patch_in,
-                                                           batched_patch_grid_w,
-                                                           batched_patch_grid_h,
-                                                           transformer_out,
-                                                           &view_patch_grid_w,
-                                                           &view_patch_grid_h,
-                                                           error,
-                                                           error_size)) {
-                return UOCR_ERROR_INTERNAL;
-            }
-            if (view_index == 0u) {
-                patch_grid_w = view_patch_grid_w;
-                patch_grid_h = view_patch_grid_h;
-            } else if (view_patch_grid_w != patch_grid_w || view_patch_grid_h != patch_grid_h) {
-                (void)metal_fail(error, error_size, "Metal batched SAM transformer grid changed within shape group");
-                return UOCR_ERROR_INTERNAL;
-            }
+        const uint32_t patch_grid_w = batched_patch_grid_w;
+        const uint32_t patch_grid_h = batched_patch_grid_h;
+        const uint64_t sam_transformer_batch_start_ns = uocr_profile_now_ns();
+        if (!metal_context_sam_add_abs_pos_batch_f16_to_slice(project->ctx,
+                                                             project->scratch->sam_patch_bhwc,
+                                                             project->weights->sam_pos_embed,
+                                                             patch_grid_w,
+                                                             patch_grid_h,
+                                                             chunk->view_count,
+                                                             project->scratch->sam_pos_bhwc,
+                                                             error,
+                                                             error_size) ||
+            !metal_context_sam_transformer_batch_workspace_f16_to_slice(project->ctx,
+                                                                        project->scratch->sam_pos_bhwc,
+                                                                        project->weights->sam_block_slices,
+                                                                        UOCR_SAM_BLOCKS,
+                                                                        patch_grid_w,
+                                                                        patch_grid_h,
+                                                                        chunk->view_count,
+                                                                        project->scratch->sam_transformer_batch_bhwc,
+                                                                        project->scratch,
+                                                                        error,
+                                                                        error_size)) {
+            return UOCR_ERROR_INTERNAL;
         }
+        metal_profile_add_event_now(project->ctx, "metal.vision.sam_transformer_batch", sam_transformer_batch_start_ns);
         uint32_t sam_grid_w = 0u;
         uint32_t sam_grid_h = 0u;
         if (!metal_context_sam_neck_batch_f16_to_slice(project,
@@ -8063,6 +8092,26 @@ static int metal_prebuild_mps_vision_shape_ndarrays(uocr_metal_context *ctx,
     PREBUILD_VISION_IO(workspace->sam_block_attention, workspace->sam_block_projected_windows, window_rows, UOCR_SAM_HIDDEN_SIZE, UOCR_SAM_HIDDEN_SIZE, "SAM window projection workspace");
     PREBUILD_VISION_IO(workspace->sam_block_norm2_bhwc, workspace->sam_block_mlp_intermediate, patch_tokens, UOCR_SAM_HIDDEN_SIZE, UOCR_SAM_MLP_INTERMEDIATE, "SAM MLP lin1 workspace");
     PREBUILD_VISION_IO(workspace->sam_block_mlp_intermediate, workspace->sam_block_mlp_bhwc, patch_tokens, UOCR_SAM_MLP_INTERMEDIATE, UOCR_SAM_HIDDEN_SIZE, "SAM MLP lin2 workspace");
+    if (view_count > 1u && workspace->projected_row_capacity >= projected_tokens) {
+        uint32_t sam_view_capacity = workspace->projected_row_capacity / projected_tokens;
+        if (sam_view_capacity > view_count) {
+            sam_view_capacity = view_count;
+        }
+        if (sam_view_capacity > 1u) {
+            const uint32_t batch_patch_rows = sam_view_capacity * patch_tokens;
+            const uint32_t batch_window_rows = sam_view_capacity * window_rows;
+            PREBUILD_VISION_IO(workspace->sam_block_norm1_bhwc, workspace->sam_block_q, batch_patch_rows, UOCR_SAM_HIDDEN_SIZE, UOCR_SAM_HIDDEN_SIZE, "SAM global Q batch workspace");
+            PREBUILD_VISION_IO(workspace->sam_block_norm1_bhwc, workspace->sam_block_k, batch_patch_rows, UOCR_SAM_HIDDEN_SIZE, UOCR_SAM_HIDDEN_SIZE, "SAM global K batch workspace");
+            PREBUILD_VISION_IO(workspace->sam_block_norm1_bhwc, workspace->sam_block_v, batch_patch_rows, UOCR_SAM_HIDDEN_SIZE, UOCR_SAM_HIDDEN_SIZE, "SAM global V batch workspace");
+            PREBUILD_VISION_IO(workspace->sam_block_window_tokens, workspace->sam_block_q, batch_window_rows, UOCR_SAM_HIDDEN_SIZE, UOCR_SAM_HIDDEN_SIZE, "SAM window Q batch workspace");
+            PREBUILD_VISION_IO(workspace->sam_block_window_tokens, workspace->sam_block_k, batch_window_rows, UOCR_SAM_HIDDEN_SIZE, UOCR_SAM_HIDDEN_SIZE, "SAM window K batch workspace");
+            PREBUILD_VISION_IO(workspace->sam_block_window_tokens, workspace->sam_block_v, batch_window_rows, UOCR_SAM_HIDDEN_SIZE, UOCR_SAM_HIDDEN_SIZE, "SAM window V batch workspace");
+            PREBUILD_VISION_IO(workspace->sam_block_attention, workspace->sam_block_attention_bhwc, batch_patch_rows, UOCR_SAM_HIDDEN_SIZE, UOCR_SAM_HIDDEN_SIZE, "SAM global projection batch workspace");
+            PREBUILD_VISION_IO(workspace->sam_block_attention, workspace->sam_block_projected_windows, batch_window_rows, UOCR_SAM_HIDDEN_SIZE, UOCR_SAM_HIDDEN_SIZE, "SAM window projection batch workspace");
+            PREBUILD_VISION_IO(workspace->sam_block_norm2_bhwc, workspace->sam_block_mlp_intermediate, batch_patch_rows, UOCR_SAM_HIDDEN_SIZE, UOCR_SAM_MLP_INTERMEDIATE, "SAM MLP lin1 batch workspace");
+            PREBUILD_VISION_IO(workspace->sam_block_mlp_intermediate, workspace->sam_block_mlp_bhwc, batch_patch_rows, UOCR_SAM_MLP_INTERMEDIATE, UOCR_SAM_HIDDEN_SIZE, "SAM MLP lin2 batch workspace");
+        }
+    }
     PREBUILD_VISION_IO(workspace->clip_block_norm1, workspace->clip_block_q, clip_tokens, UOCR_CLIP_HIDDEN_SIZE, UOCR_CLIP_HIDDEN_SIZE, "CLIP Q workspace");
     PREBUILD_VISION_IO(workspace->clip_block_norm1, workspace->clip_block_k, clip_tokens, UOCR_CLIP_HIDDEN_SIZE, UOCR_CLIP_HIDDEN_SIZE, "CLIP K workspace");
     PREBUILD_VISION_IO(workspace->clip_block_norm1, workspace->clip_block_v, clip_tokens, UOCR_CLIP_HIDDEN_SIZE, UOCR_CLIP_HIDDEN_SIZE, "CLIP V workspace");
@@ -12872,6 +12921,7 @@ int uocr_metal_context_diagnostic_sam_add_abs_pos_f16(uocr_metal_context *ctx,
         params.target_width = grid_w;
         params.target_height = grid_h;
         params.channels = UOCR_SAM_HIDDEN_SIZE;
+        params.batch_size = 1u;
 
         [enc setComputePipelineState:pipeline];
         [enc setBuffer:patch_buffer offset:patch_offset atIndex:0u];
@@ -14068,6 +14118,7 @@ int uocr_metal_context_diagnostic_sam_window_partition_f16(uocr_metal_context *c
         params.windows_per_col = windows_per_col;
         params.window_size = UOCR_SAM_WINDOW_SIZE;
         params.hidden_size = UOCR_SAM_HIDDEN_SIZE;
+        params.batch_size = 1u;
 
         const NSUInteger threads_per_group = metal_power2_threadgroup_width(256u, pipeline.maxTotalThreadsPerThreadgroup);
         [enc setComputePipelineState:pipeline];
@@ -14227,6 +14278,7 @@ int uocr_metal_context_diagnostic_sam_window_unpartition_f16(uocr_metal_context 
         params.windows_per_col = windows_per_col;
         params.window_size = UOCR_SAM_WINDOW_SIZE;
         params.hidden_size = UOCR_SAM_HIDDEN_SIZE;
+        params.batch_size = 1u;
 
         const NSUInteger threads_per_group = metal_power2_threadgroup_width(256u, pipeline.maxTotalThreadsPerThreadgroup);
         [enc setComputePipelineState:pipeline];
@@ -17707,6 +17759,768 @@ cleanup_sam_transformer:
     return result;
 }
 
+static int metal_sam_transformer_block_slices_have_weights(const uocr_metal_sam_transformer_block_slices_f16 *block) {
+    return block != NULL && block->norm1_weight.host_f16 != NULL && block->norm1_bias.host_f16 != NULL &&
+           block->qkv_weight.host_f16 != NULL && block->qkv_bias.host_f16 != NULL &&
+           block->proj_weight.host_f16 != NULL && block->proj_bias.host_f16 != NULL &&
+           block->rel_pos_h.host_f16 != NULL && block->rel_pos_w.host_f16 != NULL &&
+           block->rel_pos_h_length != 0u && block->rel_pos_w_length != 0u &&
+           block->norm2_weight.host_f16 != NULL && block->norm2_bias.host_f16 != NULL &&
+           block->mlp_lin1_weight.host_f16 != NULL && block->mlp_lin1_bias.host_f16 != NULL &&
+           block->mlp_lin2_weight.host_f16 != NULL && block->mlp_lin2_bias.host_f16 != NULL;
+}
+
+static int metal_context_sam_window_partition_batch_f16_to_slice(uocr_metal_context *ctx,
+                                                                 uocr_metal_vision_workspace_slice input_bhwc,
+                                                                 uint32_t grid_w,
+                                                                 uint32_t grid_h,
+                                                                 uint32_t view_count,
+                                                                 uocr_metal_vision_workspace_slice out_windows,
+                                                                 uint32_t *out_n_windows,
+                                                                 uint32_t *out_padded_w,
+                                                                 uint32_t *out_padded_h,
+                                                                 char *error,
+                                                                 size_t error_size) {
+    uint32_t padded_w = 0u;
+    uint32_t padded_h = 0u;
+    uint32_t windows_per_row = 0u;
+    uint32_t windows_per_col = 0u;
+    uint32_t n_windows = 0u;
+    if (ctx == NULL || view_count == 0u || out_n_windows == NULL || out_padded_w == NULL || out_padded_h == NULL ||
+        !sam_window_partition_geometry(grid_w,
+                                       grid_h,
+                                       &padded_w,
+                                       &padded_h,
+                                       &windows_per_row,
+                                       &windows_per_col,
+                                       &n_windows)) {
+        return metal_fail(error, error_size, "invalid Metal SAM window partition batch request");
+    }
+
+    uint64_t input_values_per_view = 0u;
+    uint64_t input_values = 0u;
+    uint64_t input_bytes = 0u;
+    uint64_t window_tokens_per_view = 0u;
+    uint64_t window_values_per_view = 0u;
+    uint64_t window_values = 0u;
+    uint64_t window_bytes = 0u;
+    if (!metal_vision_square_grid_values(grid_w, grid_h, UOCR_SAM_HIDDEN_SIZE, &input_values_per_view) ||
+        !checked_mul_u64(input_values_per_view, (uint64_t)view_count, &input_values) ||
+        !metal_vision_f16_bytes(input_values, &input_bytes) ||
+        !checked_mul_u64((uint64_t)n_windows, (uint64_t)UOCR_SAM_WINDOW_TOKENS, &window_tokens_per_view) ||
+        !checked_mul_u64(window_tokens_per_view, (uint64_t)UOCR_SAM_HIDDEN_SIZE, &window_values_per_view) ||
+        !checked_mul_u64(window_values_per_view, (uint64_t)view_count, &window_values) ||
+        !metal_vision_f16_bytes(window_values, &window_bytes) || window_values > (uint64_t)UINT32_MAX ||
+        !metal_vision_require_workspace_slice_f16(input_bhwc, input_bytes, "SAM window partition batch input", error, error_size) ||
+        !metal_vision_require_workspace_slice_f16(out_windows, window_bytes, "SAM window partition batch output", error, error_size)) {
+        return 0;
+    }
+
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, "uocr_sam_window_partition_f16", error, error_size);
+        if (pipeline == nil) {
+            return 0;
+        }
+        int owned_command_buffer = 0;
+        id<MTLCommandBuffer> cb = metal_command_buffer_for_op(ctx, &owned_command_buffer, "Metal SAM window partition batch", error, error_size);
+        if (cb == nil) {
+            return 0;
+        }
+        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
+        if (enc == nil) {
+            return metal_fail(error, error_size, "failed to create Metal SAM window partition batch command encoder");
+        }
+
+        uocr_metal_sam_window_partition_params params;
+        params.grid_width = grid_w;
+        params.grid_height = grid_h;
+        params.padded_width = padded_w;
+        params.padded_height = padded_h;
+        params.windows_per_row = windows_per_row;
+        params.windows_per_col = windows_per_col;
+        params.window_size = UOCR_SAM_WINDOW_SIZE;
+        params.hidden_size = UOCR_SAM_HIDDEN_SIZE;
+        params.batch_size = view_count;
+
+        const NSUInteger threads_per_group = metal_power2_threadgroup_width(256u, pipeline.maxTotalThreadsPerThreadgroup);
+        [enc setComputePipelineState:pipeline];
+        [enc setBuffer:input_bhwc.buffer offset:input_bhwc.offset atIndex:0u];
+        [enc setBuffer:out_windows.buffer offset:out_windows.offset atIndex:1u];
+        [enc setBytes:&params length:sizeof(params) atIndex:2u];
+        [enc dispatchThreads:MTLSizeMake((NSUInteger)window_values, 1u, 1u)
+       threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1u, 1u)];
+        [enc endEncoding];
+        if (!metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, "Metal SAM window partition batch", error, error_size)) {
+            return 0;
+        }
+    }
+
+    *out_n_windows = n_windows;
+    *out_padded_w = padded_w;
+    *out_padded_h = padded_h;
+    metal_clear_error(error, error_size);
+    return 1;
+}
+
+static int metal_context_sam_window_unpartition_batch_f16_to_slice(uocr_metal_context *ctx,
+                                                                   uocr_metal_vision_workspace_slice windows,
+                                                                   uint32_t grid_w,
+                                                                   uint32_t grid_h,
+                                                                   uint32_t view_count,
+                                                                   uocr_metal_vision_workspace_slice out_bhwc,
+                                                                   char *error,
+                                                                   size_t error_size) {
+    uint32_t padded_w = 0u;
+    uint32_t padded_h = 0u;
+    uint32_t windows_per_row = 0u;
+    uint32_t windows_per_col = 0u;
+    uint32_t n_windows = 0u;
+    if (ctx == NULL || view_count == 0u ||
+        !sam_window_partition_geometry(grid_w,
+                                       grid_h,
+                                       &padded_w,
+                                       &padded_h,
+                                       &windows_per_row,
+                                       &windows_per_col,
+                                       &n_windows)) {
+        return metal_fail(error, error_size, "invalid Metal SAM window unpartition batch request");
+    }
+
+    uint64_t output_values_per_view = 0u;
+    uint64_t output_values = 0u;
+    uint64_t output_bytes = 0u;
+    uint64_t window_tokens_per_view = 0u;
+    uint64_t window_values_per_view = 0u;
+    uint64_t window_values = 0u;
+    uint64_t window_bytes = 0u;
+    if (!metal_vision_square_grid_values(grid_w, grid_h, UOCR_SAM_HIDDEN_SIZE, &output_values_per_view) ||
+        !checked_mul_u64(output_values_per_view, (uint64_t)view_count, &output_values) ||
+        !metal_vision_f16_bytes(output_values, &output_bytes) ||
+        !checked_mul_u64((uint64_t)n_windows, (uint64_t)UOCR_SAM_WINDOW_TOKENS, &window_tokens_per_view) ||
+        !checked_mul_u64(window_tokens_per_view, (uint64_t)UOCR_SAM_HIDDEN_SIZE, &window_values_per_view) ||
+        !checked_mul_u64(window_values_per_view, (uint64_t)view_count, &window_values) ||
+        !metal_vision_f16_bytes(window_values, &window_bytes) || output_values > (uint64_t)UINT32_MAX ||
+        !metal_vision_require_workspace_slice_f16(windows, window_bytes, "SAM window unpartition batch input", error, error_size) ||
+        !metal_vision_require_workspace_slice_f16(out_bhwc, output_bytes, "SAM window unpartition batch output", error, error_size)) {
+        return 0;
+    }
+
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, "uocr_sam_window_unpartition_f16", error, error_size);
+        if (pipeline == nil) {
+            return 0;
+        }
+        int owned_command_buffer = 0;
+        id<MTLCommandBuffer> cb = metal_command_buffer_for_op(ctx, &owned_command_buffer, "Metal SAM window unpartition batch", error, error_size);
+        if (cb == nil) {
+            return 0;
+        }
+        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
+        if (enc == nil) {
+            return metal_fail(error, error_size, "failed to create Metal SAM window unpartition batch command encoder");
+        }
+
+        uocr_metal_sam_window_partition_params params;
+        params.grid_width = grid_w;
+        params.grid_height = grid_h;
+        params.padded_width = padded_w;
+        params.padded_height = padded_h;
+        params.windows_per_row = windows_per_row;
+        params.windows_per_col = windows_per_col;
+        params.window_size = UOCR_SAM_WINDOW_SIZE;
+        params.hidden_size = UOCR_SAM_HIDDEN_SIZE;
+        params.batch_size = view_count;
+
+        const NSUInteger threads_per_group = metal_power2_threadgroup_width(256u, pipeline.maxTotalThreadsPerThreadgroup);
+        [enc setComputePipelineState:pipeline];
+        [enc setBuffer:windows.buffer offset:windows.offset atIndex:0u];
+        [enc setBuffer:out_bhwc.buffer offset:out_bhwc.offset atIndex:1u];
+        [enc setBytes:&params length:sizeof(params) atIndex:2u];
+        [enc dispatchThreads:MTLSizeMake((NSUInteger)output_values, 1u, 1u)
+       threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1u, 1u)];
+        [enc endEncoding];
+        return metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, "Metal SAM window unpartition batch", error, error_size);
+    }
+}
+
+static int metal_context_sam_rel_pos_attention_batch_f16_to_slice(uocr_metal_context *ctx,
+                                                                  uocr_metal_vision_workspace_slice q,
+                                                                  uocr_metal_vision_workspace_slice k,
+                                                                  uocr_metal_vision_workspace_slice v,
+                                                                  uocr_metal_vision_tensor_f16 rel_pos_h,
+                                                                  uocr_metal_vision_tensor_f16 rel_pos_w,
+                                                                  uint32_t n_windows,
+                                                                  uint32_t grid_w,
+                                                                  uint32_t grid_h,
+                                                                  uint32_t view_count,
+                                                                  uint32_t rel_pos_h_length,
+                                                                  uint32_t rel_pos_w_length,
+                                                                  uocr_metal_vision_workspace_slice out,
+                                                                  char *error,
+                                                                  size_t error_size) {
+    uint64_t tokens = 0u;
+    uint64_t values_per_view = 0u;
+    uint64_t values = 0u;
+    uint64_t bytes = 0u;
+    uint64_t rel_h_values = 0u;
+    uint64_t rel_w_values = 0u;
+    uint64_t rel_h_bytes = 0u;
+    uint64_t rel_w_bytes = 0u;
+    if (ctx == NULL || n_windows == 0u || view_count == 0u || grid_w == 0u || grid_h == 0u ||
+        rel_pos_h_length == 0u || rel_pos_w_length == 0u ||
+        !checked_mul_u64((uint64_t)grid_w, (uint64_t)grid_h, &tokens) || tokens == 0u ||
+        tokens > (uint64_t)UINT32_MAX || tokens > (uint64_t)UOCR_SAM_MAX_GRID_TOKENS ||
+        !checked_mul_u64((uint64_t)n_windows, tokens, &values_per_view) ||
+        !checked_mul_u64(values_per_view, (uint64_t)UOCR_SAM_HIDDEN_SIZE, &values_per_view) ||
+        !checked_mul_u64(values_per_view, (uint64_t)view_count, &values) ||
+        !metal_vision_f16_bytes(values, &bytes) ||
+        !checked_mul_u64((uint64_t)rel_pos_h_length, (uint64_t)UOCR_SAM_HEAD_DIM, &rel_h_values) ||
+        !checked_mul_u64((uint64_t)rel_pos_w_length, (uint64_t)UOCR_SAM_HEAD_DIM, &rel_w_values) ||
+        !metal_vision_f16_bytes(rel_h_values, &rel_h_bytes) ||
+        !metal_vision_f16_bytes(rel_w_values, &rel_w_bytes) ||
+        !metal_vision_require_workspace_slice_f16(q, bytes, "SAM rel-pos batch Q", error, error_size) ||
+        !metal_vision_require_workspace_slice_f16(k, bytes, "SAM rel-pos batch K", error, error_size) ||
+        !metal_vision_require_workspace_slice_f16(v, bytes, "SAM rel-pos batch V", error, error_size) ||
+        !metal_vision_require_workspace_slice_f16(out, bytes, "SAM rel-pos batch output", error, error_size) ||
+        !metal_vision_require_tensor_slice_f16(rel_pos_h, rel_h_bytes, "SAM relative position H", error, error_size) ||
+        !metal_vision_require_tensor_slice_f16(rel_pos_w, rel_w_bytes, "SAM relative position W", error, error_size)) {
+        return 0;
+    }
+    if (grid_w > UOCR_SAM_MAX_GRID_SIZE || grid_h > UOCR_SAM_MAX_GRID_SIZE ||
+        rel_pos_h_length > UOCR_SAM_MAX_REL_POS_SIZE || rel_pos_w_length > UOCR_SAM_MAX_REL_POS_SIZE) {
+        return metal_fail(error, error_size, "Metal SAM rel-pos batch dimensions exceed limits");
+    }
+    if (UOCR_SAM_ATTENTION_HEADS * UOCR_SAM_HEAD_DIM != UOCR_SAM_HIDDEN_SIZE) {
+        return metal_fail(error, error_size, "Metal SAM rel-pos batch constants are inconsistent");
+    }
+    const uint64_t logical_windows = (uint64_t)n_windows * (uint64_t)view_count;
+    if (logical_windows > (uint64_t)NSUIntegerMax) {
+        return metal_fail(error, error_size, "Metal SAM rel-pos batch window-count overflow");
+    }
+
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, "uocr_sam_rel_pos_attention_flash_f16_to_f16", error, error_size);
+        if (pipeline == nil) {
+            return 0;
+        }
+        const NSUInteger threads_per_group = 128u;
+        if (pipeline.maxTotalThreadsPerThreadgroup < threads_per_group) {
+            return metal_fail(error, error_size, "Metal SAM rel-pos batch flash attention cannot run four simdgroups per block");
+        }
+        int owned_command_buffer = 0;
+        id<MTLCommandBuffer> cb = metal_command_buffer_for_op(ctx, &owned_command_buffer, "Metal SAM rel-pos batch attention", error, error_size);
+        if (cb == nil) {
+            return 0;
+        }
+        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
+        if (enc == nil) {
+            return metal_fail(error, error_size, "failed to create Metal SAM rel-pos batch attention command encoder");
+        }
+
+        uocr_metal_sam_rel_pos_attention_params params;
+        params.windows = n_windows;
+        params.grid_width = grid_w;
+        params.grid_height = grid_h;
+        params.tokens_per_window = (uint32_t)tokens;
+        params.heads = UOCR_SAM_ATTENTION_HEADS;
+        params.head_dim = UOCR_SAM_HEAD_DIM;
+        params.rel_pos_h_length = rel_pos_h_length;
+        params.rel_pos_w_length = rel_pos_w_length;
+        params.scale = 1.0f / sqrtf((float)UOCR_SAM_HEAD_DIM);
+        params.batch_size = view_count;
+        params.reserved1 = 0u;
+        params.reserved2 = 0u;
+
+        const NSUInteger query_blocks = (NSUInteger)(((uint32_t)tokens + 3u) / 4u);
+        [enc setComputePipelineState:pipeline];
+        [enc setBuffer:q.buffer offset:q.offset atIndex:0u];
+        [enc setBuffer:k.buffer offset:k.offset atIndex:1u];
+        [enc setBuffer:v.buffer offset:v.offset atIndex:2u];
+        [enc setBuffer:rel_pos_h.slice.buffer offset:rel_pos_h.slice.offset atIndex:3u];
+        [enc setBuffer:rel_pos_w.slice.buffer offset:rel_pos_w.slice.offset atIndex:4u];
+        [enc setBuffer:out.buffer offset:out.offset atIndex:5u];
+        [enc setBytes:&params length:sizeof(params) atIndex:6u];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)UOCR_SAM_ATTENTION_HEADS, query_blocks, (NSUInteger)logical_windows)
+             threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1u, 1u)];
+        [enc endEncoding];
+        return metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, "Metal SAM rel-pos batch attention", error, error_size);
+    }
+}
+
+static int metal_context_sam_mlp_batch_workspace_f16_to_slice(uocr_metal_context *ctx,
+                                                             uocr_metal_vision_workspace_slice input,
+                                                             const uocr_metal_sam_transformer_block_slices_f16 *block,
+                                                             uint32_t rows,
+                                                             uocr_metal_vision_workspace_slice intermediate,
+                                                             uocr_metal_vision_workspace_slice out,
+                                                             char *error,
+                                                             size_t error_size) {
+    uint64_t hidden_values = 0u;
+    uint64_t hidden_bytes = 0u;
+    uint64_t intermediate_values = 0u;
+    uint64_t intermediate_bytes = 0u;
+    const uint64_t lin1_weight_bytes = (uint64_t)UOCR_SAM_MLP_INTERMEDIATE * (uint64_t)UOCR_SAM_HIDDEN_SIZE * 2u;
+    const uint64_t lin1_bias_bytes = (uint64_t)UOCR_SAM_MLP_INTERMEDIATE * 2u;
+    const uint64_t lin2_weight_bytes = (uint64_t)UOCR_SAM_HIDDEN_SIZE * (uint64_t)UOCR_SAM_MLP_INTERMEDIATE * 2u;
+    const uint64_t lin2_bias_bytes = (uint64_t)UOCR_SAM_HIDDEN_SIZE * 2u;
+    if (ctx == NULL || !metal_sam_transformer_block_slices_have_weights(block) || rows == 0u ||
+        !checked_mul_u64((uint64_t)rows, (uint64_t)UOCR_SAM_HIDDEN_SIZE, &hidden_values) ||
+        !metal_vision_f16_bytes(hidden_values, &hidden_bytes) ||
+        !checked_mul_u64((uint64_t)rows, (uint64_t)UOCR_SAM_MLP_INTERMEDIATE, &intermediate_values) ||
+        intermediate_values > (uint64_t)UINT32_MAX ||
+        !metal_vision_f16_bytes(intermediate_values, &intermediate_bytes) ||
+        !metal_vision_require_workspace_slice_f16(input, hidden_bytes, "SAM batch MLP input", error, error_size) ||
+        !metal_vision_require_workspace_slice_f16(intermediate, intermediate_bytes, "SAM batch MLP intermediate", error, error_size) ||
+        !metal_vision_require_workspace_slice_f16(out, hidden_bytes, "SAM batch MLP output", error, error_size) ||
+        !metal_vision_require_tensor_slice_f16(block->mlp_lin1_weight, lin1_weight_bytes, "SAM MLP lin1 weight", error, error_size) ||
+        !metal_vision_require_tensor_slice_f16(block->mlp_lin1_bias, lin1_bias_bytes, "SAM MLP lin1 bias", error, error_size) ||
+        !metal_vision_require_tensor_slice_f16(block->mlp_lin2_weight, lin2_weight_bytes, "SAM MLP lin2 weight", error, error_size) ||
+        !metal_vision_require_tensor_slice_f16(block->mlp_lin2_bias, lin2_bias_bytes, "SAM MLP lin2 bias", error, error_size)) {
+        return 0;
+    }
+
+    uocr_metal_buffer_slice input_slice = { input.buffer, input.offset };
+    uocr_metal_buffer_slice intermediate_slice = { intermediate.buffer, intermediate.offset };
+    uocr_metal_buffer_slice out_slice = { out.buffer, out.offset };
+    if (!metal_run_mps_matmul_nt_f16(ctx,
+                                     input_slice,
+                                     block->mlp_lin1_weight.slice,
+                                     intermediate_slice,
+                                     rows,
+                                     UOCR_SAM_HIDDEN_SIZE,
+                                     UOCR_SAM_MLP_INTERMEDIATE,
+                                     "Metal SAM batch MLP lin1 MPS matmul",
+                                     error,
+                                     error_size) ||
+        !metal_run_bias_gelu_f16_inplace(ctx,
+                                         intermediate_slice,
+                                         block->mlp_lin1_bias.slice,
+                                         rows,
+                                         UOCR_SAM_MLP_INTERMEDIATE,
+                                         "Metal SAM batch MLP lin1 bias GELU",
+                                         error,
+                                         error_size) ||
+        !metal_run_mps_matmul_nt_f16(ctx,
+                                     intermediate_slice,
+                                     block->mlp_lin2_weight.slice,
+                                     out_slice,
+                                     rows,
+                                     UOCR_SAM_MLP_INTERMEDIATE,
+                                     UOCR_SAM_HIDDEN_SIZE,
+                                     "Metal SAM batch MLP lin2 MPS matmul",
+                                     error,
+                                     error_size) ||
+        !metal_run_bias_add_f16_inplace(ctx,
+                                        out_slice,
+                                        block->mlp_lin2_bias.slice,
+                                        rows,
+                                        UOCR_SAM_HIDDEN_SIZE,
+                                        "Metal SAM batch MLP lin2 bias add",
+                                        error,
+                                        error_size)) {
+        char detail[512];
+        metal_copy_error_detail(detail, sizeof(detail), error);
+        return metal_fail(error, error_size, "failed to compute Metal SAM batch MLP: %s", detail);
+    }
+    return 1;
+}
+
+static int metal_context_sam_transformer_batch_block_workspace_f16_to_slice(uocr_metal_context *ctx,
+                                                                           uocr_metal_vision_workspace_slice input_bhwc,
+                                                                           const uocr_metal_sam_transformer_block_slices_f16 *block,
+                                                                           uint32_t grid_w,
+                                                                           uint32_t grid_h,
+                                                                           uint32_t view_count,
+                                                                           int use_global_attention,
+                                                                           uocr_metal_vision_workspace_slice out_bhwc,
+                                                                           uocr_metal_vision_workspace *scratch,
+                                                                           char *error,
+                                                                           size_t error_size) {
+    if (ctx == NULL || !metal_sam_transformer_block_slices_have_weights(block) || view_count == 0u || scratch == NULL) {
+        return metal_fail(error, error_size, "invalid Metal SAM batch transformer block request");
+    }
+    if (UOCR_SAM_HIDDEN_SIZE != 768u || UOCR_SAM_QKV_SIZE != 2304u || UOCR_SAM_ATTENTION_HEADS != 12u ||
+        UOCR_SAM_HEAD_DIM != 64u || UOCR_SAM_ATTENTION_HEADS * UOCR_SAM_HEAD_DIM != UOCR_SAM_HIDDEN_SIZE ||
+        UOCR_SAM_WINDOW_SIZE != 14u || UOCR_SAM_WINDOW_TOKENS != 196u || UOCR_SAM_MLP_INTERMEDIATE != 3072u) {
+        return metal_fail(error, error_size, "Metal SAM batch transformer block constants are inconsistent");
+    }
+
+    uint64_t rows_per_view_u64 = 0u;
+    uint64_t hidden_bytes_per_view = 0u;
+    if (!metal_sam_transformer_activation_bytes(grid_w, grid_h, &rows_per_view_u64, &hidden_bytes_per_view, error, error_size)) {
+        return 0;
+    }
+    if (rows_per_view_u64 > (uint64_t)(UINT32_MAX / view_count)) {
+        return metal_fail(error, error_size, "Metal SAM batch transformer row-count overflow");
+    }
+    const uint32_t rows_per_view = (uint32_t)rows_per_view_u64;
+    const uint32_t rows = rows_per_view * view_count;
+
+    uint32_t n_windows = 1u;
+    uint32_t padded_w = grid_w;
+    uint32_t padded_h = grid_h;
+    uint64_t attention_rows_per_view_u64 = rows_per_view_u64;
+    if (!use_global_attention) {
+        uint32_t windows_per_row = 0u;
+        uint32_t windows_per_col = 0u;
+        if (!sam_window_partition_geometry(grid_w,
+                                           grid_h,
+                                           &padded_w,
+                                           &padded_h,
+                                           &windows_per_row,
+                                           &windows_per_col,
+                                           &n_windows)) {
+            return metal_fail(error, error_size, "invalid Metal SAM batch transformer window grid %ux%u", grid_w, grid_h);
+        }
+        if (!checked_mul_u64((uint64_t)n_windows, (uint64_t)UOCR_SAM_WINDOW_TOKENS, &attention_rows_per_view_u64)) {
+            return metal_fail(error, error_size, "Metal SAM batch transformer window row-count overflow");
+        }
+    }
+    if (attention_rows_per_view_u64 > (uint64_t)(UINT32_MAX / view_count)) {
+        return metal_fail(error, error_size, "Metal SAM batch transformer attention row-count overflow");
+    }
+    const uint32_t attention_rows = (uint32_t)attention_rows_per_view_u64 * view_count;
+
+    uint64_t hidden_values = 0u;
+    uint64_t hidden_bytes = 0u;
+    uint64_t attention_values = 0u;
+    uint64_t attention_bytes = 0u;
+    uint64_t mlp_values = 0u;
+    uint64_t mlp_bytes = 0u;
+    const uint64_t parameter_bytes = (uint64_t)UOCR_SAM_HIDDEN_SIZE * 2u;
+    const uint64_t qkv_weight_bytes = (uint64_t)UOCR_SAM_QKV_SIZE * (uint64_t)UOCR_SAM_HIDDEN_SIZE * 2u;
+    const uint64_t qkv_bias_bytes = (uint64_t)UOCR_SAM_QKV_SIZE * 2u;
+    const uint64_t projection_weight_bytes = (uint64_t)UOCR_SAM_HIDDEN_SIZE * (uint64_t)UOCR_SAM_HIDDEN_SIZE * 2u;
+    const uint64_t rel_h_bytes = (uint64_t)block->rel_pos_h_length * (uint64_t)UOCR_SAM_HEAD_DIM * 2u;
+    const uint64_t rel_w_bytes = (uint64_t)block->rel_pos_w_length * (uint64_t)UOCR_SAM_HEAD_DIM * 2u;
+    if (!checked_mul_u64((uint64_t)rows, (uint64_t)UOCR_SAM_HIDDEN_SIZE, &hidden_values) ||
+        hidden_values > (uint64_t)UINT32_MAX || !metal_vision_f16_bytes(hidden_values, &hidden_bytes) ||
+        !checked_mul_u64((uint64_t)attention_rows, (uint64_t)UOCR_SAM_HIDDEN_SIZE, &attention_values) ||
+        attention_values > (uint64_t)UINT32_MAX || !metal_vision_f16_bytes(attention_values, &attention_bytes) ||
+        !checked_mul_u64((uint64_t)rows, (uint64_t)UOCR_SAM_MLP_INTERMEDIATE, &mlp_values) ||
+        mlp_values > (uint64_t)UINT32_MAX || !metal_vision_f16_bytes(mlp_values, &mlp_bytes) ||
+        !metal_vision_require_workspace_slice_f16(input_bhwc, hidden_bytes, "SAM batch block input", error, error_size) ||
+        !metal_vision_require_workspace_slice_f16(out_bhwc, hidden_bytes, "SAM batch block output", error, error_size) ||
+        !metal_vision_require_workspace_slice_f16(scratch->sam_block_norm1_bhwc, hidden_bytes, "SAM batch block norm1", error, error_size) ||
+        !metal_vision_require_workspace_slice_f16(scratch->sam_block_window_tokens, attention_bytes, "SAM batch block window tokens", error, error_size) ||
+        !metal_vision_require_workspace_slice_f16(scratch->sam_block_q, attention_bytes, "SAM batch block Q", error, error_size) ||
+        !metal_vision_require_workspace_slice_f16(scratch->sam_block_k, attention_bytes, "SAM batch block K", error, error_size) ||
+        !metal_vision_require_workspace_slice_f16(scratch->sam_block_v, attention_bytes, "SAM batch block V", error, error_size) ||
+        !metal_vision_require_workspace_slice_f16(scratch->sam_block_attention, attention_bytes, "SAM batch block attention", error, error_size) ||
+        !metal_vision_require_workspace_slice_f16(scratch->sam_block_projected_windows, attention_bytes, "SAM batch block projected windows", error, error_size) ||
+        !metal_vision_require_workspace_slice_f16(scratch->sam_block_attention_bhwc, hidden_bytes, "SAM batch block attention BHWC", error, error_size) ||
+        !metal_vision_require_workspace_slice_f16(scratch->sam_block_residual1_bhwc, hidden_bytes, "SAM batch block residual1", error, error_size) ||
+        !metal_vision_require_workspace_slice_f16(scratch->sam_block_norm2_bhwc, hidden_bytes, "SAM batch block norm2", error, error_size) ||
+        !metal_vision_require_workspace_slice_f16(scratch->sam_block_mlp_intermediate, mlp_bytes, "SAM batch block MLP intermediate", error, error_size) ||
+        !metal_vision_require_workspace_slice_f16(scratch->sam_block_mlp_bhwc, hidden_bytes, "SAM batch block MLP", error, error_size) ||
+        !metal_vision_require_tensor_slice_f16(block->norm1_weight, parameter_bytes, "SAM block norm1 weight", error, error_size) ||
+        !metal_vision_require_tensor_slice_f16(block->norm1_bias, parameter_bytes, "SAM block norm1 bias", error, error_size) ||
+        !metal_vision_require_tensor_slice_f16(block->qkv_weight, qkv_weight_bytes, "SAM block QKV weight", error, error_size) ||
+        !metal_vision_require_tensor_slice_f16(block->qkv_bias, qkv_bias_bytes, "SAM block QKV bias", error, error_size) ||
+        !metal_vision_require_tensor_slice_f16(block->proj_weight, projection_weight_bytes, "SAM block projection weight", error, error_size) ||
+        !metal_vision_require_tensor_slice_f16(block->proj_bias, parameter_bytes, "SAM block projection bias", error, error_size) ||
+        !metal_vision_require_tensor_slice_f16(block->rel_pos_h, rel_h_bytes, "SAM block relative position H", error, error_size) ||
+        !metal_vision_require_tensor_slice_f16(block->rel_pos_w, rel_w_bytes, "SAM block relative position W", error, error_size) ||
+        !metal_vision_require_tensor_slice_f16(block->norm2_weight, parameter_bytes, "SAM block norm2 weight", error, error_size) ||
+        !metal_vision_require_tensor_slice_f16(block->norm2_bias, parameter_bytes, "SAM block norm2 bias", error, error_size)) {
+        return 0;
+    }
+
+#define RUN_SAM_BATCH_BLOCK_STEP(step_name, call_expr)                                                \
+    do {                                                                                                \
+        if (!(call_expr)) {                                                                             \
+            char detail[512];                                                                           \
+            metal_copy_error_detail(detail, sizeof(detail), error);                                      \
+            return metal_fail(error, error_size, "failed to compute Metal SAM batch block %s: %s", step_name, detail); \
+        }                                                                                               \
+    } while (0)
+
+    RUN_SAM_BATCH_BLOCK_STEP("LayerNorm1",
+                             metal_context_layernorm_f16_with_parameter_buffers(ctx,
+                                                                                input_bhwc.f16,
+                                                                                block->norm1_weight.slice.buffer,
+                                                                                block->norm1_weight.slice.offset,
+                                                                                block->norm1_bias.slice.buffer,
+                                                                                block->norm1_bias.slice.offset,
+                                                                                rows,
+                                                                                UOCR_SAM_HIDDEN_SIZE,
+                                                                                1.0e-6f,
+                                                                                UOCR_METAL_LAYERNORM_OUTPUT_F16,
+                                                                                scratch->sam_block_norm1_bhwc.f16,
+                                                                                "Metal SAM batch LayerNorm1",
+                                                                                error,
+                                                                                error_size));
+
+    if (use_global_attention) {
+        RUN_SAM_BATCH_BLOCK_STEP("QKV",
+                                 metal_run_packed_qkv_mps_f16(ctx,
+                                                               (uocr_metal_buffer_slice){scratch->sam_block_norm1_bhwc.buffer, scratch->sam_block_norm1_bhwc.offset},
+                                                               block->qkv_weight.slice,
+                                                               block->qkv_bias.slice,
+                                                               (uocr_metal_buffer_slice){scratch->sam_block_q.buffer, scratch->sam_block_q.offset},
+                                                               (uocr_metal_buffer_slice){scratch->sam_block_k.buffer, scratch->sam_block_k.offset},
+                                                               (uocr_metal_buffer_slice){scratch->sam_block_v.buffer, scratch->sam_block_v.offset},
+                                                               rows,
+                                                               UOCR_SAM_HIDDEN_SIZE,
+                                                               "Metal SAM batch global QKV MPS matmul",
+                                                               error,
+                                                               error_size));
+        RUN_SAM_BATCH_BLOCK_STEP("relative-position attention",
+                                 metal_context_sam_rel_pos_attention_batch_f16_to_slice(ctx,
+                                                                                       scratch->sam_block_q,
+                                                                                       scratch->sam_block_k,
+                                                                                       scratch->sam_block_v,
+                                                                                       block->rel_pos_h,
+                                                                                       block->rel_pos_w,
+                                                                                       1u,
+                                                                                       grid_w,
+                                                                                       grid_h,
+                                                                                       view_count,
+                                                                                       block->rel_pos_h_length,
+                                                                                       block->rel_pos_w_length,
+                                                                                       scratch->sam_block_attention,
+                                                                                       error,
+                                                                                       error_size));
+        RUN_SAM_BATCH_BLOCK_STEP("output projection",
+                                 metal_run_mps_matmul_nt_f16(ctx,
+                                                             (uocr_metal_buffer_slice){scratch->sam_block_attention.buffer, scratch->sam_block_attention.offset},
+                                                             block->proj_weight.slice,
+                                                             (uocr_metal_buffer_slice){scratch->sam_block_attention_bhwc.buffer, scratch->sam_block_attention_bhwc.offset},
+                                                             rows,
+                                                             UOCR_SAM_HIDDEN_SIZE,
+                                                             UOCR_SAM_HIDDEN_SIZE,
+                                                             "Metal SAM batch global output projection MPS matmul",
+                                                             error,
+                                                             error_size) &&
+                                 metal_run_bias_add_f16_inplace(ctx,
+                                                                (uocr_metal_buffer_slice){scratch->sam_block_attention_bhwc.buffer, scratch->sam_block_attention_bhwc.offset},
+                                                                block->proj_bias.slice,
+                                                                rows,
+                                                                UOCR_SAM_HIDDEN_SIZE,
+                                                                "Metal SAM batch global output projection bias",
+                                                                error,
+                                                                error_size));
+        RUN_SAM_BATCH_BLOCK_STEP("attention residual",
+                                 metal_run_residual_add_f16(ctx,
+                                                            (uocr_metal_buffer_slice){input_bhwc.buffer, input_bhwc.offset},
+                                                            (uocr_metal_buffer_slice){scratch->sam_block_attention_bhwc.buffer, scratch->sam_block_attention_bhwc.offset},
+                                                            (uocr_metal_buffer_slice){scratch->sam_block_residual1_bhwc.buffer, scratch->sam_block_residual1_bhwc.offset},
+                                                            (uint32_t)hidden_values,
+                                                            "Metal SAM batch global attention residual",
+                                                            error,
+                                                            error_size));
+    } else {
+        uint32_t actual_windows = 0u;
+        uint32_t actual_padded_w = 0u;
+        uint32_t actual_padded_h = 0u;
+        RUN_SAM_BATCH_BLOCK_STEP("window partition",
+                                 metal_context_sam_window_partition_batch_f16_to_slice(ctx,
+                                                                                       scratch->sam_block_norm1_bhwc,
+                                                                                       grid_w,
+                                                                                       grid_h,
+                                                                                       view_count,
+                                                                                       scratch->sam_block_window_tokens,
+                                                                                       &actual_windows,
+                                                                                       &actual_padded_w,
+                                                                                       &actual_padded_h,
+                                                                                       error,
+                                                                                       error_size));
+        if (actual_windows != n_windows || actual_padded_w != padded_w || actual_padded_h != padded_h) {
+            return metal_fail(error, error_size, "Metal SAM batch window geometry changed during partition");
+        }
+        RUN_SAM_BATCH_BLOCK_STEP("window QKV",
+                                 metal_run_packed_qkv_mps_f16(ctx,
+                                                               (uocr_metal_buffer_slice){scratch->sam_block_window_tokens.buffer, scratch->sam_block_window_tokens.offset},
+                                                               block->qkv_weight.slice,
+                                                               block->qkv_bias.slice,
+                                                               (uocr_metal_buffer_slice){scratch->sam_block_q.buffer, scratch->sam_block_q.offset},
+                                                               (uocr_metal_buffer_slice){scratch->sam_block_k.buffer, scratch->sam_block_k.offset},
+                                                               (uocr_metal_buffer_slice){scratch->sam_block_v.buffer, scratch->sam_block_v.offset},
+                                                               attention_rows,
+                                                               UOCR_SAM_HIDDEN_SIZE,
+                                                               "Metal SAM batch window QKV MPS matmul",
+                                                               error,
+                                                               error_size));
+        RUN_SAM_BATCH_BLOCK_STEP("window relative-position attention",
+                                 metal_context_sam_rel_pos_attention_batch_f16_to_slice(ctx,
+                                                                                       scratch->sam_block_q,
+                                                                                       scratch->sam_block_k,
+                                                                                       scratch->sam_block_v,
+                                                                                       block->rel_pos_h,
+                                                                                       block->rel_pos_w,
+                                                                                       n_windows,
+                                                                                       UOCR_SAM_WINDOW_SIZE,
+                                                                                       UOCR_SAM_WINDOW_SIZE,
+                                                                                       view_count,
+                                                                                       block->rel_pos_h_length,
+                                                                                       block->rel_pos_w_length,
+                                                                                       scratch->sam_block_attention,
+                                                                                       error,
+                                                                                       error_size));
+        RUN_SAM_BATCH_BLOCK_STEP("window output projection",
+                                 metal_run_mps_matmul_nt_f16(ctx,
+                                                             (uocr_metal_buffer_slice){scratch->sam_block_attention.buffer, scratch->sam_block_attention.offset},
+                                                             block->proj_weight.slice,
+                                                             (uocr_metal_buffer_slice){scratch->sam_block_projected_windows.buffer, scratch->sam_block_projected_windows.offset},
+                                                             attention_rows,
+                                                             UOCR_SAM_HIDDEN_SIZE,
+                                                             UOCR_SAM_HIDDEN_SIZE,
+                                                             "Metal SAM batch window output projection MPS matmul",
+                                                             error,
+                                                             error_size) &&
+                                 metal_run_bias_add_f16_inplace(ctx,
+                                                                (uocr_metal_buffer_slice){scratch->sam_block_projected_windows.buffer, scratch->sam_block_projected_windows.offset},
+                                                                block->proj_bias.slice,
+                                                                attention_rows,
+                                                                UOCR_SAM_HIDDEN_SIZE,
+                                                                "Metal SAM batch window output projection bias",
+                                                                error,
+                                                                error_size));
+        RUN_SAM_BATCH_BLOCK_STEP("window unpartition",
+                                 metal_context_sam_window_unpartition_batch_f16_to_slice(ctx,
+                                                                                         scratch->sam_block_projected_windows,
+                                                                                         grid_w,
+                                                                                         grid_h,
+                                                                                         view_count,
+                                                                                         scratch->sam_block_attention_bhwc,
+                                                                                         error,
+                                                                                         error_size));
+        RUN_SAM_BATCH_BLOCK_STEP("attention residual",
+                                 metal_run_residual_add_f16(ctx,
+                                                            (uocr_metal_buffer_slice){input_bhwc.buffer, input_bhwc.offset},
+                                                            (uocr_metal_buffer_slice){scratch->sam_block_attention_bhwc.buffer, scratch->sam_block_attention_bhwc.offset},
+                                                            (uocr_metal_buffer_slice){scratch->sam_block_residual1_bhwc.buffer, scratch->sam_block_residual1_bhwc.offset},
+                                                            (uint32_t)hidden_values,
+                                                            "Metal SAM batch window attention residual",
+                                                            error,
+                                                            error_size));
+    }
+
+    RUN_SAM_BATCH_BLOCK_STEP("LayerNorm2",
+                             metal_context_layernorm_f16_with_parameter_buffers(ctx,
+                                                                                scratch->sam_block_residual1_bhwc.f16,
+                                                                                block->norm2_weight.slice.buffer,
+                                                                                block->norm2_weight.slice.offset,
+                                                                                block->norm2_bias.slice.buffer,
+                                                                                block->norm2_bias.slice.offset,
+                                                                                rows,
+                                                                                UOCR_SAM_HIDDEN_SIZE,
+                                                                                1.0e-6f,
+                                                                                UOCR_METAL_LAYERNORM_OUTPUT_F16,
+                                                                                scratch->sam_block_norm2_bhwc.f16,
+                                                                                "Metal SAM batch LayerNorm2",
+                                                                                error,
+                                                                                error_size));
+    RUN_SAM_BATCH_BLOCK_STEP("MLP",
+                             metal_context_sam_mlp_batch_workspace_f16_to_slice(ctx,
+                                                                                scratch->sam_block_norm2_bhwc,
+                                                                                block,
+                                                                                rows,
+                                                                                scratch->sam_block_mlp_intermediate,
+                                                                                scratch->sam_block_mlp_bhwc,
+                                                                                error,
+                                                                                error_size));
+    RUN_SAM_BATCH_BLOCK_STEP("MLP residual",
+                             metal_run_residual_add_f16(ctx,
+                                                        (uocr_metal_buffer_slice){scratch->sam_block_residual1_bhwc.buffer, scratch->sam_block_residual1_bhwc.offset},
+                                                        (uocr_metal_buffer_slice){scratch->sam_block_mlp_bhwc.buffer, scratch->sam_block_mlp_bhwc.offset},
+                                                        (uocr_metal_buffer_slice){out_bhwc.buffer, out_bhwc.offset},
+                                                        (uint32_t)hidden_values,
+                                                        "Metal SAM batch MLP residual",
+                                                        error,
+                                                        error_size));
+
+#undef RUN_SAM_BATCH_BLOCK_STEP
+
+    return 1;
+}
+
+static int metal_context_sam_transformer_batch_workspace_f16_to_slice(uocr_metal_context *ctx,
+                                                                      uocr_metal_vision_workspace_slice input_bhwc,
+                                                                      const uocr_metal_sam_transformer_block_slices_f16 *blocks,
+                                                                      uint32_t block_count,
+                                                                      uint32_t grid_w,
+                                                                      uint32_t grid_h,
+                                                                      uint32_t view_count,
+                                                                      uocr_metal_vision_workspace_slice out_bhwc,
+                                                                      uocr_metal_vision_workspace *scratch,
+                                                                      char *error,
+                                                                      size_t error_size) {
+    metal_clear_error(error, error_size);
+    if (ctx == NULL || input_bhwc.buffer == nil || input_bhwc.f16 == NULL || blocks == NULL || view_count == 0u ||
+        out_bhwc.buffer == nil || out_bhwc.f16 == NULL || scratch == NULL) {
+        return metal_fail(error, error_size, "invalid Metal SAM batch transformer request");
+    }
+    if (block_count != UOCR_SAM_BLOCKS) {
+        return metal_fail(error, error_size, "invalid Metal SAM batch transformer block count %u", block_count);
+    }
+    uint64_t rows_per_view = 0u;
+    uint64_t hidden_bytes_per_view = 0u;
+    uint64_t hidden_values = 0u;
+    uint64_t hidden_bytes = 0u;
+    if (!metal_sam_transformer_activation_bytes(grid_w, grid_h, &rows_per_view, &hidden_bytes_per_view, error, error_size) ||
+        rows_per_view > (uint64_t)(UINT32_MAX / view_count) ||
+        !checked_mul_u64(rows_per_view, (uint64_t)view_count, &hidden_values) ||
+        !checked_mul_u64(hidden_values, (uint64_t)UOCR_SAM_HIDDEN_SIZE, &hidden_values) ||
+        hidden_values > (uint64_t)UINT32_MAX || !metal_vision_f16_bytes(hidden_values, &hidden_bytes) ||
+        !metal_vision_require_workspace_slice_f16(input_bhwc, hidden_bytes, "SAM batch transformer input", error, error_size) ||
+        !metal_vision_require_workspace_slice_f16(out_bhwc, hidden_bytes, "SAM batch transformer output", error, error_size) ||
+        !metal_vision_require_workspace_slice_f16(scratch->sam_patch_bhwc, hidden_bytes, "SAM batch transformer state A", error, error_size) ||
+        !metal_vision_require_workspace_slice_f16(scratch->sam_transformer_batch_bhwc, hidden_bytes, "SAM batch transformer state B", error, error_size)) {
+        return 0;
+    }
+    for (uint32_t block_index = 0u; block_index < block_count; ++block_index) {
+        if (!metal_sam_transformer_block_slices_have_weights(&blocks[block_index])) {
+            return metal_fail(error, error_size, "invalid Metal SAM batch transformer block %u weights", block_index);
+        }
+    }
+
+    uocr_metal_vision_workspace_slice current = input_bhwc;
+    uocr_metal_vision_workspace_slice state_a = scratch->sam_patch_bhwc;
+    uocr_metal_vision_workspace_slice state_b = scratch->sam_transformer_batch_bhwc;
+    uocr_metal_vision_workspace_slice next = state_a;
+    const uint64_t sam_blocks_start_ns = uocr_profile_now_ns();
+    for (uint32_t block_index = 0u; block_index < block_count; ++block_index) {
+        const uint64_t block_start_ns = uocr_profile_now_ns();
+        const int is_last = block_index + 1u == block_count;
+        uocr_metal_vision_workspace_slice block_out = is_last ? out_bhwc : next;
+        if (block_out.buffer == current.buffer && block_out.offset == current.offset) {
+            return metal_fail(error, error_size, "Metal SAM batch transformer attempted in-place block output");
+        }
+        if (!metal_context_sam_transformer_batch_block_workspace_f16_to_slice(ctx,
+                                                                              current,
+                                                                              &blocks[block_index],
+                                                                              grid_w,
+                                                                              grid_h,
+                                                                              view_count,
+                                                                              uocr_sam_block_uses_global_attention(block_index),
+                                                                              block_out,
+                                                                              scratch,
+                                                                              error,
+                                                                              error_size)) {
+            char detail[512];
+            metal_copy_error_detail(detail, sizeof(detail), error);
+            return metal_fail(error,
+                              error_size,
+                              "failed to compute Metal SAM batch transformer block %u: %s",
+                              block_index,
+                              detail);
+        }
+        if (!is_last) {
+            current = block_out;
+            next = (block_out.buffer == state_a.buffer && block_out.offset == state_a.offset) ? state_b : state_a;
+        }
+        metal_profile_add_event_now(ctx, view_count > 1u ? "metal.vision.sam_block_batch" : "metal.vision.sam_block", block_start_ns);
+        metal_profile_add_event_now_f(ctx,
+                                      block_start_ns,
+                                      view_count > 1u ? "metal.vision.sam_block_batch.%02u" : "metal.vision.sam_block.%02u",
+                                      block_index);
+    }
+    metal_profile_add_event_now(ctx, view_count > 1u ? "metal.vision.sam_blocks_batch" : "metal.vision.sam_blocks", sam_blocks_start_ns);
+    metal_clear_error(error, error_size);
+    return 1;
+}
+
 static int metal_context_sam_mlp_workspace_f16(uocr_metal_context *ctx,
                                                uocr_metal_vision_workspace_slice input,
                                                const uocr_metal_sam_transformer_block_f16 *block,
@@ -18654,7 +19468,7 @@ int uocr_metal_context_diagnostic_sam_rel_pos_attention_f16(uocr_metal_context *
         params.rel_pos_h_length = rel_pos_h_length;
         params.rel_pos_w_length = rel_pos_w_length;
         params.scale = 1.0f / sqrtf((float)UOCR_SAM_HEAD_DIM);
-        params.reserved0 = 0u;
+        params.batch_size = 1u;
         params.reserved1 = 0u;
         params.reserved2 = 0u;
 

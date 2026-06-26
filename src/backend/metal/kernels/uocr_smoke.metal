@@ -459,6 +459,7 @@ struct UocrSamAbsPosParams {
     uint target_width;
     uint target_height;
     uint channels;
+    uint batch_size;
 };
 
 static inline float uocr_cubic_convolution_weight(float x) {
@@ -520,12 +521,15 @@ kernel void uocr_sam_add_abs_pos_f16(device const half *patch_bhwc [[buffer(0)]]
                                      device half *dst_bhwc [[buffer(2)]],
                                      constant UocrSamAbsPosParams &params [[buffer(3)]],
                                      uint gid [[thread_position_in_grid]]) {
-    const uint total = params.target_width * params.target_height * params.channels;
+    const uint values_per_view = params.target_width * params.target_height * params.channels;
+    const uint batch_size = params.batch_size == 0u ? 1u : params.batch_size;
+    const uint total = values_per_view * batch_size;
     if (gid >= total) {
         return;
     }
-    const uint channel = gid % params.channels;
-    const uint patch_index = gid / params.channels;
+    const uint local_gid = gid % values_per_view;
+    const uint channel = local_gid % params.channels;
+    const uint patch_index = local_gid / params.channels;
     const uint out_y = patch_index / params.target_width;
     const uint out_x = patch_index - out_y * params.target_width;
     const float pos = uocr_sam_abs_pos_bicubic_antialias(pos_embed, params, out_y, out_x, channel);
@@ -1235,19 +1239,26 @@ struct UocrSamRelPosAttentionParams {
     uint rel_pos_h_length;
     uint rel_pos_w_length;
     float scale;
-    uint reserved0;
+    uint batch_size;
     uint reserved1;
     uint reserved2;
 };
 
+static inline uint uocr_sam_rel_pos_attention_batch_size(constant UocrSamRelPosAttentionParams &params) {
+    return params.batch_size == 0u ? 1u : params.batch_size;
+}
+
 static inline ulong uocr_sam_rel_pos_attention_index(constant UocrSamRelPosAttentionParams &params,
+                                                     uint batch,
                                                      uint window,
                                                      uint token,
                                                      uint head,
                                                      uint dim) {
-    return (((ulong(window) * ulong(params.tokens_per_window) + ulong(token)) * ulong(params.heads) + ulong(head)) *
-            ulong(params.head_dim)) +
-           ulong(dim);
+    return (((((ulong(batch) * ulong(params.windows) + ulong(window)) * ulong(params.tokens_per_window) + ulong(token)) *
+              ulong(params.heads) +
+              ulong(head)) *
+             ulong(params.head_dim)) +
+            ulong(dim));
 }
 
 static inline float uocr_sam_rel_pos_table_value(device const half *rel_pos,
@@ -1280,6 +1291,7 @@ struct UocrSamWindowPartitionParams {
     uint windows_per_col;
     uint window_size;
     uint hidden_size;
+    uint batch_size;
 };
 
 kernel void uocr_sam_window_partition_f16(device const half *src [[buffer(0)]],
@@ -1287,13 +1299,17 @@ kernel void uocr_sam_window_partition_f16(device const half *src [[buffer(0)]],
                                           constant UocrSamWindowPartitionParams &params [[buffer(2)]],
                                           uint gid [[thread_position_in_grid]]) {
     const uint padded_tokens = params.padded_width * params.padded_height;
-    const uint values = padded_tokens * params.hidden_size;
+    const uint values_per_view = padded_tokens * params.hidden_size;
+    const uint batch_size = params.batch_size == 0u ? 1u : params.batch_size;
+    const uint values = values_per_view * batch_size;
     if (gid >= values) {
         return;
     }
 
-    const uint channel = gid % params.hidden_size;
-    const uint flat_token = gid / params.hidden_size;
+    const uint batch = gid / values_per_view;
+    const uint local_gid = gid - batch * values_per_view;
+    const uint channel = local_gid % params.hidden_size;
+    const uint flat_token = local_gid / params.hidden_size;
     const uint token_in_window = flat_token % (params.window_size * params.window_size);
     const uint window = flat_token / (params.window_size * params.window_size);
     const uint window_x = window % params.windows_per_row;
@@ -1304,7 +1320,8 @@ kernel void uocr_sam_window_partition_f16(device const half *src [[buffer(0)]],
     const uint src_x = window_x * params.window_size + local_x;
 
     if (src_y < params.grid_height && src_x < params.grid_width) {
-        dst[gid] = src[(src_y * params.grid_width + src_x) * params.hidden_size + channel];
+        const uint src_spatial = src_y * params.grid_width + src_x;
+        dst[gid] = src[(batch * params.grid_width * params.grid_height + src_spatial) * params.hidden_size + channel];
     } else {
         dst[gid] = half(0.0f);
     }
@@ -1314,13 +1331,17 @@ kernel void uocr_sam_window_unpartition_f16(device const half *src [[buffer(0)]]
                                             device half *dst [[buffer(1)]],
                                             constant UocrSamWindowPartitionParams &params [[buffer(2)]],
                                             uint gid [[thread_position_in_grid]]) {
-    const uint values = params.grid_width * params.grid_height * params.hidden_size;
+    const uint values_per_view = params.grid_width * params.grid_height * params.hidden_size;
+    const uint batch_size = params.batch_size == 0u ? 1u : params.batch_size;
+    const uint values = values_per_view * batch_size;
     if (gid >= values) {
         return;
     }
 
-    const uint channel = gid % params.hidden_size;
-    const uint flat_token = gid / params.hidden_size;
+    const uint batch = gid / values_per_view;
+    const uint local_gid = gid - batch * values_per_view;
+    const uint channel = local_gid % params.hidden_size;
+    const uint flat_token = local_gid / params.hidden_size;
     const uint y = flat_token / params.grid_width;
     const uint x = flat_token - y * params.grid_width;
     const uint window_y = y / params.window_size;
@@ -1330,7 +1351,10 @@ kernel void uocr_sam_window_unpartition_f16(device const half *src [[buffer(0)]]
     const uint window = window_y * params.windows_per_row + window_x;
     const uint token_in_window = local_y * params.window_size + local_x;
 
-    dst[gid] = src[(window * params.window_size * params.window_size + token_in_window) * params.hidden_size + channel];
+    const uint window_tokens = params.window_size * params.window_size;
+    dst[gid] = src[((batch * params.windows_per_row * params.windows_per_col + window) * window_tokens + token_in_window) *
+                   params.hidden_size +
+                   channel];
 }
 
 struct UocrSamNeckConv1x1Params {
@@ -4251,8 +4275,11 @@ static inline void uocr_sam_rel_pos_attention_flash_impl(device const half *q_sr
     const uint query_in_block = uint(simdgroup_u16);
     const uint head = tg.x;
     const uint query_token = tg.y * UOCR_FLASH_Q_PER_TG + query_in_block;
-    const uint window = tg.z;
-    if (query_in_block >= UOCR_FLASH_Q_PER_TG || window >= params.windows ||
+    const uint batch_size = uocr_sam_rel_pos_attention_batch_size(params);
+    const uint logical_window = tg.z;
+    const uint batch = params.windows == 0u ? 0u : logical_window / params.windows;
+    const uint window = params.windows == 0u ? 0u : logical_window - batch * params.windows;
+    if (query_in_block >= UOCR_FLASH_Q_PER_TG || params.windows == 0u || batch >= batch_size || window >= params.windows ||
         query_token >= params.tokens_per_window || head >= params.heads ||
         params.grid_width == 0u || params.grid_height == 0u ||
         params.tokens_per_window != params.grid_width * params.grid_height ||
@@ -4270,7 +4297,7 @@ static inline void uocr_sam_rel_pos_attention_flash_impl(device const half *q_sr
     for (uint i = 0u; i < UOCR_FLASH_MAX_LANE_VALUES; ++i) {
         const uint dim = uocr_flash_lane_dim(lane, i);
         if (dim < params.head_dim) {
-            const ulong q_index = uocr_sam_rel_pos_attention_index(params, window, query_token, head, dim);
+            const ulong q_index = uocr_sam_rel_pos_attention_index(params, batch, window, query_token, head, dim);
             qv[i] = float(q_src[q_index]);
         } else {
             qv[i] = 0.0f;
@@ -4289,7 +4316,7 @@ static inline void uocr_sam_rel_pos_attention_flash_impl(device const half *q_sr
         for (uint i = 0u; i < UOCR_FLASH_MAX_LANE_VALUES; ++i) {
             const uint dim = uocr_flash_lane_dim(lane, i);
             if (dim < params.head_dim) {
-                const ulong k_index = uocr_sam_rel_pos_attention_index(params, window, key_token, head, dim);
+                const ulong k_index = uocr_sam_rel_pos_attention_index(params, batch, window, key_token, head, dim);
                 const float rh = uocr_sam_rel_pos_table_value(rel_pos_h,
                                                               params.rel_pos_h_length,
                                                               target_h_length,
@@ -4312,7 +4339,7 @@ static inline void uocr_sam_rel_pos_attention_flash_impl(device const half *q_sr
         for (uint i = 0u; i < UOCR_FLASH_MAX_LANE_VALUES; ++i) {
             const uint dim = uocr_flash_lane_dim(lane, i);
             if (dim < params.head_dim) {
-                const ulong v_index = uocr_sam_rel_pos_attention_index(params, window, key_token, head, dim);
+                const ulong v_index = uocr_sam_rel_pos_attention_index(params, batch, window, key_token, head, dim);
                 acc[i] = acc[i] * corr + e * float(v_src[v_index]);
             }
         }
@@ -4324,7 +4351,7 @@ static inline void uocr_sam_rel_pos_attention_flash_impl(device const half *q_sr
     for (uint i = 0u; i < UOCR_FLASH_MAX_LANE_VALUES; ++i) {
         const uint dim = uocr_flash_lane_dim(lane, i);
         if (dim < params.head_dim) {
-            const ulong dst_index = uocr_sam_rel_pos_attention_index(params, window, query_token, head, dim);
+            const ulong dst_index = uocr_sam_rel_pos_attention_index(params, batch, window, query_token, head, dim);
             dst[dst_index] = out_t(acc[i] * inv_l);
         }
     }
