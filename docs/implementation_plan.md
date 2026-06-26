@@ -48,7 +48,7 @@ Implementation status:
 - [ ] Use **custom tiled Metal kernels** for SAM attention, SAM patch/neck/stride convolutions, visual formatting, decode single-token matvecs, routed/shared MoE, and LM-head argmax.
 - [x] Use **persistent GPU token-id buffers** and fold prompt assembly into the prefill command graph.
 - [x] Use **request-sized lazy arena growth before command encoding**; never grow inside a hot loop.
-- [ ] Use **cached Python tokenizers** keyed by resolved tokenizer path.
+- [x] Use **cached Python tokenizers** keyed by resolved tokenizer path.
 - [ ] Keep the 10x milestone on **fp16 weights**; q8 decoder is a follow-up compression milestone after fp16 speed is fixed.
 - [ ] Remove production runtime toggles that preserve slow paths after the chosen path lands.
 
@@ -188,10 +188,10 @@ Current finding:
 
 Implementation status:
 
-- [ ] Add an unbounded process-local tokenizer cache keyed by resolved tokenizer path.
-- [ ] Cache tokenizer validation results by path and file identity.
-- [ ] Cache decoded EOS text by tokenizer path.
-- [ ] Use the cached tokenizer in `prepare_image()`, `prepare_pages()`, `prepare_text()`, and `decode_generated_ids()`.
+- [x] Add an unbounded process-local tokenizer cache keyed by resolved tokenizer path.
+- [x] Cache tokenizer validation results by path and file identity.
+- [x] Cache decoded EOS text by tokenizer path.
+- [x] Use the cached tokenizer in `prepare_image()`, `prepare_pages()`, `prepare_text()`, and `decode_generated_ids()`.
 - [ ] Add tests that verify cache reuse and deterministic output.
 
 Acceptance target:
@@ -301,7 +301,7 @@ Implementation status:
 - [ ] Cache MPS descriptors/NDArrays and lock large GEMMs to the fixed MPS path.
 - [x] Fuse prompt assembly into the prefill command graph.
 - [ ] Replace decode single-token matvec/MoE kernels with custom tiled kernels.
-- [ ] Add Python tokenizer/decode caching.
+- [x] Add Python tokenizer/decode caching.
 - [x] Implement request-sized lazy arenas.
 - [ ] Delete unselected fallback/duplicate production code after each stage passes gates.
 - [ ] Start q8 decoder compression work after the fp16 10x milestone.

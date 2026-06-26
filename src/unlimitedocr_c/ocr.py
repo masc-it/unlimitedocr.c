@@ -22,13 +22,13 @@ from numpy.typing import NDArray
 
 from .ffi import Engine, EngineOptions, ProfileEvent, ProfileReport
 from .frontend import (
-    EOS_TOKEN_ID,
     MODEL_VOCAB_SIZE,
     MULTI_PROMPT,
     SINGLE_PROMPT,
     ImageInput,
     PreparedRequest,
     Preset,
+    cached_eos_text,
     default_tokenizer_path,
     load_tokenizer,
     prepare_image,
@@ -71,9 +71,10 @@ def decode_generated_ids(
     if ids.size and (np.any(ids < 0) or np.any(ids >= MODEL_VOCAB_SIZE)):
         raise ValueError("generated ids contain values outside the model vocabulary")
 
-    tokenizer = load_tokenizer(tokenizer_path or default_tokenizer_path())
+    resolved_tokenizer_path = tokenizer_path or default_tokenizer_path()
+    tokenizer = load_tokenizer(resolved_tokenizer_path)
     text = tokenizer.decode([int(token_id) for token_id in ids], skip_special_tokens=False)
-    eos_text = tokenizer.decode([EOS_TOKEN_ID], skip_special_tokens=False)
+    eos_text = cached_eos_text(resolved_tokenizer_path)
     if eos_text and text.endswith(eos_text):
         text = text[: -len(eos_text)]
     return text.strip()
