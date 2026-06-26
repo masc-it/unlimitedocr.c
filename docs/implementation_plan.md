@@ -215,7 +215,7 @@ Implementation status:
 - [x] Cache stable descriptors and long-lived weight NDArrays by shape/layout/transpose.
 - [x] Cache workspace input/output NDArrays for every reusable vision and decoder prefill slice.
 - [x] Prebuild all MPS descriptors and weight NDArrays during model map/binding validation.
-- [ ] Use stack/static small Objective-C arrays for fixed two-input matmul encoding where supported by the API boundary.
+- [x] Use stack/static small Objective-C arrays for fixed two-input matmul encoding where supported by the API boundary.
 - [x] Remove destination zero-fill blits from MPS matmul calls after parity confirms all destinations are fully overwritten.
 - [ ] Make public Metal OCR require the chosen MPS GEMM path for large GEMMs.
 - [ ] Delete production MPS-disable toggles and threshold selection after the fixed MPS path passes timing gates.

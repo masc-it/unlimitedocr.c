@@ -1215,6 +1215,16 @@ typedef struct uocr_metal_kv_cache_write_params {
     uint32_t reserved1;
 } uocr_metal_kv_cache_write_params;
 
+static void metal_remove_transient_retained_object(NSMutableArray *retained_objects, id object) {
+    if (retained_objects == nil || object == nil) {
+        return;
+    }
+    const NSUInteger index = [retained_objects indexOfObjectIdenticalTo:object];
+    if (index != NSNotFound) {
+        [retained_objects removeObjectAtIndex:index];
+    }
+}
+
 static int metal_retain_transient_until_completed(uocr_metal_context *ctx,
                                                   id<MTLCommandBuffer> command_buffer,
                                                   id object,
@@ -1234,10 +1244,40 @@ static int metal_retain_transient_until_completed(uocr_metal_context *ctx,
     [command_buffer addCompletedHandler:^(id<MTLCommandBuffer> completed) {
         (void)completed;
         @synchronized(retained_objects) {
-            const NSUInteger index = [retained_objects indexOfObjectIdenticalTo:object];
-            if (index != NSNotFound) {
-                [retained_objects removeObjectAtIndex:index];
-            }
+            metal_remove_transient_retained_object(retained_objects, object);
+        }
+        [retained_objects release];
+    }];
+    return 1;
+}
+
+static int metal_retain_mps_matmul_arrays_until_completed(uocr_metal_context *ctx,
+                                                          id<MTLCommandBuffer> command_buffer,
+                                                          id input_array,
+                                                          id weight_array,
+                                                          id output_array,
+                                                          char *error,
+                                                          size_t error_size) {
+    if (ctx == NULL || ctx->transient_retains == nil || command_buffer == nil ||
+        input_array == nil || weight_array == nil || output_array == nil) {
+        return metal_fail(error, error_size, "invalid Metal MPS matmul transient retain request");
+    }
+
+    NSMutableArray *retained_objects = [ctx->transient_retains retain];
+    @synchronized(retained_objects) {
+        [retained_objects addObject:input_array];
+        [retained_objects addObject:weight_array];
+        [retained_objects addObject:output_array];
+    }
+    if (metal_profile_enabled(ctx)) {
+        uocr_profile_add_metal_transient_retain_object(ctx->profile);
+    }
+    [command_buffer addCompletedHandler:^(id<MTLCommandBuffer> completed) {
+        (void)completed;
+        @synchronized(retained_objects) {
+            metal_remove_transient_retained_object(retained_objects, input_array);
+            metal_remove_transient_retained_object(retained_objects, weight_array);
+            metal_remove_transient_retained_object(retained_objects, output_array);
         }
         [retained_objects release];
     }];
@@ -7434,20 +7474,17 @@ static int metal_run_mps_matmul_nt_f16_to_type(uocr_metal_context *ctx,
             [y_array release];
             return metal_fail(error, error_size, "failed to create %s MPS matmul encoder", op_name != NULL ? op_name : "Metal");
         }
-        NSArray *sources = [[NSArray alloc] initWithObjects:x_array, w_array, nil];
-        NSArray *retained_arrays = [[NSArray alloc] initWithObjects:x_array, w_array, y_array, nil];
+        id source_arrays[2] = { x_array, w_array };
+        NSArray *sources = [[NSArray alloc] initWithObjects:source_arrays count:2u];
         if (metal_profile_enabled(ctx)) {
-            uocr_profile_add_metal_nsarray(ctx->profile);
             uocr_profile_add_metal_nsarray(ctx->profile);
         }
         metal_profile_add_event_now(ctx, "metal.mps.matmul.setup", setup_start_ns);
-        if (sources == nil || retained_arrays == nil) {
-            [sources release];
-            [retained_arrays release];
+        if (sources == nil) {
             [x_array release];
             [w_array release];
             [y_array release];
-            return metal_fail(error, error_size, "failed to create %s MPS retain arrays", op_name != NULL ? op_name : "Metal");
+            return metal_fail(error, error_size, "failed to create %s MPS source array", op_name != NULL ? op_name : "Metal");
         }
         [kernel encodeToCommandEncoder:enc
                           commandBuffer:cb
@@ -7457,9 +7494,8 @@ static int metal_run_mps_matmul_nt_f16_to_type(uocr_metal_context *ctx,
         metal_profile_add_event_now(ctx, "metal.mps.matmul.encode", encode_start_ns);
         [sources release];
         const uint64_t retain_start_ns = uocr_profile_now_ns();
-        const int retained = metal_retain_transient_until_completed(ctx, cb, retained_arrays, error, error_size);
+        const int retained = metal_retain_mps_matmul_arrays_until_completed(ctx, cb, x_array, w_array, y_array, error, error_size);
         metal_profile_add_event_now(ctx, "metal.mps.matmul.retain", retain_start_ns);
-        [retained_arrays release];
         [x_array release];
         [w_array release];
         [y_array release];
