@@ -6807,35 +6807,8 @@ static const uocr_metal_mps_class_cache *metal_mps_classes(void) {
     return &cache;
 }
 
-static int metal_env_flag_enabled(const char *name) {
-    const char *value = name != NULL ? getenv(name) : NULL;
-    if (value == NULL || value[0] == '\0' || strcmp(value, "0") == 0 || strcmp(value, "false") == 0 ||
-        strcmp(value, "FALSE") == 0 || strcmp(value, "no") == 0 || strcmp(value, "NO") == 0 ||
-        strcmp(value, "off") == 0 || strcmp(value, "OFF") == 0) {
-        return 0;
-    }
-    return 1;
-}
-
-static uint64_t metal_env_u64(const char *name, uint64_t fallback) {
-    const char *value = name != NULL ? getenv(name) : NULL;
-    if (value == NULL || value[0] == '\0') {
-        return fallback;
-    }
-    char *end = NULL;
-    unsigned long long parsed = strtoull(value, &end, 10);
-    if (end == value || *end != '\0') {
-        return fallback;
-    }
-    return (uint64_t)parsed;
-}
-
 static int metal_mps_framework_available(void) {
-    return !metal_env_flag_enabled("UOCR_METAL_DISABLE_MPS") && metal_mps_classes()->available;
-}
-
-static uint64_t metal_mps_matmul_min_flops(void) {
-    return metal_env_u64("UOCR_METAL_MPS_MATMUL_MIN_FLOPS", UOCR_METAL_MPS_MATMUL_MIN_FLOPS);
+    return metal_mps_classes()->available;
 }
 
 static int metal_mps_matmul_nt_f16_flops(uint32_t rows,
@@ -6861,12 +6834,7 @@ static int metal_mps_matmul_nt_f16_is_large(uint32_t rows, uint32_t in_features,
 }
 
 static int metal_mps_matmul_nt_f16_should_use(uint32_t rows, uint32_t in_features, uint32_t out_features) {
-    uint64_t flops = 0u;
-    if (!metal_mps_framework_available() ||
-        !metal_mps_matmul_nt_f16_flops(rows, in_features, out_features, &flops)) {
-        return 0;
-    }
-    return flops >= metal_mps_matmul_min_flops();
+    return metal_mps_framework_available() && metal_mps_matmul_nt_f16_is_large(rows, in_features, out_features);
 }
 
 static void metal_public_mps_large_gemm_require_begin(uocr_metal_context *ctx) {
@@ -6897,17 +6865,7 @@ static int metal_public_mps_matmul_fallback_allowed(uocr_metal_context *ctx,
     if (!metal_mps_framework_available()) {
         return metal_fail(error,
                           error_size,
-                          "public Metal OCR requires MPSNDArray matmul for large %s (%ux%u x %u, %llu FLOPs), but MPS is unavailable or disabled",
-                          op_name != NULL ? op_name : "GEMM",
-                          rows,
-                          in_features,
-                          out_features,
-                          (unsigned long long)flops);
-    }
-    if (!metal_mps_matmul_nt_f16_should_use(rows, in_features, out_features)) {
-        return metal_fail(error,
-                          error_size,
-                          "public Metal OCR requires the chosen MPSNDArray matmul path for large %s (%ux%u x %u, %llu FLOPs), but the MPS threshold policy disabled it",
+                          "public Metal OCR requires MPSNDArray matmul for large %s (%ux%u x %u, %llu FLOPs), but MPS is unavailable",
                           op_name != NULL ? op_name : "GEMM",
                           rows,
                           in_features,

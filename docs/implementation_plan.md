@@ -218,7 +218,7 @@ Implementation status:
 - [x] Use stack/static small Objective-C arrays for fixed two-input matmul encoding where supported by the API boundary.
 - [x] Remove destination zero-fill blits from MPS matmul calls after parity confirms all destinations are fully overwritten.
 - [x] Make public Metal OCR require the chosen MPS GEMM path for large GEMMs.
-- [ ] Delete production MPS-disable toggles and threshold selection after the fixed MPS path passes timing gates.
+- [x] Delete production MPS-disable toggles and threshold selection after the fixed MPS path passes timing gates.
 
 Acceptance target:
 
