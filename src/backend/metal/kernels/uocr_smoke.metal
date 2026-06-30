@@ -2728,7 +2728,7 @@ static inline float uocr_moe_router_dot_f16(device const half *src,
                                             uint expert,
                                             uint tid,
                                             uint ntg,
-                                              uint simd_width,
+                                            uint simd_width,
                                             threadgroup float *partials) {
     const uint hidden_size = uocr_fc_hidden_size_or(params.hidden_size);
     float sum = 0.0f;
@@ -2738,6 +2738,34 @@ static inline float uocr_moe_router_dot_f16(device const half *src,
         sum += float(src[src_base + k]) * float(weight[weight_base + k]);
     }
     return uocr_threadgroup_sum(sum, partials, tid, ntg, simd_width);
+}
+
+static inline float uocr_moe_router_group256_sum(float value,
+                                                 threadgroup float *partials,
+                                                 uint group,
+                                                 uint local_tid,
+                                                 uint simd_width) {
+    const uint threads_per_expert = 256u;
+    const uint lane = uocr_simd_lane_from_tid(local_tid, simd_width);
+    const uint simdgroup = uocr_simdgroup_from_tid(local_tid, simd_width);
+    const uint simdgroups = uocr_simdgroups_for_threadgroup(threads_per_expert, simd_width);
+    threadgroup float *group_partials = partials + group * simdgroups;
+    const float simd_total = simd_sum(value);
+    if (lane == 0u) {
+        group_partials[simdgroup] = simd_total;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint active = simdgroups;
+    while (active > 1u) {
+        const uint upper = (active + 1u) >> 1u;
+        if (local_tid < active - upper) {
+            group_partials[local_tid] += group_partials[local_tid + upper];
+        }
+        active = upper;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    return group_partials[0];
 }
 
 [[max_total_threads_per_threadgroup(256)]] kernel void uocr_moe_router_logits_f16_to_f32(device const half *src [[buffer(0)]],
@@ -2759,6 +2787,149 @@ static inline float uocr_moe_router_dot_f16(device const half *src,
     const float value = uocr_moe_router_dot_f16(src, weight, params, token, expert, tid, ntg, simd_width, partials);
     if (tid == 0) {
         logits[token * experts + expert] = value;
+    }
+}
+
+// Decode-only router fusion for one hidden row.  Each 256-thread partition
+// computes one expert dot-product with the same per-expert accumulation shape
+// as uocr_moe_router_logits_f16_to_f32, then the first SIMD-group performs the
+// existing softmax/top-6 contract from threadgroup-resident logits.  The
+// default host path uses this only for the fixed OCR decode shape.
+[[max_total_threads_per_threadgroup(1024)]] kernel void uocr_moe_router_decode_fused_f16(device const half *src [[buffer(0)]],
+                                             device const half *weight [[buffer(1)]],
+                                             device uint *top_expert_ids [[buffer(2)]],
+                                             device float *top_weights [[buffer(3)]],
+                                             constant UocrMoeRouterParams &params [[buffer(4)]],
+                                             threadgroup half *hidden [[threadgroup(0)]],
+                                             threadgroup float *scratch [[threadgroup(1)]],
+                                             uint token [[threadgroup_position_in_grid]],
+                                             uint tid [[thread_index_in_threadgroup]],
+                                             uint ntg [[threads_per_threadgroup]],
+                                             uint simd_width [[threads_per_simdgroup]]) {
+    if (token >= params.n_tokens) {
+        return;
+    }
+    const uint hidden_size = uocr_fc_hidden_size_or(params.hidden_size);
+    const uint experts = uocr_fc_moe_experts_or(params.experts);
+    const uint top_k = uocr_fc_moe_top_k_or(params.top_k);
+    const uint threads_per_expert = 256u;
+    if (hidden_size != 1280u || experts != 64u || top_k != 6u || ntg < threads_per_expert) {
+        return;
+    }
+
+    const uint src_base = token * hidden_size;
+    for (uint k = tid; k < hidden_size; k += ntg) {
+        hidden[k] = src[src_base + k];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    threadgroup float *logits = scratch;
+    threadgroup float *partials = scratch + experts;
+    const uint experts_per_batch = ntg / threads_per_expert;
+    const uint expert_group = tid / threads_per_expert;
+    const uint local_tid = tid - expert_group * threads_per_expert;
+    for (uint expert_base = 0u; expert_base < experts; expert_base += experts_per_batch) {
+        const uint expert = expert_base + expert_group;
+        float sum = 0.0f;
+        if (expert < experts) {
+            const uint weight_base = expert * hidden_size;
+            for (uint k = local_tid; k < hidden_size; k += threads_per_expert) {
+                sum += float(hidden[k]) * float(weight[weight_base + k]);
+            }
+        }
+        const float dot = uocr_moe_router_group256_sum(sum, partials, expert_group, local_tid, simd_width);
+        if (local_tid == 0u && expert < experts) {
+            logits[expert] = dot;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    const uint lane = uocr_simd_lane_from_tid(tid, simd_width);
+    if (tid < simd_width) {
+        const bool active_lane = lane < 16u;
+        const uint expert0 = lane;
+        const uint expert1 = lane + 16u;
+        const uint expert2 = lane + 32u;
+        const uint expert3 = lane + 48u;
+        const float logit0 = active_lane ? logits[expert0] : -INFINITY;
+        const float logit1 = active_lane ? logits[expert1] : -INFINITY;
+        const float logit2 = active_lane ? logits[expert2] : -INFINITY;
+        const float logit3 = active_lane ? logits[expert3] : -INFINITY;
+        const float local_max = max(max(logit0, logit1), max(logit2, logit3));
+        const float max_logit = simd_max(local_max);
+        const float exp0 = active_lane ? exp(logit0 - max_logit) : 0.0f;
+        const float exp1 = active_lane ? exp(logit1 - max_logit) : 0.0f;
+        const float exp2 = active_lane ? exp(logit2 - max_logit) : 0.0f;
+        const float exp3 = active_lane ? exp(logit3 - max_logit) : 0.0f;
+        const float total_sum = simd_sum(exp0 + exp1 + exp2 + exp3);
+        const float inv_sum = 1.0f / total_sum;
+        const float prob0 = exp0 * inv_sum;
+        const float prob1 = exp1 * inv_sum;
+        const float prob2 = exp2 * inv_sum;
+        const float prob3 = exp3 * inv_sum;
+
+        const uint score_bits0 = active_lane ? as_type<uint>(prob0) : 0u;
+        const uint score_bits1 = active_lane ? as_type<uint>(prob1) : 0u;
+        const uint score_bits2 = active_lane ? as_type<uint>(prob2) : 0u;
+        const uint score_bits3 = active_lane ? as_type<uint>(prob3) : 0u;
+        const uint inverse0 = active_lane ? (0xffffffffu - expert0) : 0u;
+        const uint inverse1 = active_lane ? (0xffffffffu - expert1) : 0u;
+        const uint inverse2 = active_lane ? (0xffffffffu - expert2) : 0u;
+        const uint inverse3 = active_lane ? (0xffffffffu - expert3) : 0u;
+        uint selected0 = 0xffffffffu;
+        uint selected1 = 0xffffffffu;
+        uint selected2 = 0xffffffffu;
+        uint selected3 = 0xffffffffu;
+        uint selected4 = 0xffffffffu;
+        uint selected5 = 0xffffffffu;
+        for (uint rank = 0u; rank < 6u; ++rank) {
+            uint local_score_bits = 0u;
+            uint local_inverse_expert = 0u;
+            if (expert0 != selected0 && expert0 != selected1 && expert0 != selected2 &&
+                expert0 != selected3 && expert0 != selected4 && expert0 != selected5 &&
+                uocr_moe_router_topk_bits_better(score_bits0, inverse0, local_score_bits, local_inverse_expert)) {
+                local_score_bits = score_bits0;
+                local_inverse_expert = inverse0;
+            }
+            if (expert1 != selected0 && expert1 != selected1 && expert1 != selected2 &&
+                expert1 != selected3 && expert1 != selected4 && expert1 != selected5 &&
+                uocr_moe_router_topk_bits_better(score_bits1, inverse1, local_score_bits, local_inverse_expert)) {
+                local_score_bits = score_bits1;
+                local_inverse_expert = inverse1;
+            }
+            if (expert2 != selected0 && expert2 != selected1 && expert2 != selected2 &&
+                expert2 != selected3 && expert2 != selected4 && expert2 != selected5 &&
+                uocr_moe_router_topk_bits_better(score_bits2, inverse2, local_score_bits, local_inverse_expert)) {
+                local_score_bits = score_bits2;
+                local_inverse_expert = inverse2;
+            }
+            if (expert3 != selected0 && expert3 != selected1 && expert3 != selected2 &&
+                expert3 != selected3 && expert3 != selected4 && expert3 != selected5 &&
+                uocr_moe_router_topk_bits_better(score_bits3, inverse3, local_score_bits, local_inverse_expert)) {
+                local_score_bits = score_bits3;
+                local_inverse_expert = inverse3;
+            }
+            const uint simd_score_bits = simd_max(local_score_bits);
+            const uint simd_inverse_expert = simd_max(local_score_bits == simd_score_bits ? local_inverse_expert : 0u);
+            const uint best_expert = 0xffffffffu - simd_inverse_expert;
+            if (rank == 0u) {
+                selected0 = best_expert;
+            } else if (rank == 1u) {
+                selected1 = best_expert;
+            } else if (rank == 2u) {
+                selected2 = best_expert;
+            } else if (rank == 3u) {
+                selected3 = best_expert;
+            } else if (rank == 4u) {
+                selected4 = best_expert;
+            } else {
+                selected5 = best_expert;
+            }
+            if (lane == 0u) {
+                top_expert_ids[token * 6u + rank] = best_expert;
+                top_weights[token * 6u + rank] = as_type<float>(simd_score_bits);
+            }
+        }
     }
 }
 

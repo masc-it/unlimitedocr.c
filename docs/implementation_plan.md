@@ -179,7 +179,7 @@ Completion notes:
 
 ## 5. Fuse Decode Router Logits, Softmax, and Top-K
 
-Status: [ ] Not started
+Status: [x] Completed
 
 Details:
 - For decode, fuse router logits and softmax/top-k into one kernel.
@@ -194,6 +194,20 @@ Acceptance criteria:
 - Full logits/probs buffer traffic is removed from the default decode router path.
 - Synthetic router parity passes against the current implementation.
 - `base` and `gundam` E2E output remains stable.
+
+Completion notes:
+- Added `uocr_moe_router_decode_fused_f16`, a decode-only router kernel for the fixed OCR shape (`hidden=1280`, `experts=64`, `top_k=6`). It stages the single hidden row in threadgroup memory, computes router logits, applies softmax max-subtraction/sum, and writes top ids/weights directly without global logits/probs traffic.
+- The fused kernel keeps 256-thread per-expert dot-product partitions so the per-expert accumulation shape matches the existing logits kernel, while processing four experts per 1024-thread threadgroup batch. The first SIMD-group performs deterministic top-6 selection with the same `(score_bits, inverse_expert_id)` tie-break semantics as Task 4.
+- Added `UOCR_METAL_ENABLE_MOE_FUSED_ROUTER` as a compile-time fallback switch. Prefill and non-decode router calls continue to use the existing logits + softmax/top-k path.
+- Diagnostic router coverage now exercises the fused decode path when `n_tokens == 1` and optional logits/probs outputs are omitted; the existing focused test verifies top-id/top-weight parity.
+- Final Release probe artifacts:
+  - `data.tmp/probes/e2e_base_moe_fused_router.json`
+  - `data.tmp/probes/e2e_gundam_moe_fused_router.json`
+  - `data.tmp/probes/moe_fused_router_results.md`
+- Final probe summary versus Task 4:
+  - `base`: text parity true, 44 generated tokens, 7.092 native tok/s, router `2.757 -> 1.566` ms, encoder count `7732 -> 7259`, `metal.decode.moe_combine` absent.
+  - `gundam`: text parity true, 58 generated tokens, 1.515 native tok/s, router `3.750 -> 2.018` ms, encoder count `11902 -> 11275`, `metal.decode.moe_combine` absent.
+  - Total decode-loop samples were dominated by noisy command-wait time in these E2E runs, but decode command encoding/layer buckets and router traffic dropped while output parity remained stable.
 
 ## 6. Tile Shared Expert Gate/Up GEMV
 

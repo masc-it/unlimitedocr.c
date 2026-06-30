@@ -45,9 +45,13 @@
 #ifndef UOCR_METAL_ENABLE_MOE_DECODE_KERNELS
 #define UOCR_METAL_ENABLE_MOE_DECODE_KERNELS 1
 #endif
+#ifndef UOCR_METAL_ENABLE_MOE_FUSED_ROUTER
+#define UOCR_METAL_ENABLE_MOE_FUSED_ROUTER 1
+#endif
 // Keep router top-k in the one-SIMD greedy path; this avoids the old
 // full-row bitonic-sort barriers for the fixed 64-expert/top-6 decode shape.
 #define UOCR_METAL_MOE_ROUTER_TOPK_THREADS 16u
+#define UOCR_METAL_MOE_ROUTER_FUSED_THREADS 1024u
 #define UOCR_METAL_FLASH_Q_PER_TG 4u
 #define UOCR_METAL_FLASH_MAX_LANE_VALUES 4u
 #define UOCR_METAL_HALF4_WIDTH 4u
@@ -8239,6 +8243,7 @@ static int metal_prewarm_integrated_decoder_pipelines(uocr_metal_context *ctx, c
         { "uocr_dense_swiglu_down_f16_to_f16", 1 },
         { "uocr_moe_router_logits_f16_to_f32", 1 },
         { "uocr_moe_router_softmax_topk_f32", 1 },
+        { "uocr_moe_router_decode_fused_f16", 1 },
         { "uocr_moe_prefill_interleaved_gate_up_f16", 0 },
         { "uocr_moe_prefill_interleaved_down_sum_f16_to_f16", 0 },
         { "uocr_moe_decode_interleaved_gate_up_one_f16", 0 },
@@ -11442,13 +11447,26 @@ static int metal_run_moe_router_buffer_f16(uocr_metal_context *ctx,
         return 0;
     }
     @autoreleasepool {
-        id<MTLComputePipelineState> logits_pipeline = use_mps_logits ? nil :
+#if UOCR_METAL_ENABLE_MOE_FUSED_ROUTER
+        const int use_fused_decode_router = !use_mps_logits && n_tokens == 1u;
+#else
+        const int use_fused_decode_router = 0;
+#endif
+        id<MTLComputePipelineState> fused_pipeline = use_fused_decode_router ?
+            metal_get_decoder_shape_pipeline(ctx, "uocr_moe_router_decode_fused_f16", error, error_size) : nil;
+        id<MTLComputePipelineState> logits_pipeline = (use_mps_logits || use_fused_decode_router) ? nil :
             metal_get_decoder_shape_pipeline(ctx, "uocr_moe_router_logits_f16_to_f32", error, error_size);
-        id<MTLComputePipelineState> topk_pipeline = metal_get_decoder_shape_pipeline(ctx, "uocr_moe_router_softmax_topk_f32", error, error_size);
-        if ((!use_mps_logits && logits_pipeline == nil) || topk_pipeline == nil) {
+        id<MTLComputePipelineState> topk_pipeline = use_fused_decode_router ? nil :
+            metal_get_decoder_shape_pipeline(ctx, "uocr_moe_router_softmax_topk_f32", error, error_size);
+        if ((use_fused_decode_router && fused_pipeline == nil) ||
+            (!use_mps_logits && !use_fused_decode_router && logits_pipeline == nil) ||
+            (!use_fused_decode_router && topk_pipeline == nil)) {
             return 0;
         }
-        if (topk_pipeline.maxTotalThreadsPerThreadgroup < (NSUInteger)UOCR_ROUTED_EXPERTS) {
+        if (use_fused_decode_router && fused_pipeline.maxTotalThreadsPerThreadgroup < 256u) {
+            return metal_fail(error, error_size, "integrated MoE fused router pipeline does not support 256 threads");
+        }
+        if (!use_fused_decode_router && topk_pipeline.maxTotalThreadsPerThreadgroup < (NSUInteger)UOCR_ROUTED_EXPERTS) {
             return metal_fail(error, error_size, "integrated MoE router top-k pipeline does not support 64 threads");
         }
         uocr_metal_moe_router_params params;
@@ -11457,65 +11475,85 @@ static int metal_run_moe_router_buffer_f16(uocr_metal_context *ctx,
         params.experts = UOCR_ROUTED_EXPERTS;
         params.top_k = UOCR_MOE_TOP_K;
 
-        if (use_mps_logits) {
-            uocr_metal_buffer_slice router_weight_slice = { router_weight->buffer, router_weight->offset };
-            const uint64_t router_mps_start_ns = uocr_profile_now_ns();
-            if (!metal_run_mps_matmul_nt_f16_to_f32(ctx,
-                                                    input,
-                                                    router_weight_slice,
-                                                    logits,
-                                                    n_tokens,
-                                                    UOCR_HIDDEN_SIZE,
-                                                    UOCR_ROUTED_EXPERTS,
-                                                    "integrated MoE router MPS logits",
-                                                    error,
-                                                    error_size)) {
-                return 0;
-            }
-            metal_profile_add_event_now(ctx, "metal.prefill.moe_router_mps_logits", router_mps_start_ns);
-        }
-
         int owned_command_buffer = 0;
         id<MTLCommandBuffer> cb = metal_command_buffer_for_op(ctx, &owned_command_buffer, "integrated MoE router", error, error_size);
         if (cb == nil) {
             return 0;
         }
         id<MTLComputeCommandEncoder> enc = nil;
-        if (!use_mps_logits) {
+        if (use_fused_decode_router) {
             enc = metal_compute_command_encoder(ctx, cb);
             if (enc == nil) {
-                return metal_fail(error, error_size, "failed to create integrated MoE router logits encoder");
+                return metal_fail(error, error_size, "failed to create integrated MoE fused router encoder");
             }
-            const NSUInteger logits_threads = metal_power2_threadgroup_width(256u, logits_pipeline.maxTotalThreadsPerThreadgroup);
-            [enc setComputePipelineState:logits_pipeline];
+            const NSUInteger fused_threads = metal_power2_threadgroup_width((NSUInteger)UOCR_METAL_MOE_ROUTER_FUSED_THREADS,
+                                                                            fused_pipeline.maxTotalThreadsPerThreadgroup);
+            const NSUInteger hidden_tg_bytes = (NSUInteger)UOCR_HIDDEN_SIZE * sizeof(uint16_t);
+            const NSUInteger scratch_tg_bytes = ((NSUInteger)UOCR_ROUTED_EXPERTS + fused_threads) * sizeof(float);
+            [enc setComputePipelineState:fused_pipeline];
             [enc setBuffer:input.buffer offset:input.offset atIndex:0u];
             [enc setBuffer:router_weight->buffer offset:router_weight->offset atIndex:1u];
-            [enc setBuffer:logits.buffer offset:logits.offset atIndex:2u];
-            [enc setBytes:&params length:sizeof(params) atIndex:3u];
-            [enc setThreadgroupMemoryLength:logits_threads * sizeof(float) atIndex:0u];
-            [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)router_values, 1u, 1u)
-                 threadsPerThreadgroup:MTLSizeMake(logits_threads, 1u, 1u)];
+            [enc setBuffer:top_ids.buffer offset:top_ids.offset atIndex:2u];
+            [enc setBuffer:top_weights.buffer offset:top_weights.offset atIndex:3u];
+            [enc setBytes:&params length:sizeof(params) atIndex:4u];
+            [enc setThreadgroupMemoryLength:hidden_tg_bytes atIndex:0u];
+            [enc setThreadgroupMemoryLength:scratch_tg_bytes atIndex:1u];
+            [enc dispatchThreadgroups:MTLSizeMake(1u, 1u, 1u)
+                 threadsPerThreadgroup:MTLSizeMake(fused_threads, 1u, 1u)];
+            [enc endEncoding];
+        } else {
+            if (use_mps_logits) {
+                uocr_metal_buffer_slice router_weight_slice = { router_weight->buffer, router_weight->offset };
+                const uint64_t router_mps_start_ns = uocr_profile_now_ns();
+                if (!metal_run_mps_matmul_nt_f16_to_f32(ctx,
+                                                        input,
+                                                        router_weight_slice,
+                                                        logits,
+                                                        n_tokens,
+                                                        UOCR_HIDDEN_SIZE,
+                                                        UOCR_ROUTED_EXPERTS,
+                                                        "integrated MoE router MPS logits",
+                                                        error,
+                                                        error_size)) {
+                    return 0;
+                }
+                metal_profile_add_event_now(ctx, "metal.prefill.moe_router_mps_logits", router_mps_start_ns);
+            } else {
+                enc = metal_compute_command_encoder(ctx, cb);
+                if (enc == nil) {
+                    return metal_fail(error, error_size, "failed to create integrated MoE router logits encoder");
+                }
+                const NSUInteger logits_threads = metal_power2_threadgroup_width(256u, logits_pipeline.maxTotalThreadsPerThreadgroup);
+                [enc setComputePipelineState:logits_pipeline];
+                [enc setBuffer:input.buffer offset:input.offset atIndex:0u];
+                [enc setBuffer:router_weight->buffer offset:router_weight->offset atIndex:1u];
+                [enc setBuffer:logits.buffer offset:logits.offset atIndex:2u];
+                [enc setBytes:&params length:sizeof(params) atIndex:3u];
+                [enc setThreadgroupMemoryLength:logits_threads * sizeof(float) atIndex:0u];
+                [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)router_values, 1u, 1u)
+                     threadsPerThreadgroup:MTLSizeMake(logits_threads, 1u, 1u)];
+                [enc endEncoding];
+            }
+
+            enc = metal_compute_command_encoder(ctx, cb);
+            if (enc == nil) {
+                return metal_fail(error, error_size, "failed to create integrated MoE router top-k encoder");
+            }
+            const NSUInteger topk_threads = metal_power2_threadgroup_width((NSUInteger)UOCR_METAL_MOE_ROUTER_TOPK_THREADS,
+                                                                           topk_pipeline.maxTotalThreadsPerThreadgroup);
+            const NSUInteger topk_scratch_bytes = ((NSUInteger)UOCR_ROUTED_EXPERTS + topk_threads) * sizeof(float) +
+                                                  (NSUInteger)UOCR_ROUTED_EXPERTS * sizeof(uint32_t);
+            [enc setComputePipelineState:topk_pipeline];
+            [enc setBuffer:logits.buffer offset:logits.offset atIndex:0u];
+            [enc setBuffer:logits.buffer offset:logits.offset atIndex:1u];
+            [enc setBuffer:top_ids.buffer offset:top_ids.offset atIndex:2u];
+            [enc setBuffer:top_weights.buffer offset:top_weights.offset atIndex:3u];
+            [enc setBytes:&params length:sizeof(params) atIndex:4u];
+            [enc setThreadgroupMemoryLength:topk_scratch_bytes atIndex:0u];
+            [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_tokens, 1u, 1u)
+                 threadsPerThreadgroup:MTLSizeMake(topk_threads, 1u, 1u)];
             [enc endEncoding];
         }
-
-        enc = metal_compute_command_encoder(ctx, cb);
-        if (enc == nil) {
-            return metal_fail(error, error_size, "failed to create integrated MoE router top-k encoder");
-        }
-        const NSUInteger topk_threads = metal_power2_threadgroup_width((NSUInteger)UOCR_METAL_MOE_ROUTER_TOPK_THREADS,
-                                                                       topk_pipeline.maxTotalThreadsPerThreadgroup);
-        const NSUInteger topk_scratch_bytes = ((NSUInteger)UOCR_ROUTED_EXPERTS + topk_threads) * sizeof(float) +
-                                              (NSUInteger)UOCR_ROUTED_EXPERTS * sizeof(uint32_t);
-        [enc setComputePipelineState:topk_pipeline];
-        [enc setBuffer:logits.buffer offset:logits.offset atIndex:0u];
-        [enc setBuffer:logits.buffer offset:logits.offset atIndex:1u];
-        [enc setBuffer:top_ids.buffer offset:top_ids.offset atIndex:2u];
-        [enc setBuffer:top_weights.buffer offset:top_weights.offset atIndex:3u];
-        [enc setBytes:&params length:sizeof(params) atIndex:4u];
-        [enc setThreadgroupMemoryLength:topk_scratch_bytes atIndex:0u];
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_tokens, 1u, 1u)
-             threadsPerThreadgroup:MTLSizeMake(topk_threads, 1u, 1u)];
-        [enc endEncoding];
         if (!metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, "integrated MoE router", error, error_size)) {
             return 0;
         }
@@ -22899,21 +22937,42 @@ int uocr_metal_context_diagnostic_moe_router_f16(uocr_metal_context *ctx,
     }
 
     @autoreleasepool {
-        id<MTLComputePipelineState> logits_pipeline = metal_get_decoder_shape_pipeline(ctx,
-                                                                                       "uocr_moe_router_logits_f16_to_f32",
-                                                                                       error,
-                                                                                       error_size);
-        if (logits_pipeline == nil) {
+#if UOCR_METAL_ENABLE_MOE_FUSED_ROUTER
+        const int use_fused_decode_router = n_tokens == 1u && logits_out_f32_or_null == NULL && probs_out_f32_or_null == NULL;
+#else
+        const int use_fused_decode_router = 0;
+#endif
+        id<MTLComputePipelineState> fused_pipeline = use_fused_decode_router ?
+            metal_get_decoder_shape_pipeline(ctx,
+                                             "uocr_moe_router_decode_fused_f16",
+                                             error,
+                                             error_size) : nil;
+        if (use_fused_decode_router && fused_pipeline == nil) {
             return 0;
         }
-        id<MTLComputePipelineState> topk_pipeline = metal_get_decoder_shape_pipeline(ctx,
-                                                                                     "uocr_moe_router_softmax_topk_f32",
-                                                                                     error,
-                                                                                     error_size);
-        if (topk_pipeline == nil) {
+        id<MTLComputePipelineState> logits_pipeline = use_fused_decode_router ? nil :
+            metal_get_decoder_shape_pipeline(ctx,
+                                             "uocr_moe_router_logits_f16_to_f32",
+                                             error,
+                                             error_size);
+        if (!use_fused_decode_router && logits_pipeline == nil) {
             return 0;
         }
-        if (topk_pipeline.maxTotalThreadsPerThreadgroup < (NSUInteger)UOCR_ROUTED_EXPERTS) {
+        id<MTLComputePipelineState> topk_pipeline = use_fused_decode_router ? nil :
+            metal_get_decoder_shape_pipeline(ctx,
+                                             "uocr_moe_router_softmax_topk_f32",
+                                             error,
+                                             error_size);
+        if (!use_fused_decode_router && topk_pipeline == nil) {
+            return 0;
+        }
+        if (use_fused_decode_router && fused_pipeline.maxTotalThreadsPerThreadgroup < 256u) {
+            return metal_fail(error,
+                              error_size,
+                              "Metal MoE fused router pipeline supports only %llu threads; need 256",
+                              (unsigned long long)fused_pipeline.maxTotalThreadsPerThreadgroup);
+        }
+        if (!use_fused_decode_router && topk_pipeline.maxTotalThreadsPerThreadgroup < (NSUInteger)UOCR_ROUTED_EXPERTS) {
             return metal_fail(error,
                               error_size,
                               "Metal MoE router top-k pipeline supports only %llu threads; need %u",
@@ -22982,43 +23041,65 @@ int uocr_metal_context_diagnostic_moe_router_f16(uocr_metal_context *ctx,
             [logits release];
             [weight release];
             [input release];
-            return metal_fail(error, error_size, "failed to create Metal MoE router logits command encoder");
+            return metal_fail(error,
+                              error_size,
+                              use_fused_decode_router ?
+                                  "failed to create Metal MoE fused router command encoder" :
+                                  "failed to create Metal MoE router logits command encoder");
         }
-        const NSUInteger logits_threads = metal_power2_threadgroup_width(256u, logits_pipeline.maxTotalThreadsPerThreadgroup);
-        [enc setComputePipelineState:logits_pipeline];
-        [enc setBuffer:input offset:0u atIndex:0u];
-        [enc setBuffer:weight offset:0u atIndex:1u];
-        [enc setBuffer:logits offset:0u atIndex:2u];
-        [enc setBytes:&params length:sizeof(params) atIndex:3u];
-        [enc setThreadgroupMemoryLength:logits_threads * sizeof(float) atIndex:0u];
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)router_values, 1u, 1u)
-             threadsPerThreadgroup:MTLSizeMake(logits_threads, 1u, 1u)];
-        [enc endEncoding];
+        if (use_fused_decode_router) {
+            const NSUInteger fused_threads = metal_power2_threadgroup_width((NSUInteger)UOCR_METAL_MOE_ROUTER_FUSED_THREADS,
+                                                                            fused_pipeline.maxTotalThreadsPerThreadgroup);
+            const NSUInteger hidden_tg_bytes = (NSUInteger)UOCR_HIDDEN_SIZE * sizeof(uint16_t);
+            const NSUInteger scratch_tg_bytes = ((NSUInteger)UOCR_ROUTED_EXPERTS + fused_threads) * sizeof(float);
+            [enc setComputePipelineState:fused_pipeline];
+            [enc setBuffer:input offset:0u atIndex:0u];
+            [enc setBuffer:weight offset:0u atIndex:1u];
+            [enc setBuffer:top_ids offset:0u atIndex:2u];
+            [enc setBuffer:top_weights offset:0u atIndex:3u];
+            [enc setBytes:&params length:sizeof(params) atIndex:4u];
+            [enc setThreadgroupMemoryLength:hidden_tg_bytes atIndex:0u];
+            [enc setThreadgroupMemoryLength:scratch_tg_bytes atIndex:1u];
+            [enc dispatchThreadgroups:MTLSizeMake(1u, 1u, 1u)
+                 threadsPerThreadgroup:MTLSizeMake(fused_threads, 1u, 1u)];
+            [enc endEncoding];
+        } else {
+            const NSUInteger logits_threads = metal_power2_threadgroup_width(256u, logits_pipeline.maxTotalThreadsPerThreadgroup);
+            [enc setComputePipelineState:logits_pipeline];
+            [enc setBuffer:input offset:0u atIndex:0u];
+            [enc setBuffer:weight offset:0u atIndex:1u];
+            [enc setBuffer:logits offset:0u atIndex:2u];
+            [enc setBytes:&params length:sizeof(params) atIndex:3u];
+            [enc setThreadgroupMemoryLength:logits_threads * sizeof(float) atIndex:0u];
+            [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)router_values, 1u, 1u)
+                 threadsPerThreadgroup:MTLSizeMake(logits_threads, 1u, 1u)];
+            [enc endEncoding];
 
-        enc = metal_compute_command_encoder(ctx, cb);
-        if (enc == nil) {
-            [top_weights release];
-            [top_ids release];
-            [probs release];
-            [logits release];
-            [weight release];
-            [input release];
-            return metal_fail(error, error_size, "failed to create Metal MoE router top-k command encoder");
+            enc = metal_compute_command_encoder(ctx, cb);
+            if (enc == nil) {
+                [top_weights release];
+                [top_ids release];
+                [probs release];
+                [logits release];
+                [weight release];
+                [input release];
+                return metal_fail(error, error_size, "failed to create Metal MoE router top-k command encoder");
+            }
+            const NSUInteger topk_threads = metal_power2_threadgroup_width((NSUInteger)UOCR_METAL_MOE_ROUTER_TOPK_THREADS,
+                                                                           topk_pipeline.maxTotalThreadsPerThreadgroup);
+            [enc setComputePipelineState:topk_pipeline];
+            [enc setBuffer:logits offset:0u atIndex:0u];
+            [enc setBuffer:probs offset:0u atIndex:1u];
+            [enc setBuffer:top_ids offset:0u atIndex:2u];
+            [enc setBuffer:top_weights offset:0u atIndex:3u];
+            [enc setBytes:&params length:sizeof(params) atIndex:4u];
+            const NSUInteger topk_scratch_bytes = ((NSUInteger)UOCR_ROUTED_EXPERTS + topk_threads) * sizeof(float) +
+                                                  (NSUInteger)UOCR_ROUTED_EXPERTS * sizeof(uint32_t);
+            [enc setThreadgroupMemoryLength:topk_scratch_bytes atIndex:0u];
+            [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_tokens, 1u, 1u)
+                 threadsPerThreadgroup:MTLSizeMake(topk_threads, 1u, 1u)];
+            [enc endEncoding];
         }
-        const NSUInteger topk_threads = metal_power2_threadgroup_width((NSUInteger)UOCR_METAL_MOE_ROUTER_TOPK_THREADS,
-                                                                       topk_pipeline.maxTotalThreadsPerThreadgroup);
-        [enc setComputePipelineState:topk_pipeline];
-        [enc setBuffer:logits offset:0u atIndex:0u];
-        [enc setBuffer:probs offset:0u atIndex:1u];
-        [enc setBuffer:top_ids offset:0u atIndex:2u];
-        [enc setBuffer:top_weights offset:0u atIndex:3u];
-        [enc setBytes:&params length:sizeof(params) atIndex:4u];
-        const NSUInteger topk_scratch_bytes = ((NSUInteger)UOCR_ROUTED_EXPERTS + topk_threads) * sizeof(float) +
-                                              (NSUInteger)UOCR_ROUTED_EXPERTS * sizeof(uint32_t);
-        [enc setThreadgroupMemoryLength:topk_scratch_bytes atIndex:0u];
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_tokens, 1u, 1u)
-             threadsPerThreadgroup:MTLSizeMake(topk_threads, 1u, 1u)];
-        [enc endEncoding];
 
         UOCR_METAL_COMMIT_AND_WAIT_PROFILED(ctx, cb);
         if (cb.status == MTLCommandBufferStatusError) {
