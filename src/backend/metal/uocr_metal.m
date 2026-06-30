@@ -42,6 +42,7 @@
 #define UOCR_METAL_MPS_MATMUL_MIN_FLOPS_ENV "UOCR_METAL_MPS_MATMUL_MIN_FLOPS"
 #define UOCR_METAL_FLASH_Q_PER_TG 4u
 #define UOCR_METAL_FLASH_MAX_LANE_VALUES 4u
+#define UOCR_METAL_HALF4_WIDTH 4u
 #if UINTPTR_MAX > 0xffffffffu
 #define UOCR_METAL_PRIVATE_WORKSPACE_PTR_BASE ((uintptr_t)0x4000000000000000ULL)
 #else
@@ -5971,9 +5972,14 @@ static int metal_dispatch_visual_format_kernel(uocr_metal_context *ctx,
         } else {
             [enc setBytes:params length:params_size atIndex:2u];
         }
+        const NSUInteger dispatch_width = (NSUInteger)(((uint64_t)hidden_size + UOCR_METAL_HALF4_WIDTH - 1u) /
+                                                       UOCR_METAL_HALF4_WIDTH);
         NSUInteger threads_x = pipeline.threadExecutionWidth;
-        if (threads_x == 0u || threads_x > (NSUInteger)hidden_size) {
+        if (threads_x == 0u || threads_x > dispatch_width) {
             threads_x = 32u;
+        }
+        if (threads_x > dispatch_width) {
+            threads_x = dispatch_width;
         }
         if (threads_x > pipeline.maxTotalThreadsPerThreadgroup) {
             threads_x = pipeline.maxTotalThreadsPerThreadgroup;
@@ -5981,7 +5987,7 @@ static int metal_dispatch_visual_format_kernel(uocr_metal_context *ctx,
         if (threads_x == 0u) {
             threads_x = 1u;
         }
-        [enc dispatchThreads:MTLSizeMake((NSUInteger)hidden_size, (NSUInteger)rows, 1u)
+        [enc dispatchThreads:MTLSizeMake(dispatch_width, (NSUInteger)rows, 1u)
        threadsPerThreadgroup:MTLSizeMake(threads_x, 1u, 1u)];
         [enc endEncoding];
         return metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, op_name, error, error_size);
@@ -9792,9 +9798,11 @@ static int metal_run_residual_add_f16(uocr_metal_context *ctx,
         [enc setComputePipelineState:pipeline];
         [enc setBuffer:base.buffer offset:base.offset atIndex:0u];
         [enc setBuffer:update.buffer offset:update.offset atIndex:1u];
+        const NSUInteger dispatch_values = (NSUInteger)(((uint64_t)value_count + UOCR_METAL_HALF4_WIDTH - 1u) /
+                                                        UOCR_METAL_HALF4_WIDTH);
         [enc setBuffer:dst.buffer offset:dst.offset atIndex:2u];
         [enc setBytes:&value_count length:sizeof(value_count) atIndex:3u];
-        [enc dispatchThreads:MTLSizeMake((NSUInteger)value_count, 1u, 1u)
+        [enc dispatchThreads:MTLSizeMake(dispatch_values, 1u, 1u)
        threadsPerThreadgroup:MTLSizeMake(threads, 1u, 1u)];
         [enc endEncoding];
         return metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, op_name != NULL ? op_name : "residual add", error, error_size);
@@ -9842,11 +9850,13 @@ static int metal_run_bias_add_f16_inplace(uocr_metal_context *ctx,
         NSUInteger threads = pipeline.threadExecutionWidth;
         if (threads == 0u) threads = 1u;
         if (threads > 256u) threads = 256u;
+        const uint64_t vector_count = (uint64_t)rows * (((uint64_t)cols + UOCR_METAL_HALF4_WIDTH - 1u) /
+                                                        UOCR_METAL_HALF4_WIDTH);
         [enc setComputePipelineState:pipeline];
         [enc setBuffer:dst.buffer offset:dst.offset atIndex:0u];
         [enc setBuffer:bias.buffer offset:bias.offset atIndex:1u];
         [enc setBytes:&params length:sizeof(params) atIndex:2u];
-        [enc dispatchThreads:MTLSizeMake((NSUInteger)value_count, 1u, 1u)
+        [enc dispatchThreads:MTLSizeMake((NSUInteger)vector_count, 1u, 1u)
        threadsPerThreadgroup:MTLSizeMake(threads, 1u, 1u)];
         [enc endEncoding];
         return metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, op_name != NULL ? op_name : "bias add", error, error_size);
@@ -10108,15 +10118,17 @@ static int metal_run_token_embedding_from_token_slot_f16(uocr_metal_context *ctx
         params.row_width = UOCR_HIDDEN_SIZE;
         params.n_row_ids = 1u;
         params.reserved = 0u;
+        const NSUInteger dispatch_width = (NSUInteger)((UOCR_HIDDEN_SIZE + UOCR_METAL_HALF4_WIDTH - 1u) /
+                                                       UOCR_METAL_HALF4_WIDTH);
         NSUInteger threads = pipeline.threadExecutionWidth;
         if (threads == 0u) threads = 1u;
-        if (threads > (NSUInteger)UOCR_HIDDEN_SIZE) threads = (NSUInteger)UOCR_HIDDEN_SIZE;
+        if (threads > dispatch_width) threads = dispatch_width;
         [enc setComputePipelineState:pipeline];
         [enc setBuffer:embedding->buffer offset:embedding->offset atIndex:0u];
         [enc setBuffer:token_id.buffer offset:token_id.offset atIndex:1u];
         [enc setBuffer:dst.buffer offset:dst.offset atIndex:2u];
         [enc setBytes:&params length:sizeof(params) atIndex:3u];
-        [enc dispatchThreads:MTLSizeMake((NSUInteger)UOCR_HIDDEN_SIZE, 1u, 1u)
+        [enc dispatchThreads:MTLSizeMake(dispatch_width, 1u, 1u)
        threadsPerThreadgroup:MTLSizeMake(threads, 1u, 1u)];
         [enc endEncoding];
         return metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, "integrated token embedding", error, error_size);
@@ -10738,10 +10750,13 @@ static int metal_run_kv_write_buffer_f16(uocr_metal_context *ctx,
         [enc setComputePipelineState:pipeline];
         [enc setBuffer:k_src.buffer offset:k_src.offset atIndex:0u];
         [enc setBuffer:v_src.buffer offset:v_src.offset atIndex:1u];
+        const uint64_t src_vector_values = (uint64_t)n_tokens * (uint64_t)UOCR_KV_HEADS *
+                                           (((uint64_t)UOCR_HEAD_DIM + UOCR_METAL_HALF4_WIDTH - 1u) /
+                                            UOCR_METAL_HALF4_WIDTH);
         [enc setBuffer:kv offset:(NSUInteger)ctx->kv_cache_layout.k_offset_bytes atIndex:2u];
         [enc setBuffer:kv offset:(NSUInteger)ctx->kv_cache_layout.v_offset_bytes atIndex:3u];
         [enc setBytes:&params length:sizeof(params) atIndex:4u];
-        [enc dispatchThreads:MTLSizeMake((NSUInteger)src_values, 1u, 1u)
+        [enc dispatchThreads:MTLSizeMake((NSUInteger)src_vector_values, 1u, 1u)
        threadsPerThreadgroup:MTLSizeMake(threads, 1u, 1u)];
         [enc endEncoding];
         return metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, "integrated KV write", error, error_size);
@@ -11356,10 +11371,12 @@ static int metal_run_moe_combine_buffer_f16(uocr_metal_context *ctx,
         [enc setComputePipelineState:pipeline];
         [enc setBuffer:routed.buffer offset:routed.offset atIndex:0u];
         [enc setBuffer:shared.buffer offset:shared.offset atIndex:1u];
+        const NSUInteger dispatch_values = (NSUInteger)((hidden_values + UOCR_METAL_HALF4_WIDTH - 1u) /
+                                                        UOCR_METAL_HALF4_WIDTH);
         [enc setBuffer:residual.buffer offset:residual.offset atIndex:2u];
         [enc setBuffer:dst.buffer offset:dst.offset atIndex:3u];
         [enc setBytes:&params length:sizeof(params) atIndex:4u];
-        [enc dispatchThreads:MTLSizeMake((NSUInteger)hidden_values, 1u, 1u)
+        [enc dispatchThreads:MTLSizeMake(dispatch_values, 1u, 1u)
        threadsPerThreadgroup:MTLSizeMake(threads, 1u, 1u)];
         [enc endEncoding];
         return metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, "integrated MoE combine", error, error_size);
@@ -12623,14 +12640,18 @@ int uocr_metal_context_diagnostic_get_rows_f16(uocr_metal_context *ctx,
         [enc setBuffer:dst offset:0u atIndex:2u];
         [enc setBytes:&params length:sizeof(params) atIndex:3u];
 
+        const NSUInteger dispatch_width = output_type == UOCR_METAL_GET_ROWS_OUTPUT_F16 ?
+                                              (NSUInteger)(((uint64_t)row_width + UOCR_METAL_HALF4_WIDTH - 1u) /
+                                                           UOCR_METAL_HALF4_WIDTH) :
+                                              (NSUInteger)row_width;
         NSUInteger threads_per_group = pipeline.threadExecutionWidth;
         if (threads_per_group == 0u) {
             threads_per_group = 1u;
         }
-        if (threads_per_group > (NSUInteger)row_width) {
-            threads_per_group = (NSUInteger)row_width;
+        if (threads_per_group > dispatch_width) {
+            threads_per_group = dispatch_width;
         }
-        [enc dispatchThreads:MTLSizeMake((NSUInteger)row_width, (NSUInteger)n_row_ids, 1u)
+        [enc dispatchThreads:MTLSizeMake(dispatch_width, (NSUInteger)n_row_ids, 1u)
        threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1u, 1u)];
         [enc endEncoding];
 
@@ -13067,14 +13088,16 @@ static int metal_context_assemble_prompt_f16_with_table_buffer_to_buffer(uocr_me
         [enc setBuffer:dst_buffer offset:dst_offset atIndex:2u];
         [enc setBytes:&params length:sizeof(params) atIndex:3u];
 
+        const NSUInteger dispatch_width = (NSUInteger)(((uint64_t)hidden_size + UOCR_METAL_HALF4_WIDTH - 1u) /
+                                                       UOCR_METAL_HALF4_WIDTH);
         NSUInteger threads_per_group = pipeline.threadExecutionWidth;
         if (threads_per_group == 0u) {
             threads_per_group = 1u;
         }
-        if (threads_per_group > (NSUInteger)hidden_size) {
-            threads_per_group = (NSUInteger)hidden_size;
+        if (threads_per_group > dispatch_width) {
+            threads_per_group = dispatch_width;
         }
-        [enc dispatchThreads:MTLSizeMake((NSUInteger)hidden_size, (NSUInteger)n_tokens, 1u)
+        [enc dispatchThreads:MTLSizeMake(dispatch_width, (NSUInteger)n_tokens, 1u)
        threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1u, 1u)];
         [enc endEncoding];
         metal_profile_add_event_now(ctx, "metal.prompt.token_gather", token_gather_start_ns);
@@ -17100,9 +17123,13 @@ int uocr_metal_context_diagnostic_clip_residual_add_f16(uocr_metal_context *ctx,
         [enc setComputePipelineState:pipeline];
         [enc setBuffer:base offset:base_offset atIndex:0u];
         [enc setBuffer:update offset:update_offset atIndex:1u];
+        const NSUInteger dispatch_values = output_type == UOCR_METAL_DENSE_OUTPUT_F16 ?
+                                              (NSUInteger)(((uint64_t)value_count + UOCR_METAL_HALF4_WIDTH - 1u) /
+                                                           UOCR_METAL_HALF4_WIDTH) :
+                                              (NSUInteger)value_count;
         [enc setBuffer:dst offset:dst_offset atIndex:2u];
         [enc setBytes:&value_count length:sizeof(value_count) atIndex:3u];
-        [enc dispatchThreads:MTLSizeMake((NSUInteger)value_count, 1u, 1u)
+        [enc dispatchThreads:MTLSizeMake(dispatch_values, 1u, 1u)
        threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1u, 1u)];
         [enc endEncoding];
 
@@ -20390,9 +20417,13 @@ int uocr_metal_context_diagnostic_sam_residual_add_f16(uocr_metal_context *ctx,
         [enc setComputePipelineState:pipeline];
         [enc setBuffer:base offset:base_offset atIndex:0u];
         [enc setBuffer:update offset:update_offset atIndex:1u];
+        const NSUInteger dispatch_values = output_type == UOCR_METAL_DENSE_OUTPUT_F16 ?
+                                              (NSUInteger)((value_count + UOCR_METAL_HALF4_WIDTH - 1u) /
+                                                           UOCR_METAL_HALF4_WIDTH) :
+                                              (NSUInteger)value_count;
         [enc setBuffer:dst offset:dst_offset atIndex:2u];
         [enc setBytes:&params length:sizeof(params) atIndex:3u];
-        [enc dispatchThreads:MTLSizeMake((NSUInteger)value_count, 1u, 1u)
+        [enc dispatchThreads:MTLSizeMake(dispatch_values, 1u, 1u)
              threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1u, 1u)];
         [enc endEncoding];
 
@@ -25593,10 +25624,14 @@ int uocr_metal_context_diagnostic_moe_combine_f16(uocr_metal_context *ctx,
         [enc setComputePipelineState:pipeline];
         [enc setBuffer:routed offset:0u atIndex:0u];
         [enc setBuffer:shared offset:0u atIndex:1u];
+        const NSUInteger dispatch_values = output_type == UOCR_METAL_DENSE_OUTPUT_F16 ?
+                                              (NSUInteger)((value_count + UOCR_METAL_HALF4_WIDTH - 1u) /
+                                                           UOCR_METAL_HALF4_WIDTH) :
+                                              (NSUInteger)value_count;
         [enc setBuffer:residual_arg offset:0u atIndex:2u];
         [enc setBuffer:dst offset:0u atIndex:3u];
         [enc setBytes:&params length:sizeof(params) atIndex:4u];
-        [enc dispatchThreads:MTLSizeMake((NSUInteger)value_count, 1u, 1u)
+        [enc dispatchThreads:MTLSizeMake(dispatch_values, 1u, 1u)
             threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1u, 1u)];
         [enc endEncoding];
 
@@ -26499,10 +26534,13 @@ int uocr_metal_context_diagnostic_write_kv_cache_f16(uocr_metal_context *ctx,
         [enc setComputePipelineState:pipeline];
         [enc setBuffer:k_src offset:0u atIndex:0u];
         [enc setBuffer:v_src offset:0u atIndex:1u];
+        const uint64_t src_vector_values = (uint64_t)n_tokens * (uint64_t)UOCR_KV_HEADS *
+                                           (((uint64_t)UOCR_HEAD_DIM + UOCR_METAL_HALF4_WIDTH - 1u) /
+                                            UOCR_METAL_HALF4_WIDTH);
         [enc setBuffer:k_cache offset:0u atIndex:2u];
         [enc setBuffer:v_cache offset:0u atIndex:3u];
         [enc setBytes:&params length:sizeof(params) atIndex:4u];
-        [enc dispatchThreads:MTLSizeMake((NSUInteger)src_values, 1u, 1u)
+        [enc dispatchThreads:MTLSizeMake((NSUInteger)src_vector_values, 1u, 1u)
        threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1u, 1u)];
         [enc endEncoding];
 

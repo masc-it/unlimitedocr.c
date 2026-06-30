@@ -59,10 +59,10 @@ Reference: `data.tmp/reference/Metal-Shading-Language-Specification.pdf`
 - Target residual adds, bias adds, KV-cache writes, prompt assembly, row copies, and format/concat kernels.
 
 **Implementation:**
-- [ ] Identify kernels with contiguous fp16 loads/stores and minimal arithmetic.
-- [ ] Add `half4` fast paths with scalar tails.
-- [ ] Validate alignment assumptions against Metal buffer offsets.
-- [ ] Benchmark memory bandwidth and end-to-end latency.
+- [x] Identify kernels with contiguous fp16 loads/stores and minimal arithmetic.
+- [x] Add `half4` fast paths with scalar tails.
+- [x] Validate alignment assumptions against Metal buffer offsets.
+- [x] Benchmark memory bandwidth and end-to-end latency.
 
 ## 5. Make Metal math mode explicit
 

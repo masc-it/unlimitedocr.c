@@ -101,6 +101,24 @@ static inline float uocr_q4_k_load_value(device const uchar *table, uint row_siz
     return d * float(scale_min.x) * float(q) - dmin * float(scale_min.y);
 }
 
+#define UOCR_HALF4_WIDTH 4u
+
+static inline uint uocr_div_up_u32(uint value, uint divisor) {
+    return (value + divisor - 1u) / divisor;
+}
+
+static inline half4 uocr_load_half4(device const half *ptr, ulong index) {
+    return half4(*reinterpret_cast<device const packed_half4 *>(ptr + index));
+}
+
+static inline void uocr_store_half4(device half *ptr, ulong index, half4 value) {
+    *reinterpret_cast<device packed_half4 *>(ptr + index) = packed_half4(value);
+}
+
+static inline half4 uocr_zero_half4() {
+    return half4(half(0.0h), half(0.0h), half(0.0h), half(0.0h));
+}
+
 static inline uint uocr_simd_lane_from_tid(uint tid, uint simd_width) {
     return simd_width == 0u ? tid : tid - (tid / simd_width) * simd_width;
 }
@@ -204,17 +222,32 @@ kernel void uocr_get_rows_f16_to_f16(device const half *table [[buffer(0)]],
                                      device half *dst [[buffer(2)]],
                                      constant UocrGetRowsParams &params [[buffer(3)]],
                                      uint2 gid [[thread_position_in_grid]]) {
-    const uint col = gid.x;
+    const uint col = gid.x * UOCR_HALF4_WIDTH;
     const uint out_row = gid.y;
     if (col >= params.row_width || out_row >= params.n_row_ids) {
         return;
     }
+    const ulong dst_base = (ulong(out_row) * ulong(params.row_width)) + ulong(col);
     const int row = row_ids[out_row];
+    const bool full4 = col + (UOCR_HALF4_WIDTH - 1u) < params.row_width;
     if (row < 0 || (uint)row >= params.table_rows) {
-        dst[out_row * params.row_width + col] = half(0.0);
+        if (full4) {
+            uocr_store_half4(dst, dst_base, uocr_zero_half4());
+        } else {
+            for (uint i = 0u; i < UOCR_HALF4_WIDTH && col + i < params.row_width; ++i) {
+                dst[dst_base + ulong(i)] = half(0.0f);
+            }
+        }
         return;
     }
-    dst[out_row * params.row_width + col] = table[(uint)row * params.row_width + col];
+    const ulong src_base = (ulong(uint(row)) * ulong(params.row_width)) + ulong(col);
+    if (full4) {
+        uocr_store_half4(dst, dst_base, uocr_load_half4(table, src_base));
+    } else {
+        for (uint i = 0u; i < UOCR_HALF4_WIDTH && col + i < params.row_width; ++i) {
+            dst[dst_base + ulong(i)] = table[src_base + ulong(i)];
+        }
+    }
 }
 
 kernel void uocr_get_rows_f16_to_f32(device const half *table [[buffer(0)]],
@@ -287,17 +320,32 @@ kernel void uocr_assemble_prompt_text_f16(device const half *embedding_table [[b
                                           device half *dst [[buffer(2)]],
                                           constant UocrPromptAssemblyParams &params [[buffer(3)]],
                                           uint2 gid [[thread_position_in_grid]]) {
-    const uint col = gid.x;
+    const uint col = gid.x * UOCR_HALF4_WIDTH;
     const uint token = gid.y;
     if (col >= params.hidden_size || token >= params.n_tokens) {
         return;
     }
+    const ulong dst_base = (ulong(token) * ulong(params.hidden_size)) + ulong(col);
+    const bool full4 = col + (UOCR_HALF4_WIDTH - 1u) < params.hidden_size;
     const int row = input_ids[token];
     if (row < 0 || (uint)row >= params.table_rows) {
-        dst[token * params.hidden_size + col] = half(0.0);
+        if (full4) {
+            uocr_store_half4(dst, dst_base, uocr_zero_half4());
+        } else {
+            for (uint i = 0u; i < UOCR_HALF4_WIDTH && col + i < params.hidden_size; ++i) {
+                dst[dst_base + ulong(i)] = half(0.0f);
+            }
+        }
         return;
     }
-    dst[token * params.hidden_size + col] = embedding_table[(uint)row * params.hidden_size + col];
+    const ulong src_base = (ulong(uint(row)) * ulong(params.hidden_size)) + ulong(col);
+    if (full4) {
+        uocr_store_half4(dst, dst_base, uocr_load_half4(embedding_table, src_base));
+    } else {
+        for (uint i = 0u; i < UOCR_HALF4_WIDTH && col + i < params.hidden_size; ++i) {
+            dst[dst_base + ulong(i)] = embedding_table[src_base + ulong(i)];
+        }
+    }
 }
 
 kernel void uocr_assemble_prompt_text_skip_image_f16(device const half *embedding_table [[buffer(0)]],
@@ -305,7 +353,7 @@ kernel void uocr_assemble_prompt_text_skip_image_f16(device const half *embeddin
                                                      device half *dst [[buffer(2)]],
                                                      constant UocrPromptAssemblyParams &params [[buffer(3)]],
                                                      uint2 gid [[thread_position_in_grid]]) {
-    const uint col = gid.x;
+    const uint col = gid.x * UOCR_HALF4_WIDTH;
     const uint token = gid.y;
     if (col >= params.hidden_size || token >= params.n_tokens) {
         return;
@@ -314,12 +362,27 @@ kernel void uocr_assemble_prompt_text_skip_image_f16(device const half *embeddin
     if (token >= params.image_span_start && token < image_span_end) {
         return;
     }
+    const ulong dst_base = (ulong(token) * ulong(params.hidden_size)) + ulong(col);
+    const bool full4 = col + (UOCR_HALF4_WIDTH - 1u) < params.hidden_size;
     const int row = input_ids[token];
     if (row < 0 || (uint)row >= params.table_rows) {
-        dst[token * params.hidden_size + col] = half(0.0);
+        if (full4) {
+            uocr_store_half4(dst, dst_base, uocr_zero_half4());
+        } else {
+            for (uint i = 0u; i < UOCR_HALF4_WIDTH && col + i < params.hidden_size; ++i) {
+                dst[dst_base + ulong(i)] = half(0.0f);
+            }
+        }
         return;
     }
-    dst[token * params.hidden_size + col] = embedding_table[(uint)row * params.hidden_size + col];
+    const ulong src_base = (ulong(uint(row)) * ulong(params.hidden_size)) + ulong(col);
+    if (full4) {
+        uocr_store_half4(dst, dst_base, uocr_load_half4(embedding_table, src_base));
+    } else {
+        for (uint i = 0u; i < UOCR_HALF4_WIDTH && col + i < params.hidden_size; ++i) {
+            dst[dst_base + ulong(i)] = embedding_table[src_base + ulong(i)];
+        }
+    }
 }
 
 kernel void uocr_assemble_prompt_with_image_f16(device const half *embedding_table [[buffer(0)]],
@@ -363,7 +426,7 @@ kernel void uocr_format_global_visual_rows_f16(device const half *projected_rows
                                                device half *dst_rows [[buffer(3)]],
                                                constant UocrVisualFormatGlobalParams &params [[buffer(4)]],
                                                uint2 gid [[thread_position_in_grid]]) {
-    const uint col = gid.x;
+    const uint col = gid.x * UOCR_HALF4_WIDTH;
     const uint visual_row_linear = gid.y;
     if (col >= params.hidden_size || visual_row_linear >= params.view_count * params.visual_tokens_per_view) {
         return;
@@ -372,21 +435,29 @@ kernel void uocr_format_global_visual_rows_f16(device const half *projected_rows
     const uint grid_tokens = grid * grid;
     const uint view_index = visual_row_linear / params.visual_tokens_per_view;
     const uint visual_row = visual_row_linear - view_index * params.visual_tokens_per_view;
-    half value;
+    const bool full4 = col + (UOCR_HALF4_WIDTH - 1u) < params.hidden_size;
+    device const half *src = image_newline;
+    ulong src_base = ulong(col);
     if (visual_row == grid * (grid + 1u)) {
-        value = view_separator[col];
+        src = view_separator;
     } else {
         const uint row_in_view = visual_row / (grid + 1u);
         const uint col_in_view = visual_row - row_in_view * (grid + 1u);
-        if (col_in_view == grid) {
-            value = image_newline[col];
-        } else {
+        if (col_in_view != grid) {
             const uint src_row = view_index * grid_tokens + row_in_view * grid + col_in_view;
-            value = projected_rows[src_row * params.hidden_size + col];
+            src = projected_rows;
+            src_base = (ulong(src_row) * ulong(params.hidden_size)) + ulong(col);
         }
     }
     const uint dst_row = params.dst_token_base + visual_row_linear;
-    dst_rows[dst_row * params.hidden_size + col] = value;
+    const ulong dst_base = (ulong(dst_row) * ulong(params.hidden_size)) + ulong(col);
+    if (full4) {
+        uocr_store_half4(dst_rows, dst_base, uocr_load_half4(src, src_base));
+    } else {
+        for (uint i = 0u; i < UOCR_HALF4_WIDTH && col + i < params.hidden_size; ++i) {
+            dst_rows[dst_base + ulong(i)] = src[src_base + ulong(i)];
+        }
+    }
 }
 
 struct UocrVisualFormatLocalParams {
@@ -404,21 +475,29 @@ kernel void uocr_fill_local_visual_newlines_f16(device const half *image_newline
                                                 device half *dst_rows [[buffer(1)]],
                                                 constant UocrVisualFormatLocalParams &params [[buffer(2)]],
                                                 uint2 gid [[thread_position_in_grid]]) {
-    const uint col = gid.x;
+    const uint col = gid.x * UOCR_HALF4_WIDTH;
     const uint local_row = gid.y;
     if (col >= params.hidden_size || params.crop_grid_w == 0u || local_row >= params.chunk_view_count * params.grid_size) {
         return;
     }
     const uint stitched_row_stride = params.crop_grid_w * params.grid_size + 1u;
     const uint dst_row = params.dst_token_base + local_row * stitched_row_stride + params.crop_grid_w * params.grid_size;
-    dst_rows[dst_row * params.hidden_size + col] = image_newline[col];
+    const ulong dst_base = (ulong(dst_row) * ulong(params.hidden_size)) + ulong(col);
+    const bool full4 = col + (UOCR_HALF4_WIDTH - 1u) < params.hidden_size;
+    if (full4) {
+        uocr_store_half4(dst_rows, dst_base, uocr_load_half4(image_newline, ulong(col)));
+    } else {
+        for (uint i = 0u; i < UOCR_HALF4_WIDTH && col + i < params.hidden_size; ++i) {
+            dst_rows[dst_base + ulong(i)] = image_newline[col + i];
+        }
+    }
 }
 
 kernel void uocr_format_local_visual_rows_f16(device const half *projected_rows [[buffer(0)]],
                                               device half *dst_rows [[buffer(1)]],
                                               constant UocrVisualFormatLocalParams &params [[buffer(2)]],
                                               uint2 gid [[thread_position_in_grid]]) {
-    const uint col = gid.x;
+    const uint col = gid.x * UOCR_HALF4_WIDTH;
     const uint src_row = gid.y;
     const uint grid = params.grid_size;
     const uint tokens_per_view = grid * grid;
@@ -437,7 +516,16 @@ kernel void uocr_format_local_visual_rows_f16(device const half *projected_rows 
     const uint dst_row = params.dst_token_base +
                          (crop_y * grid + row_in_view) * stitched_row_stride +
                          crop_x * grid + col_in_view;
-    dst_rows[dst_row * params.hidden_size + col] = projected_rows[src_row * params.hidden_size + col];
+    const ulong src_base = (ulong(src_row) * ulong(params.hidden_size)) + ulong(col);
+    const ulong dst_base = (ulong(dst_row) * ulong(params.hidden_size)) + ulong(col);
+    const bool full4 = col + (UOCR_HALF4_WIDTH - 1u) < params.hidden_size;
+    if (full4) {
+        uocr_store_half4(dst_rows, dst_base, uocr_load_half4(projected_rows, src_base));
+    } else {
+        for (uint i = 0u; i < UOCR_HALF4_WIDTH && col + i < params.hidden_size; ++i) {
+            dst_rows[dst_base + ulong(i)] = projected_rows[src_base + ulong(i)];
+        }
+    }
 }
 
 struct UocrSamPatchEmbedParams {
@@ -876,12 +964,24 @@ kernel void uocr_bias_add_f16_inplace(device half *dst [[buffer(0)]],
                                       device const half *bias [[buffer(1)]],
                                       constant UocrBiasAddParams &params [[buffer(2)]],
                                       uint gid [[thread_position_in_grid]]) {
-    const uint value_count = params.rows * params.cols;
-    if (gid >= value_count) {
+    const uint vec_cols = uocr_div_up_u32(params.cols, UOCR_HALF4_WIDTH);
+    const uint vector_count = params.rows * vec_cols;
+    if (gid >= vector_count || vec_cols == 0u) {
         return;
     }
-    const uint col = gid - (gid / params.cols) * params.cols;
-    dst[gid] = half(float(dst[gid]) + float(bias[col]));
+    const uint row = gid / vec_cols;
+    const uint col = (gid - row * vec_cols) * UOCR_HALF4_WIDTH;
+    const ulong base = (ulong(row) * ulong(params.cols)) + ulong(col);
+    if (col + (UOCR_HALF4_WIDTH - 1u) < params.cols) {
+        const half4 values = uocr_load_half4(dst, base);
+        const half4 bias_values = uocr_load_half4(bias, ulong(col));
+        uocr_store_half4(dst, base, half4(float4(values) + float4(bias_values)));
+    } else {
+        for (uint i = 0u; i < UOCR_HALF4_WIDTH && col + i < params.cols; ++i) {
+            const ulong idx = base + ulong(i);
+            dst[idx] = half(float(dst[idx]) + float(bias[col + i]));
+        }
+    }
 }
 
 static inline float uocr_dense_dot_q8_0(device const half *src,
@@ -1180,10 +1280,20 @@ kernel void uocr_clip_residual_add_f16_to_f16(device const half *base [[buffer(0
                                               device half *dst [[buffer(2)]],
                                               constant uint &value_count [[buffer(3)]],
                                               uint gid [[thread_position_in_grid]]) {
-    if (gid >= value_count) {
+    const uint value_base = gid * UOCR_HALF4_WIDTH;
+    if (value_base >= value_count) {
         return;
     }
-    dst[gid] = half(float(base[gid]) + float(update[gid]));
+    if (value_base + (UOCR_HALF4_WIDTH - 1u) < value_count) {
+        const half4 base_values = uocr_load_half4(base, ulong(value_base));
+        const half4 update_values = uocr_load_half4(update, ulong(value_base));
+        uocr_store_half4(dst, ulong(value_base), half4(float4(base_values) + float4(update_values)));
+    } else {
+        for (uint i = 0u; i < UOCR_HALF4_WIDTH && value_base + i < value_count; ++i) {
+            const uint idx = value_base + i;
+            dst[idx] = half(float(base[idx]) + float(update[idx]));
+        }
+    }
 }
 
 kernel void uocr_clip_residual_add_f16_to_f32(device const half *base [[buffer(0)]],
@@ -1886,10 +1996,20 @@ kernel void uocr_sam_residual_add_f16_to_f16(device const half *base [[buffer(0)
                                              constant UocrSamResidualParams &params [[buffer(3)]],
                                              uint gid [[thread_position_in_grid]]) {
     const uint values = params.n_rows * params.hidden_size;
-    if (gid >= values) {
+    const uint value_base = gid * UOCR_HALF4_WIDTH;
+    if (value_base >= values) {
         return;
     }
-    dst[gid] = half(float(base[gid]) + float(update[gid]));
+    if (value_base + (UOCR_HALF4_WIDTH - 1u) < values) {
+        const half4 base_values = uocr_load_half4(base, ulong(value_base));
+        const half4 update_values = uocr_load_half4(update, ulong(value_base));
+        uocr_store_half4(dst, ulong(value_base), half4(float4(base_values) + float4(update_values)));
+    } else {
+        for (uint i = 0u; i < UOCR_HALF4_WIDTH && value_base + i < values; ++i) {
+            const uint idx = value_base + i;
+            dst[idx] = half(float(base[idx]) + float(update[idx]));
+        }
+    }
 }
 
 kernel void uocr_sam_residual_add_f16_to_f32(device const half *base [[buffer(0)]],
@@ -3794,10 +3914,23 @@ kernel void uocr_moe_combine_f16_to_f16(device const half *routed [[buffer(0)]],
                                         constant UocrMoeCombineParams &params [[buffer(4)]],
                                         uint gid [[thread_position_in_grid]]) {
     const uint total = params.n_tokens * params.hidden_size;
-    if (gid >= total) {
+    const uint value_base = gid * UOCR_HALF4_WIDTH;
+    if (value_base >= total) {
         return;
     }
-    dst[gid] = half(uocr_moe_combine_value_f16(routed, shared, residual, params, gid));
+    if (value_base + (UOCR_HALF4_WIDTH - 1u) < total) {
+        float4 value = float4(uocr_load_half4(routed, ulong(value_base))) +
+                       float4(uocr_load_half4(shared, ulong(value_base)));
+        if (params.has_residual != 0u) {
+            value += float4(uocr_load_half4(residual, ulong(value_base)));
+        }
+        uocr_store_half4(dst, ulong(value_base), half4(value));
+    } else {
+        for (uint i = 0u; i < UOCR_HALF4_WIDTH && value_base + i < total; ++i) {
+            const uint idx = value_base + i;
+            dst[idx] = half(uocr_moe_combine_value_f16(routed, shared, residual, params, idx));
+        }
+    }
 }
 
 kernel void uocr_moe_combine_f16_to_f32(device const half *routed [[buffer(0)]],
@@ -4631,15 +4764,17 @@ kernel void uocr_kv_cache_write_f16(device const half *k_src [[buffer(0)]],
                                     device half *v_cache [[buffer(3)]],
                                     constant UocrKVCacheWriteParams &params [[buffer(4)]],
                                     uint gid [[thread_position_in_grid]]) {
-    const uint head_area = params.heads * params.head_dim;
-    const uint total = params.n_tokens * head_area;
-    if (gid >= total) {
+    const uint vec_head_dim = uocr_div_up_u32(params.head_dim, UOCR_HALF4_WIDTH);
+    const uint head_area_vec = params.heads * vec_head_dim;
+    const uint total_vec = params.n_tokens * head_area_vec;
+    if (gid >= total_vec || vec_head_dim == 0u) {
         return;
     }
 
-    const uint dim = gid % params.head_dim;
-    const uint head = (gid / params.head_dim) % params.heads;
-    const uint token = gid / head_area;
+    const uint dim_vec = gid % vec_head_dim;
+    const uint dim = dim_vec * UOCR_HALF4_WIDTH;
+    const uint head = (gid / vec_head_dim) % params.heads;
+    const uint token = gid / head_area_vec;
     const uint position = params.position_start + token;
     uint cache_token = position;
     if (position >= params.prompt_length) {
@@ -4653,8 +4788,15 @@ kernel void uocr_kv_cache_write_f16(device const half *k_src [[buffer(0)]],
     const ulong dst_index = (((ulong(params.layer) * ulong(params.batch_slots) + ulong(params.slot)) *
                               ulong(params.cache_token_capacity) + ulong(cache_token)) *
                              ulong(params.heads) + ulong(head)) * ulong(params.head_dim) + ulong(dim);
-    k_cache[dst_index] = k_src[src_index];
-    v_cache[dst_index] = v_src[src_index];
+    if (dim + (UOCR_HALF4_WIDTH - 1u) < params.head_dim) {
+        uocr_store_half4(k_cache, dst_index, uocr_load_half4(k_src, src_index));
+        uocr_store_half4(v_cache, dst_index, uocr_load_half4(v_src, src_index));
+    } else {
+        for (uint i = 0u; i < UOCR_HALF4_WIDTH && dim + i < params.head_dim; ++i) {
+            k_cache[dst_index + ulong(i)] = k_src[src_index + ulong(i)];
+            v_cache[dst_index + ulong(i)] = v_src[src_index + ulong(i)];
+        }
+    }
 }
 
 #if UOCR_METAL_ENABLE_MPP_TENSOROPS
