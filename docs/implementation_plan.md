@@ -211,7 +211,7 @@ Completion notes:
 
 ## 6. Tile Shared Expert Gate/Up GEMV
 
-Status: [ ] Not started
+Status: [x] Completed
 
 Details:
 - Optimize shared expert gate/up first because it has one shared MLP per MoE layer and no top-k rank dimension.
@@ -225,6 +225,22 @@ Acceptance criteria:
 - Shared gate/up threadgroup count is materially reduced.
 - `metal.decode.moe_shared_experts` time decreases without parity drift.
 - Hot-path allocation guard remains clean.
+
+Completion notes:
+- Added `uocr_dense_swiglu_shared_gate_up_tile4_f16` for the decode shared-expert path (`n_tokens == 1`, `intermediate=1792`). It computes four gate/up output columns per threadgroup, reducing shared gate/up threadgroups from `1792` to `448` per MoE layer.
+- The retained default uses four 256-thread column partitions in one 1024-thread threadgroup. Each column keeps the same per-lane dot-product sequence and reduction shape as `uocr_dense_swiglu_gate_up_f16`, preserving fp32 accumulation order before the fp16 SwiGLU intermediate store.
+- Threadgroup hidden staging with vectorized `half4` loads was measured but not retained because the extra uniform barrier was not consistently beneficial on this GPU. The final path relies on the shared hidden row staying cache-hot across the tiled column partitions.
+- Tile-2 preserved accumulation but was not better overall. Exploratory tile-8/tile-16 variants reduced lanes per column, changed accumulation order, and were not retained because they were less stable across profiles.
+- Added `UOCR_METAL_ENABLE_MOE_SHARED_GATE_UP_TILED` as a compile-time fallback switch. Prefill and non-shared dense SwiGLU calls continue to use the existing gate/up path.
+- Added focused diagnostic coverage: `UOCR_METAL_TEST_FILTER=moe_shared_experts_f16 ./build/test/test_metal`. The diagnostic shared-expert `n_tokens == 1` path now exercises the tiled gate/up kernel.
+- Final Release probe artifacts:
+  - `data.tmp/probes/e2e_base_moe_shared_tile.json`
+  - `data.tmp/probes/e2e_gundam_moe_shared_tile.json`
+  - `data.tmp/probes/moe_shared_tile_results.md`
+- Final probe summary versus Task 5:
+  - `base`: text parity true, 44 generated tokens, 7.098 native tok/s, shared experts `2.856 -> 2.769` ms, `metal.decode.moe_combine` absent.
+  - `gundam`: text parity true, 58 generated tokens, 1.516 native tok/s, shared experts `3.771 -> 3.760` ms, `metal.decode.moe_combine` absent.
+  - E2E bucket timings remain noisy at sub-microsecond-per-call scale, but output parity is stable and the gate/up threadgroup count is materially reduced without hot-path pipeline-cache growth.
 
 ## 7. Tile Routed Expert Gate/Up GEMV
 

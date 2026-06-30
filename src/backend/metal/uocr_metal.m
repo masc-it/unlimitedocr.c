@@ -48,10 +48,15 @@
 #ifndef UOCR_METAL_ENABLE_MOE_FUSED_ROUTER
 #define UOCR_METAL_ENABLE_MOE_FUSED_ROUTER 1
 #endif
+#ifndef UOCR_METAL_ENABLE_MOE_SHARED_GATE_UP_TILED
+#define UOCR_METAL_ENABLE_MOE_SHARED_GATE_UP_TILED 1
+#endif
 // Keep router top-k in the one-SIMD greedy path; this avoids the old
 // full-row bitonic-sort barriers for the fixed 64-expert/top-6 decode shape.
 #define UOCR_METAL_MOE_ROUTER_TOPK_THREADS 16u
 #define UOCR_METAL_MOE_ROUTER_FUSED_THREADS 1024u
+#define UOCR_METAL_MOE_SHARED_GATE_UP_TILE_COLUMNS 4u
+#define UOCR_METAL_MOE_SHARED_GATE_UP_TILED_THREADS 1024u
 #define UOCR_METAL_FLASH_Q_PER_TG 4u
 #define UOCR_METAL_FLASH_MAX_LANE_VALUES 4u
 #define UOCR_METAL_HALF4_WIDTH 4u
@@ -8240,6 +8245,7 @@ static int metal_prewarm_integrated_decoder_pipelines(uocr_metal_context *ctx, c
         { "uocr_attention_output_residual_f16_to_f16", 1 },
         { "uocr_clip_residual_add_f16_to_f16", 0 },
         { "uocr_dense_swiglu_gate_up_f16", 1 },
+        { "uocr_dense_swiglu_shared_gate_up_tile4_f16", 1 },
         { "uocr_dense_swiglu_down_f16_to_f16", 1 },
         { "uocr_moe_router_logits_f16_to_f32", 1 },
         { "uocr_moe_router_softmax_topk_f32", 1 },
@@ -11328,11 +11334,25 @@ static int metal_run_dense_swiglu_buffer_f16(uocr_metal_context *ctx,
         return 0;
     }
     @autoreleasepool {
-        id<MTLComputePipelineState> gate_pipeline = metal_get_decoder_shape_pipeline(ctx, "uocr_dense_swiglu_gate_up_f16", error, error_size);
+#if UOCR_METAL_ENABLE_MOE_SHARED_GATE_UP_TILED
+        const int use_tiled_shared_gate_up = n_tokens == 1u && intermediate_size == UOCR_MOE_SHARED_INTERMEDIATE;
+#else
+        const int use_tiled_shared_gate_up = 0;
+#endif
+        id<MTLComputePipelineState> gate_pipeline = metal_get_decoder_shape_pipeline(ctx,
+                                                                                     use_tiled_shared_gate_up ?
+                                                                                         "uocr_dense_swiglu_shared_gate_up_tile4_f16" :
+                                                                                         "uocr_dense_swiglu_gate_up_f16",
+                                                                                     error,
+                                                                                     error_size);
         id<MTLComputePipelineState> down_pipeline = use_mps_down ? nil :
             metal_get_decoder_shape_pipeline(ctx, "uocr_dense_swiglu_down_f16_to_f16", error, error_size);
         if (gate_pipeline == nil || (!use_mps_down && down_pipeline == nil)) {
             return 0;
+        }
+        if (use_tiled_shared_gate_up &&
+            gate_pipeline.maxTotalThreadsPerThreadgroup < (NSUInteger)UOCR_METAL_MOE_SHARED_GATE_UP_TILED_THREADS) {
+            return metal_fail(error, error_size, "%s tiled shared gate/up pipeline does not support 1024 threads", op_name);
         }
         int owned_command_buffer = 0;
         id<MTLCommandBuffer> cb = metal_command_buffer_for_op(ctx, &owned_command_buffer, op_name, error, error_size);
@@ -11348,7 +11368,14 @@ static int metal_run_dense_swiglu_buffer_f16(uocr_metal_context *ctx,
         if (enc == nil) {
             return metal_fail(error, error_size, "failed to create %s gate/up command encoder", op_name);
         }
-        const NSUInteger gate_threads = metal_power2_threadgroup_width(256u, gate_pipeline.maxTotalThreadsPerThreadgroup);
+        const NSUInteger gate_threads = use_tiled_shared_gate_up ?
+            metal_power2_threadgroup_width((NSUInteger)UOCR_METAL_MOE_SHARED_GATE_UP_TILED_THREADS,
+                                           gate_pipeline.maxTotalThreadsPerThreadgroup) :
+            metal_power2_threadgroup_width(256u, gate_pipeline.maxTotalThreadsPerThreadgroup);
+        const NSUInteger gate_threadgroups = use_tiled_shared_gate_up ?
+            (NSUInteger)n_tokens * ((NSUInteger)intermediate_size + (NSUInteger)UOCR_METAL_MOE_SHARED_GATE_UP_TILE_COLUMNS - 1u) /
+                (NSUInteger)UOCR_METAL_MOE_SHARED_GATE_UP_TILE_COLUMNS :
+            (NSUInteger)gate_values;
         [enc setComputePipelineState:gate_pipeline];
         [enc setBuffer:input.buffer offset:input.offset atIndex:0u];
         [enc setBuffer:gate_weight->buffer offset:gate_weight->offset atIndex:1u];
@@ -11356,7 +11383,7 @@ static int metal_run_dense_swiglu_buffer_f16(uocr_metal_context *ctx,
         [enc setBuffer:mid.buffer offset:mid.offset atIndex:3u];
         [enc setBytes:&params length:sizeof(params) atIndex:4u];
         [enc setThreadgroupMemoryLength:gate_threads * 2u * sizeof(float) atIndex:0u];
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)gate_values, 1u, 1u)
+        [enc dispatchThreadgroups:MTLSizeMake(gate_threadgroups, 1u, 1u)
              threadsPerThreadgroup:MTLSizeMake(gate_threads, 1u, 1u)];
         [enc endEncoding];
 
@@ -22659,17 +22686,33 @@ static int metal_context_swiglu_f16(uocr_metal_context *ctx,
     }
 
     @autoreleasepool {
-        id<MTLComputePipelineState> gate_up_pipeline = metal_get_pipeline(ctx,
-                                                                          "uocr_dense_swiglu_gate_up_f16",
-                                                                          error,
-                                                                          error_size);
+#if UOCR_METAL_ENABLE_MOE_SHARED_GATE_UP_TILED
+        const int use_tiled_shared_gate_up = n_tokens == 1u && intermediate_size == UOCR_MOE_SHARED_INTERMEDIATE &&
+                                             residual_f16_or_null == NULL;
+#else
+        const int use_tiled_shared_gate_up = 0;
+#endif
+        id<MTLComputePipelineState> gate_up_pipeline = metal_get_decoder_shape_pipeline(ctx,
+                                                                                         use_tiled_shared_gate_up ?
+                                                                                             "uocr_dense_swiglu_shared_gate_up_tile4_f16" :
+                                                                                             "uocr_dense_swiglu_gate_up_f16",
+                                                                                         error,
+                                                                                         error_size);
         if (gate_up_pipeline == nil) {
             return 0;
+        }
+        if (use_tiled_shared_gate_up &&
+            gate_up_pipeline.maxTotalThreadsPerThreadgroup < (NSUInteger)UOCR_METAL_MOE_SHARED_GATE_UP_TILED_THREADS) {
+            return metal_fail(error,
+                              error_size,
+                              "Metal %s tiled shared gate/up pipeline supports only %llu threads; need 1024",
+                              op_label,
+                              (unsigned long long)gate_up_pipeline.maxTotalThreadsPerThreadgroup);
         }
         const char *down_function_name = output_type == UOCR_METAL_DENSE_OUTPUT_F16 ?
                                              "uocr_dense_swiglu_down_f16_to_f16" :
                                              "uocr_dense_swiglu_down_f16_to_f32";
-        id<MTLComputePipelineState> down_pipeline = metal_get_pipeline(ctx, down_function_name, error, error_size);
+        id<MTLComputePipelineState> down_pipeline = metal_get_decoder_shape_pipeline(ctx, down_function_name, error, error_size);
         if (down_pipeline == nil) {
             return 0;
         }
@@ -22774,7 +22817,14 @@ static int metal_context_swiglu_f16(uocr_metal_context *ctx,
             [input release];
             return metal_fail(error, error_size, "failed to create Metal %s gate/up command encoder", op_label);
         }
-        const NSUInteger gate_threads = metal_power2_threadgroup_width(256u, gate_up_pipeline.maxTotalThreadsPerThreadgroup);
+        const NSUInteger gate_threads = use_tiled_shared_gate_up ?
+            metal_power2_threadgroup_width((NSUInteger)UOCR_METAL_MOE_SHARED_GATE_UP_TILED_THREADS,
+                                           gate_up_pipeline.maxTotalThreadsPerThreadgroup) :
+            metal_power2_threadgroup_width(256u, gate_up_pipeline.maxTotalThreadsPerThreadgroup);
+        const NSUInteger gate_threadgroups = use_tiled_shared_gate_up ?
+            (NSUInteger)n_tokens * ((NSUInteger)intermediate_size + (NSUInteger)UOCR_METAL_MOE_SHARED_GATE_UP_TILE_COLUMNS - 1u) /
+                (NSUInteger)UOCR_METAL_MOE_SHARED_GATE_UP_TILE_COLUMNS :
+            (NSUInteger)intermediate_values;
         [enc setComputePipelineState:gate_up_pipeline];
         [enc setBuffer:input offset:0u atIndex:0u];
         [enc setBuffer:gate_weight offset:0u atIndex:1u];
@@ -22782,7 +22832,7 @@ static int metal_context_swiglu_f16(uocr_metal_context *ctx,
         [enc setBuffer:mid offset:0u atIndex:3u];
         [enc setBytes:&params length:sizeof(params) atIndex:4u];
         [enc setThreadgroupMemoryLength:gate_threads * 2u * sizeof(float) atIndex:0u];
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)intermediate_values, 1u, 1u)
+        [enc dispatchThreadgroups:MTLSizeMake(gate_threadgroups, 1u, 1u)
              threadsPerThreadgroup:MTLSizeMake(gate_threads, 1u, 1u)];
         [enc endEncoding];
 

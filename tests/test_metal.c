@@ -14293,6 +14293,9 @@ int main(void) {
         if (strcmp(filter, "moe_router_f16") == 0) {
             return test_metal_moe_router_f16();
         }
+        if (strcmp(filter, "moe_shared_experts_f16") == 0) {
+            return test_metal_moe_shared_experts_f16();
+        }
         fprintf(stderr, "unknown UOCR_METAL_TEST_FILTER=%s\n", filter);
         return 1;
     }
