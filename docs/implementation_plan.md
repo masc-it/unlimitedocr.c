@@ -124,6 +124,11 @@ Acceptance criteria:
 - Text-only and base image requests still initialize correctly.
 - E2E probe passes after Release rebuild.
 
+Status:
+- Metal image generation now releases any existing decoder runtime arenas before vision encoding.
+- Runtime arena allocation is deferred through a callback until after vision chunk scratch has been released.
+- Request memory estimates now model vision and decoder runtime as non-overlapping phases, with final visual rows overlapping prompt assembly/prefill.
+
 ## 7. Shrink Decode-Time Scratch After Prefill
 
 Use prompt-sized scratch only for prefill, then switch to one-token decode scratch.

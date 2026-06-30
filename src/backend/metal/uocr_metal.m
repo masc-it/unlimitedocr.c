@@ -12680,6 +12680,8 @@ static int metal_context_generate_image_f16_impl(uocr_metal_context *ctx,
                                           uint32_t max_views_per_chunk,
                                           uint32_t slot,
                                           uocr_metal_decoder_result_f16 *result,
+                                          uocr_metal_runtime_arena_prepare_fn prepare_runtime,
+                                          void *prepare_user,
                                           char *error,
                                           size_t error_size) {
     metal_clear_error(error, error_size);
@@ -12770,6 +12772,20 @@ static int metal_context_generate_image_f16_impl(uocr_metal_context *ctx,
     metal_vision_workspace_reset(&scratch);
     metal_profile_add_event_ms(ctx, "metal.vision.chunk_scratch_release", 0.0);
 
+    if (prepare_runtime != NULL) {
+        const uint64_t runtime_prepare_start_ns = uocr_profile_now_ns();
+        char runtime_error[512];
+        runtime_error[0] = '\0';
+        if (!prepare_runtime(prepare_user, 1u, request->n_tokens, runtime_error, sizeof(runtime_error))) {
+            uocr_metal_context_release_scratch(ctx, UOCR_METAL_SCRATCH_VISION_FINAL);
+            return metal_fail(error,
+                              error_size,
+                              "Metal image generation deferred runtime arena preparation failed: %s",
+                              runtime_error[0] != '\0' ? runtime_error : "unknown error");
+        }
+        metal_profile_add_event_now(ctx, "metal.runtime_arena_prepare_deferred", runtime_prepare_start_ns);
+    }
+
     uocr_metal_decoder_request_f16 decoder_request;
     memset(&decoder_request, 0, sizeof(decoder_request));
     decoder_request.input_ids = request->input_ids;
@@ -12812,6 +12828,34 @@ int uocr_metal_context_generate_image_f16(uocr_metal_context *ctx,
                                                         max_views_per_chunk,
                                                         slot,
                                                         result,
+                                                        NULL,
+                                                        NULL,
+                                                        error,
+                                                        error_size);
+    metal_public_mps_large_gemm_require_end(ctx);
+    return ok;
+}
+
+int uocr_metal_context_generate_image_f16_deferred_runtime(uocr_metal_context *ctx,
+                                                           const uocr_prepared_request *request,
+                                                           uint32_t max_views_per_chunk,
+                                                           uint32_t slot,
+                                                           uocr_metal_decoder_result_f16 *result,
+                                                           uocr_metal_runtime_arena_prepare_fn prepare_runtime,
+                                                           void *prepare_user,
+                                                           char *error,
+                                                           size_t error_size) {
+    if (prepare_runtime == NULL) {
+        return metal_fail(error, error_size, "Metal deferred image generation requires a runtime preparation callback");
+    }
+    metal_public_mps_large_gemm_require_begin(ctx);
+    const int ok = metal_context_generate_image_f16_impl(ctx,
+                                                        request,
+                                                        max_views_per_chunk,
+                                                        slot,
+                                                        result,
+                                                        prepare_runtime,
+                                                        prepare_user,
                                                         error,
                                                         error_size);
     metal_public_mps_large_gemm_require_end(ctx);

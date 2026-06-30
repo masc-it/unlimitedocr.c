@@ -136,6 +136,12 @@ typedef struct uocr_metal_decoder_result_f16 {
     uint32_t reserved0;
 } uocr_metal_decoder_result_f16;
 
+typedef int (*uocr_metal_runtime_arena_prepare_fn)(void *user,
+                                                   uint32_t batch_slots,
+                                                   uint32_t prompt_token_capacity,
+                                                   char *error,
+                                                   size_t error_size);
+
 int uocr_metal_is_available(void);
 const char *uocr_metal_backend_name(void);
 uint64_t uocr_metal_recommended_working_set_size(void);
@@ -302,10 +308,10 @@ int uocr_metal_context_generate_f16(uocr_metal_context *ctx,
                                     char *error,
                                     size_t error_size);
 
-/* Production public-image fp16 orchestration. Encodes vision rows into the
- * reusable Metal vision workspace, then splices that Metal slice directly into
- * the prompt arena before decoder prefill/decode. This avoids the old public
- * image path's host visual-feature allocation and prompt re-upload.
+/* Production public-image fp16 orchestration. Encodes vision rows into a
+ * GPU-resident final-feature buffer, then splices that Metal slice directly
+ * into the prompt arena before decoder prefill/decode. This avoids the old
+ * public image path's host visual-feature allocation and prompt re-upload.
  */
 int uocr_metal_context_generate_image_f16(uocr_metal_context *ctx,
                                           const uocr_prepared_request *request,
@@ -314,6 +320,15 @@ int uocr_metal_context_generate_image_f16(uocr_metal_context *ctx,
                                           uocr_metal_decoder_result_f16 *result,
                                           char *error,
                                           size_t error_size);
+int uocr_metal_context_generate_image_f16_deferred_runtime(uocr_metal_context *ctx,
+                                                           const uocr_prepared_request *request,
+                                                           uint32_t max_views_per_chunk,
+                                                           uint32_t slot,
+                                                           uocr_metal_decoder_result_f16 *result,
+                                                           uocr_metal_runtime_arena_prepare_fn prepare_runtime,
+                                                           void *prepare_user,
+                                                           char *error,
+                                                           size_t error_size);
 
 #if UOCR_METAL_ENABLE_DIAGNOSTIC_API
 /* Diagnostic get-rows entry point used by synthetic tests. Runtime prompt

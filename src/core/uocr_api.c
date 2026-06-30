@@ -563,6 +563,23 @@ static int generate_metal_text_fp16(uocr_engine *engine,
     return UOCR_OK;
 }
 
+static int prepare_metal_runtime_arenas_after_vision(void *user,
+                                                     uint32_t batch_slots,
+                                                     uint32_t prompt_token_capacity,
+                                                     char *error,
+                                                     size_t error_size) {
+    uocr_engine *engine = (uocr_engine *)user;
+    const int status = ensure_metal_runtime_arenas_for_request(engine, batch_slots, prompt_token_capacity);
+    if (status != UOCR_OK) {
+        (void)snprintf(error,
+                       error_size,
+                       "%s",
+                       engine != NULL && engine->last_error[0] != '\0' ? engine->last_error : uocr_status_string(status));
+        return 0;
+    }
+    return 1;
+}
+
 static int generate_metal_image_fp16(uocr_engine *engine,
                                      const uocr_prepared_request *request,
                                      uocr_result **out_result) {
@@ -641,10 +658,8 @@ static int generate_metal_image_fp16(uocr_engine *engine,
                                  vision_schedule.final_visual_tokens);
     }
 
-    status = ensure_metal_runtime_arenas_for_request(engine, 1u, request->n_tokens);
-    if (status != UOCR_OK) {
-        return status;
-    }
+    release_metal_runtime_arena_accounting(engine);
+    uocr_metal_context_release_runtime_arenas(engine->metal);
 
     if ((uint64_t)request->max_new_tokens > (uint64_t)SIZE_MAX / sizeof(int32_t)) {
         return set_engine_errorf(engine, UOCR_ERROR_OUT_OF_MEMORY, "generated-token buffer size overflow");
@@ -667,13 +682,15 @@ static int generate_metal_image_fp16(uocr_engine *engine,
 
     char metal_error[1024];
     memset(metal_error, 0, sizeof(metal_error));
-    if (!uocr_metal_context_generate_image_f16(engine->metal,
-                                               request,
-                                               vision_schedule.max_views_per_chunk,
-                                               0u,
-                                               &metal_result,
-                                               metal_error,
-                                               sizeof(metal_error))) {
+    if (!uocr_metal_context_generate_image_f16_deferred_runtime(engine->metal,
+                                                                request,
+                                                                vision_schedule.max_views_per_chunk,
+                                                                0u,
+                                                                &metal_result,
+                                                                prepare_metal_runtime_arenas_after_vision,
+                                                                engine,
+                                                                metal_error,
+                                                                sizeof(metal_error))) {
         uocr_free(generated);
         untrack_engine_memory(engine, UOCR_MEMORY_TRANSIENT_BUFFERS, generated_bytes);
         return set_engine_errorf(engine,

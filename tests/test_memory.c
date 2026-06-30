@@ -108,6 +108,47 @@ static int test_split_vision_chunk_shape_estimate(void) {
     return 0;
 }
 
+static int test_deferred_vision_runtime_estimate(void) {
+    const uint32_t crop_visual = uocr_local_visual_token_count(4u, 3u) + UOCR_GLOBAL_VISUAL_TOKENS;
+    const uint32_t prompt_tokens = crop_visual + 8u;
+    const uint32_t local_chunk_rows = UOCR_DEFAULT_LOCAL_VIEWS_PER_CHUNK * UOCR_LOCAL_GRID_QUERIES * UOCR_LOCAL_GRID_QUERIES;
+    const uint32_t global_chunk_rows = UOCR_GLOBAL_GRID_QUERIES * UOCR_GLOBAL_GRID_QUERIES;
+    const uint64_t model_bytes = 1024u;
+
+    uocr_runtime_memory_estimate estimate;
+    CHECK(uocr_estimate_runtime_memory_with_vision_chunk_shapes(1u,
+                                                                prompt_tokens,
+                                                                model_bytes,
+                                                                crop_visual,
+                                                                local_chunk_rows,
+                                                                global_chunk_rows,
+                                                                &estimate) == UOCR_OK);
+
+    uint64_t runtime_arena = 0u;
+    CHECK((uint64_t)(UINT64_MAX - runtime_arena) >= estimate.kv_cache_bytes);
+    runtime_arena += estimate.kv_cache_bytes;
+    CHECK((uint64_t)(UINT64_MAX - runtime_arena) >= estimate.prompt_embeddings_bytes);
+    runtime_arena += estimate.prompt_embeddings_bytes;
+    CHECK((uint64_t)(UINT64_MAX - runtime_arena) >= estimate.decoder_scratch_bytes);
+    runtime_arena += estimate.decoder_scratch_bytes;
+    CHECK((uint64_t)(UINT64_MAX - runtime_arena) >= estimate.moe_scratch_bytes);
+    runtime_arena += estimate.moe_scratch_bytes;
+    CHECK((uint64_t)(UINT64_MAX - runtime_arena) >= estimate.logits_readback_bytes);
+    runtime_arena += estimate.logits_readback_bytes;
+
+    const uint64_t runtime_phase = runtime_arena + estimate.vision_final_features_bytes;
+    const uint64_t request_peak = estimate.vision_scratch_bytes > runtime_phase ? estimate.vision_scratch_bytes : runtime_phase;
+    const uint64_t peak_subtotal = model_bytes + request_peak;
+    uint64_t expected_safety = 0u;
+    CHECK(uocr_estimate_safety_margin_bytes(peak_subtotal, &expected_safety) == UOCR_OK);
+
+    CHECK(estimate.vision_scratch_bytes > 0u);
+    CHECK(estimate.vision_final_features_bytes > 0u);
+    CHECK(estimate.total_bytes == peak_subtotal + expected_safety);
+    CHECK(estimate.total_bytes < model_bytes + estimate.vision_scratch_bytes + runtime_arena + expected_safety);
+    return 0;
+}
+
 static int test_minimal_runtime_estimate(void) {
     const uint32_t batch = 2u;
     const uint32_t prompt_tokens = 4096u;
@@ -156,6 +197,7 @@ int main(void) {
     if ((status = test_kv_formula()) != 0) return status;
     if ((status = test_vision_scratch_rows_formula()) != 0) return status;
     if ((status = test_split_vision_chunk_shape_estimate()) != 0) return status;
+    if ((status = test_deferred_vision_runtime_estimate()) != 0) return status;
     if ((status = test_minimal_runtime_estimate()) != 0) return status;
     return 0;
 }

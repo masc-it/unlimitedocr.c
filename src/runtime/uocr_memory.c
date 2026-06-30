@@ -607,14 +607,25 @@ static int estimate_runtime_memory_with_vision_estimate(uint32_t batch_slots,
         return status;
     }
 
+    uint64_t runtime_arena_bytes = 0u;
+    if (!checked_add_to_total(&runtime_arena_bytes, estimate.kv_cache_bytes) ||
+        !checked_add_to_total(&runtime_arena_bytes, estimate.prompt_embeddings_bytes) ||
+        !checked_add_to_total(&runtime_arena_bytes, estimate.decoder_scratch_bytes) ||
+        !checked_add_to_total(&runtime_arena_bytes, estimate.moe_scratch_bytes) ||
+        !checked_add_to_total(&runtime_arena_bytes, estimate.logits_readback_bytes)) {
+        return UOCR_ERROR_OUT_OF_MEMORY;
+    }
+
+    uint64_t runtime_phase_bytes = runtime_arena_bytes;
+    if (!checked_add_to_total(&runtime_phase_bytes, estimate.vision_final_features_bytes)) {
+        return UOCR_ERROR_OUT_OF_MEMORY;
+    }
+    const uint64_t vision_phase_bytes = estimate.vision_scratch_bytes;
+    const uint64_t request_peak_bytes = vision_phase_bytes > runtime_phase_bytes ? vision_phase_bytes : runtime_phase_bytes;
+
     uint64_t total = 0u;
     if (!checked_add_to_total(&total, estimate.model_views_bytes) ||
-        !checked_add_to_total(&total, estimate.kv_cache_bytes) ||
-        !checked_add_to_total(&total, estimate.prompt_embeddings_bytes) ||
-        !checked_add_to_total(&total, estimate.vision_scratch_bytes) ||
-        !checked_add_to_total(&total, estimate.decoder_scratch_bytes) ||
-        !checked_add_to_total(&total, estimate.moe_scratch_bytes) ||
-        !checked_add_to_total(&total, estimate.logits_readback_bytes) ||
+        !checked_add_to_total(&total, request_peak_bytes) ||
         !checked_add_to_total(&total, estimate.transient_bytes)) {
         return UOCR_ERROR_OUT_OF_MEMORY;
     }
