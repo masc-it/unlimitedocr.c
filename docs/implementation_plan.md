@@ -79,6 +79,11 @@ Acceptance criteria:
 - Memory accounting matches actual Metal allocations.
 - Parity probes continue to pass.
 
+Status:
+- Implemented with per-kind Metal vision scratch: local chunks use the 640/local shape and global chunks use the 1024/global shape.
+- Final visual rows now live in a separate final-feature scratch slot so local and global scratch layouts can be rebuilt independently.
+- Full release of chunk scratch after prompt assembly remains part of the next step.
+
 ## 5. Split Final Visual Rows from Large Vision Scratch
 
 Keep final visual embeddings in a small persistent buffer and release/reuse the large SAM/CLIP scratch before decoder prefill.

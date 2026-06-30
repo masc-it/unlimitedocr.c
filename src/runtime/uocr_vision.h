@@ -42,6 +42,10 @@ typedef struct uocr_vision_schedule {
     uint32_t max_views_per_chunk;
     uint32_t max_chunk_views;
     uint32_t max_chunk_projected_tokens;
+    uint32_t max_local_chunk_views;
+    uint32_t max_local_chunk_projected_tokens;
+    uint32_t max_global_chunk_views;
+    uint32_t max_global_chunk_projected_tokens;
     uint32_t final_visual_tokens;
     uint32_t projected_tokens_total;
 } uocr_vision_schedule;

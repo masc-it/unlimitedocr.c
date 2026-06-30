@@ -194,10 +194,11 @@ static int add_aligned_f16_slice_bytes(uint64_t *total, uint64_t value_count) {
     return 1;
 }
 
-int uocr_estimate_vision_memory_for_shape(uint32_t max_view_size,
-                                          uint32_t final_visual_rows,
-                                          uint32_t max_chunk_projected_rows,
-                                          uocr_vision_memory_estimate *out_estimate) {
+static int estimate_vision_memory_for_shape_internal(uint32_t max_view_size,
+                                                     uint32_t final_visual_rows,
+                                                     uint32_t max_chunk_projected_rows,
+                                                     int allow_scratch_only,
+                                                     uocr_vision_memory_estimate *out_estimate) {
     if (out_estimate == NULL) {
         return UOCR_ERROR_INVALID_ARGUMENT;
     }
@@ -205,7 +206,7 @@ int uocr_estimate_vision_memory_for_shape(uint32_t max_view_size,
     if (final_visual_rows == 0u && max_chunk_projected_rows == 0u) {
         return UOCR_OK;
     }
-    if (final_visual_rows == 0u || max_chunk_projected_rows == 0u) {
+    if (max_chunk_projected_rows == 0u || (final_visual_rows == 0u && !allow_scratch_only)) {
         return UOCR_ERROR_INVALID_ARGUMENT;
     }
 
@@ -289,7 +290,6 @@ int uocr_estimate_vision_memory_for_shape(uint32_t max_view_size,
         !checked_mul_u64(clip_mlp_values, chunk_view_capacity, &clip_mlp_batch_values) ||
         !checked_mul_u64((uint64_t)max_chunk_projected_rows, (uint64_t)UOCR_PROJECTOR_IN_SIZE, &concat_values) ||
         !checked_mul_u64((uint64_t)max_chunk_projected_rows, (uint64_t)UOCR_HIDDEN_SIZE, &projected_values) ||
-        !checked_mul_u64((uint64_t)final_visual_rows, (uint64_t)UOCR_HIDDEN_SIZE, &final_visual_values) ||
         !add_aligned_f16_slice_bytes(&total, sam_patch_bhwc_values) ||
         !add_aligned_f16_slice_bytes(&total, sam_transformer_batch_values) ||
         !add_aligned_f16_slice_bytes(&total, sam_bhwc_values) ||
@@ -325,16 +325,23 @@ int uocr_estimate_vision_memory_for_shape(uint32_t max_view_size,
         !add_aligned_f16_slice_bytes(&total, clip_mlp_batch_values) ||
         !add_aligned_f16_slice_bytes(&total, clip_mlp_batch_values) ||
         !add_aligned_f16_slice_bytes(&total, concat_values) ||
-        !add_aligned_f16_slice_bytes(&total, projected_values) ||
-        !add_aligned_f16_slice_bytes(&total, final_visual_values)) {
+        !add_aligned_f16_slice_bytes(&total, projected_values)) {
         return UOCR_ERROR_OUT_OF_MEMORY;
+    }
+    if (final_visual_rows != 0u) {
+        if (!checked_mul_u64((uint64_t)final_visual_rows, (uint64_t)UOCR_HIDDEN_SIZE, &final_visual_values) ||
+            !add_aligned_f16_slice_bytes(&total, final_visual_values)) {
+            return UOCR_ERROR_OUT_OF_MEMORY;
+        }
     }
 
     uint64_t final_visual_bytes = 0u;
     uint64_t host_staging_bytes = 0u;
     uint64_t vision_total = 0u;
-    if (!f16_slice_bytes(final_visual_values, &final_visual_bytes) || final_visual_bytes > total ||
-        !checked_add_u64(total, host_staging_bytes, &vision_total)) {
+    if (final_visual_values != 0u && !f16_slice_bytes(final_visual_values, &final_visual_bytes)) {
+        return UOCR_ERROR_OUT_OF_MEMORY;
+    }
+    if (final_visual_bytes > total || !checked_add_u64(total, host_staging_bytes, &vision_total)) {
         return UOCR_ERROR_OUT_OF_MEMORY;
     }
 
@@ -342,6 +349,76 @@ int uocr_estimate_vision_memory_for_shape(uint32_t max_view_size,
     out_estimate->final_feature_bytes = final_visual_bytes;
     out_estimate->host_staging_bytes = host_staging_bytes;
     out_estimate->total_bytes = vision_total;
+    return UOCR_OK;
+}
+
+int uocr_estimate_vision_memory_for_shape(uint32_t max_view_size,
+                                          uint32_t final_visual_rows,
+                                          uint32_t max_chunk_projected_rows,
+                                          uocr_vision_memory_estimate *out_estimate) {
+    return estimate_vision_memory_for_shape_internal(max_view_size,
+                                                     final_visual_rows,
+                                                     max_chunk_projected_rows,
+                                                     0,
+                                                     out_estimate);
+}
+
+int uocr_estimate_vision_memory_for_chunk_shapes(uint32_t final_visual_rows,
+                                                 uint32_t max_local_chunk_projected_rows,
+                                                 uint32_t max_global_chunk_projected_rows,
+                                                 uocr_vision_memory_estimate *out_estimate) {
+    if (out_estimate == NULL) {
+        return UOCR_ERROR_INVALID_ARGUMENT;
+    }
+    memset(out_estimate, 0, sizeof(*out_estimate));
+    if (final_visual_rows == 0u && max_local_chunk_projected_rows == 0u && max_global_chunk_projected_rows == 0u) {
+        return UOCR_OK;
+    }
+    if (final_visual_rows == 0u || (max_local_chunk_projected_rows == 0u && max_global_chunk_projected_rows == 0u)) {
+        return UOCR_ERROR_INVALID_ARGUMENT;
+    }
+
+    uint64_t max_gpu_workspace = 0u;
+    if (max_local_chunk_projected_rows != 0u) {
+        uocr_vision_memory_estimate local_estimate;
+        const int local_status = estimate_vision_memory_for_shape_internal(UOCR_LOCAL_VIEW_SIZE,
+                                                                           0u,
+                                                                           max_local_chunk_projected_rows,
+                                                                           1,
+                                                                           &local_estimate);
+        if (local_status != UOCR_OK) {
+            return local_status;
+        }
+        max_gpu_workspace = local_estimate.gpu_workspace_bytes;
+    }
+    if (max_global_chunk_projected_rows != 0u) {
+        uocr_vision_memory_estimate global_estimate;
+        const int global_status = estimate_vision_memory_for_shape_internal(UOCR_GLOBAL_VIEW_SIZE,
+                                                                            0u,
+                                                                            max_global_chunk_projected_rows,
+                                                                            1,
+                                                                            &global_estimate);
+        if (global_status != UOCR_OK) {
+            return global_status;
+        }
+        if (global_estimate.gpu_workspace_bytes > max_gpu_workspace) {
+            max_gpu_workspace = global_estimate.gpu_workspace_bytes;
+        }
+    }
+
+    uint64_t final_visual_values = 0u;
+    uint64_t final_visual_bytes = 0u;
+    uint64_t total = 0u;
+    if (!checked_mul_u64((uint64_t)final_visual_rows, (uint64_t)UOCR_HIDDEN_SIZE, &final_visual_values) ||
+        !f16_slice_bytes(final_visual_values, &final_visual_bytes) ||
+        !checked_add_u64(max_gpu_workspace, final_visual_bytes, &total)) {
+        return UOCR_ERROR_OUT_OF_MEMORY;
+    }
+
+    out_estimate->gpu_workspace_bytes = max_gpu_workspace;
+    out_estimate->final_feature_bytes = final_visual_bytes;
+    out_estimate->host_staging_bytes = 0u;
+    out_estimate->total_bytes = total;
     return UOCR_OK;
 }
 
@@ -492,15 +569,12 @@ int uocr_estimate_safety_margin_bytes(uint64_t subtotal_bytes, uint64_t *out_byt
     return UOCR_OK;
 }
 
-int uocr_estimate_runtime_memory_with_vision_shape(uint32_t batch_slots,
-                                                   uint32_t prompt_token_capacity,
-                                                   uint64_t model_view_bytes,
-                                                   uint32_t final_visual_token_capacity,
-                                                   uint32_t max_chunk_projected_rows,
-                                                   uint32_t max_view_size,
-                                                   uocr_runtime_memory_estimate *out_estimate) {
-    if (out_estimate == NULL || batch_slots == 0u || prompt_token_capacity == 0u ||
-        final_visual_token_capacity > prompt_token_capacity) {
+static int estimate_runtime_memory_with_vision_estimate(uint32_t batch_slots,
+                                                       uint32_t prompt_token_capacity,
+                                                       uint64_t model_view_bytes,
+                                                       const uocr_vision_memory_estimate *vision_estimate,
+                                                       uocr_runtime_memory_estimate *out_estimate) {
+    if (out_estimate == NULL || vision_estimate == NULL || batch_slots == 0u || prompt_token_capacity == 0u) {
         return UOCR_ERROR_INVALID_ARGUMENT;
     }
 
@@ -516,18 +590,10 @@ int uocr_estimate_runtime_memory_with_vision_shape(uint32_t batch_slots,
     if (status != UOCR_OK) {
         return status;
     }
-    uocr_vision_memory_estimate vision_estimate;
-    status = uocr_estimate_vision_memory_for_shape(max_view_size,
-                                                   final_visual_token_capacity,
-                                                   max_chunk_projected_rows,
-                                                   &vision_estimate);
-    if (status != UOCR_OK) {
-        return status;
-    }
-    estimate.vision_scratch_bytes = vision_estimate.total_bytes;
-    estimate.vision_gpu_workspace_bytes = vision_estimate.gpu_workspace_bytes;
-    estimate.vision_final_features_bytes = vision_estimate.final_feature_bytes;
-    estimate.vision_host_staging_bytes = vision_estimate.host_staging_bytes;
+    estimate.vision_scratch_bytes = vision_estimate->total_bytes;
+    estimate.vision_gpu_workspace_bytes = vision_estimate->gpu_workspace_bytes;
+    estimate.vision_final_features_bytes = vision_estimate->final_feature_bytes;
+    estimate.vision_host_staging_bytes = vision_estimate->host_staging_bytes;
     status = uocr_estimate_decoder_scratch_bytes(batch_slots, prompt_token_capacity, &estimate.decoder_scratch_bytes);
     if (status != UOCR_OK) {
         return status;
@@ -562,6 +628,59 @@ int uocr_estimate_runtime_memory_with_vision_shape(uint32_t batch_slots,
     estimate.total_bytes = total;
     *out_estimate = estimate;
     return UOCR_OK;
+}
+
+int uocr_estimate_runtime_memory_with_vision_shape(uint32_t batch_slots,
+                                                   uint32_t prompt_token_capacity,
+                                                   uint64_t model_view_bytes,
+                                                   uint32_t final_visual_token_capacity,
+                                                   uint32_t max_chunk_projected_rows,
+                                                   uint32_t max_view_size,
+                                                   uocr_runtime_memory_estimate *out_estimate) {
+    if (out_estimate == NULL || batch_slots == 0u || prompt_token_capacity == 0u ||
+        final_visual_token_capacity > prompt_token_capacity) {
+        return UOCR_ERROR_INVALID_ARGUMENT;
+    }
+
+    uocr_vision_memory_estimate vision_estimate;
+    const int status = uocr_estimate_vision_memory_for_shape(max_view_size,
+                                                             final_visual_token_capacity,
+                                                             max_chunk_projected_rows,
+                                                             &vision_estimate);
+    if (status != UOCR_OK) {
+        return status;
+    }
+    return estimate_runtime_memory_with_vision_estimate(batch_slots,
+                                                        prompt_token_capacity,
+                                                        model_view_bytes,
+                                                        &vision_estimate,
+                                                        out_estimate);
+}
+
+int uocr_estimate_runtime_memory_with_vision_chunk_shapes(uint32_t batch_slots,
+                                                          uint32_t prompt_token_capacity,
+                                                          uint64_t model_view_bytes,
+                                                          uint32_t final_visual_token_capacity,
+                                                          uint32_t max_local_chunk_projected_rows,
+                                                          uint32_t max_global_chunk_projected_rows,
+                                                          uocr_runtime_memory_estimate *out_estimate) {
+    if (out_estimate == NULL || batch_slots == 0u || prompt_token_capacity == 0u ||
+        final_visual_token_capacity > prompt_token_capacity) {
+        return UOCR_ERROR_INVALID_ARGUMENT;
+    }
+    uocr_vision_memory_estimate vision_estimate;
+    const int status = uocr_estimate_vision_memory_for_chunk_shapes(final_visual_token_capacity,
+                                                                    max_local_chunk_projected_rows,
+                                                                    max_global_chunk_projected_rows,
+                                                                    &vision_estimate);
+    if (status != UOCR_OK) {
+        return status;
+    }
+    return estimate_runtime_memory_with_vision_estimate(batch_slots,
+                                                        prompt_token_capacity,
+                                                        model_view_bytes,
+                                                        &vision_estimate,
+                                                        out_estimate);
 }
 
 int uocr_estimate_runtime_memory_with_vision(uint32_t batch_slots,

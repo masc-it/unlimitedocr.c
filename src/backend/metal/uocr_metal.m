@@ -3779,6 +3779,53 @@ static int metal_vision_workspace_assign_slice(uocr_metal_vision_workspace_slice
     return 1;
 }
 
+static int metal_vision_final_rows_init(uocr_metal_context *ctx,
+                                        uocr_metal_vision_workspace_slice *slice,
+                                        uint32_t final_visual_row_capacity,
+                                        int cpu_visible,
+                                        char *error,
+                                        size_t error_size) {
+    if (ctx == NULL || slice == NULL) {
+        return metal_fail(error, error_size, "invalid Metal final visual row workspace request");
+    }
+    memset(slice, 0, sizeof(*slice));
+    if (final_visual_row_capacity == 0u) {
+        return 1;
+    }
+    uint64_t values = 0u;
+    uint64_t bytes = 0u;
+    if (!checked_mul_u64((uint64_t)final_visual_row_capacity, (uint64_t)UOCR_HIDDEN_SIZE, &values) ||
+        !checked_mul_u64(values, 2u, &bytes) || bytes > (uint64_t)SIZE_MAX) {
+        return metal_fail(error, error_size, "Metal final visual row workspace byte-size overflow");
+    }
+    if (!metal_context_ensure_scratch_accounted(ctx,
+                                                UOCR_METAL_SCRATCH_VISION_FINAL,
+                                                bytes,
+                                                cpu_visible,
+                                                UOCR_MEMORY_TRANSIENT_BUFFERS,
+                                                0u,
+                                                error,
+                                                error_size)) {
+        return 0;
+    }
+    id<MTLBuffer> buffer = ctx->scratch[UOCR_METAL_SCRATCH_VISION_FINAL].buffer;
+    if (buffer == nil) {
+        return metal_fail(error, error_size, "Metal final visual row workspace scratch buffer is not allocated");
+    }
+    uint8_t *base = cpu_visible ? (uint8_t *)[buffer contents] : NULL;
+    if (cpu_visible && base == NULL) {
+        return metal_fail(error, error_size, "Metal final visual row workspace scratch buffer is not CPU-visible");
+    }
+    slice->buffer = buffer;
+    slice->offset = 0u;
+    slice->bytes = bytes;
+    slice->f16 = cpu_visible ? (uint16_t *)(void *)base : metal_private_workspace_token(0u);
+    if (slice->f16 == NULL) {
+        return metal_fail(error, error_size, "Metal final visual row workspace token overflow");
+    }
+    return 1;
+}
+
 static int metal_vision_workspace_shape_for_view_size(uint32_t max_view_size,
                                                        uint32_t *out_patch_grid,
                                                        uint32_t *out_projected_grid,
@@ -6461,6 +6508,49 @@ static int metal_project_vision_chunk_f16(const uocr_vision_chunk *chunk,
     return UOCR_OK;
 }
 
+static int metal_vision_workspace_init_for_chunk_kind(uocr_metal_context *ctx,
+                                                       uocr_metal_vision_workspace *workspace,
+                                                       uocr_vision_chunk_kind kind,
+                                                       uint32_t view_capacity,
+                                                       uint32_t projected_row_capacity,
+                                                       uocr_metal_vision_workspace_slice final_visual_rows,
+                                                       uint32_t final_visual_row_capacity,
+                                                       int cpu_visible_workspace,
+                                                       char *error,
+                                                       size_t error_size) {
+    const uint32_t max_view_size = kind == UOCR_VISION_CHUNK_LOCAL ? UOCR_LOCAL_VIEW_SIZE : UOCR_GLOBAL_VIEW_SIZE;
+    if (!metal_vision_workspace_init(ctx,
+                                     workspace,
+                                     max_view_size,
+                                     view_capacity,
+                                     projected_row_capacity,
+                                     0u,
+                                     cpu_visible_workspace,
+                                     error,
+                                     error_size)) {
+        return 0;
+    }
+    workspace->final_visual_rows = final_visual_rows;
+    workspace->final_visual_row_capacity = final_visual_row_capacity;
+    if (workspace->projected_rows.f16 == NULL || workspace->projected_row_capacity < projected_row_capacity ||
+        workspace->final_visual_rows.f16 == NULL || workspace->final_visual_row_capacity < final_visual_row_capacity) {
+        metal_vision_workspace_reset(workspace);
+        return metal_fail(error, error_size, "Metal vision workspace did not provide required projected/final slices");
+    }
+    const uint32_t local_view_count = kind == UOCR_VISION_CHUNK_LOCAL ? view_capacity : 0u;
+    const uint32_t global_view_count = kind == UOCR_VISION_CHUNK_GLOBAL ? view_capacity : 0u;
+    if (!metal_prebuild_mps_vision_workspace_ndarrays(ctx,
+                                                       workspace,
+                                                       local_view_count,
+                                                       global_view_count,
+                                                       error,
+                                                       error_size)) {
+        metal_vision_workspace_reset(workspace);
+        return 0;
+    }
+    return 1;
+}
+
 static int metal_context_encode_visual_features_to_workspace_f16(uocr_metal_context *ctx,
                                                                  const uocr_prepared_request *request,
                                                                  uint32_t max_views_per_chunk,
@@ -6478,47 +6568,6 @@ static int metal_context_encode_visual_features_to_workspace_f16(uocr_metal_cont
         return 0;
     }
 
-    uint32_t max_view_size = 0u;
-    for (uint32_t i = 0u; i < request->n_views; ++i) {
-        const uint32_t view_size = request->views[i].width > request->views[i].height ? request->views[i].width : request->views[i].height;
-        if (view_size > max_view_size) {
-            max_view_size = view_size;
-        }
-    }
-
-    if (!metal_vision_workspace_init(ctx,
-                                     scratch,
-                                     max_view_size,
-                                     schedule->max_chunk_views,
-                                     schedule->max_chunk_projected_tokens,
-                                     schedule->final_visual_tokens,
-                                     cpu_visible_workspace,
-                                     error,
-                                     error_size)) {
-        return 0;
-    }
-    if (scratch->projected_rows.f16 == NULL || scratch->projected_row_capacity < schedule->max_chunk_projected_tokens ||
-        scratch->final_visual_rows.f16 == NULL || scratch->final_visual_row_capacity < schedule->final_visual_tokens) {
-        metal_vision_workspace_reset(scratch);
-        return metal_fail(error, error_size, "Metal vision workspace did not provide required projected/final slices");
-    }
-    if (!metal_prebuild_mps_vision_workspace_ndarrays(ctx,
-                                                       scratch,
-                                                       schedule->local_view_count,
-                                                       schedule->global_view_count,
-                                                       error,
-                                                       error_size)) {
-        metal_vision_workspace_reset(scratch);
-        return 0;
-    }
-
-    uocr_metal_vision_project_context project;
-    memset(&project, 0, sizeof(project));
-    project.ctx = ctx;
-    project.request = request;
-    project.weights = weights;
-    project.scratch = scratch;
-
     uocr_vision_chunk *chunks = (uocr_vision_chunk *)calloc(schedule->chunk_count, sizeof(chunks[0]));
     if (chunks == NULL) {
         metal_vision_workspace_reset(scratch);
@@ -6535,7 +6584,9 @@ static int metal_context_encode_visual_features_to_workspace_f16(uocr_metal_cont
                                                           error_size);
     if (schedule_status != UOCR_OK || planned.chunk_count != schedule->chunk_count ||
         planned.final_visual_tokens != schedule->final_visual_tokens ||
-        planned.max_chunk_projected_tokens != schedule->max_chunk_projected_tokens) {
+        planned.max_chunk_projected_tokens != schedule->max_chunk_projected_tokens ||
+        planned.max_local_chunk_projected_tokens != schedule->max_local_chunk_projected_tokens ||
+        planned.max_global_chunk_projected_tokens != schedule->max_global_chunk_projected_tokens) {
         char detail[512];
         metal_copy_error_detail(detail, sizeof(detail), error);
         free(chunks);
@@ -6543,12 +6594,67 @@ static int metal_context_encode_visual_features_to_workspace_f16(uocr_metal_cont
         return metal_fail(error, error_size, "Metal vision schedule changed before encoding: %s", detail);
     }
 
+    uocr_metal_vision_workspace_slice final_visual_rows;
+    if (!metal_vision_final_rows_init(ctx,
+                                      &final_visual_rows,
+                                      schedule->final_visual_tokens,
+                                      cpu_visible_workspace,
+                                      error,
+                                      error_size)) {
+        free(chunks);
+        metal_vision_workspace_reset(scratch);
+        return 0;
+    }
+    scratch->final_visual_rows = final_visual_rows;
+    scratch->final_visual_row_capacity = schedule->final_visual_tokens;
+
+    uocr_metal_vision_project_context project;
+    memset(&project, 0, sizeof(project));
+    project.ctx = ctx;
+    project.request = request;
+    project.weights = weights;
+    project.scratch = scratch;
+
     const uint64_t chunk_processing_start_ns = uocr_profile_now_ns();
     uint64_t formatter_ns = 0u;
     int process_status = UOCR_OK;
     uint32_t local_newlines_encoded = 0u;
+    int active_chunk_kind = -1;
     for (uint32_t chunk_index = 0u; process_status == UOCR_OK && chunk_index < schedule->chunk_count; ++chunk_index) {
         const uocr_vision_chunk *chunk = &chunks[chunk_index];
+        if (active_chunk_kind != (int)chunk->kind) {
+            const uocr_metal_vision_workspace_slice final_rows = scratch->final_visual_rows;
+            const uint32_t final_row_capacity = scratch->final_visual_row_capacity;
+            if (active_chunk_kind >= 0 || ctx->scratch[UOCR_METAL_SCRATCH_VISION].buffer != nil) {
+                if (metal_command_batch_active(ctx)) {
+                    process_status = UOCR_ERROR_INTERNAL;
+                    (void)metal_fail(error, error_size, "Metal vision workspace shape changed inside an active command batch");
+                    break;
+                }
+                uocr_metal_context_release_scratch(ctx, UOCR_METAL_SCRATCH_VISION);
+            }
+            const uint32_t kind_view_capacity = chunk->kind == UOCR_VISION_CHUNK_LOCAL ?
+                                                   schedule->max_local_chunk_views :
+                                                   schedule->max_global_chunk_views;
+            const uint32_t kind_projected_capacity = chunk->kind == UOCR_VISION_CHUNK_LOCAL ?
+                                                        schedule->max_local_chunk_projected_tokens :
+                                                        schedule->max_global_chunk_projected_tokens;
+            if (!metal_vision_workspace_init_for_chunk_kind(ctx,
+                                                            scratch,
+                                                            chunk->kind,
+                                                            kind_view_capacity,
+                                                            kind_projected_capacity,
+                                                            final_rows,
+                                                            final_row_capacity,
+                                                            cpu_visible_workspace,
+                                                            error,
+                                                            error_size)) {
+                process_status = UOCR_ERROR_INTERNAL;
+                break;
+            }
+            project.scratch = scratch;
+            active_chunk_kind = (int)chunk->kind;
+        }
         const int had_active_batch = metal_command_batch_active(ctx);
         const char *shape_group_op = chunk->kind == UOCR_VISION_CHUNK_LOCAL ?
                                          "Metal local vision shape-group graph" :
@@ -6650,7 +6756,7 @@ static int metal_context_encode_visual_features_to_workspace_f16(uocr_metal_cont
 
 /* Diagnostic host-output vision helpers. Public OCR dispatch must use
  * uocr_metal_context_generate_image_f16(), which keeps the final visual rows in
- * the reusable Metal workspace and binds that slice directly into prompt
+ * a reusable Metal final-feature buffer and binds that slice directly into prompt
  * assembly. These helpers deliberately copy results back to caller-owned host
  * buffers for parity probes only; profile markers make accidental production
  * use visible.
@@ -7005,6 +7111,8 @@ static const char *scratch_slot_name(uocr_metal_scratch_slot slot) {
             return "logits";
         case UOCR_METAL_SCRATCH_TRANSIENT:
             return "transient";
+        case UOCR_METAL_SCRATCH_VISION_FINAL:
+            return "vision-final";
         default:
             return "unknown";
     }
@@ -7021,6 +7129,9 @@ static uocr_memory_category scratch_slot_memory_category(uocr_metal_scratch_slot
         case UOCR_METAL_SCRATCH_LOGITS:
             return UOCR_MEMORY_DECODER_SCRATCH;
         case UOCR_METAL_SCRATCH_TRANSIENT:
+            return UOCR_MEMORY_TRANSIENT_BUFFERS;
+        case UOCR_METAL_SCRATCH_VISION_FINAL:
+            return UOCR_MEMORY_VISION_FINAL_FEATURES;
         default:
             return UOCR_MEMORY_TRANSIENT_BUFFERS;
     }
@@ -7044,7 +7155,7 @@ static int scratch_capacity_for_request(uocr_metal_scratch_slot slot,
      * a fresh base request does not inherit the generic power-of-two slack used
      * for small transient/decoder scratch buffers.
      */
-    if (slot == UOCR_METAL_SCRATCH_VISION) {
+    if (slot == UOCR_METAL_SCRATCH_VISION || slot == UOCR_METAL_SCRATCH_VISION_FINAL) {
         *out_capacity = requested;
         return 1;
     }

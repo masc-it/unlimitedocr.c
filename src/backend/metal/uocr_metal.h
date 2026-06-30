@@ -43,7 +43,8 @@ typedef enum uocr_metal_scratch_slot {
     UOCR_METAL_SCRATCH_MOE = 2,
     UOCR_METAL_SCRATCH_LOGITS = 3,
     UOCR_METAL_SCRATCH_TRANSIENT = 4,
-    UOCR_METAL_SCRATCH_COUNT = 5
+    UOCR_METAL_SCRATCH_VISION_FINAL = 5,
+    UOCR_METAL_SCRATCH_COUNT = 6
 } uocr_metal_scratch_slot;
 
 typedef enum uocr_metal_runtime_arena_slot {

@@ -135,6 +135,19 @@ def memory_report_dict(memory: MemoryReport) -> dict[str, Any]:
         "total_peak_bytes": memory.total_peak_bytes,
         "recommended_working_set_bytes": memory.recommended_working_set_bytes,
         "memory_budget_bytes": memory.memory_budget_bytes,
+        "estimated_model_views_bytes": memory.estimated_model_views_bytes,
+        "estimated_kv_cache_bytes": memory.estimated_kv_cache_bytes,
+        "estimated_prompt_embeddings_bytes": memory.estimated_prompt_embeddings_bytes,
+        "estimated_vision_scratch_bytes": memory.estimated_vision_scratch_bytes,
+        "estimated_vision_gpu_workspace_bytes": memory.estimated_vision_gpu_workspace_bytes,
+        "estimated_vision_final_features_bytes": memory.estimated_vision_final_features_bytes,
+        "estimated_vision_host_staging_bytes": memory.estimated_vision_host_staging_bytes,
+        "estimated_decoder_scratch_bytes": memory.estimated_decoder_scratch_bytes,
+        "estimated_moe_scratch_bytes": memory.estimated_moe_scratch_bytes,
+        "estimated_logits_readback_bytes": memory.estimated_logits_readback_bytes,
+        "estimated_transient_bytes": memory.estimated_transient_bytes,
+        "estimated_safety_margin_bytes": memory.estimated_safety_margin_bytes,
+        "estimated_total_bytes": memory.estimated_total_bytes,
         "vision_workspace_capacity_bytes": memory.vision_workspace_capacity_bytes,
         "vision_workspace_high_watermark_bytes": memory.vision_workspace_high_watermark_bytes,
         "category_peak_bytes": dict(zip(MEMORY_CATEGORIES, memory.category_peak_bytes, strict=False)),
@@ -295,6 +308,16 @@ def vision_schedule_dict(request: PreparedRequest) -> dict[str, Any]:
             "projected_tokens_per_view": grid * grid,
         }
 
+    workspace_shapes = {
+        kind: {
+            "max_view_size": shape["max_view_size"],
+            "max_chunk_views": shape["max_chunk_views"],
+            "max_chunk_projected_rows": shape["max_chunk_projected_rows"],
+            "final_visual_rows": 0,
+        }
+        for kind, shape in chunk_shapes.items()
+    }
+
     return {
         "local_view_count": local_count,
         "global_view_count": global_count,
@@ -305,9 +328,9 @@ def vision_schedule_dict(request: PreparedRequest) -> dict[str, Any]:
         "final_visual_rows": final_visual_rows,
         "projected_rows_total": projected_rows_total,
         "request_max_view_size": request_max_view_size,
-        "current_workspace_shape": {
-            "max_view_size": request_max_view_size,
-            "max_chunk_projected_rows": max_chunk_projected_rows,
+        "workspace_plan": {
+            "request_max_view_size": request_max_view_size,
+            "scratch_shapes": workspace_shapes,
             "final_visual_rows": final_visual_rows,
         },
         "chunk_shapes": chunk_shapes,

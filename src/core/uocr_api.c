@@ -103,6 +103,8 @@ typedef struct uocr_admission_request_shape {
     uint32_t max_new_tokens;
     uint32_t visual_rows;
     uint32_t max_chunk_projected_rows;
+    uint32_t max_local_chunk_projected_rows;
+    uint32_t max_global_chunk_projected_rows;
     uint32_t max_view_size;
 } uocr_admission_request_shape;
 
@@ -196,7 +198,8 @@ static int set_admission_error_with_shape(uocr_engine *engine,
                                  UOCR_ERROR_OUT_OF_MEMORY,
                                  "%s admission rejected: memory estimate %llu bytes exceeds budget %llu bytes "
                                  "(configured_budget=%llu requests=%u requested_views=%llu prompt_tokens=%u max_new_tokens=%u "
-                                 "visual_rows=%u max_view_size=%u max_chunk_projected_rows=%u configured_max_batch=%u "
+                                 "visual_rows=%u max_view_size=%u max_chunk_projected_rows=%u "
+                                 "max_local_chunk_projected_rows=%u max_global_chunk_projected_rows=%u configured_max_batch=%u "
                                  "configured_max_prompt_tokens=%u configured_max_gen_tokens=%u current_metal_arena_batch_slots=%u "
                                  "current_metal_arena_prompt_token_capacity=%u current_metal_arena_bytes=%llu vision_workspace=%llu "
                                  "vision=%llu vision_gpu_workspace=%llu vision_final_features=%llu vision_host_staging=%llu "
@@ -212,6 +215,8 @@ static int set_admission_error_with_shape(uocr_engine *engine,
                                  shape->visual_rows,
                                  shape->max_view_size,
                                  shape->max_chunk_projected_rows,
+                                 shape->max_local_chunk_projected_rows,
+                                 shape->max_global_chunk_projected_rows,
                                  configured_max_batch,
                                  configured_max_prompt_tokens,
                                  configured_max_gen_tokens,
@@ -1055,6 +1060,8 @@ int uocr_generate_prepared(uocr_engine *engine,
     uint32_t max_new_tokens_in_batch = 0u;
     uint32_t max_visual_tokens_in_batch = 0u;
     uint32_t max_vision_chunk_projected_rows = 0u;
+    uint32_t max_local_vision_chunk_projected_rows = 0u;
+    uint32_t max_global_vision_chunk_projected_rows = 0u;
     uint32_t max_vision_view_size = 0u;
     uint64_t requested_views_in_batch = 0u;
     int any_generation_requested = 0;
@@ -1107,6 +1114,12 @@ int uocr_generate_prepared(uocr_engine *engine,
         if (vision_schedule.max_chunk_projected_tokens > max_vision_chunk_projected_rows) {
             max_vision_chunk_projected_rows = vision_schedule.max_chunk_projected_tokens;
         }
+        if (vision_schedule.max_local_chunk_projected_tokens > max_local_vision_chunk_projected_rows) {
+            max_local_vision_chunk_projected_rows = vision_schedule.max_local_chunk_projected_tokens;
+        }
+        if (vision_schedule.max_global_chunk_projected_tokens > max_global_vision_chunk_projected_rows) {
+            max_global_vision_chunk_projected_rows = vision_schedule.max_global_chunk_projected_tokens;
+        }
         for (uint32_t view_index = 0u; view_index < requests[i].n_views; ++view_index) {
             const uint32_t view_size = requests[i].views[view_index].width > requests[i].views[view_index].height ?
                                            requests[i].views[view_index].width :
@@ -1130,13 +1143,13 @@ int uocr_generate_prepared(uocr_engine *engine,
 
     uocr_runtime_memory_estimate request_estimate;
     const uint64_t estimate_start_ns = uocr_profile_now_ns();
-    const int estimate_status = uocr_estimate_runtime_memory_with_vision_shape(n_requests,
-                                                                               max_prompt_tokens_in_batch,
-                                                                               engine->model_view_bytes,
-                                                                               max_visual_tokens_in_batch,
-                                                                               max_vision_chunk_projected_rows,
-                                                                               max_vision_view_size,
-                                                                               &request_estimate);
+    const int estimate_status = uocr_estimate_runtime_memory_with_vision_chunk_shapes(n_requests,
+                                                                                      max_prompt_tokens_in_batch,
+                                                                                      engine->model_view_bytes,
+                                                                                      max_visual_tokens_in_batch,
+                                                                                      max_local_vision_chunk_projected_rows,
+                                                                                      max_global_vision_chunk_projected_rows,
+                                                                                      &request_estimate);
     if (estimate_status != UOCR_OK) {
         return set_engine_errorf(engine, estimate_status, "failed to estimate request memory requirements");
     }
@@ -1151,6 +1164,8 @@ int uocr_generate_prepared(uocr_engine *engine,
         request_shape.max_new_tokens = max_new_tokens_in_batch;
         request_shape.visual_rows = max_visual_tokens_in_batch;
         request_shape.max_chunk_projected_rows = max_vision_chunk_projected_rows;
+        request_shape.max_local_chunk_projected_rows = max_local_vision_chunk_projected_rows;
+        request_shape.max_global_chunk_projected_rows = max_global_vision_chunk_projected_rows;
         request_shape.max_view_size = max_vision_view_size;
         return set_admission_error_with_shape(engine,
                                               "request",

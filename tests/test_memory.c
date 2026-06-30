@@ -85,6 +85,29 @@ static int test_vision_scratch_rows_formula(void) {
     return 0;
 }
 
+static int test_split_vision_chunk_shape_estimate(void) {
+    const uint32_t crop_visual = uocr_local_visual_token_count(4u, 3u) + UOCR_GLOBAL_VISUAL_TOKENS;
+    const uint32_t local_chunk_rows = UOCR_DEFAULT_LOCAL_VIEWS_PER_CHUNK * UOCR_LOCAL_GRID_QUERIES * UOCR_LOCAL_GRID_QUERIES;
+    const uint32_t global_chunk_rows = UOCR_GLOBAL_GRID_QUERIES * UOCR_GLOBAL_GRID_QUERIES;
+
+    uocr_vision_memory_estimate split;
+    CHECK(uocr_estimate_vision_memory_for_chunk_shapes(crop_visual,
+                                                       local_chunk_rows,
+                                                       global_chunk_rows,
+                                                       &split) == UOCR_OK);
+    uocr_vision_memory_estimate request_wide;
+    CHECK(uocr_estimate_vision_memory_for_shape(UOCR_GLOBAL_VIEW_SIZE,
+                                                crop_visual,
+                                                local_chunk_rows,
+                                                &request_wide) == UOCR_OK);
+
+    CHECK(split.final_feature_bytes == (uint64_t)crop_visual * (uint64_t)UOCR_HIDDEN_SIZE * 2u);
+    CHECK(split.total_bytes == split.gpu_workspace_bytes + split.final_feature_bytes);
+    CHECK(split.gpu_workspace_bytes < request_wide.gpu_workspace_bytes);
+    CHECK(split.total_bytes < request_wide.total_bytes);
+    return 0;
+}
+
 static int test_minimal_runtime_estimate(void) {
     const uint32_t batch = 2u;
     const uint32_t prompt_tokens = 4096u;
@@ -132,6 +155,7 @@ int main(void) {
     if ((status = test_tracker_live_and_peak_counters()) != 0) return status;
     if ((status = test_kv_formula()) != 0) return status;
     if ((status = test_vision_scratch_rows_formula()) != 0) return status;
+    if ((status = test_split_vision_chunk_shape_estimate()) != 0) return status;
     if ((status = test_minimal_runtime_estimate()) != 0) return status;
     return 0;
 }

@@ -279,6 +279,10 @@ static int test_default_local_chunk_limit_is_memory_aware(void) {
     CHECK(schedule.max_views_per_chunk == UOCR_DEFAULT_LOCAL_VIEWS_PER_CHUNK);
     CHECK(schedule.max_chunk_views == UOCR_DEFAULT_LOCAL_VIEWS_PER_CHUNK);
     CHECK(schedule.max_chunk_projected_tokens == UOCR_DEFAULT_LOCAL_VIEWS_PER_CHUNK * UOCR_LOCAL_GRID_QUERIES * UOCR_LOCAL_GRID_QUERIES);
+    CHECK(schedule.max_local_chunk_views == UOCR_DEFAULT_LOCAL_VIEWS_PER_CHUNK);
+    CHECK(schedule.max_local_chunk_projected_tokens == UOCR_DEFAULT_LOCAL_VIEWS_PER_CHUNK * UOCR_LOCAL_GRID_QUERIES * UOCR_LOCAL_GRID_QUERIES);
+    CHECK(schedule.max_global_chunk_views == 1u);
+    CHECK(schedule.max_global_chunk_projected_tokens == UOCR_GLOBAL_GRID_QUERIES * UOCR_GLOBAL_GRID_QUERIES);
     CHECK(schedule.final_visual_tokens == visual_tokens);
     CHECK(chunks[0].kind == UOCR_VISION_CHUNK_LOCAL);
     CHECK(chunks[0].first_view == 0u && chunks[0].view_count == UOCR_DEFAULT_LOCAL_VIEWS_PER_CHUNK);

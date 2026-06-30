@@ -85,6 +85,21 @@ static int add_chunk(uocr_vision_chunk *chunks,
     if (chunk.projected_token_count > summary->max_chunk_projected_tokens) {
         summary->max_chunk_projected_tokens = chunk.projected_token_count;
     }
+    if (kind == UOCR_VISION_CHUNK_LOCAL) {
+        if (view_count > summary->max_local_chunk_views) {
+            summary->max_local_chunk_views = view_count;
+        }
+        if (chunk.projected_token_count > summary->max_local_chunk_projected_tokens) {
+            summary->max_local_chunk_projected_tokens = chunk.projected_token_count;
+        }
+    } else {
+        if (view_count > summary->max_global_chunk_views) {
+            summary->max_global_chunk_views = view_count;
+        }
+        if (chunk.projected_token_count > summary->max_global_chunk_projected_tokens) {
+            summary->max_global_chunk_projected_tokens = chunk.projected_token_count;
+        }
+    }
 
     const uint32_t index = *chunk_index;
     if (chunks != NULL && index < chunk_capacity) {

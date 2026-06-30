@@ -518,14 +518,16 @@ static int test_crop_image_request_validation(void) {
                                     &schedule,
                                     schedule_error,
                                     sizeof(schedule_error)) == UOCR_OK);
-    uint64_t expected_vision = 0u;
-    CHECK(uocr_estimate_vision_scratch_bytes_for_rows(schedule.final_visual_tokens,
-                                                       schedule.max_chunk_projected_tokens,
+    uocr_vision_memory_estimate expected_vision;
+    memset(&expected_vision, 0, sizeof(expected_vision));
+    CHECK(uocr_estimate_vision_memory_for_chunk_shapes(schedule.final_visual_tokens,
+                                                       schedule.max_local_chunk_projected_tokens,
+                                                       schedule.max_global_chunk_projected_tokens,
                                                        &expected_vision) == UOCR_OK);
     uocr_memory_report report;
     memset(&report, 0, sizeof(report));
     CHECK(uocr_engine_memory_report(engine, &report) == UOCR_OK);
-    CHECK(report.estimated_vision_scratch_bytes == expected_vision);
+    CHECK(report.estimated_vision_scratch_bytes == expected_vision.total_bytes);
     CHECK(report.estimated_vision_scratch_bytes > 0u);
     uint64_t global_vision = 0u;
     CHECK(uocr_estimate_vision_scratch_bytes(&global_vision) == UOCR_OK);
