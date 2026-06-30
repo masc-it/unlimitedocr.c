@@ -40,12 +40,13 @@ Reference: `data.tmp/reference/Metal-Shading-Language-Specification.pdf`
 - Current MPSNDArray matmul usage is directionally correct.
 - Revisit `UOCR_METAL_MPS_MATMUL_MIN_FLOPS`; the fallback one-output-per-threadgroup GEMM is not competitive for many shapes.
 - For Metal 4+ targets, evaluate MPP TensorOps `matmul2d`; keep MPSNDArray fallback for broader OS support.
+- The MPP prototype is opt-in behind `UOCR_METAL_ENABLE_MPP_TENSOROPS`; default builds keep MPSNDArray.
 - Respect TensorOps execution-scope rules: all threads in the selected scope must call `run`, and explicit barriers are needed before reading device/threadgroup tensor outputs.
 
 **Implementation:**
 - [x] Benchmark MPS threshold across representative decoder/vision GEMMs.
 - [x] Lower or autotune `UOCR_METAL_MPS_MATMUL_MIN_FLOPS`.
-- [ ] Add a feature-gated MPP TensorOps prototype for Metal 4+.
+- [x] Add a feature-gated MPP TensorOps prototype for Metal 4+.
 - [x] Keep current MPSNDArray path as default portable optimized path.
 
 ## 4. Vectorize fp16 memory-bound kernels

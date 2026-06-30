@@ -64,6 +64,10 @@
 #define UOCR_METAL_RUNTIME_COMPILE 1
 #endif
 
+#ifndef UOCR_METAL_ENABLE_MPP_TENSOROPS
+#define UOCR_METAL_ENABLE_MPP_TENSOROPS 0
+#endif
+
 #ifndef UOCR_DEFAULT_RESOURCE_PATH
 #define UOCR_DEFAULT_RESOURCE_PATH ""
 #endif
@@ -1584,6 +1588,9 @@ uocr_metal_context *uocr_metal_context_create(const char *resource_path, char *e
             }
 
             MTLCompileOptions *options = [MTLCompileOptions new];
+#if UOCR_METAL_ENABLE_MPP_TENSOROPS
+            options.preprocessorMacros = @{ @"UOCR_METAL_ENABLE_MPP_TENSOROPS" : @1 };
+#endif
             NSError *compile_error = nil;
             ctx->library = [ctx->device newLibraryWithSource:source options:options error:&compile_error];
             [options release];

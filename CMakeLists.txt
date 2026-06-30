@@ -26,6 +26,7 @@ option(UOCR_BUILD_TOOLS "Build native tools" ON)
 option(UOCR_BUILD_TESTS "Build native tests" ON)
 option(UOCR_METAL_RUNTIME_COMPILE "Compile Metal sources at runtime during development" ON)
 option(UOCR_METAL_PRECOMPILE "Precompile Metal sources into a metallib" OFF)
+option(UOCR_METAL_ENABLE_MPP_TENSOROPS "Build the experimental Metal 4 MPP TensorOps matmul prototype" OFF)
 option(UOCR_SANITIZE "Enable address/undefined sanitizers for supported compilers" OFF)
 
 string(TOUPPER "${UOCR_ENABLE_METAL}" UOCR_ENABLE_METAL_UPPER)
@@ -97,6 +98,11 @@ if(UOCR_METAL_ENABLED)
     enable_language(OBJC)
     set(UOCR_METAL_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/src/backend/metal/kernels/uocr_smoke.metal")
     set(UOCR_METALLIB_OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/unlimitedocr.metallib")
+    if(UOCR_METAL_ENABLE_MPP_TENSOROPS)
+        set(UOCR_METAL_ENABLE_MPP_TENSOROPS_VALUE 1)
+    else()
+        set(UOCR_METAL_ENABLE_MPP_TENSOROPS_VALUE 0)
+    endif()
     if(UOCR_METAL_PRECOMPILE)
         find_program(UOCR_XCRUN_EXECUTABLE xcrun)
         if(NOT UOCR_XCRUN_EXECUTABLE)
@@ -105,7 +111,7 @@ if(UOCR_METAL_ENABLED)
         set(UOCR_METAL_AIR_OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/unlimitedocr.air")
         add_custom_command(
             OUTPUT "${UOCR_METALLIB_OUTPUT}"
-            COMMAND "${UOCR_XCRUN_EXECUTABLE}" -sdk macosx metal -c "${UOCR_METAL_SOURCE}" -o "${UOCR_METAL_AIR_OUTPUT}"
+            COMMAND "${UOCR_XCRUN_EXECUTABLE}" -sdk macosx metal -c "${UOCR_METAL_SOURCE}" -DUOCR_METAL_ENABLE_MPP_TENSOROPS=${UOCR_METAL_ENABLE_MPP_TENSOROPS_VALUE} -o "${UOCR_METAL_AIR_OUTPUT}"
             COMMAND "${UOCR_XCRUN_EXECUTABLE}" -sdk macosx metallib "${UOCR_METAL_AIR_OUTPUT}" -o "${UOCR_METALLIB_OUTPUT}"
             DEPENDS "${UOCR_METAL_SOURCE}"
             COMMENT "Precompiling Metal shaders to ${UOCR_METALLIB_OUTPUT}"
@@ -126,6 +132,7 @@ if(UOCR_METAL_ENABLED)
     target_compile_definitions(uocr_metal
         PRIVATE
             UOCR_METAL_RUNTIME_COMPILE=$<BOOL:${UOCR_METAL_RUNTIME_COMPILE}>
+            UOCR_METAL_ENABLE_MPP_TENSOROPS=${UOCR_METAL_ENABLE_MPP_TENSOROPS_VALUE}
             UOCR_DEFAULT_RESOURCE_PATH=\"${CMAKE_CURRENT_SOURCE_DIR}/src/backend/metal\"
             UOCR_DEFAULT_METALLIB_PATH=\"${UOCR_METALLIB_OUTPUT}\")
     target_link_libraries(uocr_metal
