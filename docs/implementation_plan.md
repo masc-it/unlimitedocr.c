@@ -1,205 +1,266 @@
-# Memory Optimization Implementation Plan
+# MoE Decoder Optimization Implementation Plan
 
-Goal: reduce peak inference memory for UnlimitedOCR Metal inference while preserving exact fp16 model behavior and output parity with the reference Python implementation.
+Goal: improve UnlimitedOCR Metal fp16 MoE decoder throughput while preserving deterministic output, fp16 model behavior, and upstream Python parity.
 
-This plan is grounded in the upstream model architecture in `data.tmp/reference/deepencoder.py`, `data.tmp/reference/modeling_unlimitedocr.py`, and `data.tmp/reference/modeling_deepseekv2.py`.
-
-## 1. Establish and Preserve Memory Baselines
-
-Record baseline memory and speed before each optimization pass.
-
-Tasks:
-- Run `uv run probes/e2e_generation_probe.py --profile base --json`.
-- Run `uv run probes/e2e_generation_probe.py --profile gundam --json`.
-- Track native peak, live memory after generation, RSS sampled peak, generated token count, and tok/s.
-- Keep category-level accounting visible for:
-  - `model_views`
-  - `vision_gpu_workspace`
-  - `kv_cache`
-  - `decoder_scratch`
-  - `moe_scratch`
-  - `transient_buffers`
-- Treat `model_views` as the fp16 model mapping floor, separate from true transient runtime pressure.
-
-Acceptance criteria:
-- Baseline numbers are documented before code changes.
-- Probe output clearly separates model mapping from runtime workspace pressure.
-
-## 2. Add Request-Level Vision Schedule Reporting
-
-Make the planned vision schedule visible so memory behavior can be explained from request shape.
-
-Tasks:
-- Report local view count, global view count, chunk count, max chunk views, max chunk projected rows, final visual rows, and max view size.
-- Surface this information in probe JSON/profile output.
-- For crop requests, report local and global chunk shapes separately.
-
-Acceptance criteria:
-- `base` shows one global view and one global chunk.
-- `gundam` shows local crop chunks plus one global chunk.
-- Schedule metadata is present in probe output without extra diagnostic host copies.
-
-## 3. Implement Memory-Aware Local Crop Chunking
-
-Process local crops in smaller independent batches instead of all local crops at once.
+Scope: decode after prefill. The model has `hidden_size=1280`, `num_hidden_layers=12`, one dense MLP layer, and 11 routed MoE layers with `64` experts, `top_k=6`, `expert_intermediate=896`, and `shared_intermediate=1792`.
 
 Reference grounding:
-- Upstream encodes local crops as a batch with `sam_model(patches)` and `vision_model(patches, local_features_1)`.
-- There is no cross-crop attention before projected features are formatted into the final visual grid.
+- Model architecture: `data.tmp/reference/modeling_unlimitedocr.py` and `data.tmp/reference/modeling_deepseekv2.py`.
+- Metal Shading Language: `data.tmp/reference/Metal-Shading-Language-Specification.pdf`.
+- Current Metal implementation:
+  - decode MoE router: `metal_run_moe_router_buffer_f16()`
+  - shared expert path: `metal_run_dense_swiglu_buffer_f16()`
+  - routed expert path: `metal_run_moe_interleaved_buffer_f16()`
+  - final add: `metal_run_moe_combine_buffer_f16()`
+  - kernels in `src/backend/metal/kernels/uocr_smoke.metal`
 
-Tasks:
-- Add a configurable local max-views-per-chunk policy.
-- Default to a memory-friendly cap such as 4 or 8 local views per chunk.
-- Preserve current behavior behind an internal setting if useful for parity/perf comparison.
-- Ensure output rows are written to the same final visual positions as the current all-local-crops chunk.
+Metal spec constraints to apply:
+- MSL p153: choose threadgroup sizes as multiples of `threads_per_simdgroup` for best performance.
+- MSL p157: standard compute SIMD-groups are linear and independent without barriers; use `thread_index_in_simdgroup`/`simdgroup_index_in_threadgroup` deliberately.
+- MSL p215-p216: all threads in a threadgroup/SIMD-group must encounter `threadgroup_barrier`/`simdgroup_barrier`; barriers inside conditionals or loops must be uniform for all participating threads.
+- MSL p219-p222: use SIMD-group operations (`simd_sum`, `simd_max`, `simd_shuffle*`, prefix reductions) to reduce threadgroup memory traffic where deterministic reduction order is acceptable.
+- MSL p127: `[[max_total_threads_per_threadgroup]]` caps pipeline threadgroup size; Metal 4 `[[required_threads_per_threadgroup]]` can be considered only where device support and exact dispatch shape are guaranteed.
+- MSL p190-p193: use function constants for scalar/vector shape specialization instead of creating extra source variants.
+- MSL p349-p354: TensorOps/cooperative tensors are Metal 4 features; all threads in the execution scope must call TensorOp methods uniformly, and explicit barriers are required before reading device/threadgroup tensor outputs.
 
-Acceptance criteria:
-- `gundam` peak `vision_gpu_workspace` drops materially.
-- Generated text/token sequence remains unchanged for deterministic probes.
-- `base` behavior and memory stay essentially unchanged.
+Validation requirements for every native-code step:
+- Rebuild Release with Metal enabled.
+- Run `uv run probes/e2e_generation_probe.py --profile base`.
+- Run `uv run probes/e2e_generation_probe.py --profile gundam`.
+- Compare generated token counts/text previews against the current baseline.
+- Run focused C/Metal tests for any new kernel parity.
+- Restart notebook/Jupyter kernels after native dylib changes.
 
-## 4. Use Separate Local and Global Vision Workspace Shapes
+## 1. Capture MoE Decoder Baselines
 
-Allocate workspace for the actual chunk kind rather than the largest view in the whole request.
+Status: [x] Completed
 
-Reference grounding:
-- Upstream runs local patches and global image as separate SAM/CLIP calls:
-  - local: 640 input, SAM `40x40`, projector grid `10x10`
-  - global: 1024 input, SAM `64x64`, projector grid `16x16`
-
-Tasks:
-- Stop sizing all crop-mode vision workspace from the request-wide max view size.
-- Size local chunks with the 640/local shape.
-- Size global chunks with the 1024/global shape.
-- Keep final visual row storage independent of per-chunk scratch shape.
-- Update memory estimates to account for max(local_chunk_workspace, global_chunk_workspace) plus final visual storage.
-
-Acceptance criteria:
-- Crop-mode local chunk workspace no longer pays for 1024 SAM/CLIP scratch.
-- Memory accounting matches actual Metal allocations.
-- Parity probes continue to pass.
-
-Status:
-- Implemented with per-kind Metal vision scratch: local chunks use the 640/local shape and global chunks use the 1024/global shape.
-- Final visual rows now live in a separate final-feature scratch slot so local and global scratch layouts can be rebuilt independently.
-- Full release of chunk scratch after prompt assembly remains part of the next step.
-
-## 5. Split Final Visual Rows from Large Vision Scratch
-
-Keep final visual embeddings in a small persistent buffer and release/reuse the large SAM/CLIP scratch before decoder prefill.
-
-Reference grounding:
-- Upstream inserts final image features into token embeddings with `masked_scatter_` during prefill.
-- Images are passed only on prefill; decode receives no image tensors.
-
-Tasks:
-- Allocate final visual rows separately from temporary SAM/CLIP/projector workspace.
-- Write formatted local/global visual rows into the final visual buffer.
-- Release or recycle the large vision scratch once final rows are complete.
-- Bind the final visual buffer directly during prompt assembly.
-- Release final visual rows after prefill when safe.
+Details:
+- Record Release probe output for `base` and `gundam` before code changes.
+- Run probes with enough profile depth to include:
+  - `metal.decode_step`
+  - `metal.decode.layer`
+  - `metal.decode.moe_router`
+  - `metal.decode.moe_shared_experts`
+  - `metal.decode.moe_routed_experts`
+  - `metal.decode.moe_combine`
+  - `metal.decode.command_wait`
+  - `metal.decode.command_encoding`
+- Document current decode MoE dispatch structure:
+  - router logits
+  - router softmax/top-k
+  - shared gate/up
+  - shared down
+  - routed gate/up
+  - routed down
+  - combine routed + shared + residual
+- Distinguish CPU command-encoding time from GPU command-wait time; the per-kernel profile buckets are useful for structure, but `metal.decode.command_wait` carries the batched GPU execution cost.
 
 Acceptance criteria:
-- Live memory after vision and after prefill drops for crop-heavy requests.
-- Prompt assembly still avoids host readback.
-- No extra persistent copy of visual features remains after prefill.
+- Baseline tok/s and MoE profile totals are recorded.
+- Current per-token/per-layer MoE dispatch count is documented.
+- Baseline generated text is saved for parity comparison.
 
-Status:
-- The large per-chunk SAM/CLIP/projector scratch is released after final visual rows are complete and before decoder prompt assembly.
-- Final visual rows are kept in the dedicated final-feature scratch just long enough for GPU prompt assembly and prefill, then released before decode.
-- The prompt assembly path continues to bind the GPU-resident final visual buffer directly.
+Completion notes:
+- Baseline artifacts:
+  - `data.tmp/probes/e2e_base_moe_baseline.json`
+  - `data.tmp/probes/e2e_gundam_moe_baseline.json`
+  - `data.tmp/probes/moe_decoder_baseline.md`
+- Baseline speed:
+  - `base`: 44 generated tokens, 7.122 native tok/s, 654.628 ms decode loop.
+  - `gundam`: 58 generated tokens, 1.509 native tok/s, 1720.646 ms decode loop.
+- Current MoE decode structure: 7 MoE dispatches per MoE layer/token, or `11 * 7 = 77` MoE dispatches per generated token, excluding dense layer 0 and attention.
+- Profile call counts confirm 11 MoE layers per decode iteration: `base` has `43 * 11 = 473` MoE bucket calls; `gundam` has `57 * 11 = 627`.
+- CPU command encoding is small relative to GPU command wait: 0.137 ms vs 626.160 ms (`base`) and 0.267 ms vs 1675.643 ms (`gundam`).
 
-## 6. Defer Decoder Arena Allocation Until After Vision
+## 2. Fuse Routed Down and MoE Combine
 
-Avoid overlapping large vision scratch with decoder-only runtime arenas when possible.
+Status: [x] Completed
 
-Tasks:
-- Allocate or activate KV cache, hidden prompt arena, decoder scratch, MoE scratch, and logits buffers after vision encoding finishes.
-- Keep model views and vision weights available throughout.
-- Preserve existing reuse behavior for text-only generation.
-- Ensure failure paths clean up partially allocated resources.
-
-Acceptance criteria:
-- Peak memory for crop-mode requests drops by avoiding vision/decoder overlap.
-- Text-only and base image requests still initialize correctly.
-- E2E probe passes after Release rebuild.
-
-Status:
-- Metal image generation now releases any existing decoder runtime arenas before vision encoding.
-- Runtime arena allocation is deferred through a callback until after vision chunk scratch has been released.
-- Request memory estimates now model vision and decoder runtime as non-overlapping phases, with final visual rows overlapping prompt assembly/prefill.
-
-## 7. Shrink Decode-Time Scratch After Prefill
-
-Use prompt-sized scratch only for prefill, then switch to one-token decode scratch.
-
-Reference grounding:
-- The decoder prefill processes the full prompt.
-- Decode proceeds one token at a time with a 128-token generated ring over the prompt cache.
-
-Tasks:
-- Keep prompt-sized hidden/decoder/MoE scratch for integrated prefill.
-- After prefill, release or alias prompt-sized scratch to smaller decode scratch where safe.
-- Ensure the KV cache remains `prompt + 128 generated ring` per slot.
-- Keep final-token hidden available for first decode logits.
+Details:
+- Replace the decode-only sequence:
+  - routed down writes routed output
+  - separate combine kernel adds routed + shared + residual
+- With a fused routed-down-combine decode kernel that writes:
+  - `dst = routed_down(top_k experts) + shared_out + residual`
+- Preserve routed accumulation order over ranks and intermediate columns as closely as possible.
+- Preserve existing fp16 behavior by rounding the routed down-projection to fp16 before adding shared expert output and residual.
+- Leave prefill kernels unchanged.
+- Keep the old path behind an internal fallback until parity and performance are verified.
 
 Acceptance criteria:
-- Live memory after prefill drops.
-- KV cache behavior remains aligned with the upstream sliding-window ring.
-- Generation output remains stable.
+- Decode no longer launches `metal.decode.moe_combine` on the default path.
+- Synthetic fused-vs-old kernel test passes within existing fp16 tolerances.
+- `base` and `gundam` E2E output remains stable.
+- Decode command count decreases.
 
-## 8. Keep KV Cache Semantics Aligned with Upstream
+Completion notes:
+- Added `uocr_moe_decode_interleaved_down_sum_combine_f16_to_f16`, which fuses routed down projection with shared/residual combine on the decode path.
+- Preserved fp16 parity with the unfused path by rounding the routed down-projection result to fp16 before adding shared and residual rows.
+- Default decode no longer emits `metal.decode.moe_combine`; the unfused path remains available behind `UOCR_METAL_ENABLE_MOE_FUSED_DOWN_COMBINE=0` at compile time.
+- Added focused diagnostic coverage via `uocr_metal_context_diagnostic_moe_interleaved_experts_combine_f16()` and `UOCR_METAL_TEST_FILTER=moe_interleaved_experts_combine_f16 ./build/test/test_metal`.
+- Final Release probe artifacts:
+  - `data.tmp/probes/e2e_base_moe_fused_down_combine_final.json`
+  - `data.tmp/probes/e2e_gundam_moe_fused_down_combine_final.json`
+  - `data.tmp/probes/moe_fused_down_combine_results.md`
+- Final probe summary:
+  - `base`: text parity true, 44 generated tokens, 7.117 native tok/s, `metal.decode.moe_combine` absent, command encoders `8205 -> 7732`.
+  - `gundam`: text parity true, 58 generated tokens, 1.517 native tok/s, `metal.decode.moe_combine` absent, command encoders `12529 -> 11902`.
 
-Maintain the current standard MHA cache behavior.
+## 3. Add Decode-Only MoE Kernel Variants
 
-Reference grounding:
-- Actual config has `use_mla: false`.
-- The model uses `SlidingWindowLlamaAttention`, not DeepSeek-V2 MLA compressed KV.
-- Prompt tokens remain fully attendable; generated tokens use a 128-token ring.
+Status: [ ] Not started
 
-Tasks:
-- Preserve current `prompt + UOCR_GENERATED_RING_WINDOW` cache sizing.
-- Keep generated ring overwrite semantics unchanged.
-- Avoid implementing MLA/compressed-KV-specific memory changes for this model.
-- Add tests or assertions around prompt length, generated ring length, and decode attention mapping.
-
-Acceptance criteria:
-- KV memory estimates stay consistent with model config.
-- Ring-buffer decode tests continue to pass.
-
-## 9. Update Tests and Probes
-
-Expand validation around the memory-oriented changes.
-
-Tasks:
-- Add unit tests for local/global vision schedule chunking.
-- Add memory-estimate tests for:
-  - base single global view
-  - crop mode with multiple local chunks
-  - local and global workspace shape separation
-  - final visual buffer separated from scratch
-- Add probe fields for scheduled chunk shapes and actual allocation peaks.
-- Keep frontend parity tests grounded in the cached upstream source.
+Details:
+- Add kernels dedicated to `n_tokens == 1` decode rather than reusing prefill kernels.
+- Specialize fixed dimensions via function constants or compile-time constants:
+  - hidden size `1280`
+  - routed experts `64`
+  - top-k `6`
+  - routed intermediate `896`
+  - shared intermediate `1792`
+- Remove prompt-token indexing, dynamic divisions, and generic bounds checks that are unnecessary for decode.
+- Prefer 2D dispatch coordinates for `(rank, output_column)` or `(tile, output_column)` shapes when this avoids hot integer division/modulo.
+- Apply MSL p190-p193 function-constant rules: scalar/vector constants only, specialized at pipeline creation.
 
 Acceptance criteria:
-- C tests and Python tests pass.
-- Probe JSON gives enough detail to explain peak memory changes.
+- Decode path uses decode-specific MoE kernels.
+- Prefill path continues using prompt-sized kernels.
+- Fallback to existing kernels remains available for debugging.
+- `metal.decode.moe_*` profile time is equal or lower.
 
-## 10. Rebuild and Validate Release Path
+## 4. Replace Router Bitonic Sort with Deterministic Top-6 Selection
 
-Validate every native-memory change through the Release Metal path.
+Status: [ ] Not started
 
-Tasks:
-- Reconfigure and rebuild Release:
-  `cmake -S . -B build/release -DCMAKE_BUILD_TYPE=Release -DUOCR_ENABLE_METAL=ON -DUOCR_BUILD_TOOLS=ON -DUOCR_BUILD_TESTS=OFF -DUOCR_METAL_PRECOMPILE=ON && cmake --build build/release -j`
-- Run:
-  `uv run probes/e2e_generation_probe.py --profile base`
-- Run crop-heavy validation:
-  `uv run probes/e2e_generation_probe.py --profile gundam`
-- Restart any notebook/Jupyter kernel after native dylib changes.
+Details:
+- Current router top-k sorts all 64 experts; decode only needs top 6.
+- Implement repeated top-1 selection for six ranks from the 64 softmax probabilities.
+- Preserve tie-break behavior exactly: higher probability wins; equal probability selects lower expert id.
+- Use tuple-like reductions `(score, inverse_expert_id)` rather than score-only `simd_max` when preserving tie-breaks.
+- Use SIMD-group reductions/shuffles where they reduce barriers, but keep all barriers in uniform control flow per MSL p215-p216.
+- Keep softmax probabilities unrenormalized, matching the UnlimitedOCR routing contract.
 
 Acceptance criteria:
-- Release build succeeds.
-- Base E2E probe passes.
-- Gundam E2E probe passes.
-- Memory peak reduction is visible and documented.
+- Router ids and weights match the current bitonic path on deterministic synthetic cases, including equal-score ties.
+- `metal.decode.moe_router` time does not regress.
+- E2E token output remains stable.
+
+## 5. Fuse Decode Router Logits, Softmax, and Top-K
+
+Status: [ ] Not started
+
+Details:
+- For decode, fuse router logits and softmax/top-k into one kernel.
+- Avoid global memory round-trip for full 64-expert logits/probabilities when only top ids and top weights are consumed by routed experts.
+- Stage the single 1280-element hidden vector in threadgroup memory only if it improves reuse enough to justify barrier cost.
+- Consider one threadgroup per router row or a small fixed set of SIMD-groups; keep threadgroup size a multiple of `threads_per_simdgroup`.
+- Preserve softmax max-subtraction, total-sum, probability calculation, and top-k tie-break semantics.
+- Keep the existing two-stage router as a fallback until parity is proven.
+
+Acceptance criteria:
+- Decode router writes top ids/weights directly.
+- Full logits/probs buffer traffic is removed from the default decode router path.
+- Synthetic router parity passes against the current implementation.
+- `base` and `gundam` E2E output remains stable.
+
+## 6. Tile Shared Expert Gate/Up GEMV
+
+Status: [ ] Not started
+
+Details:
+- Optimize shared expert gate/up first because it has one shared MLP per MoE layer and no top-k rank dimension.
+- Current kernels launch one threadgroup per output column; implement tiled output columns per threadgroup.
+- Reuse the single decode hidden vector across a tile of columns.
+- Use vectorized `half4` loads when alignment and multiples permit (`1280` is divisible by 4).
+- Keep all threadgroup-memory staging and barriers uniform.
+- Compare tile sizes such as 4, 8, and 16 columns with profile data.
+
+Acceptance criteria:
+- Shared gate/up threadgroup count is materially reduced.
+- `metal.decode.moe_shared_experts` time decreases without parity drift.
+- Hot-path allocation guard remains clean.
+
+## 7. Tile Routed Expert Gate/Up GEMV
+
+Status: [ ] Not started
+
+Details:
+- Extend the tiled gate/up approach to routed experts after shared expert validation.
+- Shape is `top_k=6` by `expert_intermediate=896` output columns.
+- Use selected expert ids to address the interleaved expert slab.
+- Preserve gate and up dot-product accumulation order per output column as much as practical.
+- Avoid divergent barriers based on expert rank or expert id.
+
+Acceptance criteria:
+- Routed gate/up threadgroup count decreases.
+- `metal.decode.moe_routed_experts` gate/up portion improves in focused profiling.
+- Synthetic selected-expert decode parity passes.
+
+## 8. Tile Routed Down Projection with Final Add
+
+Status: [ ] Not started
+
+Details:
+- Implement tiled down projection for routed experts and keep routed-down-combine fused.
+- For each hidden output tile, accumulate six selected expert down projections weighted by router probabilities.
+- Add shared output and residual before final store.
+- Avoid extra hidden-vector read/write passes.
+- Preserve fp32 accumulation over intermediate columns and top-k ranks as closely as practical.
+
+Acceptance criteria:
+- Routed down and final add remain fused.
+- Down projection threadgroup count decreases.
+- `metal.decode.moe_routed_experts` and total decode step time improve or do not regress.
+- E2E output remains stable.
+
+## 9. Reduce Decode MoE Command Encoding Overhead
+
+Status: [ ] Not started
+
+Details:
+- After kernel fusion/tiled kernels, review command-buffer and encoder count per decoded token.
+- Keep per-token command batching intact and avoid waits between MoE sub-kernels unless data dependencies require a completed command buffer.
+- Reuse pipeline states and function-constant variants from existing caches.
+- Avoid new Objective-C allocation in the decode hot path.
+- Confirm profile events still expose enough detail for regression analysis.
+
+Acceptance criteria:
+- Command encoder count per decoded token decreases or stays flat with faster kernels.
+- `metal.decode.command_wait` and `metal.decode.command_encoding` do not regress.
+- Hot-path allocation guard passes.
+
+## 10. Evaluate Metal 4 TensorOps Prototype Behind Feature Gate
+
+Status: [ ] Not started
+
+Details:
+- Prototype TensorOps/cooperative-tensor matmul only after manual tiled kernels are measured.
+- Feature-gate by OS/GPU support and keep disabled by default until faster and stable.
+- Follow MSL p349-p354 TensorOps rules:
+  - all threads in the execution scope must call TensorOp methods uniformly
+  - TensorOps may use execution-scope barriers
+  - insert required barriers before reading device/threadgroup tensor outputs
+  - keep fallback manual kernels available
+- Prioritize half x half -> float/half combinations supported by the spec for Metal 4.
+
+Acceptance criteria:
+- Unsupported devices use manual kernels.
+- Prototype can be toggled independently for benchmarking.
+- Default E2E path remains stable.
+
+## 11. Add MoE Decoder Tests and Probe Reporting
+
+Status: [ ] Not started
+
+Details:
+- Add tests for router top-k determinism, including equal-score tie cases.
+- Add synthetic old-vs-new tests for fused routed-down-combine.
+- Add decode-only selected-expert tests with fixed `top_k=6` and interleaved expert-slab addressing.
+- Expand probe/profile reporting or saved benchmark notes to summarize MoE dispatch counts and event totals.
+- Keep test tensors fp16 and aligned with model constants.
+
+Acceptance criteria:
+- C/Metal tests cover router selection and fused routed-down-combine behavior.
+- Probe output or benchmark notes explain the speed delta from each optimization step.
+- Release E2E probes pass after every native-code change.

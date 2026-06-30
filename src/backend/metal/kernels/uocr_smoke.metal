@@ -3242,6 +3242,43 @@ kernel void uocr_moe_prefill_interleaved_down_sum_f16_to_f16(device const half *
     }
 }
 
+[[max_total_threads_per_threadgroup(256)]] kernel void uocr_moe_decode_interleaved_down_sum_combine_f16_to_f16(device const half *mid [[buffer(0)]],
+                                                                                                                device const uint *top_expert_ids [[buffer(1)]],
+                                                                                                                device const float *top_weights [[buffer(2)]],
+                                                                                                                device const half *expert_slab [[buffer(3)]],
+                                                                                                                device const half *shared [[buffer(4)]],
+                                                                                                                device const half *residual [[buffer(5)]],
+                                                                                                                device half *dst [[buffer(6)]],
+                                                                                                                constant UocrMoePrefillInterleavedParams &params [[buffer(7)]],
+                                                                                                                threadgroup float *partials [[threadgroup(0)]],
+                                                                                                                uint output_index [[threadgroup_position_in_grid]],
+                                                                                                                uint tid [[thread_index_in_threadgroup]],
+                                                                                                                uint ntg [[threads_per_threadgroup]],
+                                                                                                                uint simd_width [[threads_per_simdgroup]]) {
+    const uint token = output_index / params.hidden_size;
+    const uint out_col = output_index - token * params.hidden_size;
+    if (token >= params.n_tokens || out_col >= params.hidden_size) {
+        return;
+    }
+    const float routed_value = uocr_moe_prefill_interleaved_down_dot_f16(mid,
+                                                                         top_expert_ids,
+                                                                         top_weights,
+                                                                         expert_slab,
+                                                                         params,
+                                                                         token,
+                                                                         out_col,
+                                                                         tid,
+                                                                         ntg,
+                                                                         simd_width,
+                                                                         partials);
+    if (tid == 0) {
+        // Preserve the existing fp16 behavior of the unfused path: routed down
+        // projection is rounded to half before MoE combine reads it back.
+        const float routed = float(half(routed_value));
+        dst[output_index] = half(routed + float(shared[output_index]) + float(residual[output_index]));
+    }
+}
+
 kernel void uocr_moe_prefill_interleaved_down_sum_f16_to_f32(device const half *mid [[buffer(0)]],
                                                              device const uint *top_expert_ids [[buffer(1)]],
                                                              device const float *top_weights [[buffer(2)]],

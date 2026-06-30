@@ -39,6 +39,9 @@
 #define UOCR_METAL_MPS_MATMUL_SKINNY_OUT_FEATURES 128u
 #define UOCR_METAL_MPS_MATMUL_SKINNY_MIN_FLOPS 64000000ULL
 #define UOCR_METAL_MPS_MATMUL_MIN_FLOPS_ENV "UOCR_METAL_MPS_MATMUL_MIN_FLOPS"
+#ifndef UOCR_METAL_ENABLE_MOE_FUSED_DOWN_COMBINE
+#define UOCR_METAL_ENABLE_MOE_FUSED_DOWN_COMBINE 1
+#endif
 #define UOCR_METAL_FLASH_Q_PER_TG 4u
 #define UOCR_METAL_FLASH_MAX_LANE_VALUES 4u
 #define UOCR_METAL_HALF4_WIDTH 4u
@@ -8210,6 +8213,7 @@ static int metal_prewarm_integrated_decoder_pipelines(uocr_metal_context *ctx, c
         { "uocr_moe_router_softmax_topk_f32", 1 },
         { "uocr_moe_prefill_interleaved_gate_up_f16", 0 },
         { "uocr_moe_prefill_interleaved_down_sum_f16_to_f16", 0 },
+        { "uocr_moe_decode_interleaved_down_sum_combine_f16_to_f16", 0 },
         { "uocr_moe_combine_f16_to_f16", 1 },
     };
     @autoreleasepool {
@@ -11598,6 +11602,94 @@ static int metal_run_moe_interleaved_buffer_f16(uocr_metal_context *ctx,
     }
 }
 
+static int metal_run_moe_interleaved_decode_fused_combine_buffer_f16(uocr_metal_context *ctx,
+                                                                     uocr_metal_buffer_slice input,
+                                                                     uocr_metal_buffer_slice top_ids,
+                                                                     uocr_metal_buffer_slice top_weights,
+                                                                     uocr_metal_buffer_slice expert_slab,
+                                                                     uint32_t n_tokens,
+                                                                     uocr_metal_buffer_slice mid,
+                                                                     uocr_metal_buffer_slice shared,
+                                                                     uocr_metal_buffer_slice residual,
+                                                                     uocr_metal_buffer_slice dst,
+                                                                     char *error,
+                                                                     size_t error_size) {
+    const uint64_t hidden_bytes = (uint64_t)n_tokens * (uint64_t)UOCR_HIDDEN_SIZE * 2u;
+    const uint64_t top_ids_bytes = (uint64_t)n_tokens * (uint64_t)UOCR_MOE_TOP_K * sizeof(uint32_t);
+    const uint64_t top_weights_bytes = (uint64_t)n_tokens * (uint64_t)UOCR_MOE_TOP_K * sizeof(float);
+    const uint64_t mid_bytes = (uint64_t)n_tokens * (uint64_t)UOCR_MOE_TOP_K * (uint64_t)UOCR_MOE_EXPERT_INTERMEDIATE * 2u;
+    const uint64_t projection_values = (uint64_t)UOCR_MOE_EXPERT_INTERMEDIATE * (uint64_t)UOCR_HIDDEN_SIZE;
+    const uint64_t slab_bytes = projection_values * 2u * 3u * (uint64_t)UOCR_ROUTED_EXPERTS;
+    uint64_t gate_values = (uint64_t)n_tokens * (uint64_t)UOCR_MOE_TOP_K * (uint64_t)UOCR_MOE_EXPERT_INTERMEDIATE;
+    uint64_t down_values = (uint64_t)n_tokens * (uint64_t)UOCR_HIDDEN_SIZE;
+    if (ctx == NULL || n_tokens == 0u || gate_values > UINT32_MAX || down_values > UINT32_MAX ||
+        !metal_slice_valid(input, hidden_bytes) || !metal_slice_valid(top_ids, top_ids_bytes) ||
+        !metal_slice_valid(top_weights, top_weights_bytes) || !metal_slice_valid(expert_slab, slab_bytes) ||
+        !metal_slice_valid(mid, mid_bytes) || !metal_slice_valid(shared, hidden_bytes) ||
+        !metal_slice_valid(residual, hidden_bytes) || !metal_slice_valid(dst, hidden_bytes)) {
+        return metal_fail(error, error_size, "invalid integrated routed MoE fused-combine request");
+    }
+    @autoreleasepool {
+        id<MTLComputePipelineState> gate_pipeline = metal_get_pipeline(ctx, "uocr_moe_prefill_interleaved_gate_up_f16", error, error_size);
+        id<MTLComputePipelineState> down_combine_pipeline = metal_get_pipeline(ctx,
+                                                                               "uocr_moe_decode_interleaved_down_sum_combine_f16_to_f16",
+                                                                               error,
+                                                                               error_size);
+        if (gate_pipeline == nil || down_combine_pipeline == nil) {
+            return 0;
+        }
+        int owned_command_buffer = 0;
+        id<MTLCommandBuffer> cb = metal_command_buffer_for_op(ctx, &owned_command_buffer, "integrated routed MoE fused combine", error, error_size);
+        if (cb == nil) {
+            return 0;
+        }
+        uocr_metal_moe_prefill_interleaved_params params;
+        params.n_tokens = n_tokens;
+        params.hidden_size = UOCR_HIDDEN_SIZE;
+        params.intermediate_size = UOCR_MOE_EXPERT_INTERMEDIATE;
+        params.expert_count = UOCR_ROUTED_EXPERTS;
+        params.top_k = UOCR_MOE_TOP_K;
+        params.expert_stride_values = (uint32_t)(projection_values * 3u);
+        params.up_offset_values = (uint32_t)projection_values;
+        params.down_offset_values = (uint32_t)(projection_values * 2u);
+        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
+        if (enc == nil) {
+            return metal_fail(error, error_size, "failed to create integrated routed MoE fused gate/up encoder");
+        }
+        const NSUInteger gate_threads = metal_power2_threadgroup_width(256u, gate_pipeline.maxTotalThreadsPerThreadgroup);
+        [enc setComputePipelineState:gate_pipeline];
+        [enc setBuffer:input.buffer offset:input.offset atIndex:0u];
+        [enc setBuffer:top_ids.buffer offset:top_ids.offset atIndex:1u];
+        [enc setBuffer:expert_slab.buffer offset:expert_slab.offset atIndex:2u];
+        [enc setBuffer:mid.buffer offset:mid.offset atIndex:3u];
+        [enc setBytes:&params length:sizeof(params) atIndex:4u];
+        [enc setThreadgroupMemoryLength:gate_threads * 2u * sizeof(float) atIndex:0u];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)gate_values, 1u, 1u)
+             threadsPerThreadgroup:MTLSizeMake(gate_threads, 1u, 1u)];
+        [enc endEncoding];
+
+        enc = metal_compute_command_encoder(ctx, cb);
+        if (enc == nil) {
+            return metal_fail(error, error_size, "failed to create integrated routed MoE fused down/combine encoder");
+        }
+        const NSUInteger down_threads = metal_power2_threadgroup_width(256u, down_combine_pipeline.maxTotalThreadsPerThreadgroup);
+        [enc setComputePipelineState:down_combine_pipeline];
+        [enc setBuffer:mid.buffer offset:mid.offset atIndex:0u];
+        [enc setBuffer:top_ids.buffer offset:top_ids.offset atIndex:1u];
+        [enc setBuffer:top_weights.buffer offset:top_weights.offset atIndex:2u];
+        [enc setBuffer:expert_slab.buffer offset:expert_slab.offset atIndex:3u];
+        [enc setBuffer:shared.buffer offset:shared.offset atIndex:4u];
+        [enc setBuffer:residual.buffer offset:residual.offset atIndex:5u];
+        [enc setBuffer:dst.buffer offset:dst.offset atIndex:6u];
+        [enc setBytes:&params length:sizeof(params) atIndex:7u];
+        [enc setThreadgroupMemoryLength:down_threads * sizeof(float) atIndex:0u];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)down_values, 1u, 1u)
+             threadsPerThreadgroup:MTLSizeMake(down_threads, 1u, 1u)];
+        [enc endEncoding];
+        return metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, "integrated routed MoE fused combine", error, error_size);
+    }
+}
+
 static int metal_run_moe_combine_buffer_f16(uocr_metal_context *ctx,
                                             uocr_metal_buffer_slice routed,
                                             uocr_metal_buffer_slice shared,
@@ -11906,6 +11998,21 @@ static int metal_run_decoder_decode_one_f16(uocr_metal_context *ctx,
             if (!metal_moe_intermediate_slice(ctx, slot, routed_mid_bytes, &mid)) {
                 return metal_fail(error, error_size, "integrated decode MoE routed intermediate slice is invalid");
             }
+#if UOCR_METAL_ENABLE_MOE_FUSED_DOWN_COMBINE
+            RUN_DECODE_TIMED("metal.decode.moe_routed_experts",
+                             metal_run_moe_interleaved_decode_fused_combine_buffer_f16(ctx,
+                                                                                       norm,
+                                                                                       top_ids,
+                                                                                       top_weights,
+                                                                                       expert_slab,
+                                                                                       1u,
+                                                                                       mid,
+                                                                                       v,
+                                                                                       q,
+                                                                                       output,
+                                                                                       error,
+                                                                                       error_size));
+#else
             RUN_DECODE_TIMED("metal.decode.moe_routed_experts",
                              metal_run_moe_interleaved_buffer_f16(ctx,
                                                                   norm,
@@ -11920,6 +12027,7 @@ static int metal_run_decoder_decode_one_f16(uocr_metal_context *ctx,
                                                                   error_size));
             RUN_DECODE_TIMED("metal.decode.moe_combine",
                              metal_run_moe_combine_buffer_f16(ctx, current, v, q, 1u, output, error, error_size));
+#endif
         }
 
         current = output;
@@ -23389,6 +23497,292 @@ int uocr_metal_context_diagnostic_moe_selected_experts_prefill_f16(uocr_metal_co
         [down_weight release];
         [up_weight release];
         [gate_weight release];
+        [top_weights release];
+        [top_ids release];
+        [input release];
+        if (!ok) {
+            return 0;
+        }
+    }
+
+    metal_clear_error(error, error_size);
+    return 1;
+}
+
+int uocr_metal_context_diagnostic_moe_interleaved_experts_combine_f16(uocr_metal_context *ctx,
+                                                           const uint16_t *input_f16,
+                                                           const uint32_t *top_expert_ids,
+                                                           const float *top_weights_f32,
+                                                           const uint16_t *expert_gate_weight_f16,
+                                                           const uint16_t *expert_up_weight_f16,
+                                                           const uint16_t *expert_down_weight_f16,
+                                                           const uint16_t *shared_f16,
+                                                           const uint16_t *residual_f16,
+                                                           uint32_t n_tokens,
+                                                           uint32_t hidden_size,
+                                                           uint32_t intermediate_size,
+                                                           uint32_t expert_count,
+                                                           uint32_t top_k,
+                                                           uint16_t *out_f16,
+                                                           char *error,
+                                                           size_t error_size) {
+    metal_clear_error(error, error_size);
+    if (ctx == NULL || input_f16 == NULL || top_expert_ids == NULL || top_weights_f32 == NULL ||
+        expert_gate_weight_f16 == NULL || expert_up_weight_f16 == NULL || expert_down_weight_f16 == NULL ||
+        shared_f16 == NULL || residual_f16 == NULL || out_f16 == NULL || n_tokens == 0u || hidden_size == 0u ||
+        intermediate_size == 0u || expert_count == 0u || top_k == 0u) {
+        return metal_fail(error, error_size, "invalid Metal MoE fused-combine request");
+    }
+    if (top_k > expert_count) {
+        return metal_fail(error, error_size, "Metal MoE fused-combine top_k exceeds expert_count");
+    }
+    for (uint32_t token = 0u; token < n_tokens; ++token) {
+        for (uint32_t rank = 0u; rank < top_k; ++rank) {
+            const uint32_t expert = top_expert_ids[token * top_k + rank];
+            if (expert >= expert_count) {
+                return metal_fail(error,
+                                  error_size,
+                                  "invalid Metal MoE fused-combine expert id %u at token %u rank %u",
+                                  expert,
+                                  token,
+                                  rank);
+            }
+            for (uint32_t prev = 0u; prev < rank; ++prev) {
+                if (top_expert_ids[token * top_k + prev] == expert) {
+                    return metal_fail(error,
+                                      error_size,
+                                      "duplicate Metal MoE fused-combine expert id %u at token %u",
+                                      expert,
+                                      token);
+                }
+            }
+            if (!isfinite(top_weights_f32[token * top_k + rank])) {
+                return metal_fail(error,
+                                  error_size,
+                                  "invalid Metal MoE fused-combine expert weight at token %u rank %u",
+                                  token,
+                                  rank);
+            }
+        }
+    }
+
+    uint64_t input_values = 0u;
+    uint64_t input_bytes = 0u;
+    uint64_t top_values = 0u;
+    uint64_t top_ids_bytes = 0u;
+    uint64_t top_weights_bytes = 0u;
+    uint64_t projection_values = 0u;
+    uint64_t weight_values = 0u;
+    uint64_t weight_bytes = 0u;
+    uint64_t slab_values = 0u;
+    uint64_t slab_bytes = 0u;
+    uint64_t mid_values = 0u;
+    uint64_t mid_bytes = 0u;
+    uint64_t output_values = 0u;
+    uint64_t output_bytes = 0u;
+    uint64_t gate_groups = 0u;
+    if (!checked_mul_u64((uint64_t)n_tokens, (uint64_t)hidden_size, &input_values) ||
+        !checked_mul_u64(input_values, 2u, &input_bytes) ||
+        !checked_mul_u64((uint64_t)n_tokens, (uint64_t)top_k, &top_values) ||
+        !checked_mul_u64(top_values, (uint64_t)sizeof(uint32_t), &top_ids_bytes) ||
+        !checked_mul_u64(top_values, (uint64_t)sizeof(float), &top_weights_bytes) ||
+        !checked_mul_u64((uint64_t)intermediate_size, (uint64_t)hidden_size, &projection_values) ||
+        !checked_mul_u64((uint64_t)expert_count, projection_values, &weight_values) ||
+        !checked_mul_u64(weight_values, 2u, &weight_bytes) ||
+        !checked_mul_u64(weight_values, 3u, &slab_values) ||
+        !checked_mul_u64(slab_values, 2u, &slab_bytes) ||
+        !checked_mul_u64(top_values, (uint64_t)intermediate_size, &mid_values) ||
+        !checked_mul_u64(mid_values, 2u, &mid_bytes) ||
+        !checked_mul_u64((uint64_t)n_tokens, (uint64_t)hidden_size, &output_values) ||
+        !checked_mul_u64(output_values, 2u, &output_bytes) ||
+        !checked_mul_u64(top_values, (uint64_t)intermediate_size, &gate_groups)) {
+        return metal_fail(error, error_size, "Metal MoE fused-combine byte-size overflow");
+    }
+
+    const uint64_t max_buffer_length = metal_device_max_buffer_length(ctx->device);
+    if (input_bytes > max_buffer_length || top_ids_bytes > max_buffer_length || top_weights_bytes > max_buffer_length ||
+        weight_bytes > max_buffer_length || slab_bytes > max_buffer_length || mid_bytes > max_buffer_length ||
+        output_bytes > max_buffer_length || input_bytes > (uint64_t)SIZE_MAX || top_ids_bytes > (uint64_t)SIZE_MAX ||
+        top_weights_bytes > (uint64_t)SIZE_MAX || weight_bytes > (uint64_t)SIZE_MAX ||
+        slab_bytes > (uint64_t)SIZE_MAX || mid_bytes > (uint64_t)SIZE_MAX || output_bytes > (uint64_t)SIZE_MAX ||
+        projection_values > (uint64_t)UINT32_MAX || slab_values > (uint64_t)UINT32_MAX ||
+        gate_groups > (uint64_t)UINT32_MAX || output_values > (uint64_t)UINT32_MAX) {
+        return metal_fail(error,
+                          error_size,
+                          "Metal MoE fused-combine buffers exceed maxBufferLength %llu",
+                          (unsigned long long)max_buffer_length);
+    }
+
+    @autoreleasepool {
+        id<MTLComputePipelineState> gate_up_pipeline = metal_get_pipeline(ctx,
+                                                                          "uocr_moe_prefill_interleaved_gate_up_f16",
+                                                                          error,
+                                                                          error_size);
+        if (gate_up_pipeline == nil) {
+            return 0;
+        }
+        id<MTLComputePipelineState> down_combine_pipeline = metal_get_pipeline(ctx,
+                                                                               "uocr_moe_decode_interleaved_down_sum_combine_f16_to_f16",
+                                                                               error,
+                                                                               error_size);
+        if (down_combine_pipeline == nil) {
+            return 0;
+        }
+
+        int ok = 0;
+        id<MTLBuffer> input = nil;
+        id<MTLBuffer> top_ids = nil;
+        id<MTLBuffer> top_weights = nil;
+        id<MTLBuffer> expert_slab = nil;
+        id<MTLBuffer> shared = nil;
+        id<MTLBuffer> residual = nil;
+        id<MTLBuffer> mid = nil;
+        id<MTLBuffer> dst = nil;
+
+        input = metal_new_buffer_with_bytes(ctx, input_f16, (NSUInteger)input_bytes, MTLResourceStorageModeShared);
+        if (input == nil) {
+            (void)metal_fail(error, error_size, "failed to allocate Metal MoE fused-combine input buffer");
+            goto cleanup;
+        }
+        input.label = @"uocr_moe_fused_input_f16";
+
+        top_ids = metal_new_buffer_with_bytes(ctx, top_expert_ids, (NSUInteger)top_ids_bytes, MTLResourceStorageModeShared);
+        if (top_ids == nil) {
+            (void)metal_fail(error, error_size, "failed to allocate Metal MoE fused-combine top-id buffer");
+            goto cleanup;
+        }
+        top_ids.label = @"uocr_moe_fused_top_ids_u32";
+
+        top_weights = metal_new_buffer_with_bytes(ctx, top_weights_f32, (NSUInteger)top_weights_bytes, MTLResourceStorageModeShared);
+        if (top_weights == nil) {
+            (void)metal_fail(error, error_size, "failed to allocate Metal MoE fused-combine top-weight buffer");
+            goto cleanup;
+        }
+        top_weights.label = @"uocr_moe_fused_top_weights_f32";
+
+        expert_slab = metal_new_buffer_with_length(ctx, (NSUInteger)slab_bytes, MTLResourceStorageModeShared);
+        if (expert_slab == nil) {
+            (void)metal_fail(error, error_size, "failed to allocate Metal MoE fused-combine expert slab");
+            goto cleanup;
+        }
+        expert_slab.label = @"uocr_moe_fused_expert_slab_f16";
+        uint16_t *slab_ptr = (uint16_t *)[expert_slab contents];
+        const size_t projection_bytes = (size_t)(projection_values * 2u);
+        const uint64_t expert_stride_values = projection_values * 3u;
+        for (uint32_t expert = 0u; expert < expert_count; ++expert) {
+            const uint64_t src_base = (uint64_t)expert * projection_values;
+            const uint64_t dst_base = (uint64_t)expert * expert_stride_values;
+            memcpy(slab_ptr + dst_base,
+                   expert_gate_weight_f16 + src_base,
+                   projection_bytes);
+            memcpy(slab_ptr + dst_base + projection_values,
+                   expert_up_weight_f16 + src_base,
+                   projection_bytes);
+            memcpy(slab_ptr + dst_base + 2u * projection_values,
+                   expert_down_weight_f16 + src_base,
+                   projection_bytes);
+        }
+
+        shared = metal_new_buffer_with_bytes(ctx, shared_f16, (NSUInteger)output_bytes, MTLResourceStorageModeShared);
+        if (shared == nil) {
+            (void)metal_fail(error, error_size, "failed to allocate Metal MoE fused-combine shared buffer");
+            goto cleanup;
+        }
+        shared.label = @"uocr_moe_fused_shared_f16";
+
+        residual = metal_new_buffer_with_bytes(ctx, residual_f16, (NSUInteger)output_bytes, MTLResourceStorageModeShared);
+        if (residual == nil) {
+            (void)metal_fail(error, error_size, "failed to allocate Metal MoE fused-combine residual buffer");
+            goto cleanup;
+        }
+        residual.label = @"uocr_moe_fused_residual_f16";
+
+        mid = metal_new_buffer_with_length(ctx, (NSUInteger)mid_bytes, MTLResourceStorageModeShared);
+        if (mid == nil) {
+            (void)metal_fail(error, error_size, "failed to allocate Metal MoE fused-combine intermediate buffer");
+            goto cleanup;
+        }
+        mid.label = @"uocr_moe_fused_mid_f16";
+        memset([mid contents], 0, (size_t)mid_bytes);
+
+        dst = metal_new_buffer_with_length(ctx, (NSUInteger)output_bytes, MTLResourceStorageModeShared);
+        if (dst == nil) {
+            (void)metal_fail(error, error_size, "failed to allocate Metal MoE fused-combine output buffer");
+            goto cleanup;
+        }
+        dst.label = @"uocr_moe_fused_output_f16";
+        memset([dst contents], 0, (size_t)output_bytes);
+
+        id<MTLCommandBuffer> cb = metal_new_command_buffer(ctx);
+        if (cb == nil) {
+            (void)metal_fail(error, error_size, "failed to create Metal MoE fused-combine command buffer");
+            goto cleanup;
+        }
+        cb.label = @"uocr_moe_fused_command_buffer";
+
+        uocr_metal_moe_prefill_interleaved_params params;
+        params.n_tokens = n_tokens;
+        params.hidden_size = hidden_size;
+        params.intermediate_size = intermediate_size;
+        params.expert_count = expert_count;
+        params.top_k = top_k;
+        params.expert_stride_values = (uint32_t)expert_stride_values;
+        params.up_offset_values = (uint32_t)projection_values;
+        params.down_offset_values = (uint32_t)(projection_values * 2u);
+
+        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
+        if (enc == nil) {
+            (void)metal_fail(error, error_size, "failed to create Metal MoE fused-combine gate/up command encoder");
+            goto cleanup;
+        }
+        const NSUInteger gate_threads = metal_power2_threadgroup_width(256u, gate_up_pipeline.maxTotalThreadsPerThreadgroup);
+        [enc setComputePipelineState:gate_up_pipeline];
+        [enc setBuffer:input offset:0u atIndex:0u];
+        [enc setBuffer:top_ids offset:0u atIndex:1u];
+        [enc setBuffer:expert_slab offset:0u atIndex:2u];
+        [enc setBuffer:mid offset:0u atIndex:3u];
+        [enc setBytes:&params length:sizeof(params) atIndex:4u];
+        [enc setThreadgroupMemoryLength:gate_threads * 2u * sizeof(float) atIndex:0u];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)gate_groups, 1u, 1u)
+             threadsPerThreadgroup:MTLSizeMake(gate_threads, 1u, 1u)];
+        [enc endEncoding];
+
+        enc = metal_compute_command_encoder(ctx, cb);
+        if (enc == nil) {
+            (void)metal_fail(error, error_size, "failed to create Metal MoE fused-combine down/combine command encoder");
+            goto cleanup;
+        }
+        const NSUInteger down_threads = metal_power2_threadgroup_width(256u, down_combine_pipeline.maxTotalThreadsPerThreadgroup);
+        [enc setComputePipelineState:down_combine_pipeline];
+        [enc setBuffer:mid offset:0u atIndex:0u];
+        [enc setBuffer:top_ids offset:0u atIndex:1u];
+        [enc setBuffer:top_weights offset:0u atIndex:2u];
+        [enc setBuffer:expert_slab offset:0u atIndex:3u];
+        [enc setBuffer:shared offset:0u atIndex:4u];
+        [enc setBuffer:residual offset:0u atIndex:5u];
+        [enc setBuffer:dst offset:0u atIndex:6u];
+        [enc setBytes:&params length:sizeof(params) atIndex:7u];
+        [enc setThreadgroupMemoryLength:down_threads * sizeof(float) atIndex:0u];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)output_values, 1u, 1u)
+             threadsPerThreadgroup:MTLSizeMake(down_threads, 1u, 1u)];
+        [enc endEncoding];
+
+        UOCR_METAL_COMMIT_AND_WAIT_PROFILED(ctx, cb);
+        if (cb.status == MTLCommandBufferStatusError) {
+            NSString *description = cb.error != nil ? [cb.error localizedDescription] : @"unknown command-buffer error";
+            (void)metal_fail(error, error_size, "Metal MoE fused-combine command failed: %s", [description UTF8String]);
+            goto cleanup;
+        }
+
+        memcpy(out_f16, [dst contents], (size_t)output_bytes);
+        ok = 1;
+
+    cleanup:
+        [dst release];
+        [mid release];
+        [residual release];
+        [shared release];
+        [expert_slab release];
         [top_weights release];
         [top_ids release];
         [input release];
