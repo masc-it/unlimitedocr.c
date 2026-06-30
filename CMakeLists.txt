@@ -92,7 +92,6 @@ add_library(uocr_core STATIC
     src/core/uocr_alloc.c
     src/core/uocr_result.c
     src/model/uocr_model_file.c
-    src/quant/uocr_quant.c
     src/runtime/uocr_logits_processor.c
     src/runtime/uocr_memory.c
     src/runtime/uocr_profile.c
@@ -262,15 +261,6 @@ if(UOCR_BUILD_TESTS)
     uocr_apply_common_warnings(test_memory)
     uocr_apply_sanitizers(test_memory)
     add_test(NAME uocr_memory COMMAND test_memory)
-
-    add_executable(test_quant tests/test_quant.c)
-    target_include_directories(test_quant PRIVATE
-        "${CMAKE_CURRENT_SOURCE_DIR}/include"
-        "${CMAKE_CURRENT_SOURCE_DIR}/src")
-    target_link_libraries(test_quant PRIVATE uocr_core)
-    uocr_apply_common_warnings(test_quant)
-    uocr_apply_sanitizers(test_quant)
-    add_test(NAME uocr_quant COMMAND test_quant)
 
     add_executable(test_result tests/test_result.c)
     target_include_directories(test_result PRIVATE

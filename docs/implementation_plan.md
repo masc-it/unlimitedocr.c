@@ -1,110 +1,114 @@
-# Metal fp16 kernel implementation plan
+# Quantization cleanup plan
 
-Reference: `data.tmp/reference/Metal-Shading-Language-Specification.pdf`
+## Production status
 
-## 1. Make flash attention SIMD-width correct
+Runtime generation is already effectively **fp16-only**:
+- `src/core/uocr_api.c`
+  - rejects non-`UOCR_QPROFILE_FP16` for Metal text/image generation.
 
-**Goal:** Remove the hard dependency on 32-wide SIMD groups while preserving the fast path on current Apple GPUs.
+So most quant code is converter/planning, metadata validation, diagnostics, tests, and tools.
 
-**Details:**
-- Audit all flash-attention kernels using `UOCR_FLASH_SIMD_WIDTH 32u`.
-- Add host-side validation against `pipeline.threadExecutionWidth` for current kernels.
-- Either fail clearly on non-32 SIMD width or add an adaptive kernel path using `threads_per_simdgroup`.
+## Main removal targets
 
-**Implementation:**
-- [x] Remove hardcoded 32-wide flash-attention dispatches; derive threadgroup size from `pipeline.threadExecutionWidth`.
-- [x] Replace misleading `maxTotalThreadsPerThreadgroup`-only checks.
-- [x] Add diagnostics for unsupported SIMD width/head-dim combinations.
+### C quant layer
+- `src/quant/uocr_quant.c`
+- `src/quant/uocr_quant.h`
+- `src/quant/README.md`
+- CMake entries:
+  - `src/quant/uocr_quant.c`
+  - `test_quant`
 
-## 2. Replace threadgroup tree reductions with SIMD-group reductions
+### Model format / metadata
+- `src/model/uocr_format.h`
+  - `UOCR_QPROFILE_DYN_Q8`
+  - `UOCR_QPROFILE_DYN_Q4`
+  - `UOCR_TENSOR_Q8_0`
+  - `UOCR_TENSOR_Q4_K`
+  - `UOCR_TENSOR_PADDED_Q4_K`
+  - `UOCR_TENSOR_Q2_K`
+  - `UOCR_TENSOR_IQ2_XXS`
+  - quant reason/promotion enums if no longer useful
+- `src/model/uocr_model_file.c`
+  - quant type naming
+  - quant metadata validation via `uocr_quant_*`
+  - should become simple fp16-only validation.
 
-**Goal:** Reduce barriers, threadgroup memory use, and latency in fp16/fp32 reductions.
+### Metal kernels
+In `src/backend/metal/kernels/uocr_smoke.metal`:
+- helpers:
+  - `uocr_q8_0_load_value`
+  - `uocr_q4_k_get_scale_min`
+  - `uocr_q4_k_load_value`
+- kernels:
+  - `uocr_get_rows_q8_0_to_f16`
+  - `uocr_get_rows_q8_0_to_f32`
+  - `uocr_dense_q8_0_to_f16`
+  - `uocr_dense_q8_0_to_f32`
+  - `uocr_dense_q4_k_to_f16`
+  - `uocr_dense_q4_k_to_f32`
+  - `uocr_dense_swiglu_gate_up_q8_0`
+  - `uocr_moe_selected_gate_up_q4_k`
+  - `uocr_moe_selected_down_sum_q8_0_to_f16/f32`
+  - `uocr_moe_selected_down_sum_q4_k_to_f16/f32`
+  - `uocr_moe_prefill_selected_gate_up_q4_k`
+  - `uocr_moe_prefill_selected_down_sum_q8_0_to_f16/f32`
+  - `uocr_moe_prefill_selected_down_sum_q4_k_to_f16/f32`
 
-**Details:**
-- Prefer `simd_sum`, `simd_max`, and SIMD shuffle/reduction APIs for per-SIMD reductions.
-- Use threadgroup memory only to combine per-SIMD partials when needed.
-- Use correct active-lane handling for partial SIMD groups.
-- Target dense dots, norm kernels, router/top-k, argmax, and attention fallback reductions.
+### Metal diagnostic API
+- `src/backend/metal/uocr_metal.h`
+- `src/backend/metal/uocr_metal.m`
 
-**Implementation:**
-- [x] Add shared SIMD reduction helpers in the Metal source.
-- [x] Convert dense/norm reductions first.
-- [x] Convert router/top-k and argmax reductions.
-- [x] Benchmark barrier count and runtime before/after.
+Remove diagnostic functions for:
+- Q8 get rows
+- Q8/Q4 dense
+- Q8 shared experts
+- Q4 selected experts decode/prefill
+- Q4+Q8 fallback
+- padded Q4 paths
 
-## 3. Prefer optimized MPS/MPP matmul for large fp16 GEMMs
+### Python converter
+- `src/unlimitedocr_c/convert.py`
+  - remove `--qprofile dyn-q8/dyn-q4`
+  - remove Q8 packer
+  - remove Q4 planning/hazard logic
+  - keep only fp16 conversion.
 
-**Goal:** Ensure large fp16 matrix multiplies use Apple-tuned primitives instead of slow scalar custom kernels.
+### Quant parity/calibration tooling
+Likely removable:
+- `src/unlimitedocr_c/calibrate.py`
+- `src/unlimitedocr_c/drift.py`
+- quant parts of `src/unlimitedocr_c/parity_thresholds.py`
+- exports in `src/unlimitedocr_c/__init__.py`
+- tools:
+  - `tools/uocr-calibrate`
+  - `tools/uocr-drift`
 
-**Details:**
-- Current MPSNDArray matmul usage is directionally correct.
-- Revisit `UOCR_METAL_MPS_MATMUL_MIN_FLOPS`; the fallback one-output-per-threadgroup GEMM is not competitive for many shapes.
-- For Metal 4+ targets, evaluate MPP TensorOps `matmul2d`; keep MPSNDArray fallback for broader OS support.
-- The MPP prototype is opt-in behind `UOCR_METAL_ENABLE_MPP_TENSOROPS`; default builds keep MPSNDArray.
-- Respect TensorOps execution-scope rules: all threads in the selected scope must call `run`, and explicit barriers are needed before reading device/threadgroup tensor outputs.
+Keep `parity.py` only if still useful for fp16 diagnostics.
 
-**Implementation:**
-- [x] Benchmark MPS threshold across representative decoder/vision GEMMs.
-- [x] Lower or autotune `UOCR_METAL_MPS_MATMUL_MIN_FLOPS`.
-- [x] Add a feature-gated MPP TensorOps prototype for Metal 4+.
-- [x] Keep current MPSNDArray path as default portable optimized path.
+### Tests
+Remove/simplify:
+- `tests/test_quant.c`
+- quant sections of:
+  - `tests/test_convert.py`
+  - `tests/test_metal.c`
+  - `tests/test_uocr_model_file.c`
+- likely remove:
+  - `tests/test_calibrate.py`
+  - `tests/test_drift.py`
+  - quant-specific parts of `tests/test_parity_thresholds.py`
 
-## 4. Vectorize fp16 memory-bound kernels
+### Reference/vendor quant files
+Likely removable if no longer needed:
+- `data/ds4/gguf-tools/quants.c`
+- `data/ds4/gguf-tools/quants.h`
+- `data/ds4/gguf-tools/deepseek4-quantize.c`
 
-**Goal:** Improve bandwidth efficiency for simple fp16 elementwise/copy kernels.
+## Suggested cleanup order
 
-**Details:**
-- Use `half2`/`half4` vector loads and stores where buffers are aligned and widths are multiples of 2/4.
-- Keep scalar tail handling for odd sizes.
-- Target residual adds, bias adds, KV-cache writes, prompt assembly, row copies, and format/concat kernels.
-
-**Implementation:**
-- [x] Identify kernels with contiguous fp16 loads/stores and minimal arithmetic.
-- [x] Add `half4` fast paths with scalar tails.
-- [x] Validate alignment assumptions against Metal buffer offsets.
-- [x] Benchmark memory bandwidth and end-to-end latency.
-
-## 5. Make Metal math mode explicit
-
-**Goal:** Make fp16/fp32 numerical-performance tradeoffs intentional and reproducible.
-
-**Details:**
-- Runtime compilation now sets `MTLCompileOptions` math mode explicitly; precompile passes matching `metal` flags.
-- Default `UOCR_METAL_MATH_MODE=FAST` matches the prior compiler default for inference speed.
-- `RELAXED` preserves NaN/Inf while allowing unsafe FP optimization; `SAFE` uses precise fp32 functions for validation/debug builds.
-
-**Implementation:**
-- [x] Set explicit fast math options for runtime compilation where supported.
-- [x] Add matching flags to the CMake Metal precompile command.
-- [x] Document expected numerical behavior and tolerances.
-- [x] Add a debug/safe-math switch if needed for validation.
-
-## 6. Specialize hot kernels with function constants and threadgroup attributes
-
-**Goal:** Let the compiler optimize fixed OCR shapes and remove runtime branches from hot kernels.
-
-**Details:**
-- Added decoder-shape function constants for fixed model values: hidden size, vocab size, heads, head dim, ring window, RoPE/attention scale, MoE experts/top-k, LM-head tile shape, and QKV projection count.
-- Integrated hot-path dispatch uses specialized pipeline states while diagnostics and generic APIs keep unspecialized fallback pipelines.
-- Added `[[max_total_threads_per_threadgroup]]` to fixed-size hot kernels; `[[required_threads_per_threadgroup]]` remains deferred because it would constrain adaptive SIMD-width flash dispatch.
-
-**Implementation:**
-- [x] Identify hot kernels with runtime params that are actually fixed for the model.
-- [x] Add function-constant pipeline variants for the highest-impact paths.
-- [x] Cache specialized pipeline states by constant tuple.
-- [x] Benchmark runtime, prewarm overhead, and memory usage with the E2E generation probe.
-
-## 7. Evaluate native packed numeric and tensor-blockwise quantized paths
-
-**Goal:** Improve quantized fp16 kernels by using native Metal packed/tensor formats where available.
-
-**Details:**
-- Metal 4+ exposes packed numeric types (`int4b_format`, `uint4b_format`, fp4/fp8) and TensorOps matmul combinations for half × packed formats.
-- Current Q4/Q8 kernels manually unpack bytes/nibbles; native formats may reduce decode overhead and improve bandwidth.
-- This must be feature-gated because support depends on OS, SDK, and GPU family, and Q4_K layout may need repacking.
-
-**Implementation:**
-- [ ] Map current Q4_K/Q8_0 layouts to native formats or define a repack step.
-- [ ] Prototype Metal 4+ packed numeric unpack for local quantized dot kernels.
-- [ ] Prototype MPP TensorOps for supported half × int4/uint4 shapes.
-- [ ] Keep existing manual decode path as compatibility fallback.
+1. Remove Metal quant kernels + diagnostic APIs.
+2. Remove C quant module and CMake/test references.
+3. Simplify model file validation to fp16-only.
+4. Simplify converter to fp16-only.
+5. Remove quant calibration/drift tools and exports.
+6. Delete quant tests and docs.
+7. Rebuild Release and run E2E probe.

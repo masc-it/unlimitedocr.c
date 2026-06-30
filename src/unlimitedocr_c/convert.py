@@ -1,10 +1,10 @@
-"""Conversion planning and `.uocr` writing for Unlimited-OCR.
+"""FP16 conversion planning and `.uocr` writing for Unlimited-OCR.
 
 The planner can run from the cached safetensors header/index only, which keeps
 fast tests independent from the 6.67 GB checkpoint payload.  When the real
 safetensors file is present, the writer streams tensor ranges into the planned
-`.uocr` layout and converts BF16 payload bytes to fp16 or Q8_0 without allocating
-a full-model temporary buffer.
+`.uocr` layout and converts BF16 payload bytes to fp16 without allocating a
+full-model temporary buffer.
 """
 
 from __future__ import annotations
@@ -49,20 +49,6 @@ MOE_EXPERT_PACKING_CONTRACT = (
     "gate/up colocated for fused projection and down immediately after."
 )
 
-Q4_HAZARD_NONE = 0
-Q4_HAZARD_ROUTED_EXPERT_DOWN = 1
-Q4_HAZARD_DENSE_LAYER0_DOWN = 2
-Q4_HAZARD_ROUTED_EXPERT_DOWN_NAME = "routed-expert-down"
-Q4_HAZARD_DENSE_LAYER0_DOWN_NAME = "dense-layer0-down"
-Q4_HAZARD_ROUTED_EXPERT_DOWN_COUNT = (MOE_ROUTED_LAYER_END_EXCLUSIVE - MOE_ROUTED_LAYER_START) * MOE_ROUTED_EXPERT_COUNT
-Q4_HAZARD_DENSE_LAYER0_DOWN_COUNT = 1
-Q4_UNALIGNED_HAZARD_CONTRACT = (
-    "Plain Q4_K requires an input width divisible by 256. OCR routed expert down_proj "
-    "(896) and dense layer-0 down_proj (6848) are explicit hazards: dyn-q4 keeps "
-    "them as Q8_0 unless a future PADDED_Q4_K path records the padded width and "
-    "zero-fills padded activation columns."
-)
-
 UOCR_FILE_ALIGNMENT = 4096
 UOCR_TENSOR_DATA_ALIGNMENT = 4096
 UOCR_TENSOR_PAYLOAD_ALIGNMENT = 16
@@ -84,8 +70,6 @@ UOCR_SECTION_TENSOR_DATA = 5
 UOCR_FORMAT_VERSION = 1
 UOCR_ENDIAN_MARKER = 0x01020304
 UOCR_QPROFILE_FP16 = 1
-UOCR_QPROFILE_DYN_Q8 = 2
-UOCR_QPROFILE_DYN_Q4 = 3
 UOCR_TOKENIZER_FLAG_C_V1_NOT_REQUIRED = 1 << 0
 UOCR_TOKENIZER_METADATA_MAGIC = 0x4B4F5455
 UOCR_PROVENANCE_MAGIC = 0x564F5250
@@ -103,43 +87,16 @@ UOCR_LAYOUT_TRANSFORM_FLATTEN_LEADING_DIM = 1
 UOCR_LAYOUT_TRANSFORM_TRANSPOSE = 2
 ROW_MAJOR_LAYOUT_CONTRACT = (
     "Runtime tensor payloads preserve safetensors row-major order. Rank-2 weights remain [out,in]; "
-    "quantized rank>2 weights may be flattened to [shape[0], product(shape[1:])] without transposition."
+    "rank>2 tensors keep their source shape without transposition."
 )
 
 UOCR_QTYPE_REASON_UNKNOWN = 0
 UOCR_QTYPE_REASON_FP16_BASELINE = 1
-UOCR_QTYPE_REASON_POLICY = 2
-UOCR_QTYPE_REASON_SENSITIVE = 3
-UOCR_QTYPE_REASON_UNALIGNED = 4
-UOCR_QTYPE_REASON_CALIBRATION_DRIFT = 5
-UOCR_QTYPE_REASON_MANUAL_OVERRIDE = 6
 
 UOCR_PROMOTION_NONE = 0
-UOCR_PROMOTION_SENSITIVE = 1
-UOCR_PROMOTION_UNALIGNED = 2
-UOCR_PROMOTION_CALIBRATION_DRIFT = 3
-UOCR_PROMOTION_MANUAL_OVERRIDE = 4
 
 UOCR_TENSOR_F16 = 1
 UOCR_TENSOR_F32 = 2
-UOCR_TENSOR_Q8_0 = 10
-UOCR_TENSOR_Q4_K = 20
-UOCR_TENSOR_PADDED_Q4_K = 21
-UOCR_TENSOR_Q2_K = 30
-UOCR_TENSOR_IQ2_XXS = 31
-
-QUANTIZED_QTYPE_IDS = frozenset({UOCR_TENSOR_Q8_0, UOCR_TENSOR_Q4_K, UOCR_TENSOR_PADDED_Q4_K})
-
-UOCR_Q8_0_BLOCK_SIZE = 32
-UOCR_Q8_0_TYPE_SIZE = 34
-UOCR_Q4_K_BLOCK_SIZE = 256
-UOCR_Q4_K_TYPE_SIZE = 144
-
-PADDED_Q4_K_KERNEL_CONTRACT = (
-    "PADDED_Q4_K uses Q4_K rows at a physical inner width rounded up to 256; "
-    "Metal kernels must treat activation columns [logical_inner, physical_inner) as zero "
-    "and retain the logical inner width for output correctness."
-)
 
 CONVERTER_VERSION = (0, 1, 0)
 
@@ -148,42 +105,15 @@ PRESERVED_UNUSED_NORMAL_OCR_PREFIXES: tuple[str, ...] = (CLIP_PIXEL_PATCH_EMBEDD
 
 QPROFILE_IDS: Mapping[str, int] = {
     "fp16": UOCR_QPROFILE_FP16,
-    "dyn-q8": UOCR_QPROFILE_DYN_Q8,
-    "dyn-q4": UOCR_QPROFILE_DYN_Q4,
 }
 
 QTYPE_REASON_NAMES: Mapping[int, str] = {
     UOCR_QTYPE_REASON_UNKNOWN: "unknown",
     UOCR_QTYPE_REASON_FP16_BASELINE: "fp16-baseline",
-    UOCR_QTYPE_REASON_POLICY: "policy",
-    UOCR_QTYPE_REASON_SENSITIVE: "sensitive",
-    UOCR_QTYPE_REASON_UNALIGNED: "unaligned",
-    UOCR_QTYPE_REASON_CALIBRATION_DRIFT: "calibration-drift",
-    UOCR_QTYPE_REASON_MANUAL_OVERRIDE: "manual-override",
 }
 
 PROMOTION_REASON_NAMES: Mapping[int, str] = {
     UOCR_PROMOTION_NONE: "none",
-    UOCR_PROMOTION_SENSITIVE: "sensitive",
-    UOCR_PROMOTION_UNALIGNED: "unaligned",
-    UOCR_PROMOTION_CALIBRATION_DRIFT: "calibration-drift",
-    UOCR_PROMOTION_MANUAL_OVERRIDE: "manual-override",
-}
-
-Q4_UNALIGNED_HAZARD_NAMES: Mapping[int, str] = {
-    Q4_HAZARD_NONE: "none",
-    Q4_HAZARD_ROUTED_EXPERT_DOWN: Q4_HAZARD_ROUTED_EXPERT_DOWN_NAME,
-    Q4_HAZARD_DENSE_LAYER0_DOWN: Q4_HAZARD_DENSE_LAYER0_DOWN_NAME,
-}
-
-Q4_UNALIGNED_HAZARD_DESCRIPTIONS: Mapping[int, str] = {
-    Q4_HAZARD_ROUTED_EXPERT_DOWN: "routed expert down_proj input width 896 is not Q4_K-aligned",
-    Q4_HAZARD_DENSE_LAYER0_DOWN: "dense layer-0 down_proj input width 6848 is not Q4_K-aligned",
-}
-
-Q4_UNALIGNED_HAZARD_EXPECTED_COUNTS: Mapping[int, int] = {
-    Q4_HAZARD_ROUTED_EXPERT_DOWN: Q4_HAZARD_ROUTED_EXPERT_DOWN_COUNT,
-    Q4_HAZARD_DENSE_LAYER0_DOWN: Q4_HAZARD_DENSE_LAYER0_DOWN_COUNT,
 }
 
 LAYOUT_TRANSFORM_NAMES: Mapping[int, str] = {
@@ -309,66 +239,6 @@ KEY_TENSOR_SHAPES: Mapping[str, tuple[int, ...]] = {
 
 
 @dataclass(frozen=True)
-class QuantTypeInfo:
-    name: str
-    qtype_id: int
-    output_dtype: str
-    block_size: int
-    type_size: int
-
-
-QUANT_TYPE_INFOS: Mapping[str, QuantTypeInfo] = {
-    "UOCR_TENSOR_Q8_0": QuantTypeInfo(
-        "UOCR_TENSOR_Q8_0", UOCR_TENSOR_Q8_0, "Q8_0", UOCR_Q8_0_BLOCK_SIZE, UOCR_Q8_0_TYPE_SIZE
-    ),
-    "UOCR_TENSOR_Q4_K": QuantTypeInfo(
-        "UOCR_TENSOR_Q4_K", UOCR_TENSOR_Q4_K, "Q4_K", UOCR_Q4_K_BLOCK_SIZE, UOCR_Q4_K_TYPE_SIZE
-    ),
-    "UOCR_TENSOR_PADDED_Q4_K": QuantTypeInfo(
-        "UOCR_TENSOR_PADDED_Q4_K",
-        UOCR_TENSOR_PADDED_Q4_K,
-        "PADDED_Q4_K",
-        UOCR_Q4_K_BLOCK_SIZE,
-        UOCR_Q4_K_TYPE_SIZE,
-    ),
-}
-
-
-@dataclass(frozen=True)
-class PaddedQ4KDesign:
-    qtype: str
-    qtype_id: int
-    output_dtype: str
-    logical_shape: tuple[int, int]
-    physical_shape: tuple[int, int]
-    padding_cols: int
-    logical_input_width: int
-    physical_input_width: int
-    input_padding_width: int
-    output_bytes: int
-    block_size: int
-    row_size: int
-    kernel_contract: str
-
-    def as_dict(self) -> dict[str, Any]:
-        return {
-            "qtype": self.qtype,
-            "qtype_id": self.qtype_id,
-            "output_dtype": self.output_dtype,
-            "logical_shape": list(self.logical_shape),
-            "physical_shape": list(self.physical_shape),
-            "padding_cols": self.padding_cols,
-            "logical_input_width": self.logical_input_width,
-            "physical_input_width": self.physical_input_width,
-            "input_padding_width": self.input_padding_width,
-            "output_bytes": self.output_bytes,
-            "block_size": self.block_size,
-            "row_size": self.row_size,
-            "kernel_contract": self.kernel_contract,
-        }
-
-
-@dataclass(frozen=True)
 class TensorPlan:
     name: str
     source_dtype: str
@@ -385,9 +255,6 @@ class TensorPlan:
     payload_alignment: int
     block_size: int
     row_size: int
-    logical_input_width: int
-    physical_input_width: int
-    input_padding_width: int
     tensor_id: int
     family: str
     family_id: int
@@ -402,11 +269,6 @@ class TensorPlan:
     qtype_reason_id: int
     promotion_reason: str
     promotion_reason_id: int
-    q4_hazard: str
-    q4_hazard_id: int
-    q4_hazard_logical_input_width: int
-    q4_hazard_required_physical_input_width: int
-    q4_hazard_padding_width: int
     source_layout: str
     runtime_layout: str
     layout_transform: str
@@ -432,9 +294,6 @@ class TensorPlan:
             "payload_alignment": self.payload_alignment,
             "block_size": self.block_size,
             "row_size": self.row_size,
-            "logical_input_width": self.logical_input_width,
-            "physical_input_width": self.physical_input_width,
-            "input_padding_width": self.input_padding_width,
             "tensor_id": self.tensor_id,
             "family": self.family,
             "family_id": self.family_id,
@@ -449,11 +308,6 @@ class TensorPlan:
             "qtype_reason_id": self.qtype_reason_id,
             "promotion_reason": self.promotion_reason,
             "promotion_reason_id": self.promotion_reason_id,
-            "q4_hazard": self.q4_hazard,
-            "q4_hazard_id": self.q4_hazard_id,
-            "q4_hazard_logical_input_width": self.q4_hazard_logical_input_width,
-            "q4_hazard_required_physical_input_width": self.q4_hazard_required_physical_input_width,
-            "q4_hazard_padding_width": self.q4_hazard_padding_width,
             "source_layout": self.source_layout,
             "runtime_layout": self.runtime_layout,
             "layout_transform": self.layout_transform,
@@ -700,8 +554,6 @@ class DryRunPlan:
             "promotion_reason_histogram": dict(self.promotion_reason_histogram),
             "usage_histogram": dict(self.usage_histogram),
             "family_histogram": dict(self.family_histogram),
-            "quantized_input_widths": quantized_input_width_summary(self.tensors),
-            "q4_unaligned_hazards": q4_unaligned_hazard_summary(self.tensors),
             "layout_transforms": layout_transform_summary(self.tensors),
             "moe_expert_packing": {
                 "layout": MOE_EXPERT_PACKING_LAYOUT,
@@ -766,78 +618,6 @@ def _product(shape: Iterable[int]) -> int:
     return math.prod(int(dim) for dim in shape)
 
 
-def _flatten_weight_shape_for_quantization(shape: tuple[int, ...]) -> tuple[int, int]:
-    """Return the logical `[rows, inner]` view stored for quantized weights.
-
-    Linear and embedding weights are already two-dimensional.  Conv kernels are
-    packed row-major as `[out_channels, in_channels * kh * kw]`, matching the
-    quantized-kernel contract described in the architecture notes while keeping
-    the original safetensors shape available as :attr:`TensorPlan.shape`.
-    """
-
-    if len(shape) < 2:
-        raise ValueError(f"quantized tensor rank must be at least 2, got {shape}")
-    if any(dim <= 0 for dim in shape):
-        raise ValueError(f"quantized tensor shape must be positive, got {shape}")
-    return int(shape[0]), _product(shape[1:])
-
-
-def _quantized_tensor_metadata(
-    shape: tuple[int, ...], qtype_name: str
-) -> tuple[tuple[int, int], tuple[int, int], int, int, int, int, str]:
-    info = QUANT_TYPE_INFOS[qtype_name]
-    logical_shape = _flatten_weight_shape_for_quantization(shape)
-    rows, inner = logical_shape
-    if info.qtype_id in {UOCR_TENSOR_Q8_0, UOCR_TENSOR_PADDED_Q4_K}:
-        physical_inner = _align_up(inner, info.block_size)
-    else:
-        if inner % info.block_size != 0:
-            raise ValueError(f"inner dimension {inner} is not aligned to {info.name} block size {info.block_size}")
-        physical_inner = inner
-    physical_shape = (rows, physical_inner)
-    row_size = (physical_inner // info.block_size) * info.type_size
-    return logical_shape, physical_shape, rows * row_size, info.block_size, row_size, info.qtype_id, info.output_dtype
-
-
-def describe_padded_q4_k_design(shape: tuple[int, ...]) -> PaddedQ4KDesign:
-    """Return the disabled-by-default PADDED_Q4_K metadata contract for a weight tensor.
-
-    The conservative ``dyn-q4`` profile deliberately keeps unaligned down
-    projections in Q8_0.  This helper documents and tests the future opt-in
-    layout: source weights keep their logical inner width, payload rows are
-    packed at a Q4_K-aligned physical width, and Metal kernels must zero the
-    synthetic activation tail before/while accumulating.
-    """
-
-    (
-        logical_shape,
-        physical_shape,
-        output_bytes,
-        block_size,
-        row_size,
-        qtype_id,
-        output_dtype,
-    ) = _quantized_tensor_metadata(shape, "UOCR_TENSOR_PADDED_Q4_K")
-    logical_input_width, physical_input_width, input_padding_width = _quantized_input_widths(
-        qtype_id, logical_shape, physical_shape
-    )
-    return PaddedQ4KDesign(
-        qtype="UOCR_TENSOR_PADDED_Q4_K",
-        qtype_id=qtype_id,
-        output_dtype=output_dtype,
-        logical_shape=logical_shape,
-        physical_shape=physical_shape,
-        padding_cols=input_padding_width,
-        logical_input_width=logical_input_width,
-        physical_input_width=physical_input_width,
-        input_padding_width=input_padding_width,
-        output_bytes=output_bytes,
-        block_size=block_size,
-        row_size=row_size,
-        kernel_contract=PADDED_Q4_K_KERNEL_CONTRACT,
-    )
-
-
 def _fp16_tensor_metadata(
     shape: tuple[int, ...], source_bytes: int
 ) -> tuple[tuple[int, ...], tuple[int, ...], int, int, int, int, str]:
@@ -871,82 +651,18 @@ def _family_histogram(tensors: Iterable[TensorPlan]) -> dict[str, int]:
     return dict(Counter(t.family for t in tensors))
 
 
-def _is_quantized_qtype(qtype_id: int) -> bool:
-    return qtype_id in QUANTIZED_QTYPE_IDS
-
-
-def _quantized_input_widths(
-    qtype_id: int,
-    logical_shape: tuple[int, ...],
-    physical_shape: tuple[int, ...],
-) -> tuple[int, int, int]:
-    """Return explicit Metal input-width metadata for quantized weights.
-
-    Quantized tensors are stored as row-major `[rows, inner]` payloads even when
-    the source was a convolution.  The logical width is the real model inner
-    dimension; the physical width is the packed/padded dimension consumed by
-    block quantized kernels.  Plain fp16/f32 tensors return zero widths so callers
-    do not accidentally treat rank-4 conv shapes as quantized input widths.
-    """
-
-    if not _is_quantized_qtype(qtype_id):
-        return 0, 0, 0
-    if len(logical_shape) != 2 or len(physical_shape) != 2:
-        raise ValueError(
-            f"quantized tensor metadata must use 2D logical/physical shapes, "
-            f"got logical={logical_shape} physical={physical_shape}"
-        )
-    if physical_shape[0] != logical_shape[0]:
-        raise ValueError(
-            f"quantized tensor row count mismatch: logical={logical_shape[0]} physical={physical_shape[0]}"
-        )
-    logical_input_width = int(logical_shape[1])
-    physical_input_width = int(physical_shape[1])
-    if logical_input_width <= 0 or physical_input_width <= 0:
-        raise ValueError(
-            f"quantized input widths must be positive, got logical={logical_input_width} "
-            f"physical={physical_input_width}"
-        )
-    if physical_input_width < logical_input_width:
-        raise ValueError(
-            f"quantized physical input width {physical_input_width} is smaller than logical {logical_input_width}"
-        )
-    return logical_input_width, physical_input_width, physical_input_width - logical_input_width
-
-
-def quantized_input_width_summary(tensors: Iterable[TensorPlan]) -> dict[str, Any]:
-    quantized = [tensor for tensor in tensors if _is_quantized_qtype(tensor.qtype_id)]
-    padded = [tensor for tensor in quantized if tensor.input_padding_width > 0]
-    max_padding = max((tensor.input_padding_width for tensor in padded), default=0)
-    return {
-        "contract": (
-            "Quantized tensors store logical_input_width as the true model inner dimension and "
-            "physical_input_width as the packed/padded inner dimension consumed by Metal kernels; "
-            "input_padding_width columns must be treated as zero."
-        ),
-        "quantized_tensor_count": len(quantized),
-        "padded_tensor_count": len(padded),
-        "max_padding_width": max_padding,
-    }
-
-
-def _layout_metadata_for_tensor(
-    shape: tuple[int, ...], qtype_id: int
-) -> tuple[str, str, int, int, bool, str]:
-    if _is_quantized_qtype(qtype_id) and len(shape) > 2:
-        transform_id = UOCR_LAYOUT_TRANSFORM_FLATTEN_LEADING_DIM
-        flags = UOCR_TENSOR_FLAG_ROW_MAJOR | UOCR_TENSOR_FLAG_FLATTENED_LEADING_DIM
-        runtime_layout = "row-major-2d-flattened"
-        reason = (
-            "quantized rank>2 tensor is flattened as [shape[0], product(shape[1:])] "
-            "while preserving source row-major order"
-        )
-    else:
-        transform_id = UOCR_LAYOUT_TRANSFORM_IDENTITY
-        flags = UOCR_TENSOR_FLAG_ROW_MAJOR
-        runtime_layout = "row-major"
-        reason = "source payload order is preserved; no transpose is applied"
-    return "row-major", runtime_layout, transform_id, flags, False, reason
+def _layout_metadata_for_tensor(shape: tuple[int, ...], qtype_id: int) -> tuple[str, str, int, int, bool, str]:
+    if qtype_id != UOCR_TENSOR_F16:
+        raise ValueError(f"only fp16 tensor payloads are supported, got qtype id {qtype_id}")
+    _ = shape
+    return (
+        "row-major",
+        "row-major",
+        UOCR_LAYOUT_TRANSFORM_IDENTITY,
+        UOCR_TENSOR_FLAG_ROW_MAJOR,
+        False,
+        "source payload order is preserved; no transpose is applied",
+    )
 
 
 def layout_transform_summary(tensors: Iterable[TensorPlan]) -> dict[str, Any]:
@@ -978,154 +694,8 @@ def _validate_layout_transform_contract(tensors: Iterable[TensorPlan]) -> None:
             raise ValueError(f"tensor {tensor.name} unexpectedly requests a transpose")
         if not (tensor.layout_flags & UOCR_TENSOR_FLAG_ROW_MAJOR):
             raise ValueError(f"tensor {tensor.name} is missing the row-major layout flag")
-        if _is_quantized_qtype(tensor.qtype_id):
-            expected_logical = _flatten_weight_shape_for_quantization(tensor.shape)
-            if tensor.logical_shape != expected_logical:
-                raise ValueError(
-                    f"quantized tensor {tensor.name} logical layout mismatch: "
-                    f"got {tensor.logical_shape}, expected {expected_logical}"
-                )
-        elif tensor.logical_shape != tensor.shape or tensor.physical_shape != tensor.shape:
-            raise ValueError(f"fp tensor {tensor.name} must preserve source shape without layout conversion")
-
-
-def _q4_unaligned_hazard_for_tensor(
-    shape: tuple[int, ...], registry_entry: TensorRegistryEntry
-) -> tuple[int, int, int, int]:
-    if len(shape) < 2:
-        return Q4_HAZARD_NONE, 0, 0, 0
-    _rows, logical_input_width = _flatten_weight_shape_for_quantization(shape)
-    if logical_input_width % UOCR_Q4_K_BLOCK_SIZE == 0:
-        return Q4_HAZARD_NONE, 0, 0, 0
-
-    hazard_id = Q4_HAZARD_NONE
-    if (
-        registry_entry.family == TensorFamily.MOE_EXPERT
-        and registry_entry.projection == TensorProjection.DOWN
-        and logical_input_width == 896
-    ):
-        hazard_id = Q4_HAZARD_ROUTED_EXPERT_DOWN
-    elif (
-        registry_entry.family == TensorFamily.LAYER_DENSE_MLP
-        and registry_entry.layer == 0
-        and registry_entry.projection == TensorProjection.DOWN
-        and logical_input_width == 6848
-    ):
-        hazard_id = Q4_HAZARD_DENSE_LAYER0_DOWN
-
-    if hazard_id == Q4_HAZARD_NONE:
-        return Q4_HAZARD_NONE, 0, 0, 0
-    required_physical_width = _align_up(logical_input_width, UOCR_Q4_K_BLOCK_SIZE)
-    return hazard_id, logical_input_width, required_physical_width, required_physical_width - logical_input_width
-
-
-def q4_unaligned_hazard_summary(tensors: Iterable[TensorPlan]) -> dict[str, Any]:
-    hazards = [tensor for tensor in tensors if tensor.q4_hazard_id != Q4_HAZARD_NONE]
-    by_kind = dict(Counter(tensor.q4_hazard for tensor in hazards))
-    examples: dict[str, dict[str, Any]] = {}
-    for tensor in hazards:
-        if tensor.q4_hazard in examples:
-            continue
-        examples[tensor.q4_hazard] = {
-            "name": tensor.name,
-            "logical_input_width": tensor.q4_hazard_logical_input_width,
-            "required_physical_input_width": tensor.q4_hazard_required_physical_input_width,
-            "padding_width": tensor.q4_hazard_padding_width,
-            "fallback_qtype": tensor.qtype,
-            "qtype_reason": tensor.qtype_reason,
-            "promotion_reason": tensor.promotion_reason,
-            "description": Q4_UNALIGNED_HAZARD_DESCRIPTIONS.get(tensor.q4_hazard_id, ""),
-        }
-    return {
-        "contract": Q4_UNALIGNED_HAZARD_CONTRACT,
-        "block_size": UOCR_Q4_K_BLOCK_SIZE,
-        "total_count": len(hazards),
-        "by_kind": by_kind,
-        "examples": examples,
-    }
-
-
-def _validate_q4_unaligned_hazard_contract(
-    tensors: Iterable[TensorPlan], *, qprofile: str, require_complete: bool
-) -> None:
-    counts: Counter[int] = Counter()
-    for tensor in tensors:
-        if tensor.q4_hazard_id == Q4_HAZARD_NONE:
-            if (
-                tensor.q4_hazard != "none"
-                or tensor.q4_hazard_logical_input_width != 0
-                or tensor.q4_hazard_required_physical_input_width != 0
-                or tensor.q4_hazard_padding_width != 0
-            ):
-                raise ValueError(f"tensor {tensor.name} has inconsistent empty Q4 hazard metadata")
-            continue
-
-        counts[tensor.q4_hazard_id] += 1
-        if tensor.q4_hazard != Q4_UNALIGNED_HAZARD_NAMES.get(tensor.q4_hazard_id):
-            raise ValueError(f"tensor {tensor.name} has inconsistent Q4 hazard name {tensor.q4_hazard!r}")
-        if tensor.q4_hazard_logical_input_width <= 0:
-            raise ValueError(f"tensor {tensor.name} Q4 hazard logical width is missing")
-        if tensor.q4_hazard_logical_input_width % UOCR_Q4_K_BLOCK_SIZE == 0:
-            raise ValueError(f"tensor {tensor.name} is marked as a Q4 hazard but its logical width is aligned")
-        expected_physical = _align_up(tensor.q4_hazard_logical_input_width, UOCR_Q4_K_BLOCK_SIZE)
-        if tensor.q4_hazard_required_physical_input_width != expected_physical:
-            raise ValueError(f"tensor {tensor.name} Q4 hazard required physical width is wrong")
-        if tensor.q4_hazard_padding_width != expected_physical - tensor.q4_hazard_logical_input_width:
-            raise ValueError(f"tensor {tensor.name} Q4 hazard padding width is wrong")
-        if qprofile == "dyn-q4":
-            if tensor.qtype_id == UOCR_TENSOR_Q4_K:
-                raise ValueError(f"dyn-q4 tensor {tensor.name} is an unaligned hazard but uses plain Q4_K")
-            if tensor.qtype_id != UOCR_TENSOR_Q8_0:
-                raise ValueError(f"dyn-q4 tensor {tensor.name} Q4 hazard must use Q8_0 fallback")
-            if tensor.qtype_reason_id != UOCR_QTYPE_REASON_UNALIGNED:
-                raise ValueError(f"dyn-q4 tensor {tensor.name} Q4 hazard must use unaligned qtype reason")
-            if tensor.promotion_reason_id != UOCR_PROMOTION_UNALIGNED:
-                raise ValueError(f"dyn-q4 tensor {tensor.name} Q4 hazard must use unaligned promotion reason")
-
-    if require_complete and qprofile == "dyn-q4":
-        for hazard_id, expected_count in Q4_UNALIGNED_HAZARD_EXPECTED_COUNTS.items():
-            actual_count = counts.get(hazard_id, 0)
-            if actual_count != expected_count:
-                raise ValueError(
-                    f"dyn-q4 Q4 hazard {Q4_UNALIGNED_HAZARD_NAMES[hazard_id]} count mismatch: "
-                    f"got {actual_count}, expected {expected_count}"
-                )
-
-
-def _validate_quantized_input_width_contract(tensors: Iterable[TensorPlan]) -> None:
-    for tensor in tensors:
-        is_quantized = _is_quantized_qtype(tensor.qtype_id)
-        if not is_quantized:
-            if tensor.logical_input_width != 0 or tensor.physical_input_width != 0 or tensor.input_padding_width != 0:
-                raise ValueError(f"plain tensor {tensor.name} must not carry quantized input-width metadata")
-            continue
-
-        logical, physical, padding = _quantized_input_widths(
-            tensor.qtype_id, tensor.logical_shape, tensor.physical_shape
-        )
-        if (tensor.logical_input_width, tensor.physical_input_width, tensor.input_padding_width) != (
-            logical,
-            physical,
-            padding,
-        ):
-            raise ValueError(f"quantized input-width metadata mismatch for {tensor.name}")
-        if tensor.block_size <= 0 or tensor.row_size <= 0:
-            raise ValueError(f"quantized tensor {tensor.name} must record block_size and row_size")
-        if physical % tensor.block_size != 0:
-            raise ValueError(
-                f"quantized tensor {tensor.name} physical input width {physical} is not a multiple of "
-                f"block_size {tensor.block_size}"
-            )
-        info = QUANT_TYPE_INFOS.get(tensor.qtype)
-        if info is not None:
-            expected_row_size = (physical // info.block_size) * info.type_size
-            if tensor.block_size != info.block_size or tensor.row_size != expected_row_size:
-                raise ValueError(
-                    f"quantized tensor {tensor.name} row metadata mismatch: block_size={tensor.block_size}, "
-                    f"row_size={tensor.row_size}, expected row_size={expected_row_size}"
-                )
-        if tensor.qtype_id == UOCR_TENSOR_Q4_K and padding != 0:
-            raise ValueError(f"Q4_K tensor {tensor.name} must not use padded input width")
+        if tensor.logical_shape != tensor.shape or tensor.physical_shape != tensor.shape:
+            raise ValueError(f"fp16 tensor {tensor.name} must preserve source shape without layout conversion")
 
 
 def _validate_moe_expert_interleaved_layout(tensors: Iterable[TensorPlan], *, require_complete: bool) -> None:
@@ -1621,119 +1191,6 @@ def _usage_for_name(name: str) -> tuple[str, int, str]:
     return "runtime", 1, "fp16 baseline"
 
 
-def _dyn_q8_mandatory_fp16_reason(name: str, registry_entry: TensorRegistryEntry) -> str | None:
-    if registry_entry.family == TensorFamily.MOE_ROUTER:
-        return "dyn-q8 fp16 keep-list: MoE router weights must preserve top-k expert selection"
-    if registry_entry.family in {
-        TensorFamily.FINAL_NORM,
-        TensorFamily.LAYER_NORM,
-        TensorFamily.IMAGE_NEWLINE,
-        TensorFamily.VIEW_SEPARATOR,
-    }:
-        return "dyn-q8 fp16 keep-list: norms and special visual embeddings stay fp16"
-    if registry_entry.projection == TensorProjection.BIAS or name.endswith(".bias"):
-        return "dyn-q8 fp16 keep-list: biases stay fp16"
-    lowered = name.lower()
-    if "norm" in lowered:
-        return "dyn-q8 fp16 keep-list: normalization parameters stay fp16"
-    if "pos" in lowered or "position" in lowered or "rel_pos" in lowered:
-        return "dyn-q8 fp16 keep-list: positional embeddings/tables stay fp16"
-    if lowered.endswith("class_embedding"):
-        return "dyn-q8 fp16 keep-list: CLIP class embedding stays fp16"
-    return None
-
-
-def _dyn_q8_quant_reason(name: str, shape: tuple[int, ...], registry_entry: TensorRegistryEntry) -> str | None:
-    keep_reason = _dyn_q8_mandatory_fp16_reason(name, registry_entry)
-    if keep_reason is not None or len(shape) < 2:
-        return None
-    if name == "lm_head.weight":
-        return "dyn-q8 policy: LM head -> Q8_0"
-    if name == "model.embed_tokens.weight":
-        return "dyn-q8 policy: token embedding -> Q8_0"
-    if not name.endswith(".weight"):
-        return None
-    if registry_entry.family in {
-        TensorFamily.LAYER_ATTN,
-        TensorFamily.LAYER_DENSE_MLP,
-        TensorFamily.MOE_EXPERT,
-        TensorFamily.MOE_SHARED,
-    }:
-        return "dyn-q8 policy: large decoder linear -> Q8_0"
-    if registry_entry.family in {TensorFamily.VISION_SAM, TensorFamily.VISION_CLIP}:
-        return "dyn-q8 policy: vision conv/linear weight -> Q8_0"
-    if registry_entry.family == TensorFamily.PROJECTOR:
-        return "dyn-q8 policy: visual projector linear weight -> Q8_0"
-    return None
-
-
-def _dyn_q4_mandatory_fp16_reason(name: str, registry_entry: TensorRegistryEntry) -> str | None:
-    q8_reason = _dyn_q8_mandatory_fp16_reason(name, registry_entry)
-    if q8_reason is None:
-        return None
-    return q8_reason.replace("dyn-q8", "dyn-q4", 1)
-
-
-def _dyn_q4_quant_choice(
-    name: str, shape: tuple[int, ...], registry_entry: TensorRegistryEntry
-) -> tuple[str, str] | None:
-    keep_reason = _dyn_q4_mandatory_fp16_reason(name, registry_entry)
-    if keep_reason is not None or len(shape) < 2:
-        return None
-    if name == "lm_head.weight":
-        return "UOCR_TENSOR_Q8_0", "dyn-q4 policy: LM head stays Q8_0 until generation parity permits q4"
-    if name == "model.embed_tokens.weight":
-        return "UOCR_TENSOR_Q8_0", "dyn-q4 policy: token embedding stays Q8_0 until embedding parity permits q4"
-    if not name.endswith(".weight"):
-        return None
-
-    projection = registry_entry.projection
-    if registry_entry.family == TensorFamily.LAYER_ATTN:
-        return "UOCR_TENSOR_Q4_K", "dyn-q4 policy: attention projection inner dim 1280 -> Q4_K candidate"
-    if registry_entry.family == TensorFamily.MOE_EXPERT:
-        if projection in {TensorProjection.GATE, TensorProjection.UP}:
-            return "UOCR_TENSOR_Q4_K", "dyn-q4 policy: routed expert gate/up inner dim 1280 -> Q4_K candidate"
-        if projection == TensorProjection.DOWN:
-            return "UOCR_TENSOR_Q8_0", "dyn-q4 policy: routed expert down inner dim 896 is unaligned for Q4_K -> Q8_0"
-    if registry_entry.family == TensorFamily.LAYER_DENSE_MLP:
-        if projection in {TensorProjection.GATE, TensorProjection.UP}:
-            return "UOCR_TENSOR_Q4_K", "dyn-q4 policy: dense layer-0 gate/up inner dim 1280 -> Q4_K candidate"
-        if projection == TensorProjection.DOWN:
-            return "UOCR_TENSOR_Q8_0", "dyn-q4 policy: dense layer-0 down inner dim 6848 is unaligned for Q4_K -> Q8_0"
-    if registry_entry.family == TensorFamily.MOE_SHARED:
-        if projection == TensorProjection.DOWN:
-            return "UOCR_TENSOR_Q4_K", "dyn-q4 policy: shared expert down inner dim 1792 -> Q4_K candidate after q8 parity"
-        return "UOCR_TENSOR_Q8_0", "dyn-q4 policy: shared expert gate/up stays Q8_0 until calibration permits q4"
-    if registry_entry.family in {TensorFamily.VISION_SAM, TensorFamily.VISION_CLIP}:
-        return "UOCR_TENSOR_Q8_0", "dyn-q4 policy: vision weights stay Q8_0 initially; selective q4 is deferred"
-    if registry_entry.family == TensorFamily.PROJECTOR:
-        return "UOCR_TENSOR_Q8_0", "dyn-q4 policy: visual projector stays Q8_0 initially for OCR-sensitive features"
-    return None
-
-
-def _reason_name(reason_names: Mapping[int, str], reason_id: int) -> str:
-    return reason_names.get(reason_id, "unknown")
-
-
-def _qtype_metadata_for_selection(
-    qprofile: str, qtype: str, reason: str
-) -> tuple[int, int]:
-    if qprofile == "fp16":
-        return UOCR_QTYPE_REASON_FP16_BASELINE, UOCR_PROMOTION_NONE
-    lowered = reason.lower()
-    if "manual override" in lowered or "manual-override" in lowered:
-        return UOCR_QTYPE_REASON_MANUAL_OVERRIDE, UOCR_PROMOTION_MANUAL_OVERRIDE
-    if "calibration drift" in lowered or "calibration-drift" in lowered:
-        return UOCR_QTYPE_REASON_CALIBRATION_DRIFT, UOCR_PROMOTION_CALIBRATION_DRIFT
-    if "unaligned" in lowered:
-        return UOCR_QTYPE_REASON_UNALIGNED, UOCR_PROMOTION_UNALIGNED
-    if qtype == "UOCR_TENSOR_F16":
-        return UOCR_QTYPE_REASON_SENSITIVE, UOCR_PROMOTION_SENSITIVE
-    if qprofile == "dyn-q4" and qtype == "UOCR_TENSOR_Q8_0":
-        return UOCR_QTYPE_REASON_SENSITIVE, UOCR_PROMOTION_SENSITIVE
-    return UOCR_QTYPE_REASON_POLICY, UOCR_PROMOTION_NONE
-
-
 def _projection_for_plan(registry_entry: TensorRegistryEntry) -> tuple[str, int]:
     projection = registry_entry.projection
     if projection == TensorProjection.NONE:
@@ -1741,7 +1198,14 @@ def _projection_for_plan(registry_entry: TensorRegistryEntry) -> tuple[str, int]
     return projection.name, int(projection)
 
 
+def _reason_name(reason_names: Mapping[int, str], reason_id: int) -> str:
+    return reason_names.get(reason_id, "unknown")
+
+
 def _make_tensor_plan(name: str, entry: Mapping[str, Any], qprofile: str, registry_entry: TensorRegistryEntry) -> TensorPlan:
+    if qprofile != "fp16":
+        raise ValueError(f"unknown qprofile {qprofile!r}")
+
     shape = tuple(int(dim) for dim in entry["shape"])
     offsets = (int(entry["data_offsets"][0]), int(entry["data_offsets"][1]))
     source_bytes = offsets[1] - offsets[0]
@@ -1753,78 +1217,8 @@ def _make_tensor_plan(name: str, entry: Mapping[str, Any], qprofile: str, regist
     logical_shape, physical_shape, output_bytes, block_size, row_size, qtype_id, output_dtype = _fp16_tensor_metadata(
         shape, source_bytes
     )
-
-    if qprofile == "dyn-q8":
-        quant_reason = _dyn_q8_quant_reason(name, shape, registry_entry)
-        if quant_reason is not None:
-            try:
-                (
-                    logical_shape,
-                    physical_shape,
-                    output_bytes,
-                    block_size,
-                    row_size,
-                    qtype_id,
-                    output_dtype,
-                ) = _quantized_tensor_metadata(shape, "UOCR_TENSOR_Q8_0")
-                qtype = "UOCR_TENSOR_Q8_0"
-                reason = quant_reason
-            except ValueError as exc:
-                reason = f"dyn-q8 fp16 fallback: {quant_reason}; {exc}"
-        else:
-            reason = (
-                _dyn_q8_mandatory_fp16_reason(name, registry_entry)
-                or "dyn-q8 fp16 keep-list: non-weight or small tensor"
-            )
-    elif qprofile == "dyn-q4":
-        quant_choice = _dyn_q4_quant_choice(name, shape, registry_entry)
-        if quant_choice is not None:
-            qtype_name, quant_reason = quant_choice
-            try:
-                (
-                    logical_shape,
-                    physical_shape,
-                    output_bytes,
-                    block_size,
-                    row_size,
-                    qtype_id,
-                    output_dtype,
-                ) = _quantized_tensor_metadata(shape, qtype_name)
-                qtype = qtype_name
-                reason = quant_reason
-            except ValueError as exc:
-                if qtype_name != "UOCR_TENSOR_Q4_K":
-                    reason = f"dyn-q4 fp16 fallback: {quant_reason}; {exc}"
-                else:
-                    (
-                        logical_shape,
-                        physical_shape,
-                        output_bytes,
-                        block_size,
-                        row_size,
-                        qtype_id,
-                        output_dtype,
-                    ) = _quantized_tensor_metadata(shape, "UOCR_TENSOR_Q8_0")
-                    qtype = "UOCR_TENSOR_Q8_0"
-                    reason = f"dyn-q4 Q8_0 fallback for unaligned Q4_K candidate: {quant_reason}; {exc}"
-        else:
-            reason = (
-                _dyn_q4_mandatory_fp16_reason(name, registry_entry)
-                or "dyn-q4 fp16 keep-list: non-weight or small tensor"
-            )
-    elif qprofile != "fp16":
-        raise ValueError(f"unknown qprofile {qprofile!r}")
-
-    qtype_reason_id, promotion_reason_id = _qtype_metadata_for_selection(qprofile, qtype, reason)
-    logical_input_width, physical_input_width, input_padding_width = _quantized_input_widths(
-        qtype_id, logical_shape, physical_shape
-    )
-    (
-        q4_hazard_id,
-        q4_hazard_logical_input_width,
-        q4_hazard_required_physical_input_width,
-        q4_hazard_padding_width,
-    ) = _q4_unaligned_hazard_for_tensor(shape, registry_entry)
+    qtype_reason_id = UOCR_QTYPE_REASON_FP16_BASELINE
+    promotion_reason_id = UOCR_PROMOTION_NONE
     (
         source_layout,
         runtime_layout,
@@ -1850,9 +1244,6 @@ def _make_tensor_plan(name: str, entry: Mapping[str, Any], qprofile: str, regist
         payload_alignment=UOCR_TENSOR_PAYLOAD_ALIGNMENT,
         block_size=block_size,
         row_size=row_size,
-        logical_input_width=logical_input_width,
-        physical_input_width=physical_input_width,
-        input_padding_width=input_padding_width,
         tensor_id=registry_entry.tensor_id,
         family=registry_entry.family.name,
         family_id=int(registry_entry.family),
@@ -1867,11 +1258,6 @@ def _make_tensor_plan(name: str, entry: Mapping[str, Any], qprofile: str, regist
         qtype_reason_id=qtype_reason_id,
         promotion_reason=_reason_name(PROMOTION_REASON_NAMES, promotion_reason_id),
         promotion_reason_id=promotion_reason_id,
-        q4_hazard=Q4_UNALIGNED_HAZARD_NAMES[q4_hazard_id],
-        q4_hazard_id=q4_hazard_id,
-        q4_hazard_logical_input_width=q4_hazard_logical_input_width,
-        q4_hazard_required_physical_input_width=q4_hazard_required_physical_input_width,
-        q4_hazard_padding_width=q4_hazard_padding_width,
         source_layout=source_layout,
         runtime_layout=runtime_layout,
         layout_transform=LAYOUT_TRANSFORM_NAMES[layout_transform_id],
@@ -1885,9 +1271,7 @@ def _make_tensor_plan(name: str, entry: Mapping[str, Any], qprofile: str, regist
 def _relayout_plan(plan: DryRunPlan, tensors: Iterable[TensorPlan]) -> DryRunPlan:
     ordered = tuple(sorted(tensors, key=lambda tensor: tensor.tensor_id))
     sections, laid_out, planned_file_size, metadata_bytes = _layout_dry_run_file(ordered)
-    _validate_quantized_input_width_contract(laid_out)
     _validate_layout_transform_contract(laid_out)
-    _validate_q4_unaligned_hazard_contract(laid_out, qprofile=plan.qprofile, require_complete=False)
     return replace(
         plan,
         tensors=laid_out,
@@ -1962,9 +1346,7 @@ def build_dry_run_plan(
         for name in sorted(entries, key=lambda key: registry[key].tensor_id)
     )
     sections, tensors, planned_file_size, metadata_bytes = _layout_dry_run_file(tensors)
-    _validate_quantized_input_width_contract(tensors)
     _validate_layout_transform_contract(tensors)
-    _validate_q4_unaligned_hazard_contract(tensors, qprofile=qprofile, require_complete=strict)
     _validate_moe_expert_interleaved_layout(tensors, require_complete=strict)
     total_source_bytes = sum(t.source_bytes for t in tensors)
     total_output_bytes = sum(t.output_bytes for t in tensors)
@@ -2299,78 +1681,6 @@ def _stream_bf16_to_f16(
     return bytes_written
 
 
-def _round_away_from_zero(values: np.ndarray) -> np.ndarray:
-    return np.where(values >= 0.0, np.floor(values + 0.5), np.ceil(values - 0.5))
-
-
-def _pack_q8_0_rows(rows: np.ndarray) -> bytes:
-    if rows.ndim != 2 or rows.shape[1] % UOCR_Q8_0_BLOCK_SIZE != 0:
-        raise ValueError(f"Q8_0 rows must be [n, multiple_of_{UOCR_Q8_0_BLOCK_SIZE}], got {rows.shape}")
-    blocks = rows.reshape(-1, UOCR_Q8_0_BLOCK_SIZE).astype(np.float32, copy=False)
-    amax = np.max(np.abs(blocks), axis=1)
-    scales = amax / np.float32(127.0)
-    inv_scales = np.divide(
-        np.float32(1.0),
-        scales,
-        out=np.zeros_like(scales, dtype=np.float32),
-        where=scales != 0.0,
-    )
-    quantized = _round_away_from_zero(blocks * inv_scales[:, None])
-    quantized = np.clip(quantized, -128, 127).astype(np.int8, copy=False)
-
-    packed = np.empty((blocks.shape[0], UOCR_Q8_0_TYPE_SIZE), dtype=np.uint8)
-    packed[:, :2] = scales.astype(np.dtype("<f2"), copy=False).view(np.uint8).reshape(-1, 2)
-    packed[:, 2:] = quantized.view(np.uint8)
-    return packed.tobytes()
-
-
-def _stream_bf16_to_q8_0(
-    src: BinaryIO,
-    dst: BinaryIO,
-    *,
-    tensor: TensorPlan,
-    stats: _StreamingValueStats | None = None,
-    chunk_source_bytes: int = 8 * 1024 * 1024,
-) -> int:
-    if tensor.qtype_id != UOCR_TENSOR_Q8_0:
-        raise ValueError(f"tensor {tensor.name} is not Q8_0")
-    if len(tensor.logical_shape) != 2 or len(tensor.physical_shape) != 2:
-        raise ValueError(f"Q8_0 tensor {tensor.name} must have 2D logical/physical shapes")
-    rows, logical_inner = tensor.logical_shape
-    physical_rows, physical_inner = tensor.physical_shape
-    if physical_rows != rows or physical_inner < logical_inner or physical_inner % UOCR_Q8_0_BLOCK_SIZE != 0:
-        raise ValueError(f"Q8_0 tensor {tensor.name} has invalid logical/physical shapes")
-    if tensor.source_bytes != rows * logical_inner * 2:
-        raise ValueError(f"Q8_0 tensor {tensor.name} source byte count does not match logical shape")
-    expected_row_size = (physical_inner // UOCR_Q8_0_BLOCK_SIZE) * UOCR_Q8_0_TYPE_SIZE
-    if tensor.row_size != expected_row_size or tensor.output_bytes != rows * expected_row_size:
-        raise ValueError(f"Q8_0 tensor {tensor.name} output byte count does not match physical shape")
-
-    source_row_bytes = logical_inner * 2
-    rows_per_chunk = max(1, chunk_source_bytes // max(1, source_row_bytes))
-    rows_done = 0
-    bytes_written = 0
-    while rows_done < rows:
-        batch_rows = min(rows_per_chunk, rows - rows_done)
-        raw = src.read(batch_rows * source_row_bytes)
-        if len(raw) != batch_rows * source_row_bytes:
-            raise EOFError(f"unexpected end of safetensors payload while streaming {tensor.name}")
-        values = _bf16_bytes_to_f32(raw).reshape(batch_rows, logical_inner)
-        if stats is not None:
-            stats.update(values)
-        if physical_inner != logical_inner:
-            padded = np.zeros((batch_rows, physical_inner), dtype=np.float32)
-            padded[:, :logical_inner] = values
-            values = padded
-        packed = _pack_q8_0_rows(values)
-        dst.write(packed)
-        bytes_written += len(packed)
-        rows_done += batch_rows
-    if bytes_written != tensor.output_bytes:
-        raise IOError(f"tensor {tensor.name} wrote {bytes_written} bytes, expected {tensor.output_bytes}")
-    return bytes_written
-
-
 def _read_uocr_tensor_payload_view(model_path: str | Path, tensor_id: int) -> _UocrTensorPayloadView:
     path = Path(model_path)
     with path.open("rb") as f:
@@ -2457,45 +1767,19 @@ def _iter_expected_converted_tensor_chunks(
     *,
     chunk_source_bytes: int = 8 * 1024 * 1024,
 ) -> Iterable[bytes]:
-    if tensor.qtype_id == UOCR_TENSOR_F16:
-        if tensor.source_bytes % 2 != 0:
-            raise ValueError(f"BF16 tensor byte count must be even, got {tensor.source_bytes}")
-        remaining = tensor.source_bytes
-        chunk_bytes = max(2, chunk_source_bytes - (chunk_source_bytes % 2))
-        while remaining:
-            wanted = min(remaining, chunk_bytes)
-            raw = src.read(wanted)
-            if len(raw) != wanted:
-                raise EOFError(f"unexpected end of safetensors payload while reading {tensor.name}")
-            yield _bf16_bytes_to_f32(raw).astype(np.dtype("<f2"), copy=False).tobytes()
-            remaining -= wanted
-        return
-
-    if tensor.qtype_id == UOCR_TENSOR_Q8_0:
-        if len(tensor.logical_shape) != 2 or len(tensor.physical_shape) != 2:
-            raise ValueError(f"Q8_0 tensor {tensor.name} must have 2D logical/physical shapes")
-        rows, logical_inner = tensor.logical_shape
-        physical_rows, physical_inner = tensor.physical_shape
-        if physical_rows != rows or physical_inner < logical_inner or physical_inner % UOCR_Q8_0_BLOCK_SIZE != 0:
-            raise ValueError(f"Q8_0 tensor {tensor.name} has invalid logical/physical shapes")
-        source_row_bytes = logical_inner * 2
-        rows_per_chunk = max(1, chunk_source_bytes // max(1, source_row_bytes))
-        rows_done = 0
-        while rows_done < rows:
-            batch_rows = min(rows_per_chunk, rows - rows_done)
-            raw = src.read(batch_rows * source_row_bytes)
-            if len(raw) != batch_rows * source_row_bytes:
-                raise EOFError(f"unexpected end of safetensors payload while reading {tensor.name}")
-            values = _bf16_bytes_to_f32(raw).reshape(batch_rows, logical_inner)
-            if physical_inner != logical_inner:
-                padded = np.zeros((batch_rows, physical_inner), dtype=np.float32)
-                padded[:, :logical_inner] = values
-                values = padded
-            yield _pack_q8_0_rows(values)
-            rows_done += batch_rows
-        return
-
-    raise NotImplementedError(f"single-tensor compare for qtype {tensor.qtype} is not implemented")
+    if tensor.qtype_id != UOCR_TENSOR_F16:
+        raise NotImplementedError(f"single-tensor compare for qtype {tensor.qtype} is not implemented")
+    if tensor.source_bytes % 2 != 0:
+        raise ValueError(f"BF16 tensor byte count must be even, got {tensor.source_bytes}")
+    remaining = tensor.source_bytes
+    chunk_bytes = max(2, chunk_source_bytes - (chunk_source_bytes % 2))
+    while remaining:
+        wanted = min(remaining, chunk_bytes)
+        raw = src.read(wanted)
+        if len(raw) != wanted:
+            raise EOFError(f"unexpected end of safetensors payload while reading {tensor.name}")
+        yield _bf16_bytes_to_f32(raw).astype(np.dtype("<f2"), copy=False).tobytes()
+        remaining -= wanted
 
 
 def _metadata_mismatches_for_compare(
@@ -2547,7 +1831,7 @@ def compare_single_tensor_conversion(
     tensor = plan.tensors[0]
     if tensor.usage_id == UOCR_TENSOR_USAGE_OMITTED_WITH_REASON:
         raise ValueError(f"tensor {tensor.name} has no payload to compare")
-    if tensor.qtype_id not in {UOCR_TENSOR_F16, UOCR_TENSOR_Q8_0}:
+    if tensor.qtype_id != UOCR_TENSOR_F16:
         raise NotImplementedError(f"single-tensor compare for qtype {tensor.qtype} is not implemented")
 
     model = Path(model_path)
@@ -2634,16 +1918,15 @@ def write_uocr_model(
 ) -> Path:
     """Stream a planned `.uocr` file to disk.
 
-    The writer supports the fp16 baseline and the first dynamic q8 profile.  It
-    converts each BF16 safetensors range to its planned runtime qtype in bounded
-    chunks and writes directly into the mmap-friendly layout produced by
-    :func:`build_dry_run_plan`.  When ``stats_path`` is supplied, the same chunks
-    are also summarized into per-tensor conversion statistics without creating a
-    full-model temporary array.
+    The writer supports the fp16 baseline.  It converts each BF16 safetensors
+    range to fp16 in bounded chunks and writes directly into the mmap-friendly
+    layout produced by :func:`build_dry_run_plan`.  When ``stats_path`` is
+    supplied, the same chunks are also summarized into per-tensor conversion
+    statistics without creating a full-model temporary array.
     """
 
-    if plan.qprofile not in {"fp16", "dyn-q8"}:
-        raise NotImplementedError("only fp16 and dyn-q8 .uocr writing are implemented")
+    if plan.qprofile != "fp16":
+        raise NotImplementedError("only fp16 .uocr writing is implemented")
     if plan.tensor_count == 0:
         raise ValueError("cannot write a .uocr with no tensors")
 
@@ -2710,14 +1993,11 @@ def write_uocr_model(
                 dst.seek(tensor.payload_offset)
                 before = dst.tell()
                 value_stats = _StreamingValueStats() if conversion_stats is not None else None
-                if tensor.qtype_id == UOCR_TENSOR_F16:
-                    output_bytes_written = _stream_bf16_to_f16(
-                        src, dst, source_bytes=tensor.source_bytes, stats=value_stats
-                    )
-                elif tensor.qtype_id == UOCR_TENSOR_Q8_0:
-                    output_bytes_written = _stream_bf16_to_q8_0(src, dst, tensor=tensor, stats=value_stats)
-                else:
+                if tensor.qtype_id != UOCR_TENSOR_F16:
                     raise NotImplementedError(f"writing qtype {tensor.qtype} is not implemented")
+                output_bytes_written = _stream_bf16_to_f16(
+                    src, dst, source_bytes=tensor.source_bytes, stats=value_stats
+                )
                 written = dst.tell() - before
                 if written != tensor.output_bytes or output_bytes_written != tensor.output_bytes:
                     raise IOError(
@@ -2768,9 +2048,6 @@ def _print_summary(plan: DryRunPlan, *, dry_run: bool) -> None:
     print(f"qtype reasons: {dict(plan.qtype_reason_histogram)}")
     print(f"promotion reasons: {dict(plan.promotion_reason_histogram)}")
     print(f"usage: {dict(plan.usage_histogram)}")
-    q4_hazards = q4_unaligned_hazard_summary(plan.tensors)
-    if q4_hazards["total_count"]:
-        print(f"q4 unaligned hazards: {q4_hazards['by_kind']}")
     print("families:")
     for family, count in sorted(plan.family_histogram.items()):
         print(f"  {family}: {count}")
@@ -2797,9 +2074,9 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="explicit source .safetensors payload for --out or --compare-uocr",
     )
-    parser.add_argument("--qprofile", choices=["fp16", "dyn-q8", "dyn-q4"], default="fp16")
+    parser.add_argument("--qprofile", choices=["fp16"], default="fp16")
     parser.add_argument("--dry-run", action="store_true", help="plan only; does not require full weights")
-    parser.add_argument("--out", type=Path, default=None, help="write an fp16 or dyn-q8 .uocr file to this path")
+    parser.add_argument("--out", type=Path, default=None, help="write an fp16 .uocr file to this path")
     parser.add_argument(
         "--compare-uocr",
         type=Path,
@@ -2828,9 +2105,6 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--compare-uocr requires --tensor")
     if args.conversion_stats is not None and args.out is None:
         parser.error("--conversion-stats requires --out")
-    if args.out is not None and args.qprofile == "dyn-q4":
-        parser.error("dyn-q4 .uocr writing is not implemented yet; use --dry-run for q4 planning")
-
     plan = build_dry_run_plan(
         args.hf_dir,
         qprofile=args.qprofile,

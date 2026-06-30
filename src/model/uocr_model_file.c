@@ -2,7 +2,6 @@
 
 #include "core/uocr_alloc.h"
 #include "model/uocr_tensor_registry.h"
-#include "quant/uocr_quant.h"
 
 #include <errno.h>
 #include <stdarg.h>
@@ -80,12 +79,6 @@ const char *uocr_qprofile_name(uint32_t qprofile) {
     switch (qprofile) {
         case UOCR_QPROFILE_FP16:
             return "fp16";
-        case UOCR_QPROFILE_DYN_Q8:
-            return "dyn-q8";
-        case UOCR_QPROFILE_DYN_Q4:
-            return "dyn-q4";
-        case UOCR_QPROFILE_CUSTOM:
-            return "custom";
         default:
             return "unknown";
     }
@@ -97,16 +90,6 @@ const char *uocr_tensor_qtype_name(uint32_t qtype) {
             return "f16";
         case UOCR_TENSOR_F32:
             return "f32";
-        case UOCR_TENSOR_Q8_0:
-            return "q8_0";
-        case UOCR_TENSOR_Q4_K:
-            return "q4_k";
-        case UOCR_TENSOR_PADDED_Q4_K:
-            return "padded_q4_k";
-        case UOCR_TENSOR_Q2_K:
-            return "q2_k";
-        case UOCR_TENSOR_IQ2_XXS:
-            return "iq2_xxs";
         default:
             return "unknown";
     }
@@ -118,16 +101,6 @@ const char *uocr_tensor_qtype_reason_name(uint32_t reason) {
             return "unknown";
         case UOCR_TENSOR_QTYPE_REASON_FP16_BASELINE:
             return "fp16-baseline";
-        case UOCR_TENSOR_QTYPE_REASON_POLICY:
-            return "policy";
-        case UOCR_TENSOR_QTYPE_REASON_SENSITIVE:
-            return "sensitive";
-        case UOCR_TENSOR_QTYPE_REASON_UNALIGNED:
-            return "unaligned";
-        case UOCR_TENSOR_QTYPE_REASON_CALIBRATION_DRIFT:
-            return "calibration-drift";
-        case UOCR_TENSOR_QTYPE_REASON_MANUAL_OVERRIDE:
-            return "manual-override";
         default:
             return "unknown";
     }
@@ -137,14 +110,6 @@ const char *uocr_tensor_promotion_reason_name(uint32_t reason) {
     switch (reason) {
         case UOCR_TENSOR_PROMOTION_NONE:
             return "none";
-        case UOCR_TENSOR_PROMOTION_SENSITIVE:
-            return "sensitive";
-        case UOCR_TENSOR_PROMOTION_UNALIGNED:
-            return "unaligned";
-        case UOCR_TENSOR_PROMOTION_CALIBRATION_DRIFT:
-            return "calibration-drift";
-        case UOCR_TENSOR_PROMOTION_MANUAL_OVERRIDE:
-            return "manual-override";
         default:
             return "unknown";
     }
@@ -537,6 +502,71 @@ static int validate_provenance(const uint8_t *bytes,
     return 0;
 }
 
+static int checked_mul_u64(uint64_t a, uint64_t b, uint64_t *out) {
+    if (out == NULL) {
+        return 0;
+    }
+    if (a != 0u && b > UINT64_MAX / a) {
+        return 0;
+    }
+    *out = a * b;
+    return 1;
+}
+
+static int validate_fp16_tensor_entry(const uocr_tensor_entry *tensor,
+                                      uint32_t index,
+                                      char *error,
+                                      size_t error_size) {
+    if (tensor->qtype != UOCR_TENSOR_F16) {
+        return fail(error, error_size, "tensor entry %u has non-fp16 qtype %u", index, tensor->qtype);
+    }
+    if (tensor->rank == 0u || tensor->rank > UOCR_TENSOR_MAX_DIMS) {
+        return fail(error, error_size, "tensor entry %u rank %u is invalid for fp16", index, tensor->rank);
+    }
+    uint64_t elements = 1u;
+    for (uint32_t dim = 0u; dim < tensor->rank; ++dim) {
+        if (tensor->logical_shape[dim] == 0u || tensor->physical_shape[dim] == 0u) {
+            return fail(error, error_size, "tensor entry %u has zero fp16 shape dimension", index);
+        }
+        if (tensor->logical_shape[dim] != tensor->physical_shape[dim]) {
+            return fail(error,
+                        error_size,
+                        "tensor entry %u fp16 physical dim %u=%u differs from logical dim %u",
+                        index,
+                        dim,
+                        tensor->physical_shape[dim],
+                        tensor->logical_shape[dim]);
+        }
+        if (!checked_mul_u64(elements, (uint64_t)tensor->physical_shape[dim], &elements)) {
+            return fail(error, error_size, "tensor entry %u fp16 shape overflows", index);
+        }
+    }
+    uint64_t expected_payload_size = 0u;
+    if (!checked_mul_u64(elements, 2u, &expected_payload_size)) {
+        return fail(error, error_size, "tensor entry %u fp16 payload size overflows", index);
+    }
+    if (tensor->payload_size != expected_payload_size) {
+        return fail(error,
+                    error_size,
+                    "tensor entry %u fp16 payload size mismatch: got %llu expected %llu",
+                    index,
+                    (unsigned long long)tensor->payload_size,
+                    (unsigned long long)expected_payload_size);
+    }
+    if (tensor->block_size != 0u || tensor->row_size != 0u || tensor->scale_offset != 0u || tensor->scale_size != 0u ||
+        tensor->min_offset != 0u || tensor->min_size != 0u) {
+        return fail(error, error_size, "tensor entry %u fp16 tensor has non-fp16 packing metadata", index);
+    }
+    if (tensor->qtype_reason != UOCR_TENSOR_QTYPE_REASON_UNKNOWN &&
+        tensor->qtype_reason != UOCR_TENSOR_QTYPE_REASON_FP16_BASELINE) {
+        return fail(error, error_size, "tensor entry %u has unknown fp16 qtype reason %u", index, tensor->qtype_reason);
+    }
+    if (tensor->promotion_reason != UOCR_TENSOR_PROMOTION_NONE) {
+        return fail(error, error_size, "tensor entry %u has non-empty fp16 promotion reason %u", index, tensor->promotion_reason);
+    }
+    return 0;
+}
+
 static int validate_tensor_directory(const uint8_t *bytes,
                                      size_t file_size,
                                      const uocr_section_entry *directory_section,
@@ -625,13 +655,6 @@ static int validate_tensor_directory(const uint8_t *bytes,
         if (tensor->usage != UOCR_TENSOR_USAGE_RUNTIME && tensor->usage != UOCR_TENSOR_USAGE_PRESERVED_UNUSED) {
             return fail(error, error_size, "tensor entry %u has unknown usage %u", i, tensor->usage);
         }
-        uocr_quant_type_info qtype_info;
-        if (!uocr_quant_get_type_info(tensor->qtype, &qtype_info)) {
-            return fail(error, error_size, "tensor entry %u has unknown qtype %u", i, tensor->qtype);
-        }
-        if (!uocr_quant_is_enabled(tensor->qtype)) {
-            return fail(error, error_size, "tensor entry %u qtype %s is disabled", i, qtype_info.name);
-        }
         if (tensor_data_section == NULL) {
             return fail(error, error_size, "tensor entry %u has payload but tensor-data section is missing", i);
         }
@@ -646,13 +669,8 @@ static int validate_tensor_directory(const uint8_t *bytes,
                         (unsigned long long)tensor->payload_offset,
                         UOCR_TENSOR_PAYLOAD_ALIGNMENT);
         }
-        char quant_error[256];
-        if (!uocr_quant_validate_tensor_entry(tensor, quant_error, sizeof(quant_error))) {
-            return fail(error,
-                        error_size,
-                        "tensor entry %u quantization metadata invalid: %s",
-                        i,
-                        quant_error);
+        if (validate_fp16_tensor_entry(tensor, i, error, error_size) != 0) {
+            return -1;
         }
         if (!checked_range(tensor->payload_offset, tensor->payload_size, file_size)) {
             return fail(error, error_size, "tensor entry %u payload is out of range", i);
@@ -712,6 +730,9 @@ int uocr_model_file_validate_memory(const void *data, size_t size, uocr_model_fi
     }
     if (header->required_alignment == 0u) {
         return fail(error, error_size, "required alignment must be non-zero");
+    }
+    if (header->qprofile != UOCR_QPROFILE_FP16) {
+        return fail(error, error_size, "only fp16 .uocr models are supported, got qprofile %u", header->qprofile);
     }
     if (header->section_count == 0u) {
         return fail(error, error_size, "section_count must be non-zero");

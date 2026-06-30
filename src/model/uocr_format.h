@@ -13,10 +13,7 @@
 #define UOCR_TENSOR_PAYLOAD_ALIGNMENT 16u
 
 typedef enum uocr_qprofile_id {
-    UOCR_QPROFILE_FP16 = 1,
-    UOCR_QPROFILE_DYN_Q8 = 2,
-    UOCR_QPROFILE_DYN_Q4 = 3,
-    UOCR_QPROFILE_CUSTOM = 255
+    UOCR_QPROFILE_FP16 = 1
 } uocr_qprofile_id;
 
 typedef enum uocr_section_type {
@@ -38,12 +35,7 @@ typedef enum uocr_provenance_flags {
 
 typedef enum uocr_tensor_qtype {
     UOCR_TENSOR_F16 = 1,
-    UOCR_TENSOR_F32 = 2,
-    UOCR_TENSOR_Q8_0 = 10,
-    UOCR_TENSOR_Q4_K = 20,
-    UOCR_TENSOR_PADDED_Q4_K = 21,
-    UOCR_TENSOR_Q2_K = 30,
-    UOCR_TENSOR_IQ2_XXS = 31
+    UOCR_TENSOR_F32 = 2
 } uocr_tensor_qtype;
 
 typedef enum uocr_tensor_usage {
@@ -60,20 +52,11 @@ typedef enum uocr_tensor_flags {
 
 typedef enum uocr_tensor_qtype_reason {
     UOCR_TENSOR_QTYPE_REASON_UNKNOWN = 0,
-    UOCR_TENSOR_QTYPE_REASON_FP16_BASELINE = 1,
-    UOCR_TENSOR_QTYPE_REASON_POLICY = 2,
-    UOCR_TENSOR_QTYPE_REASON_SENSITIVE = 3,
-    UOCR_TENSOR_QTYPE_REASON_UNALIGNED = 4,
-    UOCR_TENSOR_QTYPE_REASON_CALIBRATION_DRIFT = 5,
-    UOCR_TENSOR_QTYPE_REASON_MANUAL_OVERRIDE = 6
+    UOCR_TENSOR_QTYPE_REASON_FP16_BASELINE = 1
 } uocr_tensor_qtype_reason;
 
 typedef enum uocr_tensor_promotion_reason {
-    UOCR_TENSOR_PROMOTION_NONE = 0,
-    UOCR_TENSOR_PROMOTION_SENSITIVE = 1,
-    UOCR_TENSOR_PROMOTION_UNALIGNED = 2,
-    UOCR_TENSOR_PROMOTION_CALIBRATION_DRIFT = 3,
-    UOCR_TENSOR_PROMOTION_MANUAL_OVERRIDE = 4
+    UOCR_TENSOR_PROMOTION_NONE = 0
 } uocr_tensor_promotion_reason;
 
 typedef enum uocr_tensor_family {
@@ -210,7 +193,7 @@ typedef struct UOCR_PACKED uocr_provenance_record {
     uint8_t config_hash[32];
     uint8_t tokenizer_hash[32];
     uint8_t safetensors_index_hash[32];
-    uint8_t calibration_corpus_hash[32];
+    uint8_t reserved_hash[32];
     uint64_t json_offset;
     uint64_t json_size;
 } uocr_provenance_record;
