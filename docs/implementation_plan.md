@@ -69,15 +69,15 @@ Reference: `data.tmp/reference/Metal-Shading-Language-Specification.pdf`
 **Goal:** Make fp16/fp32 numerical-performance tradeoffs intentional and reproducible.
 
 **Details:**
-- Runtime compilation currently uses empty `MTLCompileOptions`; precompile also passes no explicit math flags.
-- The spec says fast math is default, but explicit settings prevent toolchain drift.
-- Confirm NaN/Inf assumptions are acceptable for inference kernels before enforcing fast mode.
+- Runtime compilation now sets `MTLCompileOptions` math mode explicitly; precompile passes matching `metal` flags.
+- Default `UOCR_METAL_MATH_MODE=FAST` matches the prior compiler default for inference speed.
+- `RELAXED` preserves NaN/Inf while allowing unsafe FP optimization; `SAFE` uses precise fp32 functions for validation/debug builds.
 
 **Implementation:**
-- [ ] Set explicit fast math options for runtime compilation where supported.
-- [ ] Add matching flags to the CMake Metal precompile command.
-- [ ] Document expected numerical behavior and tolerances.
-- [ ] Add a debug/safe-math switch if needed for validation.
+- [x] Set explicit fast math options for runtime compilation where supported.
+- [x] Add matching flags to the CMake Metal precompile command.
+- [x] Document expected numerical behavior and tolerances.
+- [x] Add a debug/safe-math switch if needed for validation.
 
 ## 6. Specialize hot kernels with function constants and threadgroup attributes
 

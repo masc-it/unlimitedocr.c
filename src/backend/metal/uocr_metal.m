@@ -69,6 +69,16 @@
 #define UOCR_METAL_ENABLE_MPP_TENSOROPS 0
 #endif
 
+#define UOCR_METAL_MATH_MODE_SAFE 0
+#define UOCR_METAL_MATH_MODE_RELAXED 1
+#define UOCR_METAL_MATH_MODE_FAST 2
+#ifndef UOCR_METAL_MATH_MODE
+#define UOCR_METAL_MATH_MODE UOCR_METAL_MATH_MODE_FAST
+#endif
+#ifndef UOCR_METAL_MATH_FP32_FAST
+#define UOCR_METAL_MATH_FP32_FAST 1
+#endif
+
 #ifndef UOCR_DEFAULT_RESOURCE_PATH
 #define UOCR_DEFAULT_RESOURCE_PATH ""
 #endif
@@ -782,6 +792,35 @@ static NSString *load_runtime_source(const char *resource_path, char *error, siz
     [source appendString:loaded];
     [source appendString:@"\n"];
     return source;
+}
+
+static void metal_configure_compile_math_options(MTLCompileOptions *options) {
+    if (options == nil) {
+        return;
+    }
+    if (@available(macOS 15.0, iOS 18.0, *)) {
+#if UOCR_METAL_MATH_MODE == UOCR_METAL_MATH_MODE_SAFE
+        options.mathMode = MTLMathModeSafe;
+#elif UOCR_METAL_MATH_MODE == UOCR_METAL_MATH_MODE_RELAXED
+        options.mathMode = MTLMathModeRelaxed;
+#else
+        options.mathMode = MTLMathModeFast;
+#endif
+#if UOCR_METAL_MATH_FP32_FAST
+        options.mathFloatingPointFunctions = MTLMathFloatingPointFunctionsFast;
+#else
+        options.mathFloatingPointFunctions = MTLMathFloatingPointFunctionsPrecise;
+#endif
+    } else {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+#if UOCR_METAL_MATH_MODE == UOCR_METAL_MATH_MODE_SAFE
+        options.fastMathEnabled = NO;
+#else
+        options.fastMathEnabled = YES;
+#endif
+#pragma clang diagnostic pop
+    }
 }
 #endif
 
@@ -1592,6 +1631,7 @@ uocr_metal_context *uocr_metal_context_create(const char *resource_path, char *e
 #if UOCR_METAL_ENABLE_MPP_TENSOROPS
             options.preprocessorMacros = @{ @"UOCR_METAL_ENABLE_MPP_TENSOROPS" : @1 };
 #endif
+            metal_configure_compile_math_options(options);
             NSError *compile_error = nil;
             ctx->library = [ctx->device newLibraryWithSource:source options:options error:&compile_error];
             [options release];
