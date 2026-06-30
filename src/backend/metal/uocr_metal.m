@@ -27,7 +27,19 @@
 
 #define UOCR_METAL_MPS_DATA_TYPE_FLOAT16 (0x10000000U | 16U)
 #define UOCR_METAL_MPS_DATA_TYPE_FLOAT32 (0x10000000U | 32U)
-#define UOCR_METAL_MPS_MATMUL_MIN_FLOPS 64000000ULL
+#ifndef UOCR_METAL_MPS_MATMUL_MIN_FLOPS
+/*
+ * Keep one-output-per-threadgroup GEMM out of large fp16 shapes while avoiding
+ * MPS setup overhead on small decode MLPs. The lowered default admits moderate,
+ * non-skinny GEMMs; the default skinny-output guard keeps the base-profile
+ * router GEMM (277x1280x64, ~45M FLOPs) on the faster custom path. Setting
+ * UOCR_METAL_MPS_MATMUL_MIN_FLOPS explicitly bypasses that guard for probes.
+ */
+#define UOCR_METAL_MPS_MATMUL_MIN_FLOPS 32000000ULL
+#endif
+#define UOCR_METAL_MPS_MATMUL_SKINNY_OUT_FEATURES 128u
+#define UOCR_METAL_MPS_MATMUL_SKINNY_MIN_FLOPS 64000000ULL
+#define UOCR_METAL_MPS_MATMUL_MIN_FLOPS_ENV "UOCR_METAL_MPS_MATMUL_MIN_FLOPS"
 #define UOCR_METAL_FLASH_Q_PER_TG 4u
 #define UOCR_METAL_FLASH_MAX_LANE_VALUES 4u
 #if UINTPTR_MAX > 0xffffffffu
@@ -8368,10 +8380,37 @@ static int metal_mps_matmul_nt_f16_flops(uint32_t rows,
     return 1;
 }
 
+static uint64_t metal_mps_matmul_min_flops(int *out_overridden) {
+    uint64_t threshold = UOCR_METAL_MPS_MATMUL_MIN_FLOPS;
+    int overridden = 0;
+    const char *env = getenv(UOCR_METAL_MPS_MATMUL_MIN_FLOPS_ENV);
+    if (env != NULL && env[0] != '\0') {
+        errno = 0;
+        char *end = NULL;
+        unsigned long long parsed = strtoull(env, &end, 0);
+        if (errno == 0 && end != env && end != NULL && *end == '\0') {
+            threshold = (uint64_t)parsed;
+            overridden = 1;
+        }
+    }
+    if (out_overridden != NULL) {
+        *out_overridden = overridden;
+    }
+    return threshold;
+}
+
 static int metal_mps_matmul_nt_f16_is_large(uint32_t rows, uint32_t in_features, uint32_t out_features) {
     uint64_t flops = 0u;
-    return metal_mps_matmul_nt_f16_flops(rows, in_features, out_features, &flops) &&
-           flops >= UOCR_METAL_MPS_MATMUL_MIN_FLOPS;
+    int threshold_overridden = 0;
+    const uint64_t min_flops = metal_mps_matmul_min_flops(&threshold_overridden);
+    if (!metal_mps_matmul_nt_f16_flops(rows, in_features, out_features, &flops) || flops < min_flops) {
+        return 0;
+    }
+    if (!threshold_overridden && out_features < UOCR_METAL_MPS_MATMUL_SKINNY_OUT_FEATURES &&
+        flops < UOCR_METAL_MPS_MATMUL_SKINNY_MIN_FLOPS) {
+        return 0;
+    }
+    return 1;
 }
 
 static int metal_mps_matmul_nt_f16_should_use(uint32_t rows, uint32_t in_features, uint32_t out_features) {
