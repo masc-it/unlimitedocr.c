@@ -102,6 +102,85 @@ static inline float uocr_q4_k_load_value(device const uchar *table, uint row_siz
 }
 
 #define UOCR_HALF4_WIDTH 4u
+#define UOCR_FC_HIDDEN_SIZE 0
+#define UOCR_FC_ATTENTION_HEADS 1
+#define UOCR_FC_HEAD_DIM 2
+#define UOCR_FC_RING_WINDOW 3
+#define UOCR_FC_MOE_EXPERTS 4
+#define UOCR_FC_MOE_TOP_K 5
+#define UOCR_FC_RMS_EPS 6
+#define UOCR_FC_ROPE_FREQ_SCALE 7
+#define UOCR_FC_ATTENTION_SCALE 8
+#define UOCR_FC_ATTENTION_PROJECTION_COUNT 9
+#define UOCR_FC_VOCAB_SIZE 10
+#define UOCR_FC_LM_HEAD_TILE_TOKENS 11
+#define UOCR_FC_LM_HEAD_LANES_PER_TOKEN 12
+
+constant uint uocr_fc_hidden_size [[function_constant(UOCR_FC_HIDDEN_SIZE)]];
+constant uint uocr_fc_attention_heads [[function_constant(UOCR_FC_ATTENTION_HEADS)]];
+constant uint uocr_fc_head_dim [[function_constant(UOCR_FC_HEAD_DIM)]];
+constant uint uocr_fc_ring_window [[function_constant(UOCR_FC_RING_WINDOW)]];
+constant uint uocr_fc_moe_experts [[function_constant(UOCR_FC_MOE_EXPERTS)]];
+constant uint uocr_fc_moe_top_k [[function_constant(UOCR_FC_MOE_TOP_K)]];
+constant float uocr_fc_rms_eps [[function_constant(UOCR_FC_RMS_EPS)]];
+constant float uocr_fc_rope_freq_scale [[function_constant(UOCR_FC_ROPE_FREQ_SCALE)]];
+constant float uocr_fc_attention_scale [[function_constant(UOCR_FC_ATTENTION_SCALE)]];
+constant uint uocr_fc_attention_projection_count [[function_constant(UOCR_FC_ATTENTION_PROJECTION_COUNT)]];
+constant uint uocr_fc_vocab_size [[function_constant(UOCR_FC_VOCAB_SIZE)]];
+constant uint uocr_fc_lm_head_tile_tokens [[function_constant(UOCR_FC_LM_HEAD_TILE_TOKENS)]];
+constant uint uocr_fc_lm_head_lanes_per_token [[function_constant(UOCR_FC_LM_HEAD_LANES_PER_TOKEN)]];
+
+static inline uint uocr_fc_hidden_size_or(uint runtime_value) {
+    return is_function_constant_defined(uocr_fc_hidden_size) ? uocr_fc_hidden_size : runtime_value;
+}
+
+static inline uint uocr_fc_attention_heads_or(uint runtime_value) {
+    return is_function_constant_defined(uocr_fc_attention_heads) ? uocr_fc_attention_heads : runtime_value;
+}
+
+static inline uint uocr_fc_head_dim_or(uint runtime_value) {
+    return is_function_constant_defined(uocr_fc_head_dim) ? uocr_fc_head_dim : runtime_value;
+}
+
+static inline uint uocr_fc_ring_window_or(uint runtime_value) {
+    return is_function_constant_defined(uocr_fc_ring_window) ? uocr_fc_ring_window : runtime_value;
+}
+
+static inline uint uocr_fc_moe_experts_or(uint runtime_value) {
+    return is_function_constant_defined(uocr_fc_moe_experts) ? uocr_fc_moe_experts : runtime_value;
+}
+
+static inline uint uocr_fc_moe_top_k_or(uint runtime_value) {
+    return is_function_constant_defined(uocr_fc_moe_top_k) ? uocr_fc_moe_top_k : runtime_value;
+}
+
+static inline float uocr_fc_rms_eps_or(float runtime_value) {
+    return is_function_constant_defined(uocr_fc_rms_eps) ? uocr_fc_rms_eps : runtime_value;
+}
+
+static inline float uocr_fc_rope_freq_scale_or(float runtime_value) {
+    return is_function_constant_defined(uocr_fc_rope_freq_scale) ? uocr_fc_rope_freq_scale : runtime_value;
+}
+
+static inline float uocr_fc_attention_scale_or(float runtime_value) {
+    return is_function_constant_defined(uocr_fc_attention_scale) ? uocr_fc_attention_scale : runtime_value;
+}
+
+static inline uint uocr_fc_attention_projection_count_or(uint runtime_value) {
+    return is_function_constant_defined(uocr_fc_attention_projection_count) ? uocr_fc_attention_projection_count : runtime_value;
+}
+
+static inline uint uocr_fc_vocab_size_or(uint runtime_value) {
+    return is_function_constant_defined(uocr_fc_vocab_size) ? uocr_fc_vocab_size : runtime_value;
+}
+
+static inline uint uocr_fc_lm_head_tile_tokens_or(uint runtime_value) {
+    return is_function_constant_defined(uocr_fc_lm_head_tile_tokens) ? uocr_fc_lm_head_tile_tokens : runtime_value;
+}
+
+static inline uint uocr_fc_lm_head_lanes_per_token_or(uint runtime_value) {
+    return is_function_constant_defined(uocr_fc_lm_head_lanes_per_token) ? uocr_fc_lm_head_lanes_per_token : runtime_value;
+}
 
 static inline uint uocr_div_up_u32(uint value, uint divisor) {
     return (value + divisor - 1u) / divisor;
@@ -722,7 +801,7 @@ struct UocrRmsNormParams {
     uint reserved;
 };
 
-kernel void uocr_rmsnorm_f16_to_f16(device const half *src [[buffer(0)]],
+[[max_total_threads_per_threadgroup(256)]] kernel void uocr_rmsnorm_f16_to_f16(device const half *src [[buffer(0)]],
                                     device const half *weight [[buffer(1)]],
                                     device half *dst [[buffer(2)]],
                                     constant UocrRmsNormParams &params [[buffer(3)]],
@@ -735,22 +814,24 @@ kernel void uocr_rmsnorm_f16_to_f16(device const half *src [[buffer(0)]],
         return;
     }
 
+    const uint hidden_size = uocr_fc_hidden_size_or(params.hidden_size);
+    const float eps = uocr_fc_rms_eps_or(params.eps);
     float sum = 0.0f;
-    const uint row_base = row * params.hidden_size;
-    for (uint col = tid; col < params.hidden_size; col += ntg) {
+    const uint row_base = row * hidden_size;
+    for (uint col = tid; col < hidden_size; col += ntg) {
         const float x = float(src[row_base + col]);
         sum += x * x;
     }
     const float total = uocr_threadgroup_sum(sum, partials, tid, ntg, simd_width);
-    const float scale = 1.0f / sqrt(total / float(params.hidden_size) + params.eps);
-    for (uint col = tid; col < params.hidden_size; col += ntg) {
+    const float scale = 1.0f / sqrt(total / float(hidden_size) + eps);
+    for (uint col = tid; col < hidden_size; col += ntg) {
         const float x = float(src[row_base + col]);
         const float w = float(weight[col]);
         dst[row_base + col] = half(x * scale * w);
     }
 }
 
-kernel void uocr_rmsnorm_f16_to_f32(device const half *src [[buffer(0)]],
+[[max_total_threads_per_threadgroup(256)]] kernel void uocr_rmsnorm_f16_to_f32(device const half *src [[buffer(0)]],
                                     device const half *weight [[buffer(1)]],
                                     device float *dst [[buffer(2)]],
                                     constant UocrRmsNormParams &params [[buffer(3)]],
@@ -763,15 +844,17 @@ kernel void uocr_rmsnorm_f16_to_f32(device const half *src [[buffer(0)]],
         return;
     }
 
+    const uint hidden_size = uocr_fc_hidden_size_or(params.hidden_size);
+    const float eps = uocr_fc_rms_eps_or(params.eps);
     float sum = 0.0f;
-    const uint row_base = row * params.hidden_size;
-    for (uint col = tid; col < params.hidden_size; col += ntg) {
+    const uint row_base = row * hidden_size;
+    for (uint col = tid; col < hidden_size; col += ntg) {
         const float x = float(src[row_base + col]);
         sum += x * x;
     }
     const float total = uocr_threadgroup_sum(sum, partials, tid, ntg, simd_width);
-    const float scale = 1.0f / sqrt(total / float(params.hidden_size) + params.eps);
-    for (uint col = tid; col < params.hidden_size; col += ntg) {
+    const float scale = 1.0f / sqrt(total / float(hidden_size) + eps);
+    for (uint col = tid; col < hidden_size; col += ntg) {
         const float x = float(src[row_base + col]);
         const float w = float(weight[col]);
         dst[row_base + col] = x * scale * w;
@@ -2414,7 +2497,7 @@ kernel void uocr_no_repeat_collect_banned_i32(device const int *sequence [[buffe
     }
 }
 
-kernel void uocr_lm_head_argmax_f16(device const half *hidden [[buffer(0)]],
+[[max_total_threads_per_threadgroup(256)]] kernel void uocr_lm_head_argmax_f16(device const half *hidden [[buffer(0)]],
                                     device const half *weight [[buffer(1)]],
                                     device const uchar *ban_flags [[buffer(2)]],
                                     device float *partial_scores_out [[buffer(3)]],
@@ -2427,34 +2510,37 @@ kernel void uocr_lm_head_argmax_f16(device const half *hidden [[buffer(0)]],
                                     uint tid [[thread_index_in_threadgroup]],
                                     uint ntg [[threads_per_threadgroup]],
                                     uint simd_width [[threads_per_simdgroup]]) {
-    for (uint k = tid; k < params.hidden_size; k += ntg) {
+    const uint hidden_size = uocr_fc_hidden_size_or(params.hidden_size);
+    const uint vocab_size = uocr_fc_vocab_size_or(params.vocab_size);
+    const uint tile_tokens = uocr_fc_lm_head_tile_tokens_or(params.tile_tokens);
+    const uint lanes = uocr_fc_lm_head_lanes_per_token_or(params.lanes_per_token);
+    for (uint k = tid; k < hidden_size; k += ntg) {
         hidden_tg[k] = hidden[k];
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    const uint lanes = params.lanes_per_token;
     const uint local_token = tid / lanes;
     const uint lane = tid - local_token * lanes;
-    const uint token_id = tile * params.tile_tokens + local_token;
+    const uint token_id = tile * tile_tokens + local_token;
 
     float sum = 0.0f;
-    if (local_token < params.tile_tokens && token_id < params.vocab_size) {
-        const ulong weight_base = ulong(token_id) * ulong(params.hidden_size);
-        for (uint k = lane; k < params.hidden_size; k += lanes) {
+    if (local_token < tile_tokens && token_id < vocab_size) {
+        const ulong weight_base = ulong(token_id) * ulong(hidden_size);
+        for (uint k = lane; k < hidden_size; k += lanes) {
             sum += float(hidden_tg[k]) * float(weight[weight_base + ulong(k)]);
         }
     }
     for (uint stride = lanes >> 1u; stride > 0u; stride >>= 1u) {
         const float other = simd_shuffle_down(sum, ushort(stride));
-        if (local_token < params.tile_tokens && lane < stride) {
+        if (local_token < tile_tokens && lane < stride) {
             sum += other;
         }
     }
 
-    if (local_token < params.tile_tokens && lane == 0u) {
+    if (local_token < tile_tokens && lane == 0u) {
         float score = sum;
         uint id = token_id;
-        if (token_id >= params.vocab_size) {
+        if (token_id >= vocab_size) {
             id = 0xffffffffu;
             score = -INFINITY;
         } else if (params.banned_count != 0u && ban_flags[token_id] != uchar(0u)) {
@@ -2468,8 +2554,8 @@ kernel void uocr_lm_head_argmax_f16(device const half *hidden [[buffer(0)]],
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    float best_score = tid < params.tile_tokens ? partials[tid] : -INFINITY;
-    uint best_id = tid < params.tile_tokens ? partial_ids[tid] : 0xffffffffu;
+    float best_score = tid < tile_tokens ? partials[tid] : -INFINITY;
+    uint best_id = tid < tile_tokens ? partial_ids[tid] : 0xffffffffu;
     uocr_threadgroup_argmax_pair(best_score, best_id, partials, partial_ids, tid, ntg, simd_width);
 
     if (tid == 0u && tile < params.partial_count) {
@@ -2556,16 +2642,17 @@ static inline float uocr_attention_projection_dot_f16(device const half *src,
                                                       uint ntg,
                                               uint simd_width,
                                                       threadgroup float *partials) {
+    const uint hidden_size = uocr_fc_hidden_size_or(params.hidden_size);
     float sum = 0.0f;
-    const uint src_base = token * params.hidden_size;
-    const uint weight_base = out_col * params.hidden_size;
-    for (uint k = tid; k < params.hidden_size; k += ntg) {
+    const uint src_base = token * hidden_size;
+    const uint weight_base = out_col * hidden_size;
+    for (uint k = tid; k < hidden_size; k += ntg) {
         sum += float(src[src_base + k]) * float(weight[weight_base + k]);
     }
     return uocr_threadgroup_sum(sum, partials, tid, ntg, simd_width);
 }
 
-kernel void uocr_attention_qkvo_f16_to_f16(device const half *src [[buffer(0)]],
+[[max_total_threads_per_threadgroup(256)]] kernel void uocr_attention_qkvo_f16_to_f16(device const half *src [[buffer(0)]],
                                            device const half *q_weight [[buffer(1)]],
                                            device const half *k_weight [[buffer(2)]],
                                            device const half *v_weight [[buffer(3)]],
@@ -2580,12 +2667,14 @@ kernel void uocr_attention_qkvo_f16_to_f16(device const half *src [[buffer(0)]],
                                            uint tid [[thread_index_in_threadgroup]],
                                            uint ntg [[threads_per_threadgroup]],
                                            uint simd_width [[threads_per_simdgroup]]) {
-    const uint values_per_projection = params.n_tokens * params.hidden_size;
+    const uint hidden_size = uocr_fc_hidden_size_or(params.hidden_size);
+    const uint projection_count = uocr_fc_attention_projection_count_or(params.projection_count);
+    const uint values_per_projection = params.n_tokens * hidden_size;
     const uint projection = output_index / values_per_projection;
     const uint element = output_index - projection * values_per_projection;
-    const uint token = element / params.hidden_size;
-    const uint out_col = element - token * params.hidden_size;
-    if (projection >= params.projection_count || token >= params.n_tokens || out_col >= params.hidden_size) {
+    const uint token = element / hidden_size;
+    const uint out_col = element - token * hidden_size;
+    if (projection >= projection_count || token >= params.n_tokens || out_col >= hidden_size) {
         return;
     }
 
@@ -2604,11 +2693,11 @@ kernel void uocr_attention_qkvo_f16_to_f16(device const half *src [[buffer(0)]],
 
     const float value = uocr_attention_projection_dot_f16(src, weight, params, token, out_col, tid, ntg, simd_width, partials);
     if (tid == 0) {
-        dst[token * params.hidden_size + out_col] = half(value);
+        dst[token * hidden_size + out_col] = half(value);
     }
 }
 
-kernel void uocr_attention_qkvo_f16_to_f32(device const half *src [[buffer(0)]],
+[[max_total_threads_per_threadgroup(256)]] kernel void uocr_attention_qkvo_f16_to_f32(device const half *src [[buffer(0)]],
                                            device const half *q_weight [[buffer(1)]],
                                            device const half *k_weight [[buffer(2)]],
                                            device const half *v_weight [[buffer(3)]],
@@ -2623,12 +2712,14 @@ kernel void uocr_attention_qkvo_f16_to_f32(device const half *src [[buffer(0)]],
                                            uint tid [[thread_index_in_threadgroup]],
                                            uint ntg [[threads_per_threadgroup]],
                                            uint simd_width [[threads_per_simdgroup]]) {
-    const uint values_per_projection = params.n_tokens * params.hidden_size;
+    const uint hidden_size = uocr_fc_hidden_size_or(params.hidden_size);
+    const uint projection_count = uocr_fc_attention_projection_count_or(params.projection_count);
+    const uint values_per_projection = params.n_tokens * hidden_size;
     const uint projection = output_index / values_per_projection;
     const uint element = output_index - projection * values_per_projection;
-    const uint token = element / params.hidden_size;
-    const uint out_col = element - token * params.hidden_size;
-    if (projection >= params.projection_count || token >= params.n_tokens || out_col >= params.hidden_size) {
+    const uint token = element / hidden_size;
+    const uint out_col = element - token * hidden_size;
+    if (projection >= projection_count || token >= params.n_tokens || out_col >= hidden_size) {
         return;
     }
 
@@ -2647,7 +2738,7 @@ kernel void uocr_attention_qkvo_f16_to_f32(device const half *src [[buffer(0)]],
 
     const float value = uocr_attention_projection_dot_f16(src, weight, params, token, out_col, tid, ntg, simd_width, partials);
     if (tid == 0) {
-        dst[token * params.hidden_size + out_col] = value;
+        dst[token * hidden_size + out_col] = value;
     }
 }
 
@@ -2667,16 +2758,17 @@ static inline float uocr_attention_output_dot_f16(device const half *src,
                                                   uint ntg,
                                               uint simd_width,
                                                   threadgroup float *partials) {
+    const uint hidden_size = uocr_fc_hidden_size_or(params.hidden_size);
     float sum = 0.0f;
-    const uint src_base = token * params.hidden_size;
-    const uint weight_base = out_col * params.hidden_size;
-    for (uint k = tid; k < params.hidden_size; k += ntg) {
+    const uint src_base = token * hidden_size;
+    const uint weight_base = out_col * hidden_size;
+    for (uint k = tid; k < hidden_size; k += ntg) {
         sum += float(src[src_base + k]) * float(weight[weight_base + k]);
     }
     return uocr_threadgroup_sum(sum, partials, tid, ntg, simd_width);
 }
 
-kernel void uocr_attention_output_residual_f16_to_f16(device const half *src [[buffer(0)]],
+[[max_total_threads_per_threadgroup(256)]] kernel void uocr_attention_output_residual_f16_to_f16(device const half *src [[buffer(0)]],
                                                       device const half *weight [[buffer(1)]],
                                                       device const half *residual [[buffer(2)]],
                                                       device half *dst [[buffer(3)]],
@@ -2686,20 +2778,21 @@ kernel void uocr_attention_output_residual_f16_to_f16(device const half *src [[b
                                                       uint tid [[thread_index_in_threadgroup]],
                                                       uint ntg [[threads_per_threadgroup]],
                                                       uint simd_width [[threads_per_simdgroup]]) {
-    const uint token = output_index / params.hidden_size;
-    const uint out_col = output_index - token * params.hidden_size;
-    if (token >= params.n_tokens || out_col >= params.hidden_size) {
+    const uint hidden_size = uocr_fc_hidden_size_or(params.hidden_size);
+    const uint token = output_index / hidden_size;
+    const uint out_col = output_index - token * hidden_size;
+    if (token >= params.n_tokens || out_col >= hidden_size) {
         return;
     }
 
     const float projected = uocr_attention_output_dot_f16(src, weight, params, token, out_col, tid, ntg, simd_width, partials);
     if (tid == 0) {
-        const uint dst_index = token * params.hidden_size + out_col;
+        const uint dst_index = token * hidden_size + out_col;
         dst[dst_index] = half(projected + float(residual[dst_index]));
     }
 }
 
-kernel void uocr_attention_output_residual_f16_to_f32(device const half *src [[buffer(0)]],
+[[max_total_threads_per_threadgroup(256)]] kernel void uocr_attention_output_residual_f16_to_f32(device const half *src [[buffer(0)]],
                                                       device const half *weight [[buffer(1)]],
                                                       device const half *residual [[buffer(2)]],
                                                       device float *dst [[buffer(3)]],
@@ -2709,15 +2802,16 @@ kernel void uocr_attention_output_residual_f16_to_f32(device const half *src [[b
                                                       uint tid [[thread_index_in_threadgroup]],
                                                       uint ntg [[threads_per_threadgroup]],
                                                       uint simd_width [[threads_per_simdgroup]]) {
-    const uint token = output_index / params.hidden_size;
-    const uint out_col = output_index - token * params.hidden_size;
-    if (token >= params.n_tokens || out_col >= params.hidden_size) {
+    const uint hidden_size = uocr_fc_hidden_size_or(params.hidden_size);
+    const uint token = output_index / hidden_size;
+    const uint out_col = output_index - token * hidden_size;
+    if (token >= params.n_tokens || out_col >= hidden_size) {
         return;
     }
 
     const float projected = uocr_attention_output_dot_f16(src, weight, params, token, out_col, tid, ntg, simd_width, partials);
     if (tid == 0) {
-        const uint dst_index = token * params.hidden_size + out_col;
+        const uint dst_index = token * hidden_size + out_col;
         dst[dst_index] = projected + float(residual[dst_index]);
     }
 }
@@ -2729,7 +2823,7 @@ struct UocrDenseSwigluParams {
     uint has_residual;
 };
 
-kernel void uocr_dense_swiglu_gate_up_f16(device const half *src [[buffer(0)]],
+[[max_total_threads_per_threadgroup(256)]] kernel void uocr_dense_swiglu_gate_up_f16(device const half *src [[buffer(0)]],
                                           device const half *gate_weight [[buffer(1)]],
                                           device const half *up_weight [[buffer(2)]],
                                           device half *mid [[buffer(3)]],
@@ -2745,13 +2839,14 @@ kernel void uocr_dense_swiglu_gate_up_f16(device const half *src [[buffer(0)]],
         return;
     }
 
+    const uint hidden_size = uocr_fc_hidden_size_or(params.hidden_size);
     threadgroup float *gate_partials = partials;
     threadgroup float *up_partials = partials + ntg;
     float gate_sum = 0.0f;
     float up_sum = 0.0f;
-    const uint src_base = token * params.hidden_size;
-    const uint weight_base = out_col * params.hidden_size;
-    for (uint k = tid; k < params.hidden_size; k += ntg) {
+    const uint src_base = token * hidden_size;
+    const uint weight_base = out_col * hidden_size;
+    for (uint k = tid; k < hidden_size; k += ntg) {
         const float x = float(src[src_base + k]);
         gate_sum += x * float(gate_weight[weight_base + k]);
         up_sum += x * float(up_weight[weight_base + k]);
@@ -2820,7 +2915,7 @@ static inline float uocr_dense_swiglu_down_dot_f16(device const half *mid,
     return uocr_threadgroup_sum(sum, partials, tid, ntg, simd_width);
 }
 
-kernel void uocr_dense_swiglu_down_f16_to_f16(device const half *mid [[buffer(0)]],
+[[max_total_threads_per_threadgroup(256)]] kernel void uocr_dense_swiglu_down_f16_to_f16(device const half *mid [[buffer(0)]],
                                               device const half *down_weight [[buffer(1)]],
                                               device const half *residual [[buffer(2)]],
                                               device half *dst [[buffer(3)]],
@@ -2830,15 +2925,16 @@ kernel void uocr_dense_swiglu_down_f16_to_f16(device const half *mid [[buffer(0)
                                               uint tid [[thread_index_in_threadgroup]],
                                               uint ntg [[threads_per_threadgroup]],
                                               uint simd_width [[threads_per_simdgroup]]) {
-    const uint token = output_index / params.hidden_size;
-    const uint out_col = output_index - token * params.hidden_size;
-    if (token >= params.n_tokens || out_col >= params.hidden_size) {
+    const uint hidden_size = uocr_fc_hidden_size_or(params.hidden_size);
+    const uint token = output_index / hidden_size;
+    const uint out_col = output_index - token * hidden_size;
+    if (token >= params.n_tokens || out_col >= hidden_size) {
         return;
     }
 
     float value = uocr_dense_swiglu_down_dot_f16(mid, down_weight, params, token, out_col, tid, ntg, simd_width, partials);
     if (tid == 0) {
-        const uint dst_index = token * params.hidden_size + out_col;
+        const uint dst_index = token * hidden_size + out_col;
         if (params.has_residual != 0u) {
             value += float(residual[dst_index]);
         }
@@ -2846,7 +2942,7 @@ kernel void uocr_dense_swiglu_down_f16_to_f16(device const half *mid [[buffer(0)
     }
 }
 
-kernel void uocr_dense_swiglu_down_f16_to_f32(device const half *mid [[buffer(0)]],
+[[max_total_threads_per_threadgroup(256)]] kernel void uocr_dense_swiglu_down_f16_to_f32(device const half *mid [[buffer(0)]],
                                               device const half *down_weight [[buffer(1)]],
                                               device const half *residual [[buffer(2)]],
                                               device float *dst [[buffer(3)]],
@@ -2856,15 +2952,16 @@ kernel void uocr_dense_swiglu_down_f16_to_f32(device const half *mid [[buffer(0)
                                               uint tid [[thread_index_in_threadgroup]],
                                               uint ntg [[threads_per_threadgroup]],
                                               uint simd_width [[threads_per_simdgroup]]) {
-    const uint token = output_index / params.hidden_size;
-    const uint out_col = output_index - token * params.hidden_size;
-    if (token >= params.n_tokens || out_col >= params.hidden_size) {
+    const uint hidden_size = uocr_fc_hidden_size_or(params.hidden_size);
+    const uint token = output_index / hidden_size;
+    const uint out_col = output_index - token * hidden_size;
+    if (token >= params.n_tokens || out_col >= hidden_size) {
         return;
     }
 
     float value = uocr_dense_swiglu_down_dot_f16(mid, down_weight, params, token, out_col, tid, ntg, simd_width, partials);
     if (tid == 0) {
-        const uint dst_index = token * params.hidden_size + out_col;
+        const uint dst_index = token * hidden_size + out_col;
         if (params.has_residual != 0u) {
             value += float(residual[dst_index]);
         }
@@ -2894,16 +2991,17 @@ static inline float uocr_moe_router_dot_f16(device const half *src,
                                             uint ntg,
                                               uint simd_width,
                                             threadgroup float *partials) {
+    const uint hidden_size = uocr_fc_hidden_size_or(params.hidden_size);
     float sum = 0.0f;
-    const uint src_base = token * params.hidden_size;
-    const uint weight_base = expert * params.hidden_size;
-    for (uint k = tid; k < params.hidden_size; k += ntg) {
+    const uint src_base = token * hidden_size;
+    const uint weight_base = expert * hidden_size;
+    for (uint k = tid; k < hidden_size; k += ntg) {
         sum += float(src[src_base + k]) * float(weight[weight_base + k]);
     }
     return uocr_threadgroup_sum(sum, partials, tid, ntg, simd_width);
 }
 
-kernel void uocr_moe_router_logits_f16_to_f32(device const half *src [[buffer(0)]],
+[[max_total_threads_per_threadgroup(256)]] kernel void uocr_moe_router_logits_f16_to_f32(device const half *src [[buffer(0)]],
                                              device const half *weight [[buffer(1)]],
                                              device float *logits [[buffer(2)]],
                                              constant UocrMoeRouterParams &params [[buffer(3)]],
@@ -2912,22 +3010,23 @@ kernel void uocr_moe_router_logits_f16_to_f32(device const half *src [[buffer(0)
                                              uint tid [[thread_index_in_threadgroup]],
                                              uint ntg [[threads_per_threadgroup]],
                                              uint simd_width [[threads_per_simdgroup]]) {
-    const uint token = output_index / params.experts;
-    const uint expert = output_index - token * params.experts;
-    if (token >= params.n_tokens || expert >= params.experts) {
+    const uint experts = uocr_fc_moe_experts_or(params.experts);
+    const uint token = output_index / experts;
+    const uint expert = output_index - token * experts;
+    if (token >= params.n_tokens || expert >= experts) {
         return;
     }
 
     const float value = uocr_moe_router_dot_f16(src, weight, params, token, expert, tid, ntg, simd_width, partials);
     if (tid == 0) {
-        logits[token * params.experts + expert] = value;
+        logits[token * experts + expert] = value;
     }
 }
 
 // Unlimited-OCR routing contract: softmax(hidden @ router_weight.T) over all
 // 64 experts, greedy top-6, raw selected probabilities, no top-k
 // renormalization/scaling, and no DS4 softplus/sqrt/bias transforms.
-kernel void uocr_moe_router_softmax_topk_f32(device const float *logits [[buffer(0)]],
+[[max_total_threads_per_threadgroup(64)]] kernel void uocr_moe_router_softmax_topk_f32(device const float *logits [[buffer(0)]],
                                              device float *probs [[buffer(1)]],
                                              device uint *top_expert_ids [[buffer(2)]],
                                              device float *top_weights [[buffer(3)]],
@@ -2941,27 +3040,29 @@ kernel void uocr_moe_router_softmax_topk_f32(device const float *logits [[buffer
         return;
     }
 
+    const uint experts = uocr_fc_moe_experts_or(params.experts);
+    const uint top_k = uocr_fc_moe_top_k_or(params.top_k);
     threadgroup float *scores = scratch;
-    threadgroup float *partials = scratch + params.experts;
-    threadgroup uint *indices = (threadgroup uint *)(scratch + params.experts + ntg);
+    threadgroup float *partials = scratch + experts;
+    threadgroup uint *indices = (threadgroup uint *)(scratch + experts + ntg);
 
     float local_max = -INFINITY;
-    const uint row_base = token * params.experts;
-    for (uint expert = tid; expert < params.experts; expert += ntg) {
+    const uint row_base = token * experts;
+    for (uint expert = tid; expert < experts; expert += ntg) {
         const float value = logits[row_base + expert];
         scores[expert] = value;
         local_max = max(local_max, value);
     }
     const float max_logit = uocr_threadgroup_max(local_max, partials, tid, ntg, simd_width);
     float local_sum = 0.0f;
-    for (uint expert = tid; expert < params.experts; expert += ntg) {
+    for (uint expert = tid; expert < experts; expert += ntg) {
         const float value = exp(scores[expert] - max_logit);
         scores[expert] = value;
         local_sum += value;
     }
     const float total_sum = uocr_threadgroup_sum(local_sum, partials, tid, ntg, simd_width);
     const float inv_sum = 1.0f / total_sum;
-    for (uint expert = tid; expert < params.experts; expert += ntg) {
+    for (uint expert = tid; expert < experts; expert += ntg) {
         const float prob = scores[expert] * inv_sum;
         scores[expert] = prob;
         probs[row_base + expert] = prob;
@@ -2974,10 +3075,10 @@ kernel void uocr_moe_router_softmax_topk_f32(device const float *logits [[buffer
     // thread-0 scan. This keeps selection deterministic for equal
     // probabilities by preferring the lower expert id; the routed sum is
     // commutative, so descending score order is only a diagnostic convention.
-    for (uint k = 2u; k <= params.experts; k <<= 1u) {
+    for (uint k = 2u; k <= experts; k <<= 1u) {
         for (uint j = k >> 1u; j > 0u; j >>= 1u) {
             const uint other = tid ^ j;
-            if (other > tid && other < params.experts) {
+            if (other > tid && other < experts) {
                 const uint a = indices[tid];
                 const uint b = indices[other];
                 bool swap = false;
@@ -2995,10 +3096,10 @@ kernel void uocr_moe_router_softmax_topk_f32(device const float *logits [[buffer
         }
     }
 
-    if (tid < params.top_k) {
+    if (tid < top_k) {
         const uint expert = indices[tid];
-        top_expert_ids[token * params.top_k + tid] = expert;
-        top_weights[token * params.top_k + tid] = scores[expert];
+        top_expert_ids[token * top_k + tid] = expert;
+        top_weights[token * top_k + tid] = scores[expert];
     }
 }
 
@@ -3907,13 +4008,14 @@ static inline float uocr_moe_combine_value_f16(device const half *routed,
     return value;
 }
 
-kernel void uocr_moe_combine_f16_to_f16(device const half *routed [[buffer(0)]],
+[[max_total_threads_per_threadgroup(256)]] kernel void uocr_moe_combine_f16_to_f16(device const half *routed [[buffer(0)]],
                                         device const half *shared [[buffer(1)]],
                                         device const half *residual [[buffer(2)]],
                                         device half *dst [[buffer(3)]],
                                         constant UocrMoeCombineParams &params [[buffer(4)]],
                                         uint gid [[thread_position_in_grid]]) {
-    const uint total = params.n_tokens * params.hidden_size;
+    const uint hidden_size = uocr_fc_hidden_size_or(params.hidden_size);
+    const uint total = params.n_tokens * hidden_size;
     const uint value_base = gid * UOCR_HALF4_WIDTH;
     if (value_base >= total) {
         return;
@@ -3933,13 +4035,14 @@ kernel void uocr_moe_combine_f16_to_f16(device const half *routed [[buffer(0)]],
     }
 }
 
-kernel void uocr_moe_combine_f16_to_f32(device const half *routed [[buffer(0)]],
+[[max_total_threads_per_threadgroup(256)]] kernel void uocr_moe_combine_f16_to_f32(device const half *routed [[buffer(0)]],
                                         device const half *shared [[buffer(1)]],
                                         device const half *residual [[buffer(2)]],
                                         device float *dst [[buffer(3)]],
                                         constant UocrMoeCombineParams &params [[buffer(4)]],
                                         uint gid [[thread_position_in_grid]]) {
-    const uint total = params.n_tokens * params.hidden_size;
+    const uint hidden_size = uocr_fc_hidden_size_or(params.hidden_size);
+    const uint total = params.n_tokens * hidden_size;
     if (gid >= total) {
         return;
     }
@@ -3959,32 +4062,38 @@ struct UocrRopeQKParams {
 
 static inline void uocr_rope_pair(uint gid,
                                   constant UocrRopeQKParams &params,
+                                  uint heads,
+                                  uint head_dim,
+                                  float freq_scale,
                                   thread uint &token,
                                   thread uint &head,
                                   thread uint &a,
                                   thread uint &b,
                                   thread float &c,
                                   thread float &s) {
-    const uint half_dim = params.head_dim >> 1u;
+    const uint half_dim = head_dim >> 1u;
     const uint pair = gid % half_dim;
     const uint token_head = gid / half_dim;
-    head = token_head % params.heads;
-    token = token_head / params.heads;
+    head = token_head % heads;
+    token = token_head / heads;
     a = pair;
     b = pair + half_dim;
-    const float angle = float(params.position_start + token) * exp2(float(pair) * params.freq_scale);
+    const float angle = float(params.position_start + token) * exp2(float(pair) * freq_scale);
     c = cos(angle);
     s = sin(angle);
 }
 
-kernel void uocr_rope_qk_f16_to_f16(device const half *q_src [[buffer(0)]],
+[[max_total_threads_per_threadgroup(256)]] kernel void uocr_rope_qk_f16_to_f16(device const half *q_src [[buffer(0)]],
                                     device const half *k_src [[buffer(1)]],
                                     device half *q_dst [[buffer(2)]],
                                     device half *k_dst [[buffer(3)]],
                                     constant UocrRopeQKParams &params [[buffer(4)]],
                                     uint gid [[thread_position_in_grid]]) {
-    const uint half_dim = params.head_dim >> 1u;
-    const uint total = params.n_tokens * params.heads * half_dim;
+    const uint heads = uocr_fc_attention_heads_or(params.heads);
+    const uint head_dim = uocr_fc_head_dim_or(params.head_dim);
+    const float freq_scale = uocr_fc_rope_freq_scale_or(params.freq_scale);
+    const uint half_dim = head_dim >> 1u;
+    const uint total = params.n_tokens * heads * half_dim;
     if (gid >= total) {
         return;
     }
@@ -3995,8 +4104,8 @@ kernel void uocr_rope_qk_f16_to_f16(device const half *q_src [[buffer(0)]],
     uint b;
     float c;
     float s;
-    uocr_rope_pair(gid, params, token, head, a, b, c, s);
-    const ulong base = (ulong(token) * ulong(params.heads) + ulong(head)) * ulong(params.head_dim);
+    uocr_rope_pair(gid, params, heads, head_dim, freq_scale, token, head, a, b, c, s);
+    const ulong base = (ulong(token) * ulong(heads) + ulong(head)) * ulong(head_dim);
     const float q0 = float(q_src[base + ulong(a)]);
     const float q1 = float(q_src[base + ulong(b)]);
     const float k0 = float(k_src[base + ulong(a)]);
@@ -4007,14 +4116,17 @@ kernel void uocr_rope_qk_f16_to_f16(device const half *q_src [[buffer(0)]],
     k_dst[base + ulong(b)] = half(k0 * s + k1 * c);
 }
 
-kernel void uocr_rope_qk_f16_to_f32(device const half *q_src [[buffer(0)]],
+[[max_total_threads_per_threadgroup(256)]] kernel void uocr_rope_qk_f16_to_f32(device const half *q_src [[buffer(0)]],
                                     device const half *k_src [[buffer(1)]],
                                     device float *q_dst [[buffer(2)]],
                                     device float *k_dst [[buffer(3)]],
                                     constant UocrRopeQKParams &params [[buffer(4)]],
                                     uint gid [[thread_position_in_grid]]) {
-    const uint half_dim = params.head_dim >> 1u;
-    const uint total = params.n_tokens * params.heads * half_dim;
+    const uint heads = uocr_fc_attention_heads_or(params.heads);
+    const uint head_dim = uocr_fc_head_dim_or(params.head_dim);
+    const float freq_scale = uocr_fc_rope_freq_scale_or(params.freq_scale);
+    const uint half_dim = head_dim >> 1u;
+    const uint total = params.n_tokens * heads * half_dim;
     if (gid >= total) {
         return;
     }
@@ -4025,8 +4137,8 @@ kernel void uocr_rope_qk_f16_to_f32(device const half *q_src [[buffer(0)]],
     uint b;
     float c;
     float s;
-    uocr_rope_pair(gid, params, token, head, a, b, c, s);
-    const ulong base = (ulong(token) * ulong(params.heads) + ulong(head)) * ulong(params.head_dim);
+    uocr_rope_pair(gid, params, heads, head_dim, freq_scale, token, head, a, b, c, s);
+    const ulong base = (ulong(token) * ulong(heads) + ulong(head)) * ulong(head_dim);
     const float q0 = float(q_src[base + ulong(a)]);
     const float q1 = float(q_src[base + ulong(b)]);
     const float k0 = float(k_src[base + ulong(a)]);
@@ -4198,21 +4310,24 @@ struct UocrDecodeAttentionParams {
  * supplied by the host as first_generated.
  */
 static inline uint uocr_decode_attention_cache_token(constant UocrDecodeAttentionParams &params,
-                                                     uint attention_index) {
+                                                     uint attention_index,
+                                                     uint ring_window) {
     if (attention_index < params.prompt_length) {
         return attention_index;
     }
     const uint generated_index = params.first_generated + (attention_index - params.prompt_length);
-    return params.prompt_length + (generated_index % params.ring_window);
+    return params.prompt_length + (generated_index % ring_window);
 }
 
 static inline ulong uocr_decode_attention_cache_index(constant UocrDecodeAttentionParams &params,
+                                                      uint heads,
+                                                      uint head_dim,
                                                       uint cache_token,
                                                       uint head,
                                                       uint dim) {
     return (((ulong(params.layer) * ulong(params.batch_slots) + ulong(params.slot)) *
              ulong(params.cache_token_capacity) + ulong(cache_token)) *
-            ulong(params.heads) + ulong(head)) * ulong(params.head_dim) + ulong(dim);
+            ulong(heads) + ulong(head)) * ulong(head_dim) + ulong(dim);
 }
 
 #define UOCR_FLASH_Q_PER_TG 4u
@@ -4571,11 +4686,14 @@ static inline void uocr_prefill_attention_flash_impl(device const half *q_src,
                                                      ushort simd_width_u16) {
     const uint lane = uint(lane_u16);
     const uint simd_width = uint(simd_width_u16);
+    const uint heads = uocr_fc_attention_heads_or(params.heads);
+    const uint head_dim = uocr_fc_head_dim_or(params.head_dim);
+    const float scale = uocr_fc_attention_scale_or(params.scale);
     const uint query_in_block = uint(simdgroup_u16);
     const uint head = tg.x;
     const uint query_token = tg.y * UOCR_FLASH_Q_PER_TG + query_in_block;
-    if (query_in_block >= UOCR_FLASH_Q_PER_TG || query_token >= params.n_tokens || head >= params.heads ||
-        params.head_dim == 0u || params.head_dim > simd_width * UOCR_FLASH_MAX_LANE_VALUES) {
+    if (query_in_block >= UOCR_FLASH_Q_PER_TG || query_token >= params.n_tokens || head >= heads ||
+        head_dim == 0u || head_dim > simd_width * UOCR_FLASH_MAX_LANE_VALUES) {
         return;
     }
 
@@ -4583,8 +4701,8 @@ static inline void uocr_prefill_attention_flash_impl(device const half *q_src,
     float acc[UOCR_FLASH_MAX_LANE_VALUES];
     for (uint i = 0u; i < UOCR_FLASH_MAX_LANE_VALUES; ++i) {
         const uint dim = uocr_flash_lane_dim(lane, i, simd_width);
-        if (dim < params.head_dim) {
-            const ulong q_index = (ulong(query_token) * ulong(params.heads) + ulong(head)) * ulong(params.head_dim) + ulong(dim);
+        if (dim < head_dim) {
+            const ulong q_index = (ulong(query_token) * ulong(heads) + ulong(head)) * ulong(head_dim) + ulong(dim);
             qv[i] = float(q_src[q_index]);
         } else {
             qv[i] = 0.0f;
@@ -4598,19 +4716,19 @@ static inline void uocr_prefill_attention_flash_impl(device const half *q_src,
         float local_dot = 0.0f;
         for (uint i = 0u; i < UOCR_FLASH_MAX_LANE_VALUES; ++i) {
             const uint dim = uocr_flash_lane_dim(lane, i, simd_width);
-            if (dim < params.head_dim) {
-                const ulong k_index = (ulong(key_token) * ulong(params.heads) + ulong(head)) * ulong(params.head_dim) + ulong(dim);
+            if (dim < head_dim) {
+                const ulong k_index = (ulong(key_token) * ulong(heads) + ulong(head)) * ulong(head_dim) + ulong(dim);
                 local_dot += qv[i] * float(k_src[k_index]);
             }
         }
-        const float score = simd_sum(local_dot) * params.scale;
+        const float score = simd_sum(local_dot) * scale;
         const float mnew = max(m, score);
         const float corr = exp(m - mnew);
         const float e = exp(score - mnew);
         for (uint i = 0u; i < UOCR_FLASH_MAX_LANE_VALUES; ++i) {
             const uint dim = uocr_flash_lane_dim(lane, i, simd_width);
-            if (dim < params.head_dim) {
-                const ulong v_index = (ulong(key_token) * ulong(params.heads) + ulong(head)) * ulong(params.head_dim) + ulong(dim);
+            if (dim < head_dim) {
+                const ulong v_index = (ulong(key_token) * ulong(heads) + ulong(head)) * ulong(head_dim) + ulong(dim);
                 acc[i] = acc[i] * corr + e * float(v_src[v_index]);
             }
         }
@@ -4621,14 +4739,14 @@ static inline void uocr_prefill_attention_flash_impl(device const half *q_src,
     const float inv_l = l > 0.0f ? 1.0f / l : 0.0f;
     for (uint i = 0u; i < UOCR_FLASH_MAX_LANE_VALUES; ++i) {
         const uint dim = uocr_flash_lane_dim(lane, i, simd_width);
-        if (dim < params.head_dim) {
-            const ulong dst_index = (ulong(query_token) * ulong(params.heads) + ulong(head)) * ulong(params.head_dim) + ulong(dim);
+        if (dim < head_dim) {
+            const ulong dst_index = (ulong(query_token) * ulong(heads) + ulong(head)) * ulong(head_dim) + ulong(dim);
             dst[dst_index] = out_t(acc[i] * inv_l);
         }
     }
 }
 
-kernel void uocr_prefill_attention_flash_f16_to_f16(device const half *q_src [[buffer(0)]],
+[[max_total_threads_per_threadgroup(512)]] kernel void uocr_prefill_attention_flash_f16_to_f16(device const half *q_src [[buffer(0)]],
                                                     device const half *k_src [[buffer(1)]],
                                                     device const half *v_src [[buffer(2)]],
                                                     device half *dst [[buffer(3)]],
@@ -4640,7 +4758,7 @@ kernel void uocr_prefill_attention_flash_f16_to_f16(device const half *q_src [[b
     uocr_prefill_attention_flash_impl(q_src, k_src, v_src, dst, params, tg, lane, simdgroup, simd_width);
 }
 
-kernel void uocr_prefill_attention_flash_f16_to_f32(device const half *q_src [[buffer(0)]],
+[[max_total_threads_per_threadgroup(512)]] kernel void uocr_prefill_attention_flash_f16_to_f32(device const half *q_src [[buffer(0)]],
                                                     device const half *k_src [[buffer(1)]],
                                                     device const half *v_src [[buffer(2)]],
                                                     device float *dst [[buffer(3)]],
@@ -4663,8 +4781,12 @@ static inline void uocr_decode_attention_flash_impl(device const half *q_src,
                                                     ushort simd_width_u16) {
     const uint lane = uint(lane_u16);
     const uint simd_width = uint(simd_width_u16);
-    if (head >= params.heads || params.attention_length == 0u ||
-        params.head_dim == 0u || params.head_dim > simd_width * UOCR_FLASH_MAX_LANE_VALUES) {
+    const uint heads = uocr_fc_attention_heads_or(params.heads);
+    const uint head_dim = uocr_fc_head_dim_or(params.head_dim);
+    const uint ring_window = uocr_fc_ring_window_or(params.ring_window);
+    const float scale = uocr_fc_attention_scale_or(params.scale);
+    if (head >= heads || params.attention_length == 0u ||
+        head_dim == 0u || head_dim > simd_width * UOCR_FLASH_MAX_LANE_VALUES) {
         return;
     }
 
@@ -4672,8 +4794,8 @@ static inline void uocr_decode_attention_flash_impl(device const half *q_src,
     float acc[UOCR_FLASH_MAX_LANE_VALUES];
     for (uint i = 0u; i < UOCR_FLASH_MAX_LANE_VALUES; ++i) {
         const uint dim = uocr_flash_lane_dim(lane, i, simd_width);
-        if (dim < params.head_dim) {
-            const ulong q_index = ulong(head) * ulong(params.head_dim) + ulong(dim);
+        if (dim < head_dim) {
+            const ulong q_index = ulong(head) * ulong(head_dim) + ulong(dim);
             qv[i] = float(q_src[q_index]);
         } else {
             qv[i] = 0.0f;
@@ -4684,26 +4806,26 @@ static inline void uocr_decode_attention_flash_impl(device const half *q_src,
     float m = UOCR_FLASH_NEG_INF;
     float l = 0.0f;
     for (uint attention_index = 0u; attention_index < params.attention_length; ++attention_index) {
-        const uint cache_token = uocr_decode_attention_cache_token(params, attention_index);
+        const uint cache_token = uocr_decode_attention_cache_token(params, attention_index, ring_window);
         if (cache_token >= params.cache_token_capacity) {
             continue;
         }
         float local_dot = 0.0f;
         for (uint i = 0u; i < UOCR_FLASH_MAX_LANE_VALUES; ++i) {
             const uint dim = uocr_flash_lane_dim(lane, i, simd_width);
-            if (dim < params.head_dim) {
-                const ulong k_index = uocr_decode_attention_cache_index(params, cache_token, head, dim);
+            if (dim < head_dim) {
+                const ulong k_index = uocr_decode_attention_cache_index(params, heads, head_dim, cache_token, head, dim);
                 local_dot += qv[i] * float(k_cache[k_index]);
             }
         }
-        const float score = simd_sum(local_dot) * params.scale;
+        const float score = simd_sum(local_dot) * scale;
         const float mnew = max(m, score);
         const float corr = exp(m - mnew);
         const float e = exp(score - mnew);
         for (uint i = 0u; i < UOCR_FLASH_MAX_LANE_VALUES; ++i) {
             const uint dim = uocr_flash_lane_dim(lane, i, simd_width);
-            if (dim < params.head_dim) {
-                const ulong v_index = uocr_decode_attention_cache_index(params, cache_token, head, dim);
+            if (dim < head_dim) {
+                const ulong v_index = uocr_decode_attention_cache_index(params, heads, head_dim, cache_token, head, dim);
                 acc[i] = acc[i] * corr + e * float(v_cache[v_index]);
             }
         }
@@ -4714,14 +4836,14 @@ static inline void uocr_decode_attention_flash_impl(device const half *q_src,
     const float inv_l = l > 0.0f ? 1.0f / l : 0.0f;
     for (uint i = 0u; i < UOCR_FLASH_MAX_LANE_VALUES; ++i) {
         const uint dim = uocr_flash_lane_dim(lane, i, simd_width);
-        if (dim < params.head_dim) {
-            const ulong dst_index = ulong(head) * ulong(params.head_dim) + ulong(dim);
+        if (dim < head_dim) {
+            const ulong dst_index = ulong(head) * ulong(head_dim) + ulong(dim);
             dst[dst_index] = out_t(acc[i] * inv_l);
         }
     }
 }
 
-kernel void uocr_decode_attention_flash_f16_to_f16(device const half *q_src [[buffer(0)]],
+[[max_total_threads_per_threadgroup(256)]] kernel void uocr_decode_attention_flash_f16_to_f16(device const half *q_src [[buffer(0)]],
                                                    device const half *k_cache [[buffer(1)]],
                                                    device const half *v_cache [[buffer(2)]],
                                                    device half *dst [[buffer(3)]],
@@ -4732,7 +4854,7 @@ kernel void uocr_decode_attention_flash_f16_to_f16(device const half *q_src [[bu
     uocr_decode_attention_flash_impl(q_src, k_cache, v_cache, dst, params, head, lane, simd_width);
 }
 
-kernel void uocr_decode_attention_flash_f16_to_f32(device const half *q_src [[buffer(0)]],
+[[max_total_threads_per_threadgroup(256)]] kernel void uocr_decode_attention_flash_f16_to_f32(device const half *q_src [[buffer(0)]],
                                                    device const half *k_cache [[buffer(1)]],
                                                    device const half *v_cache [[buffer(2)]],
                                                    device float *dst [[buffer(3)]],
@@ -4758,14 +4880,17 @@ struct UocrKVCacheWriteParams {
     uint reserved1;
 };
 
-kernel void uocr_kv_cache_write_f16(device const half *k_src [[buffer(0)]],
+[[max_total_threads_per_threadgroup(256)]] kernel void uocr_kv_cache_write_f16(device const half *k_src [[buffer(0)]],
                                     device const half *v_src [[buffer(1)]],
                                     device half *k_cache [[buffer(2)]],
                                     device half *v_cache [[buffer(3)]],
                                     constant UocrKVCacheWriteParams &params [[buffer(4)]],
                                     uint gid [[thread_position_in_grid]]) {
-    const uint vec_head_dim = uocr_div_up_u32(params.head_dim, UOCR_HALF4_WIDTH);
-    const uint head_area_vec = params.heads * vec_head_dim;
+    const uint heads = uocr_fc_attention_heads_or(params.heads);
+    const uint head_dim = uocr_fc_head_dim_or(params.head_dim);
+    const uint ring_window = uocr_fc_ring_window_or(params.ring_window);
+    const uint vec_head_dim = uocr_div_up_u32(head_dim, UOCR_HALF4_WIDTH);
+    const uint head_area_vec = heads * vec_head_dim;
     const uint total_vec = params.n_tokens * head_area_vec;
     if (gid >= total_vec || vec_head_dim == 0u) {
         return;
@@ -4773,26 +4898,26 @@ kernel void uocr_kv_cache_write_f16(device const half *k_src [[buffer(0)]],
 
     const uint dim_vec = gid % vec_head_dim;
     const uint dim = dim_vec * UOCR_HALF4_WIDTH;
-    const uint head = (gid / vec_head_dim) % params.heads;
+    const uint head = (gid / vec_head_dim) % heads;
     const uint token = gid / head_area_vec;
     const uint position = params.position_start + token;
     uint cache_token = position;
     if (position >= params.prompt_length) {
-        cache_token = params.prompt_length + ((position - params.prompt_length) % params.ring_window);
+        cache_token = params.prompt_length + ((position - params.prompt_length) % ring_window);
     }
     if (cache_token >= params.cache_token_capacity) {
         return;
     }
 
-    const ulong src_index = (ulong(token) * ulong(params.heads) + ulong(head)) * ulong(params.head_dim) + ulong(dim);
+    const ulong src_index = (ulong(token) * ulong(heads) + ulong(head)) * ulong(head_dim) + ulong(dim);
     const ulong dst_index = (((ulong(params.layer) * ulong(params.batch_slots) + ulong(params.slot)) *
                               ulong(params.cache_token_capacity) + ulong(cache_token)) *
-                             ulong(params.heads) + ulong(head)) * ulong(params.head_dim) + ulong(dim);
-    if (dim + (UOCR_HALF4_WIDTH - 1u) < params.head_dim) {
+                             ulong(heads) + ulong(head)) * ulong(head_dim) + ulong(dim);
+    if (dim + (UOCR_HALF4_WIDTH - 1u) < head_dim) {
         uocr_store_half4(k_cache, dst_index, uocr_load_half4(k_src, src_index));
         uocr_store_half4(v_cache, dst_index, uocr_load_half4(v_src, src_index));
     } else {
-        for (uint i = 0u; i < UOCR_HALF4_WIDTH && dim + i < params.head_dim; ++i) {
+        for (uint i = 0u; i < UOCR_HALF4_WIDTH && dim + i < head_dim; ++i) {
             k_cache[dst_index + ulong(i)] = k_src[src_index + ulong(i)];
             v_cache[dst_index + ulong(i)] = v_src[src_index + ulong(i)];
         }

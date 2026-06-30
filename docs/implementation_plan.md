@@ -84,15 +84,15 @@ Reference: `data.tmp/reference/Metal-Shading-Language-Specification.pdf`
 **Goal:** Let the compiler optimize fixed OCR shapes and remove runtime branches from hot kernels.
 
 **Details:**
-- The spec supports function constants to generate pipeline-state-time variants without offline macro explosion.
-- Use them for fixed or low-cardinality values: head dim, output type, quant format, top-k, tile sizes, and optional bias/residual paths.
-- Add `[[max_total_threads_per_threadgroup]]` where fixed limits are known; evaluate Metal 4 `[[required_threads_per_threadgroup]]` for fixed-size kernels.
+- Added decoder-shape function constants for fixed model values: hidden size, vocab size, heads, head dim, ring window, RoPE/attention scale, MoE experts/top-k, LM-head tile shape, and QKV projection count.
+- Integrated hot-path dispatch uses specialized pipeline states while diagnostics and generic APIs keep unspecialized fallback pipelines.
+- Added `[[max_total_threads_per_threadgroup]]` to fixed-size hot kernels; `[[required_threads_per_threadgroup]]` remains deferred because it would constrain adaptive SIMD-width flash dispatch.
 
 **Implementation:**
-- [ ] Identify hot kernels with runtime params that are actually fixed for the model.
-- [ ] Add function-constant pipeline variants for the highest-impact paths.
-- [ ] Cache specialized pipeline states by constant tuple.
-- [ ] Benchmark instruction count, occupancy, and runtime.
+- [x] Identify hot kernels with runtime params that are actually fixed for the model.
+- [x] Add function-constant pipeline variants for the highest-impact paths.
+- [x] Cache specialized pipeline states by constant tuple.
+- [x] Benchmark runtime, prewarm overhead, and memory usage with the E2E generation probe.
 
 ## 7. Evaluate native packed numeric and tensor-blockwise quantized paths
 

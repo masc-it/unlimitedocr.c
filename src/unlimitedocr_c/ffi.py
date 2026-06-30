@@ -257,13 +257,34 @@ def _shared_library_names() -> tuple[str, ...]:
     return ("libunlimitedocr.so",)
 
 
+def _release_library_dir() -> Path:
+    return project_root() / "build" / "release"
+
+
+def _release_library_paths() -> list[Path]:
+    release_dir = _release_library_dir()
+    return [release_dir / name for name in _shared_library_names()]
+
+
+def _is_source_tree_release_library(path: Path) -> bool:
+    release_dir = _release_library_dir().resolve(strict=False)
+    return path.expanduser().resolve(strict=False).parent == release_dir
+
+
+def _require_source_tree_release_library(path: Path, label: str) -> Path:
+    expanded = path.expanduser()
+    if is_source_tree_package() and not _is_source_tree_release_library(expanded):
+        expected = ", ".join(str(candidate) for candidate in _release_library_paths())
+        raise FileNotFoundError(f"{label} must point to the Release native library ({expected})")
+    return expanded
+
+
 def candidate_library_paths() -> list[Path]:
     env = os.environ.get("UOCR_LIBRARY_PATH")
-    candidates: list[Path] = [Path(env)] if env else []
-    root = project_root()
-    for build_dir in ("debug", "release", "relwithdebinfo", "cpu"):
-        for name in _shared_library_names():
-            candidates.append(root / "build" / build_dir / name)
+    if env:
+        return [_require_source_tree_release_library(Path(env), "UOCR_LIBRARY_PATH")]
+
+    candidates: list[Path] = _release_library_paths()
     if not is_source_tree_package():
         package_lib = Path(__file__).resolve().parent / "lib"
         for name in _shared_library_names():
@@ -320,7 +341,7 @@ _LIB: ct.CDLL | None = None
 def load_library(path: str | Path | None = None) -> ct.CDLL:
     global _LIB
     if path is not None:
-        return _bind_library(Path(path))
+        return _bind_library(_require_source_tree_release_library(Path(path), "library_path"))
     if _LIB is None:
         _LIB = _bind_library(find_library_path())
     return _LIB

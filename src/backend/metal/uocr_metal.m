@@ -43,6 +43,19 @@
 #define UOCR_METAL_FLASH_Q_PER_TG 4u
 #define UOCR_METAL_FLASH_MAX_LANE_VALUES 4u
 #define UOCR_METAL_HALF4_WIDTH 4u
+#define UOCR_METAL_FC_HIDDEN_SIZE 0u
+#define UOCR_METAL_FC_ATTENTION_HEADS 1u
+#define UOCR_METAL_FC_HEAD_DIM 2u
+#define UOCR_METAL_FC_RING_WINDOW 3u
+#define UOCR_METAL_FC_MOE_EXPERTS 4u
+#define UOCR_METAL_FC_MOE_TOP_K 5u
+#define UOCR_METAL_FC_RMS_EPS 6u
+#define UOCR_METAL_FC_ROPE_FREQ_SCALE 7u
+#define UOCR_METAL_FC_ATTENTION_SCALE 8u
+#define UOCR_METAL_FC_ATTENTION_PROJECTION_COUNT 9u
+#define UOCR_METAL_FC_VOCAB_SIZE 10u
+#define UOCR_METAL_FC_LM_HEAD_TILE_TOKENS 11u
+#define UOCR_METAL_FC_LM_HEAD_LANES_PER_TOKEN 12u
 #if UINTPTR_MAX > 0xffffffffu
 #define UOCR_METAL_PRIVATE_WORKSPACE_PTR_BASE ((uintptr_t)0x4000000000000000ULL)
 #else
@@ -1446,25 +1459,41 @@ static int metal_retain_mps_matmul_arrays_until_completed(uocr_metal_context *ct
     return 1;
 }
 
-static id<MTLComputePipelineState> metal_get_pipeline(uocr_metal_context *ctx,
-                                                       const char *function_name,
-                                                       char *error,
-                                                       size_t error_size) {
+static id<MTLComputePipelineState> metal_get_pipeline_with_constants(uocr_metal_context *ctx,
+                                                                      const char *function_name,
+                                                                      NSString *constant_tuple_key,
+                                                                      MTLFunctionConstantValues *constant_values,
+                                                                      char *error,
+                                                                      size_t error_size) {
     if (ctx == NULL || function_name == NULL || function_name[0] == '\0') {
         (void)metal_fail(error, error_size, "invalid Metal pipeline request");
         return nil;
     }
 
-    NSString *key = [NSString stringWithUTF8String:function_name];
+    NSString *name = [NSString stringWithUTF8String:function_name];
+    NSString *key = constant_tuple_key != nil ? [name stringByAppendingString:constant_tuple_key] : name;
     id<MTLComputePipelineState> cached = [ctx->pipeline_cache objectForKey:key];
     if (cached != nil) {
         return cached;
     }
 
     NSError *ns_error = nil;
-    id<MTLFunction> fn = [ctx->library newFunctionWithName:key];
+    id<MTLFunction> fn = nil;
+    if (constant_values != nil) {
+        fn = [ctx->library newFunctionWithName:name constantValues:constant_values error:&ns_error];
+    } else {
+        fn = [ctx->library newFunctionWithName:name];
+    }
     if (fn == nil) {
-        (void)metal_fail(error, error_size, "Metal function %s not found", function_name);
+        if (ns_error != nil) {
+            (void)metal_fail(error,
+                             error_size,
+                             "Metal function %s specialization failed: %s",
+                             function_name,
+                             [[ns_error localizedDescription] UTF8String]);
+        } else {
+            (void)metal_fail(error, error_size, "Metal function %s not found", function_name);
+        }
         return nil;
     }
 
@@ -1482,6 +1511,83 @@ static id<MTLComputePipelineState> metal_get_pipeline(uocr_metal_context *ctx,
     [ctx->pipeline_cache setObject:pipeline forKey:key];
     [pipeline release];
     return [ctx->pipeline_cache objectForKey:key];
+}
+
+static id<MTLComputePipelineState> metal_get_pipeline(uocr_metal_context *ctx,
+                                                       const char *function_name,
+                                                       char *error,
+                                                       size_t error_size) {
+    return metal_get_pipeline_with_constants(ctx, function_name, nil, nil, error, error_size);
+}
+
+static id<MTLComputePipelineState> metal_get_decoder_shape_pipeline(uocr_metal_context *ctx,
+                                                                     const char *function_name,
+                                                                     char *error,
+                                                                     size_t error_size) {
+    if (ctx == NULL || function_name == NULL || function_name[0] == '\0') {
+        (void)metal_fail(error, error_size, "invalid decoder-shape Metal pipeline request");
+        return nil;
+    }
+    @autoreleasepool {
+        const uint32_t hidden_size = UOCR_HIDDEN_SIZE;
+        const uint32_t attention_heads = UOCR_ATTENTION_HEADS;
+        const uint32_t head_dim = UOCR_HEAD_DIM;
+        const uint32_t ring_window = UOCR_GENERATED_RING_WINDOW;
+        const uint32_t moe_experts = UOCR_ROUTED_EXPERTS;
+        const uint32_t moe_top_k = UOCR_MOE_TOP_K;
+        const float rms_eps = UOCR_RMS_NORM_EPS;
+        const float rope_freq_scale = -2.0f * log2f((float)UOCR_ROPE_THETA) / (float)UOCR_HEAD_DIM;
+        const float attention_scale = 1.0f / sqrtf((float)UOCR_HEAD_DIM);
+        const uint32_t attention_projection_count = 3u;
+        const uint32_t vocab_size = UOCR_VOCAB_SIZE;
+        const uint32_t lm_head_tile_tokens = UOCR_METAL_LM_HEAD_ARGMAX_TILE_TOKENS;
+        const uint32_t lm_head_lanes_per_token = UOCR_METAL_LM_HEAD_ARGMAX_LANES_PER_TOKEN;
+        static NSString *tuple_key = nil;
+        if (tuple_key == nil) {
+            tuple_key = [[NSString stringWithFormat:@"#decoder-shape:h%u:a%u:d%u:r%u:e%u:k%u:v%u:t%u:l%u",
+                          hidden_size,
+                          attention_heads,
+                          head_dim,
+                          ring_window,
+                          moe_experts,
+                          moe_top_k,
+                          vocab_size,
+                          lm_head_tile_tokens,
+                          lm_head_lanes_per_token] retain];
+        }
+        NSString *name = [NSString stringWithUTF8String:function_name];
+        NSString *cache_key = [name stringByAppendingString:tuple_key];
+        id<MTLComputePipelineState> cached = [ctx->pipeline_cache objectForKey:cache_key];
+        if (cached != nil) {
+            return cached;
+        }
+        MTLFunctionConstantValues *constants = [MTLFunctionConstantValues new];
+        if (constants == nil) {
+            (void)metal_fail(error, error_size, "failed to allocate Metal function constants");
+            return nil;
+        }
+        [constants setConstantValue:&hidden_size type:MTLDataTypeUInt atIndex:UOCR_METAL_FC_HIDDEN_SIZE];
+        [constants setConstantValue:&attention_heads type:MTLDataTypeUInt atIndex:UOCR_METAL_FC_ATTENTION_HEADS];
+        [constants setConstantValue:&head_dim type:MTLDataTypeUInt atIndex:UOCR_METAL_FC_HEAD_DIM];
+        [constants setConstantValue:&ring_window type:MTLDataTypeUInt atIndex:UOCR_METAL_FC_RING_WINDOW];
+        [constants setConstantValue:&moe_experts type:MTLDataTypeUInt atIndex:UOCR_METAL_FC_MOE_EXPERTS];
+        [constants setConstantValue:&moe_top_k type:MTLDataTypeUInt atIndex:UOCR_METAL_FC_MOE_TOP_K];
+        [constants setConstantValue:&rms_eps type:MTLDataTypeFloat atIndex:UOCR_METAL_FC_RMS_EPS];
+        [constants setConstantValue:&rope_freq_scale type:MTLDataTypeFloat atIndex:UOCR_METAL_FC_ROPE_FREQ_SCALE];
+        [constants setConstantValue:&attention_scale type:MTLDataTypeFloat atIndex:UOCR_METAL_FC_ATTENTION_SCALE];
+        [constants setConstantValue:&attention_projection_count type:MTLDataTypeUInt atIndex:UOCR_METAL_FC_ATTENTION_PROJECTION_COUNT];
+        [constants setConstantValue:&vocab_size type:MTLDataTypeUInt atIndex:UOCR_METAL_FC_VOCAB_SIZE];
+        [constants setConstantValue:&lm_head_tile_tokens type:MTLDataTypeUInt atIndex:UOCR_METAL_FC_LM_HEAD_TILE_TOKENS];
+        [constants setConstantValue:&lm_head_lanes_per_token type:MTLDataTypeUInt atIndex:UOCR_METAL_FC_LM_HEAD_LANES_PER_TOKEN];
+        id<MTLComputePipelineState> pipeline = metal_get_pipeline_with_constants(ctx,
+                                                                                 function_name,
+                                                                                 tuple_key,
+                                                                                 constants,
+                                                                                 error,
+                                                                                 error_size);
+        [constants release];
+        return pipeline;
+    }
 }
 
 static NSUInteger metal_power2_threadgroup_width(NSUInteger preferred, NSUInteger max_allowed) {
@@ -7963,34 +8069,41 @@ static int metal_mps_framework_available(void);
 static id metal_ensure_mps_matmul_kernel(uocr_metal_context *ctx, char *error, size_t error_size);
 
 static int metal_prewarm_integrated_decoder_pipelines(uocr_metal_context *ctx, char *error, size_t error_size) {
-    static const char *const pipeline_names[] = {
-        "uocr_rmsnorm_f16_to_f16",
-        "uocr_dense_f16_to_f32",
-        "uocr_no_repeat_collect_banned_i32",
-        "uocr_lm_head_argmax_f16",
-        "uocr_argmax_pairs_f32",
-        "uocr_get_rows_f16_to_f16",
-        "uocr_assemble_prompt_text_f16",
-        "uocr_assemble_prompt_text_skip_image_f16",
-        "uocr_assemble_prompt_with_image_f16",
-        "uocr_attention_qkvo_f16_to_f16",
-        "uocr_rope_qk_f16_to_f16",
-        "uocr_kv_cache_write_f16",
-        "uocr_prefill_attention_flash_f16_to_f16",
-        "uocr_decode_attention_flash_f16_to_f16",
-        "uocr_attention_output_residual_f16_to_f16",
-        "uocr_clip_residual_add_f16_to_f16",
-        "uocr_dense_swiglu_gate_up_f16",
-        "uocr_dense_swiglu_down_f16_to_f16",
-        "uocr_moe_router_logits_f16_to_f32",
-        "uocr_moe_router_softmax_topk_f32",
-        "uocr_moe_prefill_interleaved_gate_up_f16",
-        "uocr_moe_prefill_interleaved_down_sum_f16_to_f16",
-        "uocr_moe_combine_f16_to_f16",
+    typedef struct uocr_metal_prewarm_pipeline {
+        const char *name;
+        int decoder_shape_specialized;
+    } uocr_metal_prewarm_pipeline;
+    static const uocr_metal_prewarm_pipeline pipeline_names[] = {
+        { "uocr_rmsnorm_f16_to_f16", 1 },
+        { "uocr_dense_f16_to_f32", 0 },
+        { "uocr_no_repeat_collect_banned_i32", 0 },
+        { "uocr_lm_head_argmax_f16", 1 },
+        { "uocr_argmax_pairs_f32", 0 },
+        { "uocr_get_rows_f16_to_f16", 0 },
+        { "uocr_assemble_prompt_text_f16", 0 },
+        { "uocr_assemble_prompt_text_skip_image_f16", 0 },
+        { "uocr_assemble_prompt_with_image_f16", 0 },
+        { "uocr_attention_qkvo_f16_to_f16", 1 },
+        { "uocr_rope_qk_f16_to_f16", 1 },
+        { "uocr_kv_cache_write_f16", 1 },
+        { "uocr_prefill_attention_flash_f16_to_f16", 1 },
+        { "uocr_decode_attention_flash_f16_to_f16", 1 },
+        { "uocr_attention_output_residual_f16_to_f16", 1 },
+        { "uocr_clip_residual_add_f16_to_f16", 0 },
+        { "uocr_dense_swiglu_gate_up_f16", 1 },
+        { "uocr_dense_swiglu_down_f16_to_f16", 1 },
+        { "uocr_moe_router_logits_f16_to_f32", 1 },
+        { "uocr_moe_router_softmax_topk_f32", 1 },
+        { "uocr_moe_prefill_interleaved_gate_up_f16", 0 },
+        { "uocr_moe_prefill_interleaved_down_sum_f16_to_f16", 0 },
+        { "uocr_moe_combine_f16_to_f16", 1 },
     };
     @autoreleasepool {
         for (uint32_t i = 0u; i < (uint32_t)(sizeof(pipeline_names) / sizeof(pipeline_names[0])); ++i) {
-            if (metal_get_pipeline(ctx, pipeline_names[i], error, error_size) == nil) {
+            id<MTLComputePipelineState> pipeline = pipeline_names[i].decoder_shape_specialized ?
+                metal_get_decoder_shape_pipeline(ctx, pipeline_names[i].name, error, error_size) :
+                metal_get_pipeline(ctx, pipeline_names[i].name, error, error_size);
+            if (pipeline == nil) {
                 return 0;
             }
         }
@@ -10272,7 +10385,7 @@ static int metal_run_lm_head_argmax_f16(uocr_metal_context *ctx,
         return 0;
     }
     @autoreleasepool {
-        id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, "uocr_lm_head_argmax_f16", error, error_size);
+        id<MTLComputePipelineState> pipeline = metal_get_decoder_shape_pipeline(ctx, "uocr_lm_head_argmax_f16", error, error_size);
         if (pipeline == nil) {
             return 0;
         }
@@ -10400,7 +10513,7 @@ static int metal_run_rmsnorm_buffer_f16(uocr_metal_context *ctx,
         return metal_fail(error, error_size, "invalid %s RMSNorm request", op_name);
     }
     @autoreleasepool {
-        id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, "uocr_rmsnorm_f16_to_f16", error, error_size);
+        id<MTLComputePipelineState> pipeline = metal_get_decoder_shape_pipeline(ctx, "uocr_rmsnorm_f16_to_f16", error, error_size);
         if (pipeline == nil) {
             return 0;
         }
@@ -10633,7 +10746,7 @@ static int metal_run_attention_qkv_buffer_f16(uocr_metal_context *ctx,
         return 0;
     }
     @autoreleasepool {
-        id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, "uocr_attention_qkvo_f16_to_f16", error, error_size);
+        id<MTLComputePipelineState> pipeline = metal_get_decoder_shape_pipeline(ctx, "uocr_attention_qkvo_f16_to_f16", error, error_size);
         if (pipeline == nil) {
             return 0;
         }
@@ -10691,7 +10804,7 @@ static int metal_run_rope_qk_buffer_f16(uocr_metal_context *ctx,
         return metal_fail(error, error_size, "integrated RoPE position range exceeds max positions");
     }
     @autoreleasepool {
-        id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, "uocr_rope_qk_f16_to_f16", error, error_size);
+        id<MTLComputePipelineState> pipeline = metal_get_decoder_shape_pipeline(ctx, "uocr_rope_qk_f16_to_f16", error, error_size);
         if (pipeline == nil) {
             return 0;
         }
@@ -10758,7 +10871,7 @@ static int metal_run_kv_write_buffer_f16(uocr_metal_context *ctx,
         return metal_fail(error, error_size, "integrated KV write dispatch size overflow");
     }
     @autoreleasepool {
-        id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, "uocr_kv_cache_write_f16", error, error_size);
+        id<MTLComputePipelineState> pipeline = metal_get_decoder_shape_pipeline(ctx, "uocr_kv_cache_write_f16", error, error_size);
         if (pipeline == nil) {
             return 0;
         }
@@ -10833,7 +10946,7 @@ static int metal_run_decode_attention_buffer_f16(uocr_metal_context *ctx,
         return metal_fail(error, error_size, "integrated decode attention KV arena is invalid");
     }
     @autoreleasepool {
-        id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, "uocr_decode_attention_flash_f16_to_f16", error, error_size);
+        id<MTLComputePipelineState> pipeline = metal_get_decoder_shape_pipeline(ctx, "uocr_decode_attention_flash_f16_to_f16", error, error_size);
         if (pipeline == nil) {
             return 0;
         }
@@ -10900,7 +11013,7 @@ static int metal_run_prefill_attention_buffer_f16(uocr_metal_context *ctx,
         return metal_fail(error, error_size, "invalid integrated prefill attention request");
     }
     @autoreleasepool {
-        id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, "uocr_prefill_attention_flash_f16_to_f16", error, error_size);
+        id<MTLComputePipelineState> pipeline = metal_get_decoder_shape_pipeline(ctx, "uocr_prefill_attention_flash_f16_to_f16", error, error_size);
         if (pipeline == nil) {
             return 0;
         }
@@ -10988,7 +11101,7 @@ static int metal_run_attention_output_residual_buffer_f16(uocr_metal_context *ct
         return 0;
     }
     @autoreleasepool {
-        id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, "uocr_attention_output_residual_f16_to_f16", error, error_size);
+        id<MTLComputePipelineState> pipeline = metal_get_decoder_shape_pipeline(ctx, "uocr_attention_output_residual_f16_to_f16", error, error_size);
         if (pipeline == nil) {
             return 0;
         }
@@ -11062,9 +11175,9 @@ static int metal_run_dense_swiglu_buffer_f16(uocr_metal_context *ctx,
         return 0;
     }
     @autoreleasepool {
-        id<MTLComputePipelineState> gate_pipeline = metal_get_pipeline(ctx, "uocr_dense_swiglu_gate_up_f16", error, error_size);
+        id<MTLComputePipelineState> gate_pipeline = metal_get_decoder_shape_pipeline(ctx, "uocr_dense_swiglu_gate_up_f16", error, error_size);
         id<MTLComputePipelineState> down_pipeline = use_mps_down ? nil :
-            metal_get_pipeline(ctx, "uocr_dense_swiglu_down_f16_to_f16", error, error_size);
+            metal_get_decoder_shape_pipeline(ctx, "uocr_dense_swiglu_down_f16_to_f16", error, error_size);
         if (gate_pipeline == nil || (!use_mps_down && down_pipeline == nil)) {
             return 0;
         }
@@ -11182,8 +11295,8 @@ static int metal_run_moe_router_buffer_f16(uocr_metal_context *ctx,
     }
     @autoreleasepool {
         id<MTLComputePipelineState> logits_pipeline = use_mps_logits ? nil :
-            metal_get_pipeline(ctx, "uocr_moe_router_logits_f16_to_f32", error, error_size);
-        id<MTLComputePipelineState> topk_pipeline = metal_get_pipeline(ctx, "uocr_moe_router_softmax_topk_f32", error, error_size);
+            metal_get_decoder_shape_pipeline(ctx, "uocr_moe_router_logits_f16_to_f32", error, error_size);
+        id<MTLComputePipelineState> topk_pipeline = metal_get_decoder_shape_pipeline(ctx, "uocr_moe_router_softmax_topk_f32", error, error_size);
         if ((!use_mps_logits && logits_pipeline == nil) || topk_pipeline == nil) {
             return 0;
         }
@@ -11387,7 +11500,7 @@ static int metal_run_moe_combine_buffer_f16(uocr_metal_context *ctx,
         return metal_fail(error, error_size, "invalid integrated MoE combine request");
     }
     @autoreleasepool {
-        id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, "uocr_moe_combine_f16_to_f16", error, error_size);
+        id<MTLComputePipelineState> pipeline = metal_get_decoder_shape_pipeline(ctx, "uocr_moe_combine_f16_to_f16", error, error_size);
         if (pipeline == nil) {
             return 0;
         }
