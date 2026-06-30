@@ -28,6 +28,8 @@
 #define UOCR_METAL_MPS_DATA_TYPE_FLOAT16 (0x10000000U | 16U)
 #define UOCR_METAL_MPS_DATA_TYPE_FLOAT32 (0x10000000U | 32U)
 #define UOCR_METAL_MPS_MATMUL_MIN_FLOPS 64000000ULL
+#define UOCR_METAL_FLASH_Q_PER_TG 4u
+#define UOCR_METAL_FLASH_MAX_LANE_VALUES 4u
 #if UINTPTR_MAX > 0xffffffffu
 #define UOCR_METAL_PRIVATE_WORKSPACE_PTR_BASE ((uintptr_t)0x4000000000000000ULL)
 #else
@@ -501,6 +503,60 @@ static void metal_clear_error(char *error, size_t error_size) {
     if (error != NULL && error_size > 0u) {
         error[0] = '\0';
     }
+}
+
+static int metal_flash_attention_threads_per_threadgroup(id<MTLComputePipelineState> pipeline,
+                                                         NSUInteger simdgroups,
+                                                         uint32_t head_dim,
+                                                         const char *op_name,
+                                                         NSUInteger *out_threads,
+                                                         char *error,
+                                                         size_t error_size) {
+    if (pipeline == nil || simdgroups == 0u || head_dim == 0u || out_threads == NULL) {
+        return metal_fail(error, error_size, "invalid Metal flash-attention dispatch configuration");
+    }
+    const NSUInteger simd_width = pipeline.threadExecutionWidth;
+    if (simd_width == 0u) {
+        return metal_fail(error, error_size, "%s flash-attention pipeline reported zero threadExecutionWidth", op_name);
+    }
+    if (simd_width > NSUIntegerMax / (NSUInteger)UOCR_METAL_FLASH_MAX_LANE_VALUES) {
+        return metal_fail(error,
+                          error_size,
+                          "%s flash-attention threadExecutionWidth %llu overflows head-dim coverage",
+                          op_name,
+                          (unsigned long long)simd_width);
+    }
+    const NSUInteger covered_head_dim = simd_width * (NSUInteger)UOCR_METAL_FLASH_MAX_LANE_VALUES;
+    if ((NSUInteger)head_dim > covered_head_dim) {
+        return metal_fail(error,
+                          error_size,
+                          "%s flash-attention head_dim %u exceeds %llu lanes covered by threadExecutionWidth %llu",
+                          op_name,
+                          head_dim,
+                          (unsigned long long)covered_head_dim,
+                          (unsigned long long)simd_width);
+    }
+    if (simd_width > NSUIntegerMax / simdgroups) {
+        return metal_fail(error,
+                          error_size,
+                          "%s flash-attention threadgroup size overflows for %llu SIMD-groups at width %llu",
+                          op_name,
+                          (unsigned long long)simdgroups,
+                          (unsigned long long)simd_width);
+    }
+    const NSUInteger threads = simd_width * simdgroups;
+    if (pipeline.maxTotalThreadsPerThreadgroup < threads) {
+        return metal_fail(error,
+                          error_size,
+                          "%s flash-attention requires %llu threads per threadgroup (%llu SIMD-groups x threadExecutionWidth %llu), pipeline supports only %llu",
+                          op_name,
+                          (unsigned long long)threads,
+                          (unsigned long long)simdgroups,
+                          (unsigned long long)simd_width,
+                          (unsigned long long)pipeline.maxTotalThreadsPerThreadgroup);
+    }
+    *out_threads = threads;
+    return 1;
 }
 
 static int checked_add_u64(uint64_t a, uint64_t b, uint64_t *out) {
@@ -10680,9 +10736,15 @@ static int metal_run_decode_attention_buffer_f16(uocr_metal_context *ctx,
         if (pipeline == nil) {
             return 0;
         }
-        const NSUInteger threads = 32u;
-        if (pipeline.maxTotalThreadsPerThreadgroup < threads) {
-            return metal_fail(error, error_size, "integrated decode flash-attention pipeline cannot run one simdgroup per head");
+        NSUInteger threads = 0u;
+        if (!metal_flash_attention_threads_per_threadgroup(pipeline,
+                                                           1u,
+                                                           UOCR_HEAD_DIM,
+                                                           "integrated decode",
+                                                           &threads,
+                                                           error,
+                                                           error_size)) {
+            return 0;
         }
         int owned_command_buffer = 0;
         id<MTLCommandBuffer> cb = metal_command_buffer_for_op(ctx, &owned_command_buffer, "integrated decode attention", error, error_size);
@@ -10729,7 +10791,7 @@ static int metal_run_prefill_attention_buffer_f16(uocr_metal_context *ctx,
                                                   char *error,
                                                   size_t error_size) {
     const uint64_t hidden_bytes = (uint64_t)n_tokens * (uint64_t)UOCR_HIDDEN_SIZE * 2u;
-    uint64_t query_blocks = ((uint64_t)n_tokens + 3u) / 4u;
+    uint64_t query_blocks = ((uint64_t)n_tokens + (uint64_t)UOCR_METAL_FLASH_Q_PER_TG - 1u) / (uint64_t)UOCR_METAL_FLASH_Q_PER_TG;
     if (ctx == NULL || n_tokens == 0u || n_tokens > UOCR_MAX_POSITIONS ||
         !metal_slice_valid(q, hidden_bytes) || !metal_slice_valid(k, hidden_bytes) ||
         !metal_slice_valid(v, hidden_bytes) || !metal_slice_valid(dst, hidden_bytes) ||
@@ -10741,9 +10803,15 @@ static int metal_run_prefill_attention_buffer_f16(uocr_metal_context *ctx,
         if (pipeline == nil) {
             return 0;
         }
-        const NSUInteger threads = 128u;
-        if (pipeline.maxTotalThreadsPerThreadgroup < threads) {
-            return metal_fail(error, error_size, "integrated prefill flash-attention pipeline cannot run four simdgroups per block");
+        NSUInteger threads = 0u;
+        if (!metal_flash_attention_threads_per_threadgroup(pipeline,
+                                                           UOCR_METAL_FLASH_Q_PER_TG,
+                                                           UOCR_HEAD_DIM,
+                                                           "integrated prefill",
+                                                           &threads,
+                                                           error,
+                                                           error_size)) {
+            return 0;
         }
         int owned_command_buffer = 0;
         id<MTLCommandBuffer> cb = metal_command_buffer_for_op(ctx, &owned_command_buffer, "integrated prefill attention", error, error_size);
@@ -16483,10 +16551,16 @@ int uocr_metal_context_diagnostic_clip_attention_f16(uocr_metal_context *ctx,
         params.reserved1 = 0u;
         params.reserved2 = 0u;
 
-        const NSUInteger threads_per_group = 128u;
-        const NSUInteger query_blocks = (NSUInteger)((token_count + 3u) / 4u);
-        if (pipeline.maxTotalThreadsPerThreadgroup < threads_per_group) {
-            result = metal_fail(error, error_size, "Metal CLIP flash attention cannot run four simdgroups per block");
+        NSUInteger threads_per_group = 0u;
+        const NSUInteger query_blocks = (NSUInteger)((token_count + UOCR_METAL_FLASH_Q_PER_TG - 1u) / UOCR_METAL_FLASH_Q_PER_TG);
+        if (!metal_flash_attention_threads_per_threadgroup(pipeline,
+                                                           UOCR_METAL_FLASH_Q_PER_TG,
+                                                           UOCR_CLIP_HEAD_DIM,
+                                                           "Metal CLIP",
+                                                           &threads_per_group,
+                                                           error,
+                                                           error_size)) {
+            result = 0;
             goto cleanup_clip_attention;
         }
 
@@ -17077,9 +17151,15 @@ static int metal_context_clip_attention_batch_f16_to_slice(uocr_metal_context *c
         if (pipeline == nil) {
             return 0;
         }
-        const NSUInteger threads_per_group = 128u;
-        if (pipeline.maxTotalThreadsPerThreadgroup < threads_per_group) {
-            return metal_fail(error, error_size, "Metal CLIP batch flash attention cannot run four simdgroups per block");
+        NSUInteger threads_per_group = 0u;
+        if (!metal_flash_attention_threads_per_threadgroup(pipeline,
+                                                           UOCR_METAL_FLASH_Q_PER_TG,
+                                                           UOCR_CLIP_HEAD_DIM,
+                                                           "Metal CLIP batch",
+                                                           &threads_per_group,
+                                                           error,
+                                                           error_size)) {
+            return 0;
         }
         int owned_command_buffer = 0;
         id<MTLCommandBuffer> cb = metal_command_buffer_for_op(ctx, &owned_command_buffer, "Metal CLIP batch attention", error, error_size);
@@ -17101,7 +17181,7 @@ static int metal_context_clip_attention_batch_f16_to_slice(uocr_metal_context *c
         params.reserved1 = 0u;
         params.reserved2 = 0u;
 
-        const NSUInteger query_blocks = (NSUInteger)((token_count + 3u) / 4u);
+        const NSUInteger query_blocks = (NSUInteger)((token_count + UOCR_METAL_FLASH_Q_PER_TG - 1u) / UOCR_METAL_FLASH_Q_PER_TG);
         [enc setComputePipelineState:pipeline];
         [enc setBuffer:q_tokens.buffer offset:q_tokens.offset atIndex:0u];
         [enc setBuffer:k_tokens.buffer offset:k_tokens.offset atIndex:1u];
@@ -18602,9 +18682,15 @@ static int metal_context_sam_rel_pos_attention_batch_f16_to_slice(uocr_metal_con
         if (pipeline == nil) {
             return 0;
         }
-        const NSUInteger threads_per_group = 128u;
-        if (pipeline.maxTotalThreadsPerThreadgroup < threads_per_group) {
-            return metal_fail(error, error_size, "Metal SAM rel-pos batch flash attention cannot run four simdgroups per block");
+        NSUInteger threads_per_group = 0u;
+        if (!metal_flash_attention_threads_per_threadgroup(pipeline,
+                                                           UOCR_METAL_FLASH_Q_PER_TG,
+                                                           UOCR_SAM_HEAD_DIM,
+                                                           op_name,
+                                                           &threads_per_group,
+                                                           error,
+                                                           error_size)) {
+            return 0;
         }
         int owned_command_buffer = 0;
         id<MTLCommandBuffer> cb = metal_command_buffer_for_op(ctx, &owned_command_buffer, op_name, error, error_size);
@@ -18630,7 +18716,7 @@ static int metal_context_sam_rel_pos_attention_batch_f16_to_slice(uocr_metal_con
         params.reserved1 = 0u;
         params.reserved2 = 0u;
 
-        const NSUInteger query_blocks = (NSUInteger)(((uint32_t)tokens + 3u) / 4u);
+        const NSUInteger query_blocks = (NSUInteger)(((uint32_t)tokens + UOCR_METAL_FLASH_Q_PER_TG - 1u) / UOCR_METAL_FLASH_Q_PER_TG);
         [enc setComputePipelineState:pipeline];
         [enc setBuffer:q.buffer offset:q.offset atIndex:0u];
         [enc setBuffer:k.buffer offset:k.offset atIndex:1u];
@@ -19746,14 +19832,20 @@ static int metal_context_sam_attention_f16(uocr_metal_context *ctx,
         params.reserved1 = 0u;
         params.reserved2 = 0u;
 
-        const NSUInteger threads_per_group = 128u;
-        const NSUInteger query_blocks = (NSUInteger)((tokens_per_window + 3u) / 4u);
-        if (pipeline.maxTotalThreadsPerThreadgroup < threads_per_group) {
+        NSUInteger threads_per_group = 0u;
+        const NSUInteger query_blocks = (NSUInteger)((tokens_per_window + UOCR_METAL_FLASH_Q_PER_TG - 1u) / UOCR_METAL_FLASH_Q_PER_TG);
+        if (!metal_flash_attention_threads_per_threadgroup(pipeline,
+                                                           UOCR_METAL_FLASH_Q_PER_TG,
+                                                           UOCR_SAM_HEAD_DIM,
+                                                           diagnostic_name,
+                                                           &threads_per_group,
+                                                           error,
+                                                           error_size)) {
             [dst release];
             [v_src release];
             [k_src release];
             [q_src release];
-            return metal_fail(error, error_size, "%s flash path cannot run four simdgroups per block", diagnostic_name);
+            return 0;
         }
 
         [enc setComputePipelineState:pipeline];
@@ -20081,16 +20173,22 @@ int uocr_metal_context_diagnostic_sam_rel_pos_attention_f16(uocr_metal_context *
         params.reserved1 = 0u;
         params.reserved2 = 0u;
 
-        const NSUInteger threads_per_group = 128u;
-        const NSUInteger query_blocks = (NSUInteger)(((uint32_t)tokens + 3u) / 4u);
-        if (pipeline.maxTotalThreadsPerThreadgroup < threads_per_group) {
+        NSUInteger threads_per_group = 0u;
+        const NSUInteger query_blocks = (NSUInteger)(((uint32_t)tokens + UOCR_METAL_FLASH_Q_PER_TG - 1u) / UOCR_METAL_FLASH_Q_PER_TG);
+        if (!metal_flash_attention_threads_per_threadgroup(pipeline,
+                                                           UOCR_METAL_FLASH_Q_PER_TG,
+                                                           UOCR_SAM_HEAD_DIM,
+                                                           "Metal SAM relative-position",
+                                                           &threads_per_group,
+                                                           error,
+                                                           error_size)) {
             [dst release];
             [rel_w release];
             [rel_h release];
             [v_src release];
             [k_src release];
             [q_src release];
-            return metal_fail(error, error_size, "Metal SAM relative-position flash attention cannot run four simdgroups per block");
+            return 0;
         }
 
         [enc setComputePipelineState:pipeline];
@@ -25687,10 +25785,16 @@ int uocr_metal_context_diagnostic_prefill_attention_f16(uocr_metal_context *ctx,
             return 0;
         }
 
-        const NSUInteger threads_per_group = 128u;
-        const NSUInteger query_blocks = (NSUInteger)((n_tokens + 3u) / 4u);
-        if (pipeline.maxTotalThreadsPerThreadgroup < threads_per_group) {
-            return metal_fail(error, error_size, "Metal prefill flash attention cannot run four simdgroups per block");
+        NSUInteger threads_per_group = 0u;
+        const NSUInteger query_blocks = (NSUInteger)((n_tokens + UOCR_METAL_FLASH_Q_PER_TG - 1u) / UOCR_METAL_FLASH_Q_PER_TG);
+        if (!metal_flash_attention_threads_per_threadgroup(pipeline,
+                                                           UOCR_METAL_FLASH_Q_PER_TG,
+                                                           UOCR_HEAD_DIM,
+                                                           "Metal prefill",
+                                                           &threads_per_group,
+                                                           error,
+                                                           error_size)) {
+            return 0;
         }
 
         id<MTLBuffer> q_src = metal_new_buffer_with_bytes(ctx, q_f16, (NSUInteger)input_bytes, MTLResourceStorageModeShared);
@@ -26066,12 +26170,15 @@ int uocr_metal_context_diagnostic_decode_attention_f16(uocr_metal_context *ctx,
         if (pipeline == nil) {
             return 0;
         }
-        const NSUInteger threads_per_group = 32u;
-        if (pipeline.maxTotalThreadsPerThreadgroup < threads_per_group) {
-            return metal_fail(error,
-                              error_size,
-                              "Metal decode flash attention pipeline supports only %llu threads per group",
-                              (unsigned long long)pipeline.maxTotalThreadsPerThreadgroup);
+        NSUInteger threads_per_group = 0u;
+        if (!metal_flash_attention_threads_per_threadgroup(pipeline,
+                                                           1u,
+                                                           UOCR_HEAD_DIM,
+                                                           "Metal decode",
+                                                           &threads_per_group,
+                                                           error,
+                                                           error_size)) {
+            return 0;
         }
 
         id<MTLBuffer> q_src = metal_new_buffer_with_bytes(ctx, q_f16, (NSUInteger)q_bytes, MTLResourceStorageModeShared);

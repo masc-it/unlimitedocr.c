@@ -1,5 +1,7 @@
 # Metal fp16 kernel implementation plan
 
+Reference: `data.tmp/reference/Metal-Shading-Language-Specification.pdf`
+
 ## 1. Make flash attention SIMD-width correct
 
 **Goal:** Remove the hard dependency on 32-wide SIMD groups while preserving the fast path on current Apple GPUs.
@@ -10,9 +12,9 @@
 - Either fail clearly on non-32 SIMD width or add an adaptive kernel path using `threads_per_simdgroup`.
 
 **Implementation:**
-- [ ] Guard all 32-wide flash-attention dispatches with `pipeline.threadExecutionWidth == 32`.
-- [ ] Replace misleading `maxTotalThreadsPerThreadgroup`-only checks.
-- [ ] Add tests/diagnostics for unsupported SIMD width.
+- [x] Remove hardcoded 32-wide flash-attention dispatches; derive threadgroup size from `pipeline.threadExecutionWidth`.
+- [x] Replace misleading `maxTotalThreadsPerThreadgroup`-only checks.
+- [x] Add diagnostics for unsupported SIMD width/head-dim combinations.
 
 ## 2. Replace threadgroup tree reductions with SIMD-group reductions
 

@@ -4182,13 +4182,12 @@ static inline ulong uocr_decode_attention_cache_index(constant UocrDecodeAttenti
             ulong(params.heads) + ulong(head)) * ulong(params.head_dim) + ulong(dim);
 }
 
-#define UOCR_FLASH_SIMD_WIDTH 32u
 #define UOCR_FLASH_Q_PER_TG 4u
 #define UOCR_FLASH_MAX_LANE_VALUES 4u
 #define UOCR_FLASH_NEG_INF (-3.4028234663852886e38f)
 
-static inline uint uocr_flash_lane_dim(uint lane, uint component) {
-    return lane + component * UOCR_FLASH_SIMD_WIDTH;
+static inline uint uocr_flash_lane_dim(uint lane, uint component, uint simd_width) {
+    return lane + component * simd_width;
 }
 
 template <typename out_t>
@@ -4199,8 +4198,10 @@ static inline void uocr_sam_window_attention_flash_impl(device const half *q_src
                                                         constant UocrSamWindowAttentionParams &params,
                                                         uint3 tg,
                                                         ushort lane_u16,
-                                                        ushort simdgroup_u16) {
+                                                        ushort simdgroup_u16,
+                                                        ushort simd_width_u16) {
     const uint lane = uint(lane_u16);
+    const uint simd_width = uint(simd_width_u16);
     const uint query_in_block = uint(simdgroup_u16);
     const uint head = tg.x;
     const uint query_token = tg.y * UOCR_FLASH_Q_PER_TG + query_in_block;
@@ -4210,14 +4211,14 @@ static inline void uocr_sam_window_attention_flash_impl(device const half *q_src
     const uint window = params.windows == 0u ? 0u : logical_window - batch * params.windows;
     if (query_in_block >= UOCR_FLASH_Q_PER_TG || params.windows == 0u || batch >= batch_size || window >= params.windows ||
         query_token >= params.tokens_per_window || head >= params.heads ||
-        params.head_dim == 0u || params.head_dim > UOCR_FLASH_SIMD_WIDTH * UOCR_FLASH_MAX_LANE_VALUES) {
+        params.head_dim == 0u || params.head_dim > simd_width * UOCR_FLASH_MAX_LANE_VALUES) {
         return;
     }
 
     float qv[UOCR_FLASH_MAX_LANE_VALUES];
     float acc[UOCR_FLASH_MAX_LANE_VALUES];
     for (uint i = 0u; i < UOCR_FLASH_MAX_LANE_VALUES; ++i) {
-        const uint dim = uocr_flash_lane_dim(lane, i);
+        const uint dim = uocr_flash_lane_dim(lane, i, simd_width);
         if (dim < params.head_dim) {
             const ulong q_index = uocr_sam_window_attention_index(params, batch, window, query_token, head, dim);
             qv[i] = float(q_src[q_index]);
@@ -4232,7 +4233,7 @@ static inline void uocr_sam_window_attention_flash_impl(device const half *q_src
     for (uint key_token = 0u; key_token < params.tokens_per_window; ++key_token) {
         float local_dot = 0.0f;
         for (uint i = 0u; i < UOCR_FLASH_MAX_LANE_VALUES; ++i) {
-            const uint dim = uocr_flash_lane_dim(lane, i);
+            const uint dim = uocr_flash_lane_dim(lane, i, simd_width);
             if (dim < params.head_dim) {
                 const ulong k_index = uocr_sam_window_attention_index(params, batch, window, key_token, head, dim);
                 local_dot += qv[i] * float(k_src[k_index]);
@@ -4243,7 +4244,7 @@ static inline void uocr_sam_window_attention_flash_impl(device const half *q_src
         const float corr = exp(m - mnew);
         const float e = exp(score - mnew);
         for (uint i = 0u; i < UOCR_FLASH_MAX_LANE_VALUES; ++i) {
-            const uint dim = uocr_flash_lane_dim(lane, i);
+            const uint dim = uocr_flash_lane_dim(lane, i, simd_width);
             if (dim < params.head_dim) {
                 const ulong v_index = uocr_sam_window_attention_index(params, batch, window, key_token, head, dim);
                 acc[i] = acc[i] * corr + e * float(v_src[v_index]);
@@ -4255,7 +4256,7 @@ static inline void uocr_sam_window_attention_flash_impl(device const half *q_src
 
     const float inv_l = l > 0.0f ? 1.0f / l : 0.0f;
     for (uint i = 0u; i < UOCR_FLASH_MAX_LANE_VALUES; ++i) {
-        const uint dim = uocr_flash_lane_dim(lane, i);
+        const uint dim = uocr_flash_lane_dim(lane, i, simd_width);
         if (dim < params.head_dim) {
             const ulong dst_index = uocr_sam_window_attention_index(params, batch, window, query_token, head, dim);
             dst[dst_index] = out_t(acc[i] * inv_l);
@@ -4270,8 +4271,9 @@ kernel void uocr_sam_window_attention_flash_f16_to_f16(device const half *q_src 
                                                        constant UocrSamWindowAttentionParams &params [[buffer(4)]],
                                                        uint3 tg [[threadgroup_position_in_grid]],
                                                        ushort lane [[thread_index_in_simdgroup]],
-                                                       ushort simdgroup [[simdgroup_index_in_threadgroup]]) {
-    uocr_sam_window_attention_flash_impl(q_src, k_src, v_src, dst, params, tg, lane, simdgroup);
+                                                       ushort simdgroup [[simdgroup_index_in_threadgroup]],
+                                                       ushort simd_width [[threads_per_simdgroup]]) {
+    uocr_sam_window_attention_flash_impl(q_src, k_src, v_src, dst, params, tg, lane, simdgroup, simd_width);
 }
 
 kernel void uocr_sam_window_attention_flash_f16_to_f32(device const half *q_src [[buffer(0)]],
@@ -4281,8 +4283,9 @@ kernel void uocr_sam_window_attention_flash_f16_to_f32(device const half *q_src 
                                                        constant UocrSamWindowAttentionParams &params [[buffer(4)]],
                                                        uint3 tg [[threadgroup_position_in_grid]],
                                                        ushort lane [[thread_index_in_simdgroup]],
-                                                       ushort simdgroup [[simdgroup_index_in_threadgroup]]) {
-    uocr_sam_window_attention_flash_impl(q_src, k_src, v_src, dst, params, tg, lane, simdgroup);
+                                                       ushort simdgroup [[simdgroup_index_in_threadgroup]],
+                                                       ushort simd_width [[threads_per_simdgroup]]) {
+    uocr_sam_window_attention_flash_impl(q_src, k_src, v_src, dst, params, tg, lane, simdgroup, simd_width);
 }
 
 template <typename out_t>
@@ -4295,8 +4298,10 @@ static inline void uocr_sam_rel_pos_attention_flash_impl(device const half *q_sr
                                                          constant UocrSamRelPosAttentionParams &params,
                                                          uint3 tg,
                                                          ushort lane_u16,
-                                                         ushort simdgroup_u16) {
+                                                         ushort simdgroup_u16,
+                                                         ushort simd_width_u16) {
     const uint lane = uint(lane_u16);
+    const uint simd_width = uint(simd_width_u16);
     const uint query_in_block = uint(simdgroup_u16);
     const uint head = tg.x;
     const uint query_token = tg.y * UOCR_FLASH_Q_PER_TG + query_in_block;
@@ -4308,7 +4313,7 @@ static inline void uocr_sam_rel_pos_attention_flash_impl(device const half *q_sr
         query_token >= params.tokens_per_window || head >= params.heads ||
         params.grid_width == 0u || params.grid_height == 0u ||
         params.tokens_per_window != params.grid_width * params.grid_height ||
-        params.head_dim == 0u || params.head_dim > UOCR_FLASH_SIMD_WIDTH * UOCR_FLASH_MAX_LANE_VALUES) {
+        params.head_dim == 0u || params.head_dim > simd_width * UOCR_FLASH_MAX_LANE_VALUES) {
         return;
     }
 
@@ -4320,7 +4325,7 @@ static inline void uocr_sam_rel_pos_attention_flash_impl(device const half *q_sr
     float qv[UOCR_FLASH_MAX_LANE_VALUES];
     float acc[UOCR_FLASH_MAX_LANE_VALUES];
     for (uint i = 0u; i < UOCR_FLASH_MAX_LANE_VALUES; ++i) {
-        const uint dim = uocr_flash_lane_dim(lane, i);
+        const uint dim = uocr_flash_lane_dim(lane, i, simd_width);
         if (dim < params.head_dim) {
             const ulong q_index = uocr_sam_rel_pos_attention_index(params, batch, window, query_token, head, dim);
             qv[i] = float(q_src[q_index]);
@@ -4339,7 +4344,7 @@ static inline void uocr_sam_rel_pos_attention_flash_impl(device const half *q_sr
         const uint rel_w_index = uint(int(query_x) - int(key_x) + int(params.grid_width) - 1);
         float local_score = 0.0f;
         for (uint i = 0u; i < UOCR_FLASH_MAX_LANE_VALUES; ++i) {
-            const uint dim = uocr_flash_lane_dim(lane, i);
+            const uint dim = uocr_flash_lane_dim(lane, i, simd_width);
             if (dim < params.head_dim) {
                 const ulong k_index = uocr_sam_rel_pos_attention_index(params, batch, window, key_token, head, dim);
                 const float rh = uocr_sam_rel_pos_table_value(rel_pos_h,
@@ -4362,7 +4367,7 @@ static inline void uocr_sam_rel_pos_attention_flash_impl(device const half *q_sr
         const float corr = exp(m - mnew);
         const float e = exp(score - mnew);
         for (uint i = 0u; i < UOCR_FLASH_MAX_LANE_VALUES; ++i) {
-            const uint dim = uocr_flash_lane_dim(lane, i);
+            const uint dim = uocr_flash_lane_dim(lane, i, simd_width);
             if (dim < params.head_dim) {
                 const ulong v_index = uocr_sam_rel_pos_attention_index(params, batch, window, key_token, head, dim);
                 acc[i] = acc[i] * corr + e * float(v_src[v_index]);
@@ -4374,7 +4379,7 @@ static inline void uocr_sam_rel_pos_attention_flash_impl(device const half *q_sr
 
     const float inv_l = l > 0.0f ? 1.0f / l : 0.0f;
     for (uint i = 0u; i < UOCR_FLASH_MAX_LANE_VALUES; ++i) {
-        const uint dim = uocr_flash_lane_dim(lane, i);
+        const uint dim = uocr_flash_lane_dim(lane, i, simd_width);
         if (dim < params.head_dim) {
             const ulong dst_index = uocr_sam_rel_pos_attention_index(params, batch, window, query_token, head, dim);
             dst[dst_index] = out_t(acc[i] * inv_l);
@@ -4391,8 +4396,9 @@ kernel void uocr_sam_rel_pos_attention_flash_f16_to_f16(device const half *q_src
                                                         constant UocrSamRelPosAttentionParams &params [[buffer(6)]],
                                                         uint3 tg [[threadgroup_position_in_grid]],
                                                         ushort lane [[thread_index_in_simdgroup]],
-                                                        ushort simdgroup [[simdgroup_index_in_threadgroup]]) {
-    uocr_sam_rel_pos_attention_flash_impl(q_src, k_src, v_src, rel_pos_h, rel_pos_w, dst, params, tg, lane, simdgroup);
+                                                        ushort simdgroup [[simdgroup_index_in_threadgroup]],
+                                                        ushort simd_width [[threads_per_simdgroup]]) {
+    uocr_sam_rel_pos_attention_flash_impl(q_src, k_src, v_src, rel_pos_h, rel_pos_w, dst, params, tg, lane, simdgroup, simd_width);
 }
 
 kernel void uocr_sam_rel_pos_attention_flash_f16_to_f32(device const half *q_src [[buffer(0)]],
@@ -4404,8 +4410,9 @@ kernel void uocr_sam_rel_pos_attention_flash_f16_to_f32(device const half *q_src
                                                         constant UocrSamRelPosAttentionParams &params [[buffer(6)]],
                                                         uint3 tg [[threadgroup_position_in_grid]],
                                                         ushort lane [[thread_index_in_simdgroup]],
-                                                        ushort simdgroup [[simdgroup_index_in_threadgroup]]) {
-    uocr_sam_rel_pos_attention_flash_impl(q_src, k_src, v_src, rel_pos_h, rel_pos_w, dst, params, tg, lane, simdgroup);
+                                                        ushort simdgroup [[simdgroup_index_in_threadgroup]],
+                                                        ushort simd_width [[threads_per_simdgroup]]) {
+    uocr_sam_rel_pos_attention_flash_impl(q_src, k_src, v_src, rel_pos_h, rel_pos_w, dst, params, tg, lane, simdgroup, simd_width);
 }
 
 #define UOCR_SAM_REL_POS_TILE_KEYS 16u
@@ -4423,8 +4430,10 @@ kernel void uocr_sam_rel_pos_attention_tiled_f16_to_f16(device const half *q_src
                                                                uint3 tid3 [[thread_position_in_threadgroup]],
                                                                uint3 ntg3 [[threads_per_threadgroup]],
                                                                ushort lane_u16 [[thread_index_in_simdgroup]],
-                                                               ushort simdgroup_u16 [[simdgroup_index_in_threadgroup]]) {
+                                                               ushort simdgroup_u16 [[simdgroup_index_in_threadgroup]],
+                                                               ushort simd_width_u16 [[threads_per_simdgroup]]) {
     const uint lane = uint(lane_u16);
+    const uint simd_width = uint(simd_width_u16);
     const uint tid = tid3.x;
     const uint ntg = ntg3.x;
     const uint query_in_block = uint(simdgroup_u16);
@@ -4440,7 +4449,7 @@ kernel void uocr_sam_rel_pos_attention_tiled_f16_to_f16(device const half *q_src
         params.grid_width == 0u || params.grid_height == 0u ||
         params.tokens_per_window != params.grid_width * params.grid_height ||
         params.rel_pos_h_length != target_h_length || params.rel_pos_w_length != target_w_length ||
-        params.head_dim == 0u || params.head_dim > UOCR_FLASH_SIMD_WIDTH * UOCR_FLASH_MAX_LANE_VALUES) {
+        params.head_dim == 0u || params.head_dim > simd_width * UOCR_FLASH_MAX_LANE_VALUES) {
         return;
     }
 
@@ -4451,7 +4460,7 @@ kernel void uocr_sam_rel_pos_attention_tiled_f16_to_f16(device const half *q_src
     float qv[UOCR_FLASH_MAX_LANE_VALUES];
     float acc[UOCR_FLASH_MAX_LANE_VALUES];
     for (uint i = 0u; i < UOCR_FLASH_MAX_LANE_VALUES; ++i) {
-        const uint dim = uocr_flash_lane_dim(lane, i);
+        const uint dim = uocr_flash_lane_dim(lane, i, simd_width);
         if (query_valid && dim < params.head_dim) {
             const ulong q_index = uocr_sam_rel_pos_attention_index(params, batch, window, query_token, head, dim);
             qv[i] = float(q_src[q_index]);
@@ -4484,7 +4493,7 @@ kernel void uocr_sam_rel_pos_attention_tiled_f16_to_f16(device const half *q_src
             const uint rel_w_index = query_valid ? uint(int(query_x) - int(key_x) + int(params.grid_width) - 1) : 0u;
             float local_score = 0.0f;
             for (uint i = 0u; i < UOCR_FLASH_MAX_LANE_VALUES; ++i) {
-                const uint dim = uocr_flash_lane_dim(lane, i);
+                const uint dim = uocr_flash_lane_dim(lane, i, simd_width);
                 if (query_valid && dim < params.head_dim) {
                     const float rh = float(rel_pos_h[ulong(rel_h_index) * ulong(params.head_dim) + ulong(dim)]);
                     const float rw = float(rel_pos_w[ulong(rel_w_index) * ulong(params.head_dim) + ulong(dim)]);
@@ -4496,7 +4505,7 @@ kernel void uocr_sam_rel_pos_attention_tiled_f16_to_f16(device const half *q_src
             const float corr = exp(m - mnew);
             const float e = exp(score - mnew);
             for (uint i = 0u; i < UOCR_FLASH_MAX_LANE_VALUES; ++i) {
-                const uint dim = uocr_flash_lane_dim(lane, i);
+                const uint dim = uocr_flash_lane_dim(lane, i, simd_width);
                 if (query_valid && dim < params.head_dim) {
                     acc[i] = acc[i] * corr + e * float(v_tile[key_offset * params.head_dim + dim]);
                 }
@@ -4509,7 +4518,7 @@ kernel void uocr_sam_rel_pos_attention_tiled_f16_to_f16(device const half *q_src
 
     const float inv_l = l > 0.0f ? 1.0f / l : 0.0f;
     for (uint i = 0u; i < UOCR_FLASH_MAX_LANE_VALUES; ++i) {
-        const uint dim = uocr_flash_lane_dim(lane, i);
+        const uint dim = uocr_flash_lane_dim(lane, i, simd_width);
         if (query_valid && dim < params.head_dim) {
             const ulong dst_index = uocr_sam_rel_pos_attention_index(params, batch, window, query_token, head, dim);
             dst[dst_index] = half(acc[i] * inv_l);
@@ -4525,20 +4534,22 @@ static inline void uocr_prefill_attention_flash_impl(device const half *q_src,
                                                      constant UocrPrefillAttentionParams &params,
                                                      uint2 tg,
                                                      ushort lane_u16,
-                                                     ushort simdgroup_u16) {
+                                                     ushort simdgroup_u16,
+                                                     ushort simd_width_u16) {
     const uint lane = uint(lane_u16);
+    const uint simd_width = uint(simd_width_u16);
     const uint query_in_block = uint(simdgroup_u16);
     const uint head = tg.x;
     const uint query_token = tg.y * UOCR_FLASH_Q_PER_TG + query_in_block;
     if (query_in_block >= UOCR_FLASH_Q_PER_TG || query_token >= params.n_tokens || head >= params.heads ||
-        params.head_dim == 0u || params.head_dim > UOCR_FLASH_SIMD_WIDTH * UOCR_FLASH_MAX_LANE_VALUES) {
+        params.head_dim == 0u || params.head_dim > simd_width * UOCR_FLASH_MAX_LANE_VALUES) {
         return;
     }
 
     float qv[UOCR_FLASH_MAX_LANE_VALUES];
     float acc[UOCR_FLASH_MAX_LANE_VALUES];
     for (uint i = 0u; i < UOCR_FLASH_MAX_LANE_VALUES; ++i) {
-        const uint dim = uocr_flash_lane_dim(lane, i);
+        const uint dim = uocr_flash_lane_dim(lane, i, simd_width);
         if (dim < params.head_dim) {
             const ulong q_index = (ulong(query_token) * ulong(params.heads) + ulong(head)) * ulong(params.head_dim) + ulong(dim);
             qv[i] = float(q_src[q_index]);
@@ -4553,7 +4564,7 @@ static inline void uocr_prefill_attention_flash_impl(device const half *q_src,
     for (uint key_token = 0u; key_token <= query_token; ++key_token) {
         float local_dot = 0.0f;
         for (uint i = 0u; i < UOCR_FLASH_MAX_LANE_VALUES; ++i) {
-            const uint dim = uocr_flash_lane_dim(lane, i);
+            const uint dim = uocr_flash_lane_dim(lane, i, simd_width);
             if (dim < params.head_dim) {
                 const ulong k_index = (ulong(key_token) * ulong(params.heads) + ulong(head)) * ulong(params.head_dim) + ulong(dim);
                 local_dot += qv[i] * float(k_src[k_index]);
@@ -4564,7 +4575,7 @@ static inline void uocr_prefill_attention_flash_impl(device const half *q_src,
         const float corr = exp(m - mnew);
         const float e = exp(score - mnew);
         for (uint i = 0u; i < UOCR_FLASH_MAX_LANE_VALUES; ++i) {
-            const uint dim = uocr_flash_lane_dim(lane, i);
+            const uint dim = uocr_flash_lane_dim(lane, i, simd_width);
             if (dim < params.head_dim) {
                 const ulong v_index = (ulong(key_token) * ulong(params.heads) + ulong(head)) * ulong(params.head_dim) + ulong(dim);
                 acc[i] = acc[i] * corr + e * float(v_src[v_index]);
@@ -4576,7 +4587,7 @@ static inline void uocr_prefill_attention_flash_impl(device const half *q_src,
 
     const float inv_l = l > 0.0f ? 1.0f / l : 0.0f;
     for (uint i = 0u; i < UOCR_FLASH_MAX_LANE_VALUES; ++i) {
-        const uint dim = uocr_flash_lane_dim(lane, i);
+        const uint dim = uocr_flash_lane_dim(lane, i, simd_width);
         if (dim < params.head_dim) {
             const ulong dst_index = (ulong(query_token) * ulong(params.heads) + ulong(head)) * ulong(params.head_dim) + ulong(dim);
             dst[dst_index] = out_t(acc[i] * inv_l);
@@ -4591,8 +4602,9 @@ kernel void uocr_prefill_attention_flash_f16_to_f16(device const half *q_src [[b
                                                     constant UocrPrefillAttentionParams &params [[buffer(4)]],
                                                     uint2 tg [[threadgroup_position_in_grid]],
                                                     ushort lane [[thread_index_in_simdgroup]],
-                                                    ushort simdgroup [[simdgroup_index_in_threadgroup]]) {
-    uocr_prefill_attention_flash_impl(q_src, k_src, v_src, dst, params, tg, lane, simdgroup);
+                                                    ushort simdgroup [[simdgroup_index_in_threadgroup]],
+                                                    ushort simd_width [[threads_per_simdgroup]]) {
+    uocr_prefill_attention_flash_impl(q_src, k_src, v_src, dst, params, tg, lane, simdgroup, simd_width);
 }
 
 kernel void uocr_prefill_attention_flash_f16_to_f32(device const half *q_src [[buffer(0)]],
@@ -4602,8 +4614,9 @@ kernel void uocr_prefill_attention_flash_f16_to_f32(device const half *q_src [[b
                                                     constant UocrPrefillAttentionParams &params [[buffer(4)]],
                                                     uint2 tg [[threadgroup_position_in_grid]],
                                                     ushort lane [[thread_index_in_simdgroup]],
-                                                    ushort simdgroup [[simdgroup_index_in_threadgroup]]) {
-    uocr_prefill_attention_flash_impl(q_src, k_src, v_src, dst, params, tg, lane, simdgroup);
+                                                    ushort simdgroup [[simdgroup_index_in_threadgroup]],
+                                                    ushort simd_width [[threads_per_simdgroup]]) {
+    uocr_prefill_attention_flash_impl(q_src, k_src, v_src, dst, params, tg, lane, simdgroup, simd_width);
 }
 
 template <typename out_t>
@@ -4613,17 +4626,19 @@ static inline void uocr_decode_attention_flash_impl(device const half *q_src,
                                                     device out_t *dst,
                                                     constant UocrDecodeAttentionParams &params,
                                                     uint head,
-                                                    ushort lane_u16) {
+                                                    ushort lane_u16,
+                                                    ushort simd_width_u16) {
     const uint lane = uint(lane_u16);
+    const uint simd_width = uint(simd_width_u16);
     if (head >= params.heads || params.attention_length == 0u ||
-        params.head_dim == 0u || params.head_dim > UOCR_FLASH_SIMD_WIDTH * UOCR_FLASH_MAX_LANE_VALUES) {
+        params.head_dim == 0u || params.head_dim > simd_width * UOCR_FLASH_MAX_LANE_VALUES) {
         return;
     }
 
     float qv[UOCR_FLASH_MAX_LANE_VALUES];
     float acc[UOCR_FLASH_MAX_LANE_VALUES];
     for (uint i = 0u; i < UOCR_FLASH_MAX_LANE_VALUES; ++i) {
-        const uint dim = uocr_flash_lane_dim(lane, i);
+        const uint dim = uocr_flash_lane_dim(lane, i, simd_width);
         if (dim < params.head_dim) {
             const ulong q_index = ulong(head) * ulong(params.head_dim) + ulong(dim);
             qv[i] = float(q_src[q_index]);
@@ -4642,7 +4657,7 @@ static inline void uocr_decode_attention_flash_impl(device const half *q_src,
         }
         float local_dot = 0.0f;
         for (uint i = 0u; i < UOCR_FLASH_MAX_LANE_VALUES; ++i) {
-            const uint dim = uocr_flash_lane_dim(lane, i);
+            const uint dim = uocr_flash_lane_dim(lane, i, simd_width);
             if (dim < params.head_dim) {
                 const ulong k_index = uocr_decode_attention_cache_index(params, cache_token, head, dim);
                 local_dot += qv[i] * float(k_cache[k_index]);
@@ -4653,7 +4668,7 @@ static inline void uocr_decode_attention_flash_impl(device const half *q_src,
         const float corr = exp(m - mnew);
         const float e = exp(score - mnew);
         for (uint i = 0u; i < UOCR_FLASH_MAX_LANE_VALUES; ++i) {
-            const uint dim = uocr_flash_lane_dim(lane, i);
+            const uint dim = uocr_flash_lane_dim(lane, i, simd_width);
             if (dim < params.head_dim) {
                 const ulong v_index = uocr_decode_attention_cache_index(params, cache_token, head, dim);
                 acc[i] = acc[i] * corr + e * float(v_cache[v_index]);
@@ -4665,7 +4680,7 @@ static inline void uocr_decode_attention_flash_impl(device const half *q_src,
 
     const float inv_l = l > 0.0f ? 1.0f / l : 0.0f;
     for (uint i = 0u; i < UOCR_FLASH_MAX_LANE_VALUES; ++i) {
-        const uint dim = uocr_flash_lane_dim(lane, i);
+        const uint dim = uocr_flash_lane_dim(lane, i, simd_width);
         if (dim < params.head_dim) {
             const ulong dst_index = ulong(head) * ulong(params.head_dim) + ulong(dim);
             dst[dst_index] = out_t(acc[i] * inv_l);
@@ -4679,8 +4694,9 @@ kernel void uocr_decode_attention_flash_f16_to_f16(device const half *q_src [[bu
                                                    device half *dst [[buffer(3)]],
                                                    constant UocrDecodeAttentionParams &params [[buffer(4)]],
                                                    uint head [[threadgroup_position_in_grid]],
-                                                   ushort lane [[thread_index_in_simdgroup]]) {
-    uocr_decode_attention_flash_impl(q_src, k_cache, v_cache, dst, params, head, lane);
+                                                   ushort lane [[thread_index_in_simdgroup]],
+                                                   ushort simd_width [[threads_per_simdgroup]]) {
+    uocr_decode_attention_flash_impl(q_src, k_cache, v_cache, dst, params, head, lane, simd_width);
 }
 
 kernel void uocr_decode_attention_flash_f16_to_f32(device const half *q_src [[buffer(0)]],
@@ -4689,8 +4705,9 @@ kernel void uocr_decode_attention_flash_f16_to_f32(device const half *q_src [[bu
                                                    device float *dst [[buffer(3)]],
                                                    constant UocrDecodeAttentionParams &params [[buffer(4)]],
                                                    uint head [[threadgroup_position_in_grid]],
-                                                   ushort lane [[thread_index_in_simdgroup]]) {
-    uocr_decode_attention_flash_impl(q_src, k_cache, v_cache, dst, params, head, lane);
+                                                   ushort lane [[thread_index_in_simdgroup]],
+                                                   ushort simd_width [[threads_per_simdgroup]]) {
+    uocr_decode_attention_flash_impl(q_src, k_cache, v_cache, dst, params, head, lane, simd_width);
 }
 
 struct UocrKVCacheWriteParams {
