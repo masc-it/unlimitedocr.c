@@ -7329,7 +7329,9 @@ static int metal_context_ensure_scratch_accounted(uocr_metal_context *ctx,
             return 0;
         }
         buffer.label = [NSString stringWithFormat:@"uocr_scratch_%s", scratch_slot_name(slot)];
-        metal_clear_mps_workspace_ndarray_cache(ctx);
+        if (slot != UOCR_METAL_SCRATCH_VISION_FINAL) {
+            metal_clear_mps_workspace_ndarray_cache(ctx);
+        }
         [scratch->buffer release];
         metal_scratch_release_accounting(ctx, scratch);
         scratch->buffer = buffer;
@@ -7368,7 +7370,9 @@ void uocr_metal_context_release_scratch(uocr_metal_context *ctx, uocr_metal_scra
     }
     @autoreleasepool {
         uocr_metal_scratch_buffer *scratch = &ctx->scratch[slot];
-        metal_clear_mps_workspace_ndarray_cache(ctx);
+        if (scratch->buffer != nil && slot != UOCR_METAL_SCRATCH_VISION_FINAL) {
+            metal_clear_mps_workspace_ndarray_cache(ctx);
+        }
         [scratch->buffer release];
         scratch->buffer = nil;
         scratch->capacity = 0u;
@@ -12341,6 +12345,12 @@ static int metal_context_generate_f16_impl(uocr_metal_context *ctx,
     }
     metal_profile_add_event_now(ctx, "metal.prefill", prefill_start_ns);
 
+    if (image_features_buffer != nil && ctx->scratch[UOCR_METAL_SCRATCH_VISION_FINAL].buffer == image_features_buffer) {
+        uocr_metal_context_release_scratch(ctx, UOCR_METAL_SCRATCH_VISION_FINAL);
+        image_features_buffer = nil;
+        metal_profile_add_event_ms(ctx, "metal.prefill.final_visual_release", 0.0);
+    }
+
     if (request->max_new_tokens == 0u) {
         metal_clear_error(error, error_size);
         return 1;
@@ -12733,15 +12743,32 @@ static int metal_context_generate_image_f16_impl(uocr_metal_context *ctx,
                                        "Metal image vision hot path",
                                        error,
                                        error_size)) {
+        uocr_metal_context_release_scratch(ctx, UOCR_METAL_SCRATCH_VISION);
+        uocr_metal_context_release_scratch(ctx, UOCR_METAL_SCRATCH_VISION_FINAL);
         metal_vision_workspace_reset(&scratch);
         return 0;
     }
     if (!vision_ok) {
         char vision_detail[512];
         metal_copy_error_detail(vision_detail, sizeof(vision_detail), error);
+        uocr_metal_context_release_scratch(ctx, UOCR_METAL_SCRATCH_VISION);
+        uocr_metal_context_release_scratch(ctx, UOCR_METAL_SCRATCH_VISION_FINAL);
+        metal_vision_workspace_reset(&scratch);
         return metal_fail(error, error_size, "Metal image vision encoding failed: %s", vision_detail);
     }
     metal_profile_add_event_now(ctx, "metal.vision", vision_start_ns);
+
+    id<MTLBuffer> final_visual_rows_buffer = scratch.final_visual_rows.buffer;
+    const NSUInteger final_visual_rows_offset = scratch.final_visual_rows.offset;
+    if (final_visual_rows_buffer == nil) {
+        uocr_metal_context_release_scratch(ctx, UOCR_METAL_SCRATCH_VISION);
+        uocr_metal_context_release_scratch(ctx, UOCR_METAL_SCRATCH_VISION_FINAL);
+        metal_vision_workspace_reset(&scratch);
+        return metal_fail(error, error_size, "Metal image generation final visual rows buffer is not allocated");
+    }
+    uocr_metal_context_release_scratch(ctx, UOCR_METAL_SCRATCH_VISION);
+    metal_vision_workspace_reset(&scratch);
+    metal_profile_add_event_ms(ctx, "metal.vision.chunk_scratch_release", 0.0);
 
     uocr_metal_decoder_request_f16 decoder_request;
     memset(&decoder_request, 0, sizeof(decoder_request));
@@ -12759,15 +12786,16 @@ static int metal_context_generate_image_f16_impl(uocr_metal_context *ctx,
     const uint64_t generate_start_ns = uocr_profile_now_ns();
     const int ok = metal_context_generate_f16_impl(ctx,
                                                    &decoder_request,
-                                                   scratch.final_visual_rows.buffer,
-                                                   scratch.final_visual_rows.offset,
+                                                   final_visual_rows_buffer,
+                                                   final_visual_rows_offset,
                                                    result,
                                                    error,
                                                    error_size);
     if (ok) {
         metal_profile_add_event_now(ctx, "metal.image_generate", generate_start_ns);
     }
-    metal_vision_workspace_reset(&scratch);
+    uocr_metal_context_release_scratch(ctx, UOCR_METAL_SCRATCH_VISION);
+    uocr_metal_context_release_scratch(ctx, UOCR_METAL_SCRATCH_VISION_FINAL);
     return ok;
 }
 

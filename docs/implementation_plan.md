@@ -104,6 +104,11 @@ Acceptance criteria:
 - Prompt assembly still avoids host readback.
 - No extra persistent copy of visual features remains after prefill.
 
+Status:
+- The large per-chunk SAM/CLIP/projector scratch is released after final visual rows are complete and before decoder prompt assembly.
+- Final visual rows are kept in the dedicated final-feature scratch just long enough for GPU prompt assembly and prefill, then released before decode.
+- The prompt assembly path continues to bind the GPU-resident final visual buffer directly.
+
 ## 6. Defer Decoder Arena Allocation Until After Vision
 
 Avoid overlapping large vision scratch with decoder-only runtime arenas when possible.
