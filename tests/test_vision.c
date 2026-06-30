@@ -251,6 +251,49 @@ static int test_crop_local_views_are_chunked_before_global(void) {
     return 0;
 }
 
+static int test_default_local_chunk_limit_is_memory_aware(void) {
+    enum { GRID_W = 4u, GRID_H = 3u, LOCAL_VIEWS = GRID_W * GRID_H };
+    const uint32_t local_visual_tokens = uocr_local_visual_token_count(GRID_W, GRID_H);
+    const uint32_t visual_tokens = local_visual_tokens + UOCR_GLOBAL_VISUAL_TOKENS;
+    owned_request owned;
+    CHECK(make_request(visual_tokens, LOCAL_VIEWS + 1u, GRID_W, GRID_H, &owned));
+    for (uint32_t i = 0u; i < LOCAL_VIEWS; ++i) {
+        fill_local_view(&owned.views[i]);
+    }
+    fill_global_view(&owned.views[LOCAL_VIEWS]);
+
+    const uint32_t default_limit = uocr_default_vision_max_views_per_chunk(&owned.request);
+    CHECK(default_limit == UOCR_DEFAULT_LOCAL_VIEWS_PER_CHUNK);
+
+    char error[256];
+    memset(error, 0, sizeof(error));
+    uocr_vision_schedule schedule;
+    memset(&schedule, 0, sizeof(schedule));
+    uocr_vision_chunk chunks[3];
+    memset(chunks, 0, sizeof(chunks));
+    CHECK(uocr_plan_vision_schedule(&owned.request, default_limit, chunks, 3u, &schedule, error, sizeof(error)) == UOCR_OK);
+    CHECK(error[0] == '\0');
+    CHECK(schedule.chunk_count == 3u);
+    CHECK(schedule.local_view_count == LOCAL_VIEWS);
+    CHECK(schedule.global_view_count == 1u);
+    CHECK(schedule.max_views_per_chunk == UOCR_DEFAULT_LOCAL_VIEWS_PER_CHUNK);
+    CHECK(schedule.max_chunk_views == UOCR_DEFAULT_LOCAL_VIEWS_PER_CHUNK);
+    CHECK(schedule.max_chunk_projected_tokens == UOCR_DEFAULT_LOCAL_VIEWS_PER_CHUNK * UOCR_LOCAL_GRID_QUERIES * UOCR_LOCAL_GRID_QUERIES);
+    CHECK(schedule.final_visual_tokens == visual_tokens);
+    CHECK(chunks[0].kind == UOCR_VISION_CHUNK_LOCAL);
+    CHECK(chunks[0].first_view == 0u && chunks[0].view_count == UOCR_DEFAULT_LOCAL_VIEWS_PER_CHUNK);
+    CHECK(chunks[0].projected_token_count == UOCR_DEFAULT_LOCAL_VIEWS_PER_CHUNK * UOCR_LOCAL_GRID_QUERIES * UOCR_LOCAL_GRID_QUERIES);
+    CHECK(chunks[1].kind == UOCR_VISION_CHUNK_LOCAL);
+    CHECK(chunks[1].first_view == UOCR_DEFAULT_LOCAL_VIEWS_PER_CHUNK);
+    CHECK(chunks[1].view_count == LOCAL_VIEWS - UOCR_DEFAULT_LOCAL_VIEWS_PER_CHUNK);
+    CHECK(chunks[2].kind == UOCR_VISION_CHUNK_GLOBAL);
+    CHECK(chunks[2].first_view == LOCAL_VIEWS);
+    CHECK(chunks[2].final_token_start == local_visual_tokens);
+
+    free_owned_request(&owned);
+    return 0;
+}
+
 static int test_schedule_query_and_capacity_failure(void) {
     enum { GRID_W = 2u, GRID_H = 2u, LOCAL_VIEWS = GRID_W * GRID_H };
     const uint32_t visual_tokens = uocr_local_visual_token_count(GRID_W, GRID_H) + UOCR_GLOBAL_VISUAL_TOKENS;
@@ -627,6 +670,7 @@ static int test_process_rejects_too_small_projected_scratch(void) {
 int main(void) {
     if (test_global_views_are_chunked_in_page_order() != 0) return 1;
     if (test_crop_local_views_are_chunked_before_global() != 0) return 1;
+    if (test_default_local_chunk_limit_is_memory_aware() != 0) return 1;
     if (test_schedule_query_and_capacity_failure() != 0) return 1;
     if (test_schedule_rejects_invalid_view_order() != 0) return 1;
     if (test_schedule_rejects_visual_placeholder_count_mismatch() != 0) return 1;

@@ -45,8 +45,21 @@ from unlimitedocr_c.api import (  # noqa: E402
     resolve_model_path,
 )
 from unlimitedocr_c.ffi import Engine, EngineOptions, MemoryReport, ProfileReport  # noqa: E402
-from unlimitedocr_c.frontend import PRESETS, SINGLE_PROMPT, default_tokenizer_path, prepare_image  # noqa: E402
+from unlimitedocr_c.frontend import (  # noqa: E402
+    GLOBAL_QUERIES,
+    GLOBAL_VIEW_SIZE,
+    GLOBAL_VISUAL_TOKENS,
+    LOCAL_QUERIES,
+    LOCAL_VIEW_SIZE,
+    PRESETS,
+    SINGLE_PROMPT,
+    PreparedRequest,
+    default_tokenizer_path,
+    prepare_image,
+)
 from unlimitedocr_c.ocr import decode_generated_ids, default_resource_path  # noqa: E402
+
+DEFAULT_LOCAL_VIEWS_PER_CHUNK = 8
 
 MEMORY_CATEGORIES = (
     "model_views",
@@ -148,6 +161,157 @@ def profile_report_dict(report: ProfileReport | None, limit: int) -> dict[str, A
         "metal_transient_retain_object_count": report.metal_transient_retain_object_count,
         "events": [event.as_dict() for event in events],
         "memory": memory_report_dict(report.memory),
+    }
+
+
+def local_max_views_per_chunk() -> int:
+    raw = os.environ.get("UOCR_VISION_LOCAL_MAX_VIEWS_PER_CHUNK")
+    if raw is None or raw == "":
+        return DEFAULT_LOCAL_VIEWS_PER_CHUNK
+    try:
+        value = int(raw, 10)
+    except ValueError:
+        return DEFAULT_LOCAL_VIEWS_PER_CHUNK
+    return value if value > 0 else DEFAULT_LOCAL_VIEWS_PER_CHUNK
+
+
+def _view_max_size(views: list[Any]) -> int:
+    return max((max(int(view.width), int(view.height)) for view in views), default=0)
+
+
+def _append_vision_chunk(
+    chunks: list[dict[str, Any]],
+    *,
+    kind: str,
+    first_view: int,
+    view_count: int,
+    view_max_size: int,
+    projected_grid: int,
+    projected_token_start: int,
+    final_token_start: int,
+    final_token_count: int,
+) -> int:
+    projected_tokens_per_view = projected_grid * projected_grid
+    projected_token_count = view_count * projected_tokens_per_view
+    chunks.append(
+        {
+            "kind": kind,
+            "first_view": first_view,
+            "view_count": view_count,
+            "view_max_size": view_max_size,
+            "projected_grid_w": projected_grid,
+            "projected_grid_h": projected_grid,
+            "projected_tokens_per_view": projected_tokens_per_view,
+            "projected_token_start": projected_token_start,
+            "projected_token_count": projected_token_count,
+            "final_token_start": final_token_start,
+            "final_token_count": final_token_count,
+        }
+    )
+    return projected_token_count
+
+
+def vision_schedule_dict(request: PreparedRequest) -> dict[str, Any]:
+    """Mirror the native vision schedule in probe output.
+
+    The native path uses a memory-aware local-crop chunk cap followed by one
+    global chunk. Reporting this request-derived plan makes the memory shape
+    explicit without adding native diagnostic readbacks.
+    """
+
+    local_views = [view for view in request.views if view.kind == "local"]
+    global_views = [view for view in request.views if view.kind == "global"]
+    local_count = len(local_views)
+    global_count = len(global_views)
+    max_views_per_chunk = min(local_count, local_max_views_per_chunk()) if local_count else (global_count or 1)
+    request_max_view_size = _view_max_size(list(request.views))
+
+    chunks: list[dict[str, Any]] = []
+    final_visual_rows = 0
+    projected_rows_total = 0
+    projected_start = 0
+
+    if local_count == 0:
+        final_visual_rows = global_count * GLOBAL_VISUAL_TOKENS
+        projected_rows_total = global_count * GLOBAL_QUERIES * GLOBAL_QUERIES
+        for first in range(0, global_count, max_views_per_chunk):
+            count = min(max_views_per_chunk, global_count - first)
+            projected_start += _append_vision_chunk(
+                chunks,
+                kind="global",
+                first_view=first,
+                view_count=count,
+                view_max_size=_view_max_size(global_views[first:first + count]),
+                projected_grid=GLOBAL_QUERIES,
+                projected_token_start=projected_start,
+                final_token_start=first * GLOBAL_VISUAL_TOKENS,
+                final_token_count=count * GLOBAL_VISUAL_TOKENS,
+            )
+    else:
+        local_visual_rows = (LOCAL_QUERIES * request.crop_grid_w + 1) * (LOCAL_QUERIES * request.crop_grid_h)
+        final_visual_rows = local_visual_rows + GLOBAL_VISUAL_TOKENS
+        projected_rows_total = local_count * LOCAL_QUERIES * LOCAL_QUERIES + GLOBAL_QUERIES * GLOBAL_QUERIES
+        for first in range(0, local_count, max_views_per_chunk):
+            count = min(max_views_per_chunk, local_count - first)
+            projected_start += _append_vision_chunk(
+                chunks,
+                kind="local",
+                first_view=first,
+                view_count=count,
+                view_max_size=_view_max_size(local_views[first:first + count]),
+                projected_grid=LOCAL_QUERIES,
+                projected_token_start=projected_start,
+                final_token_start=0,
+                final_token_count=local_visual_rows,
+            )
+        if global_count != 0:
+            projected_start += _append_vision_chunk(
+                chunks,
+                kind="global",
+                first_view=local_count,
+                view_count=1,
+                view_max_size=_view_max_size(global_views[:1]),
+                projected_grid=GLOBAL_QUERIES,
+                projected_token_start=projected_start,
+                final_token_start=local_visual_rows,
+                final_token_count=GLOBAL_VISUAL_TOKENS,
+            )
+
+    max_chunk_views = max((chunk["view_count"] for chunk in chunks), default=0)
+    max_chunk_projected_rows = max((chunk["projected_token_count"] for chunk in chunks), default=0)
+    chunk_shapes: dict[str, dict[str, Any]] = {}
+    for kind, grid, default_size in (("local", LOCAL_QUERIES, LOCAL_VIEW_SIZE), ("global", GLOBAL_QUERIES, GLOBAL_VIEW_SIZE)):
+        kind_chunks = [chunk for chunk in chunks if chunk["kind"] == kind]
+        if not kind_chunks:
+            continue
+        chunk_shapes[kind] = {
+            "chunk_count": len(kind_chunks),
+            "view_count": local_count if kind == "local" else global_count,
+            "max_chunk_views": max(chunk["view_count"] for chunk in kind_chunks),
+            "max_chunk_projected_rows": max(chunk["projected_token_count"] for chunk in kind_chunks),
+            "max_view_size": max(max(chunk["view_max_size"], default_size) for chunk in kind_chunks),
+            "projected_grid_w": grid,
+            "projected_grid_h": grid,
+            "projected_tokens_per_view": grid * grid,
+        }
+
+    return {
+        "local_view_count": local_count,
+        "global_view_count": global_count,
+        "chunk_count": len(chunks),
+        "max_views_per_chunk": max_views_per_chunk,
+        "max_chunk_views": max_chunk_views,
+        "max_chunk_projected_rows": max_chunk_projected_rows,
+        "final_visual_rows": final_visual_rows,
+        "projected_rows_total": projected_rows_total,
+        "request_max_view_size": request_max_view_size,
+        "current_workspace_shape": {
+            "max_view_size": request_max_view_size,
+            "max_chunk_projected_rows": max_chunk_projected_rows,
+            "final_visual_rows": final_visual_rows,
+        },
+        "chunk_shapes": chunk_shapes,
+        "chunks": chunks,
     }
 
 
@@ -266,6 +430,7 @@ def main() -> int:
         "resource_path": str(args.resource) if args.resource is not None else default_release_resource(),
         "prompt_tokens": request.n_tokens,
         "max_new_tokens": request.max_new_tokens,
+        "vision_schedule": vision_schedule_dict(request),
         "generated_tokens": generated_count,
         "tokens_per_second_native": (generated_count / timings["generate_native_s"]) if timings.get("generate_native_s", 0.0) > 0.0 else None,
         "timings_s": timings,
@@ -286,6 +451,22 @@ def main() -> int:
     print(f"library:  {payload['library_path']}")
     print(f"resource: {payload['resource_path']}")
     print(f"request:  profile={args.profile} prompt_tokens={request.n_tokens} max_new_tokens={request.max_new_tokens}")
+    schedule = payload["vision_schedule"]
+    print(
+        "vision:   "
+        f"local_views={schedule['local_view_count']} global_views={schedule['global_view_count']} "
+        f"chunks={schedule['chunk_count']} max_chunk_views={schedule['max_chunk_views']} "
+        f"max_chunk_projected_rows={schedule['max_chunk_projected_rows']} "
+        f"final_visual_rows={schedule['final_visual_rows']} "
+        f"request_max_view_size={schedule['request_max_view_size']}"
+    )
+    for kind, shape in schedule["chunk_shapes"].items():
+        print(
+            f"  {kind:6s}: chunks={shape['chunk_count']} views={shape['view_count']} "
+            f"max_chunk_views={shape['max_chunk_views']} "
+            f"max_chunk_projected_rows={shape['max_chunk_projected_rows']} "
+            f"max_view_size={shape['max_view_size']} grid={shape['projected_grid_w']}x{shape['projected_grid_h']}"
+        )
     print(f"output:   generated_tokens={generated_count} native_tok_s={payload['tokens_per_second_native']:.3f}")
     print("\nTimings:")
     for name, seconds in timings.items():

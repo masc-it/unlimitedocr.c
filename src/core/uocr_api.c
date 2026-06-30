@@ -609,12 +609,14 @@ static int generate_metal_image_fp16(uocr_engine *engine,
 
     uocr_vision_schedule vision_schedule;
     memset(&vision_schedule, 0, sizeof(vision_schedule));
-    status = uocr_plan_vision_schedule_same_shape(request,
-                                                  NULL,
-                                                  0u,
-                                                  &vision_schedule,
-                                                  validation_error,
-                                                  sizeof(validation_error));
+    const uint32_t vision_max_views_per_chunk = uocr_default_vision_max_views_per_chunk(request);
+    status = uocr_plan_vision_schedule(request,
+                                       vision_max_views_per_chunk,
+                                       NULL,
+                                       0u,
+                                       &vision_schedule,
+                                       validation_error,
+                                       sizeof(validation_error));
     if (status != UOCR_OK) {
         return set_engine_errorf(engine,
                                  status,
@@ -1087,12 +1089,14 @@ int uocr_generate_prepared(uocr_engine *engine,
         (void)sequence_state; /* retained here to exercise state construction before inference kernels land */
         uocr_vision_schedule vision_schedule;
         memset(&vision_schedule, 0, sizeof(vision_schedule));
-        const int vision_status = uocr_plan_vision_schedule_same_shape(&requests[i],
-                                                                       NULL,
-                                                                       0u,
-                                                                       &vision_schedule,
-                                                                       validation_error,
-                                                                       sizeof(validation_error));
+        const uint32_t vision_max_views_per_chunk = uocr_default_vision_max_views_per_chunk(&requests[i]);
+        const int vision_status = uocr_plan_vision_schedule(&requests[i],
+                                                           vision_max_views_per_chunk,
+                                                           NULL,
+                                                           0u,
+                                                           &vision_schedule,
+                                                           validation_error,
+                                                           sizeof(validation_error));
         if (vision_status != UOCR_OK) {
             return set_engine_errorf(engine, vision_status, "request %u vision scheduling failed: %s", i, validation_error);
         }

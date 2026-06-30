@@ -1,95 +1,211 @@
 # unlimitedocr.c
 
-Metal-first C inference core for `baidu/Unlimited-OCR`.
+An optimized C inference engine for the `baidu/Unlimited-OCR` model, with a
+Python frontend for practical OCR workflows.
 
-This project is intentionally narrow and model-specific. Python owns the v1 frontend
-(image loading, preprocessing, prompt rendering, tokenization, decoding); the C
-library owns prepared-request validation, model loading, Metal/CUDA backends,
-KV cache, generation, logits processors, and batching.
+The product goal is simple: run UnlimitedOCR locally with low-overhead native
+inference. Python handles image loading, prompt construction, tokenization, and
+text decoding; the C library owns model loading, memory management, KV cache,
+logits processing, and GPU execution.
 
-## User-facing API
+## Backend support
+
+| Backend | Status |
+| --- | --- |
+| Metal | Supported today on macOS |
+
+The runtime executes fp16 `.uocr` model files.
+
+## Highlights
+
+- Native C ABI in `include/unlimitedocr.h`.
+- Metal backend with precompiled shader support.
+- mmap-backed fp16 `.uocr` tensor views.
+- Python API that accepts paths, URLs, bytes, file-like objects, base64/data URI
+  strings, and `PIL.Image.Image` inputs.
+- Cache-aware model resolution with Hugging Face download/conversion.
+- Engine reuse for repeated OCR calls.
+- Native profile and memory reports.
+
+## Requirements
+
+- macOS with a Metal-capable GPU.
+- Python 3.12+.
+- CMake and Xcode Command Line Tools.
+- `uv` for local development commands.
+
+## Build from source
+
+Build the Release native library and precompile the Metal library:
+
+```sh
+uv sync
+cmake -S . -B build/release \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DUOCR_ENABLE_METAL=ON \
+  -DUOCR_BUILD_TOOLS=ON \
+  -DUOCR_METAL_PRECOMPILE=ON
+cmake --build build/release -j
+```
+
+When running from the source tree, Python loads the Release library from
+`build/release/libunlimitedocr.dylib`. Use `UOCR_LIBRARY_PATH` to point Python
+at this Release build explicitly.
+
+## Quick start from Python
 
 ```python
 from unlimitedocr_c import UnlimitedOCR
 
-ocr = UnlimitedOCR()  # resolves/downloads the .uocr model cache-aware
-text = ocr.generate("page.png", profile="base")  # profile: "base" or "gundam"
-print(text)
+with UnlimitedOCR() as ocr:
+    text = ocr.generate("page.png", profile="base")
+    print(text)
 ```
 
-`generate()` accepts a local path, HTTP(S) URL, base64/data-URI string,
-`BytesIO`/bytes, or a `PIL.Image.Image`, and returns the decoded OCR text.
-Model resolution checks `UOCR_MODEL_PATH`, local `dist/`, the package cache, and
-then Hugging Face; downloads are stored under the UnlimitedOCR cache directory.
+`UnlimitedOCR()` resolves the model automatically. Resolution order is:
 
-## Current status
+1. explicit `model_path=...`
+2. `UOCR_MODEL_PATH`
+3. local `dist/unlimitedocr-fp16.uocr`
+4. UnlimitedOCR cache directories
+5. preconverted model download from Hugging Face
+6. upstream `baidu/Unlimited-OCR` download followed by fp16 `.uocr` conversion
 
-Implemented first native scaffold:
+The high-level wrapper keeps the native engine open and reuses it across calls;
+release resources with `close()` or context-manager exit.
 
-- plain CMake build
-- `include/unlimitedocr.h` C ABI
-- `libunlimitedocr` shared library stub
-- CPU reference backend placeholder
-- macOS Metal backend skeleton with runtime source compilation, mmap/no-copy smoke test, `.uocr` no-copy model view mapping/warmup, transient retain tracking, reusable named scratch buffers, long-lived runtime arenas, fp16 get-rows gather, direct prompt assembly, fp16 RMSNorm, fp16 dense kernels, fp16 attention Q/K/V/O projections, attention output projection plus residual add, layer-0 dense SwiGLU, MoE router softmax/top-6, selected routed-expert fp16 decode, MoE shared-expert fp16 MLP, MoE routed/shared combine, split-half RoPE, causal/varlen prefill attention, OCR-specific single-token decode window/prefix attention, and KV cache layout/writes
-- prepared-request validation foundation plus per-sequence prompt/image span state
-- upstream-compatible sliding-window no-repeat n-gram logits processor
-- DS4-style internal allocation wrappers with live/peak accounting and no-allocation guard primitive
-- runtime memory category accounting, KV/vision/decoder/MoE/logits estimates, public memory reports, Metal working-set default budgets, and memory-budget checks
-- mmap-backed `.uocr` header/config/tokenizer/provenance/tensor-directory loader
-- C engine `model_path` loading with resident tensor-data memory accounting
-- page-aligned tensor-data section validation for Metal no-copy model views
-- stable tensor registry and binary-search tensor-id lookup shared by converter planning and runtime metadata
-- fp16 converter dry-run against cached safetensors header/index with planned page-aligned `.uocr` layout
-- fp16 `.uocr` writer that streams real safetensors tensor ranges with BF16->FP16 conversion when weights are available
-- Python prepared-request frontend and fixture writer
-- Python `ctypes` wrapper for build-tree `libunlimitedocr`
-- `uocr-dump` header/config/tokenizer/provenance/tensor-layout inspection tool
-- native CTest and pytest smoke tests
+## Input examples
 
-Real inference kernels are not implemented yet. Full-model conversion is implemented for fp16 layout/streaming but requires the real safetensors payload, which is not checked into this repo.
+```python
+from io import BytesIO
+from PIL import Image
+from unlimitedocr_c import UnlimitedOCR
 
-## Install / build
+ocr = UnlimitedOCR()
 
-```sh
-uv pip install .
+print(ocr.generate("/path/to/page.png"))          # local path
+print(ocr.generate("https://example.com/page.jpg"))  # URL
+print(ocr.generate(open("page.png", "rb").read()))   # bytes
+print(ocr.generate(BytesIO(b"...image bytes...")))   # file-like
+print(ocr.generate(Image.open("page.png")))          # PIL image
+
+ocr.close()
 ```
 
-For local development and tests:
+Profiles:
 
-```sh
-make test
+- `profile="base"` — standard single 1024px global view.
+- `profile="gundam"` — crop-aware profile for larger or denser pages.
+
+## Lower-level API with profiling
+
+Use `ocr_image()` when you want the decoded text plus token ids and native
+profile data:
+
+```python
+from unlimitedocr_c import ocr_image, resolve_model_path
+
+model_path = resolve_model_path()
+result = ocr_image(
+    "page.png",
+    model_path=model_path,
+    preset="gundam",
+    max_gen_tokens=512,
+    profile=True,
+)
+
+print(result.text)
+print(result.token_ids.tolist())
+if result.profile:
+    print(result.profile.summary())
 ```
 
-Equivalent direct commands:
+## Reusing an engine explicitly
 
-```sh
-cmake -S . -B build/debug -DCMAKE_BUILD_TYPE=Debug -DUOCR_ENABLE_METAL=AUTO
-cmake --build build/debug -j
-ctest --test-dir build/debug --output-on-failure
-uv run pytest
+```python
+from unlimitedocr_c import (
+    Engine,
+    EngineOptions,
+    default_resource_path,
+    generate_prepared,
+    prepare_image,
+    resolve_model_path,
+)
+
+request = prepare_image("page.png", preset="base", max_new_tokens=512)
+
+engine = Engine(
+    EngineOptions(
+        model_path=str(resolve_model_path()),
+        backend="metal",
+        resource_path=default_resource_path("metal"),
+        max_batch=1,
+        max_prompt_tokens=request.n_tokens,
+        max_gen_tokens=request.max_new_tokens,
+        profile=True,
+    )
+)
+try:
+    result = generate_prepared(request, engine=engine, profile=True)
+    print(result.text)
+finally:
+    engine.close()
 ```
 
-The build emits `build/debug/libunlimitedocr.dylib` on macOS. Python can also
-locate the library via `UOCR_LIBRARY_PATH=/path/to/libunlimitedocr.dylib`.
+## Multi-page and PDF OCR
 
-## Prepared fixtures
+```python
+from unlimitedocr_c import ocr_pages, ocr_pdf, resolve_model_path
 
-```sh
-uv run tools/uocr-ref-dump --image path/to/page.png --out fixtures/page --max-new-tokens 0
+model_path = resolve_model_path()
+
+pages = ocr_pages(["page-1.png", "page-2.png"], model_path=model_path)
+print(pages.text)
+
+# Requires PyMuPDF (`uv add pymupdf` or `pip install pymupdf`).
+pdf = ocr_pdf("document.pdf", model_path=model_path, dpi=300)
+print(pdf.text)
 ```
 
-## Converter
+## Useful environment variables
 
-Plan conversion from the cached header/index without full weights:
+- `UOCR_MODEL_PATH` — path to an fp16 `.uocr` model.
+- `UOCR_CACHE_DIR` — cache directory for downloaded/converted models.
+- `UOCR_MODEL_REPO_ID` / `UOCR_MODEL_REVISION` — preconverted model source.
+- `UOCR_SOURCE_MODEL_REPO_ID` / `UOCR_SOURCE_MODEL_REVISION` — upstream model
+  source used for local conversion.
+- `UOCR_LIBRARY_PATH` — native `libunlimitedocr` path.
+- `UOCR_METAL_RESOURCE_PATH` — directory containing `unlimitedocr.metallib` or
+  Metal source kernels.
+- `UOCR_PROFILE=1` — enable profile reporting through the environment.
+
+## Model conversion tools
+
+Preview the conversion layout:
 
 ```sh
 uv run tools/uocr-convert --dry-run
 ```
 
-Write fp16 `.uocr` when the real safetensors payload is present:
+Write an fp16 `.uocr` model when the upstream safetensors payload is available:
 
 ```sh
-uv run tools/uocr-convert --out /path/to/unlimitedocr-fp16.uocr --overwrite
+uv run tools/uocr-convert --out dist/unlimitedocr-fp16.uocr --overwrite
 ```
 
-Single-tensor debugging can use `--tensor NAME_OR_ID`.
+Inspect a converted model:
+
+```sh
+build/release/uocr-dump dist/unlimitedocr-fp16.uocr
+```
+
+## Verification
+
+Run the end-to-end Metal generation probe:
+
+```sh
+uv run probes/e2e_generation_probe.py --profile base
+```
+
+For native and Python tests during development, configure with
+`-DUOCR_BUILD_TESTS=ON`, then run `ctest` and `uv run pytest`.

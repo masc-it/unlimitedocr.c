@@ -2,6 +2,7 @@
 
 #include <stdarg.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "model/uocr_constants.h"
@@ -26,6 +27,19 @@ static void vision_clear_error(char *error, size_t error_size) {
 
 static uint32_t min_u32(uint32_t a, uint32_t b) {
     return a < b ? a : b;
+}
+
+static uint32_t vision_local_max_views_per_chunk(void) {
+    const char *value = getenv("UOCR_VISION_LOCAL_MAX_VIEWS_PER_CHUNK");
+    if (value == NULL || value[0] == '\0') {
+        return UOCR_DEFAULT_LOCAL_VIEWS_PER_CHUNK;
+    }
+    char *end = NULL;
+    const unsigned long parsed = strtoul(value, &end, 10);
+    if (end == value || *end != '\0' || parsed == 0ul || parsed > (unsigned long)UINT32_MAX) {
+        return UOCR_DEFAULT_LOCAL_VIEWS_PER_CHUNK;
+    }
+    return (uint32_t)parsed;
 }
 
 static void make_chunk(uocr_vision_chunk *chunk,
@@ -81,6 +95,31 @@ static int add_chunk(uocr_vision_chunk *chunks,
 }
 
 uint32_t uocr_default_vision_max_views_per_chunk(const uocr_prepared_request *request) {
+    if (request == NULL || request->n_views == 0u || request->views == NULL) {
+        return 1u;
+    }
+
+    uint32_t local_views = 0u;
+    uint32_t global_views = 0u;
+    for (uint32_t i = 0u; i < request->n_views; ++i) {
+        if (request->views[i].kind == UOCR_VIEW_LOCAL) {
+            ++local_views;
+        } else if (request->views[i].kind == UOCR_VIEW_GLOBAL) {
+            ++global_views;
+        }
+    }
+
+    if (local_views != 0u) {
+        const uint32_t local_limit = vision_local_max_views_per_chunk();
+        return local_views < local_limit ? local_views : local_limit;
+    }
+    if (global_views != 0u) {
+        return global_views;
+    }
+    return 1u;
+}
+
+static uint32_t vision_same_shape_max_views_per_chunk(const uocr_prepared_request *request) {
     if (request == NULL || request->n_views == 0u || request->views == NULL) {
         return 1u;
     }
@@ -224,7 +263,7 @@ int uocr_plan_vision_schedule_same_shape(const uocr_prepared_request *request,
                                          uocr_vision_schedule *out_schedule,
                                          char *error,
                                          size_t error_size) {
-    const uint32_t chunk_limit = uocr_default_vision_max_views_per_chunk(request);
+    const uint32_t chunk_limit = vision_same_shape_max_views_per_chunk(request);
     const int status = uocr_plan_vision_schedule(request,
                                                  chunk_limit,
                                                  chunks,
