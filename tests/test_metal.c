@@ -14290,6 +14290,9 @@ int main(void) {
         if (strcmp(filter, "moe_interleaved_experts_combine_f16") == 0) {
             return test_metal_moe_interleaved_experts_combine_f16();
         }
+        if (strcmp(filter, "moe_selected_experts_decode_f16") == 0) {
+            return test_metal_moe_selected_experts_decode_f16();
+        }
         if (strcmp(filter, "moe_router_f16") == 0) {
             return test_metal_moe_router_f16();
         }

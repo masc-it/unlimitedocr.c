@@ -3758,6 +3758,119 @@ kernel void uocr_moe_decode_interleaved_gate_up_one_f16(device const half *src [
     }
 }
 
+// Decode-only routed-expert gate/up tiling.  Each threadgroup covers one
+// selected rank and four adjacent intermediate columns.  The 256 lanes walk
+// hidden indices in the same order as uocr_moe_decode_interleaved_gate_up_one_f16
+// for every column while reusing each hidden load across the four columns.  Each
+// column is then reduced with uocr_threadgroup_sum2 using the same threadgroup
+// width and reduction tree as the scalar decode kernel, preserving the fp32
+// accumulation feeding the fp16 SwiGLU intermediate store.  The expert-id branch
+// is uniform for the whole threadgroup, and all valid/tail columns execute the
+// same sequence of barriers.
+[[max_total_threads_per_threadgroup(256)]] kernel void uocr_moe_decode_interleaved_gate_up_tile4_f16(device const half *src [[buffer(0)]],
+                                                        device const uint *top_expert_ids [[buffer(1)]],
+                                                        device const half *expert_slab [[buffer(2)]],
+                                                        device half *mid [[buffer(3)]],
+                                                        constant UocrMoePrefillInterleavedParams &params [[buffer(4)]],
+                                                        threadgroup float *partials [[threadgroup(0)]],
+                                                        uint output_tile [[threadgroup_position_in_grid]],
+                                                        uint tid [[thread_index_in_threadgroup]],
+                                                        uint ntg [[threads_per_threadgroup]],
+                                                        uint simd_width [[threads_per_simdgroup]]) {
+    const uint tile_columns = 4u;
+    const uint tiles_per_rank = uocr_div_up_u32(params.intermediate_size, tile_columns);
+    const uint tiles_per_token = params.top_k * tiles_per_rank;
+    const uint token = output_tile / tiles_per_token;
+    const uint token_rem = output_tile - token * tiles_per_token;
+    const uint rank = token_rem / tiles_per_rank;
+    const uint tile = token_rem - rank * tiles_per_rank;
+    if (token >= params.n_tokens || rank >= params.top_k || ntg != 256u) {
+        return;
+    }
+
+    const uint out_col0 = tile * tile_columns;
+    const uint out_col1 = out_col0 + 1u;
+    const uint out_col2 = out_col0 + 2u;
+    const uint out_col3 = out_col0 + 3u;
+    const bool valid0 = out_col0 < params.intermediate_size;
+    const bool valid1 = out_col1 < params.intermediate_size;
+    const bool valid2 = out_col2 < params.intermediate_size;
+    const bool valid3 = out_col3 < params.intermediate_size;
+    const ulong mid_base = (ulong(token) * ulong(params.top_k) + ulong(rank)) * ulong(params.intermediate_size);
+    const uint expert = top_expert_ids[token * params.top_k + rank];
+    if (expert >= params.expert_count) {
+        if (tid == 0u) {
+            if (valid0) mid[mid_base + ulong(out_col0)] = half(0.0f);
+            if (valid1) mid[mid_base + ulong(out_col1)] = half(0.0f);
+            if (valid2) mid[mid_base + ulong(out_col2)] = half(0.0f);
+            if (valid3) mid[mid_base + ulong(out_col3)] = half(0.0f);
+        }
+        return;
+    }
+
+    float gate0 = 0.0f;
+    float up0 = 0.0f;
+    float gate1 = 0.0f;
+    float up1 = 0.0f;
+    float gate2 = 0.0f;
+    float up2 = 0.0f;
+    float gate3 = 0.0f;
+    float up3 = 0.0f;
+    const ulong src_base = ulong(token) * ulong(params.hidden_size);
+    const ulong expert_base = ulong(expert) * ulong(params.expert_stride_values);
+    const ulong gate_base0 = expert_base + ulong(out_col0) * ulong(params.hidden_size);
+    const ulong gate_base1 = expert_base + ulong(out_col1) * ulong(params.hidden_size);
+    const ulong gate_base2 = expert_base + ulong(out_col2) * ulong(params.hidden_size);
+    const ulong gate_base3 = expert_base + ulong(out_col3) * ulong(params.hidden_size);
+    const ulong up_base0 = expert_base + ulong(params.up_offset_values) + ulong(out_col0) * ulong(params.hidden_size);
+    const ulong up_base1 = expert_base + ulong(params.up_offset_values) + ulong(out_col1) * ulong(params.hidden_size);
+    const ulong up_base2 = expert_base + ulong(params.up_offset_values) + ulong(out_col2) * ulong(params.hidden_size);
+    const ulong up_base3 = expert_base + ulong(params.up_offset_values) + ulong(out_col3) * ulong(params.hidden_size);
+    for (uint k = tid; k < params.hidden_size; k += ntg) {
+        const ulong kk = ulong(k);
+        const float x = float(src[src_base + kk]);
+        if (valid0) {
+            gate0 += x * float(expert_slab[gate_base0 + kk]);
+            up0 += x * float(expert_slab[up_base0 + kk]);
+        }
+        if (valid1) {
+            gate1 += x * float(expert_slab[gate_base1 + kk]);
+            up1 += x * float(expert_slab[up_base1 + kk]);
+        }
+        if (valid2) {
+            gate2 += x * float(expert_slab[gate_base2 + kk]);
+            up2 += x * float(expert_slab[up_base2 + kk]);
+        }
+        if (valid3) {
+            gate3 += x * float(expert_slab[gate_base3 + kk]);
+            up3 += x * float(expert_slab[up_base3 + kk]);
+        }
+    }
+
+    float gate = 0.0f;
+    float up = 0.0f;
+    uocr_threadgroup_sum2(gate0, up0, partials, partials + ntg, tid, ntg, simd_width, gate, up);
+    if (tid == 0u && valid0) {
+        const float silu = gate / (1.0f + exp(-gate));
+        mid[mid_base + ulong(out_col0)] = half(silu * up);
+    }
+    uocr_threadgroup_sum2(gate1, up1, partials, partials + ntg, tid, ntg, simd_width, gate, up);
+    if (tid == 0u && valid1) {
+        const float silu = gate / (1.0f + exp(-gate));
+        mid[mid_base + ulong(out_col1)] = half(silu * up);
+    }
+    uocr_threadgroup_sum2(gate2, up2, partials, partials + ntg, tid, ntg, simd_width, gate, up);
+    if (tid == 0u && valid2) {
+        const float silu = gate / (1.0f + exp(-gate));
+        mid[mid_base + ulong(out_col2)] = half(silu * up);
+    }
+    uocr_threadgroup_sum2(gate3, up3, partials, partials + ntg, tid, ntg, simd_width, gate, up);
+    if (tid == 0u && valid3) {
+        const float silu = gate / (1.0f + exp(-gate));
+        mid[mid_base + ulong(out_col3)] = half(silu * up);
+    }
+}
+
 static inline float uocr_moe_prefill_interleaved_down_dot_f16(device const half *mid,
                                                               device const uint *top_expert_ids,
                                                               device const float *top_weights,

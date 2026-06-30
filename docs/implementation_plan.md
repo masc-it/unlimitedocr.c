@@ -244,7 +244,7 @@ Completion notes:
 
 ## 7. Tile Routed Expert Gate/Up GEMV
 
-Status: [ ] Not started
+Status: [x] Completed
 
 Details:
 - Extend the tiled gate/up approach to routed experts after shared expert validation.
@@ -257,6 +257,22 @@ Acceptance criteria:
 - Routed gate/up threadgroup count decreases.
 - `metal.decode.moe_routed_experts` gate/up portion improves in focused profiling.
 - Synthetic selected-expert decode parity passes.
+
+Completion notes:
+- Added `uocr_moe_decode_interleaved_gate_up_tile4_f16` for decode routed experts and gated it behind `UOCR_METAL_ENABLE_MOE_ROUTED_GATE_UP_TILED`.
+- The retained default maps one selected expert rank and four adjacent intermediate columns to a 256-thread threadgroup, reducing routed gate/up threadgroups from `top_k * 896 = 5376` to `top_k * ceil(896/4) = 1344` per MoE layer.
+- Each lane walks the same hidden-index sequence for every output column as `uocr_moe_decode_interleaved_gate_up_one_f16`; each column then uses the same `uocr_threadgroup_sum2` reduction tree before the fp16 SwiGLU intermediate store. This preserves the per-column accumulation shape while reusing the hidden load across the four columns.
+- The selected expert id is uniform for the whole threadgroup. Invalid-expert diagnostics zero all columns uniformly before returning, and all valid/tail columns execute the same barrier sequence.
+- Measured variants included a four-column/1024-thread partition and a two-column/512-thread partition. They reduced threadgroups but were not retained because they did not beat the 256-thread hidden-reuse variant in same-session probes.
+- Added focused filter coverage for `UOCR_METAL_TEST_FILTER=moe_selected_experts_decode_f16`; `moe_interleaved_experts_combine_f16` now exercises the tiled decode interleaved path.
+- Final Release probe artifacts:
+  - `data.tmp/probes/e2e_base_moe_routed_tile.json`
+  - `data.tmp/probes/e2e_gundam_moe_routed_tile.json`
+  - `data.tmp/probes/moe_routed_tile_results.md`
+- Final probe summary:
+  - `base`: text parity true, 44 generated tokens, 7.087 native tok/s, routed experts `2.484 -> 2.503` ms versus Task 6; same-session tiled-disabled probe was `2.634 -> 2.503` ms.
+  - `gundam`: text parity true, 58 generated tokens, 1.515 native tok/s, routed experts `3.335 -> 3.588` ms versus Task 6; same-session tiled-disabled probe was `3.765 -> 3.588` ms.
+  - Command encoder count stayed flat and `metal.decode.moe_combine` remained absent. E2E command-wait totals remain noisy; final text parity is stable, and the same-session disabled comparison is included in the probe notes.
 
 ## 8. Tile Routed Down Projection with Final Add
 

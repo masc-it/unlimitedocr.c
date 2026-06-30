@@ -51,12 +51,17 @@
 #ifndef UOCR_METAL_ENABLE_MOE_SHARED_GATE_UP_TILED
 #define UOCR_METAL_ENABLE_MOE_SHARED_GATE_UP_TILED 1
 #endif
+#ifndef UOCR_METAL_ENABLE_MOE_ROUTED_GATE_UP_TILED
+#define UOCR_METAL_ENABLE_MOE_ROUTED_GATE_UP_TILED 1
+#endif
 // Keep router top-k in the one-SIMD greedy path; this avoids the old
 // full-row bitonic-sort barriers for the fixed 64-expert/top-6 decode shape.
 #define UOCR_METAL_MOE_ROUTER_TOPK_THREADS 16u
 #define UOCR_METAL_MOE_ROUTER_FUSED_THREADS 1024u
 #define UOCR_METAL_MOE_SHARED_GATE_UP_TILE_COLUMNS 4u
 #define UOCR_METAL_MOE_SHARED_GATE_UP_TILED_THREADS 1024u
+#define UOCR_METAL_MOE_ROUTED_GATE_UP_TILE_COLUMNS 4u
+#define UOCR_METAL_MOE_ROUTED_GATE_UP_TILED_THREADS 256u
 #define UOCR_METAL_FLASH_Q_PER_TG 4u
 #define UOCR_METAL_FLASH_MAX_LANE_VALUES 4u
 #define UOCR_METAL_HALF4_WIDTH 4u
@@ -8253,6 +8258,7 @@ static int metal_prewarm_integrated_decoder_pipelines(uocr_metal_context *ctx, c
         { "uocr_moe_prefill_interleaved_gate_up_f16", 0 },
         { "uocr_moe_prefill_interleaved_down_sum_f16_to_f16", 0 },
         { "uocr_moe_decode_interleaved_gate_up_one_f16", 0 },
+        { "uocr_moe_decode_interleaved_gate_up_tile4_f16", 0 },
         { "uocr_moe_decode_interleaved_down_sum_combine_f16_to_f16", 0 },
         { "uocr_moe_decode_interleaved_down_sum_combine_one_f16_to_f16", 1 },
         { "uocr_moe_combine_f16_to_f16", 1 },
@@ -11731,15 +11737,31 @@ static int metal_run_moe_interleaved_decode_fused_combine_buffer_f16(uocr_metal_
 #else
         const int use_decode_kernels = 0;
 #endif
-        id<MTLComputePipelineState> gate_pipeline = use_decode_kernels ?
-            metal_get_pipeline(ctx, "uocr_moe_decode_interleaved_gate_up_one_f16", error, error_size) :
-            metal_get_pipeline(ctx, "uocr_moe_prefill_interleaved_gate_up_f16", error, error_size);
+#if UOCR_METAL_ENABLE_MOE_ROUTED_GATE_UP_TILED
+        const int use_tiled_routed_gate_up = use_decode_kernels;
+#else
+        const int use_tiled_routed_gate_up = 0;
+#endif
+        const char *gate_function_name = use_tiled_routed_gate_up ?
+                                             "uocr_moe_decode_interleaved_gate_up_tile4_f16" :
+                                             (use_decode_kernels ?
+                                                  "uocr_moe_decode_interleaved_gate_up_one_f16" :
+                                                  "uocr_moe_prefill_interleaved_gate_up_f16");
+        id<MTLComputePipelineState> gate_pipeline = metal_get_pipeline(ctx, gate_function_name, error, error_size);
         id<MTLComputePipelineState> down_combine_pipeline = metal_get_pipeline(ctx,
                                                                                "uocr_moe_decode_interleaved_down_sum_combine_f16_to_f16",
                                                                                error,
                                                                                error_size);
         if (gate_pipeline == nil || down_combine_pipeline == nil) {
             return 0;
+        }
+        if (use_tiled_routed_gate_up &&
+            gate_pipeline.maxTotalThreadsPerThreadgroup < (NSUInteger)UOCR_METAL_MOE_ROUTED_GATE_UP_TILED_THREADS) {
+            return metal_fail(error,
+                              error_size,
+                              "integrated routed MoE tiled gate/up pipeline supports only %llu threads; need %u",
+                              (unsigned long long)gate_pipeline.maxTotalThreadsPerThreadgroup,
+                              UOCR_METAL_MOE_ROUTED_GATE_UP_TILED_THREADS);
         }
         int owned_command_buffer = 0;
         id<MTLCommandBuffer> cb = metal_command_buffer_for_op(ctx, &owned_command_buffer, "integrated routed MoE fused combine", error, error_size);
@@ -11759,7 +11781,15 @@ static int metal_run_moe_interleaved_decode_fused_combine_buffer_f16(uocr_metal_
         if (enc == nil) {
             return metal_fail(error, error_size, "failed to create integrated routed MoE fused gate/up encoder");
         }
-        const NSUInteger gate_threads = metal_power2_threadgroup_width(256u, gate_pipeline.maxTotalThreadsPerThreadgroup);
+        const NSUInteger gate_threads = use_tiled_routed_gate_up ?
+            metal_power2_threadgroup_width((NSUInteger)UOCR_METAL_MOE_ROUTED_GATE_UP_TILED_THREADS,
+                                           gate_pipeline.maxTotalThreadsPerThreadgroup) :
+            metal_power2_threadgroup_width(256u, gate_pipeline.maxTotalThreadsPerThreadgroup);
+        const NSUInteger gate_threadgroups = use_tiled_routed_gate_up ?
+            (NSUInteger)n_tokens * (NSUInteger)UOCR_MOE_TOP_K *
+                (((NSUInteger)UOCR_MOE_EXPERT_INTERMEDIATE + (NSUInteger)UOCR_METAL_MOE_ROUTED_GATE_UP_TILE_COLUMNS - 1u) /
+                 (NSUInteger)UOCR_METAL_MOE_ROUTED_GATE_UP_TILE_COLUMNS) :
+            (NSUInteger)gate_values;
         [enc setComputePipelineState:gate_pipeline];
         [enc setBuffer:input.buffer offset:input.offset atIndex:0u];
         [enc setBuffer:top_ids.buffer offset:top_ids.offset atIndex:1u];
@@ -11767,7 +11797,7 @@ static int metal_run_moe_interleaved_decode_fused_combine_buffer_f16(uocr_metal_
         [enc setBuffer:mid.buffer offset:mid.offset atIndex:3u];
         [enc setBytes:&prefill_params length:sizeof(prefill_params) atIndex:4u];
         [enc setThreadgroupMemoryLength:gate_threads * 2u * sizeof(float) atIndex:0u];
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)gate_values, 1u, 1u)
+        [enc dispatchThreadgroups:MTLSizeMake(gate_threadgroups, 1u, 1u)
              threadsPerThreadgroup:MTLSizeMake(gate_threads, 1u, 1u)];
         [enc endEncoding];
 
@@ -23785,6 +23815,11 @@ int uocr_metal_context_diagnostic_moe_interleaved_experts_combine_f16(uocr_metal
 
     @autoreleasepool {
         const int use_decode_kernels = (n_tokens == 1u);
+#if UOCR_METAL_ENABLE_MOE_ROUTED_GATE_UP_TILED
+        const int use_tiled_routed_gate_up = use_decode_kernels;
+#else
+        const int use_tiled_routed_gate_up = 0;
+#endif
         id<MTLComputePipelineState> gate_up_pipeline = nil;
         id<MTLComputePipelineState> down_combine_pipeline = nil;
         if (use_decode_kernels) {
@@ -23802,7 +23837,9 @@ int uocr_metal_context_diagnostic_moe_interleaved_experts_combine_f16(uocr_metal
                                       expert_count,
                                       top_k];
             gate_up_pipeline = metal_get_pipeline(ctx,
-                                                  "uocr_moe_decode_interleaved_gate_up_one_f16",
+                                                  use_tiled_routed_gate_up ?
+                                                      "uocr_moe_decode_interleaved_gate_up_tile4_f16" :
+                                                      "uocr_moe_decode_interleaved_gate_up_one_f16",
                                                   error,
                                                   error_size);
             down_combine_pipeline = metal_get_pipeline_with_constants(ctx,
@@ -23824,6 +23861,14 @@ int uocr_metal_context_diagnostic_moe_interleaved_experts_combine_f16(uocr_metal
         }
         if (gate_up_pipeline == nil || down_combine_pipeline == nil) {
             return 0;
+        }
+        if (use_tiled_routed_gate_up &&
+            gate_up_pipeline.maxTotalThreadsPerThreadgroup < (NSUInteger)UOCR_METAL_MOE_ROUTED_GATE_UP_TILED_THREADS) {
+            return metal_fail(error,
+                              error_size,
+                              "Metal MoE fused-combine tiled gate/up pipeline supports only %llu threads; need %u",
+                              (unsigned long long)gate_up_pipeline.maxTotalThreadsPerThreadgroup,
+                              UOCR_METAL_MOE_ROUTED_GATE_UP_TILED_THREADS);
         }
 
         int ok = 0;
@@ -23943,7 +23988,15 @@ int uocr_metal_context_diagnostic_moe_interleaved_experts_combine_f16(uocr_metal
             (void)metal_fail(error, error_size, "failed to create Metal MoE fused-combine gate/up command encoder");
             goto cleanup;
         }
-        const NSUInteger gate_threads = metal_power2_threadgroup_width(256u, gate_up_pipeline.maxTotalThreadsPerThreadgroup);
+        const NSUInteger gate_threads = use_tiled_routed_gate_up ?
+            metal_power2_threadgroup_width((NSUInteger)UOCR_METAL_MOE_ROUTED_GATE_UP_TILED_THREADS,
+                                           gate_up_pipeline.maxTotalThreadsPerThreadgroup) :
+            metal_power2_threadgroup_width(256u, gate_up_pipeline.maxTotalThreadsPerThreadgroup);
+        const NSUInteger gate_threadgroups = use_tiled_routed_gate_up ?
+            (NSUInteger)n_tokens * (NSUInteger)top_k *
+                (((NSUInteger)intermediate_size + (NSUInteger)UOCR_METAL_MOE_ROUTED_GATE_UP_TILE_COLUMNS - 1u) /
+                 (NSUInteger)UOCR_METAL_MOE_ROUTED_GATE_UP_TILE_COLUMNS) :
+            (NSUInteger)gate_groups;
         [enc setComputePipelineState:gate_up_pipeline];
         [enc setBuffer:input offset:0u atIndex:0u];
         [enc setBuffer:top_ids offset:0u atIndex:1u];
@@ -23951,7 +24004,7 @@ int uocr_metal_context_diagnostic_moe_interleaved_experts_combine_f16(uocr_metal
         [enc setBuffer:mid offset:0u atIndex:3u];
         [enc setBytes:&prefill_params length:sizeof(prefill_params) atIndex:4u];
         [enc setThreadgroupMemoryLength:gate_threads * 2u * sizeof(float) atIndex:0u];
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)gate_groups, 1u, 1u)
+        [enc dispatchThreadgroups:MTLSizeMake(gate_threadgroups, 1u, 1u)
              threadsPerThreadgroup:MTLSizeMake(gate_threads, 1u, 1u)];
         [enc endEncoding];
 
