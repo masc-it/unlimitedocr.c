@@ -7,6 +7,21 @@ This project is intentionally narrow and model-specific. Python owns the v1 fron
 library owns prepared-request validation, model loading, Metal/CUDA backends,
 KV cache, generation, logits processors, and batching.
 
+## User-facing API
+
+```python
+from unlimitedocr_c import UnlimitedOCR
+
+ocr = UnlimitedOCR()  # resolves/downloads the .uocr model cache-aware
+text = ocr.generate("page.png", profile="base")  # profile: "base" or "gundam"
+print(text)
+```
+
+`generate()` accepts a local path, HTTP(S) URL, base64/data-URI string,
+`BytesIO`/bytes, or a `PIL.Image.Image`, and returns the decoded OCR text.
+Model resolution checks `UOCR_MODEL_PATH`, local `dist/`, the package cache, and
+then Hugging Face; downloads are stored under the UnlimitedOCR cache directory.
+
 ## Current status
 
 Implemented first native scaffold:
@@ -33,7 +48,13 @@ Implemented first native scaffold:
 
 Real inference kernels are not implemented yet. Full-model conversion is implemented for fp16 layout/streaming but requires the real safetensors payload, which is not checked into this repo.
 
-## Build
+## Install / build
+
+```sh
+uv pip install .
+```
+
+For local development and tests:
 
 ```sh
 make test

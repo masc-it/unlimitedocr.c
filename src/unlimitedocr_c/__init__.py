@@ -1,5 +1,17 @@
 """Python helpers for the Unlimited-OCR C inference core."""
 
+from .api import (
+    DEFAULT_CONVERTED_MODEL_REPO_ID,
+    DEFAULT_MODEL_FILENAME,
+    DEFAULT_SOURCE_MODEL_REPO_ID,
+    ImageSource,
+    ModelResolutionError,
+    ProfileName,
+    UnlimitedOCR,
+    default_cache_dir,
+    load_user_image,
+    resolve_model_path,
+)
 from .calibrate import (
     CalibrationCandidateReport,
     CalibrationCaseReport,
@@ -166,6 +178,16 @@ from .parity_thresholds import (
 )
 
 __all__ = [
+    "DEFAULT_CONVERTED_MODEL_REPO_ID",
+    "DEFAULT_MODEL_FILENAME",
+    "DEFAULT_SOURCE_MODEL_REPO_ID",
+    "ImageSource",
+    "ModelResolutionError",
+    "ProfileName",
+    "UnlimitedOCR",
+    "default_cache_dir",
+    "load_user_image",
+    "resolve_model_path",
     "CalibrationCandidateReport",
     "CalibrationCaseReport",
     "CalibrationFixtureCase",

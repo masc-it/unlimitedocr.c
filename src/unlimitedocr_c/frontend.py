@@ -171,8 +171,25 @@ def project_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
+def is_source_tree_package() -> bool:
+    """Return True when importing from this repository's src/ tree."""
+
+    root = project_root()
+    package_dir = Path(__file__).resolve().parent
+    return (root / "CMakeLists.txt").is_file() and package_dir == (root / "src" / "unlimitedocr_c").resolve()
+
+
+def package_resource_dir() -> Path:
+    return Path(__file__).resolve().parent / "resources"
+
+
 def default_context_dir() -> Path:
-    candidates = [Path.cwd() / "data" / "context", project_root() / "data" / "context"]
+    candidates = [
+        Path.cwd() / "data" / "context",
+        project_root() / "data" / "context",
+    ]
+    if not is_source_tree_package():
+        candidates.append(package_resource_dir() / "context")
     for candidate in candidates:
         if (candidate / "tokenizer.json").exists():
             return candidate

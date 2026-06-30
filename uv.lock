@@ -524,6 +524,7 @@ name = "unlimitedocr-c"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "huggingface-hub" },
     { name = "numpy" },
     { name = "pillow" },
     { name = "safetensors" },
@@ -537,6 +538,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "huggingface-hub", specifier = ">=0.23" },
     { name = "numpy", specifier = ">=2" },
     { name = "pillow", specifier = ">=10" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8" },

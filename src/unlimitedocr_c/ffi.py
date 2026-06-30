@@ -12,7 +12,7 @@ from typing import Sequence
 import numpy as np
 from numpy.typing import NDArray
 
-from .frontend import GLOBAL_VIEW_SIZE, LOCAL_VIEW_SIZE, PreparedRequest, project_root
+from .frontend import GLOBAL_VIEW_SIZE, LOCAL_VIEW_SIZE, PreparedRequest, is_source_tree_package, project_root
 
 UOCR_OK = 0
 UOCR_ERROR_INVALID_ARGUMENT = -1
@@ -264,9 +264,10 @@ def candidate_library_paths() -> list[Path]:
     for build_dir in ("debug", "release", "relwithdebinfo", "cpu"):
         for name in _shared_library_names():
             candidates.append(root / "build" / build_dir / name)
-    package_lib = Path(__file__).resolve().parent / "lib"
-    for name in _shared_library_names():
-        candidates.append(package_lib / name)
+    if not is_source_tree_package():
+        package_lib = Path(__file__).resolve().parent / "lib"
+        for name in _shared_library_names():
+            candidates.append(package_lib / name)
     return candidates
 
 

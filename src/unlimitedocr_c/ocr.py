@@ -33,6 +33,7 @@ from .frontend import (
     load_tokenizer,
     prepare_image,
     prepare_pages,
+    is_source_tree_package,
     project_root,
 )
 
@@ -47,11 +48,33 @@ class GenerationResult:
 
 
 def default_resource_path(backend: str = "metal") -> str | None:
-    """Return the development resource path for backends that need one."""
+    """Return a Metal resource directory for packaged and development builds."""
 
-    if backend.lower() == "metal":
-        return str(project_root() / "src" / "backend" / "metal")
-    return None
+    if backend.lower() != "metal":
+        return None
+
+    env_resource_path = os.environ.get("UOCR_METAL_RESOURCE_PATH")
+    if env_resource_path:
+        return str(Path(env_resource_path).expanduser())
+
+    root = project_root()
+    source_metal_dir = root / "src" / "backend" / "metal"
+    candidates = [
+        root / "build" / "release",
+        root / "build" / "precompile",
+        root / "build" / "qa-precompiled",
+        root / "build" / "debug",
+        source_metal_dir,
+    ]
+    fallback = source_metal_dir
+    if not is_source_tree_package():
+        package_metal_dir = Path(__file__).resolve().parent / "metal"
+        candidates.insert(0, package_metal_dir)
+        fallback = package_metal_dir
+    for candidate in candidates:
+        if (candidate / "unlimitedocr.metallib").exists() or (candidate / "kernels" / "uocr_smoke.metal").exists():
+            return str(candidate)
+    return str(fallback)
 
 
 def decode_generated_ids(
