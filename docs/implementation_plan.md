@@ -27,10 +27,10 @@ Reference: `data.tmp/reference/Metal-Shading-Language-Specification.pdf`
 - Target dense dots, norm kernels, router/top-k, argmax, and attention fallback reductions.
 
 **Implementation:**
-- [ ] Add shared SIMD reduction helpers in the Metal source.
-- [ ] Convert dense/norm reductions first.
-- [ ] Convert router/top-k and argmax reductions.
-- [ ] Benchmark barrier count and runtime before/after.
+- [x] Add shared SIMD reduction helpers in the Metal source.
+- [x] Convert dense/norm reductions first.
+- [x] Convert router/top-k and argmax reductions.
+- [x] Benchmark barrier count and runtime before/after.
 
 ## 3. Prefer optimized MPS/MPP matmul for large fp16 GEMMs
 

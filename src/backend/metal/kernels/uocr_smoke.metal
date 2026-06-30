@@ -94,6 +94,104 @@ static inline float uocr_q4_k_load_value(device const uchar *table, uint row_siz
     return d * float(scale_min.x) * float(q) - dmin * float(scale_min.y);
 }
 
+static inline uint uocr_simd_lane_from_tid(uint tid, uint simd_width) {
+    return simd_width == 0u ? tid : tid - (tid / simd_width) * simd_width;
+}
+
+static inline uint uocr_simdgroup_from_tid(uint tid, uint simd_width) {
+    return simd_width == 0u ? 0u : tid / simd_width;
+}
+
+static inline uint uocr_simdgroups_for_threadgroup(uint ntg, uint simd_width) {
+    return simd_width == 0u ? 1u : (ntg + simd_width - 1u) / simd_width;
+}
+
+static inline float uocr_threadgroup_sum(float value,
+                                         threadgroup float *partials,
+                                         uint tid,
+                                         uint ntg,
+                                         uint simd_width) {
+    const uint lane = uocr_simd_lane_from_tid(tid, simd_width);
+    const uint simdgroup = uocr_simdgroup_from_tid(tid, simd_width);
+    const uint simdgroups = uocr_simdgroups_for_threadgroup(ntg, simd_width);
+    const float simd_total = simd_sum(value);
+    if (lane == 0u) {
+        partials[simdgroup] = simd_total;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint active = simdgroups;
+    while (active > 1u) {
+        const uint upper = (active + 1u) >> 1u;
+        if (tid < active - upper) {
+            partials[tid] += partials[tid + upper];
+        }
+        active = upper;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    return partials[0];
+}
+
+static inline float uocr_threadgroup_max(float value,
+                                         threadgroup float *partials,
+                                         uint tid,
+                                         uint ntg,
+                                         uint simd_width) {
+    const uint lane = uocr_simd_lane_from_tid(tid, simd_width);
+    const uint simdgroup = uocr_simdgroup_from_tid(tid, simd_width);
+    const uint simdgroups = uocr_simdgroups_for_threadgroup(ntg, simd_width);
+    const float simd_total = simd_max(value);
+    if (lane == 0u) {
+        partials[simdgroup] = simd_total;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint active = simdgroups;
+    while (active > 1u) {
+        const uint upper = (active + 1u) >> 1u;
+        if (tid < active - upper) {
+            partials[tid] = max(partials[tid], partials[tid + upper]);
+        }
+        active = upper;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    return partials[0];
+}
+
+static inline void uocr_threadgroup_sum2(float value0,
+                                         float value1,
+                                         threadgroup float *partials0,
+                                         threadgroup float *partials1,
+                                         uint tid,
+                                         uint ntg,
+                                         uint simd_width,
+                                         thread float &out0,
+                                         thread float &out1) {
+    const uint lane = uocr_simd_lane_from_tid(tid, simd_width);
+    const uint simdgroup = uocr_simdgroup_from_tid(tid, simd_width);
+    const uint simdgroups = uocr_simdgroups_for_threadgroup(ntg, simd_width);
+    const float simd_total0 = simd_sum(value0);
+    const float simd_total1 = simd_sum(value1);
+    if (lane == 0u) {
+        partials0[simdgroup] = simd_total0;
+        partials1[simdgroup] = simd_total1;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint active = simdgroups;
+    while (active > 1u) {
+        const uint upper = (active + 1u) >> 1u;
+        if (tid < active - upper) {
+            partials0[tid] += partials0[tid + upper];
+            partials1[tid] += partials1[tid + upper];
+        }
+        active = upper;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    out0 = partials0[0];
+    out1 = partials1[0];
+}
+
 kernel void uocr_get_rows_f16_to_f16(device const half *table [[buffer(0)]],
                                      device const int *row_ids [[buffer(1)]],
                                      device half *dst [[buffer(2)]],
@@ -358,7 +456,8 @@ kernel void uocr_sam_patch_embed_f16_input(device const half *pixels [[buffer(0)
                                            threadgroup float *partials [[threadgroup(0)]],
                                            uint3 block [[threadgroup_position_in_grid]],
                                            uint3 tid3 [[thread_position_in_threadgroup]],
-                                           uint3 ntg3 [[threads_per_threadgroup]]) {
+                                           uint3 ntg3 [[threads_per_threadgroup]],
+                                           uint simd_width [[threads_per_simdgroup]]) {
     const uint tid = tid3.x;
     const uint ntg = ntg3.x;
     const uint out_channel = block.x;
@@ -387,17 +486,9 @@ kernel void uocr_sam_patch_embed_f16_input(device const half *pixels [[buffer(0)
         const float w = float(weight[uocr_sam_patch_weight_index(out_channel, c, ky, kx)]);
         acc += x * w;
     }
-    partials[tid] = acc;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint stride = ntg >> 1; stride > 0u; stride >>= 1u) {
-        if (tid < stride) {
-            partials[tid] += partials[tid + stride];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
+    const float total = uocr_threadgroup_sum(acc, partials, tid, ntg, simd_width);
     if (tid == 0u) {
-        const float value = partials[0] + (params.has_bias != 0u ? float(bias[out_channel]) : 0.0f);
+        const float value = total + (params.has_bias != 0u ? float(bias[out_channel]) : 0.0f);
         dst_bhwc[(batch_index * patch_count + patch_index) * 768u + out_channel] = half(value);
     }
 }
@@ -410,7 +501,8 @@ kernel void uocr_sam_patch_embed_f32_input(device const float *pixels [[buffer(0
                                            threadgroup float *partials [[threadgroup(0)]],
                                            uint3 block [[threadgroup_position_in_grid]],
                                            uint3 tid3 [[thread_position_in_threadgroup]],
-                                           uint3 ntg3 [[threads_per_threadgroup]]) {
+                                           uint3 ntg3 [[threads_per_threadgroup]],
+                                           uint simd_width [[threads_per_simdgroup]]) {
     const uint tid = tid3.x;
     const uint ntg = ntg3.x;
     const uint out_channel = block.x;
@@ -439,17 +531,9 @@ kernel void uocr_sam_patch_embed_f32_input(device const float *pixels [[buffer(0
         const float w = float(weight[uocr_sam_patch_weight_index(out_channel, c, ky, kx)]);
         acc += x * w;
     }
-    partials[tid] = acc;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint stride = ntg >> 1; stride > 0u; stride >>= 1u) {
-        if (tid < stride) {
-            partials[tid] += partials[tid + stride];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
+    const float total = uocr_threadgroup_sum(acc, partials, tid, ntg, simd_width);
     if (tid == 0u) {
-        const float value = partials[0] + (params.has_bias != 0u ? float(bias[out_channel]) : 0.0f);
+        const float value = total + (params.has_bias != 0u ? float(bias[out_channel]) : 0.0f);
         dst_bhwc[(batch_index * patch_count + patch_index) * 768u + out_channel] = half(value);
     }
 }
@@ -550,7 +634,8 @@ kernel void uocr_rmsnorm_f16_to_f16(device const half *src [[buffer(0)]],
                                     threadgroup float *partials [[threadgroup(0)]],
                                     uint row [[threadgroup_position_in_grid]],
                                     uint tid [[thread_index_in_threadgroup]],
-                                    uint ntg [[threads_per_threadgroup]]) {
+                                    uint ntg [[threads_per_threadgroup]],
+                                    uint simd_width [[threads_per_simdgroup]]) {
     if (row >= params.n_rows) {
         return;
     }
@@ -561,17 +646,8 @@ kernel void uocr_rmsnorm_f16_to_f16(device const half *src [[buffer(0)]],
         const float x = float(src[row_base + col]);
         sum += x * x;
     }
-    partials[tid] = sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint stride = ntg >> 1; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            partials[tid] += partials[tid + stride];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    const float scale = 1.0f / sqrt(partials[0] / float(params.hidden_size) + params.eps);
+    const float total = uocr_threadgroup_sum(sum, partials, tid, ntg, simd_width);
+    const float scale = 1.0f / sqrt(total / float(params.hidden_size) + params.eps);
     for (uint col = tid; col < params.hidden_size; col += ntg) {
         const float x = float(src[row_base + col]);
         const float w = float(weight[col]);
@@ -586,7 +662,8 @@ kernel void uocr_rmsnorm_f16_to_f32(device const half *src [[buffer(0)]],
                                     threadgroup float *partials [[threadgroup(0)]],
                                     uint row [[threadgroup_position_in_grid]],
                                     uint tid [[thread_index_in_threadgroup]],
-                                    uint ntg [[threads_per_threadgroup]]) {
+                                    uint ntg [[threads_per_threadgroup]],
+                                    uint simd_width [[threads_per_simdgroup]]) {
     if (row >= params.n_rows) {
         return;
     }
@@ -597,17 +674,8 @@ kernel void uocr_rmsnorm_f16_to_f32(device const half *src [[buffer(0)]],
         const float x = float(src[row_base + col]);
         sum += x * x;
     }
-    partials[tid] = sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint stride = ntg >> 1; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            partials[tid] += partials[tid + stride];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    const float scale = 1.0f / sqrt(partials[0] / float(params.hidden_size) + params.eps);
+    const float total = uocr_threadgroup_sum(sum, partials, tid, ntg, simd_width);
+    const float scale = 1.0f / sqrt(total / float(params.hidden_size) + params.eps);
     for (uint col = tid; col < params.hidden_size; col += ntg) {
         const float x = float(src[row_base + col]);
         const float w = float(weight[col]);
@@ -620,20 +688,13 @@ static inline float uocr_layernorm_reduce_sum(device const half *src,
                                               uint row_base,
                                               uint tid,
                                               uint ntg,
+                                              uint simd_width,
                                               threadgroup float *partials) {
     float sum = 0.0f;
     for (uint col = tid; col < params.hidden_size; col += ntg) {
         sum += float(src[row_base + col]);
     }
-    partials[tid] = sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint stride = ntg >> 1; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            partials[tid] += partials[tid + stride];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    return partials[0];
+    return uocr_threadgroup_sum(sum, partials, tid, ntg, simd_width);
 }
 
 static inline float uocr_layernorm_reduce_var(device const half *src,
@@ -642,21 +703,14 @@ static inline float uocr_layernorm_reduce_var(device const half *src,
                                               float mean,
                                               uint tid,
                                               uint ntg,
+                                              uint simd_width,
                                               threadgroup float *partials) {
     float sum = 0.0f;
     for (uint col = tid; col < params.hidden_size; col += ntg) {
         const float centered = float(src[row_base + col]) - mean;
         sum += centered * centered;
     }
-    partials[tid] = sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint stride = ntg >> 1; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            partials[tid] += partials[tid + stride];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    return partials[0] / float(params.hidden_size);
+    return uocr_threadgroup_sum(sum, partials, tid, ntg, simd_width) / float(params.hidden_size);
 }
 
 kernel void uocr_layernorm_f16_to_f16(device const half *src [[buffer(0)]],
@@ -667,14 +721,15 @@ kernel void uocr_layernorm_f16_to_f16(device const half *src [[buffer(0)]],
                                       threadgroup float *partials [[threadgroup(0)]],
                                       uint row [[threadgroup_position_in_grid]],
                                       uint tid [[thread_index_in_threadgroup]],
-                                      uint ntg [[threads_per_threadgroup]]) {
+                                      uint ntg [[threads_per_threadgroup]],
+                                      uint simd_width [[threads_per_simdgroup]]) {
     if (row >= params.n_rows) {
         return;
     }
 
     const uint row_base = row * params.hidden_size;
-    const float mean = uocr_layernorm_reduce_sum(src, params, row_base, tid, ntg, partials) / float(params.hidden_size);
-    const float variance = uocr_layernorm_reduce_var(src, params, row_base, mean, tid, ntg, partials);
+    const float mean = uocr_layernorm_reduce_sum(src, params, row_base, tid, ntg, simd_width, partials) / float(params.hidden_size);
+    const float variance = uocr_layernorm_reduce_var(src, params, row_base, mean, tid, ntg, simd_width, partials);
     const float scale = 1.0f / sqrt(variance + params.eps);
     for (uint col = tid; col < params.hidden_size; col += ntg) {
         const float normalized = (float(src[row_base + col]) - mean) * scale;
@@ -690,14 +745,15 @@ kernel void uocr_layernorm_f16_to_f32(device const half *src [[buffer(0)]],
                                       threadgroup float *partials [[threadgroup(0)]],
                                       uint row [[threadgroup_position_in_grid]],
                                       uint tid [[thread_index_in_threadgroup]],
-                                      uint ntg [[threads_per_threadgroup]]) {
+                                      uint ntg [[threads_per_threadgroup]],
+                                      uint simd_width [[threads_per_simdgroup]]) {
     if (row >= params.n_rows) {
         return;
     }
 
     const uint row_base = row * params.hidden_size;
-    const float mean = uocr_layernorm_reduce_sum(src, params, row_base, tid, ntg, partials) / float(params.hidden_size);
-    const float variance = uocr_layernorm_reduce_var(src, params, row_base, mean, tid, ntg, partials);
+    const float mean = uocr_layernorm_reduce_sum(src, params, row_base, tid, ntg, simd_width, partials) / float(params.hidden_size);
+    const float variance = uocr_layernorm_reduce_var(src, params, row_base, mean, tid, ntg, simd_width, partials);
     const float scale = 1.0f / sqrt(variance + params.eps);
     for (uint col = tid; col < params.hidden_size; col += ntg) {
         const float normalized = (float(src[row_base + col]) - mean) * scale;
@@ -741,6 +797,7 @@ static inline float uocr_dense_dot_f16(device const half *src,
                                        uint out_col,
                                        uint tid,
                                        uint ntg,
+                                       uint simd_width,
                                        threadgroup float *partials) {
     float sum = 0.0f;
     const uint src_base = row * params.in_features;
@@ -748,16 +805,7 @@ static inline float uocr_dense_dot_f16(device const half *src,
     for (uint k = tid; k < params.in_features; k += ntg) {
         sum += float(src[src_base + k]) * float(weight[weight_base + k]);
     }
-    partials[tid] = sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint stride = ntg >> 1; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            partials[tid] += partials[tid + stride];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    return partials[0];
+    return uocr_threadgroup_sum(sum, partials, tid, ntg, simd_width);
 }
 
 kernel void uocr_dense_f16_to_f16(device const half *src [[buffer(0)]],
@@ -768,14 +816,15 @@ kernel void uocr_dense_f16_to_f16(device const half *src [[buffer(0)]],
                                   threadgroup float *partials [[threadgroup(0)]],
                                   uint output_index [[threadgroup_position_in_grid]],
                                   uint tid [[thread_index_in_threadgroup]],
-                                  uint ntg [[threads_per_threadgroup]]) {
+                                  uint ntg [[threads_per_threadgroup]],
+                                  uint simd_width [[threads_per_simdgroup]]) {
     const uint row = output_index / params.out_features;
     const uint out_col = output_index - row * params.out_features;
     if (row >= params.input_rows || out_col >= params.out_features) {
         return;
     }
 
-    float value = uocr_dense_dot_f16(src, weight, params, row, out_col, tid, ntg, partials);
+    float value = uocr_dense_dot_f16(src, weight, params, row, out_col, tid, ntg, simd_width, partials);
     if (tid == 0) {
         if (params.has_bias != 0u) {
             value += float(bias[out_col]);
@@ -792,14 +841,15 @@ kernel void uocr_dense_f16_to_f32(device const half *src [[buffer(0)]],
                                   threadgroup float *partials [[threadgroup(0)]],
                                   uint output_index [[threadgroup_position_in_grid]],
                                   uint tid [[thread_index_in_threadgroup]],
-                                  uint ntg [[threads_per_threadgroup]]) {
+                                  uint ntg [[threads_per_threadgroup]],
+                                  uint simd_width [[threads_per_simdgroup]]) {
     const uint row = output_index / params.out_features;
     const uint out_col = output_index - row * params.out_features;
     if (row >= params.input_rows || out_col >= params.out_features) {
         return;
     }
 
-    float value = uocr_dense_dot_f16(src, weight, params, row, out_col, tid, ntg, partials);
+    float value = uocr_dense_dot_f16(src, weight, params, row, out_col, tid, ntg, simd_width, partials);
     if (tid == 0) {
         if (params.has_bias != 0u) {
             value += float(bias[out_col]);
@@ -834,22 +884,14 @@ static inline float uocr_dense_dot_q8_0(device const half *src,
                                         uint out_col,
                                         uint tid,
                                         uint ntg,
+                                        uint simd_width,
                                         threadgroup float *partials) {
     float sum = 0.0f;
     const uint src_base = row * params.logical_in_features;
     for (uint k = tid; k < params.logical_in_features; k += ntg) {
         sum += float(src[src_base + k]) * uocr_q8_0_load_value(weight, params.weight_row_size, out_col, k);
     }
-    partials[tid] = sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint stride = ntg >> 1; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            partials[tid] += partials[tid + stride];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    return partials[0];
+    return uocr_threadgroup_sum(sum, partials, tid, ntg, simd_width);
 }
 
 kernel void uocr_dense_q8_0_to_f16(device const half *src [[buffer(0)]],
@@ -860,14 +902,15 @@ kernel void uocr_dense_q8_0_to_f16(device const half *src [[buffer(0)]],
                                    threadgroup float *partials [[threadgroup(0)]],
                                    uint output_index [[threadgroup_position_in_grid]],
                                    uint tid [[thread_index_in_threadgroup]],
-                                   uint ntg [[threads_per_threadgroup]]) {
+                                   uint ntg [[threads_per_threadgroup]],
+                                   uint simd_width [[threads_per_simdgroup]]) {
     const uint row = output_index / params.out_features;
     const uint out_col = output_index - row * params.out_features;
     if (row >= params.input_rows || out_col >= params.out_features) {
         return;
     }
 
-    float value = uocr_dense_dot_q8_0(src, weight, params, row, out_col, tid, ntg, partials);
+    float value = uocr_dense_dot_q8_0(src, weight, params, row, out_col, tid, ntg, simd_width, partials);
     if (tid == 0) {
         if (params.has_bias != 0u) {
             value += float(bias[out_col]);
@@ -884,14 +927,15 @@ kernel void uocr_dense_q8_0_to_f32(device const half *src [[buffer(0)]],
                                    threadgroup float *partials [[threadgroup(0)]],
                                    uint output_index [[threadgroup_position_in_grid]],
                                    uint tid [[thread_index_in_threadgroup]],
-                                   uint ntg [[threads_per_threadgroup]]) {
+                                   uint ntg [[threads_per_threadgroup]],
+                                   uint simd_width [[threads_per_simdgroup]]) {
     const uint row = output_index / params.out_features;
     const uint out_col = output_index - row * params.out_features;
     if (row >= params.input_rows || out_col >= params.out_features) {
         return;
     }
 
-    float value = uocr_dense_dot_q8_0(src, weight, params, row, out_col, tid, ntg, partials);
+    float value = uocr_dense_dot_q8_0(src, weight, params, row, out_col, tid, ntg, simd_width, partials);
     if (tid == 0) {
         if (params.has_bias != 0u) {
             value += float(bias[out_col]);
@@ -907,22 +951,14 @@ static inline float uocr_dense_dot_q4_k(device const half *src,
                                         uint out_col,
                                         uint tid,
                                         uint ntg,
+                                        uint simd_width,
                                         threadgroup float *partials) {
     float sum = 0.0f;
     const uint src_base = row * params.logical_in_features;
     for (uint k = tid; k < params.logical_in_features; k += ntg) {
         sum += float(src[src_base + k]) * uocr_q4_k_load_value(weight, params.weight_row_size, out_col, k);
     }
-    partials[tid] = sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint stride = ntg >> 1; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            partials[tid] += partials[tid + stride];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    return partials[0];
+    return uocr_threadgroup_sum(sum, partials, tid, ntg, simd_width);
 }
 
 kernel void uocr_dense_q4_k_to_f16(device const half *src [[buffer(0)]],
@@ -933,14 +969,15 @@ kernel void uocr_dense_q4_k_to_f16(device const half *src [[buffer(0)]],
                                    threadgroup float *partials [[threadgroup(0)]],
                                    uint output_index [[threadgroup_position_in_grid]],
                                    uint tid [[thread_index_in_threadgroup]],
-                                   uint ntg [[threads_per_threadgroup]]) {
+                                   uint ntg [[threads_per_threadgroup]],
+                                   uint simd_width [[threads_per_simdgroup]]) {
     const uint row = output_index / params.out_features;
     const uint out_col = output_index - row * params.out_features;
     if (row >= params.input_rows || out_col >= params.out_features) {
         return;
     }
 
-    float value = uocr_dense_dot_q4_k(src, weight, params, row, out_col, tid, ntg, partials);
+    float value = uocr_dense_dot_q4_k(src, weight, params, row, out_col, tid, ntg, simd_width, partials);
     if (tid == 0) {
         if (params.has_bias != 0u) {
             value += float(bias[out_col]);
@@ -957,14 +994,15 @@ kernel void uocr_dense_q4_k_to_f32(device const half *src [[buffer(0)]],
                                    threadgroup float *partials [[threadgroup(0)]],
                                    uint output_index [[threadgroup_position_in_grid]],
                                    uint tid [[thread_index_in_threadgroup]],
-                                   uint ntg [[threads_per_threadgroup]]) {
+                                   uint ntg [[threads_per_threadgroup]],
+                                   uint simd_width [[threads_per_simdgroup]]) {
     const uint row = output_index / params.out_features;
     const uint out_col = output_index - row * params.out_features;
     if (row >= params.input_rows || out_col >= params.out_features) {
         return;
     }
 
-    float value = uocr_dense_dot_q4_k(src, weight, params, row, out_col, tid, ntg, partials);
+    float value = uocr_dense_dot_q4_k(src, weight, params, row, out_col, tid, ntg, simd_width, partials);
     if (tid == 0) {
         if (params.has_bias != 0u) {
             value += float(bias[out_col]);
@@ -983,7 +1021,8 @@ kernel void uocr_sam_qkv_f16_to_f16(device const half *src [[buffer(0)]],
                                     threadgroup float *partials [[threadgroup(0)]],
                                     uint output_index [[threadgroup_position_in_grid]],
                                     uint tid [[thread_index_in_threadgroup]],
-                                    uint ntg [[threads_per_threadgroup]]) {
+                                    uint ntg [[threads_per_threadgroup]],
+                                    uint simd_width [[threads_per_simdgroup]]) {
     const uint values_per_projection = params.input_rows * params.out_features;
     const uint projection = output_index / values_per_projection;
     const uint element = output_index - projection * values_per_projection;
@@ -994,7 +1033,7 @@ kernel void uocr_sam_qkv_f16_to_f16(device const half *src [[buffer(0)]],
     }
 
     const uint packed_col = projection * params.out_features + out_col;
-    float value = uocr_dense_dot_f16(src, weight, params, row, packed_col, tid, ntg, partials);
+    float value = uocr_dense_dot_f16(src, weight, params, row, packed_col, tid, ntg, simd_width, partials);
     if (tid == 0) {
         value += float(bias[packed_col]);
         device half *dst = projection == 0u ? q_dst : (projection == 1u ? k_dst : v_dst);
@@ -1012,7 +1051,8 @@ kernel void uocr_sam_qkv_f16_to_f32(device const half *src [[buffer(0)]],
                                     threadgroup float *partials [[threadgroup(0)]],
                                     uint output_index [[threadgroup_position_in_grid]],
                                     uint tid [[thread_index_in_threadgroup]],
-                                    uint ntg [[threads_per_threadgroup]]) {
+                                    uint ntg [[threads_per_threadgroup]],
+                                    uint simd_width [[threads_per_simdgroup]]) {
     const uint values_per_projection = params.input_rows * params.out_features;
     const uint projection = output_index / values_per_projection;
     const uint element = output_index - projection * values_per_projection;
@@ -1023,7 +1063,7 @@ kernel void uocr_sam_qkv_f16_to_f32(device const half *src [[buffer(0)]],
     }
 
     const uint packed_col = projection * params.out_features + out_col;
-    float value = uocr_dense_dot_f16(src, weight, params, row, packed_col, tid, ntg, partials);
+    float value = uocr_dense_dot_f16(src, weight, params, row, packed_col, tid, ntg, simd_width, partials);
     if (tid == 0) {
         value += float(bias[packed_col]);
         device float *dst = projection == 0u ? q_dst : (projection == 1u ? k_dst : v_dst);
@@ -1041,7 +1081,8 @@ kernel void uocr_clip_qkv_f16_to_f16(device const half *src [[buffer(0)]],
                                      threadgroup float *partials [[threadgroup(0)]],
                                      uint output_index [[threadgroup_position_in_grid]],
                                      uint tid [[thread_index_in_threadgroup]],
-                                     uint ntg [[threads_per_threadgroup]]) {
+                                     uint ntg [[threads_per_threadgroup]],
+                                     uint simd_width [[threads_per_simdgroup]]) {
     const uint values_per_projection = params.input_rows * params.out_features;
     const uint projection = output_index / values_per_projection;
     const uint element = output_index - projection * values_per_projection;
@@ -1052,7 +1093,7 @@ kernel void uocr_clip_qkv_f16_to_f16(device const half *src [[buffer(0)]],
     }
 
     const uint packed_col = projection * params.out_features + out_col;
-    float value = uocr_dense_dot_f16(src, weight, params, row, packed_col, tid, ntg, partials);
+    float value = uocr_dense_dot_f16(src, weight, params, row, packed_col, tid, ntg, simd_width, partials);
     if (tid == 0) {
         value += float(bias[packed_col]);
         device half *dst = projection == 0u ? q_dst : (projection == 1u ? k_dst : v_dst);
@@ -1070,7 +1111,8 @@ kernel void uocr_clip_qkv_f16_to_f32(device const half *src [[buffer(0)]],
                                      threadgroup float *partials [[threadgroup(0)]],
                                      uint output_index [[threadgroup_position_in_grid]],
                                      uint tid [[thread_index_in_threadgroup]],
-                                     uint ntg [[threads_per_threadgroup]]) {
+                                     uint ntg [[threads_per_threadgroup]],
+                                     uint simd_width [[threads_per_simdgroup]]) {
     const uint values_per_projection = params.input_rows * params.out_features;
     const uint projection = output_index / values_per_projection;
     const uint element = output_index - projection * values_per_projection;
@@ -1081,7 +1123,7 @@ kernel void uocr_clip_qkv_f16_to_f32(device const half *src [[buffer(0)]],
     }
 
     const uint packed_col = projection * params.out_features + out_col;
-    float value = uocr_dense_dot_f16(src, weight, params, row, packed_col, tid, ntg, partials);
+    float value = uocr_dense_dot_f16(src, weight, params, row, packed_col, tid, ntg, simd_width, partials);
     if (tid == 0) {
         value += float(bias[packed_col]);
         device float *dst = projection == 0u ? q_dst : (projection == 1u ? k_dst : v_dst);
@@ -1757,27 +1799,28 @@ static inline float uocr_sam_layernorm2d_value(device const half *src_nchw,
                                                uint batch,
                                                threadgroup float *partials,
                                                uint tid,
-                                               uint ntg) {
+                                               uint ntg,
+                                               uint simd_width) {
     const uint spatial_size = params.grid_width * params.grid_height;
     float value = 0.0f;
     if (tid < params.channels) {
         value = float(src_nchw[(ulong(batch) * ulong(params.channels) + ulong(tid)) * ulong(spatial_size) + ulong(spatial)]);
     }
-    partials[tid] = tid < params.channels ? value : 0.0f;
-    partials[ntg + tid] = tid < params.channels ? value * value : 0.0f;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint stride = ntg >> 1; stride > 0u; stride >>= 1u) {
-        if (tid < stride) {
-            partials[tid] += partials[tid + stride];
-            partials[ntg + tid] += partials[ntg + tid + stride];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
+    float value_sum = 0.0f;
+    float square_sum = 0.0f;
+    uocr_threadgroup_sum2(tid < params.channels ? value : 0.0f,
+                          tid < params.channels ? value * value : 0.0f,
+                          partials,
+                          partials + ntg,
+                          tid,
+                          ntg,
+                          simd_width,
+                          value_sum,
+                          square_sum);
 
     const float inv_channels = 1.0f / float(params.channels);
-    const float mean = partials[0] * inv_channels;
-    const float variance = max(partials[ntg] * inv_channels - mean * mean, 0.0f);
+    const float mean = value_sum * inv_channels;
+    const float variance = max(square_sum * inv_channels - mean * mean, 0.0f);
     return (value - mean) * rsqrt(variance + params.eps) * float(weight[channel]) + float(bias[channel]);
 }
 
@@ -1789,7 +1832,8 @@ kernel void uocr_sam_layernorm2d_f16_to_f16(device const half *src_nchw [[buffer
                                             threadgroup float *partials [[threadgroup(0)]],
                                             uint3 block [[threadgroup_position_in_grid]],
                                             uint tid [[thread_index_in_threadgroup]],
-                                            uint3 ntg3 [[threads_per_threadgroup]]) {
+                                            uint3 ntg3 [[threads_per_threadgroup]],
+                                            uint simd_width [[threads_per_simdgroup]]) {
     const uint ntg = ntg3.x;
     const uint spatial_size = params.grid_width * params.grid_height;
     const uint spatial = block.x;
@@ -1797,7 +1841,7 @@ kernel void uocr_sam_layernorm2d_f16_to_f16(device const half *src_nchw [[buffer
     if (spatial >= spatial_size || tid >= params.channels || batch >= params.batch_size) {
         return;
     }
-    const float value = uocr_sam_layernorm2d_value(src_nchw, weight, bias, params, spatial, tid, batch, partials, tid, ntg);
+    const float value = uocr_sam_layernorm2d_value(src_nchw, weight, bias, params, spatial, tid, batch, partials, tid, ntg, simd_width);
     dst_nchw[(ulong(batch) * ulong(params.channels) + ulong(tid)) * ulong(spatial_size) + ulong(spatial)] = half(value);
 }
 
@@ -1809,7 +1853,8 @@ kernel void uocr_sam_layernorm2d_f16_to_f32(device const half *src_nchw [[buffer
                                             threadgroup float *partials [[threadgroup(0)]],
                                             uint3 block [[threadgroup_position_in_grid]],
                                             uint tid [[thread_index_in_threadgroup]],
-                                            uint3 ntg3 [[threads_per_threadgroup]]) {
+                                            uint3 ntg3 [[threads_per_threadgroup]],
+                                            uint simd_width [[threads_per_simdgroup]]) {
     const uint ntg = ntg3.x;
     const uint spatial_size = params.grid_width * params.grid_height;
     const uint spatial = block.x;
@@ -1817,7 +1862,7 @@ kernel void uocr_sam_layernorm2d_f16_to_f32(device const half *src_nchw [[buffer
     if (spatial >= spatial_size || tid >= params.channels || batch >= params.batch_size) {
         return;
     }
-    const float value = uocr_sam_layernorm2d_value(src_nchw, weight, bias, params, spatial, tid, batch, partials, tid, ntg);
+    const float value = uocr_sam_layernorm2d_value(src_nchw, weight, bias, params, spatial, tid, batch, partials, tid, ntg, simd_width);
     dst_nchw[(ulong(batch) * ulong(params.channels) + ulong(tid)) * ulong(spatial_size) + ulong(spatial)] = value;
 }
 
@@ -1859,6 +1904,7 @@ static inline float uocr_sam_attention_project_dot_f16(device const half *src,
                                                        uint out_col,
                                                        uint tid,
                                                        uint ntg,
+                                              uint simd_width,
                                                        threadgroup float *partials) {
     float sum = 0.0f;
     const uint src_base = row * params.hidden_size;
@@ -1866,16 +1912,7 @@ static inline float uocr_sam_attention_project_dot_f16(device const half *src,
     for (uint k = tid; k < params.hidden_size; k += ntg) {
         sum += float(src[src_base + k]) * float(weight[weight_base + k]);
     }
-    partials[tid] = sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint stride = ntg >> 1; stride > 0u; stride >>= 1u) {
-        if (tid < stride) {
-            partials[tid] += partials[tid + stride];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    return partials[0];
+    return uocr_threadgroup_sum(sum, partials, tid, ntg, simd_width);
 }
 
 kernel void uocr_sam_attention_project_residual_f16_to_f16(device const half *src [[buffer(0)]],
@@ -1887,14 +1924,15 @@ kernel void uocr_sam_attention_project_residual_f16_to_f16(device const half *sr
                                                            threadgroup float *partials [[threadgroup(0)]],
                                                            uint output_index [[threadgroup_position_in_grid]],
                                                            uint tid [[thread_index_in_threadgroup]],
-                                                           uint ntg [[threads_per_threadgroup]]) {
+                                                           uint ntg [[threads_per_threadgroup]],
+                                                           uint simd_width [[threads_per_simdgroup]]) {
     const uint row = output_index / params.hidden_size;
     const uint out_col = output_index - row * params.hidden_size;
     if (row >= params.n_rows || out_col >= params.hidden_size) {
         return;
     }
 
-    float value = uocr_sam_attention_project_dot_f16(src, weight, params, row, out_col, tid, ntg, partials);
+    float value = uocr_sam_attention_project_dot_f16(src, weight, params, row, out_col, tid, ntg, simd_width, partials);
     if (tid == 0u) {
         const uint dst_index = row * params.hidden_size + out_col;
         dst[dst_index] = half(value + float(bias[out_col]) + float(residual[dst_index]));
@@ -1910,14 +1948,15 @@ kernel void uocr_sam_attention_project_residual_f16_to_f32(device const half *sr
                                                            threadgroup float *partials [[threadgroup(0)]],
                                                            uint output_index [[threadgroup_position_in_grid]],
                                                            uint tid [[thread_index_in_threadgroup]],
-                                                           uint ntg [[threads_per_threadgroup]]) {
+                                                           uint ntg [[threads_per_threadgroup]],
+                                                           uint simd_width [[threads_per_simdgroup]]) {
     const uint row = output_index / params.hidden_size;
     const uint out_col = output_index - row * params.hidden_size;
     if (row >= params.n_rows || out_col >= params.hidden_size) {
         return;
     }
 
-    float value = uocr_sam_attention_project_dot_f16(src, weight, params, row, out_col, tid, ntg, partials);
+    float value = uocr_sam_attention_project_dot_f16(src, weight, params, row, out_col, tid, ntg, simd_width, partials);
     if (tid == 0u) {
         const uint dst_index = row * params.hidden_size + out_col;
         dst[dst_index] = value + float(bias[out_col]) + float(residual[dst_index]);
@@ -1966,7 +2005,8 @@ kernel void uocr_sam_mlp_lin1_gelu_f16(device const half *src [[buffer(0)]],
                                        threadgroup float *partials [[threadgroup(0)]],
                                        uint output_index [[threadgroup_position_in_grid]],
                                        uint tid [[thread_index_in_threadgroup]],
-                                       uint ntg [[threads_per_threadgroup]]) {
+                                       uint ntg [[threads_per_threadgroup]],
+                                       uint simd_width [[threads_per_simdgroup]]) {
     const uint row = output_index / params.intermediate_size;
     const uint out_col = output_index - row * params.intermediate_size;
     if (row >= params.n_rows || out_col >= params.intermediate_size) {
@@ -1979,18 +2019,10 @@ kernel void uocr_sam_mlp_lin1_gelu_f16(device const half *src [[buffer(0)]],
     for (uint k = tid; k < params.hidden_size; k += ntg) {
         sum += float(src[src_base + k]) * float(weight[weight_base + k]);
     }
-    partials[tid] = sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint stride = ntg >> 1; stride > 0u; stride >>= 1u) {
-        if (tid < stride) {
-            partials[tid] += partials[tid + stride];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
+    const float total = uocr_threadgroup_sum(sum, partials, tid, ntg, simd_width);
 
     if (tid == 0u) {
-        const float projected = partials[0] + float(bias[out_col]);
+        const float projected = total + float(bias[out_col]);
         mid[row * params.intermediate_size + out_col] = half(uocr_gelu_erf(projected));
     }
 }
@@ -2002,6 +2034,7 @@ static inline float uocr_sam_mlp_lin2_dot_f16(device const half *mid,
                                               uint out_col,
                                               uint tid,
                                               uint ntg,
+                                              uint simd_width,
                                               threadgroup float *partials) {
     float sum = 0.0f;
     const uint mid_base = row * params.intermediate_size;
@@ -2009,16 +2042,7 @@ static inline float uocr_sam_mlp_lin2_dot_f16(device const half *mid,
     for (uint k = tid; k < params.intermediate_size; k += ntg) {
         sum += float(mid[mid_base + k]) * float(weight[weight_base + k]);
     }
-    partials[tid] = sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint stride = ntg >> 1; stride > 0u; stride >>= 1u) {
-        if (tid < stride) {
-            partials[tid] += partials[tid + stride];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    return partials[0];
+    return uocr_threadgroup_sum(sum, partials, tid, ntg, simd_width);
 }
 
 kernel void uocr_sam_mlp_lin2_f16_to_f16(device const half *mid [[buffer(0)]],
@@ -2029,14 +2053,15 @@ kernel void uocr_sam_mlp_lin2_f16_to_f16(device const half *mid [[buffer(0)]],
                                          threadgroup float *partials [[threadgroup(0)]],
                                          uint output_index [[threadgroup_position_in_grid]],
                                          uint tid [[thread_index_in_threadgroup]],
-                                         uint ntg [[threads_per_threadgroup]]) {
+                                         uint ntg [[threads_per_threadgroup]],
+                                         uint simd_width [[threads_per_simdgroup]]) {
     const uint row = output_index / params.hidden_size;
     const uint out_col = output_index - row * params.hidden_size;
     if (row >= params.n_rows || out_col >= params.hidden_size) {
         return;
     }
 
-    float value = uocr_sam_mlp_lin2_dot_f16(mid, weight, params, row, out_col, tid, ntg, partials);
+    float value = uocr_sam_mlp_lin2_dot_f16(mid, weight, params, row, out_col, tid, ntg, simd_width, partials);
     if (tid == 0u) {
         dst[row * params.hidden_size + out_col] = half(value + float(bias[out_col]));
     }
@@ -2050,14 +2075,15 @@ kernel void uocr_sam_mlp_lin2_f16_to_f32(device const half *mid [[buffer(0)]],
                                          threadgroup float *partials [[threadgroup(0)]],
                                          uint output_index [[threadgroup_position_in_grid]],
                                          uint tid [[thread_index_in_threadgroup]],
-                                         uint ntg [[threads_per_threadgroup]]) {
+                                         uint ntg [[threads_per_threadgroup]],
+                                         uint simd_width [[threads_per_simdgroup]]) {
     const uint row = output_index / params.hidden_size;
     const uint out_col = output_index - row * params.hidden_size;
     if (row >= params.n_rows || out_col >= params.hidden_size) {
         return;
     }
 
-    float value = uocr_sam_mlp_lin2_dot_f16(mid, weight, params, row, out_col, tid, ntg, partials);
+    float value = uocr_sam_mlp_lin2_dot_f16(mid, weight, params, row, out_col, tid, ntg, simd_width, partials);
     if (tid == 0u) {
         dst[row * params.hidden_size + out_col] = value + float(bias[out_col]);
     }
@@ -2177,6 +2203,51 @@ static inline bool uocr_argmax_pair_better(float score, uint id, float best_scor
     return uocr_argmax_better(score, id, best_score, best_id);
 }
 
+static inline void uocr_threadgroup_argmax_pair(thread float &best_score,
+                                                thread uint &best_id,
+                                                threadgroup float *scores,
+                                                threadgroup uint *ids,
+                                                uint tid,
+                                                uint ntg,
+                                                uint simd_width) {
+    const uint lane = uocr_simd_lane_from_tid(tid, simd_width);
+    const uint simdgroup = uocr_simdgroup_from_tid(tid, simd_width);
+    const uint simdgroups = uocr_simdgroups_for_threadgroup(ntg, simd_width);
+
+    for (uint offset = simd_width >> 1u; offset > 0u; offset >>= 1u) {
+        const float other_score = simd_shuffle_down(best_score, ushort(offset));
+        const uint other_id = simd_shuffle_down(best_id, ushort(offset));
+        if (lane + offset < simd_width && uocr_argmax_pair_better(other_score, other_id, best_score, best_id)) {
+            best_score = other_score;
+            best_id = other_id;
+        }
+    }
+
+    if (lane == 0u) {
+        scores[simdgroup] = best_score;
+        ids[simdgroup] = best_id;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint active = simdgroups;
+    while (active > 1u) {
+        const uint upper = (active + 1u) >> 1u;
+        if (tid < active - upper) {
+            const float score = scores[tid + upper];
+            const uint id = ids[tid + upper];
+            if (uocr_argmax_pair_better(score, id, scores[tid], ids[tid])) {
+                scores[tid] = score;
+                ids[tid] = id;
+            }
+        }
+        active = upper;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    best_score = scores[0];
+    best_id = ids[0];
+}
+
 kernel void uocr_no_repeat_collect_banned_i32(device const int *sequence [[buffer(0)]],
                                              device uchar *ban_flags [[buffer(1)]],
                                              constant UocrNoRepeatCollectParams &params [[buffer(2)]],
@@ -2227,7 +2298,8 @@ kernel void uocr_lm_head_argmax_f16(device const half *hidden [[buffer(0)]],
                                     threadgroup half *hidden_tg [[threadgroup(2)]],
                                     uint tile [[threadgroup_position_in_grid]],
                                     uint tid [[thread_index_in_threadgroup]],
-                                    uint ntg [[threads_per_threadgroup]]) {
+                                    uint ntg [[threads_per_threadgroup]],
+                                    uint simd_width [[threads_per_simdgroup]]) {
     for (uint k = tid; k < params.hidden_size; k += ntg) {
         hidden_tg[k] = hidden[k];
     }
@@ -2245,18 +2317,15 @@ kernel void uocr_lm_head_argmax_f16(device const half *hidden [[buffer(0)]],
             sum += float(hidden_tg[k]) * float(weight[weight_base + ulong(k)]);
         }
     }
-    partials[tid] = sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint stride = lanes >> 1; stride > 0u; stride >>= 1) {
+    for (uint stride = lanes >> 1u; stride > 0u; stride >>= 1u) {
+        const float other = simd_shuffle_down(sum, ushort(stride));
         if (local_token < params.tile_tokens && lane < stride) {
-            partials[tid] += partials[tid + stride];
+            sum += other;
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
     if (local_token < params.tile_tokens && lane == 0u) {
-        float score = partials[tid];
+        float score = sum;
         uint id = token_id;
         if (token_id >= params.vocab_size) {
             id = 0xffffffffu;
@@ -2272,21 +2341,13 @@ kernel void uocr_lm_head_argmax_f16(device const half *hidden [[buffer(0)]],
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    for (uint stride = params.tile_tokens >> 1; stride > 0u; stride >>= 1) {
-        if (tid < stride) {
-            const float score = partials[tid + stride];
-            const uint id = partial_ids[tid + stride];
-            if (uocr_argmax_pair_better(score, id, partials[tid], partial_ids[tid])) {
-                partials[tid] = score;
-                partial_ids[tid] = id;
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
+    float best_score = tid < params.tile_tokens ? partials[tid] : -INFINITY;
+    uint best_id = tid < params.tile_tokens ? partial_ids[tid] : 0xffffffffu;
+    uocr_threadgroup_argmax_pair(best_score, best_id, partials, partial_ids, tid, ntg, simd_width);
 
     if (tid == 0u && tile < params.partial_count) {
-        partial_scores_out[tile] = partial_ids[0] == 0xffffffffu ? -INFINITY : partials[0];
-        partial_ids_out[tile] = partial_ids[0];
+        partial_scores_out[tile] = best_id == 0xffffffffu ? -INFINITY : best_score;
+        partial_ids_out[tile] = best_id;
     }
 }
 
@@ -2298,7 +2359,8 @@ kernel void uocr_argmax_pairs_f32(device const float *partial_scores [[buffer(0)
                                   threadgroup float *scores [[threadgroup(0)]],
                                   threadgroup uint *ids [[threadgroup(1)]],
                                   uint tid [[thread_index_in_threadgroup]],
-                                  uint ntg [[threads_per_threadgroup]]) {
+                                  uint ntg [[threads_per_threadgroup]],
+                                  uint simd_width [[threads_per_simdgroup]]) {
     float best_score = -INFINITY;
     uint best_id = 0xffffffffu;
     for (uint i = tid; i < params.count; i += ntg) {
@@ -2309,26 +2371,12 @@ kernel void uocr_argmax_pairs_f32(device const float *partial_scores [[buffer(0)
             best_id = id;
         }
     }
-    scores[tid] = best_score;
-    ids[tid] = best_id;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint stride = ntg >> 1; stride > 0u; stride >>= 1) {
-        if (tid < stride) {
-            const float score = scores[tid + stride];
-            const uint id = ids[tid + stride];
-            if (uocr_argmax_pair_better(score, id, scores[tid], ids[tid])) {
-                scores[tid] = score;
-                ids[tid] = id;
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
+    uocr_threadgroup_argmax_pair(best_score, best_id, scores, ids, tid, ntg, simd_width);
 
     if (tid == 0u) {
-        const uint id = ids[0] == 0xffffffffu ? 0u : ids[0];
+        const uint id = best_id == 0xffffffffu ? 0u : best_id;
         token_id_out[0] = int(id);
-        score_out[0] = ids[0] == 0xffffffffu ? -INFINITY : scores[0];
+        score_out[0] = best_id == 0xffffffffu ? -INFINITY : best_score;
     }
 }
 
@@ -2340,7 +2388,8 @@ kernel void uocr_argmax_f32(device const float *logits [[buffer(0)]],
                             threadgroup uint *partial_ids [[threadgroup(1)]],
                             uint row [[threadgroup_position_in_grid]],
                             uint tid [[thread_index_in_threadgroup]],
-                            uint ntg [[threads_per_threadgroup]]) {
+                            uint ntg [[threads_per_threadgroup]],
+                            uint simd_width [[threads_per_simdgroup]]) {
     if (row >= params.rows) {
         return;
     }
@@ -2355,26 +2404,12 @@ kernel void uocr_argmax_f32(device const float *logits [[buffer(0)]],
             best_id = col;
         }
     }
-    partial_scores[tid] = best_score;
-    partial_ids[tid] = best_id;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint stride = ntg >> 1; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            const float score = partial_scores[tid + stride];
-            const uint id = partial_ids[tid + stride];
-            if (uocr_argmax_better(score, id, partial_scores[tid], partial_ids[tid])) {
-                partial_scores[tid] = score;
-                partial_ids[tid] = id;
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
+    uocr_threadgroup_argmax_pair(best_score, best_id, partial_scores, partial_ids, tid, ntg, simd_width);
 
     if (tid == 0) {
-        const uint id = partial_ids[0] == 0xffffffffu ? 0u : partial_ids[0];
+        const uint id = best_id == 0xffffffffu ? 0u : best_id;
         token_ids[row] = id;
-        scores[row] = partial_ids[0] == 0xffffffffu ? -INFINITY : partial_scores[0];
+        scores[row] = best_id == 0xffffffffu ? -INFINITY : best_score;
     }
 }
 
@@ -2392,6 +2427,7 @@ static inline float uocr_attention_projection_dot_f16(device const half *src,
                                                       uint out_col,
                                                       uint tid,
                                                       uint ntg,
+                                              uint simd_width,
                                                       threadgroup float *partials) {
     float sum = 0.0f;
     const uint src_base = token * params.hidden_size;
@@ -2399,16 +2435,7 @@ static inline float uocr_attention_projection_dot_f16(device const half *src,
     for (uint k = tid; k < params.hidden_size; k += ntg) {
         sum += float(src[src_base + k]) * float(weight[weight_base + k]);
     }
-    partials[tid] = sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint stride = ntg >> 1; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            partials[tid] += partials[tid + stride];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    return partials[0];
+    return uocr_threadgroup_sum(sum, partials, tid, ntg, simd_width);
 }
 
 kernel void uocr_attention_qkvo_f16_to_f16(device const half *src [[buffer(0)]],
@@ -2424,7 +2451,8 @@ kernel void uocr_attention_qkvo_f16_to_f16(device const half *src [[buffer(0)]],
                                            threadgroup float *partials [[threadgroup(0)]],
                                            uint output_index [[threadgroup_position_in_grid]],
                                            uint tid [[thread_index_in_threadgroup]],
-                                           uint ntg [[threads_per_threadgroup]]) {
+                                           uint ntg [[threads_per_threadgroup]],
+                                           uint simd_width [[threads_per_simdgroup]]) {
     const uint values_per_projection = params.n_tokens * params.hidden_size;
     const uint projection = output_index / values_per_projection;
     const uint element = output_index - projection * values_per_projection;
@@ -2447,7 +2475,7 @@ kernel void uocr_attention_qkvo_f16_to_f16(device const half *src [[buffer(0)]],
         dst = o_dst;
     }
 
-    const float value = uocr_attention_projection_dot_f16(src, weight, params, token, out_col, tid, ntg, partials);
+    const float value = uocr_attention_projection_dot_f16(src, weight, params, token, out_col, tid, ntg, simd_width, partials);
     if (tid == 0) {
         dst[token * params.hidden_size + out_col] = half(value);
     }
@@ -2466,7 +2494,8 @@ kernel void uocr_attention_qkvo_f16_to_f32(device const half *src [[buffer(0)]],
                                            threadgroup float *partials [[threadgroup(0)]],
                                            uint output_index [[threadgroup_position_in_grid]],
                                            uint tid [[thread_index_in_threadgroup]],
-                                           uint ntg [[threads_per_threadgroup]]) {
+                                           uint ntg [[threads_per_threadgroup]],
+                                           uint simd_width [[threads_per_simdgroup]]) {
     const uint values_per_projection = params.n_tokens * params.hidden_size;
     const uint projection = output_index / values_per_projection;
     const uint element = output_index - projection * values_per_projection;
@@ -2489,7 +2518,7 @@ kernel void uocr_attention_qkvo_f16_to_f32(device const half *src [[buffer(0)]],
         dst = o_dst;
     }
 
-    const float value = uocr_attention_projection_dot_f16(src, weight, params, token, out_col, tid, ntg, partials);
+    const float value = uocr_attention_projection_dot_f16(src, weight, params, token, out_col, tid, ntg, simd_width, partials);
     if (tid == 0) {
         dst[token * params.hidden_size + out_col] = value;
     }
@@ -2509,6 +2538,7 @@ static inline float uocr_attention_output_dot_f16(device const half *src,
                                                   uint out_col,
                                                   uint tid,
                                                   uint ntg,
+                                              uint simd_width,
                                                   threadgroup float *partials) {
     float sum = 0.0f;
     const uint src_base = token * params.hidden_size;
@@ -2516,16 +2546,7 @@ static inline float uocr_attention_output_dot_f16(device const half *src,
     for (uint k = tid; k < params.hidden_size; k += ntg) {
         sum += float(src[src_base + k]) * float(weight[weight_base + k]);
     }
-    partials[tid] = sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint stride = ntg >> 1; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            partials[tid] += partials[tid + stride];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    return partials[0];
+    return uocr_threadgroup_sum(sum, partials, tid, ntg, simd_width);
 }
 
 kernel void uocr_attention_output_residual_f16_to_f16(device const half *src [[buffer(0)]],
@@ -2536,14 +2557,15 @@ kernel void uocr_attention_output_residual_f16_to_f16(device const half *src [[b
                                                       threadgroup float *partials [[threadgroup(0)]],
                                                       uint output_index [[threadgroup_position_in_grid]],
                                                       uint tid [[thread_index_in_threadgroup]],
-                                                      uint ntg [[threads_per_threadgroup]]) {
+                                                      uint ntg [[threads_per_threadgroup]],
+                                                      uint simd_width [[threads_per_simdgroup]]) {
     const uint token = output_index / params.hidden_size;
     const uint out_col = output_index - token * params.hidden_size;
     if (token >= params.n_tokens || out_col >= params.hidden_size) {
         return;
     }
 
-    const float projected = uocr_attention_output_dot_f16(src, weight, params, token, out_col, tid, ntg, partials);
+    const float projected = uocr_attention_output_dot_f16(src, weight, params, token, out_col, tid, ntg, simd_width, partials);
     if (tid == 0) {
         const uint dst_index = token * params.hidden_size + out_col;
         dst[dst_index] = half(projected + float(residual[dst_index]));
@@ -2558,14 +2580,15 @@ kernel void uocr_attention_output_residual_f16_to_f32(device const half *src [[b
                                                       threadgroup float *partials [[threadgroup(0)]],
                                                       uint output_index [[threadgroup_position_in_grid]],
                                                       uint tid [[thread_index_in_threadgroup]],
-                                                      uint ntg [[threads_per_threadgroup]]) {
+                                                      uint ntg [[threads_per_threadgroup]],
+                                                      uint simd_width [[threads_per_simdgroup]]) {
     const uint token = output_index / params.hidden_size;
     const uint out_col = output_index - token * params.hidden_size;
     if (token >= params.n_tokens || out_col >= params.hidden_size) {
         return;
     }
 
-    const float projected = uocr_attention_output_dot_f16(src, weight, params, token, out_col, tid, ntg, partials);
+    const float projected = uocr_attention_output_dot_f16(src, weight, params, token, out_col, tid, ntg, simd_width, partials);
     if (tid == 0) {
         const uint dst_index = token * params.hidden_size + out_col;
         dst[dst_index] = projected + float(residual[dst_index]);
@@ -2587,7 +2610,8 @@ kernel void uocr_dense_swiglu_gate_up_f16(device const half *src [[buffer(0)]],
                                           threadgroup float *partials [[threadgroup(0)]],
                                           uint output_index [[threadgroup_position_in_grid]],
                                           uint tid [[thread_index_in_threadgroup]],
-                                          uint ntg [[threads_per_threadgroup]]) {
+                                          uint ntg [[threads_per_threadgroup]],
+                                          uint simd_width [[threads_per_simdgroup]]) {
     const uint token = output_index / params.intermediate_size;
     const uint out_col = output_index - token * params.intermediate_size;
     if (token >= params.n_tokens || out_col >= params.intermediate_size) {
@@ -2605,21 +2629,11 @@ kernel void uocr_dense_swiglu_gate_up_f16(device const half *src [[buffer(0)]],
         gate_sum += x * float(gate_weight[weight_base + k]);
         up_sum += x * float(up_weight[weight_base + k]);
     }
-    gate_partials[tid] = gate_sum;
-    up_partials[tid] = up_sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint stride = ntg >> 1; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            gate_partials[tid] += gate_partials[tid + stride];
-            up_partials[tid] += up_partials[tid + stride];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
+    float gate = 0.0f;
+    float up = 0.0f;
+    uocr_threadgroup_sum2(gate_sum, up_sum, gate_partials, up_partials, tid, ntg, simd_width, gate, up);
 
     if (tid == 0) {
-        const float gate = gate_partials[0];
-        const float up = up_partials[0];
         const float silu = gate / (1.0f + exp(-gate));
         mid[token * params.intermediate_size + out_col] = half(silu * up);
     }
@@ -2633,7 +2647,8 @@ kernel void uocr_dense_swiglu_gate_up_q8_0(device const half *src [[buffer(0)]],
                                            threadgroup float *partials [[threadgroup(0)]],
                                            uint output_index [[threadgroup_position_in_grid]],
                                            uint tid [[thread_index_in_threadgroup]],
-                                           uint ntg [[threads_per_threadgroup]]) {
+                                           uint ntg [[threads_per_threadgroup]],
+                                           uint simd_width [[threads_per_simdgroup]]) {
     const uint token = output_index / params.out_features;
     const uint out_col = output_index - token * params.out_features;
     if (token >= params.input_rows || out_col >= params.out_features) {
@@ -2650,21 +2665,11 @@ kernel void uocr_dense_swiglu_gate_up_q8_0(device const half *src [[buffer(0)]],
         gate_sum += x * uocr_q8_0_load_value(gate_weight, params.weight_row_size, out_col, k);
         up_sum += x * uocr_q8_0_load_value(up_weight, params.weight_row_size, out_col, k);
     }
-    gate_partials[tid] = gate_sum;
-    up_partials[tid] = up_sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint stride = ntg >> 1; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            gate_partials[tid] += gate_partials[tid + stride];
-            up_partials[tid] += up_partials[tid + stride];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
+    float gate = 0.0f;
+    float up = 0.0f;
+    uocr_threadgroup_sum2(gate_sum, up_sum, gate_partials, up_partials, tid, ntg, simd_width, gate, up);
 
     if (tid == 0) {
-        const float gate = gate_partials[0];
-        const float up = up_partials[0];
         const float silu = gate / (1.0f + exp(-gate));
         mid[token * params.out_features + out_col] = half(silu * up);
     }
@@ -2677,6 +2682,7 @@ static inline float uocr_dense_swiglu_down_dot_f16(device const half *mid,
                                                    uint out_col,
                                                    uint tid,
                                                    uint ntg,
+                                              uint simd_width,
                                                    threadgroup float *partials) {
     float sum = 0.0f;
     const uint mid_base = token * params.intermediate_size;
@@ -2684,16 +2690,7 @@ static inline float uocr_dense_swiglu_down_dot_f16(device const half *mid,
     for (uint k = tid; k < params.intermediate_size; k += ntg) {
         sum += float(mid[mid_base + k]) * float(down_weight[weight_base + k]);
     }
-    partials[tid] = sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint stride = ntg >> 1; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            partials[tid] += partials[tid + stride];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    return partials[0];
+    return uocr_threadgroup_sum(sum, partials, tid, ntg, simd_width);
 }
 
 kernel void uocr_dense_swiglu_down_f16_to_f16(device const half *mid [[buffer(0)]],
@@ -2704,14 +2701,15 @@ kernel void uocr_dense_swiglu_down_f16_to_f16(device const half *mid [[buffer(0)
                                               threadgroup float *partials [[threadgroup(0)]],
                                               uint output_index [[threadgroup_position_in_grid]],
                                               uint tid [[thread_index_in_threadgroup]],
-                                              uint ntg [[threads_per_threadgroup]]) {
+                                              uint ntg [[threads_per_threadgroup]],
+                                              uint simd_width [[threads_per_simdgroup]]) {
     const uint token = output_index / params.hidden_size;
     const uint out_col = output_index - token * params.hidden_size;
     if (token >= params.n_tokens || out_col >= params.hidden_size) {
         return;
     }
 
-    float value = uocr_dense_swiglu_down_dot_f16(mid, down_weight, params, token, out_col, tid, ntg, partials);
+    float value = uocr_dense_swiglu_down_dot_f16(mid, down_weight, params, token, out_col, tid, ntg, simd_width, partials);
     if (tid == 0) {
         const uint dst_index = token * params.hidden_size + out_col;
         if (params.has_residual != 0u) {
@@ -2729,14 +2727,15 @@ kernel void uocr_dense_swiglu_down_f16_to_f32(device const half *mid [[buffer(0)
                                               threadgroup float *partials [[threadgroup(0)]],
                                               uint output_index [[threadgroup_position_in_grid]],
                                               uint tid [[thread_index_in_threadgroup]],
-                                              uint ntg [[threads_per_threadgroup]]) {
+                                              uint ntg [[threads_per_threadgroup]],
+                                              uint simd_width [[threads_per_simdgroup]]) {
     const uint token = output_index / params.hidden_size;
     const uint out_col = output_index - token * params.hidden_size;
     if (token >= params.n_tokens || out_col >= params.hidden_size) {
         return;
     }
 
-    float value = uocr_dense_swiglu_down_dot_f16(mid, down_weight, params, token, out_col, tid, ntg, partials);
+    float value = uocr_dense_swiglu_down_dot_f16(mid, down_weight, params, token, out_col, tid, ntg, simd_width, partials);
     if (tid == 0) {
         const uint dst_index = token * params.hidden_size + out_col;
         if (params.has_residual != 0u) {
@@ -2766,6 +2765,7 @@ static inline float uocr_moe_router_dot_f16(device const half *src,
                                             uint expert,
                                             uint tid,
                                             uint ntg,
+                                              uint simd_width,
                                             threadgroup float *partials) {
     float sum = 0.0f;
     const uint src_base = token * params.hidden_size;
@@ -2773,16 +2773,7 @@ static inline float uocr_moe_router_dot_f16(device const half *src,
     for (uint k = tid; k < params.hidden_size; k += ntg) {
         sum += float(src[src_base + k]) * float(weight[weight_base + k]);
     }
-    partials[tid] = sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint stride = ntg >> 1; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            partials[tid] += partials[tid + stride];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    return partials[0];
+    return uocr_threadgroup_sum(sum, partials, tid, ntg, simd_width);
 }
 
 kernel void uocr_moe_router_logits_f16_to_f32(device const half *src [[buffer(0)]],
@@ -2792,14 +2783,15 @@ kernel void uocr_moe_router_logits_f16_to_f32(device const half *src [[buffer(0)
                                              threadgroup float *partials [[threadgroup(0)]],
                                              uint output_index [[threadgroup_position_in_grid]],
                                              uint tid [[thread_index_in_threadgroup]],
-                                             uint ntg [[threads_per_threadgroup]]) {
+                                             uint ntg [[threads_per_threadgroup]],
+                                             uint simd_width [[threads_per_simdgroup]]) {
     const uint token = output_index / params.experts;
     const uint expert = output_index - token * params.experts;
     if (token >= params.n_tokens || expert >= params.experts) {
         return;
     }
 
-    const float value = uocr_moe_router_dot_f16(src, weight, params, token, expert, tid, ntg, partials);
+    const float value = uocr_moe_router_dot_f16(src, weight, params, token, expert, tid, ntg, simd_width, partials);
     if (tid == 0) {
         logits[token * params.experts + expert] = value;
     }
@@ -2816,7 +2808,8 @@ kernel void uocr_moe_router_softmax_topk_f32(device const float *logits [[buffer
                                              threadgroup float *scratch [[threadgroup(0)]],
                                              uint token [[threadgroup_position_in_grid]],
                                              uint tid [[thread_index_in_threadgroup]],
-                                             uint ntg [[threads_per_threadgroup]]) {
+                                             uint ntg [[threads_per_threadgroup]],
+                                             uint simd_width [[threads_per_simdgroup]]) {
     if (token >= params.n_tokens) {
         return;
     }
@@ -2832,34 +2825,15 @@ kernel void uocr_moe_router_softmax_topk_f32(device const float *logits [[buffer
         scores[expert] = value;
         local_max = max(local_max, value);
     }
-    partials[tid] = local_max;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint stride = ntg >> 1; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            partials[tid] = max(partials[tid], partials[tid + stride]);
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    const float max_logit = partials[0];
+    const float max_logit = uocr_threadgroup_max(local_max, partials, tid, ntg, simd_width);
     float local_sum = 0.0f;
     for (uint expert = tid; expert < params.experts; expert += ntg) {
         const float value = exp(scores[expert] - max_logit);
         scores[expert] = value;
         local_sum += value;
     }
-    partials[tid] = local_sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint stride = ntg >> 1; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            partials[tid] += partials[tid + stride];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    const float inv_sum = 1.0f / partials[0];
+    const float total_sum = uocr_threadgroup_sum(local_sum, partials, tid, ntg, simd_width);
+    const float inv_sum = 1.0f / total_sum;
     for (uint expert = tid; expert < params.experts; expert += ntg) {
         const float prob = scores[expert] * inv_sum;
         scores[expert] = prob;
@@ -2949,7 +2923,8 @@ kernel void uocr_moe_selected_gate_up_f16(device const half *src [[buffer(0)]],
                                           threadgroup float *partials [[threadgroup(0)]],
                                           uint output_index [[threadgroup_position_in_grid]],
                                           uint tid [[thread_index_in_threadgroup]],
-                                          uint ntg [[threads_per_threadgroup]]) {
+                                          uint ntg [[threads_per_threadgroup]],
+                                          uint simd_width [[threads_per_simdgroup]]) {
     const uint rank = output_index / params.intermediate_size;
     const uint out_col = output_index - rank * params.intermediate_size;
     if (rank >= params.top_k || out_col >= params.intermediate_size) {
@@ -2967,21 +2942,11 @@ kernel void uocr_moe_selected_gate_up_f16(device const half *src [[buffer(0)]],
         gate_sum += x * float(gate_weight[weight_base + ulong(k)]);
         up_sum += x * float(up_weight[weight_base + ulong(k)]);
     }
-    gate_partials[tid] = gate_sum;
-    up_partials[tid] = up_sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint stride = ntg >> 1; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            gate_partials[tid] += gate_partials[tid + stride];
-            up_partials[tid] += up_partials[tid + stride];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
+    float gate = 0.0f;
+    float up = 0.0f;
+    uocr_threadgroup_sum2(gate_sum, up_sum, gate_partials, up_partials, tid, ntg, simd_width, gate, up);
 
     if (tid == 0) {
-        const float gate = gate_partials[0];
-        const float up = up_partials[0];
         const float silu = gate / (1.0f + exp(-gate));
         mid[rank * params.intermediate_size + out_col] = half(silu * up);
     }
@@ -2995,7 +2960,8 @@ kernel void uocr_moe_selected_gate_up_q4_k(device const half *src [[buffer(0)]],
                                            threadgroup float *partials [[threadgroup(0)]],
                                            uint output_index [[threadgroup_position_in_grid]],
                                            uint tid [[thread_index_in_threadgroup]],
-                                           uint ntg [[threads_per_threadgroup]]) {
+                                           uint ntg [[threads_per_threadgroup]],
+                                           uint simd_width [[threads_per_simdgroup]]) {
     const uint rank = output_index / params.intermediate_size;
     const uint out_col = output_index - rank * params.intermediate_size;
     if (rank >= params.top_k || out_col >= params.intermediate_size) {
@@ -3012,21 +2978,11 @@ kernel void uocr_moe_selected_gate_up_q4_k(device const half *src [[buffer(0)]],
         gate_sum += x * uocr_q4_k_load_value(gate_weight, params.gate_row_size, weight_row, k);
         up_sum += x * uocr_q4_k_load_value(up_weight, params.gate_row_size, weight_row, k);
     }
-    gate_partials[tid] = gate_sum;
-    up_partials[tid] = up_sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint stride = ntg >> 1; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            gate_partials[tid] += gate_partials[tid + stride];
-            up_partials[tid] += up_partials[tid + stride];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
+    float gate = 0.0f;
+    float up = 0.0f;
+    uocr_threadgroup_sum2(gate_sum, up_sum, gate_partials, up_partials, tid, ntg, simd_width, gate, up);
 
     if (tid == 0) {
-        const float gate = gate_partials[0];
-        const float up = up_partials[0];
         const float silu = gate / (1.0f + exp(-gate));
         mid[rank * params.intermediate_size + out_col] = half(silu * up);
     }
@@ -3039,6 +2995,7 @@ static inline float uocr_moe_selected_down_sum_dot_f16(device const half *mid,
                                                        uint out_col,
                                                        uint tid,
                                                        uint ntg,
+                                              uint simd_width,
                                                        threadgroup float *partials) {
     float sum = 0.0f;
     for (uint rank = 0; rank < params.top_k; ++rank) {
@@ -3051,16 +3008,7 @@ static inline float uocr_moe_selected_down_sum_dot_f16(device const half *mid,
         }
         sum += expert_sum * top_weights[rank];
     }
-    partials[tid] = sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint stride = ntg >> 1; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            partials[tid] += partials[tid + stride];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    return partials[0];
+    return uocr_threadgroup_sum(sum, partials, tid, ntg, simd_width);
 }
 
 kernel void uocr_moe_selected_down_sum_f16_to_f16(device const half *mid [[buffer(0)]],
@@ -3071,11 +3019,12 @@ kernel void uocr_moe_selected_down_sum_f16_to_f16(device const half *mid [[buffe
                                                   threadgroup float *partials [[threadgroup(0)]],
                                                   uint out_col [[threadgroup_position_in_grid]],
                                                   uint tid [[thread_index_in_threadgroup]],
-                                                  uint ntg [[threads_per_threadgroup]]) {
+                                                  uint ntg [[threads_per_threadgroup]],
+                                                  uint simd_width [[threads_per_simdgroup]]) {
     if (out_col >= params.hidden_size) {
         return;
     }
-    const float value = uocr_moe_selected_down_sum_dot_f16(mid, down_weight, top_weights, params, out_col, tid, ntg, partials);
+    const float value = uocr_moe_selected_down_sum_dot_f16(mid, down_weight, top_weights, params, out_col, tid, ntg, simd_width, partials);
     if (tid == 0) {
         dst[out_col] = half(value);
     }
@@ -3089,11 +3038,12 @@ kernel void uocr_moe_selected_down_sum_f16_to_f32(device const half *mid [[buffe
                                                   threadgroup float *partials [[threadgroup(0)]],
                                                   uint out_col [[threadgroup_position_in_grid]],
                                                   uint tid [[thread_index_in_threadgroup]],
-                                                  uint ntg [[threads_per_threadgroup]]) {
+                                                  uint ntg [[threads_per_threadgroup]],
+                                                  uint simd_width [[threads_per_simdgroup]]) {
     if (out_col >= params.hidden_size) {
         return;
     }
-    const float value = uocr_moe_selected_down_sum_dot_f16(mid, down_weight, top_weights, params, out_col, tid, ntg, partials);
+    const float value = uocr_moe_selected_down_sum_dot_f16(mid, down_weight, top_weights, params, out_col, tid, ntg, simd_width, partials);
     if (tid == 0) {
         dst[out_col] = value;
     }
@@ -3106,6 +3056,7 @@ static inline float uocr_moe_selected_down_sum_dot_q8_0(device const half *mid,
                                                         uint out_col,
                                                         uint tid,
                                                         uint ntg,
+                                              uint simd_width,
                                                         threadgroup float *partials) {
     float sum = 0.0f;
     for (uint rank = 0; rank < params.top_k; ++rank) {
@@ -3118,16 +3069,7 @@ static inline float uocr_moe_selected_down_sum_dot_q8_0(device const half *mid,
         }
         sum += expert_sum * top_weights[rank];
     }
-    partials[tid] = sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint stride = ntg >> 1; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            partials[tid] += partials[tid + stride];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    return partials[0];
+    return uocr_threadgroup_sum(sum, partials, tid, ntg, simd_width);
 }
 
 kernel void uocr_moe_selected_down_sum_q8_0_to_f16(device const half *mid [[buffer(0)]],
@@ -3138,11 +3080,12 @@ kernel void uocr_moe_selected_down_sum_q8_0_to_f16(device const half *mid [[buff
                                                    threadgroup float *partials [[threadgroup(0)]],
                                                    uint out_col [[threadgroup_position_in_grid]],
                                                    uint tid [[thread_index_in_threadgroup]],
-                                                   uint ntg [[threads_per_threadgroup]]) {
+                                                   uint ntg [[threads_per_threadgroup]],
+                                                   uint simd_width [[threads_per_simdgroup]]) {
     if (out_col >= params.hidden_size) {
         return;
     }
-    const float value = uocr_moe_selected_down_sum_dot_q8_0(mid, down_weight, top_weights, params, out_col, tid, ntg, partials);
+    const float value = uocr_moe_selected_down_sum_dot_q8_0(mid, down_weight, top_weights, params, out_col, tid, ntg, simd_width, partials);
     if (tid == 0) {
         dst[out_col] = half(value);
     }
@@ -3156,11 +3099,12 @@ kernel void uocr_moe_selected_down_sum_q8_0_to_f32(device const half *mid [[buff
                                                    threadgroup float *partials [[threadgroup(0)]],
                                                    uint out_col [[threadgroup_position_in_grid]],
                                                    uint tid [[thread_index_in_threadgroup]],
-                                                   uint ntg [[threads_per_threadgroup]]) {
+                                                   uint ntg [[threads_per_threadgroup]],
+                                                   uint simd_width [[threads_per_simdgroup]]) {
     if (out_col >= params.hidden_size) {
         return;
     }
-    const float value = uocr_moe_selected_down_sum_dot_q8_0(mid, down_weight, top_weights, params, out_col, tid, ntg, partials);
+    const float value = uocr_moe_selected_down_sum_dot_q8_0(mid, down_weight, top_weights, params, out_col, tid, ntg, simd_width, partials);
     if (tid == 0) {
         dst[out_col] = value;
     }
@@ -3173,6 +3117,7 @@ static inline float uocr_moe_selected_down_sum_dot_q4_k(device const half *mid,
                                                         uint out_col,
                                                         uint tid,
                                                         uint ntg,
+                                              uint simd_width,
                                                         threadgroup float *partials) {
     float sum = 0.0f;
     for (uint rank = 0; rank < params.top_k; ++rank) {
@@ -3185,16 +3130,7 @@ static inline float uocr_moe_selected_down_sum_dot_q4_k(device const half *mid,
         }
         sum += expert_sum * top_weights[rank];
     }
-    partials[tid] = sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint stride = ntg >> 1; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            partials[tid] += partials[tid + stride];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    return partials[0];
+    return uocr_threadgroup_sum(sum, partials, tid, ntg, simd_width);
 }
 
 kernel void uocr_moe_selected_down_sum_q4_k_to_f16(device const half *mid [[buffer(0)]],
@@ -3205,11 +3141,12 @@ kernel void uocr_moe_selected_down_sum_q4_k_to_f16(device const half *mid [[buff
                                                    threadgroup float *partials [[threadgroup(0)]],
                                                    uint out_col [[threadgroup_position_in_grid]],
                                                    uint tid [[thread_index_in_threadgroup]],
-                                                   uint ntg [[threads_per_threadgroup]]) {
+                                                   uint ntg [[threads_per_threadgroup]],
+                                                   uint simd_width [[threads_per_simdgroup]]) {
     if (out_col >= params.hidden_size) {
         return;
     }
-    const float value = uocr_moe_selected_down_sum_dot_q4_k(mid, down_weight, top_weights, params, out_col, tid, ntg, partials);
+    const float value = uocr_moe_selected_down_sum_dot_q4_k(mid, down_weight, top_weights, params, out_col, tid, ntg, simd_width, partials);
     if (tid == 0) {
         dst[out_col] = half(value);
     }
@@ -3223,11 +3160,12 @@ kernel void uocr_moe_selected_down_sum_q4_k_to_f32(device const half *mid [[buff
                                                    threadgroup float *partials [[threadgroup(0)]],
                                                    uint out_col [[threadgroup_position_in_grid]],
                                                    uint tid [[thread_index_in_threadgroup]],
-                                                   uint ntg [[threads_per_threadgroup]]) {
+                                                   uint ntg [[threads_per_threadgroup]],
+                                                   uint simd_width [[threads_per_simdgroup]]) {
     if (out_col >= params.hidden_size) {
         return;
     }
-    const float value = uocr_moe_selected_down_sum_dot_q4_k(mid, down_weight, top_weights, params, out_col, tid, ntg, partials);
+    const float value = uocr_moe_selected_down_sum_dot_q4_k(mid, down_weight, top_weights, params, out_col, tid, ntg, simd_width, partials);
     if (tid == 0) {
         dst[out_col] = value;
     }
@@ -3297,7 +3235,8 @@ kernel void uocr_moe_prefill_selected_gate_up_f16(device const half *src [[buffe
                                                   threadgroup float *partials [[threadgroup(0)]],
                                                   uint output_index [[threadgroup_position_in_grid]],
                                                   uint tid [[thread_index_in_threadgroup]],
-                                                  uint ntg [[threads_per_threadgroup]]) {
+                                                  uint ntg [[threads_per_threadgroup]],
+                                                  uint simd_width [[threads_per_simdgroup]]) {
     const uint per_token = params.top_k * params.intermediate_size;
     const uint token = output_index / per_token;
     const uint token_rem = output_index - token * per_token;
@@ -3327,21 +3266,11 @@ kernel void uocr_moe_prefill_selected_gate_up_f16(device const half *src [[buffe
         gate_sum += x * float(gate_weight[weight_base + ulong(k)]);
         up_sum += x * float(up_weight[weight_base + ulong(k)]);
     }
-    gate_partials[tid] = gate_sum;
-    up_partials[tid] = up_sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint stride = ntg >> 1; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            gate_partials[tid] += gate_partials[tid + stride];
-            up_partials[tid] += up_partials[tid + stride];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
+    float gate = 0.0f;
+    float up = 0.0f;
+    uocr_threadgroup_sum2(gate_sum, up_sum, gate_partials, up_partials, tid, ntg, simd_width, gate, up);
 
     if (tid == 0) {
-        const float gate = gate_partials[0];
-        const float up = up_partials[0];
         const float silu = gate / (1.0f + exp(-gate));
         const ulong mid_index = (ulong(token) * ulong(params.top_k) + ulong(rank)) *
                                     ulong(params.intermediate_size) +
@@ -3359,7 +3288,8 @@ kernel void uocr_moe_prefill_selected_gate_up_q4_k(device const half *src [[buff
                                                    threadgroup float *partials [[threadgroup(0)]],
                                                    uint output_index [[threadgroup_position_in_grid]],
                                                    uint tid [[thread_index_in_threadgroup]],
-                                                   uint ntg [[threads_per_threadgroup]]) {
+                                                   uint ntg [[threads_per_threadgroup]],
+                                                   uint simd_width [[threads_per_simdgroup]]) {
     const uint per_token = params.top_k * params.intermediate_size;
     const uint token = output_index / per_token;
     const uint token_rem = output_index - token * per_token;
@@ -3388,21 +3318,11 @@ kernel void uocr_moe_prefill_selected_gate_up_q4_k(device const half *src [[buff
         gate_sum += x * uocr_q4_k_load_value(gate_weight, params.gate_row_size, weight_row, k);
         up_sum += x * uocr_q4_k_load_value(up_weight, params.gate_row_size, weight_row, k);
     }
-    gate_partials[tid] = gate_sum;
-    up_partials[tid] = up_sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint stride = ntg >> 1; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            gate_partials[tid] += gate_partials[tid + stride];
-            up_partials[tid] += up_partials[tid + stride];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
+    float gate = 0.0f;
+    float up = 0.0f;
+    uocr_threadgroup_sum2(gate_sum, up_sum, gate_partials, up_partials, tid, ntg, simd_width, gate, up);
 
     if (tid == 0) {
-        const float gate = gate_partials[0];
-        const float up = up_partials[0];
         const float silu = gate / (1.0f + exp(-gate));
         const ulong mid_index = (ulong(token) * ulong(params.top_k) + ulong(rank)) *
                                     ulong(params.intermediate_size) +
@@ -3420,6 +3340,7 @@ static inline float uocr_moe_prefill_selected_down_dot_f16(device const half *mi
                                                            uint out_col,
                                                            uint tid,
                                                            uint ntg,
+                                              uint simd_width,
                                                            threadgroup float *partials) {
     float sum = 0.0f;
     for (uint rank = 0; rank < params.top_k; ++rank) {
@@ -3437,16 +3358,7 @@ static inline float uocr_moe_prefill_selected_down_dot_f16(device const half *mi
         }
         sum += expert_sum * top_weights[token * params.top_k + rank];
     }
-    partials[tid] = sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint stride = ntg >> 1; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            partials[tid] += partials[tid + stride];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    return partials[0];
+    return uocr_threadgroup_sum(sum, partials, tid, ntg, simd_width);
 }
 
 kernel void uocr_moe_prefill_selected_down_sum_f16_to_f16(device const half *mid [[buffer(0)]],
@@ -3458,7 +3370,8 @@ kernel void uocr_moe_prefill_selected_down_sum_f16_to_f16(device const half *mid
                                                           threadgroup float *partials [[threadgroup(0)]],
                                                           uint output_index [[threadgroup_position_in_grid]],
                                                           uint tid [[thread_index_in_threadgroup]],
-                                                          uint ntg [[threads_per_threadgroup]]) {
+                                                          uint ntg [[threads_per_threadgroup]],
+                                                          uint simd_width [[threads_per_simdgroup]]) {
     const uint token = output_index / params.hidden_size;
     const uint out_col = output_index - token * params.hidden_size;
     if (token >= params.n_tokens || out_col >= params.hidden_size) {
@@ -3473,6 +3386,7 @@ kernel void uocr_moe_prefill_selected_down_sum_f16_to_f16(device const half *mid
                                                                out_col,
                                                                tid,
                                                                ntg,
+                                                               simd_width,
                                                                partials);
     if (tid == 0) {
         dst[output_index] = half(value);
@@ -3488,7 +3402,8 @@ kernel void uocr_moe_prefill_selected_down_sum_f16_to_f32(device const half *mid
                                                           threadgroup float *partials [[threadgroup(0)]],
                                                           uint output_index [[threadgroup_position_in_grid]],
                                                           uint tid [[thread_index_in_threadgroup]],
-                                                          uint ntg [[threads_per_threadgroup]]) {
+                                                          uint ntg [[threads_per_threadgroup]],
+                                                          uint simd_width [[threads_per_simdgroup]]) {
     const uint token = output_index / params.hidden_size;
     const uint out_col = output_index - token * params.hidden_size;
     if (token >= params.n_tokens || out_col >= params.hidden_size) {
@@ -3503,6 +3418,7 @@ kernel void uocr_moe_prefill_selected_down_sum_f16_to_f32(device const half *mid
                                                                out_col,
                                                                tid,
                                                                ntg,
+                                                               simd_width,
                                                                partials);
     if (tid == 0) {
         dst[output_index] = value;
@@ -3518,6 +3434,7 @@ static inline float uocr_moe_prefill_selected_down_dot_q8_0(device const half *m
                                                             uint out_col,
                                                             uint tid,
                                                             uint ntg,
+                                              uint simd_width,
                                                             threadgroup float *partials) {
     float sum = 0.0f;
     for (uint rank = 0; rank < params.top_k; ++rank) {
@@ -3535,16 +3452,7 @@ static inline float uocr_moe_prefill_selected_down_dot_q8_0(device const half *m
         }
         sum += expert_sum * top_weights[token * params.top_k + rank];
     }
-    partials[tid] = sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint stride = ntg >> 1; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            partials[tid] += partials[tid + stride];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    return partials[0];
+    return uocr_threadgroup_sum(sum, partials, tid, ntg, simd_width);
 }
 
 kernel void uocr_moe_prefill_selected_down_sum_q8_0_to_f16(device const half *mid [[buffer(0)]],
@@ -3556,7 +3464,8 @@ kernel void uocr_moe_prefill_selected_down_sum_q8_0_to_f16(device const half *mi
                                                            threadgroup float *partials [[threadgroup(0)]],
                                                            uint output_index [[threadgroup_position_in_grid]],
                                                            uint tid [[thread_index_in_threadgroup]],
-                                                           uint ntg [[threads_per_threadgroup]]) {
+                                                           uint ntg [[threads_per_threadgroup]],
+                                                           uint simd_width [[threads_per_simdgroup]]) {
     const uint token = output_index / params.hidden_size;
     const uint out_col = output_index - token * params.hidden_size;
     if (token >= params.n_tokens || out_col >= params.hidden_size) {
@@ -3571,6 +3480,7 @@ kernel void uocr_moe_prefill_selected_down_sum_q8_0_to_f16(device const half *mi
                                                                 out_col,
                                                                 tid,
                                                                 ntg,
+                                                                simd_width,
                                                                 partials);
     if (tid == 0) {
         dst[output_index] = half(value);
@@ -3586,7 +3496,8 @@ kernel void uocr_moe_prefill_selected_down_sum_q8_0_to_f32(device const half *mi
                                                            threadgroup float *partials [[threadgroup(0)]],
                                                            uint output_index [[threadgroup_position_in_grid]],
                                                            uint tid [[thread_index_in_threadgroup]],
-                                                           uint ntg [[threads_per_threadgroup]]) {
+                                                           uint ntg [[threads_per_threadgroup]],
+                                                           uint simd_width [[threads_per_simdgroup]]) {
     const uint token = output_index / params.hidden_size;
     const uint out_col = output_index - token * params.hidden_size;
     if (token >= params.n_tokens || out_col >= params.hidden_size) {
@@ -3601,6 +3512,7 @@ kernel void uocr_moe_prefill_selected_down_sum_q8_0_to_f32(device const half *mi
                                                                 out_col,
                                                                 tid,
                                                                 ntg,
+                                                                simd_width,
                                                                 partials);
     if (tid == 0) {
         dst[output_index] = value;
@@ -3616,6 +3528,7 @@ static inline float uocr_moe_prefill_selected_down_dot_q4_k(device const half *m
                                                             uint out_col,
                                                             uint tid,
                                                             uint ntg,
+                                              uint simd_width,
                                                             threadgroup float *partials) {
     float sum = 0.0f;
     for (uint rank = 0; rank < params.top_k; ++rank) {
@@ -3633,16 +3546,7 @@ static inline float uocr_moe_prefill_selected_down_dot_q4_k(device const half *m
         }
         sum += expert_sum * top_weights[token * params.top_k + rank];
     }
-    partials[tid] = sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint stride = ntg >> 1; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            partials[tid] += partials[tid + stride];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    return partials[0];
+    return uocr_threadgroup_sum(sum, partials, tid, ntg, simd_width);
 }
 
 kernel void uocr_moe_prefill_selected_down_sum_q4_k_to_f16(device const half *mid [[buffer(0)]],
@@ -3654,7 +3558,8 @@ kernel void uocr_moe_prefill_selected_down_sum_q4_k_to_f16(device const half *mi
                                                            threadgroup float *partials [[threadgroup(0)]],
                                                            uint output_index [[threadgroup_position_in_grid]],
                                                            uint tid [[thread_index_in_threadgroup]],
-                                                           uint ntg [[threads_per_threadgroup]]) {
+                                                           uint ntg [[threads_per_threadgroup]],
+                                                           uint simd_width [[threads_per_simdgroup]]) {
     const uint token = output_index / params.hidden_size;
     const uint out_col = output_index - token * params.hidden_size;
     if (token >= params.n_tokens || out_col >= params.hidden_size) {
@@ -3669,6 +3574,7 @@ kernel void uocr_moe_prefill_selected_down_sum_q4_k_to_f16(device const half *mi
                                                                 out_col,
                                                                 tid,
                                                                 ntg,
+                                                                simd_width,
                                                                 partials);
     if (tid == 0) {
         dst[output_index] = half(value);
@@ -3684,7 +3590,8 @@ kernel void uocr_moe_prefill_selected_down_sum_q4_k_to_f32(device const half *mi
                                                            threadgroup float *partials [[threadgroup(0)]],
                                                            uint output_index [[threadgroup_position_in_grid]],
                                                            uint tid [[thread_index_in_threadgroup]],
-                                                           uint ntg [[threads_per_threadgroup]]) {
+                                                           uint ntg [[threads_per_threadgroup]],
+                                                           uint simd_width [[threads_per_simdgroup]]) {
     const uint token = output_index / params.hidden_size;
     const uint out_col = output_index - token * params.hidden_size;
     if (token >= params.n_tokens || out_col >= params.hidden_size) {
@@ -3699,6 +3606,7 @@ kernel void uocr_moe_prefill_selected_down_sum_q4_k_to_f32(device const half *mi
                                                                 out_col,
                                                                 tid,
                                                                 ntg,
+                                                                simd_width,
                                                                 partials);
     if (tid == 0) {
         dst[output_index] = value;
@@ -3713,7 +3621,8 @@ kernel void uocr_moe_prefill_interleaved_gate_up_f16(device const half *src [[bu
                                                      threadgroup float *partials [[threadgroup(0)]],
                                                      uint output_index [[threadgroup_position_in_grid]],
                                                      uint tid [[thread_index_in_threadgroup]],
-                                                     uint ntg [[threads_per_threadgroup]]) {
+                                                     uint ntg [[threads_per_threadgroup]],
+                                                     uint simd_width [[threads_per_simdgroup]]) {
     const uint per_token = params.top_k * params.intermediate_size;
     const uint token = output_index / per_token;
     const uint token_rem = output_index - token * per_token;
@@ -3744,21 +3653,11 @@ kernel void uocr_moe_prefill_interleaved_gate_up_f16(device const half *src [[bu
         gate_sum += x * float(expert_slab[gate_base + ulong(k)]);
         up_sum += x * float(expert_slab[up_base + ulong(k)]);
     }
-    gate_partials[tid] = gate_sum;
-    up_partials[tid] = up_sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint stride = ntg >> 1; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            gate_partials[tid] += gate_partials[tid + stride];
-            up_partials[tid] += up_partials[tid + stride];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
+    float gate = 0.0f;
+    float up = 0.0f;
+    uocr_threadgroup_sum2(gate_sum, up_sum, gate_partials, up_partials, tid, ntg, simd_width, gate, up);
 
     if (tid == 0) {
-        const float gate = gate_partials[0];
-        const float up = up_partials[0];
         const float silu = gate / (1.0f + exp(-gate));
         const ulong mid_index = (ulong(token) * ulong(params.top_k) + ulong(rank)) *
                                     ulong(params.intermediate_size) +
@@ -3776,6 +3675,7 @@ static inline float uocr_moe_prefill_interleaved_down_dot_f16(device const half 
                                                               uint out_col,
                                                               uint tid,
                                                               uint ntg,
+                                              uint simd_width,
                                                               threadgroup float *partials) {
     float sum = 0.0f;
     for (uint rank = 0; rank < params.top_k; ++rank) {
@@ -3794,16 +3694,7 @@ static inline float uocr_moe_prefill_interleaved_down_dot_f16(device const half 
         }
         sum += expert_sum * top_weights[token * params.top_k + rank];
     }
-    partials[tid] = sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint stride = ntg >> 1; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            partials[tid] += partials[tid + stride];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    return partials[0];
+    return uocr_threadgroup_sum(sum, partials, tid, ntg, simd_width);
 }
 
 kernel void uocr_moe_prefill_interleaved_down_sum_f16_to_f16(device const half *mid [[buffer(0)]],
@@ -3815,7 +3706,8 @@ kernel void uocr_moe_prefill_interleaved_down_sum_f16_to_f16(device const half *
                                                              threadgroup float *partials [[threadgroup(0)]],
                                                              uint output_index [[threadgroup_position_in_grid]],
                                                              uint tid [[thread_index_in_threadgroup]],
-                                                             uint ntg [[threads_per_threadgroup]]) {
+                                                             uint ntg [[threads_per_threadgroup]],
+                                                             uint simd_width [[threads_per_simdgroup]]) {
     const uint token = output_index / params.hidden_size;
     const uint out_col = output_index - token * params.hidden_size;
     if (token >= params.n_tokens || out_col >= params.hidden_size) {
@@ -3830,6 +3722,7 @@ kernel void uocr_moe_prefill_interleaved_down_sum_f16_to_f16(device const half *
                                                                   out_col,
                                                                   tid,
                                                                   ntg,
+                                                                  simd_width,
                                                                   partials);
     if (tid == 0) {
         dst[output_index] = half(value);
@@ -3845,7 +3738,8 @@ kernel void uocr_moe_prefill_interleaved_down_sum_f16_to_f32(device const half *
                                                              threadgroup float *partials [[threadgroup(0)]],
                                                              uint output_index [[threadgroup_position_in_grid]],
                                                              uint tid [[thread_index_in_threadgroup]],
-                                                             uint ntg [[threads_per_threadgroup]]) {
+                                                             uint ntg [[threads_per_threadgroup]],
+                                                             uint simd_width [[threads_per_simdgroup]]) {
     const uint token = output_index / params.hidden_size;
     const uint out_col = output_index - token * params.hidden_size;
     if (token >= params.n_tokens || out_col >= params.hidden_size) {
@@ -3860,6 +3754,7 @@ kernel void uocr_moe_prefill_interleaved_down_sum_f16_to_f32(device const half *
                                                                   out_col,
                                                                   tid,
                                                                   ntg,
+                                                                  simd_width,
                                                                   partials);
     if (tid == 0) {
         dst[output_index] = value;
@@ -4047,12 +3942,14 @@ kernel void uocr_prefill_attention_varlen_f16_to_f16(device const half *q_src [[
                                                      threadgroup float *partials [[threadgroup(0)]],
                                                      uint group_index [[threadgroup_position_in_grid]],
                                                      uint tid [[thread_index_in_threadgroup]],
-                                                     uint ntg [[threads_per_threadgroup]]) {
+                                                     uint ntg [[threads_per_threadgroup]],
+                                                     uint simd_width [[threads_per_simdgroup]]) {
     const uint token = group_index / params.heads;
     const uint head = group_index - token * params.heads;
-    if (token >= params.total_tokens || head >= params.heads || tid >= params.head_dim || ntg < params.head_dim) {
+    if (token >= params.total_tokens || head >= params.heads || ntg < params.head_dim) {
         return;
     }
+    const bool dim_valid = tid < params.head_dim;
 
     uint seq_start;
     uint seq_end;
@@ -4062,33 +3959,30 @@ kernel void uocr_prefill_attention_varlen_f16_to_f16(device const half *q_src [[
     }
 
     const ulong q_index = (ulong(token) * ulong(params.heads) + ulong(head)) * ulong(params.head_dim) + ulong(tid);
-    const float q = float(q_src[q_index]);
+    const float q = dim_valid ? float(q_src[q_index]) : 0.0f;
     float acc = 0.0f;
     float m = -3.4028234663852886e38f;
     float l = 0.0f;
     for (uint key_token = seq_start; key_token <= token; ++key_token) {
         const ulong k_index = (ulong(key_token) * ulong(params.heads) + ulong(head)) * ulong(params.head_dim) + ulong(tid);
-        partials[tid] = q * float(k_src[k_index]);
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint stride = ntg >> 1u; stride > 0u; stride >>= 1u) {
-            if (tid < stride) {
-                partials[tid] += partials[tid + stride];
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-        const float score = partials[0] * params.scale;
+        const float local_dot = dim_valid ? q * float(k_src[k_index]) : 0.0f;
+        const float score = uocr_threadgroup_sum(local_dot, partials, tid, ntg, simd_width) * params.scale;
         const float mnew = max(m, score);
         const float corr = exp(m - mnew);
         const float e = exp(score - mnew);
         const ulong v_index = (ulong(key_token) * ulong(params.heads) + ulong(head)) * ulong(params.head_dim) + ulong(tid);
-        acc = acc * corr + e * float(v_src[v_index]);
+        if (dim_valid) {
+            acc = acc * corr + e * float(v_src[v_index]);
+        }
         l = l * corr + e;
         m = mnew;
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    const ulong dst_index = (ulong(token) * ulong(params.heads) + ulong(head)) * ulong(params.head_dim) + ulong(tid);
-    dst[dst_index] = half(l > 0.0f ? acc / l : 0.0f);
+    if (dim_valid) {
+        const ulong dst_index = (ulong(token) * ulong(params.heads) + ulong(head)) * ulong(params.head_dim) + ulong(tid);
+        dst[dst_index] = half(l > 0.0f ? acc / l : 0.0f);
+    }
 }
 
 kernel void uocr_prefill_attention_varlen_f16_to_f32(device const half *q_src [[buffer(0)]],
@@ -4100,12 +3994,14 @@ kernel void uocr_prefill_attention_varlen_f16_to_f32(device const half *q_src [[
                                                      threadgroup float *partials [[threadgroup(0)]],
                                                      uint group_index [[threadgroup_position_in_grid]],
                                                      uint tid [[thread_index_in_threadgroup]],
-                                                     uint ntg [[threads_per_threadgroup]]) {
+                                                     uint ntg [[threads_per_threadgroup]],
+                                                     uint simd_width [[threads_per_simdgroup]]) {
     const uint token = group_index / params.heads;
     const uint head = group_index - token * params.heads;
-    if (token >= params.total_tokens || head >= params.heads || tid >= params.head_dim || ntg < params.head_dim) {
+    if (token >= params.total_tokens || head >= params.heads || ntg < params.head_dim) {
         return;
     }
+    const bool dim_valid = tid < params.head_dim;
 
     uint seq_start;
     uint seq_end;
@@ -4115,33 +4011,30 @@ kernel void uocr_prefill_attention_varlen_f16_to_f32(device const half *q_src [[
     }
 
     const ulong q_index = (ulong(token) * ulong(params.heads) + ulong(head)) * ulong(params.head_dim) + ulong(tid);
-    const float q = float(q_src[q_index]);
+    const float q = dim_valid ? float(q_src[q_index]) : 0.0f;
     float acc = 0.0f;
     float m = -3.4028234663852886e38f;
     float l = 0.0f;
     for (uint key_token = seq_start; key_token <= token; ++key_token) {
         const ulong k_index = (ulong(key_token) * ulong(params.heads) + ulong(head)) * ulong(params.head_dim) + ulong(tid);
-        partials[tid] = q * float(k_src[k_index]);
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint stride = ntg >> 1u; stride > 0u; stride >>= 1u) {
-            if (tid < stride) {
-                partials[tid] += partials[tid + stride];
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-        const float score = partials[0] * params.scale;
+        const float local_dot = dim_valid ? q * float(k_src[k_index]) : 0.0f;
+        const float score = uocr_threadgroup_sum(local_dot, partials, tid, ntg, simd_width) * params.scale;
         const float mnew = max(m, score);
         const float corr = exp(m - mnew);
         const float e = exp(score - mnew);
         const ulong v_index = (ulong(key_token) * ulong(params.heads) + ulong(head)) * ulong(params.head_dim) + ulong(tid);
-        acc = acc * corr + e * float(v_src[v_index]);
+        if (dim_valid) {
+            acc = acc * corr + e * float(v_src[v_index]);
+        }
         l = l * corr + e;
         m = mnew;
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    const ulong dst_index = (ulong(token) * ulong(params.heads) + ulong(head)) * ulong(params.head_dim) + ulong(tid);
-    dst[dst_index] = l > 0.0f ? acc / l : 0.0f;
+    if (dim_valid) {
+        const ulong dst_index = (ulong(token) * ulong(params.heads) + ulong(head)) * ulong(params.head_dim) + ulong(tid);
+        dst[dst_index] = l > 0.0f ? acc / l : 0.0f;
+    }
 }
 
 struct UocrDecodeAttentionParams {
