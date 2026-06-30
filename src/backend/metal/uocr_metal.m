@@ -45,6 +45,9 @@
 #ifndef UOCR_METAL_ENABLE_MOE_DECODE_KERNELS
 #define UOCR_METAL_ENABLE_MOE_DECODE_KERNELS 1
 #endif
+// Keep router top-k in the one-SIMD greedy path; this avoids the old
+// full-row bitonic-sort barriers for the fixed 64-expert/top-6 decode shape.
+#define UOCR_METAL_MOE_ROUTER_TOPK_THREADS 16u
 #define UOCR_METAL_FLASH_Q_PER_TG 4u
 #define UOCR_METAL_FLASH_MAX_LANE_VALUES 4u
 #define UOCR_METAL_HALF4_WIDTH 4u
@@ -11499,7 +11502,8 @@ static int metal_run_moe_router_buffer_f16(uocr_metal_context *ctx,
         if (enc == nil) {
             return metal_fail(error, error_size, "failed to create integrated MoE router top-k encoder");
         }
-        const NSUInteger topk_threads = metal_power2_threadgroup_width(64u, topk_pipeline.maxTotalThreadsPerThreadgroup);
+        const NSUInteger topk_threads = metal_power2_threadgroup_width((NSUInteger)UOCR_METAL_MOE_ROUTER_TOPK_THREADS,
+                                                                       topk_pipeline.maxTotalThreadsPerThreadgroup);
         const NSUInteger topk_scratch_bytes = ((NSUInteger)UOCR_ROUTED_EXPERTS + topk_threads) * sizeof(float) +
                                               (NSUInteger)UOCR_ROUTED_EXPERTS * sizeof(uint32_t);
         [enc setComputePipelineState:topk_pipeline];
@@ -22895,17 +22899,17 @@ int uocr_metal_context_diagnostic_moe_router_f16(uocr_metal_context *ctx,
     }
 
     @autoreleasepool {
-        id<MTLComputePipelineState> logits_pipeline = metal_get_pipeline(ctx,
-                                                                         "uocr_moe_router_logits_f16_to_f32",
-                                                                         error,
-                                                                         error_size);
+        id<MTLComputePipelineState> logits_pipeline = metal_get_decoder_shape_pipeline(ctx,
+                                                                                       "uocr_moe_router_logits_f16_to_f32",
+                                                                                       error,
+                                                                                       error_size);
         if (logits_pipeline == nil) {
             return 0;
         }
-        id<MTLComputePipelineState> topk_pipeline = metal_get_pipeline(ctx,
-                                                                       "uocr_moe_router_softmax_topk_f32",
-                                                                       error,
-                                                                       error_size);
+        id<MTLComputePipelineState> topk_pipeline = metal_get_decoder_shape_pipeline(ctx,
+                                                                                     "uocr_moe_router_softmax_topk_f32",
+                                                                                     error,
+                                                                                     error_size);
         if (topk_pipeline == nil) {
             return 0;
         }
@@ -23001,7 +23005,8 @@ int uocr_metal_context_diagnostic_moe_router_f16(uocr_metal_context *ctx,
             [input release];
             return metal_fail(error, error_size, "failed to create Metal MoE router top-k command encoder");
         }
-        const NSUInteger topk_threads = metal_power2_threadgroup_width(64u, topk_pipeline.maxTotalThreadsPerThreadgroup);
+        const NSUInteger topk_threads = metal_power2_threadgroup_width((NSUInteger)UOCR_METAL_MOE_ROUTER_TOPK_THREADS,
+                                                                       topk_pipeline.maxTotalThreadsPerThreadgroup);
         [enc setComputePipelineState:topk_pipeline];
         [enc setBuffer:logits offset:0u atIndex:0u];
         [enc setBuffer:probs offset:0u atIndex:1u];

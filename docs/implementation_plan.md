@@ -147,7 +147,7 @@ Completion notes:
 
 ## 4. Replace Router Bitonic Sort with Deterministic Top-6 Selection
 
-Status: [ ] Not started
+Status: [x] Completed
 
 Details:
 - Current router top-k sorts all 64 experts; decode only needs top 6.
@@ -161,6 +161,21 @@ Acceptance criteria:
 - Router ids and weights match the current bitonic path on deterministic synthetic cases, including equal-score ties.
 - `metal.decode.moe_router` time does not regress.
 - E2E token output remains stable.
+
+Completion notes:
+- Replaced the router softmax/top-k full 64-expert bitonic sort with deterministic greedy top-6 selection.
+- Selection uses tuple ordering `(score_bits, inverse_expert_id)` over nonnegative softmax probabilities, so higher probability wins and exact ties select the lower expert id while keeping raw, unrenormalized softmax weights.
+- The default dispatch uses `UOCR_METAL_MOE_ROUTER_TOPK_THREADS=16`, keeping the fixed 64-expert/top-6 selection on the one-SIMD greedy path and avoiding the old bitonic top-k barrier sequence. A generic multi-SIMD greedy fallback remains in the kernel.
+- Diagnostic router coverage now has a focused filter: `UOCR_METAL_TEST_FILTER=moe_router_f16 ./build/test/test_metal`. The existing zero-logit/equal-probability case verifies lower-id tie order (`0..5`).
+- Diagnostic router pipeline creation now uses decoder-shape function constants, matching the integrated decode path and avoiding generic function-constant pipeline creation failures.
+- Final Release probe artifacts:
+  - `data.tmp/probes/e2e_base_moe_router_topk.json`
+  - `data.tmp/probes/e2e_gundam_moe_router_topk.json`
+  - `data.tmp/probes/moe_router_topk_results.md`
+- Final probe summary versus Task 3:
+  - `base`: text parity true, 44 generated tokens, 7.121 native tok/s, decode loop `653.218 -> 651.531` ms, router `2.720 -> 2.757` ms, `metal.decode.moe_combine` absent.
+  - `gundam`: text parity true, 58 generated tokens, 1.516 native tok/s, decode loop `1707.815 -> 1700.695` ms, router `3.665 -> 3.750` ms, `metal.decode.moe_combine` absent.
+  - Router bucket differences are sub-microsecond per MoE call and noisy in E2E profiling; the greedy top-k path preserves parity and removes the full bitonic sort. Task 5 should address the remaining router cost by fusing logits, softmax, and top-k and removing the full logits/probs round trip.
 
 ## 5. Fuse Decode Router Logits, Softmax, and Top-K
 

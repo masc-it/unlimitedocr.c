@@ -2713,10 +2713,12 @@ struct UocrMoeRouterParams {
     uint top_k;
 };
 
-static inline bool uocr_moe_router_topk_better(threadgroup const float *scores, uint a, uint b) {
-    const float va = scores[a];
-    const float vb = scores[b];
-    return va > vb || (va == vb && a < b);
+static inline bool uocr_moe_router_topk_bits_better(uint score_bits,
+                                                     uint inverse_expert,
+                                                     uint best_score_bits,
+                                                     uint best_inverse_expert) {
+    return score_bits > best_score_bits ||
+           (score_bits == best_score_bits && inverse_expert > best_inverse_expert);
 }
 
 static inline float uocr_moe_router_dot_f16(device const half *src,
@@ -2779,12 +2781,105 @@ static inline float uocr_moe_router_dot_f16(device const half *src,
 
     const uint experts = uocr_fc_moe_experts_or(params.experts);
     const uint top_k = uocr_fc_moe_top_k_or(params.top_k);
+    const uint row_base = token * experts;
+    const uint lane = uocr_simd_lane_from_tid(tid, simd_width);
+
+    if (experts == 64u && top_k == 6u && ntg == 16u && ntg <= simd_width) {
+        const uint expert0 = tid;
+        const uint expert1 = tid + ntg;
+        const uint expert2 = tid + 2u * ntg;
+        const uint expert3 = tid + 3u * ntg;
+        const float logit0 = logits[row_base + expert0];
+        const float logit1 = logits[row_base + expert1];
+        const float logit2 = logits[row_base + expert2];
+        const float logit3 = logits[row_base + expert3];
+        const float local_max = max(max(logit0, logit1), max(logit2, logit3));
+        const float max_logit = simd_max(local_max);
+        const float exp0 = exp(logit0 - max_logit);
+        const float exp1 = exp(logit1 - max_logit);
+        const float exp2 = exp(logit2 - max_logit);
+        const float exp3 = exp(logit3 - max_logit);
+        const float total_sum = simd_sum(exp0 + exp1 + exp2 + exp3);
+        const float inv_sum = 1.0f / total_sum;
+        const float prob0 = exp0 * inv_sum;
+        const float prob1 = exp1 * inv_sum;
+        const float prob2 = exp2 * inv_sum;
+        const float prob3 = exp3 * inv_sum;
+        probs[row_base + expert0] = prob0;
+        probs[row_base + expert1] = prob1;
+        probs[row_base + expert2] = prob2;
+        probs[row_base + expert3] = prob3;
+
+        const uint score_bits0 = as_type<uint>(prob0);
+        const uint score_bits1 = as_type<uint>(prob1);
+        const uint score_bits2 = as_type<uint>(prob2);
+        const uint score_bits3 = as_type<uint>(prob3);
+        const uint inverse0 = 0xffffffffu - expert0;
+        const uint inverse1 = 0xffffffffu - expert1;
+        const uint inverse2 = 0xffffffffu - expert2;
+        const uint inverse3 = 0xffffffffu - expert3;
+        uint selected0 = 0xffffffffu;
+        uint selected1 = 0xffffffffu;
+        uint selected2 = 0xffffffffu;
+        uint selected3 = 0xffffffffu;
+        uint selected4 = 0xffffffffu;
+        uint selected5 = 0xffffffffu;
+        for (uint rank = 0u; rank < 6u; ++rank) {
+            uint local_score_bits = 0u;
+            uint local_inverse_expert = 0u;
+            if (expert0 != selected0 && expert0 != selected1 && expert0 != selected2 &&
+                expert0 != selected3 && expert0 != selected4 && expert0 != selected5 &&
+                uocr_moe_router_topk_bits_better(score_bits0, inverse0, local_score_bits, local_inverse_expert)) {
+                local_score_bits = score_bits0;
+                local_inverse_expert = inverse0;
+            }
+            if (expert1 != selected0 && expert1 != selected1 && expert1 != selected2 &&
+                expert1 != selected3 && expert1 != selected4 && expert1 != selected5 &&
+                uocr_moe_router_topk_bits_better(score_bits1, inverse1, local_score_bits, local_inverse_expert)) {
+                local_score_bits = score_bits1;
+                local_inverse_expert = inverse1;
+            }
+            if (expert2 != selected0 && expert2 != selected1 && expert2 != selected2 &&
+                expert2 != selected3 && expert2 != selected4 && expert2 != selected5 &&
+                uocr_moe_router_topk_bits_better(score_bits2, inverse2, local_score_bits, local_inverse_expert)) {
+                local_score_bits = score_bits2;
+                local_inverse_expert = inverse2;
+            }
+            if (expert3 != selected0 && expert3 != selected1 && expert3 != selected2 &&
+                expert3 != selected3 && expert3 != selected4 && expert3 != selected5 &&
+                uocr_moe_router_topk_bits_better(score_bits3, inverse3, local_score_bits, local_inverse_expert)) {
+                local_score_bits = score_bits3;
+                local_inverse_expert = inverse3;
+            }
+            const uint simd_score_bits = simd_max(local_score_bits);
+            const uint simd_inverse_expert = simd_max(local_score_bits == simd_score_bits ? local_inverse_expert : 0u);
+            const uint best_expert = 0xffffffffu - simd_inverse_expert;
+            if (rank == 0u) {
+                selected0 = best_expert;
+            } else if (rank == 1u) {
+                selected1 = best_expert;
+            } else if (rank == 2u) {
+                selected2 = best_expert;
+            } else if (rank == 3u) {
+                selected3 = best_expert;
+            } else if (rank == 4u) {
+                selected4 = best_expert;
+            } else {
+                selected5 = best_expert;
+            }
+            if (lane == 0u) {
+                top_expert_ids[token * 6u + rank] = best_expert;
+                top_weights[token * 6u + rank] = as_type<float>(simd_score_bits);
+            }
+        }
+        return;
+    }
+
     threadgroup float *scores = scratch;
     threadgroup float *partials = scratch + experts;
     threadgroup uint *indices = (threadgroup uint *)(scratch + experts + ntg);
 
     float local_max = -INFINITY;
-    const uint row_base = token * experts;
     for (uint expert = tid; expert < experts; expert += ntg) {
         const float value = logits[row_base + expert];
         scores[expert] = value;
@@ -2799,44 +2894,185 @@ static inline float uocr_moe_router_dot_f16(device const half *src,
     }
     const float total_sum = uocr_threadgroup_sum(local_sum, partials, tid, ntg, simd_width);
     const float inv_sum = 1.0f / total_sum;
+    uint owned_score_bits = 0u;
     for (uint expert = tid; expert < experts; expert += ntg) {
         const float prob = scores[expert] * inv_sum;
         scores[expert] = prob;
         probs[row_base + expert] = prob;
         indices[expert] = expert;
+        if (expert == tid) {
+            owned_score_bits = as_type<uint>(prob);
+        }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // OCR only needs top-6 from 64 experts, but use the same bitonic
-    // index-sort shape as DS4's router/argsort kernels instead of a serial
-    // thread-0 scan. This keeps selection deterministic for equal
-    // probabilities by preferring the lower expert id; the routed sum is
-    // commutative, so descending score order is only a diagnostic convention.
-    for (uint k = 2u; k <= experts; k <<= 1u) {
-        for (uint j = k >> 1u; j > 0u; j >>= 1u) {
-            const uint other = tid ^ j;
-            if (other > tid && other < experts) {
-                const uint a = indices[tid];
-                const uint b = indices[other];
-                bool swap = false;
-                if ((tid & k) == 0u) {
-                    swap = uocr_moe_router_topk_better(scores, b, a);
-                } else {
-                    swap = uocr_moe_router_topk_better(scores, a, b);
+    // OCR only needs top-6 from 64 experts.  Select each rank with a
+    // deterministic repeated argmax instead of sorting the whole row.  The
+    // tuple key is (score_bits, inverse_expert_id): for nonnegative softmax
+    // probabilities, unsigned score bits preserve higher-score priority and
+    // exact ties select the lower expert id.  Prefer a one-SIMD greedy top-6
+    // path: each lane owns multiple experts, SIMD reductions find each rank,
+    // and the selected ids stay in registers.  This replaces the previous
+    // full-row bitonic sort and avoids top-k threadgroup barriers.
+    if (ntg == experts && top_k <= 6u) {
+        const uint simdgroups = uocr_simdgroups_for_threadgroup(ntg, simd_width);
+        const uint simdgroup = uocr_simdgroup_from_tid(tid, simd_width);
+        threadgroup uint *selected_ids = indices;
+        threadgroup uint *group_score_bits = indices + 6u;
+        threadgroup uint *group_inverse_experts = group_score_bits + simdgroups;
+        const uint inverse_expert = 0xffffffffu - tid;
+        for (uint rank = 0u; rank < top_k; ++rank) {
+            bool already_selected = false;
+            for (uint prev = 0u; prev < rank; ++prev) {
+                if (selected_ids[prev] == tid) {
+                    already_selected = true;
                 }
-                if (swap) {
-                    indices[tid] = b;
-                    indices[other] = a;
+            }
+            const uint local_score_bits = already_selected ? 0u : owned_score_bits;
+            const uint local_inverse_expert = already_selected ? 0u : inverse_expert;
+            const uint simd_score_bits = simd_max(local_score_bits);
+            const uint simd_inverse_expert = simd_max(local_score_bits == simd_score_bits ? local_inverse_expert : 0u);
+            if (lane == 0u) {
+                group_score_bits[simdgroup] = simd_score_bits;
+                group_inverse_experts[simdgroup] = simd_inverse_expert;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            if (tid == 0u) {
+                uint best_score_bits = 0u;
+                uint best_inverse_expert = 0u;
+                for (uint group = 0u; group < simdgroups; ++group) {
+                    const uint score_bits = group_score_bits[group];
+                    const uint group_inverse_expert = group_inverse_experts[group];
+                    if (uocr_moe_router_topk_bits_better(score_bits,
+                                                         group_inverse_expert,
+                                                         best_score_bits,
+                                                         best_inverse_expert)) {
+                        best_score_bits = score_bits;
+                        best_inverse_expert = group_inverse_expert;
+                    }
                 }
+                const uint best_expert = 0xffffffffu - best_inverse_expert;
+                selected_ids[rank] = best_expert;
+                top_expert_ids[token * top_k + rank] = best_expert;
+                top_weights[token * top_k + rank] = as_type<float>(best_score_bits);
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
+        return;
     }
 
-    if (tid < top_k) {
-        const uint expert = indices[tid];
-        top_expert_ids[token * top_k + tid] = expert;
-        top_weights[token * top_k + tid] = scores[expert];
+    if (ntg <= simd_width && top_k <= 6u) {
+        uint selected0 = 0xffffffffu;
+        uint selected1 = 0xffffffffu;
+        uint selected2 = 0xffffffffu;
+        uint selected3 = 0xffffffffu;
+        uint selected4 = 0xffffffffu;
+        uint selected5 = 0xffffffffu;
+        for (uint rank = 0u; rank < top_k; ++rank) {
+            uint local_score_bits = 0u;
+            uint local_inverse_expert = 0u;
+            for (uint expert = tid; expert < experts; expert += ntg) {
+                const bool already_selected =
+                    (rank > 0u && expert == selected0) ||
+                    (rank > 1u && expert == selected1) ||
+                    (rank > 2u && expert == selected2) ||
+                    (rank > 3u && expert == selected3) ||
+                    (rank > 4u && expert == selected4) ||
+                    (rank > 5u && expert == selected5);
+                if (!already_selected) {
+                    const uint score_bits = as_type<uint>(scores[expert]);
+                    const uint inverse_expert = 0xffffffffu - expert;
+                    if (uocr_moe_router_topk_bits_better(score_bits,
+                                                         inverse_expert,
+                                                         local_score_bits,
+                                                         local_inverse_expert)) {
+                        local_score_bits = score_bits;
+                        local_inverse_expert = inverse_expert;
+                    }
+                }
+            }
+            const uint simd_score_bits = simd_max(local_score_bits);
+            const uint simd_inverse_expert = simd_max(local_score_bits == simd_score_bits ? local_inverse_expert : 0u);
+            const uint best_expert = 0xffffffffu - simd_inverse_expert;
+            if (rank == 0u) {
+                selected0 = best_expert;
+            } else if (rank == 1u) {
+                selected1 = best_expert;
+            } else if (rank == 2u) {
+                selected2 = best_expert;
+            } else if (rank == 3u) {
+                selected3 = best_expert;
+            } else if (rank == 4u) {
+                selected4 = best_expert;
+            } else {
+                selected5 = best_expert;
+            }
+            if (lane == 0u) {
+                top_expert_ids[token * top_k + rank] = best_expert;
+                top_weights[token * top_k + rank] = scores[best_expert];
+            }
+        }
+        return;
+    }
+
+    const uint simdgroups = uocr_simdgroups_for_threadgroup(ntg, simd_width);
+    const uint simdgroup = uocr_simdgroup_from_tid(tid, simd_width);
+    threadgroup uint *selected_ids = indices;
+    const uint selected_words = (top_k + 1u) & ~1u;
+    threadgroup uint *group_score_bits = indices + selected_words;
+    threadgroup uint *group_inverse_experts = group_score_bits + simdgroups;
+    for (uint rank = 0u; rank < top_k; ++rank) {
+        uint local_score_bits = 0u;
+        uint local_inverse_expert = 0u;
+        for (uint expert = tid; expert < experts; expert += ntg) {
+            bool already_selected = false;
+            for (uint prev = 0u; prev < rank; ++prev) {
+                if (selected_ids[prev] == expert) {
+                    already_selected = true;
+                }
+            }
+            if (!already_selected) {
+                const uint score_bits = as_type<uint>(scores[expert]);
+                const uint inverse_expert = 0xffffffffu - expert;
+                if (uocr_moe_router_topk_bits_better(score_bits,
+                                                     inverse_expert,
+                                                     local_score_bits,
+                                                     local_inverse_expert)) {
+                    local_score_bits = score_bits;
+                    local_inverse_expert = inverse_expert;
+                }
+            }
+        }
+
+        const uint simd_score_bits = simd_max(local_score_bits);
+        const uint simd_inverse_expert = simd_max(local_score_bits == simd_score_bits ? local_inverse_expert : 0u);
+        if (lane == 0u) {
+            group_score_bits[simdgroup] = simd_score_bits;
+            group_inverse_experts[simdgroup] = simd_inverse_expert;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (tid == 0u) {
+            uint best_score_bits = 0u;
+            uint best_inverse_expert = 0u;
+            for (uint group = 0u; group < simdgroups; ++group) {
+                const uint score_bits = group_score_bits[group];
+                const uint inverse_expert = group_inverse_experts[group];
+                if (uocr_moe_router_topk_bits_better(score_bits,
+                                                     inverse_expert,
+                                                     best_score_bits,
+                                                     best_inverse_expert)) {
+                    best_score_bits = score_bits;
+                    best_inverse_expert = inverse_expert;
+                }
+            }
+            const uint best_expert = 0xffffffffu - best_inverse_expert;
+            selected_ids[rank] = best_expert;
+            top_expert_ids[token * top_k + rank] = best_expert;
+            top_weights[token * top_k + rank] = scores[best_expert];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 }
 
