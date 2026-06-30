@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from threading import RLock
 from typing import Any, Iterable, Literal, Sequence
 import json
 import math
@@ -38,6 +39,13 @@ GLOBAL_VISUAL_TOKENS = (GLOBAL_QUERIES + 1) * GLOBAL_QUERIES + 1
 
 SINGLE_PROMPT = "<image>document parsing."
 MULTI_PROMPT = "<image>Multi page parsing."
+EXPECTED_OUTPUT_IDS_NPY = "expected_output_ids.npy"
+EXPECTED_TEXT_TXT = "expected_text.txt"
+
+_TOKENIZER_CACHE_LOCK = RLock()
+_TOKENIZER_CACHE: dict[str, tuple[tuple[Any, ...], Tokenizer]] = {}
+_TOKENIZER_VALIDATION_CACHE: set[tuple[str, tuple[Any, ...]]] = set()
+_EOS_TEXT_CACHE: dict[tuple[str, tuple[Any, ...]], str] = {}
 
 ViewKind = Literal["global", "local"]
 PixelFormat = Literal["f16_nchw", "f32_nchw"]
@@ -104,6 +112,8 @@ class PreparedRequest:
     tokenizer_path: str
     source_images: tuple[dict[str, Any], ...] = ()
     model_vocab_size: int = MODEL_VOCAB_SIZE
+    expected_output_ids: NDArray[np.int32] | None = None
+    expected_text: str | None = None
 
     @property
     def n_tokens(self) -> int:
@@ -114,7 +124,7 @@ class PreparedRequest:
         return int(self.image_mask.sum(dtype=np.uint64))
 
     def manifest(self) -> dict[str, Any]:
-        return {
+        manifest: dict[str, Any] = {
             "version": 1,
             "mode": self.mode,
             "prompt": self.prompt,
@@ -144,6 +154,17 @@ class PreparedRequest:
                 for i, view in enumerate(self.views)
             ],
         }
+        expected_output: dict[str, Any] = {}
+        if self.expected_output_ids is not None:
+            ids = np.asarray(self.expected_output_ids, dtype=np.int32)
+            expected_output["ids_file"] = EXPECTED_OUTPUT_IDS_NPY
+            expected_output["ids_dtype"] = str(ids.dtype)
+            expected_output["ids_shape"] = list(ids.shape)
+        if self.expected_text is not None:
+            expected_output["text_file"] = EXPECTED_TEXT_TXT
+        if expected_output:
+            manifest["expected_output"] = expected_output
+        return manifest
 
 
 def project_root() -> Path:
@@ -170,14 +191,48 @@ def _load_json(path: Path) -> dict[str, Any]:
     return data
 
 
-def load_tokenizer(tokenizer_path: str | Path | None = None) -> Tokenizer:
+def _resolve_tokenizer_path(tokenizer_path: str | Path | None = None) -> Path:
     path = Path(tokenizer_path) if tokenizer_path is not None else default_tokenizer_path()
+    return path.expanduser().resolve()
+
+
+def _file_identity(path: Path) -> tuple[int, int, int, int]:
+    stat = path.stat()
+    return (int(stat.st_dev), int(stat.st_ino), int(stat.st_size), int(stat.st_mtime_ns))
+
+
+def _tokenizer_file_identity(path: Path) -> tuple[Any, ...]:
+    config_path = path.with_name("config.json")
+    config_identity: tuple[int, int, int, int] | None = _file_identity(config_path) if config_path.exists() else None
+    return (_file_identity(path), config_identity)
+
+
+def load_tokenizer(tokenizer_path: str | Path | None = None) -> Tokenizer:
+    path = _resolve_tokenizer_path(tokenizer_path)
+    identity = _tokenizer_file_identity(path)
+    cache_key = str(path)
+    with _TOKENIZER_CACHE_LOCK:
+        cached = _TOKENIZER_CACHE.get(cache_key)
+        if cached is not None and cached[0] == identity:
+            return cached[1]
+
     tokenizer = Tokenizer.from_file(str(path))
     validate_tokenizer(tokenizer, path)
+    with _TOKENIZER_CACHE_LOCK:
+        _TOKENIZER_CACHE[cache_key] = (identity, tokenizer)
     return tokenizer
 
 
 def validate_tokenizer(tokenizer: Tokenizer, tokenizer_path: str | Path | None = None) -> None:
+    validation_key: tuple[str, tuple[Any, ...]] | None = None
+    validation_cached = False
+    path: Path | None = None
+    if tokenizer_path is not None:
+        path = _resolve_tokenizer_path(tokenizer_path)
+        validation_key = (str(path), _tokenizer_file_identity(path))
+        with _TOKENIZER_CACHE_LOCK:
+            validation_cached = validation_key in _TOKENIZER_VALIDATION_CACHE
+
     base_vocab = tokenizer.get_vocab_size(with_added_tokens=False)
     if base_vocab != BPE_VOCAB_SIZE:
         raise ValueError(f"BPE vocab size mismatch: expected {BPE_VOCAB_SIZE}, got {base_vocab}")
@@ -191,18 +246,41 @@ def validate_tokenizer(tokenizer: Tokenizer, tokenizer_path: str | Path | None =
     if tokenizer.token_to_id(IMAGE_TOKEN) != IMAGE_TOKEN_ID:
         raise ValueError("<image> token id mismatch")
 
-    if tokenizer_path is not None:
-        raw = _load_json(Path(tokenizer_path))
+    if validation_cached:
+        return
+
+    if path is not None:
+        raw = _load_json(path)
         added = raw.get("added_tokens", [])
         if len(added) != ADDED_TOKEN_COUNT:
             raise ValueError(f"added token count mismatch: expected {ADDED_TOKEN_COUNT}, got {len(added)}")
 
-        config_path = Path(tokenizer_path).with_name("config.json")
+        config_path = path.with_name("config.json")
         if config_path.exists():
             config = _load_json(config_path)
             vocab_size = int(config.get("vocab_size", -1))
             if vocab_size != MODEL_VOCAB_SIZE:
                 raise ValueError(f"model vocab_size mismatch: expected {MODEL_VOCAB_SIZE}, got {vocab_size}")
+
+    if validation_key is not None:
+        with _TOKENIZER_CACHE_LOCK:
+            _TOKENIZER_VALIDATION_CACHE.add(validation_key)
+
+
+def cached_eos_text(tokenizer_path: str | Path | None = None) -> str:
+    path = _resolve_tokenizer_path(tokenizer_path)
+    identity = _tokenizer_file_identity(path)
+    cache_key = (str(path), identity)
+    with _TOKENIZER_CACHE_LOCK:
+        cached = _EOS_TEXT_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+
+    tokenizer = load_tokenizer(path)
+    eos_text = tokenizer.decode([EOS_TOKEN_ID], skip_special_tokens=False)
+    with _TOKENIZER_CACHE_LOCK:
+        _EOS_TEXT_CACHE[cache_key] = eos_text
+    return eos_text
 
 
 def format_messages_plain(conversations: Sequence[dict[str, Any]], system_prompt: str = "") -> str:
@@ -388,7 +466,7 @@ def prepare_image(image: ImageInput,
                   no_repeat_window: int = 128,
                   dtype: np.dtype[Any] | type[np.float16] | type[np.float32] = np.float16) -> PreparedRequest:
     cfg = _resolve_preset(preset)
-    tokenizer_path_resolved = Path(tokenizer_path) if tokenizer_path is not None else default_tokenizer_path()
+    tokenizer_path_resolved = _resolve_tokenizer_path(tokenizer_path)
     tokenizer = load_tokenizer(tokenizer_path_resolved)
     rendered = render_prompt(prompt)
     pil_image, source_metadata = _load_image_with_metadata(image, source_index=0)
@@ -446,7 +524,7 @@ def prepare_pages(images: Sequence[ImageInput],
     if image_size != GLOBAL_VIEW_SIZE:
         raise ValueError("v1 multi-page frontend supports only 1024x1024 global views")
 
-    tokenizer_path_resolved = Path(tokenizer_path) if tokenizer_path is not None else default_tokenizer_path()
+    tokenizer_path_resolved = _resolve_tokenizer_path(tokenizer_path)
     tokenizer = load_tokenizer(tokenizer_path_resolved)
     rendered = render_prompt(prompt)
 
@@ -485,7 +563,7 @@ def prepare_text(prompt: str,
                  max_new_tokens: int | None = None,
                  no_repeat_ngram_size: int = 0,
                  no_repeat_window: int = 0) -> PreparedRequest:
-    tokenizer_path_resolved = Path(tokenizer_path) if tokenizer_path is not None else default_tokenizer_path()
+    tokenizer_path_resolved = _resolve_tokenizer_path(tokenizer_path)
     tokenizer = load_tokenizer(tokenizer_path_resolved)
     rendered = render_prompt(prompt)
     input_ids, image_mask = _build_token_sequence(tokenizer, rendered, [])
@@ -510,6 +588,13 @@ def prepare_text(prompt: str,
 def save_prepared_request(request: PreparedRequest, out_dir: str | Path) -> None:
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
+    if request.expected_output_ids is not None:
+        expected_ids = np.ascontiguousarray(request.expected_output_ids, dtype=np.int32)
+        if expected_ids.ndim != 1:
+            raise ValueError(f"expected_output_ids must be a 1D int32 array, got shape {expected_ids.shape}")
+        np.save(out / EXPECTED_OUTPUT_IDS_NPY, expected_ids)
+    if request.expected_text is not None:
+        (out / EXPECTED_TEXT_TXT).write_text(request.expected_text, encoding="utf-8")
     (out / "manifest.json").write_text(json.dumps(request.manifest(), indent=2, sort_keys=True) + "\n", encoding="utf-8")
     np.save(out / "input_ids.npy", request.input_ids)
     np.save(out / "image_mask.npy", request.image_mask)

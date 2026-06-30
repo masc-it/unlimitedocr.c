@@ -1,3 +1,4 @@
+#define UOCR_METAL_ENABLE_DIAGNOSTIC_API 1
 #include "backend/metal/uocr_metal.h"
 #include "model/uocr_constants.h"
 #include "model/uocr_model_file.h"
@@ -5,6 +6,7 @@
 #include "runtime/uocr_memory.h"
 #include "runtime/uocr_request_validation.h"
 #include "runtime/uocr_sequence.h"
+#include "quant/uocr_quant.h"
 #include "unlimitedocr.h"
 
 #include "uocr_test_model_file.h"
@@ -55,6 +57,37 @@ static int test_metal_smoke(void) {
     memset(error, 0, sizeof(error));
     CHECK(uocr_metal_smoke_test(UOCR_TEST_METAL_RESOURCE_PATH, error, sizeof(error)) == 1);
     CHECK(error[0] == '\0');
+    return 0;
+}
+
+static int test_metal_compile_all_kernels(void) {
+    if (!uocr_metal_is_available()) {
+        return 0;
+    }
+
+    char error[1024];
+    memset(error, 0, sizeof(error));
+    uocr_metal_context *ctx = uocr_metal_context_create(UOCR_TEST_METAL_RESOURCE_PATH, error, sizeof(error));
+    CHECK(ctx != NULL);
+    CHECK(error[0] == '\0');
+
+    const uint32_t function_count = uocr_metal_context_library_function_count(ctx);
+    CHECK(function_count > 0u);
+    CHECK(uocr_metal_context_pipeline_cache_count(ctx) == 0u);
+
+    uint32_t pipeline_count = 0u;
+    CHECK(uocr_metal_context_compile_all_pipelines(ctx, &pipeline_count, error, sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    CHECK(pipeline_count == function_count);
+    CHECK(uocr_metal_context_pipeline_cache_count(ctx) == function_count);
+
+    uint32_t second_count = 0u;
+    CHECK(uocr_metal_context_compile_all_pipelines(ctx, &second_count, error, sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    CHECK(second_count == function_count);
+    CHECK(uocr_metal_context_pipeline_cache_count(ctx) == function_count);
+
+    uocr_metal_context_destroy(ctx);
     return 0;
 }
 
@@ -452,7 +485,7 @@ static int test_metal_sam_patch_embed_f16(void) {
 
     uint32_t grid_w = 0u;
     uint32_t grid_h = 0u;
-    CHECK(uocr_metal_context_sam_patch_embed_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_sam_patch_embed_f16(ctx,
                                                  pixels_f32,
                                                  UOCR_PIXEL_F32_NCHW,
                                                  WIDTH,
@@ -495,7 +528,7 @@ static int test_metal_sam_patch_embed_f16(void) {
         }
     }
     weights[sam_patch_weight_index(5u, 2u, 3u, 4u)] = f32_to_f16_bits(1.0f);
-    CHECK(uocr_metal_context_sam_patch_embed_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_sam_patch_embed_f16(ctx,
                                                  pixels_f16,
                                                  UOCR_PIXEL_F16_NCHW,
                                                  PATCH,
@@ -512,7 +545,7 @@ static int test_metal_sam_patch_embed_f16(void) {
     CHECK(out[5u] == f32_to_f16_bits(207.0f));
     CHECK(out[7u] == f32_to_f16_bits(0.0f));
 
-    CHECK(uocr_metal_context_sam_patch_embed_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_sam_patch_embed_f16(ctx,
                                                  pixels_f32,
                                                  UOCR_PIXEL_F32_NCHW,
                                                  17u,
@@ -625,7 +658,7 @@ static int test_metal_sam_abs_pos_f16(void) {
     uocr_metal_context *ctx = uocr_metal_context_create(UOCR_TEST_METAL_RESOURCE_PATH, error, sizeof(error));
     CHECK(ctx != NULL);
 
-    CHECK(uocr_metal_context_sam_add_abs_pos_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_sam_add_abs_pos_f16(ctx,
                                                  global_patch,
                                                  pos,
                                                  SRC_GRID,
@@ -648,7 +681,7 @@ static int test_metal_sam_abs_pos_f16(void) {
         }
     }
 
-    CHECK(uocr_metal_context_sam_add_abs_pos_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_sam_add_abs_pos_f16(ctx,
                                                  local_patch,
                                                  pos,
                                                  LOCAL_GRID,
@@ -673,7 +706,7 @@ static int test_metal_sam_abs_pos_f16(void) {
         }
     }
 
-    CHECK(uocr_metal_context_sam_add_abs_pos_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_sam_add_abs_pos_f16(ctx,
                                                  local_patch,
                                                  pos,
                                                  LOCAL_GRID,
@@ -727,7 +760,7 @@ static int test_metal_sam_layernorm_f16(void) {
     uocr_metal_context *ctx = uocr_metal_context_create(UOCR_TEST_METAL_RESOURCE_PATH, error, sizeof(error));
     CHECK(ctx != NULL);
 
-    CHECK(uocr_metal_context_sam_layernorm_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_sam_layernorm_f16(ctx,
                                                input,
                                                weight,
                                                bias,
@@ -748,7 +781,7 @@ static int test_metal_sam_layernorm_f16(void) {
         }
     }
 
-    CHECK(uocr_metal_context_sam_layernorm_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_sam_layernorm_f16(ctx,
                                                input,
                                                weight,
                                                bias,
@@ -767,7 +800,7 @@ static int test_metal_sam_layernorm_f16(void) {
         }
     }
 
-    CHECK(uocr_metal_context_sam_layernorm_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_sam_layernorm_f16(ctx,
                                                input,
                                                weight,
                                                bias,
@@ -832,7 +865,7 @@ static int test_metal_sam_neck_conv1x1_f16(void) {
     uocr_metal_context *ctx = uocr_metal_context_create(UOCR_TEST_METAL_RESOURCE_PATH, error, sizeof(error));
     CHECK(ctx != NULL);
 
-    CHECK(uocr_metal_context_sam_neck_conv1x1_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_sam_neck_conv1x1_f16(ctx,
                                                    input,
                                                    weight,
                                                    GRID_W,
@@ -866,7 +899,7 @@ static int test_metal_sam_neck_conv1x1_f16(void) {
         CHECK(fabsf(out_f32[idx] - expected) <= 2.0e-5f);
     }
 
-    CHECK(uocr_metal_context_sam_neck_conv1x1_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_sam_neck_conv1x1_f16(ctx,
                                                    input,
                                                    weight,
                                                    GRID_W,
@@ -887,7 +920,7 @@ static int test_metal_sam_neck_conv1x1_f16(void) {
         CHECK(fabsf(f16_bits_to_f32(out_f16[idx]) - expected) <= 8.0e-4f);
     }
 
-    CHECK(uocr_metal_context_sam_neck_conv1x1_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_sam_neck_conv1x1_f16(ctx,
                                                    input,
                                                    NULL,
                                                    GRID_W,
@@ -898,7 +931,7 @@ static int test_metal_sam_neck_conv1x1_f16(void) {
                                                    sizeof(error)) == 0);
     CHECK(strstr(error, "invalid Metal SAM neck 1x1") != NULL);
 
-    CHECK(uocr_metal_context_sam_neck_conv1x1_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_sam_neck_conv1x1_f16(ctx,
                                                    input,
                                                    weight,
                                                    UOCR_SAM_MAX_GRID_SIZE + 1u,
@@ -972,7 +1005,7 @@ static int test_metal_sam_neck_conv3x3_f16(void) {
     uocr_metal_context *ctx = uocr_metal_context_create(UOCR_TEST_METAL_RESOURCE_PATH, error, sizeof(error));
     CHECK(ctx != NULL);
 
-    CHECK(uocr_metal_context_sam_neck_conv3x3_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_sam_neck_conv3x3_f16(ctx,
                                                    input,
                                                    weight,
                                                    GRID_W,
@@ -1007,7 +1040,7 @@ static int test_metal_sam_neck_conv3x3_f16(void) {
         CHECK(fabsf(out_f32[idx] - expected) <= 5.0e-4f);
     }
 
-    CHECK(uocr_metal_context_sam_neck_conv3x3_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_sam_neck_conv3x3_f16(ctx,
                                                    input,
                                                    weight,
                                                    GRID_W,
@@ -1029,7 +1062,7 @@ static int test_metal_sam_neck_conv3x3_f16(void) {
         CHECK(fabsf(f16_bits_to_f32(out_f16[idx]) - expected) <= 2.0e-3f);
     }
 
-    CHECK(uocr_metal_context_sam_layernorm2d_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_sam_layernorm2d_f16(ctx,
                                                   out_f16,
                                                   ln_weight,
                                                   ln_bias,
@@ -1054,7 +1087,7 @@ static int test_metal_sam_neck_conv3x3_f16(void) {
         CHECK(fabsf(ln_out_f32[idx] - expected) <= 1.2e-4f);
     }
 
-    CHECK(uocr_metal_context_sam_layernorm2d_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_sam_layernorm2d_f16(ctx,
                                                   out_f16,
                                                   ln_weight,
                                                   ln_bias,
@@ -1079,7 +1112,7 @@ static int test_metal_sam_neck_conv3x3_f16(void) {
         CHECK(fabsf(f16_bits_to_f32(ln_out_f16[idx]) - expected) <= 2.0e-3f);
     }
 
-    CHECK(uocr_metal_context_sam_neck_conv3x3_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_sam_neck_conv3x3_f16(ctx,
                                                    input,
                                                    NULL,
                                                    GRID_W,
@@ -1090,7 +1123,7 @@ static int test_metal_sam_neck_conv3x3_f16(void) {
                                                    sizeof(error)) == 0);
     CHECK(strstr(error, "invalid Metal SAM neck 3x3") != NULL);
 
-    CHECK(uocr_metal_context_sam_neck_conv3x3_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_sam_neck_conv3x3_f16(ctx,
                                                    input,
                                                    weight,
                                                    UOCR_SAM_MAX_GRID_SIZE + 1u,
@@ -1174,7 +1207,7 @@ static int test_metal_sam_layernorm2d_f16(void) {
     uocr_metal_context *ctx = uocr_metal_context_create(UOCR_TEST_METAL_RESOURCE_PATH, error, sizeof(error));
     CHECK(ctx != NULL);
 
-    CHECK(uocr_metal_context_sam_layernorm2d_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_sam_layernorm2d_f16(ctx,
                                                   input,
                                                   weight,
                                                   bias,
@@ -1211,7 +1244,7 @@ static int test_metal_sam_layernorm2d_f16(void) {
         CHECK(fabsf(out_f32[idx] - expected) <= 8.0e-5f);
     }
 
-    CHECK(uocr_metal_context_sam_layernorm2d_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_sam_layernorm2d_f16(ctx,
                                                   input,
                                                   weight,
                                                   bias,
@@ -1235,7 +1268,7 @@ static int test_metal_sam_layernorm2d_f16(void) {
         CHECK(fabsf(f16_bits_to_f32(out_f16[idx]) - expected) <= 2.0e-3f);
     }
 
-    CHECK(uocr_metal_context_sam_layernorm2d_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_sam_layernorm2d_f16(ctx,
                                                   input,
                                                   weight,
                                                   NULL,
@@ -1247,7 +1280,7 @@ static int test_metal_sam_layernorm2d_f16(void) {
                                                   sizeof(error)) == 0);
     CHECK(strstr(error, "invalid Metal SAM LayerNorm2d") != NULL);
 
-    CHECK(uocr_metal_context_sam_layernorm2d_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_sam_layernorm2d_f16(ctx,
                                                   input,
                                                   weight,
                                                   bias,
@@ -1323,7 +1356,7 @@ static int test_metal_sam_net2_conv3x3_stride2_f16(void) {
     uocr_metal_context *ctx = uocr_metal_context_create(UOCR_TEST_METAL_RESOURCE_PATH, error, sizeof(error));
     CHECK(ctx != NULL);
 
-    CHECK(uocr_metal_context_sam_net2_conv3x3_stride2_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_sam_net2_conv3x3_stride2_f16(ctx,
                                                            input,
                                                            weight,
                                                            GRID_W,
@@ -1358,7 +1391,7 @@ static int test_metal_sam_net2_conv3x3_stride2_f16(void) {
         CHECK(fabsf(out_f32[idx] - expected) <= 5.0e-4f);
     }
 
-    CHECK(uocr_metal_context_sam_net2_conv3x3_stride2_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_sam_net2_conv3x3_stride2_f16(ctx,
                                                            input,
                                                            weight,
                                                            GRID_W,
@@ -1380,7 +1413,7 @@ static int test_metal_sam_net2_conv3x3_stride2_f16(void) {
         CHECK(fabsf(f16_bits_to_f32(out_f16[idx]) - expected) <= 2.0e-3f);
     }
 
-    CHECK(uocr_metal_context_sam_net2_conv3x3_stride2_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_sam_net2_conv3x3_stride2_f16(ctx,
                                                            input,
                                                            NULL,
                                                            GRID_W,
@@ -1391,7 +1424,7 @@ static int test_metal_sam_net2_conv3x3_stride2_f16(void) {
                                                            sizeof(error)) == 0);
     CHECK(strstr(error, "invalid Metal SAM net_2") != NULL);
 
-    CHECK(uocr_metal_context_sam_net2_conv3x3_stride2_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_sam_net2_conv3x3_stride2_f16(ctx,
                                                            input,
                                                            weight,
                                                            UOCR_SAM_MAX_GRID_SIZE + 1u,
@@ -1466,7 +1499,7 @@ static int test_metal_sam_net3_conv3x3_stride2_f16(void) {
     uocr_metal_context *ctx = uocr_metal_context_create(UOCR_TEST_METAL_RESOURCE_PATH, error, sizeof(error));
     CHECK(ctx != NULL);
 
-    CHECK(uocr_metal_context_sam_net3_conv3x3_stride2_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_sam_net3_conv3x3_stride2_f16(ctx,
                                                            input,
                                                            weight,
                                                            GRID_W,
@@ -1501,7 +1534,7 @@ static int test_metal_sam_net3_conv3x3_stride2_f16(void) {
         CHECK(fabsf(out_f32[idx] - expected) <= 8.0e-4f);
     }
 
-    CHECK(uocr_metal_context_sam_net3_conv3x3_stride2_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_sam_net3_conv3x3_stride2_f16(ctx,
                                                            input,
                                                            weight,
                                                            GRID_W,
@@ -1523,7 +1556,7 @@ static int test_metal_sam_net3_conv3x3_stride2_f16(void) {
         CHECK(fabsf(f16_bits_to_f32(out_f16[idx]) - expected) <= 2.5e-3f);
     }
 
-    CHECK(uocr_metal_context_sam_net3_conv3x3_stride2_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_sam_net3_conv3x3_stride2_f16(ctx,
                                                            input,
                                                            NULL,
                                                            GRID_W,
@@ -1534,7 +1567,7 @@ static int test_metal_sam_net3_conv3x3_stride2_f16(void) {
                                                            sizeof(error)) == 0);
     CHECK(strstr(error, "invalid Metal SAM net_3") != NULL);
 
-    CHECK(uocr_metal_context_sam_net3_conv3x3_stride2_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_sam_net3_conv3x3_stride2_f16(ctx,
                                                            input,
                                                            weight,
                                                            UOCR_SAM_MAX_GRID_SIZE + 1u,
@@ -1599,7 +1632,7 @@ static int test_metal_clip_embed_sam_f16(void) {
             }
         }
 
-        CHECK(uocr_metal_context_clip_embed_sam_f16(ctx,
+        CHECK(uocr_metal_context_diagnostic_clip_embed_sam_f16(ctx,
                                                      sam_features,
                                                      class_embedding,
                                                      grid,
@@ -1634,7 +1667,7 @@ static int test_metal_clip_embed_sam_f16(void) {
             CHECK(fabsf(out_f32[out_index] - f16_bits_to_f32(expected_bits)) <= 1.0e-6f);
         }
 
-        CHECK(uocr_metal_context_clip_embed_sam_f16(ctx,
+        CHECK(uocr_metal_context_diagnostic_clip_embed_sam_f16(ctx,
                                                      sam_features,
                                                      class_embedding,
                                                      grid,
@@ -1665,7 +1698,7 @@ static int test_metal_clip_embed_sam_f16(void) {
 
     uint16_t one_value = f32_to_f16_bits(0.0f);
     float one_out = 0.0f;
-    CHECK(uocr_metal_context_clip_embed_sam_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_clip_embed_sam_f16(ctx,
                                                  &one_value,
                                                  NULL,
                                                  1u,
@@ -1676,7 +1709,7 @@ static int test_metal_clip_embed_sam_f16(void) {
                                                  sizeof(error)) == 0);
     CHECK(strstr(error, "invalid Metal CLIP SAM embedding") != NULL);
 
-    CHECK(uocr_metal_context_clip_embed_sam_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_clip_embed_sam_f16(ctx,
                                                  &one_value,
                                                  &one_value,
                                                  UOCR_CLIP_MAX_GRID_SIZE + 1u,
@@ -1739,7 +1772,7 @@ static int test_metal_clip_abs_pos_f16(void) {
             }
         }
 
-        CHECK(uocr_metal_context_clip_add_abs_pos_f16(ctx,
+        CHECK(uocr_metal_context_diagnostic_clip_add_abs_pos_f16(ctx,
                                                        input,
                                                        pos,
                                                        grid,
@@ -1768,7 +1801,7 @@ static int test_metal_clip_abs_pos_f16(void) {
             CHECK(fabsf(out_f32[idx] - expected) <= 5.0e-4f);
         }
 
-        CHECK(uocr_metal_context_clip_add_abs_pos_f16(ctx,
+        CHECK(uocr_metal_context_diagnostic_clip_add_abs_pos_f16(ctx,
                                                        input,
                                                        pos,
                                                        grid,
@@ -1792,7 +1825,7 @@ static int test_metal_clip_abs_pos_f16(void) {
 
     uint16_t one_value = f32_to_f16_bits(0.0f);
     float one_out = 0.0f;
-    CHECK(uocr_metal_context_clip_add_abs_pos_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_clip_add_abs_pos_f16(ctx,
                                                    &one_value,
                                                    NULL,
                                                    UOCR_LOCAL_GRID_QUERIES,
@@ -1803,7 +1836,7 @@ static int test_metal_clip_abs_pos_f16(void) {
                                                    sizeof(error)) == 0);
     CHECK(strstr(error, "invalid Metal CLIP abs pos") != NULL);
 
-    CHECK(uocr_metal_context_clip_add_abs_pos_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_clip_add_abs_pos_f16(ctx,
                                                    &one_value,
                                                    pos,
                                                    UOCR_LOCAL_GRID_QUERIES + 1u,
@@ -1870,7 +1903,7 @@ static int test_metal_clip_pre_layernorm_f16(void) {
             }
         }
 
-        CHECK(uocr_metal_context_clip_pre_layernorm_f16(ctx,
+        CHECK(uocr_metal_context_diagnostic_clip_pre_layernorm_f16(ctx,
                                                          input,
                                                          weight,
                                                          bias,
@@ -1893,7 +1926,7 @@ static int test_metal_clip_pre_layernorm_f16(void) {
             }
         }
 
-        CHECK(uocr_metal_context_clip_pre_layernorm_f16(ctx,
+        CHECK(uocr_metal_context_diagnostic_clip_pre_layernorm_f16(ctx,
                                                          input,
                                                          weight,
                                                          bias,
@@ -1920,7 +1953,7 @@ static int test_metal_clip_pre_layernorm_f16(void) {
 
     uint16_t one_value = f32_to_f16_bits(0.0f);
     float one_out = 0.0f;
-    CHECK(uocr_metal_context_clip_pre_layernorm_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_clip_pre_layernorm_f16(ctx,
                                                      &one_value,
                                                      NULL,
                                                      bias,
@@ -1931,7 +1964,7 @@ static int test_metal_clip_pre_layernorm_f16(void) {
                                                      sizeof(error)) == 0);
     CHECK(strstr(error, "invalid Metal CLIP pre-LayerNorm") != NULL);
 
-    CHECK(uocr_metal_context_clip_pre_layernorm_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_clip_pre_layernorm_f16(ctx,
                                                      &one_value,
                                                      weight,
                                                      bias,
@@ -1997,7 +2030,7 @@ static int test_metal_clip_layernorm_f16(void) {
             }
         }
 
-        CHECK(uocr_metal_context_clip_layernorm_f16(ctx,
+        CHECK(uocr_metal_context_diagnostic_clip_layernorm_f16(ctx,
                                                      input,
                                                      weight,
                                                      bias,
@@ -2020,7 +2053,7 @@ static int test_metal_clip_layernorm_f16(void) {
             }
         }
 
-        CHECK(uocr_metal_context_clip_layernorm_f16(ctx,
+        CHECK(uocr_metal_context_diagnostic_clip_layernorm_f16(ctx,
                                                      input,
                                                      weight,
                                                      bias,
@@ -2047,7 +2080,7 @@ static int test_metal_clip_layernorm_f16(void) {
 
     uint16_t one_value = f32_to_f16_bits(0.0f);
     float one_out = 0.0f;
-    CHECK(uocr_metal_context_clip_layernorm_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_clip_layernorm_f16(ctx,
                                                  &one_value,
                                                  NULL,
                                                  bias,
@@ -2058,7 +2091,7 @@ static int test_metal_clip_layernorm_f16(void) {
                                                  sizeof(error)) == 0);
     CHECK(strstr(error, "invalid Metal CLIP LayerNorm") != NULL);
 
-    CHECK(uocr_metal_context_clip_layernorm_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_clip_layernorm_f16(ctx,
                                                  &one_value,
                                                  weight,
                                                  bias,
@@ -2141,7 +2174,7 @@ static int test_metal_clip_qkv_f16(void) {
             }
         }
 
-        CHECK(uocr_metal_context_clip_qkv_f16(ctx,
+        CHECK(uocr_metal_context_diagnostic_clip_qkv_f16(ctx,
                                                input,
                                                weight,
                                                bias,
@@ -2174,7 +2207,7 @@ static int test_metal_clip_qkv_f16(void) {
             CHECK(fabsf(v_f32[clip_qkv_out_index(token, 3u, 9u)]) <= 1.0e-5f);
         }
 
-        CHECK(uocr_metal_context_clip_qkv_f16(ctx,
+        CHECK(uocr_metal_context_diagnostic_clip_qkv_f16(ctx,
                                                input,
                                                weight,
                                                bias,
@@ -2211,7 +2244,7 @@ static int test_metal_clip_qkv_f16(void) {
 
     uint16_t one_value = f32_to_f16_bits(0.0f);
     float one_out = 0.0f;
-    CHECK(uocr_metal_context_clip_qkv_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_clip_qkv_f16(ctx,
                                            &one_value,
                                            NULL,
                                            bias,
@@ -2224,7 +2257,7 @@ static int test_metal_clip_qkv_f16(void) {
                                            sizeof(error)) == 0);
     CHECK(strstr(error, "invalid Metal CLIP QKV") != NULL);
 
-    CHECK(uocr_metal_context_clip_qkv_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_clip_qkv_f16(ctx,
                                            &one_value,
                                            weight,
                                            bias,
@@ -2288,7 +2321,7 @@ static int test_metal_clip_attention_f16(void) {
             }
         }
 
-        CHECK(uocr_metal_context_clip_attention_f16(ctx,
+        CHECK(uocr_metal_context_diagnostic_clip_attention_f16(ctx,
                                                      q,
                                                      k,
                                                      v,
@@ -2322,7 +2355,7 @@ static int test_metal_clip_attention_f16(void) {
             CHECK(fabsf(out_f32[idx] - expected) <= 1.2e-4f);
         }
 
-        CHECK(uocr_metal_context_clip_attention_f16(ctx,
+        CHECK(uocr_metal_context_diagnostic_clip_attention_f16(ctx,
                                                      q,
                                                      k,
                                                      v,
@@ -2353,7 +2386,7 @@ static int test_metal_clip_attention_f16(void) {
 
     uint16_t one_value = f32_to_f16_bits(0.0f);
     float one_out = 0.0f;
-    CHECK(uocr_metal_context_clip_attention_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_clip_attention_f16(ctx,
                                                  &one_value,
                                                  NULL,
                                                  &one_value,
@@ -2364,7 +2397,7 @@ static int test_metal_clip_attention_f16(void) {
                                                  sizeof(error)) == 0);
     CHECK(strstr(error, "invalid Metal CLIP attention") != NULL);
 
-    CHECK(uocr_metal_context_clip_attention_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_clip_attention_f16(ctx,
                                                  &one_value,
                                                  &one_value,
                                                  &one_value,
@@ -2440,7 +2473,7 @@ static int test_metal_clip_output_projection_f16(void) {
             }
         }
 
-        CHECK(uocr_metal_context_clip_output_projection_f16(ctx,
+        CHECK(uocr_metal_context_diagnostic_clip_output_projection_f16(ctx,
                                                             input,
                                                             weight,
                                                             bias,
@@ -2471,7 +2504,7 @@ static int test_metal_clip_output_projection_f16(void) {
             CHECK(fabsf(out_f32[idx] - expected) <= 3.0e-5f);
         }
 
-        CHECK(uocr_metal_context_clip_output_projection_f16(ctx,
+        CHECK(uocr_metal_context_diagnostic_clip_output_projection_f16(ctx,
                                                             input,
                                                             weight,
                                                             bias,
@@ -2498,7 +2531,7 @@ static int test_metal_clip_output_projection_f16(void) {
 
     uint16_t one_value = f32_to_f16_bits(0.0f);
     float one_out = 0.0f;
-    CHECK(uocr_metal_context_clip_output_projection_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_clip_output_projection_f16(ctx,
                                                         &one_value,
                                                         weight,
                                                         NULL,
@@ -2509,7 +2542,7 @@ static int test_metal_clip_output_projection_f16(void) {
                                                         sizeof(error)) == 0);
     CHECK(strstr(error, "invalid Metal CLIP output projection") != NULL);
 
-    CHECK(uocr_metal_context_clip_output_projection_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_clip_output_projection_f16(ctx,
                                                         &one_value,
                                                         weight,
                                                         bias,
@@ -2520,7 +2553,7 @@ static int test_metal_clip_output_projection_f16(void) {
                                                         sizeof(error)) == 0);
     CHECK(strstr(error, "invalid Metal CLIP output projection token count") != NULL);
 
-    CHECK(uocr_metal_context_clip_output_projection_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_clip_output_projection_f16(ctx,
                                                         &one_value,
                                                         weight,
                                                         bias,
@@ -2574,7 +2607,7 @@ static int test_metal_clip_quickgelu_f16(void) {
             }
         }
 
-        CHECK(uocr_metal_context_clip_quickgelu_f16(ctx,
+        CHECK(uocr_metal_context_diagnostic_clip_quickgelu_f16(ctx,
                                                     input,
                                                     tokens,
                                                     UOCR_METAL_DENSE_OUTPUT_F32,
@@ -2599,7 +2632,7 @@ static int test_metal_clip_quickgelu_f16(void) {
             CHECK(fabsf(out_f32[idx] - expected) <= 2.0e-5f);
         }
 
-        CHECK(uocr_metal_context_clip_quickgelu_f16(ctx,
+        CHECK(uocr_metal_context_diagnostic_clip_quickgelu_f16(ctx,
                                                     input,
                                                     tokens,
                                                     UOCR_METAL_DENSE_OUTPUT_F16,
@@ -2620,7 +2653,7 @@ static int test_metal_clip_quickgelu_f16(void) {
 
     uint16_t one_value = f32_to_f16_bits(0.0f);
     float one_out = 0.0f;
-    CHECK(uocr_metal_context_clip_quickgelu_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_clip_quickgelu_f16(ctx,
                                                 NULL,
                                                 UOCR_CLIP_LOCAL_TOKENS,
                                                 UOCR_METAL_DENSE_OUTPUT_F32,
@@ -2629,7 +2662,7 @@ static int test_metal_clip_quickgelu_f16(void) {
                                                 sizeof(error)) == 0);
     CHECK(strstr(error, "invalid Metal CLIP QuickGELU") != NULL);
 
-    CHECK(uocr_metal_context_clip_quickgelu_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_clip_quickgelu_f16(ctx,
                                                 &one_value,
                                                 UOCR_CLIP_LOCAL_TOKENS - 1u,
                                                 UOCR_METAL_DENSE_OUTPUT_F32,
@@ -2638,7 +2671,7 @@ static int test_metal_clip_quickgelu_f16(void) {
                                                 sizeof(error)) == 0);
     CHECK(strstr(error, "invalid Metal CLIP QuickGELU token count") != NULL);
 
-    CHECK(uocr_metal_context_clip_quickgelu_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_clip_quickgelu_f16(ctx,
                                                 &one_value,
                                                 UOCR_CLIP_LOCAL_TOKENS,
                                                 (uocr_metal_dense_output_type)99,
@@ -2750,7 +2783,7 @@ static int test_metal_clip_mlp_f16(void) {
             }
         }
 
-        CHECK(uocr_metal_context_clip_mlp_f16(ctx,
+        CHECK(uocr_metal_context_diagnostic_clip_mlp_f16(ctx,
                                               input,
                                               fc1_weight,
                                               fc1_bias,
@@ -2798,7 +2831,7 @@ static int test_metal_clip_mlp_f16(void) {
 
     uint16_t one_value = f32_to_f16_bits(0.0f);
     float one_out = 0.0f;
-    CHECK(uocr_metal_context_clip_mlp_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_clip_mlp_f16(ctx,
                                           NULL,
                                           fc1_weight,
                                           fc1_bias,
@@ -2811,7 +2844,7 @@ static int test_metal_clip_mlp_f16(void) {
                                           sizeof(error)) == 0);
     CHECK(strstr(error, "invalid Metal CLIP MLP") != NULL);
 
-    CHECK(uocr_metal_context_clip_mlp_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_clip_mlp_f16(ctx,
                                           &one_value,
                                           fc1_weight,
                                           fc1_bias,
@@ -2824,7 +2857,7 @@ static int test_metal_clip_mlp_f16(void) {
                                           sizeof(error)) == 0);
     CHECK(strstr(error, "invalid Metal CLIP MLP token count") != NULL);
 
-    CHECK(uocr_metal_context_clip_mlp_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_clip_mlp_f16(ctx,
                                           &one_value,
                                           fc1_weight,
                                           fc1_bias,
@@ -2881,7 +2914,7 @@ static int test_metal_clip_residual_add_f16(void) {
             }
         }
 
-        CHECK(uocr_metal_context_clip_residual_add_f16(ctx,
+        CHECK(uocr_metal_context_diagnostic_clip_residual_add_f16(ctx,
                                                        base,
                                                        update,
                                                        tokens,
@@ -2907,7 +2940,7 @@ static int test_metal_clip_residual_add_f16(void) {
             CHECK(fabsf(out_f32[idx] - expected) <= 1.0e-7f);
         }
 
-        CHECK(uocr_metal_context_clip_residual_add_f16(ctx,
+        CHECK(uocr_metal_context_diagnostic_clip_residual_add_f16(ctx,
                                                        base,
                                                        update,
                                                        tokens,
@@ -2930,7 +2963,7 @@ static int test_metal_clip_residual_add_f16(void) {
 
     uint16_t one_value = f32_to_f16_bits(0.0f);
     float one_out = 0.0f;
-    CHECK(uocr_metal_context_clip_residual_add_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_clip_residual_add_f16(ctx,
                                                    NULL,
                                                    &one_value,
                                                    UOCR_CLIP_LOCAL_TOKENS,
@@ -2940,7 +2973,7 @@ static int test_metal_clip_residual_add_f16(void) {
                                                    sizeof(error)) == 0);
     CHECK(strstr(error, "invalid Metal CLIP residual") != NULL);
 
-    CHECK(uocr_metal_context_clip_residual_add_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_clip_residual_add_f16(ctx,
                                                    &one_value,
                                                    &one_value,
                                                    UOCR_CLIP_LOCAL_TOKENS - 1u,
@@ -2950,7 +2983,7 @@ static int test_metal_clip_residual_add_f16(void) {
                                                    sizeof(error)) == 0);
     CHECK(strstr(error, "invalid Metal CLIP residual token count") != NULL);
 
-    CHECK(uocr_metal_context_clip_residual_add_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_clip_residual_add_f16(ctx,
                                                    &one_value,
                                                    &one_value,
                                                    UOCR_CLIP_LOCAL_TOKENS,
@@ -3048,7 +3081,7 @@ static int test_metal_clip_transformer_f16(void) {
         fc2_bias,
     };
 
-    CHECK(uocr_metal_context_clip_transformer_block_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_clip_transformer_block_f16(ctx,
                                                         input,
                                                         &block,
                                                         tokens,
@@ -3057,7 +3090,7 @@ static int test_metal_clip_transformer_f16(void) {
                                                         error,
                                                         sizeof(error)) == 1);
     CHECK(error[0] == '\0');
-    CHECK(uocr_metal_context_clip_transformer_block_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_clip_transformer_block_f16(ctx,
                                                         input,
                                                         &block,
                                                         tokens,
@@ -3092,7 +3125,7 @@ static int test_metal_clip_transformer_f16(void) {
     for (uint32_t i = 0u; i < UOCR_CLIP_BLOCKS; ++i) {
         blocks[i] = block;
     }
-    CHECK(uocr_metal_context_clip_transformer_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_clip_transformer_f16(ctx,
                                                   input,
                                                   blocks,
                                                   UOCR_CLIP_BLOCKS,
@@ -3107,7 +3140,7 @@ static int test_metal_clip_transformer_f16(void) {
         CHECK(stack_out_f16[idx] == input[idx]);
     }
 
-    CHECK(uocr_metal_context_clip_transformer_block_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_clip_transformer_block_f16(ctx,
                                                         input,
                                                         NULL,
                                                         tokens,
@@ -3117,7 +3150,7 @@ static int test_metal_clip_transformer_f16(void) {
                                                         sizeof(error)) == 0);
     CHECK(strstr(error, "invalid Metal CLIP transformer block") != NULL);
 
-    CHECK(uocr_metal_context_clip_transformer_block_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_clip_transformer_block_f16(ctx,
                                                         input,
                                                         &block,
                                                         tokens - 1u,
@@ -3127,7 +3160,7 @@ static int test_metal_clip_transformer_f16(void) {
                                                         sizeof(error)) == 0);
     CHECK(strstr(error, "invalid Metal CLIP transformer block token count") != NULL);
 
-    CHECK(uocr_metal_context_clip_transformer_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_clip_transformer_f16(ctx,
                                                   input,
                                                   blocks,
                                                   UOCR_CLIP_BLOCKS - 1u,
@@ -3209,7 +3242,7 @@ static int test_metal_clip_sam_concat_f16(void) {
             }
         }
 
-        CHECK(uocr_metal_context_clip_sam_concat_f16(ctx,
+        CHECK(uocr_metal_context_diagnostic_clip_sam_concat_f16(ctx,
                                                      clip_tokens,
                                                      sam_nchw,
                                                      grid,
@@ -3219,7 +3252,7 @@ static int test_metal_clip_sam_concat_f16(void) {
                                                      error,
                                                      sizeof(error)) == 1);
         CHECK(error[0] == '\0');
-        CHECK(uocr_metal_context_clip_sam_concat_f16(ctx,
+        CHECK(uocr_metal_context_diagnostic_clip_sam_concat_f16(ctx,
                                                      clip_tokens,
                                                      sam_nchw,
                                                      grid,
@@ -3265,7 +3298,7 @@ static int test_metal_clip_sam_concat_f16(void) {
 
     uint16_t one_value = f32_to_f16_bits(0.0f);
     float one_out = 0.0f;
-    CHECK(uocr_metal_context_clip_sam_concat_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_clip_sam_concat_f16(ctx,
                                                  NULL,
                                                  &one_value,
                                                  UOCR_LOCAL_GRID_QUERIES,
@@ -3276,7 +3309,7 @@ static int test_metal_clip_sam_concat_f16(void) {
                                                  sizeof(error)) == 0);
     CHECK(strstr(error, "invalid Metal CLIP/SAM concat") != NULL);
 
-    CHECK(uocr_metal_context_clip_sam_concat_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_clip_sam_concat_f16(ctx,
                                                  &one_value,
                                                  &one_value,
                                                  12u,
@@ -3287,7 +3320,7 @@ static int test_metal_clip_sam_concat_f16(void) {
                                                  sizeof(error)) == 0);
     CHECK(strstr(error, "unsupported Metal CLIP/SAM concat grid") != NULL);
 
-    CHECK(uocr_metal_context_clip_sam_concat_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_clip_sam_concat_f16(ctx,
                                                  &one_value,
                                                  &one_value,
                                                  UOCR_LOCAL_GRID_QUERIES,
@@ -3371,7 +3404,7 @@ static int test_metal_visual_projector_f16(void) {
             }
         }
 
-        CHECK(uocr_metal_context_visual_projector_f16(ctx,
+        CHECK(uocr_metal_context_diagnostic_visual_projector_f16(ctx,
                                                       input,
                                                       weight,
                                                       bias,
@@ -3398,7 +3431,7 @@ static int test_metal_visual_projector_f16(void) {
             CHECK(fabsf(out_f32[idx] - expected) <= 2.0e-5f);
         }
 
-        CHECK(uocr_metal_context_visual_projector_f16(ctx,
+        CHECK(uocr_metal_context_diagnostic_visual_projector_f16(ctx,
                                                       input,
                                                       weight,
                                                       bias,
@@ -3421,7 +3454,7 @@ static int test_metal_visual_projector_f16(void) {
 
     uint16_t one_value = f32_to_f16_bits(0.0f);
     float one_out = 0.0f;
-    CHECK(uocr_metal_context_visual_projector_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_visual_projector_f16(ctx,
                                                   NULL,
                                                   weight,
                                                   bias,
@@ -3432,7 +3465,7 @@ static int test_metal_visual_projector_f16(void) {
                                                   sizeof(error)) == 0);
     CHECK(strstr(error, "invalid Metal visual projector") != NULL);
 
-    CHECK(uocr_metal_context_visual_projector_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_visual_projector_f16(ctx,
                                                   &one_value,
                                                   weight,
                                                   bias,
@@ -3443,7 +3476,7 @@ static int test_metal_visual_projector_f16(void) {
                                                   sizeof(error)) == 0);
     CHECK(strstr(error, "invalid Metal visual projector") != NULL);
 
-    CHECK(uocr_metal_context_visual_projector_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_visual_projector_f16(ctx,
                                                   &one_value,
                                                   weight,
                                                   bias,
@@ -3494,7 +3527,7 @@ static int test_metal_sam_window_partition_f16(void) {
     uint32_t n_windows = 0u;
     uint32_t padded_w = 0u;
     uint32_t padded_h = 0u;
-    CHECK(uocr_metal_context_sam_window_partition_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_sam_window_partition_f16(ctx,
                                                        input,
                                                        GRID_W,
                                                        GRID_H,
@@ -3536,7 +3569,7 @@ static int test_metal_sam_window_partition_f16(void) {
         CHECK(windows[dst_idx] == expected);
     }
 
-    CHECK(uocr_metal_context_sam_window_unpartition_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_sam_window_unpartition_f16(ctx,
                                                          windows,
                                                          GRID_W,
                                                          GRID_H,
@@ -3548,7 +3581,7 @@ static int test_metal_sam_window_partition_f16(void) {
         CHECK(roundtrip[i] == input[i]);
     }
 
-    CHECK(uocr_metal_context_sam_window_partition_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_sam_window_partition_f16(ctx,
                                                        input,
                                                        0u,
                                                        GRID_H,
@@ -3560,7 +3593,7 @@ static int test_metal_sam_window_partition_f16(void) {
                                                        sizeof(error)) == 0);
     CHECK(strstr(error, "invalid Metal SAM window partition") != NULL);
 
-    CHECK(uocr_metal_context_sam_window_unpartition_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_sam_window_unpartition_f16(ctx,
                                                          NULL,
                                                          GRID_W,
                                                          GRID_H,
@@ -3954,7 +3987,7 @@ static int test_metal_sam_qkv_f16(void) {
     uocr_metal_context *ctx = uocr_metal_context_create(UOCR_TEST_METAL_RESOURCE_PATH, error, sizeof(error));
     CHECK(ctx != NULL);
 
-    CHECK(uocr_metal_context_sam_qkv_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_sam_qkv_f16(ctx,
                                          input,
                                          weight,
                                          bias,
@@ -3981,7 +4014,7 @@ static int test_metal_sam_qkv_f16(void) {
         CHECK(fabsf(v_f32[sam_qkv_out_index(row, 5u, 5u)]) <= 1.0e-5f);
     }
 
-    CHECK(uocr_metal_context_sam_qkv_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_sam_qkv_f16(ctx,
                                          input,
                                          weight,
                                          bias,
@@ -4004,7 +4037,7 @@ static int test_metal_sam_qkv_f16(void) {
         CHECK(v_f16[sam_qkv_out_index(row, 11u, 63u)] == f32_to_f16_bits(x7 - x9 + 0.25f));
     }
 
-    CHECK(uocr_metal_context_sam_qkv_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_sam_qkv_f16(ctx,
                                          input,
                                          weight,
                                          bias,
@@ -4071,7 +4104,7 @@ static int test_metal_sam_window_attention_f16(void) {
     uocr_metal_context *ctx = uocr_metal_context_create(UOCR_TEST_METAL_RESOURCE_PATH, error, sizeof(error));
     CHECK(ctx != NULL);
 
-    CHECK(uocr_metal_context_sam_window_attention_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_sam_window_attention_f16(ctx,
                                                        q,
                                                        k,
                                                        v,
@@ -4106,7 +4139,7 @@ static int test_metal_sam_window_attention_f16(void) {
         CHECK(fabsf(out_f32[idx] - expected) <= 2.0e-4f);
     }
 
-    CHECK(uocr_metal_context_sam_window_attention_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_sam_window_attention_f16(ctx,
                                                        q,
                                                        k,
                                                        v,
@@ -4128,7 +4161,7 @@ static int test_metal_sam_window_attention_f16(void) {
         CHECK(fabsf(f16_bits_to_f32(out_f16[idx]) - expected) <= 2.0e-3f);
     }
 
-    CHECK(uocr_metal_context_sam_window_attention_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_sam_window_attention_f16(ctx,
                                                        q,
                                                        k,
                                                        v,
@@ -4193,7 +4226,7 @@ static int test_metal_sam_global_attention_f16(void) {
     uocr_metal_context *ctx = uocr_metal_context_create(UOCR_TEST_METAL_RESOURCE_PATH, error, sizeof(error));
     CHECK(ctx != NULL);
 
-    CHECK(uocr_metal_context_sam_global_attention_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_sam_global_attention_f16(ctx,
                                                        q,
                                                        k,
                                                        v,
@@ -4229,7 +4262,7 @@ static int test_metal_sam_global_attention_f16(void) {
         CHECK(fabsf(out_f32[idx] - expected) <= 2.0e-4f);
     }
 
-    CHECK(uocr_metal_context_sam_global_attention_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_sam_global_attention_f16(ctx,
                                                        q,
                                                        k,
                                                        v,
@@ -4253,7 +4286,7 @@ static int test_metal_sam_global_attention_f16(void) {
         CHECK(fabsf(f16_bits_to_f32(out_f16[idx]) - expected) <= 2.0e-3f);
     }
 
-    CHECK(uocr_metal_context_sam_global_attention_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_sam_global_attention_f16(ctx,
                                                        q,
                                                        k,
                                                        v,
@@ -4264,7 +4297,7 @@ static int test_metal_sam_global_attention_f16(void) {
                                                        error,
                                                        sizeof(error)) == 0);
     CHECK(strstr(error, "invalid Metal SAM global attention") != NULL);
-    CHECK(uocr_metal_context_sam_global_attention_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_sam_global_attention_f16(ctx,
                                                        q,
                                                        k,
                                                        v,
@@ -4347,7 +4380,7 @@ static int test_metal_sam_rel_pos_attention_f16(void) {
     uocr_metal_context *ctx = uocr_metal_context_create(UOCR_TEST_METAL_RESOURCE_PATH, error, sizeof(error));
     CHECK(ctx != NULL);
 
-    CHECK(uocr_metal_context_sam_rel_pos_attention_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_sam_rel_pos_attention_f16(ctx,
                                                         q,
                                                         k,
                                                         v,
@@ -4399,7 +4432,7 @@ static int test_metal_sam_rel_pos_attention_f16(void) {
         CHECK(fabsf(out_f32[idx] - expected) <= 2.5e-4f);
     }
 
-    CHECK(uocr_metal_context_sam_rel_pos_attention_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_sam_rel_pos_attention_f16(ctx,
                                                         q,
                                                         k,
                                                         v,
@@ -4439,7 +4472,7 @@ static int test_metal_sam_rel_pos_attention_f16(void) {
         CHECK(fabsf(f16_bits_to_f32(out_f16[idx]) - expected) <= 2.0e-3f);
     }
 
-    CHECK(uocr_metal_context_sam_rel_pos_attention_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_sam_rel_pos_attention_f16(ctx,
                                                         q,
                                                         k,
                                                         v,
@@ -4455,7 +4488,7 @@ static int test_metal_sam_rel_pos_attention_f16(void) {
                                                         error,
                                                         sizeof(error)) == 0);
     CHECK(strstr(error, "invalid Metal SAM relative-position attention") != NULL);
-    CHECK(uocr_metal_context_sam_rel_pos_attention_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_sam_rel_pos_attention_f16(ctx,
                                                         q,
                                                         k,
                                                         v,
@@ -4538,7 +4571,7 @@ static int test_metal_sam_mlp_f16(void) {
     uocr_metal_context *ctx = uocr_metal_context_create(UOCR_TEST_METAL_RESOURCE_PATH, error, sizeof(error));
     CHECK(ctx != NULL);
 
-    CHECK(uocr_metal_context_sam_mlp_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_sam_mlp_f16(ctx,
                                           input,
                                           lin1_weight,
                                           lin1_bias,
@@ -4574,7 +4607,7 @@ static int test_metal_sam_mlp_f16(void) {
         CHECK(fabsf(out_f32[idx] - expected) <= 3.0e-4f);
     }
 
-    CHECK(uocr_metal_context_sam_mlp_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_sam_mlp_f16(ctx,
                                           input,
                                           lin1_weight,
                                           lin1_bias,
@@ -4599,7 +4632,7 @@ static int test_metal_sam_mlp_f16(void) {
         CHECK(fabsf(f16_bits_to_f32(out_f16[idx]) - expected) <= 2.0e-3f);
     }
 
-    CHECK(uocr_metal_context_sam_mlp_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_sam_mlp_f16(ctx,
                                           input,
                                           lin1_weight,
                                           NULL,
@@ -4670,7 +4703,7 @@ static int test_metal_sam_residuals_f16(void) {
     uocr_metal_context *ctx = uocr_metal_context_create(UOCR_TEST_METAL_RESOURCE_PATH, error, sizeof(error));
     CHECK(ctx != NULL);
 
-    CHECK(uocr_metal_context_sam_attention_project_residual_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_sam_attention_project_residual_f16(ctx,
                                                                  context,
                                                                  weight,
                                                                  bias,
@@ -4704,7 +4737,7 @@ static int test_metal_sam_residuals_f16(void) {
         CHECK(fabsf(out_f32[idx] - expected) <= 2.0e-5f);
     }
 
-    CHECK(uocr_metal_context_sam_attention_project_residual_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_sam_attention_project_residual_f16(ctx,
                                                                  context,
                                                                  weight,
                                                                  bias,
@@ -4726,7 +4759,7 @@ static int test_metal_sam_residuals_f16(void) {
         CHECK(fabsf(f16_bits_to_f32(out_f16[idx]) - expected) <= 1.5e-3f);
     }
 
-    CHECK(uocr_metal_context_sam_residual_add_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_sam_residual_add_f16(ctx,
                                                    residual,
                                                    update,
                                                    ROWS,
@@ -4741,7 +4774,7 @@ static int test_metal_sam_residuals_f16(void) {
         CHECK(fabsf(out_f32[idx] - expected) <= 1.0e-7f);
     }
 
-    CHECK(uocr_metal_context_sam_residual_add_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_sam_residual_add_f16(ctx,
                                                    residual,
                                                    update,
                                                    ROWS,
@@ -4756,7 +4789,7 @@ static int test_metal_sam_residuals_f16(void) {
         CHECK(fabsf(f16_bits_to_f32(out_f16[idx]) - expected) <= 8.0e-4f);
     }
 
-    CHECK(uocr_metal_context_sam_residual_add_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_sam_residual_add_f16(ctx,
                                                    residual,
                                                    NULL,
                                                    ROWS,
@@ -4766,7 +4799,7 @@ static int test_metal_sam_residuals_f16(void) {
                                                    sizeof(error)) == 0);
     CHECK(strstr(error, "invalid Metal SAM residual") != NULL);
 
-    CHECK(uocr_metal_context_sam_attention_project_residual_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_sam_attention_project_residual_f16(ctx,
                                                                  context,
                                                                  weight,
                                                                  bias,
@@ -4883,7 +4916,7 @@ static int test_metal_sam_transformer_block_f16(void) {
     uocr_metal_context *ctx = uocr_metal_context_create(UOCR_TEST_METAL_RESOURCE_PATH, error, sizeof(error));
     CHECK(ctx != NULL);
 
-    CHECK(uocr_metal_context_sam_transformer_block_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_sam_transformer_block_f16(ctx,
                                                        input,
                                                        &block,
                                                        GRID_W,
@@ -4915,7 +4948,7 @@ static int test_metal_sam_transformer_block_f16(void) {
 
     block.rel_pos_h_length = UOCR_SAM_WINDOW_REL_POS_SIZE;
     block.rel_pos_w_length = UOCR_SAM_WINDOW_REL_POS_SIZE;
-    CHECK(uocr_metal_context_sam_transformer_block_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_sam_transformer_block_f16(ctx,
                                                        input,
                                                        &block,
                                                        GRID_W,
@@ -4942,7 +4975,7 @@ static int test_metal_sam_transformer_block_f16(void) {
     for (uint32_t i = 0u; i < UOCR_SAM_BLOCKS; ++i) {
         blocks[i] = block;
     }
-    CHECK(uocr_metal_context_sam_transformer_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_sam_transformer_f16(ctx,
                                                  input,
                                                  blocks,
                                                  UOCR_SAM_BLOCKS,
@@ -4958,7 +4991,7 @@ static int test_metal_sam_transformer_block_f16(void) {
         CHECK(stack_out_f16[idx] == input[idx]);
     }
 
-    CHECK(uocr_metal_context_sam_transformer_block_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_sam_transformer_block_f16(ctx,
                                                        input,
                                                        NULL,
                                                        GRID_W,
@@ -4970,7 +5003,7 @@ static int test_metal_sam_transformer_block_f16(void) {
                                                        sizeof(error)) == 0);
     CHECK(strstr(error, "invalid Metal SAM transformer block") != NULL);
 
-    CHECK(uocr_metal_context_sam_transformer_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_sam_transformer_f16(ctx,
                                                  input,
                                                  blocks,
                                                  UOCR_SAM_BLOCKS - 1u,
@@ -6208,7 +6241,7 @@ static int run_metal_attention_block_from_model_f16(uocr_metal_context *ctx,
     }
 
     int ok = 0;
-    if (uocr_metal_context_rmsnorm_f16(ctx,
+    if (uocr_metal_context_diagnostic_rmsnorm_f16(ctx,
                                        hidden_in,
                                        input_norm_weight,
                                        n_tokens,
@@ -6218,7 +6251,7 @@ static int run_metal_attention_block_from_model_f16(uocr_metal_context *ctx,
                                        normed,
                                        error,
                                        error_size) != 1 ||
-        uocr_metal_context_attention_qkvo_f16(ctx,
+        uocr_metal_context_diagnostic_attention_qkvo_f16(ctx,
                                               normed,
                                               q_weight,
                                               k_weight,
@@ -6232,7 +6265,7 @@ static int run_metal_attention_block_from_model_f16(uocr_metal_context *ctx,
                                               unused_o,
                                               error,
                                               error_size) != 1 ||
-        uocr_metal_context_rope_qk_f16(ctx,
+        uocr_metal_context_diagnostic_rope_qk_f16(ctx,
                                        q,
                                        k,
                                        n_tokens,
@@ -6242,7 +6275,7 @@ static int run_metal_attention_block_from_model_f16(uocr_metal_context *ctx,
                                        k_rope,
                                        error,
                                        error_size) != 1 ||
-        uocr_metal_context_prefill_attention_f16(ctx,
+        uocr_metal_context_diagnostic_prefill_attention_f16(ctx,
                                                  q_rope,
                                                  k_rope,
                                                  v,
@@ -6251,7 +6284,7 @@ static int run_metal_attention_block_from_model_f16(uocr_metal_context *ctx,
                                                  context,
                                                  error,
                                                  error_size) != 1 ||
-        uocr_metal_context_attention_output_residual_f16(ctx,
+        uocr_metal_context_diagnostic_attention_output_residual_f16(ctx,
                                                          context,
                                                          o_weight,
                                                          hidden_in,
@@ -6260,7 +6293,7 @@ static int run_metal_attention_block_from_model_f16(uocr_metal_context *ctx,
                                                          attn_hidden_out,
                                                          error,
                                                          error_size) != 1 ||
-        uocr_metal_context_rmsnorm_f16(ctx,
+        uocr_metal_context_diagnostic_rmsnorm_f16(ctx,
                                        attn_hidden_out,
                                        post_norm_weight,
                                        n_tokens,
@@ -6344,7 +6377,7 @@ static int run_metal_dense_decoder_layer0_from_model_f16(uocr_metal_context *ctx
                                                 mlp_input,
                                                 error,
                                                 error_size) != 1 ||
-        uocr_metal_context_dense_swiglu_f16(ctx,
+        uocr_metal_context_diagnostic_dense_swiglu_f16(ctx,
                                             mlp_input,
                                             gate_weight,
                                             up_weight,
@@ -6889,7 +6922,7 @@ static int run_metal_moe_decoder_layer_from_model_f16(uocr_metal_context *ctx,
                                                 mlp_input,
                                                 error,
                                                 error_size) != 1 ||
-        uocr_metal_context_moe_router_f16(ctx,
+        uocr_metal_context_diagnostic_moe_router_f16(ctx,
                                           mlp_input,
                                           router_weight,
                                           n_tokens,
@@ -6899,7 +6932,7 @@ static int run_metal_moe_decoder_layer_from_model_f16(uocr_metal_context *ctx,
                                           top_weights,
                                           error,
                                           error_size) != 1 ||
-        uocr_metal_context_moe_shared_experts_f16(ctx,
+        uocr_metal_context_diagnostic_moe_shared_experts_f16(ctx,
                                                   mlp_input,
                                                   shared_gate,
                                                   shared_up,
@@ -6949,7 +6982,7 @@ static int run_metal_moe_decoder_layer_from_model_f16(uocr_metal_context *ctx,
                                             &compact_down,
                                             error,
                                             error_size) != 1 ||
-            uocr_metal_context_moe_selected_experts_prefill_f16(ctx,
+            uocr_metal_context_diagnostic_moe_selected_experts_prefill_f16(ctx,
                                                                 mlp_input,
                                                                 remapped_ids,
                                                                 top_weights,
@@ -7001,7 +7034,7 @@ static int run_metal_moe_decoder_layer_from_model_f16(uocr_metal_context *ctx,
                                                  selected_down,
                                                  error,
                                                  error_size) != 1 ||
-                uocr_metal_context_moe_selected_experts_decode_f16(ctx,
+                uocr_metal_context_diagnostic_moe_selected_experts_decode_f16(ctx,
                                                                    mlp_input + (size_t)token * UOCR_HIDDEN_SIZE,
                                                                    top_ids + (size_t)token * UOCR_MOE_TOP_K,
                                                                    top_weights + (size_t)token * UOCR_MOE_TOP_K,
@@ -7023,7 +7056,7 @@ static int run_metal_moe_decoder_layer_from_model_f16(uocr_metal_context *ctx,
         free(selected_gate);
     }
 
-    if (uocr_metal_context_moe_combine_f16(ctx,
+    if (uocr_metal_context_diagnostic_moe_combine_f16(ctx,
                                            routed,
                                            shared,
                                            attn_hidden,
@@ -7702,7 +7735,7 @@ static int test_metal_image_router_topk_python_dump_parity(void) {
                                                        mlp_input,
                                                        error,
                                                        sizeof(error)) == 1);
-        CHECK(uocr_metal_context_moe_router_f16(ctx,
+        CHECK(uocr_metal_context_diagnostic_moe_router_f16(ctx,
                                                 mlp_input,
                                                 router_weight,
                                                 n_tokens,
@@ -8686,7 +8719,7 @@ static int test_metal_text_layer0_python_dump_parity(void) {
     CHECK(mlp_input != NULL);
     CHECK(actual != NULL);
 
-    CHECK(uocr_metal_context_rmsnorm_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_rmsnorm_f16(ctx,
                                          prompt,
                                          input_norm_weight,
                                          n_tokens,
@@ -8696,7 +8729,7 @@ static int test_metal_text_layer0_python_dump_parity(void) {
                                          normed,
                                          error,
                                          sizeof(error)) == 1);
-    CHECK(uocr_metal_context_attention_qkvo_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_attention_qkvo_f16(ctx,
                                                 normed,
                                                 q_weight,
                                                 k_weight,
@@ -8710,7 +8743,7 @@ static int test_metal_text_layer0_python_dump_parity(void) {
                                                 unused_o,
                                                 error,
                                                 sizeof(error)) == 1);
-    CHECK(uocr_metal_context_rope_qk_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_rope_qk_f16(ctx,
                                          q,
                                          k,
                                          n_tokens,
@@ -8720,7 +8753,7 @@ static int test_metal_text_layer0_python_dump_parity(void) {
                                          k_rope,
                                          error,
                                          sizeof(error)) == 1);
-    CHECK(uocr_metal_context_prefill_attention_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_prefill_attention_f16(ctx,
                                                    q_rope,
                                                    k_rope,
                                                    v,
@@ -8729,7 +8762,7 @@ static int test_metal_text_layer0_python_dump_parity(void) {
                                                    context,
                                                    error,
                                                    sizeof(error)) == 1);
-    CHECK(uocr_metal_context_attention_output_residual_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_attention_output_residual_f16(ctx,
                                                            context,
                                                            o_weight,
                                                            prompt,
@@ -8738,7 +8771,7 @@ static int test_metal_text_layer0_python_dump_parity(void) {
                                                            attn_hidden,
                                                            error,
                                                            sizeof(error)) == 1);
-    CHECK(uocr_metal_context_rmsnorm_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_rmsnorm_f16(ctx,
                                          attn_hidden,
                                          post_norm_weight,
                                          n_tokens,
@@ -8748,7 +8781,7 @@ static int test_metal_text_layer0_python_dump_parity(void) {
                                          mlp_input,
                                          error,
                                          sizeof(error)) == 1);
-    CHECK(uocr_metal_context_dense_swiglu_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_dense_swiglu_f16(ctx,
                                               mlp_input,
                                               gate_weight,
                                               up_weight,
@@ -8918,7 +8951,7 @@ static int test_metal_text_layer1_python_dump_parity(void) {
                                                    mlp_input,
                                                    error,
                                                    sizeof(error)) == 1);
-    CHECK(uocr_metal_context_moe_router_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_moe_router_f16(ctx,
                                             mlp_input,
                                             router_weight,
                                             n_tokens,
@@ -8928,7 +8961,7 @@ static int test_metal_text_layer1_python_dump_parity(void) {
                                             top_weights,
                                             error,
                                             sizeof(error)) == 1);
-    CHECK(uocr_metal_context_moe_shared_experts_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_moe_shared_experts_f16(ctx,
                                                     mlp_input,
                                                     shared_gate,
                                                     shared_up,
@@ -8947,7 +8980,7 @@ static int test_metal_text_layer1_python_dump_parity(void) {
                                                selected_down,
                                                error,
                                                sizeof(error)) == 1);
-        CHECK(uocr_metal_context_moe_selected_experts_decode_f16(ctx,
+        CHECK(uocr_metal_context_diagnostic_moe_selected_experts_decode_f16(ctx,
                                                                  mlp_input + (size_t)token * UOCR_HIDDEN_SIZE,
                                                                  top_ids + (size_t)token * UOCR_MOE_TOP_K,
                                                                  top_weights + (size_t)token * UOCR_MOE_TOP_K,
@@ -8959,7 +8992,7 @@ static int test_metal_text_layer1_python_dump_parity(void) {
                                                                  error,
                                                                  sizeof(error)) == 1);
     }
-    CHECK(uocr_metal_context_moe_combine_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_moe_combine_f16(ctx,
                                              routed,
                                              shared,
                                              attn_hidden,
@@ -9354,6 +9387,115 @@ static int test_metal_text_generated_ids_python_dump_parity(void) {
     return 0;
 }
 
+static void write_q8_scale_le(uint8_t *dst, uint16_t scale_bits) {
+    dst[0] = (uint8_t)(scale_bits & 0xffu);
+    dst[1] = (uint8_t)(scale_bits >> 8u);
+}
+
+static float q8_0_expected_value(const uint8_t *table, uint32_t row_size, uint32_t row, uint32_t col) {
+    const uint32_t block = col / 32u;
+    const uint32_t in_block = col % 32u;
+    const uint8_t *packed = table + (size_t)row * row_size + (size_t)block * 34u;
+    const uint16_t scale_bits = (uint16_t)((uint16_t)packed[0] | ((uint16_t)packed[1] << 8u));
+    const int8_t q = (int8_t)packed[2u + in_block];
+    return f16_bits_to_f32(scale_bits) * (float)q;
+}
+
+static void set_q8_0_q(uint8_t *table, uint32_t row_size, uint32_t row, uint32_t col, int8_t q) {
+    const uint32_t block = col / 32u;
+    const uint32_t in_block = col % 32u;
+    uint8_t *packed = table + (size_t)row * row_size + (size_t)block * 34u;
+    packed[2u + in_block] = (uint8_t)q;
+}
+
+static void init_q4_k_rows(uint8_t *table, uint32_t rows, uint32_t row_size, uint32_t physical_cols, uint16_t d_bits) {
+    memset(table, 0, (size_t)rows * row_size);
+    for (uint32_t row = 0u; row < rows; ++row) {
+        for (uint32_t block = 0u; block < physical_cols / UOCR_Q4_K_BLOCK_SIZE; ++block) {
+            uint8_t *packed = table + (size_t)row * row_size + (size_t)block * UOCR_Q4_K_TYPE_SIZE;
+            write_q8_scale_le(packed, d_bits);
+            write_q8_scale_le(packed + 2u, 0u);
+            for (uint32_t i = 0u; i < 4u; ++i) {
+                packed[4u + i] = 1u;
+                packed[8u + i] = 0u;
+                packed[12u + i] = 1u;
+            }
+        }
+    }
+}
+
+static uint8_t q4_k_scale_value(const uint8_t *scales, uint32_t group) {
+    if (group < 4u) {
+        return (uint8_t)(scales[group] & 63u);
+    }
+    const uint32_t k = group - 4u;
+    return (uint8_t)((scales[8u + k] & 0x0fu) | ((scales[k] & 0xc0u) >> 2u));
+}
+
+static uint8_t q4_k_min_value(const uint8_t *scales, uint32_t group) {
+    if (group < 4u) {
+        return (uint8_t)(scales[group + 4u] & 63u);
+    }
+    const uint32_t k = group - 4u;
+    return (uint8_t)((scales[8u + k] >> 4u) | ((scales[4u + k] & 0xc0u) >> 2u));
+}
+
+static float q4_k_expected_value(const uint8_t *table, uint32_t row_size, uint32_t row, uint32_t col) {
+    const uint32_t block = col / UOCR_Q4_K_BLOCK_SIZE;
+    const uint32_t in_block = col % UOCR_Q4_K_BLOCK_SIZE;
+    const uint8_t *packed = table + (size_t)row * row_size + (size_t)block * UOCR_Q4_K_TYPE_SIZE;
+    const uint16_t d_bits = (uint16_t)((uint16_t)packed[0] | ((uint16_t)packed[1] << 8u));
+    const uint16_t dmin_bits = (uint16_t)((uint16_t)packed[2] | ((uint16_t)packed[3] << 8u));
+    const uint8_t *scales = packed + 4u;
+    const uint8_t *qs = packed + 16u;
+    const uint32_t il = in_block / 16u;
+    const uint32_t offset = in_block % 16u;
+    const uint32_t group = il / 2u;
+    const uint32_t q_base = (il / 4u) * 32u + 16u * (il & 1u);
+    const uint8_t q_byte = qs[q_base + offset];
+    const uint32_t q = (il & 2u) == 0u ? (uint32_t)(q_byte & 0x0fu) : (uint32_t)(q_byte >> 4u);
+    return f16_bits_to_f32(d_bits) * (float)q4_k_scale_value(scales, group) * (float)q -
+           f16_bits_to_f32(dmin_bits) * (float)q4_k_min_value(scales, group);
+}
+
+static void set_q4_k_scale_min(uint8_t *table,
+                                 uint32_t row_size,
+                                 uint32_t row,
+                                 uint32_t block,
+                                 uint32_t group,
+                                 uint8_t scale,
+                                 uint8_t min) {
+    uint8_t *packed = table + (size_t)row * row_size + (size_t)block * UOCR_Q4_K_TYPE_SIZE;
+    uint8_t *scales = packed + 4u;
+    scale = (uint8_t)(scale & 63u);
+    min = (uint8_t)(min & 63u);
+    if (group < 4u) {
+        scales[group] = (uint8_t)((scales[group] & 0xc0u) | scale);
+        scales[group + 4u] = (uint8_t)((scales[group + 4u] & 0xc0u) | min);
+    } else {
+        const uint32_t k = group - 4u;
+        scales[8u + k] = (uint8_t)((scale & 0x0fu) | (uint8_t)((min & 0x0fu) << 4u));
+        scales[k] = (uint8_t)((scales[k] & 0x3fu) | (uint8_t)((scale & 0x30u) << 2u));
+        scales[4u + k] = (uint8_t)((scales[4u + k] & 0x3fu) | (uint8_t)((min & 0x30u) << 2u));
+    }
+}
+
+static void set_q4_k_q(uint8_t *table, uint32_t row_size, uint32_t row, uint32_t col, uint8_t q) {
+    const uint32_t block = col / UOCR_Q4_K_BLOCK_SIZE;
+    const uint32_t in_block = col % UOCR_Q4_K_BLOCK_SIZE;
+    const uint32_t il = in_block / 16u;
+    const uint32_t offset = in_block % 16u;
+    const uint32_t q_base = (il / 4u) * 32u + 16u * (il & 1u);
+    uint8_t *packed = table + (size_t)row * row_size + (size_t)block * UOCR_Q4_K_TYPE_SIZE;
+    uint8_t *dst = packed + 16u + q_base + offset;
+    q = (uint8_t)(q & 0x0fu);
+    if ((il & 2u) == 0u) {
+        *dst = (uint8_t)((*dst & 0xf0u) | q);
+    } else {
+        *dst = (uint8_t)((*dst & 0x0fu) | (uint8_t)(q << 4u));
+    }
+}
+
 static int test_metal_get_rows_f16(void) {
     if (!uocr_metal_is_available()) {
         return 0;
@@ -9385,7 +9527,7 @@ static int test_metal_get_rows_f16(void) {
 
     uint16_t out_f16[OUT_ROWS * ROW_WIDTH];
     memset(out_f16, 0, sizeof(out_f16));
-    CHECK(uocr_metal_context_get_rows_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_get_rows_f16(ctx,
                                           table,
                                           TABLE_ROWS,
                                           ROW_WIDTH,
@@ -9405,7 +9547,7 @@ static int test_metal_get_rows_f16(void) {
 
     float out_f32[OUT_ROWS * ROW_WIDTH];
     memset(out_f32, 0, sizeof(out_f32));
-    CHECK(uocr_metal_context_get_rows_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_get_rows_f16(ctx,
                                           table,
                                           TABLE_ROWS,
                                           ROW_WIDTH,
@@ -9424,7 +9566,7 @@ static int test_metal_get_rows_f16(void) {
     }
 
     const int32_t bad_row_ids[1] = {TABLE_ROWS};
-    CHECK(uocr_metal_context_get_rows_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_get_rows_f16(ctx,
                                           table,
                                           TABLE_ROWS,
                                           ROW_WIDTH,
@@ -9435,6 +9577,110 @@ static int test_metal_get_rows_f16(void) {
                                           error,
                                           sizeof(error)) == 0);
     CHECK(strstr(error, "outside table rows") != NULL);
+
+    uocr_metal_context_destroy(ctx);
+    return 0;
+}
+
+static int test_metal_get_rows_q8_0(void) {
+    if (!uocr_metal_is_available()) {
+        return 0;
+    }
+
+    enum { TABLE_ROWS = 4, LOGICAL_WIDTH = 33, PHYSICAL_WIDTH = 64, OUT_ROWS = 3 };
+    enum { ROW_SIZE = (PHYSICAL_WIDTH / 32) * 34 };
+    uint8_t table[TABLE_ROWS * ROW_SIZE];
+    memset(table, 0, sizeof(table));
+
+    for (uint32_t row = 0u; row < (uint32_t)TABLE_ROWS; ++row) {
+        uint8_t *row_base = table + row * (uint32_t)ROW_SIZE;
+        write_q8_scale_le(row_base, row == 0u ? f32_to_f16_bits(0.0f) : f32_to_f16_bits(0.25f * (float)row));
+        int8_t *q0 = (int8_t *)(void *)(row_base + 2u);
+        for (uint32_t col = 0u; col < 32u; ++col) {
+            q0[col] = (int8_t)(((int)(row * 17u + col * 3u) % 41) - 20);
+        }
+        uint8_t *block1 = row_base + 34u;
+        write_q8_scale_le(block1, f32_to_f16_bits(0.125f * (float)(row + 1u)));
+        int8_t *q1 = (int8_t *)(void *)(block1 + 2u);
+        q1[0] = (int8_t)(12 - (int)row);
+        q1[1] = -99; /* physical padding; must not appear in logical output */
+    }
+
+    const int32_t row_ids[OUT_ROWS] = {2, 1, 3};
+    char error[1024];
+    memset(error, 0, sizeof(error));
+    uocr_metal_context *ctx = uocr_metal_context_create(UOCR_TEST_METAL_RESOURCE_PATH, error, sizeof(error));
+    CHECK(ctx != NULL);
+
+    float out_f32[OUT_ROWS * LOGICAL_WIDTH];
+    memset(out_f32, 0, sizeof(out_f32));
+    CHECK(uocr_metal_context_diagnostic_get_rows_q8_0(ctx,
+                                           table,
+                                           TABLE_ROWS,
+                                           LOGICAL_WIDTH,
+                                           PHYSICAL_WIDTH,
+                                           row_ids,
+                                           OUT_ROWS,
+                                           UOCR_METAL_GET_ROWS_OUTPUT_F32,
+                                           out_f32,
+                                           error,
+                                           sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    for (uint32_t out_row = 0u; out_row < (uint32_t)OUT_ROWS; ++out_row) {
+        for (uint32_t col = 0u; col < (uint32_t)LOGICAL_WIDTH; ++col) {
+            const float expected = q8_0_expected_value(table, ROW_SIZE, (uint32_t)row_ids[out_row], col);
+            const float actual = out_f32[out_row * (uint32_t)LOGICAL_WIDTH + col];
+            CHECK(fabsf(actual - expected) <= 1.0e-6f);
+        }
+    }
+
+    uint16_t out_f16[OUT_ROWS * LOGICAL_WIDTH];
+    memset(out_f16, 0, sizeof(out_f16));
+    CHECK(uocr_metal_context_diagnostic_get_rows_q8_0(ctx,
+                                           table,
+                                           TABLE_ROWS,
+                                           LOGICAL_WIDTH,
+                                           PHYSICAL_WIDTH,
+                                           row_ids,
+                                           OUT_ROWS,
+                                           UOCR_METAL_GET_ROWS_OUTPUT_F16,
+                                           out_f16,
+                                           error,
+                                           sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    for (uint32_t out_row = 0u; out_row < (uint32_t)OUT_ROWS; ++out_row) {
+        for (uint32_t col = 0u; col < (uint32_t)LOGICAL_WIDTH; ++col) {
+            const float expected = q8_0_expected_value(table, ROW_SIZE, (uint32_t)row_ids[out_row], col);
+            CHECK(out_f16[out_row * (uint32_t)LOGICAL_WIDTH + col] == f32_to_f16_bits(expected));
+        }
+    }
+
+    const int32_t bad_row_ids[1] = {TABLE_ROWS};
+    CHECK(uocr_metal_context_diagnostic_get_rows_q8_0(ctx,
+                                           table,
+                                           TABLE_ROWS,
+                                           LOGICAL_WIDTH,
+                                           PHYSICAL_WIDTH,
+                                           bad_row_ids,
+                                           1u,
+                                           UOCR_METAL_GET_ROWS_OUTPUT_F32,
+                                           out_f32,
+                                           error,
+                                           sizeof(error)) == 0);
+    CHECK(strstr(error, "outside table rows") != NULL);
+
+    CHECK(uocr_metal_context_diagnostic_get_rows_q8_0(ctx,
+                                           table,
+                                           TABLE_ROWS,
+                                           LOGICAL_WIDTH,
+                                           33u,
+                                           row_ids,
+                                           OUT_ROWS,
+                                           UOCR_METAL_GET_ROWS_OUTPUT_F32,
+                                           out_f32,
+                                           error,
+                                           sizeof(error)) == 0);
+    CHECK(strstr(error, "widths") != NULL);
 
     uocr_metal_context_destroy(ctx);
     return 0;
@@ -9465,7 +9711,7 @@ static int test_metal_prompt_assembly_f16(void) {
     const int32_t text_ids[TEXT_TOKENS] = {0, 3, 5, 1};
     uint16_t text_out[TEXT_TOKENS * HIDDEN];
     memset(text_out, 0, sizeof(text_out));
-    CHECK(uocr_metal_context_assemble_prompt_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_assemble_prompt_f16(ctx,
                                                  table,
                                                  TABLE_ROWS,
                                                  HIDDEN,
@@ -9487,7 +9733,7 @@ static int test_metal_prompt_assembly_f16(void) {
     const int32_t prompt_ids[PROMPT_TOKENS] = {0, 2, 12345, 12346, 4, 1};
     uint16_t prompt_out[PROMPT_TOKENS * HIDDEN];
     memset(prompt_out, 0, sizeof(prompt_out));
-    CHECK(uocr_metal_context_assemble_prompt_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_assemble_prompt_f16(ctx,
                                                  table,
                                                  TABLE_ROWS,
                                                  HIDDEN,
@@ -9513,7 +9759,7 @@ static int test_metal_prompt_assembly_f16(void) {
     }
 
     const int32_t bad_text_ids[1] = {TABLE_ROWS};
-    CHECK(uocr_metal_context_assemble_prompt_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_assemble_prompt_f16(ctx,
                                                  table,
                                                  TABLE_ROWS,
                                                  HIDDEN,
@@ -9735,7 +9981,7 @@ static int test_metal_rmsnorm_f16(void) {
 
     float out_f32[ROWS * HIDDEN];
     memset(out_f32, 0, sizeof(out_f32));
-    CHECK(uocr_metal_context_rmsnorm_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_rmsnorm_f16(ctx,
                                          input,
                                          weight,
                                          ROWS,
@@ -9752,7 +9998,7 @@ static int test_metal_rmsnorm_f16(void) {
 
     uint16_t out_f16[ROWS * HIDDEN];
     memset(out_f16, 0, sizeof(out_f16));
-    CHECK(uocr_metal_context_rmsnorm_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_rmsnorm_f16(ctx,
                                          input,
                                          weight,
                                          ROWS,
@@ -9767,7 +10013,7 @@ static int test_metal_rmsnorm_f16(void) {
         CHECK(fabsf(f16_bits_to_f32(out_f16[i]) - expected[i]) < 4.0e-3f);
     }
 
-    CHECK(uocr_metal_context_rmsnorm_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_rmsnorm_f16(ctx,
                                          input,
                                          weight,
                                          ROWS,
@@ -10383,7 +10629,7 @@ static int test_metal_dense_f16(void) {
     CHECK(ctx != NULL);
 
     memset(out_f32, 0, (size_t)ROWS * OUT_FEATURES * sizeof(float));
-    CHECK(uocr_metal_context_dense_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_dense_f16(ctx,
                                        input,
                                        weight,
                                        bias,
@@ -10400,7 +10646,7 @@ static int test_metal_dense_f16(void) {
     }
 
     memset(out_f16, 0, (size_t)ROWS * OUT_FEATURES * sizeof(uint16_t));
-    CHECK(uocr_metal_context_dense_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_dense_f16(ctx,
                                        input,
                                        weight,
                                        bias,
@@ -10417,7 +10663,7 @@ static int test_metal_dense_f16(void) {
     }
 
     memset(out_f32, 0, (size_t)ROWS * OUT_FEATURES * sizeof(float));
-    CHECK(uocr_metal_context_dense_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_dense_f16(ctx,
                                        input,
                                        weight,
                                        NULL,
@@ -10433,7 +10679,7 @@ static int test_metal_dense_f16(void) {
         CHECK(fabsf(out_f32[col] - (expected[col] - f16_bits_to_f32(bias[col]))) < 2.5e-3f);
     }
 
-    CHECK(uocr_metal_context_dense_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_dense_f16(ctx,
                                        input,
                                        weight,
                                        bias,
@@ -10445,7 +10691,7 @@ static int test_metal_dense_f16(void) {
                                        error,
                                        sizeof(error)) == 0);
     CHECK(strstr(error, "unsupported Metal dense output type") != NULL);
-    CHECK(uocr_metal_context_dense_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_dense_f16(ctx,
                                        input,
                                        weight,
                                        bias,
@@ -10465,6 +10711,469 @@ static int test_metal_dense_f16(void) {
     free(bias);
     free(weight);
     free(input);
+    return 0;
+}
+
+static int test_metal_dense_q8_0(void) {
+    if (!uocr_metal_is_available()) {
+        return 0;
+    }
+
+    enum { ROWS = 3, LOGICAL_IN_FEATURES = 1277, PHYSICAL_IN_FEATURES = 1280, OUT_FEATURES = 64 };
+    enum { WEIGHT_ROW_SIZE = (PHYSICAL_IN_FEATURES / 32) * 34 };
+    const uint16_t input_values[] = {
+        0xb400u, /* -0.25 */
+        0xb000u, /* -0.125 */
+        0x0000u, /* 0.0 */
+        0x2c00u, /* 0.0625 */
+        0x3000u, /* 0.125 */
+        0x3400u  /* 0.25 */
+    };
+    const uint16_t bias_values[] = {
+        0x0000u, /* 0.0 */
+        0x3000u, /* 0.125 */
+        0xb000u, /* -0.125 */
+        0x2c00u  /* 0.0625 */
+    };
+    const uint32_t input_value_count = (uint32_t)(sizeof(input_values) / sizeof(input_values[0]));
+    const uint32_t bias_value_count = (uint32_t)(sizeof(bias_values) / sizeof(bias_values[0]));
+
+    uint16_t *input = (uint16_t *)malloc((size_t)ROWS * LOGICAL_IN_FEATURES * sizeof(uint16_t));
+    uint8_t *weight = (uint8_t *)malloc((size_t)OUT_FEATURES * WEIGHT_ROW_SIZE);
+    uint16_t *bias = (uint16_t *)malloc((size_t)OUT_FEATURES * sizeof(uint16_t));
+    float *expected = (float *)malloc((size_t)ROWS * OUT_FEATURES * sizeof(float));
+    float *out_f32 = (float *)malloc((size_t)ROWS * OUT_FEATURES * sizeof(float));
+    uint16_t *out_f16 = (uint16_t *)malloc((size_t)OUT_FEATURES * sizeof(uint16_t));
+    CHECK(input != NULL && weight != NULL && bias != NULL && expected != NULL && out_f32 != NULL && out_f16 != NULL);
+
+    for (uint32_t i = 0u; i < (uint32_t)(ROWS * LOGICAL_IN_FEATURES); ++i) {
+        input[i] = input_values[(i * 19u + i / 31u + 2u) % input_value_count];
+    }
+    memset(weight, 0, (size_t)OUT_FEATURES * WEIGHT_ROW_SIZE);
+    for (uint32_t out_col = 0u; out_col < (uint32_t)OUT_FEATURES; ++out_col) {
+        uint8_t *row_base = weight + (size_t)out_col * WEIGHT_ROW_SIZE;
+        for (uint32_t block = 0u; block < (uint32_t)(PHYSICAL_IN_FEATURES / 32); ++block) {
+            uint8_t *packed = row_base + (size_t)block * 34u;
+            const float scale = 0.00390625f * (float)(1u + ((out_col + block) % 4u));
+            write_q8_scale_le(packed, f32_to_f16_bits(scale));
+            int8_t *qs = (int8_t *)(void *)(packed + 2u);
+            for (uint32_t i = 0u; i < 32u; ++i) {
+                const uint32_t logical_col = block * 32u + i;
+                qs[i] = logical_col < (uint32_t)LOGICAL_IN_FEATURES ?
+                            (int8_t)(((int)(out_col * 13u + block * 7u + i * 5u) % 17) - 8) :
+                            (int8_t)(77 + (int)i); /* physical padding must be ignored */
+            }
+        }
+    }
+    for (uint32_t i = 0u; i < (uint32_t)OUT_FEATURES; ++i) {
+        bias[i] = bias_values[(i * 7u + 1u) % bias_value_count];
+    }
+
+    for (uint32_t row = 0u; row < (uint32_t)ROWS; ++row) {
+        for (uint32_t col = 0u; col < (uint32_t)OUT_FEATURES; ++col) {
+            float sum = f16_bits_to_f32(bias[col]);
+            for (uint32_t k = 0u; k < (uint32_t)LOGICAL_IN_FEATURES; ++k) {
+                sum += f16_bits_to_f32(input[row * (uint32_t)LOGICAL_IN_FEATURES + k]) *
+                       q8_0_expected_value(weight, WEIGHT_ROW_SIZE, col, k);
+            }
+            expected[row * (uint32_t)OUT_FEATURES + col] = sum;
+        }
+    }
+
+    char error[1024];
+    memset(error, 0, sizeof(error));
+    uocr_metal_context *ctx = uocr_metal_context_create(UOCR_TEST_METAL_RESOURCE_PATH, error, sizeof(error));
+    CHECK(ctx != NULL);
+
+    memset(out_f32, 0, (size_t)ROWS * OUT_FEATURES * sizeof(float));
+    CHECK(uocr_metal_context_diagnostic_dense_q8_0(ctx,
+                                        input,
+                                        weight,
+                                        bias,
+                                        ROWS,
+                                        LOGICAL_IN_FEATURES,
+                                        PHYSICAL_IN_FEATURES,
+                                        OUT_FEATURES,
+                                        UOCR_METAL_DENSE_OUTPUT_F32,
+                                        out_f32,
+                                        error,
+                                        sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    for (uint32_t i = 0u; i < (uint32_t)(ROWS * OUT_FEATURES); ++i) {
+        CHECK(fabsf(out_f32[i] - expected[i]) < 5.0e-3f);
+    }
+
+    memset(out_f16, 0, (size_t)OUT_FEATURES * sizeof(uint16_t));
+    CHECK(uocr_metal_context_diagnostic_dense_q8_0(ctx,
+                                        input,
+                                        weight,
+                                        bias,
+                                        1u,
+                                        LOGICAL_IN_FEATURES,
+                                        PHYSICAL_IN_FEATURES,
+                                        OUT_FEATURES,
+                                        UOCR_METAL_DENSE_OUTPUT_F16,
+                                        out_f16,
+                                        error,
+                                        sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    for (uint32_t i = 0u; i < (uint32_t)OUT_FEATURES; ++i) {
+        CHECK(fabsf(f16_bits_to_f32(out_f16[i]) - expected[i]) < 7.5e-2f);
+    }
+
+    memset(out_f32, 0, (size_t)ROWS * OUT_FEATURES * sizeof(float));
+    CHECK(uocr_metal_context_diagnostic_dense_q8_0(ctx,
+                                        input,
+                                        weight,
+                                        NULL,
+                                        1u,
+                                        LOGICAL_IN_FEATURES,
+                                        PHYSICAL_IN_FEATURES,
+                                        OUT_FEATURES,
+                                        UOCR_METAL_DENSE_OUTPUT_F32,
+                                        out_f32,
+                                        error,
+                                        sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    for (uint32_t col = 0u; col < (uint32_t)OUT_FEATURES; ++col) {
+        CHECK(fabsf(out_f32[col] - (expected[col] - f16_bits_to_f32(bias[col]))) < 5.0e-3f);
+    }
+
+    CHECK(uocr_metal_context_diagnostic_dense_q8_0(ctx,
+                                        input,
+                                        weight,
+                                        bias,
+                                        ROWS,
+                                        LOGICAL_IN_FEATURES,
+                                        PHYSICAL_IN_FEATURES,
+                                        OUT_FEATURES,
+                                        (uocr_metal_dense_output_type)99,
+                                        out_f32,
+                                        error,
+                                        sizeof(error)) == 0);
+    CHECK(strstr(error, "unsupported Metal Q8_0 dense output type") != NULL);
+    CHECK(uocr_metal_context_diagnostic_dense_q8_0(ctx,
+                                        input,
+                                        weight,
+                                        bias,
+                                        ROWS,
+                                        LOGICAL_IN_FEATURES,
+                                        1279u,
+                                        OUT_FEATURES,
+                                        UOCR_METAL_DENSE_OUTPUT_F32,
+                                        out_f32,
+                                        error,
+                                        sizeof(error)) == 0);
+    CHECK(strstr(error, "widths") != NULL);
+
+    uocr_metal_context_destroy(ctx);
+    free(out_f16);
+    free(out_f32);
+    free(expected);
+    free(bias);
+    free(weight);
+    free(input);
+    return 0;
+}
+
+static int test_metal_dense_q4_k(void) {
+    if (!uocr_metal_is_available()) {
+        return 0;
+    }
+
+    enum { ROWS = 3, LOGICAL_IN_FEATURES = 1277, PHYSICAL_IN_FEATURES = 1280, OUT_FEATURES = 64 };
+    enum { WEIGHT_ROW_SIZE = (PHYSICAL_IN_FEATURES / UOCR_Q4_K_BLOCK_SIZE) * UOCR_Q4_K_TYPE_SIZE };
+    const uint16_t input_values[] = {
+        0xb800u, /* -0.5 */
+        0xb400u, /* -0.25 */
+        0x0000u, /* 0.0 */
+        0x2c00u, /* 0.0625 */
+        0x3000u, /* 0.125 */
+        0x3400u  /* 0.25 */
+    };
+    const uint16_t bias_values[] = {
+        0x0000u, /* 0.0 */
+        0x2c00u, /* 0.0625 */
+        0xac00u, /* -0.0625 */
+        0x3000u  /* 0.125 */
+    };
+    const uint32_t input_value_count = (uint32_t)(sizeof(input_values) / sizeof(input_values[0]));
+    const uint32_t bias_value_count = (uint32_t)(sizeof(bias_values) / sizeof(bias_values[0]));
+
+    uint16_t *input = (uint16_t *)malloc((size_t)ROWS * LOGICAL_IN_FEATURES * sizeof(uint16_t));
+    uint8_t *weight = (uint8_t *)malloc((size_t)OUT_FEATURES * WEIGHT_ROW_SIZE);
+    uint16_t *bias = (uint16_t *)malloc((size_t)OUT_FEATURES * sizeof(uint16_t));
+    float *expected = (float *)malloc((size_t)ROWS * OUT_FEATURES * sizeof(float));
+    float *out_f32 = (float *)malloc((size_t)ROWS * OUT_FEATURES * sizeof(float));
+    uint16_t *out_f16 = (uint16_t *)malloc((size_t)OUT_FEATURES * sizeof(uint16_t));
+    CHECK(input != NULL && weight != NULL && bias != NULL && expected != NULL && out_f32 != NULL && out_f16 != NULL);
+
+    for (uint32_t i = 0u; i < (uint32_t)(ROWS * LOGICAL_IN_FEATURES); ++i) {
+        input[i] = input_values[(i * 11u + i / 17u + 3u) % input_value_count];
+    }
+    init_q4_k_rows(weight, (uint32_t)OUT_FEATURES, (uint32_t)WEIGHT_ROW_SIZE, (uint32_t)PHYSICAL_IN_FEATURES, 0x2400u);
+    for (uint32_t out_col = 0u; out_col < (uint32_t)OUT_FEATURES; ++out_col) {
+        const uint32_t c0 = (out_col * 37u + 11u) % (uint32_t)LOGICAL_IN_FEATURES;
+        uint32_t c1 = (out_col * 53u + 127u) % (uint32_t)LOGICAL_IN_FEATURES;
+        uint32_t c2 = (out_col * 71u + 509u) % (uint32_t)LOGICAL_IN_FEATURES;
+        if (c1 == c0) c1 = (c1 + 1u) % (uint32_t)LOGICAL_IN_FEATURES;
+        if (c2 == c0 || c2 == c1) c2 = (c2 + 3u) % (uint32_t)LOGICAL_IN_FEATURES;
+        set_q4_k_q(weight, (uint32_t)WEIGHT_ROW_SIZE, out_col, c0, (uint8_t)(1u + (out_col % 7u)));
+        set_q4_k_q(weight, (uint32_t)WEIGHT_ROW_SIZE, out_col, c1, (uint8_t)(2u + ((out_col * 3u) % 6u)));
+        set_q4_k_q(weight, (uint32_t)WEIGHT_ROW_SIZE, out_col, c2, (uint8_t)(3u + ((out_col * 5u) % 5u)));
+        set_q4_k_q(weight,
+                   (uint32_t)WEIGHT_ROW_SIZE,
+                   out_col,
+                   (uint32_t)LOGICAL_IN_FEATURES + 2u,
+                   15u); /* physical padding must be ignored */
+    }
+    for (uint32_t i = 0u; i < (uint32_t)OUT_FEATURES; ++i) {
+        bias[i] = bias_values[(i * 5u + 1u) % bias_value_count];
+    }
+
+    for (uint32_t row = 0u; row < (uint32_t)ROWS; ++row) {
+        for (uint32_t col = 0u; col < (uint32_t)OUT_FEATURES; ++col) {
+            float sum = f16_bits_to_f32(bias[col]);
+            for (uint32_t k = 0u; k < (uint32_t)LOGICAL_IN_FEATURES; ++k) {
+                sum += f16_bits_to_f32(input[row * (uint32_t)LOGICAL_IN_FEATURES + k]) *
+                       q4_k_expected_value(weight, (uint32_t)WEIGHT_ROW_SIZE, col, k);
+            }
+            expected[row * (uint32_t)OUT_FEATURES + col] = sum;
+        }
+    }
+
+    char error[1024];
+    memset(error, 0, sizeof(error));
+    uocr_metal_context *ctx = uocr_metal_context_create(UOCR_TEST_METAL_RESOURCE_PATH, error, sizeof(error));
+    CHECK(ctx != NULL);
+
+    memset(out_f32, 0, (size_t)ROWS * OUT_FEATURES * sizeof(float));
+    CHECK(uocr_metal_context_diagnostic_dense_q4_k(ctx,
+                                        input,
+                                        weight,
+                                        bias,
+                                        ROWS,
+                                        LOGICAL_IN_FEATURES,
+                                        PHYSICAL_IN_FEATURES,
+                                        OUT_FEATURES,
+                                        UOCR_METAL_DENSE_OUTPUT_F32,
+                                        out_f32,
+                                        error,
+                                        sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    for (uint32_t i = 0u; i < (uint32_t)(ROWS * OUT_FEATURES); ++i) {
+        CHECK(fabsf(out_f32[i] - expected[i]) < 5.0e-5f);
+    }
+
+    memset(out_f16, 0, (size_t)OUT_FEATURES * sizeof(uint16_t));
+    CHECK(uocr_metal_context_diagnostic_dense_q4_k(ctx,
+                                        input,
+                                        weight,
+                                        bias,
+                                        1u,
+                                        LOGICAL_IN_FEATURES,
+                                        PHYSICAL_IN_FEATURES,
+                                        OUT_FEATURES,
+                                        UOCR_METAL_DENSE_OUTPUT_F16,
+                                        out_f16,
+                                        error,
+                                        sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    for (uint32_t i = 0u; i < (uint32_t)OUT_FEATURES; ++i) {
+        CHECK(fabsf(f16_bits_to_f32(out_f16[i]) - expected[i]) < 7.5e-4f);
+    }
+
+    memset(out_f32, 0, (size_t)OUT_FEATURES * sizeof(float));
+    CHECK(uocr_metal_context_diagnostic_dense_q4_k(ctx,
+                                        input,
+                                        weight,
+                                        NULL,
+                                        1u,
+                                        LOGICAL_IN_FEATURES,
+                                        PHYSICAL_IN_FEATURES,
+                                        OUT_FEATURES,
+                                        UOCR_METAL_DENSE_OUTPUT_F32,
+                                        out_f32,
+                                        error,
+                                        sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    for (uint32_t col = 0u; col < (uint32_t)OUT_FEATURES; ++col) {
+        CHECK(fabsf(out_f32[col] - (expected[col] - f16_bits_to_f32(bias[col]))) < 5.0e-5f);
+    }
+
+    CHECK(uocr_metal_context_diagnostic_dense_q4_k(ctx,
+                                        input,
+                                        weight,
+                                        bias,
+                                        ROWS,
+                                        LOGICAL_IN_FEATURES,
+                                        1279u,
+                                        OUT_FEATURES,
+                                        UOCR_METAL_DENSE_OUTPUT_F32,
+                                        out_f32,
+                                        error,
+                                        sizeof(error)) == 0);
+    CHECK(strstr(error, "invalid Metal Q4_K dense widths") != NULL);
+
+    CHECK(uocr_metal_context_diagnostic_dense_q4_k(ctx,
+                                        input,
+                                        weight,
+                                        bias,
+                                        ROWS,
+                                        LOGICAL_IN_FEATURES,
+                                        PHYSICAL_IN_FEATURES,
+                                        OUT_FEATURES,
+                                        (uocr_metal_dense_output_type)99,
+                                        out_f32,
+                                        error,
+                                        sizeof(error)) == 0);
+    CHECK(strstr(error, "unsupported Metal Q4_K dense output type") != NULL);
+
+    uocr_metal_context_destroy(ctx);
+    free(out_f16);
+    free(out_f32);
+    free(expected);
+    free(bias);
+    free(weight);
+    free(input);
+    return 0;
+}
+
+static int test_metal_quantized_dense_dot_edges(void) {
+    if (!uocr_metal_is_available()) {
+        return 0;
+    }
+
+    char error[1024];
+    memset(error, 0, sizeof(error));
+    uocr_metal_context *ctx = uocr_metal_context_create(UOCR_TEST_METAL_RESOURCE_PATH, error, sizeof(error));
+    CHECK(ctx != NULL);
+
+    {
+        enum { ROWS = 2, LOGICAL_IN = 33, PHYSICAL_IN = 64, OUT_FEATURES = 3 };
+        enum { WEIGHT_ROW_SIZE = (PHYSICAL_IN / 32) * 34 };
+        uint16_t input[ROWS * LOGICAL_IN];
+        uint8_t weight[OUT_FEATURES * WEIGHT_ROW_SIZE];
+        uint16_t bias[OUT_FEATURES] = {
+            0x3000u, /* 0.125 */
+            0xb000u, /* -0.125 */
+            0x0000u  /* 0.0 */
+        };
+        float expected[ROWS * OUT_FEATURES];
+        float out[ROWS * OUT_FEATURES];
+        memset(input, 0, sizeof(input));
+        memset(weight, 0, sizeof(weight));
+
+        input[0u * (uint32_t)LOGICAL_IN + 0u] = 0x3c00u;  /* 1.0 */
+        input[0u * (uint32_t)LOGICAL_IN + 31u] = 0xb800u; /* -0.5 */
+        input[0u * (uint32_t)LOGICAL_IN + 32u] = 0x3400u; /* 0.25 */
+        input[1u * (uint32_t)LOGICAL_IN + 0u] = 0xbc00u;  /* -1.0 */
+        input[1u * (uint32_t)LOGICAL_IN + 31u] = 0x3800u; /* 0.5 */
+        input[1u * (uint32_t)LOGICAL_IN + 32u] = 0x4000u; /* 2.0 */
+
+        for (uint32_t out_col = 0u; out_col < (uint32_t)OUT_FEATURES; ++out_col) {
+            uint8_t *row_base = weight + (size_t)out_col * WEIGHT_ROW_SIZE;
+            write_q8_scale_le(row_base, f32_to_f16_bits(0.03125f * (float)(out_col + 1u)));
+            write_q8_scale_le(row_base + 34u, f32_to_f16_bits(0.0625f * (float)(out_col + 1u)));
+            set_q8_0_q(weight, (uint32_t)WEIGHT_ROW_SIZE, out_col, 0u, (int8_t)-128);
+            set_q8_0_q(weight, (uint32_t)WEIGHT_ROW_SIZE, out_col, 31u, (int8_t)127);
+            set_q8_0_q(weight, (uint32_t)WEIGHT_ROW_SIZE, out_col, 32u, (int8_t)(-7 + (int)out_col));
+            set_q8_0_q(weight, (uint32_t)WEIGHT_ROW_SIZE, out_col, 33u, (int8_t)99); /* physical padding */
+        }
+        for (uint32_t row = 0u; row < (uint32_t)ROWS; ++row) {
+            for (uint32_t col = 0u; col < (uint32_t)OUT_FEATURES; ++col) {
+                float sum = f16_bits_to_f32(bias[col]);
+                for (uint32_t k = 0u; k < (uint32_t)LOGICAL_IN; ++k) {
+                    sum += f16_bits_to_f32(input[row * (uint32_t)LOGICAL_IN + k]) *
+                           q8_0_expected_value(weight, (uint32_t)WEIGHT_ROW_SIZE, col, k);
+                }
+                expected[row * (uint32_t)OUT_FEATURES + col] = sum;
+            }
+        }
+
+        memset(out, 0, sizeof(out));
+        CHECK(uocr_metal_context_diagnostic_dense_q8_0(ctx,
+                                            input,
+                                            weight,
+                                            bias,
+                                            ROWS,
+                                            LOGICAL_IN,
+                                            PHYSICAL_IN,
+                                            OUT_FEATURES,
+                                            UOCR_METAL_DENSE_OUTPUT_F32,
+                                            out,
+                                            error,
+                                            sizeof(error)) == 1);
+        CHECK(error[0] == '\0');
+        for (uint32_t i = 0u; i < (uint32_t)(ROWS * OUT_FEATURES); ++i) {
+            CHECK(fabsf(out[i] - expected[i]) < 1.0e-5f);
+        }
+    }
+
+    {
+        enum { ROWS = 2, LOGICAL_IN = 145, PHYSICAL_IN = 256, OUT_FEATURES = 3 };
+        enum { WEIGHT_ROW_SIZE = (PHYSICAL_IN / UOCR_Q4_K_BLOCK_SIZE) * UOCR_Q4_K_TYPE_SIZE };
+        const uint32_t selected_cols[] = {0u, 31u, 64u, 128u, 144u};
+        const uint16_t selected_values[ROWS][5] = {
+            {0x3c00u, 0xb800u, 0x3400u, 0x4000u, 0xbc00u}, /* 1, -0.5, 0.25, 2, -1 */
+            {0xbc00u, 0x3800u, 0xb400u, 0x3c00u, 0x3400u}  /* -1, 0.5, -0.25, 1, 0.25 */
+        };
+        uint16_t input[ROWS * LOGICAL_IN];
+        uint8_t weight[OUT_FEATURES * WEIGHT_ROW_SIZE];
+        float expected[ROWS * OUT_FEATURES];
+        float out[ROWS * OUT_FEATURES];
+        memset(input, 0, sizeof(input));
+        init_q4_k_rows(weight, (uint32_t)OUT_FEATURES, (uint32_t)WEIGHT_ROW_SIZE, (uint32_t)PHYSICAL_IN, f32_to_f16_bits(0.03125f));
+
+        for (uint32_t row = 0u; row < (uint32_t)ROWS; ++row) {
+            for (uint32_t i = 0u; i < (uint32_t)(sizeof(selected_cols) / sizeof(selected_cols[0])); ++i) {
+                input[row * (uint32_t)LOGICAL_IN + selected_cols[i]] = selected_values[row][i];
+            }
+        }
+        for (uint32_t out_col = 0u; out_col < (uint32_t)OUT_FEATURES; ++out_col) {
+            uint8_t *row_base = weight + (size_t)out_col * WEIGHT_ROW_SIZE;
+            write_q8_scale_le(row_base + 2u, f32_to_f16_bits(0.015625f * (float)(out_col + 1u)));
+            set_q4_k_scale_min(weight, (uint32_t)WEIGHT_ROW_SIZE, out_col, 0u, 0u, (uint8_t)(3u + out_col), 2u);
+            set_q4_k_scale_min(weight, (uint32_t)WEIGHT_ROW_SIZE, out_col, 0u, 2u, (uint8_t)(17u + out_col), 5u);
+            set_q4_k_scale_min(weight, (uint32_t)WEIGHT_ROW_SIZE, out_col, 0u, 4u, (uint8_t)(49u + out_col), 37u);
+            set_q4_k_q(weight, (uint32_t)WEIGHT_ROW_SIZE, out_col, 0u, (uint8_t)(15u - out_col));
+            set_q4_k_q(weight, (uint32_t)WEIGHT_ROW_SIZE, out_col, 31u, 0u); /* min-only value */
+            set_q4_k_q(weight, (uint32_t)WEIGHT_ROW_SIZE, out_col, 64u, (uint8_t)(7u + out_col));
+            set_q4_k_q(weight, (uint32_t)WEIGHT_ROW_SIZE, out_col, 128u, (uint8_t)(11u - out_col));
+            set_q4_k_q(weight, (uint32_t)WEIGHT_ROW_SIZE, out_col, 144u, (uint8_t)(4u + out_col));
+            set_q4_k_q(weight, (uint32_t)WEIGHT_ROW_SIZE, out_col, 145u, 15u); /* physical padding */
+        }
+        for (uint32_t row = 0u; row < (uint32_t)ROWS; ++row) {
+            for (uint32_t col = 0u; col < (uint32_t)OUT_FEATURES; ++col) {
+                float sum = 0.0f;
+                for (uint32_t k = 0u; k < (uint32_t)LOGICAL_IN; ++k) {
+                    sum += f16_bits_to_f32(input[row * (uint32_t)LOGICAL_IN + k]) *
+                           q4_k_expected_value(weight, (uint32_t)WEIGHT_ROW_SIZE, col, k);
+                }
+                expected[row * (uint32_t)OUT_FEATURES + col] = sum;
+            }
+        }
+
+        memset(out, 0, sizeof(out));
+        CHECK(uocr_metal_context_diagnostic_dense_q4_k(ctx,
+                                            input,
+                                            weight,
+                                            NULL,
+                                            ROWS,
+                                            LOGICAL_IN,
+                                            PHYSICAL_IN,
+                                            OUT_FEATURES,
+                                            UOCR_METAL_DENSE_OUTPUT_F32,
+                                            out,
+                                            error,
+                                            sizeof(error)) == 1);
+        CHECK(error[0] == '\0');
+        for (uint32_t i = 0u; i < (uint32_t)(ROWS * OUT_FEATURES); ++i) {
+            CHECK(fabsf(out[i] - expected[i]) < 1.0e-5f);
+        }
+    }
+
+    uocr_metal_context_destroy(ctx);
     return 0;
 }
 
@@ -10537,7 +11246,7 @@ static int test_metal_attention_qkvo_f16(void) {
     uocr_metal_context *ctx = uocr_metal_context_create(UOCR_TEST_METAL_RESOURCE_PATH, error, sizeof(error));
     CHECK(ctx != NULL);
 
-    CHECK(uocr_metal_context_attention_qkvo_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_attention_qkvo_f16(ctx,
                                                 input,
                                                 weights[0],
                                                 weights[1],
@@ -10558,7 +11267,7 @@ static int test_metal_attention_qkvo_f16(void) {
         }
     }
 
-    CHECK(uocr_metal_context_attention_qkvo_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_attention_qkvo_f16(ctx,
                                                 input,
                                                 weights[0],
                                                 weights[1],
@@ -10579,7 +11288,7 @@ static int test_metal_attention_qkvo_f16(void) {
         }
     }
 
-    CHECK(uocr_metal_context_attention_qkvo_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_attention_qkvo_f16(ctx,
                                                 input,
                                                 weights[0],
                                                 weights[1],
@@ -10594,7 +11303,7 @@ static int test_metal_attention_qkvo_f16(void) {
                                                 error,
                                                 sizeof(error)) == 0);
     CHECK(strstr(error, "invalid Metal attention projection request") != NULL);
-    CHECK(uocr_metal_context_attention_qkvo_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_attention_qkvo_f16(ctx,
                                                 input,
                                                 weights[0],
                                                 weights[1],
@@ -10686,7 +11395,7 @@ static int test_metal_attention_output_residual_f16(void) {
     CHECK(ctx != NULL);
 
     memset(out_f32, 0, (size_t)TOKENS * HIDDEN * sizeof(float));
-    CHECK(uocr_metal_context_attention_output_residual_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_attention_output_residual_f16(ctx,
                                                            context,
                                                            weight,
                                                            residual,
@@ -10701,7 +11410,7 @@ static int test_metal_attention_output_residual_f16(void) {
     }
 
     memset(out_f16, 0, (size_t)HIDDEN * sizeof(uint16_t));
-    CHECK(uocr_metal_context_attention_output_residual_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_attention_output_residual_f16(ctx,
                                                            context,
                                                            weight,
                                                            residual,
@@ -10715,7 +11424,7 @@ static int test_metal_attention_output_residual_f16(void) {
         CHECK(fabsf(f16_bits_to_f32(out_f16[i]) - expected[i]) < 8.0e-3f);
     }
 
-    CHECK(uocr_metal_context_attention_output_residual_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_attention_output_residual_f16(ctx,
                                                            context,
                                                            weight,
                                                            residual,
@@ -10725,7 +11434,7 @@ static int test_metal_attention_output_residual_f16(void) {
                                                            error,
                                                            sizeof(error)) == 0);
     CHECK(strstr(error, "unsupported Metal attention output type") != NULL);
-    CHECK(uocr_metal_context_attention_output_residual_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_attention_output_residual_f16(ctx,
                                                            context,
                                                            weight,
                                                            residual,
@@ -10860,7 +11569,7 @@ static int test_metal_dense_swiglu_f16(void) {
     CHECK(ctx != NULL);
 
     memset(out_f32, 0, (size_t)TOKENS * HIDDEN * sizeof(float));
-    CHECK(uocr_metal_context_dense_swiglu_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_dense_swiglu_f16(ctx,
                                               input,
                                               gate_weight,
                                               up_weight,
@@ -10877,7 +11586,7 @@ static int test_metal_dense_swiglu_f16(void) {
     }
 
     memset(out_f16, 0, (size_t)HIDDEN * sizeof(uint16_t));
-    CHECK(uocr_metal_context_dense_swiglu_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_dense_swiglu_f16(ctx,
                                               input,
                                               gate_weight,
                                               up_weight,
@@ -10893,7 +11602,7 @@ static int test_metal_dense_swiglu_f16(void) {
         CHECK(fabsf(f16_bits_to_f32(out_f16[i]) - expected_no_residual[i]) < 2.0e-5f);
     }
 
-    CHECK(uocr_metal_context_dense_swiglu_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_dense_swiglu_f16(ctx,
                                               input,
                                               gate_weight,
                                               up_weight,
@@ -10905,7 +11614,7 @@ static int test_metal_dense_swiglu_f16(void) {
                                               error,
                                               sizeof(error)) == 0);
     CHECK(strstr(error, "unsupported Metal dense SwiGLU output type") != NULL);
-    CHECK(uocr_metal_context_dense_swiglu_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_dense_swiglu_f16(ctx,
                                               input,
                                               gate_weight,
                                               up_weight,
@@ -11032,7 +11741,7 @@ static int test_metal_moe_shared_experts_f16(void) {
     CHECK(ctx != NULL);
 
     memset(out_f32, 0, (size_t)TOKENS * HIDDEN * sizeof(float));
-    CHECK(uocr_metal_context_moe_shared_experts_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_moe_shared_experts_f16(ctx,
                                                     input,
                                                     gate_weight,
                                                     up_weight,
@@ -11048,7 +11757,7 @@ static int test_metal_moe_shared_experts_f16(void) {
     }
 
     memset(out_f16, 0, (size_t)HIDDEN * sizeof(uint16_t));
-    CHECK(uocr_metal_context_moe_shared_experts_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_moe_shared_experts_f16(ctx,
                                                     input,
                                                     gate_weight,
                                                     up_weight,
@@ -11063,7 +11772,7 @@ static int test_metal_moe_shared_experts_f16(void) {
         CHECK(fabsf(f16_bits_to_f32(out_f16[i]) - expected[i]) < 3.0e-4f);
     }
 
-    CHECK(uocr_metal_context_moe_shared_experts_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_moe_shared_experts_f16(ctx,
                                                     input,
                                                     gate_weight,
                                                     up_weight,
@@ -11074,7 +11783,7 @@ static int test_metal_moe_shared_experts_f16(void) {
                                                     error,
                                                     sizeof(error)) == 0);
     CHECK(strstr(error, "unsupported Metal MoE shared experts output type") != NULL);
-    CHECK(uocr_metal_context_moe_shared_experts_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_moe_shared_experts_f16(ctx,
                                                     input,
                                                     gate_weight,
                                                     up_weight,
@@ -11085,6 +11794,185 @@ static int test_metal_moe_shared_experts_f16(void) {
                                                     error,
                                                     sizeof(error)) == 0);
     CHECK(strstr(error, "invalid Metal MoE shared experts request") != NULL);
+
+    uocr_metal_context_destroy(ctx);
+    free(out_f16);
+    free(out_f32);
+    free(expected);
+    free(mid);
+    free(down_weight);
+    free(up_weight);
+    free(gate_weight);
+    free(input);
+    return 0;
+}
+
+static int test_metal_moe_shared_experts_q8_0(void) {
+    if (!uocr_metal_is_available()) {
+        return 0;
+    }
+
+    enum { TOKENS = 2, HIDDEN = UOCR_HIDDEN_SIZE, INTERMEDIATE = UOCR_MOE_SHARED_INTERMEDIATE };
+    enum { PHYSICAL_HIDDEN = HIDDEN + 32, PHYSICAL_INTERMEDIATE = INTERMEDIATE + 32 };
+    enum { GATE_ROW_SIZE = (PHYSICAL_HIDDEN / 32) * 34, DOWN_ROW_SIZE = (PHYSICAL_INTERMEDIATE / 32) * 34 };
+    const uint16_t input_values[] = {
+        0xb400u, /* -0.25 */
+        0xb000u, /* -0.125 */
+        0x0000u, /* 0.0 */
+        0x2c00u, /* 0.0625 */
+        0x3000u, /* 0.125 */
+        0x3400u  /* 0.25 */
+    };
+    const uint32_t input_value_count = (uint32_t)(sizeof(input_values) / sizeof(input_values[0]));
+
+    uint16_t *input = (uint16_t *)malloc((size_t)TOKENS * HIDDEN * sizeof(uint16_t));
+    uint8_t *gate_weight = (uint8_t *)calloc((size_t)INTERMEDIATE, (size_t)GATE_ROW_SIZE);
+    uint8_t *up_weight = (uint8_t *)calloc((size_t)INTERMEDIATE, (size_t)GATE_ROW_SIZE);
+    uint8_t *down_weight = (uint8_t *)calloc((size_t)HIDDEN, (size_t)DOWN_ROW_SIZE);
+    float *mid = (float *)malloc((size_t)TOKENS * INTERMEDIATE * sizeof(float));
+    float *expected = (float *)malloc((size_t)TOKENS * HIDDEN * sizeof(float));
+    float *out_f32 = (float *)malloc((size_t)TOKENS * HIDDEN * sizeof(float));
+    uint16_t *out_f16 = (uint16_t *)malloc((size_t)HIDDEN * sizeof(uint16_t));
+    CHECK(input != NULL && gate_weight != NULL && up_weight != NULL && down_weight != NULL && mid != NULL &&
+          expected != NULL && out_f32 != NULL && out_f16 != NULL);
+
+    for (uint32_t i = 0u; i < (uint32_t)(TOKENS * HIDDEN); ++i) {
+        input[i] = input_values[(i * 17u + i / 23u + 3u) % input_value_count];
+    }
+
+    for (uint32_t row = 0u; row < (uint32_t)INTERMEDIATE; ++row) {
+        for (uint32_t block = 0u; block < (uint32_t)(PHYSICAL_HIDDEN / 32); ++block) {
+            const uint16_t gate_scale = f32_to_f16_bits(0.03125f * (float)(1u + ((row + block) & 1u)));
+            const uint16_t up_scale = f32_to_f16_bits(0.015625f * (float)(1u + ((row + block + 1u) % 3u)));
+            write_q8_scale_le(gate_weight + (size_t)row * GATE_ROW_SIZE + (size_t)block * 34u, gate_scale);
+            write_q8_scale_le(up_weight + (size_t)row * GATE_ROW_SIZE + (size_t)block * 34u, up_scale);
+        }
+        const uint32_t g0 = (row * 29u) % (uint32_t)HIDDEN;
+        const uint32_t g1 = (row * 29u + 101u) % (uint32_t)HIDDEN;
+        const uint32_t u0 = (row * 43u + 11u) % (uint32_t)HIDDEN;
+        const uint32_t u1 = (row * 43u + 307u) % (uint32_t)HIDDEN;
+        set_q8_0_q(gate_weight, GATE_ROW_SIZE, row, g0, (int8_t)((int)(row % 13u) - 6));
+        set_q8_0_q(gate_weight, GATE_ROW_SIZE, row, g1, (int8_t)(5 - (int)(row % 11u)));
+        set_q8_0_q(up_weight, GATE_ROW_SIZE, row, u0, (int8_t)((int)(row % 9u) - 4));
+        set_q8_0_q(up_weight, GATE_ROW_SIZE, row, u1, (int8_t)(4 - (int)(row % 7u)));
+        set_q8_0_q(gate_weight, GATE_ROW_SIZE, row, HIDDEN + 5u, 99); /* physical padding */
+        set_q8_0_q(up_weight, GATE_ROW_SIZE, row, HIDDEN + 11u, -99); /* physical padding */
+    }
+
+    for (uint32_t col = 0u; col < (uint32_t)HIDDEN; ++col) {
+        for (uint32_t block = 0u; block < (uint32_t)(PHYSICAL_INTERMEDIATE / 32); ++block) {
+            const uint16_t scale = f32_to_f16_bits(0.015625f * (float)(1u + ((col + block) % 4u)));
+            write_q8_scale_le(down_weight + (size_t)col * DOWN_ROW_SIZE + (size_t)block * 34u, scale);
+        }
+        const uint32_t d0 = (col * 31u) % (uint32_t)INTERMEDIATE;
+        const uint32_t d1 = (col * 31u + 271u) % (uint32_t)INTERMEDIATE;
+        const uint32_t d2 = (col * 31u + 1009u) % (uint32_t)INTERMEDIATE;
+        set_q8_0_q(down_weight, DOWN_ROW_SIZE, col, d0, (int8_t)((int)(col % 15u) - 7));
+        set_q8_0_q(down_weight, DOWN_ROW_SIZE, col, d1, (int8_t)(6 - (int)(col % 13u)));
+        set_q8_0_q(down_weight, DOWN_ROW_SIZE, col, d2, (int8_t)((int)(col % 11u) - 5));
+        set_q8_0_q(down_weight, DOWN_ROW_SIZE, col, INTERMEDIATE + 3u, 88); /* physical padding */
+    }
+
+    for (uint32_t token = 0u; token < (uint32_t)TOKENS; ++token) {
+        for (uint32_t row = 0u; row < (uint32_t)INTERMEDIATE; ++row) {
+            const uint32_t g0 = (row * 29u) % (uint32_t)HIDDEN;
+            const uint32_t g1 = (row * 29u + 101u) % (uint32_t)HIDDEN;
+            const uint32_t u0 = (row * 43u + 11u) % (uint32_t)HIDDEN;
+            const uint32_t u1 = (row * 43u + 307u) % (uint32_t)HIDDEN;
+            float gate = 0.0f;
+            float up = 0.0f;
+            gate += f16_bits_to_f32(input[token * (uint32_t)HIDDEN + g0]) *
+                    q8_0_expected_value(gate_weight, GATE_ROW_SIZE, row, g0);
+            gate += f16_bits_to_f32(input[token * (uint32_t)HIDDEN + g1]) *
+                    q8_0_expected_value(gate_weight, GATE_ROW_SIZE, row, g1);
+            up += f16_bits_to_f32(input[token * (uint32_t)HIDDEN + u0]) *
+                  q8_0_expected_value(up_weight, GATE_ROW_SIZE, row, u0);
+            up += f16_bits_to_f32(input[token * (uint32_t)HIDDEN + u1]) *
+                  q8_0_expected_value(up_weight, GATE_ROW_SIZE, row, u1);
+            const float silu = gate / (1.0f + expf(-gate));
+            mid[token * (uint32_t)INTERMEDIATE + row] = f16_bits_to_f32(f32_to_f16_bits(silu * up));
+        }
+    }
+    for (uint32_t token = 0u; token < (uint32_t)TOKENS; ++token) {
+        for (uint32_t col = 0u; col < (uint32_t)HIDDEN; ++col) {
+            const uint32_t d0 = (col * 31u) % (uint32_t)INTERMEDIATE;
+            const uint32_t d1 = (col * 31u + 271u) % (uint32_t)INTERMEDIATE;
+            const uint32_t d2 = (col * 31u + 1009u) % (uint32_t)INTERMEDIATE;
+            float sum = 0.0f;
+            sum += mid[token * (uint32_t)INTERMEDIATE + d0] * q8_0_expected_value(down_weight, DOWN_ROW_SIZE, col, d0);
+            sum += mid[token * (uint32_t)INTERMEDIATE + d1] * q8_0_expected_value(down_weight, DOWN_ROW_SIZE, col, d1);
+            sum += mid[token * (uint32_t)INTERMEDIATE + d2] * q8_0_expected_value(down_weight, DOWN_ROW_SIZE, col, d2);
+            expected[token * (uint32_t)HIDDEN + col] = sum;
+        }
+    }
+
+    char error[1024];
+    memset(error, 0, sizeof(error));
+    uocr_metal_context *ctx = uocr_metal_context_create(UOCR_TEST_METAL_RESOURCE_PATH, error, sizeof(error));
+    CHECK(ctx != NULL);
+
+    memset(out_f32, 0, (size_t)TOKENS * HIDDEN * sizeof(float));
+    CHECK(uocr_metal_context_diagnostic_moe_shared_experts_q8_0(ctx,
+                                                     input,
+                                                     gate_weight,
+                                                     up_weight,
+                                                     down_weight,
+                                                     PHYSICAL_HIDDEN,
+                                                     PHYSICAL_INTERMEDIATE,
+                                                     TOKENS,
+                                                     UOCR_METAL_DENSE_OUTPUT_F32,
+                                                     out_f32,
+                                                     error,
+                                                     sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    for (uint32_t i = 0u; i < (uint32_t)(TOKENS * HIDDEN); ++i) {
+        CHECK(fabsf(out_f32[i] - expected[i]) < 1.0e-4f);
+    }
+
+    memset(out_f16, 0, (size_t)HIDDEN * sizeof(uint16_t));
+    CHECK(uocr_metal_context_diagnostic_moe_shared_experts_q8_0(ctx,
+                                                     input,
+                                                     gate_weight,
+                                                     up_weight,
+                                                     down_weight,
+                                                     PHYSICAL_HIDDEN,
+                                                     PHYSICAL_INTERMEDIATE,
+                                                     1u,
+                                                     UOCR_METAL_DENSE_OUTPUT_F16,
+                                                     out_f16,
+                                                     error,
+                                                     sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    for (uint32_t i = 0u; i < (uint32_t)HIDDEN; ++i) {
+        CHECK(fabsf(f16_bits_to_f32(out_f16[i]) - expected[i]) < 3.0e-4f);
+    }
+
+    CHECK(uocr_metal_context_diagnostic_moe_shared_experts_q8_0(ctx,
+                                                     input,
+                                                     gate_weight,
+                                                     up_weight,
+                                                     down_weight,
+                                                     PHYSICAL_HIDDEN,
+                                                     PHYSICAL_INTERMEDIATE,
+                                                     TOKENS,
+                                                     (uocr_metal_dense_output_type)99,
+                                                     out_f32,
+                                                     error,
+                                                     sizeof(error)) == 0);
+    CHECK(strstr(error, "unsupported Metal MoE shared Q8_0 output type") != NULL);
+    CHECK(uocr_metal_context_diagnostic_moe_shared_experts_q8_0(ctx,
+                                                     input,
+                                                     gate_weight,
+                                                     up_weight,
+                                                     down_weight,
+                                                     1279u,
+                                                     PHYSICAL_INTERMEDIATE,
+                                                     TOKENS,
+                                                     UOCR_METAL_DENSE_OUTPUT_F32,
+                                                     out_f32,
+                                                     error,
+                                                     sizeof(error)) == 0);
+    CHECK(strstr(error, "widths") != NULL);
 
     uocr_metal_context_destroy(ctx);
     free(out_f16);
@@ -11221,7 +12109,7 @@ static int test_metal_moe_router_f16(void) {
     memset(probs, 0, (size_t)TOKENS * EXPERTS * sizeof(float));
     memset(top_ids, 0xff, (size_t)TOKENS * TOP_K * sizeof(uint32_t));
     memset(top_weights, 0, (size_t)TOKENS * TOP_K * sizeof(float));
-    CHECK(uocr_metal_context_moe_router_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_moe_router_f16(ctx,
                                             input,
                                             weight,
                                             TOKENS,
@@ -11243,7 +12131,7 @@ static int test_metal_moe_router_f16(void) {
 
     memset(top_ids_optional, 0xff, (size_t)TOP_K * sizeof(uint32_t));
     memset(top_weights_optional, 0, (size_t)TOP_K * sizeof(float));
-    CHECK(uocr_metal_context_moe_router_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_moe_router_f16(ctx,
                                             input,
                                             weight,
                                             1u,
@@ -11259,12 +12147,77 @@ static int test_metal_moe_router_f16(void) {
         CHECK(fabsf(top_weights_optional[i] - expected_top_weights[i]) < 2.0e-6f);
     }
 
+    /* Regression guard for the OCR routing contract.  DS4 applies
+     * sqrt(softplus(logits)) plus selected-top-k renormalization/scaling in
+     * its router path; Unlimited-OCR must keep raw softmax probabilities over
+     * all 64 experts and pass those unrenormalized probabilities to the
+     * selected experts.
+     */
+    memset(input, 0, (size_t)TOKENS * HIDDEN * sizeof(uint16_t));
+    memset(weight, 0, (size_t)EXPERTS * HIDDEN * sizeof(uint16_t));
+    input[0] = f32_to_f16_bits(1.0f);
+    float max_contract_logit = -INFINITY;
+    for (uint32_t expert = 0u; expert < (uint32_t)EXPERTS; ++expert) {
+        const float desired = ((float)expert - 31.5f) * 0.125f;
+        weight[expert * (uint32_t)HIDDEN] = f32_to_f16_bits(desired);
+        const float rounded = f16_bits_to_f32(weight[expert * (uint32_t)HIDDEN]);
+        expected_logits[expert] = rounded;
+        if (rounded > max_contract_logit) {
+            max_contract_logit = rounded;
+        }
+    }
+    float contract_denom = 0.0f;
+    for (uint32_t expert = 0u; expert < (uint32_t)EXPERTS; ++expert) {
+        const float value = expf(expected_logits[expert] - max_contract_logit);
+        expected_probs[expert] = value;
+        contract_denom += value;
+    }
+    for (uint32_t expert = 0u; expert < (uint32_t)EXPERTS; ++expert) {
+        expected_probs[expert] /= contract_denom;
+    }
+    memset(expected_top_ids, 0, (size_t)TOKENS * TOP_K * sizeof(uint32_t));
+    memset(expected_top_weights, 0, (size_t)TOKENS * TOP_K * sizeof(float));
+    compute_router_topk_expected(expected_probs,
+                                 0u,
+                                 (uint32_t)EXPERTS,
+                                 (uint32_t)TOP_K,
+                                 expected_top_ids,
+                                 expected_top_weights);
+    memset(logits, 0, (size_t)TOKENS * EXPERTS * sizeof(float));
+    memset(probs, 0, (size_t)TOKENS * EXPERTS * sizeof(float));
+    memset(top_ids, 0xff, (size_t)TOKENS * TOP_K * sizeof(uint32_t));
+    memset(top_weights, 0, (size_t)TOKENS * TOP_K * sizeof(float));
+    CHECK(uocr_metal_context_diagnostic_moe_router_f16(ctx,
+                                            input,
+                                            weight,
+                                            1u,
+                                            logits,
+                                            probs,
+                                            top_ids,
+                                            top_weights,
+                                            error,
+                                            sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    for (uint32_t expert = 0u; expert < (uint32_t)EXPERTS; ++expert) {
+        CHECK(fabsf(logits[expert] - expected_logits[expert]) < 2.0e-6f);
+        CHECK(fabsf(probs[expert] - expected_probs[expert]) < 2.0e-6f);
+    }
+    float selected_sum = 0.0f;
+    for (uint32_t rank = 0u; rank < (uint32_t)TOP_K; ++rank) {
+        CHECK(top_ids[rank] == expected_top_ids[rank]);
+        CHECK(fabsf(top_weights[rank] - expected_top_weights[rank]) < 2.0e-6f);
+        selected_sum += top_weights[rank];
+    }
+    CHECK(selected_sum > 0.40f && selected_sum < 0.75f);
+    CHECK(fabsf(selected_sum - 1.0f) > 0.20f);
+    CHECK(fabsf(selected_sum - 1.5f) > 0.50f);
+
     memset(weight, 0, (size_t)EXPERTS * HIDDEN * sizeof(uint16_t));
     memset(logits, 1, (size_t)TOKENS * EXPERTS * sizeof(float));
     memset(probs, 1, (size_t)TOKENS * EXPERTS * sizeof(float));
     memset(top_ids, 0xff, (size_t)TOKENS * TOP_K * sizeof(uint32_t));
     memset(top_weights, 0, (size_t)TOKENS * TOP_K * sizeof(float));
-    CHECK(uocr_metal_context_moe_router_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_moe_router_f16(ctx,
                                             input,
                                             weight,
                                             TOKENS,
@@ -11286,7 +12239,7 @@ static int test_metal_moe_router_f16(void) {
         }
     }
 
-    CHECK(uocr_metal_context_moe_router_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_moe_router_f16(ctx,
                                             input,
                                             weight,
                                             TOKENS,
@@ -11297,7 +12250,7 @@ static int test_metal_moe_router_f16(void) {
                                             error,
                                             sizeof(error)) == 0);
     CHECK(strstr(error, "invalid Metal MoE router request") != NULL);
-    CHECK(uocr_metal_context_moe_router_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_moe_router_f16(ctx,
                                             input,
                                             weight,
                                             0u,
@@ -11430,7 +12383,7 @@ static int test_metal_moe_selected_experts_decode_f16(void) {
     CHECK(ctx != NULL);
 
     memset(out_f32, 0, (size_t)HIDDEN * sizeof(float));
-    CHECK(uocr_metal_context_moe_selected_experts_decode_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_moe_selected_experts_decode_f16(ctx,
                                                              input,
                                                              top_ids,
                                                              top_weights,
@@ -11447,7 +12400,7 @@ static int test_metal_moe_selected_experts_decode_f16(void) {
     }
 
     memset(out_f16, 0, (size_t)HIDDEN * sizeof(uint16_t));
-    CHECK(uocr_metal_context_moe_selected_experts_decode_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_moe_selected_experts_decode_f16(ctx,
                                                              input,
                                                              top_ids,
                                                              top_weights,
@@ -11463,7 +12416,7 @@ static int test_metal_moe_selected_experts_decode_f16(void) {
         CHECK(fabsf(f16_bits_to_f32(out_f16[col]) - expected[col]) < 3.0e-4f);
     }
 
-    CHECK(uocr_metal_context_moe_selected_experts_decode_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_moe_selected_experts_decode_f16(ctx,
                                                              input,
                                                              top_ids,
                                                              top_weights,
@@ -11477,7 +12430,7 @@ static int test_metal_moe_selected_experts_decode_f16(void) {
     CHECK(strstr(error, "unsupported Metal MoE selected-expert output type") != NULL);
 
     uint32_t bad_ids[TOP_K] = {7u, 2u, UOCR_ROUTED_EXPERTS, 0u, 5u, 11u};
-    CHECK(uocr_metal_context_moe_selected_experts_decode_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_moe_selected_experts_decode_f16(ctx,
                                                              input,
                                                              bad_ids,
                                                              top_weights,
@@ -11495,6 +12448,376 @@ static int test_metal_moe_selected_experts_decode_f16(void) {
     free(out_f32);
     free(expected);
     free(mid);
+    free(down_weight);
+    free(up_weight);
+    free(gate_weight);
+    free(input);
+    return 0;
+}
+
+static int test_metal_moe_selected_experts_decode_q4_k(void) {
+    if (!uocr_metal_is_available()) {
+        return 0;
+    }
+
+    enum { HIDDEN = UOCR_HIDDEN_SIZE, PHYSICAL = UOCR_HIDDEN_SIZE, INTERMEDIATE = UOCR_MOE_EXPERT_INTERMEDIATE };
+    enum { TOP_K = UOCR_MOE_TOP_K, ROW_SIZE = (PHYSICAL / UOCR_Q4_K_BLOCK_SIZE) * UOCR_Q4_K_TYPE_SIZE };
+    enum { DOWN_PHYSICAL = 1024, DOWN_ROW_SIZE = (DOWN_PHYSICAL / UOCR_Q8_0_BLOCK_SIZE) * UOCR_Q8_0_TYPE_SIZE };
+    enum { DOWN_Q4_PHYSICAL = 1024, DOWN_Q4_ROW_SIZE = (DOWN_Q4_PHYSICAL / UOCR_Q4_K_BLOCK_SIZE) * UOCR_Q4_K_TYPE_SIZE };
+    const uint32_t top_ids[TOP_K] = {3u, 17u, 5u, 63u, 11u, 0u};
+    const float top_weights[TOP_K] = {0.3125f, 0.25f, 0.1875f, 0.125f, 0.0625f, 0.03125f};
+    const uint16_t input_values[] = {
+        0xb800u, /* -0.5 */
+        0xb400u, /* -0.25 */
+        0x0000u, /* 0.0 */
+        0x3000u, /* 0.125 */
+        0x3400u, /* 0.25 */
+        0x3800u  /* 0.5 */
+    };
+    const uint16_t down_values[] = {
+        0x2400u, /* 0.015625 */
+        0x2800u, /* 0.03125 */
+        0xa400u, /* -0.015625 */
+        0xa800u, /* -0.03125 */
+        0x2c00u, /* 0.0625 */
+        0xac00u  /* -0.0625 */
+    };
+    const uint32_t input_value_count = (uint32_t)(sizeof(input_values) / sizeof(input_values[0]));
+    const uint32_t down_value_count = (uint32_t)(sizeof(down_values) / sizeof(down_values[0]));
+
+    uint16_t *input = (uint16_t *)malloc((size_t)HIDDEN * sizeof(uint16_t));
+    uint8_t *gate_weight = (uint8_t *)malloc((size_t)TOP_K * INTERMEDIATE * ROW_SIZE);
+    uint8_t *up_weight = (uint8_t *)malloc((size_t)TOP_K * INTERMEDIATE * ROW_SIZE);
+    uint16_t *down_weight = (uint16_t *)calloc((size_t)TOP_K * HIDDEN * INTERMEDIATE, sizeof(uint16_t));
+    uint8_t *down_weight_q8 = (uint8_t *)malloc((size_t)TOP_K * HIDDEN * DOWN_ROW_SIZE);
+    uint8_t *down_weight_q4 = (uint8_t *)malloc((size_t)TOP_K * HIDDEN * DOWN_Q4_ROW_SIZE);
+    float *mid = (float *)malloc((size_t)TOP_K * INTERMEDIATE * sizeof(float));
+    float *expected = (float *)malloc((size_t)HIDDEN * sizeof(float));
+    float *expected_q8 = (float *)malloc((size_t)HIDDEN * sizeof(float));
+    float *expected_q4 = (float *)malloc((size_t)HIDDEN * sizeof(float));
+    float *out_f32 = (float *)malloc((size_t)HIDDEN * sizeof(float));
+    uint16_t *out_f16 = (uint16_t *)malloc((size_t)HIDDEN * sizeof(uint16_t));
+    CHECK(input != NULL && gate_weight != NULL && up_weight != NULL && down_weight != NULL &&
+          down_weight_q8 != NULL && down_weight_q4 != NULL && mid != NULL && expected != NULL &&
+          expected_q8 != NULL && expected_q4 != NULL && out_f32 != NULL && out_f16 != NULL);
+
+    init_q4_k_rows(gate_weight, (uint32_t)(TOP_K * INTERMEDIATE), (uint32_t)ROW_SIZE, (uint32_t)PHYSICAL, 0x2c00u);
+    init_q4_k_rows(up_weight, (uint32_t)(TOP_K * INTERMEDIATE), (uint32_t)ROW_SIZE, (uint32_t)PHYSICAL, 0x2c00u);
+    memset(down_weight_q8, 0, (size_t)TOP_K * HIDDEN * DOWN_ROW_SIZE);
+    init_q4_k_rows(down_weight_q4,
+                   (uint32_t)(TOP_K * HIDDEN),
+                   (uint32_t)DOWN_Q4_ROW_SIZE,
+                   (uint32_t)DOWN_Q4_PHYSICAL,
+                   0x2200u);
+    for (uint32_t row = 0u; row < (uint32_t)(TOP_K * HIDDEN); ++row) {
+        for (uint32_t block = 0u; block < (uint32_t)(DOWN_PHYSICAL / UOCR_Q8_0_BLOCK_SIZE); ++block) {
+            write_q8_scale_le(down_weight_q8 + (size_t)row * DOWN_ROW_SIZE + (size_t)block * UOCR_Q8_0_TYPE_SIZE,
+                              f32_to_f16_bits(0.015625f * (float)(1u + ((row + block) % 3u))));
+        }
+    }
+    for (uint32_t col = 0u; col < (uint32_t)HIDDEN; ++col) {
+        input[col] = input_values[(col * 5u + col / 31u + 1u) % input_value_count];
+    }
+
+    for (uint32_t rank = 0u; rank < (uint32_t)TOP_K; ++rank) {
+        for (uint32_t row = 0u; row < (uint32_t)INTERMEDIATE; ++row) {
+            const uint32_t gate_row = rank * (uint32_t)INTERMEDIATE + row;
+            uint32_t g0 = (rank * 131u + row * 19u + 7u) % (uint32_t)HIDDEN;
+            uint32_t g1 = (rank * 193u + row * 29u + 41u) % (uint32_t)HIDDEN;
+            uint32_t u0 = (rank * 67u + row * 17u + 13u) % (uint32_t)HIDDEN;
+            uint32_t u1 = (rank * 101u + row * 23u + 59u) % (uint32_t)HIDDEN;
+            if (g1 == g0) g1 = (g1 + 1u) % (uint32_t)HIDDEN;
+            if (u1 == u0) u1 = (u1 + 1u) % (uint32_t)HIDDEN;
+            set_q4_k_q(gate_weight, (uint32_t)ROW_SIZE, gate_row, g0, (uint8_t)(1u + ((rank + row) % 7u)));
+            set_q4_k_q(gate_weight, (uint32_t)ROW_SIZE, gate_row, g1, (uint8_t)(2u + ((rank * 3u + row) % 6u)));
+            set_q4_k_q(up_weight, (uint32_t)ROW_SIZE, gate_row, u0, (uint8_t)(1u + ((rank * 5u + row) % 7u)));
+            set_q4_k_q(up_weight, (uint32_t)ROW_SIZE, gate_row, u1, (uint8_t)(2u + ((rank + row * 3u) % 6u)));
+        }
+    }
+
+    for (uint32_t rank = 0u; rank < (uint32_t)TOP_K; ++rank) {
+        for (uint32_t col = 0u; col < (uint32_t)HIDDEN; ++col) {
+            uint32_t d0 = (rank * 173u + col * 7u) % (uint32_t)INTERMEDIATE;
+            uint32_t d1 = (rank * 181u + col * 11u + 37u) % (uint32_t)INTERMEDIATE;
+            uint32_t d2 = (rank * 191u + col * 13u + 101u) % (uint32_t)INTERMEDIATE;
+            if (d1 == d0) d1 = (d1 + 1u) % (uint32_t)INTERMEDIATE;
+            if (d2 == d0 || d2 == d1) d2 = (d2 + 2u) % (uint32_t)INTERMEDIATE;
+            const size_t base = ((size_t)rank * HIDDEN + col) * INTERMEDIATE;
+            down_weight[base + d0] = down_values[(rank + col + 2u) % down_value_count];
+            down_weight[base + d1] = down_values[(rank * 3u + col * 5u + 1u) % down_value_count];
+            down_weight[base + d2] = down_values[(rank * 7u + col * 11u + 5u) % down_value_count];
+            const uint32_t q8_row = rank * (uint32_t)HIDDEN + col;
+            set_q8_0_q(down_weight_q8, (uint32_t)DOWN_ROW_SIZE, q8_row, d0, (int8_t)(1 + (int)((rank + col) % 5u)));
+            set_q8_0_q(down_weight_q8, (uint32_t)DOWN_ROW_SIZE, q8_row, d1, (int8_t)(-2 - (int)((rank * 2u + col) % 4u)));
+            set_q8_0_q(down_weight_q8, (uint32_t)DOWN_ROW_SIZE, q8_row, d2, (int8_t)(3 + (int)((rank * 3u + col) % 3u)));
+            set_q8_0_q(down_weight_q8,
+                       (uint32_t)DOWN_ROW_SIZE,
+                       q8_row,
+                       (uint32_t)INTERMEDIATE + 7u,
+                       (int8_t)-101); /* physical padding must be ignored */
+            set_q4_k_q(down_weight_q4,
+                       (uint32_t)DOWN_Q4_ROW_SIZE,
+                       q8_row,
+                       d0,
+                       (uint8_t)(1u + ((rank + col) % 8u)));
+            set_q4_k_q(down_weight_q4,
+                       (uint32_t)DOWN_Q4_ROW_SIZE,
+                       q8_row,
+                       d1,
+                       (uint8_t)(2u + ((rank * 2u + col) % 7u)));
+            set_q4_k_q(down_weight_q4,
+                       (uint32_t)DOWN_Q4_ROW_SIZE,
+                       q8_row,
+                       d2,
+                       (uint8_t)(3u + ((rank * 3u + col) % 6u)));
+            set_q4_k_q(down_weight_q4,
+                       (uint32_t)DOWN_Q4_ROW_SIZE,
+                       q8_row,
+                       (uint32_t)INTERMEDIATE + 13u,
+                       15u); /* physical padding must be ignored */
+        }
+    }
+
+    for (uint32_t rank = 0u; rank < (uint32_t)TOP_K; ++rank) {
+        for (uint32_t row = 0u; row < (uint32_t)INTERMEDIATE; ++row) {
+            float gate = 0.0f;
+            float up = 0.0f;
+            const uint32_t weight_row = rank * (uint32_t)INTERMEDIATE + row;
+            for (uint32_t col = 0u; col < (uint32_t)HIDDEN; ++col) {
+                const float x = f16_bits_to_f32(input[col]);
+                gate += x * q4_k_expected_value(gate_weight, (uint32_t)ROW_SIZE, weight_row, col);
+                up += x * q4_k_expected_value(up_weight, (uint32_t)ROW_SIZE, weight_row, col);
+            }
+            const float silu = gate / (1.0f + expf(-gate));
+            mid[(size_t)rank * INTERMEDIATE + row] = f16_bits_to_f32(f32_to_f16_bits(silu * up));
+        }
+    }
+
+    for (uint32_t col = 0u; col < (uint32_t)HIDDEN; ++col) {
+        float routed_sum = 0.0f;
+        float routed_sum_q8 = 0.0f;
+        float routed_sum_q4 = 0.0f;
+        for (uint32_t rank = 0u; rank < (uint32_t)TOP_K; ++rank) {
+            float expert_sum = 0.0f;
+            float expert_sum_q8 = 0.0f;
+            float expert_sum_q4 = 0.0f;
+            const size_t base = ((size_t)rank * HIDDEN + col) * INTERMEDIATE;
+            const uint32_t q8_row = rank * (uint32_t)HIDDEN + col;
+            for (uint32_t row = 0u; row < (uint32_t)INTERMEDIATE; ++row) {
+                expert_sum += mid[(size_t)rank * INTERMEDIATE + row] * f16_bits_to_f32(down_weight[base + row]);
+                expert_sum_q8 += mid[(size_t)rank * INTERMEDIATE + row] *
+                                 q8_0_expected_value(down_weight_q8, (uint32_t)DOWN_ROW_SIZE, q8_row, row);
+                expert_sum_q4 += mid[(size_t)rank * INTERMEDIATE + row] *
+                                 q4_k_expected_value(down_weight_q4, (uint32_t)DOWN_Q4_ROW_SIZE, q8_row, row);
+            }
+            routed_sum += expert_sum * top_weights[rank];
+            routed_sum_q8 += expert_sum_q8 * top_weights[rank];
+            routed_sum_q4 += expert_sum_q4 * top_weights[rank];
+        }
+        expected[col] = routed_sum;
+        expected_q8[col] = routed_sum_q8;
+        expected_q4[col] = routed_sum_q4;
+    }
+
+    char error[1024];
+    memset(error, 0, sizeof(error));
+    uocr_metal_context *ctx = uocr_metal_context_create(UOCR_TEST_METAL_RESOURCE_PATH, error, sizeof(error));
+    CHECK(ctx != NULL);
+
+    memset(out_f32, 0, (size_t)HIDDEN * sizeof(float));
+    CHECK(uocr_metal_context_diagnostic_moe_selected_experts_decode_q4_k(ctx,
+                                                              input,
+                                                              top_ids,
+                                                              top_weights,
+                                                              gate_weight,
+                                                              up_weight,
+                                                              down_weight,
+                                                              PHYSICAL,
+                                                              UOCR_METAL_DENSE_OUTPUT_F32,
+                                                              out_f32,
+                                                              error,
+                                                              sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    for (uint32_t col = 0u; col < (uint32_t)HIDDEN; ++col) {
+        CHECK(fabsf(out_f32[col] - expected[col]) < 5.0e-5f);
+    }
+
+    memset(out_f16, 0, (size_t)HIDDEN * sizeof(uint16_t));
+    CHECK(uocr_metal_context_diagnostic_moe_selected_experts_decode_q4_k(ctx,
+                                                              input,
+                                                              top_ids,
+                                                              top_weights,
+                                                              gate_weight,
+                                                              up_weight,
+                                                              down_weight,
+                                                              PHYSICAL,
+                                                              UOCR_METAL_DENSE_OUTPUT_F16,
+                                                              out_f16,
+                                                              error,
+                                                              sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    for (uint32_t col = 0u; col < (uint32_t)HIDDEN; ++col) {
+        CHECK(fabsf(f16_bits_to_f32(out_f16[col]) - expected[col]) < 7.0e-4f);
+    }
+
+    memset(out_f32, 0, (size_t)HIDDEN * sizeof(float));
+    CHECK(uocr_metal_context_diagnostic_moe_selected_experts_decode_q4_k_q8_0(ctx,
+                                                                   input,
+                                                                   top_ids,
+                                                                   top_weights,
+                                                                   gate_weight,
+                                                                   up_weight,
+                                                                   down_weight_q8,
+                                                                   PHYSICAL,
+                                                                   DOWN_PHYSICAL,
+                                                                   UOCR_METAL_DENSE_OUTPUT_F32,
+                                                                   out_f32,
+                                                                   error,
+                                                                   sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    for (uint32_t col = 0u; col < (uint32_t)HIDDEN; ++col) {
+        CHECK(fabsf(out_f32[col] - expected_q8[col]) < 7.0e-5f);
+    }
+
+    memset(out_f16, 0, (size_t)HIDDEN * sizeof(uint16_t));
+    CHECK(uocr_metal_context_diagnostic_moe_selected_experts_decode_q4_k_q8_0(ctx,
+                                                                   input,
+                                                                   top_ids,
+                                                                   top_weights,
+                                                                   gate_weight,
+                                                                   up_weight,
+                                                                   down_weight_q8,
+                                                                   PHYSICAL,
+                                                                   DOWN_PHYSICAL,
+                                                                   UOCR_METAL_DENSE_OUTPUT_F16,
+                                                                   out_f16,
+                                                                   error,
+                                                                   sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    for (uint32_t col = 0u; col < (uint32_t)HIDDEN; ++col) {
+        CHECK(fabsf(f16_bits_to_f32(out_f16[col]) - expected_q8[col]) < 8.0e-4f);
+    }
+
+    memset(out_f32, 0, (size_t)HIDDEN * sizeof(float));
+    CHECK(uocr_metal_context_diagnostic_moe_selected_experts_decode_q4_k_padded(ctx,
+                                                                     input,
+                                                                     top_ids,
+                                                                     top_weights,
+                                                                     gate_weight,
+                                                                     up_weight,
+                                                                     down_weight_q4,
+                                                                     PHYSICAL,
+                                                                     DOWN_Q4_PHYSICAL,
+                                                                     UOCR_METAL_DENSE_OUTPUT_F32,
+                                                                     out_f32,
+                                                                     error,
+                                                                     sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    for (uint32_t col = 0u; col < (uint32_t)HIDDEN; ++col) {
+        CHECK(fabsf(out_f32[col] - expected_q4[col]) < 7.0e-5f);
+    }
+
+    memset(out_f16, 0, (size_t)HIDDEN * sizeof(uint16_t));
+    CHECK(uocr_metal_context_diagnostic_moe_selected_experts_decode_q4_k_padded(ctx,
+                                                                     input,
+                                                                     top_ids,
+                                                                     top_weights,
+                                                                     gate_weight,
+                                                                     up_weight,
+                                                                     down_weight_q4,
+                                                                     PHYSICAL,
+                                                                     DOWN_Q4_PHYSICAL,
+                                                                     UOCR_METAL_DENSE_OUTPUT_F16,
+                                                                     out_f16,
+                                                                     error,
+                                                                     sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    for (uint32_t col = 0u; col < (uint32_t)HIDDEN; ++col) {
+        CHECK(fabsf(f16_bits_to_f32(out_f16[col]) - expected_q4[col]) < 8.0e-4f);
+    }
+
+    CHECK(uocr_metal_context_diagnostic_moe_selected_experts_decode_q4_k_padded(ctx,
+                                                                     input,
+                                                                     top_ids,
+                                                                     top_weights,
+                                                                     gate_weight,
+                                                                     up_weight,
+                                                                     down_weight_q4,
+                                                                     PHYSICAL,
+                                                                     900u,
+                                                                     UOCR_METAL_DENSE_OUTPUT_F32,
+                                                                     out_f32,
+                                                                     error,
+                                                                     sizeof(error)) == 0);
+    CHECK(strstr(error, "invalid Metal MoE selected-expert Q4_K/padded-Q4_K decode down widths") != NULL);
+
+    CHECK(uocr_metal_context_diagnostic_moe_selected_experts_decode_q4_k_q8_0(ctx,
+                                                                   input,
+                                                                   top_ids,
+                                                                   top_weights,
+                                                                   gate_weight,
+                                                                   up_weight,
+                                                                   down_weight_q8,
+                                                                   PHYSICAL,
+                                                                   900u,
+                                                                   UOCR_METAL_DENSE_OUTPUT_F32,
+                                                                   out_f32,
+                                                                   error,
+                                                                   sizeof(error)) == 0);
+    CHECK(strstr(error, "invalid Metal MoE selected-expert Q4_K/Q8_0 decode down widths") != NULL);
+
+    CHECK(uocr_metal_context_diagnostic_moe_selected_experts_decode_q4_k(ctx,
+                                                              input,
+                                                              top_ids,
+                                                              top_weights,
+                                                              gate_weight,
+                                                              up_weight,
+                                                              down_weight,
+                                                              1408u,
+                                                              UOCR_METAL_DENSE_OUTPUT_F32,
+                                                              out_f32,
+                                                              error,
+                                                              sizeof(error)) == 0);
+    CHECK(strstr(error, "invalid Metal MoE selected-expert Q4_K decode widths") != NULL);
+
+    CHECK(uocr_metal_context_diagnostic_moe_selected_experts_decode_q4_k(ctx,
+                                                              input,
+                                                              top_ids,
+                                                              top_weights,
+                                                              gate_weight,
+                                                              up_weight,
+                                                              down_weight,
+                                                              PHYSICAL,
+                                                              (uocr_metal_dense_output_type)99,
+                                                              out_f32,
+                                                              error,
+                                                              sizeof(error)) == 0);
+    CHECK(strstr(error, "unsupported Metal MoE selected-expert Q4_K output type") != NULL);
+
+    uint32_t bad_ids[TOP_K] = {3u, 17u, UOCR_ROUTED_EXPERTS, 63u, 11u, 0u};
+    CHECK(uocr_metal_context_diagnostic_moe_selected_experts_decode_q4_k(ctx,
+                                                              input,
+                                                              bad_ids,
+                                                              top_weights,
+                                                              gate_weight,
+                                                              up_weight,
+                                                              down_weight,
+                                                              PHYSICAL,
+                                                              UOCR_METAL_DENSE_OUTPUT_F32,
+                                                              out_f32,
+                                                              error,
+                                                              sizeof(error)) == 0);
+    CHECK(strstr(error, "invalid Metal MoE selected Q4_K expert id") != NULL);
+
+    uocr_metal_context_destroy(ctx);
+    free(out_f16);
+    free(out_f32);
+    free(expected_q4);
+    free(expected_q8);
+    free(expected);
+    free(mid);
+    free(down_weight_q4);
+    free(down_weight_q8);
     free(down_weight);
     free(up_weight);
     free(gate_weight);
@@ -11601,7 +12924,7 @@ static int test_metal_moe_selected_experts_prefill_f16(void) {
     CHECK(ctx != NULL);
 
     memset(out_f32, 0, sizeof(out_f32));
-    CHECK(uocr_metal_context_moe_selected_experts_prefill_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_moe_selected_experts_prefill_f16(ctx,
                                                               input,
                                                               top_ids,
                                                               top_weights,
@@ -11623,7 +12946,7 @@ static int test_metal_moe_selected_experts_prefill_f16(void) {
     }
 
     memset(out_f16, 0, sizeof(out_f16));
-    CHECK(uocr_metal_context_moe_selected_experts_prefill_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_moe_selected_experts_prefill_f16(ctx,
                                                               input,
                                                               top_ids,
                                                               top_weights,
@@ -11647,7 +12970,7 @@ static int test_metal_moe_selected_experts_prefill_f16(void) {
     uint32_t bad_ids[TOKENS * TOP_K];
     memcpy(bad_ids, top_ids, sizeof(bad_ids));
     bad_ids[3] = EXPERTS;
-    CHECK(uocr_metal_context_moe_selected_experts_prefill_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_moe_selected_experts_prefill_f16(ctx,
                                                               input,
                                                               bad_ids,
                                                               top_weights,
@@ -11665,7 +12988,7 @@ static int test_metal_moe_selected_experts_prefill_f16(void) {
                                                               sizeof(error)) == 0);
     CHECK(strstr(error, "invalid Metal MoE prefill expert id") != NULL);
 
-    CHECK(uocr_metal_context_moe_selected_experts_prefill_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_moe_selected_experts_prefill_f16(ctx,
                                                               input,
                                                               top_ids,
                                                               top_weights,
@@ -11682,6 +13005,403 @@ static int test_metal_moe_selected_experts_prefill_f16(void) {
                                                               error,
                                                               sizeof(error)) == 0);
     CHECK(strstr(error, "unsupported Metal MoE selected-expert prefill output type") != NULL);
+
+    uocr_metal_context_destroy(ctx);
+    return 0;
+}
+
+static int test_metal_moe_selected_experts_prefill_q4_k(void) {
+    if (!uocr_metal_is_available()) {
+        return 0;
+    }
+
+    enum { TOKENS = 3, HIDDEN = 256, PHYSICAL = 256, INTERMEDIATE = 7, EXPERTS = 4, TOP_K = 2 };
+    enum { ROW_SIZE = (PHYSICAL / UOCR_Q4_K_BLOCK_SIZE) * UOCR_Q4_K_TYPE_SIZE };
+    enum { DOWN_PHYSICAL = 32, DOWN_ROW_SIZE = (DOWN_PHYSICAL / UOCR_Q8_0_BLOCK_SIZE) * UOCR_Q8_0_TYPE_SIZE };
+    enum { DOWN_Q4_PHYSICAL = 256, DOWN_Q4_ROW_SIZE = (DOWN_Q4_PHYSICAL / UOCR_Q4_K_BLOCK_SIZE) * UOCR_Q4_K_TYPE_SIZE };
+    uint16_t input[TOKENS * HIDDEN];
+    uint32_t top_ids[TOKENS * TOP_K] = {
+        0u, 2u,
+        1u, 3u,
+        2u, 0u,
+    };
+    float top_weights[TOKENS * TOP_K] = {
+        0.625f, 0.25f,
+        0.5f, 0.125f,
+        0.375f, 0.3125f,
+    };
+    uint8_t gate_weight[EXPERTS * INTERMEDIATE * ROW_SIZE];
+    uint8_t up_weight[EXPERTS * INTERMEDIATE * ROW_SIZE];
+    uint16_t down_weight[EXPERTS * HIDDEN * INTERMEDIATE];
+    uint8_t down_weight_q8[EXPERTS * HIDDEN * DOWN_ROW_SIZE];
+    uint8_t down_weight_q4[EXPERTS * HIDDEN * DOWN_Q4_ROW_SIZE];
+    float mid[TOKENS * TOP_K * INTERMEDIATE];
+    float expected[TOKENS * HIDDEN];
+    float expected_q8[TOKENS * HIDDEN];
+    float expected_q4[TOKENS * HIDDEN];
+    float out_f32[TOKENS * HIDDEN];
+    uint16_t out_f16[TOKENS * HIDDEN];
+
+    memset(down_weight, 0, sizeof(down_weight));
+    memset(down_weight_q8, 0, sizeof(down_weight_q8));
+    init_q4_k_rows(down_weight_q4,
+                   (uint32_t)(EXPERTS * HIDDEN),
+                   (uint32_t)DOWN_Q4_ROW_SIZE,
+                   (uint32_t)DOWN_Q4_PHYSICAL,
+                   0x2400u);
+    init_q4_k_rows(gate_weight, (uint32_t)(EXPERTS * INTERMEDIATE), (uint32_t)ROW_SIZE, (uint32_t)PHYSICAL, 0x2800u);
+    init_q4_k_rows(up_weight, (uint32_t)(EXPERTS * INTERMEDIATE), (uint32_t)ROW_SIZE, (uint32_t)PHYSICAL, 0x2800u);
+    for (uint32_t row = 0u; row < (uint32_t)(EXPERTS * HIDDEN); ++row) {
+        write_q8_scale_le(down_weight_q8 + (size_t)row * DOWN_ROW_SIZE,
+                          f32_to_f16_bits(0.03125f * (float)(1u + (row % 2u))));
+    }
+    const float input_values[] = {-0.5f, -0.25f, 0.0f, 0.125f, 0.25f, 0.5f, 0.75f};
+    const float down_values[] = {-0.375f, -0.125f, 0.0625f, 0.125f, 0.25f, 0.375f};
+    for (uint32_t i = 0u; i < (uint32_t)(TOKENS * HIDDEN); ++i) {
+        input[i] = f32_to_f16_bits(input_values[(i * 5u + 2u) % (sizeof(input_values) / sizeof(input_values[0]))]);
+    }
+
+    for (uint32_t expert = 0u; expert < (uint32_t)EXPERTS; ++expert) {
+        for (uint32_t row = 0u; row < (uint32_t)INTERMEDIATE; ++row) {
+            const uint32_t qrow = expert * (uint32_t)INTERMEDIATE + row;
+            const uint32_t g0 = (expert * 17u + row * 11u) % (uint32_t)HIDDEN;
+            const uint32_t g1 = (expert * 23u + row * 13u + 19u) % (uint32_t)HIDDEN;
+            const uint32_t u0 = (expert * 29u + row * 7u + 5u) % (uint32_t)HIDDEN;
+            const uint32_t u1 = (expert * 31u + row * 5u + 37u) % (uint32_t)HIDDEN;
+            set_q4_k_q(gate_weight, (uint32_t)ROW_SIZE, qrow, g0, (uint8_t)(1u + ((expert + row) % 8u)));
+            set_q4_k_q(gate_weight, (uint32_t)ROW_SIZE, qrow, g1, (uint8_t)(2u + ((expert * 3u + row) % 7u)));
+            set_q4_k_q(up_weight, (uint32_t)ROW_SIZE, qrow, u0, (uint8_t)(1u + ((expert * 5u + row) % 8u)));
+            set_q4_k_q(up_weight, (uint32_t)ROW_SIZE, qrow, u1, (uint8_t)(2u + ((expert + row * 3u) % 7u)));
+        }
+    }
+    for (uint32_t expert = 0u; expert < (uint32_t)EXPERTS; ++expert) {
+        for (uint32_t col = 0u; col < (uint32_t)HIDDEN; ++col) {
+            const size_t base = ((size_t)expert * HIDDEN + col) * INTERMEDIATE;
+            const uint32_t d0 = (expert + col) % (uint32_t)INTERMEDIATE;
+            const uint32_t d1 = (expert * 2u + col + 1u) % (uint32_t)INTERMEDIATE;
+            down_weight[base + d0] = f32_to_f16_bits(down_values[(expert + col + 2u) % 6u]);
+            down_weight[base + d1] = f32_to_f16_bits(down_values[(expert * 3u + col + 4u) % 6u]);
+            const uint32_t q8_row = expert * (uint32_t)HIDDEN + col;
+            set_q8_0_q(down_weight_q8, (uint32_t)DOWN_ROW_SIZE, q8_row, d0, (int8_t)(2 + (int)((expert + col) % 4u)));
+            set_q8_0_q(down_weight_q8, (uint32_t)DOWN_ROW_SIZE, q8_row, d1, (int8_t)(-3 - (int)((expert * 2u + col) % 3u)));
+            set_q8_0_q(down_weight_q8,
+                       (uint32_t)DOWN_ROW_SIZE,
+                       q8_row,
+                       (uint32_t)INTERMEDIATE + 3u,
+                       (int8_t)111); /* physical padding must be ignored */
+            set_q4_k_q(down_weight_q4,
+                       (uint32_t)DOWN_Q4_ROW_SIZE,
+                       q8_row,
+                       d0,
+                       (uint8_t)(1u + ((expert + col) % 8u)));
+            set_q4_k_q(down_weight_q4,
+                       (uint32_t)DOWN_Q4_ROW_SIZE,
+                       q8_row,
+                       d1,
+                       (uint8_t)(2u + ((expert * 2u + col) % 7u)));
+            set_q4_k_q(down_weight_q4,
+                       (uint32_t)DOWN_Q4_ROW_SIZE,
+                       q8_row,
+                       (uint32_t)INTERMEDIATE + 5u,
+                       15u); /* physical padding must be ignored */
+        }
+    }
+
+    for (uint32_t token = 0u; token < (uint32_t)TOKENS; ++token) {
+        for (uint32_t rank = 0u; rank < (uint32_t)TOP_K; ++rank) {
+            const uint32_t expert = top_ids[token * (uint32_t)TOP_K + rank];
+            for (uint32_t row = 0u; row < (uint32_t)INTERMEDIATE; ++row) {
+                float gate = 0.0f;
+                float up = 0.0f;
+                const uint32_t weight_row = expert * (uint32_t)INTERMEDIATE + row;
+                const size_t input_base = (size_t)token * HIDDEN;
+                for (uint32_t col = 0u; col < (uint32_t)HIDDEN; ++col) {
+                    const float x = f16_bits_to_f32(input[input_base + col]);
+                    gate += x * q4_k_expected_value(gate_weight, (uint32_t)ROW_SIZE, weight_row, col);
+                    up += x * q4_k_expected_value(up_weight, (uint32_t)ROW_SIZE, weight_row, col);
+                }
+                const float silu = gate / (1.0f + expf(-gate));
+                mid[((size_t)token * TOP_K + rank) * INTERMEDIATE + row] = f16_bits_to_f32(f32_to_f16_bits(silu * up));
+            }
+        }
+    }
+
+    for (uint32_t token = 0u; token < (uint32_t)TOKENS; ++token) {
+        for (uint32_t col = 0u; col < (uint32_t)HIDDEN; ++col) {
+            float routed_sum = 0.0f;
+            float routed_sum_q8 = 0.0f;
+            float routed_sum_q4 = 0.0f;
+            for (uint32_t rank = 0u; rank < (uint32_t)TOP_K; ++rank) {
+                const uint32_t expert = top_ids[token * (uint32_t)TOP_K + rank];
+                float expert_sum = 0.0f;
+                float expert_sum_q8 = 0.0f;
+                float expert_sum_q4 = 0.0f;
+                const size_t mid_base = ((size_t)token * TOP_K + rank) * INTERMEDIATE;
+                const size_t weight_base = ((size_t)expert * HIDDEN + col) * INTERMEDIATE;
+                const uint32_t q8_row = expert * (uint32_t)HIDDEN + col;
+                for (uint32_t row = 0u; row < (uint32_t)INTERMEDIATE; ++row) {
+                    expert_sum += mid[mid_base + row] * f16_bits_to_f32(down_weight[weight_base + row]);
+                    expert_sum_q8 += mid[mid_base + row] *
+                                     q8_0_expected_value(down_weight_q8, (uint32_t)DOWN_ROW_SIZE, q8_row, row);
+                    expert_sum_q4 += mid[mid_base + row] *
+                                     q4_k_expected_value(down_weight_q4, (uint32_t)DOWN_Q4_ROW_SIZE, q8_row, row);
+                }
+                routed_sum += expert_sum * top_weights[token * (uint32_t)TOP_K + rank];
+                routed_sum_q8 += expert_sum_q8 * top_weights[token * (uint32_t)TOP_K + rank];
+                routed_sum_q4 += expert_sum_q4 * top_weights[token * (uint32_t)TOP_K + rank];
+            }
+            expected[token * (uint32_t)HIDDEN + col] = routed_sum;
+            expected_q8[token * (uint32_t)HIDDEN + col] = routed_sum_q8;
+            expected_q4[token * (uint32_t)HIDDEN + col] = routed_sum_q4;
+        }
+    }
+
+    char error[1024];
+    memset(error, 0, sizeof(error));
+    uocr_metal_context *ctx = uocr_metal_context_create(UOCR_TEST_METAL_RESOURCE_PATH, error, sizeof(error));
+    CHECK(ctx != NULL);
+
+    memset(out_f32, 0, sizeof(out_f32));
+    CHECK(uocr_metal_context_diagnostic_moe_selected_experts_prefill_q4_k(ctx,
+                                                               input,
+                                                               top_ids,
+                                                               top_weights,
+                                                               gate_weight,
+                                                               up_weight,
+                                                               down_weight,
+                                                               TOKENS,
+                                                               HIDDEN,
+                                                               PHYSICAL,
+                                                               INTERMEDIATE,
+                                                               EXPERTS,
+                                                               TOP_K,
+                                                               UOCR_METAL_DENSE_OUTPUT_F32,
+                                                               out_f32,
+                                                               error,
+                                                               sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    for (uint32_t i = 0u; i < (uint32_t)(TOKENS * HIDDEN); ++i) {
+        CHECK(fabsf(out_f32[i] - expected[i]) < 5.0e-5f);
+    }
+
+    memset(out_f16, 0, sizeof(out_f16));
+    CHECK(uocr_metal_context_diagnostic_moe_selected_experts_prefill_q4_k(ctx,
+                                                               input,
+                                                               top_ids,
+                                                               top_weights,
+                                                               gate_weight,
+                                                               up_weight,
+                                                               down_weight,
+                                                               TOKENS,
+                                                               HIDDEN,
+                                                               PHYSICAL,
+                                                               INTERMEDIATE,
+                                                               EXPERTS,
+                                                               TOP_K,
+                                                               UOCR_METAL_DENSE_OUTPUT_F16,
+                                                               out_f16,
+                                                               error,
+                                                               sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    for (uint32_t i = 0u; i < (uint32_t)(TOKENS * HIDDEN); ++i) {
+        CHECK(fabsf(f16_bits_to_f32(out_f16[i]) - expected[i]) < 6.0e-4f);
+    }
+
+    memset(out_f32, 0, sizeof(out_f32));
+    CHECK(uocr_metal_context_diagnostic_moe_selected_experts_prefill_q4_k_q8_0(ctx,
+                                                                    input,
+                                                                    top_ids,
+                                                                    top_weights,
+                                                                    gate_weight,
+                                                                    up_weight,
+                                                                    down_weight_q8,
+                                                                    TOKENS,
+                                                                    HIDDEN,
+                                                                    PHYSICAL,
+                                                                    INTERMEDIATE,
+                                                                    DOWN_PHYSICAL,
+                                                                    EXPERTS,
+                                                                    TOP_K,
+                                                                    UOCR_METAL_DENSE_OUTPUT_F32,
+                                                                    out_f32,
+                                                                    error,
+                                                                    sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    for (uint32_t i = 0u; i < (uint32_t)(TOKENS * HIDDEN); ++i) {
+        CHECK(fabsf(out_f32[i] - expected_q8[i]) < 5.0e-5f);
+    }
+
+    memset(out_f16, 0, sizeof(out_f16));
+    CHECK(uocr_metal_context_diagnostic_moe_selected_experts_prefill_q4_k_q8_0(ctx,
+                                                                    input,
+                                                                    top_ids,
+                                                                    top_weights,
+                                                                    gate_weight,
+                                                                    up_weight,
+                                                                    down_weight_q8,
+                                                                    TOKENS,
+                                                                    HIDDEN,
+                                                                    PHYSICAL,
+                                                                    INTERMEDIATE,
+                                                                    DOWN_PHYSICAL,
+                                                                    EXPERTS,
+                                                                    TOP_K,
+                                                                    UOCR_METAL_DENSE_OUTPUT_F16,
+                                                                    out_f16,
+                                                                    error,
+                                                                    sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    for (uint32_t i = 0u; i < (uint32_t)(TOKENS * HIDDEN); ++i) {
+        CHECK(fabsf(f16_bits_to_f32(out_f16[i]) - expected_q8[i]) < 6.0e-4f);
+    }
+
+    memset(out_f32, 0, sizeof(out_f32));
+    CHECK(uocr_metal_context_diagnostic_moe_selected_experts_prefill_q4_k_padded(ctx,
+                                                                      input,
+                                                                      top_ids,
+                                                                      top_weights,
+                                                                      gate_weight,
+                                                                      up_weight,
+                                                                      down_weight_q4,
+                                                                      TOKENS,
+                                                                      HIDDEN,
+                                                                      PHYSICAL,
+                                                                      INTERMEDIATE,
+                                                                      DOWN_Q4_PHYSICAL,
+                                                                      EXPERTS,
+                                                                      TOP_K,
+                                                                      UOCR_METAL_DENSE_OUTPUT_F32,
+                                                                      out_f32,
+                                                                      error,
+                                                                      sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    for (uint32_t i = 0u; i < (uint32_t)(TOKENS * HIDDEN); ++i) {
+        CHECK(fabsf(out_f32[i] - expected_q4[i]) < 5.0e-5f);
+    }
+
+    memset(out_f16, 0, sizeof(out_f16));
+    CHECK(uocr_metal_context_diagnostic_moe_selected_experts_prefill_q4_k_padded(ctx,
+                                                                      input,
+                                                                      top_ids,
+                                                                      top_weights,
+                                                                      gate_weight,
+                                                                      up_weight,
+                                                                      down_weight_q4,
+                                                                      TOKENS,
+                                                                      HIDDEN,
+                                                                      PHYSICAL,
+                                                                      INTERMEDIATE,
+                                                                      DOWN_Q4_PHYSICAL,
+                                                                      EXPERTS,
+                                                                      TOP_K,
+                                                                      UOCR_METAL_DENSE_OUTPUT_F16,
+                                                                      out_f16,
+                                                                      error,
+                                                                      sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    for (uint32_t i = 0u; i < (uint32_t)(TOKENS * HIDDEN); ++i) {
+        CHECK(fabsf(f16_bits_to_f32(out_f16[i]) - expected_q4[i]) < 6.0e-4f);
+    }
+
+    CHECK(uocr_metal_context_diagnostic_moe_selected_experts_prefill_q4_k_padded(ctx,
+                                                                      input,
+                                                                      top_ids,
+                                                                      top_weights,
+                                                                      gate_weight,
+                                                                      up_weight,
+                                                                      down_weight_q4,
+                                                                      TOKENS,
+                                                                      HIDDEN,
+                                                                      PHYSICAL,
+                                                                      INTERMEDIATE,
+                                                                      255u,
+                                                                      EXPERTS,
+                                                                      TOP_K,
+                                                                      UOCR_METAL_DENSE_OUTPUT_F32,
+                                                                      out_f32,
+                                                                      error,
+                                                                      sizeof(error)) == 0);
+    CHECK(strstr(error, "invalid Metal MoE selected-expert Q4_K/padded-Q4_K prefill down widths") != NULL);
+
+    CHECK(uocr_metal_context_diagnostic_moe_selected_experts_prefill_q4_k_q8_0(ctx,
+                                                                    input,
+                                                                    top_ids,
+                                                                    top_weights,
+                                                                    gate_weight,
+                                                                    up_weight,
+                                                                    down_weight_q8,
+                                                                    TOKENS,
+                                                                    HIDDEN,
+                                                                    PHYSICAL,
+                                                                    INTERMEDIATE,
+                                                                    31u,
+                                                                    EXPERTS,
+                                                                    TOP_K,
+                                                                    UOCR_METAL_DENSE_OUTPUT_F32,
+                                                                    out_f32,
+                                                                    error,
+                                                                    sizeof(error)) == 0);
+    CHECK(strstr(error, "invalid Metal MoE selected-expert Q4_K/Q8_0 prefill down widths") != NULL);
+
+    uint32_t bad_ids[TOKENS * TOP_K];
+    memcpy(bad_ids, top_ids, sizeof(bad_ids));
+    bad_ids[3] = EXPERTS;
+    CHECK(uocr_metal_context_diagnostic_moe_selected_experts_prefill_q4_k(ctx,
+                                                               input,
+                                                               bad_ids,
+                                                               top_weights,
+                                                               gate_weight,
+                                                               up_weight,
+                                                               down_weight,
+                                                               TOKENS,
+                                                               HIDDEN,
+                                                               PHYSICAL,
+                                                               INTERMEDIATE,
+                                                               EXPERTS,
+                                                               TOP_K,
+                                                               UOCR_METAL_DENSE_OUTPUT_F32,
+                                                               out_f32,
+                                                               error,
+                                                               sizeof(error)) == 0);
+    CHECK(strstr(error, "invalid Metal MoE Q4_K prefill expert id") != NULL);
+
+    CHECK(uocr_metal_context_diagnostic_moe_selected_experts_prefill_q4_k(ctx,
+                                                               input,
+                                                               top_ids,
+                                                               top_weights,
+                                                               gate_weight,
+                                                               up_weight,
+                                                               down_weight,
+                                                               TOKENS,
+                                                               HIDDEN,
+                                                               384u,
+                                                               INTERMEDIATE,
+                                                               EXPERTS,
+                                                               TOP_K,
+                                                               UOCR_METAL_DENSE_OUTPUT_F32,
+                                                               out_f32,
+                                                               error,
+                                                               sizeof(error)) == 0);
+    CHECK(strstr(error, "invalid Metal MoE selected-expert Q4_K prefill widths") != NULL);
+
+    CHECK(uocr_metal_context_diagnostic_moe_selected_experts_prefill_q4_k(ctx,
+                                                               input,
+                                                               top_ids,
+                                                               top_weights,
+                                                               gate_weight,
+                                                               up_weight,
+                                                               down_weight,
+                                                               TOKENS,
+                                                               HIDDEN,
+                                                               PHYSICAL,
+                                                               INTERMEDIATE,
+                                                               EXPERTS,
+                                                               TOP_K,
+                                                               (uocr_metal_dense_output_type)99,
+                                                               out_f32,
+                                                               error,
+                                                               sizeof(error)) == 0);
+    CHECK(strstr(error, "unsupported Metal MoE selected-expert Q4_K prefill output type") != NULL);
 
     uocr_metal_context_destroy(ctx);
     return 0;
@@ -11740,7 +13460,7 @@ static int test_metal_moe_combine_f16(void) {
     CHECK(ctx != NULL);
 
     memset(out_f32, 0, (size_t)TOKENS * HIDDEN * sizeof(float));
-    CHECK(uocr_metal_context_moe_combine_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_moe_combine_f16(ctx,
                                              routed,
                                              shared,
                                              residual,
@@ -11755,7 +13475,7 @@ static int test_metal_moe_combine_f16(void) {
     }
 
     memset(out_f16, 0, (size_t)TOKENS * HIDDEN * sizeof(uint16_t));
-    CHECK(uocr_metal_context_moe_combine_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_moe_combine_f16(ctx,
                                              routed,
                                              shared,
                                              NULL,
@@ -11769,7 +13489,7 @@ static int test_metal_moe_combine_f16(void) {
         CHECK(fabsf(f16_bits_to_f32(out_f16[i]) - expected_no_residual[i]) < 8.0e-4f);
     }
 
-    CHECK(uocr_metal_context_moe_combine_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_moe_combine_f16(ctx,
                                              routed,
                                              shared,
                                              residual,
@@ -11779,7 +13499,7 @@ static int test_metal_moe_combine_f16(void) {
                                              error,
                                              sizeof(error)) == 0);
     CHECK(strstr(error, "unsupported Metal MoE combine output type") != NULL);
-    CHECK(uocr_metal_context_moe_combine_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_moe_combine_f16(ctx,
                                              routed,
                                              shared,
                                              residual,
@@ -11870,7 +13590,7 @@ static int test_metal_rope_qk_f16(void) {
 
     memset(q_out_f32, 0, (size_t)TOKENS * HIDDEN * sizeof(float));
     memset(k_out_f32, 0, (size_t)TOKENS * HIDDEN * sizeof(float));
-    CHECK(uocr_metal_context_rope_qk_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_rope_qk_f16(ctx,
                                          q,
                                          k,
                                          TOKENS,
@@ -11888,7 +13608,7 @@ static int test_metal_rope_qk_f16(void) {
 
     memset(q_out_f16, 0, (size_t)TOKENS * HIDDEN * sizeof(uint16_t));
     memset(k_out_f16, 0, (size_t)TOKENS * HIDDEN * sizeof(uint16_t));
-    CHECK(uocr_metal_context_rope_qk_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_rope_qk_f16(ctx,
                                          q,
                                          k,
                                          TOKENS,
@@ -11904,7 +13624,25 @@ static int test_metal_rope_qk_f16(void) {
         CHECK(fabsf(f16_bits_to_f32(k_out_f16[i]) - expected_k[i]) < 4.0e-3f);
     }
 
-    CHECK(uocr_metal_context_rope_qk_f16(ctx,
+    memset(q_out_f32, 0, (size_t)TOKENS * HIDDEN * sizeof(float));
+    memset(k_out_f32, 0, (size_t)TOKENS * HIDDEN * sizeof(float));
+    CHECK(uocr_metal_context_diagnostic_rope_qk_f16(ctx,
+                                         q,
+                                         k,
+                                         1u,
+                                         0u,
+                                         UOCR_METAL_DENSE_OUTPUT_F32,
+                                         q_out_f32,
+                                         k_out_f32,
+                                         error,
+                                         sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    for (uint32_t i = 0u; i < HIDDEN; ++i) {
+        CHECK(fabsf(q_out_f32[i] - f16_bits_to_f32(q[i])) < 1.0e-6f);
+        CHECK(fabsf(k_out_f32[i] - f16_bits_to_f32(k[i])) < 1.0e-6f);
+    }
+
+    CHECK(uocr_metal_context_diagnostic_rope_qk_f16(ctx,
                                          q,
                                          k,
                                          0u,
@@ -11916,7 +13654,7 @@ static int test_metal_rope_qk_f16(void) {
                                          sizeof(error)) == 0);
     CHECK(strstr(error, "invalid Metal RoPE request") != NULL);
 
-    CHECK(uocr_metal_context_rope_qk_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_rope_qk_f16(ctx,
                                          q,
                                          k,
                                          2u,
@@ -11928,7 +13666,7 @@ static int test_metal_rope_qk_f16(void) {
                                          sizeof(error)) == 0);
     CHECK(strstr(error, "exceeds max positions") != NULL);
 
-    CHECK(uocr_metal_context_rope_qk_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_rope_qk_f16(ctx,
                                          q,
                                          k,
                                          TOKENS,
@@ -12108,7 +13846,7 @@ static int test_metal_prefill_attention_f16(void) {
     CHECK(ctx != NULL);
 
     memset(out_f32, 0, (size_t)TOKENS * HIDDEN * sizeof(float));
-    CHECK(uocr_metal_context_prefill_attention_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_prefill_attention_f16(ctx,
                                                    q,
                                                    k,
                                                    v,
@@ -12126,7 +13864,7 @@ static int test_metal_prefill_attention_f16(void) {
     }
 
     memset(out_f16, 0, (size_t)TOKENS * HIDDEN * sizeof(uint16_t));
-    CHECK(uocr_metal_context_prefill_attention_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_prefill_attention_f16(ctx,
                                                    q,
                                                    k,
                                                    v,
@@ -12140,7 +13878,7 @@ static int test_metal_prefill_attention_f16(void) {
         CHECK(fabsf(f16_bits_to_f32(out_f16[i]) - expected[i]) < 1.0e-2f);
     }
 
-    CHECK(uocr_metal_context_prefill_attention_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_prefill_attention_f16(ctx,
                                                    q,
                                                    k,
                                                    v,
@@ -12150,7 +13888,7 @@ static int test_metal_prefill_attention_f16(void) {
                                                    error,
                                                    sizeof(error)) == 0);
     CHECK(strstr(error, "invalid Metal prefill attention request") != NULL);
-    CHECK(uocr_metal_context_prefill_attention_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_prefill_attention_f16(ctx,
                                                    q,
                                                    k,
                                                    v,
@@ -12230,7 +13968,7 @@ static int test_metal_prefill_attention_varlen_f16(void) {
     CHECK(ctx != NULL);
 
     memset(out_f32, 0, (size_t)TOTAL_TOKENS * HIDDEN * sizeof(float));
-    CHECK(uocr_metal_context_prefill_attention_varlen_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_prefill_attention_varlen_f16(ctx,
                                                           q,
                                                           k,
                                                           v,
@@ -12252,7 +13990,7 @@ static int test_metal_prefill_attention_varlen_f16(void) {
     }
 
     memset(out_f16, 0, (size_t)TOTAL_TOKENS * HIDDEN * sizeof(uint16_t));
-    CHECK(uocr_metal_context_prefill_attention_varlen_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_prefill_attention_varlen_f16(ctx,
                                                           q,
                                                           k,
                                                           v,
@@ -12270,7 +14008,7 @@ static int test_metal_prefill_attention_varlen_f16(void) {
     }
 
     const uint32_t bad_cu_order[BATCH + 1] = {0u, 5u, 4u};
-    CHECK(uocr_metal_context_prefill_attention_varlen_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_prefill_attention_varlen_f16(ctx,
                                                           q,
                                                           k,
                                                           v,
@@ -12284,7 +14022,7 @@ static int test_metal_prefill_attention_varlen_f16(void) {
                                                           sizeof(error)) == 0);
     CHECK(strstr(error, "sequence metadata") != NULL || strstr(error, "cu_seqlens") != NULL);
 
-    CHECK(uocr_metal_context_prefill_attention_varlen_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_prefill_attention_varlen_f16(ctx,
                                                           q,
                                                           k,
                                                           v,
@@ -12526,6 +14264,31 @@ static int test_metal_kv_cache_layout_helpers(void) {
     CHECK(uocr_metal_kv_cache_decode_position_allowed(&decode_plan, 6u) == 1);
     CHECK(uocr_metal_kv_cache_decode_position_allowed(&decode_plan, 7u) == 0);
 
+    memset(&decode_plan, 0, sizeof(decode_plan));
+    CHECK(uocr_metal_kv_cache_decode_attention_plan(7u,
+                                                    16u,
+                                                    UOCR_GENERATED_RING_WINDOW + 1u,
+                                                    &decode_plan) == 1);
+    CHECK(decode_plan.attention_length == 7u + UOCR_GENERATED_RING_WINDOW);
+    CHECK(decode_plan.first_generated_index == 1u);
+    CHECK(decode_plan.first_generated_position == 8u);
+    CHECK(uocr_metal_kv_cache_decode_position_allowed(&decode_plan, 0u) == 1);
+    CHECK(uocr_metal_kv_cache_decode_position_allowed(&decode_plan, 6u) == 1);
+    CHECK(uocr_metal_kv_cache_decode_position_allowed(&decode_plan, 7u) == 0);
+    CHECK(uocr_metal_kv_cache_decode_position_allowed(&decode_plan, 8u) == 1);
+    CHECK(uocr_metal_kv_cache_decode_position_allowed(&decode_plan,
+                                                      7u + UOCR_GENERATED_RING_WINDOW) == 1);
+    CHECK(uocr_metal_kv_cache_decode_attention_index_to_token(&decode_plan, 0u, &cache_token) == 1);
+    CHECK(cache_token == 0u);
+    CHECK(uocr_metal_kv_cache_decode_attention_index_to_token(&decode_plan, 6u, &cache_token) == 1);
+    CHECK(cache_token == 6u);
+    CHECK(uocr_metal_kv_cache_decode_attention_index_to_token(&decode_plan, 7u, &cache_token) == 1);
+    CHECK(cache_token == 8u);
+    CHECK(uocr_metal_kv_cache_decode_attention_index_to_token(&decode_plan,
+                                                              7u + UOCR_GENERATED_RING_WINDOW - 1u,
+                                                              &cache_token) == 1);
+    CHECK(cache_token == 7u);
+
     uocr_metal_kv_cache_layout empty_layout;
     memset(&empty_layout, 0, sizeof(empty_layout));
     CHECK(uocr_metal_kv_cache_offset(&empty_layout, 0, 0u, 0u, 0u, 0u, 0u, &offset) == 0);
@@ -12652,7 +14415,7 @@ static int test_metal_kv_cache_write_f16(void) {
     uocr_metal_context *ctx = uocr_metal_context_create(UOCR_TEST_METAL_RESOURCE_PATH, error, sizeof(error));
     CHECK(ctx != NULL);
 
-    CHECK(uocr_metal_context_write_kv_cache_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_write_kv_cache_f16(ctx,
                                                 k_src,
                                                 v_src,
                                                 initial_k,
@@ -12694,7 +14457,7 @@ static int test_metal_kv_cache_write_f16(void) {
         CHECK(v_out[index] == expected_v);
     }
 
-    CHECK(uocr_metal_context_write_kv_cache_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_write_kv_cache_f16(ctx,
                                                 k_src,
                                                 v_src,
                                                 NULL,
@@ -12726,7 +14489,7 @@ static int test_metal_kv_cache_write_f16(void) {
         CHECK(v_out[index] == (should_have_value ? v_src[src_index] : 0u));
     }
 
-    CHECK(uocr_metal_context_write_kv_cache_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_write_kv_cache_f16(ctx,
                                                 k_src,
                                                 v_src,
                                                 initial_k,
@@ -12744,7 +14507,7 @@ static int test_metal_kv_cache_write_f16(void) {
                                                 sizeof(error)) == 0);
     CHECK(strstr(error, "invalid Metal KV cache write request") != NULL);
 
-    CHECK(uocr_metal_context_write_kv_cache_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_write_kv_cache_f16(ctx,
                                                 k_src,
                                                 v_src,
                                                 initial_k,
@@ -12762,7 +14525,7 @@ static int test_metal_kv_cache_write_f16(void) {
                                                 sizeof(error)) == 0);
     CHECK(strstr(error, "layer/slot out of range") != NULL);
 
-    CHECK(uocr_metal_context_write_kv_cache_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_write_kv_cache_f16(ctx,
                                                 k_src,
                                                 v_src,
                                                 initial_k,
@@ -12780,7 +14543,7 @@ static int test_metal_kv_cache_write_f16(void) {
                                                 sizeof(error)) == 0);
     CHECK(strstr(error, "invalid Metal KV cache layout") != NULL);
 
-    CHECK(uocr_metal_context_write_kv_cache_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_write_kv_cache_f16(ctx,
                                                 k_src,
                                                 v_src,
                                                 initial_k,
@@ -12910,7 +14673,7 @@ static int test_metal_decode_attention_f16(void) {
                                             expected) == 1);
 
     memset(out_f32, 0, (size_t)out_values * sizeof(float));
-    CHECK(uocr_metal_context_decode_attention_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_decode_attention_f16(ctx,
                                                   q,
                                                   k_cache,
                                                   v_cache,
@@ -12930,7 +14693,7 @@ static int test_metal_decode_attention_f16(void) {
     }
 
     memset(out_f16, 0, (size_t)out_values * sizeof(uint16_t));
-    CHECK(uocr_metal_context_decode_attention_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_decode_attention_f16(ctx,
                                                   q,
                                                   k_cache,
                                                   v_cache,
@@ -12991,7 +14754,7 @@ static int test_metal_decode_attention_f16(void) {
                                             wrapped_generated,
                                             expected) == 1);
     memset(out_f32, 0, (size_t)out_values * sizeof(float));
-    CHECK(uocr_metal_context_decode_attention_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_decode_attention_f16(ctx,
                                                   q,
                                                   k_cache,
                                                   v_cache,
@@ -13011,7 +14774,7 @@ static int test_metal_decode_attention_f16(void) {
     }
     CHECK(out_f32[0] > -0.98f && out_f32[0] < -0.90f);
 
-    CHECK(uocr_metal_context_decode_attention_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_decode_attention_f16(ctx,
                                                   q,
                                                   k_cache,
                                                   v_cache,
@@ -13027,7 +14790,7 @@ static int test_metal_decode_attention_f16(void) {
                                                   sizeof(error)) == 0);
     CHECK(strstr(error, "generated count") != NULL);
 
-    CHECK(uocr_metal_context_decode_attention_f16(ctx,
+    CHECK(uocr_metal_context_diagnostic_decode_attention_f16(ctx,
                                                   q,
                                                   k_cache,
                                                   v_cache,
@@ -13049,6 +14812,140 @@ static int test_metal_decode_attention_f16(void) {
     free(expected);
     free(v_cache);
     free(k_cache);
+    free(q);
+    return 0;
+}
+
+static int test_metal_sdpa_prefill_decode_consistency_f16(void) {
+    if (!uocr_metal_is_available()) {
+        return 0;
+    }
+
+    enum {
+        TOKENS = 4,
+        BATCH_SLOTS = 1,
+        PROMPT_TOKEN_CAPACITY = TOKENS,
+        CACHE_TOKEN_CAPACITY = PROMPT_TOKEN_CAPACITY + UOCR_GENERATED_RING_WINDOW,
+        LAYER = 1,
+        SLOT = 0,
+        HIDDEN = UOCR_ATTENTION_HEADS * UOCR_HEAD_DIM,
+        HEAD_AREA = UOCR_KV_HEADS * UOCR_HEAD_DIM
+    };
+    const uint64_t prompt_values = (uint64_t)TOKENS * (uint64_t)HIDDEN;
+    const uint64_t cache_values = (uint64_t)UOCR_DECODER_LAYERS * (uint64_t)BATCH_SLOTS *
+                                  (uint64_t)CACHE_TOKEN_CAPACITY * (uint64_t)HEAD_AREA;
+    const uint16_t q_values[] = {
+        0x0000u, /* 0.0 */
+        0x2800u, /* 0.03125 */
+        0x2c00u, /* 0.0625 */
+        0xb000u, /* -0.125 */
+        0x3000u  /* 0.125 */
+    };
+    const uint16_t k_values[] = {
+        0x0000u, /* 0.0 */
+        0x2400u, /* 0.015625 */
+        0x2800u, /* 0.03125 */
+        0xac00u, /* -0.0625 */
+        0x2c00u  /* 0.0625 */
+    };
+    const uint16_t v_values[] = {
+        0xbc00u, /* -1.0 */
+        0xb800u, /* -0.5 */
+        0x0000u, /* 0.0 */
+        0x3400u, /* 0.25 */
+        0x3800u, /* 0.5 */
+        0x3c00u  /* 1.0 */
+    };
+    const uint32_t q_count = (uint32_t)(sizeof(q_values) / sizeof(q_values[0]));
+    const uint32_t k_count = (uint32_t)(sizeof(k_values) / sizeof(k_values[0]));
+    const uint32_t v_count = (uint32_t)(sizeof(v_values) / sizeof(v_values[0]));
+
+    uint16_t *q = (uint16_t *)malloc((size_t)prompt_values * sizeof(uint16_t));
+    uint16_t *k = (uint16_t *)malloc((size_t)prompt_values * sizeof(uint16_t));
+    uint16_t *v = (uint16_t *)malloc((size_t)prompt_values * sizeof(uint16_t));
+    float *expected_prefill = (float *)malloc((size_t)prompt_values * sizeof(float));
+    float *prefill_out = (float *)malloc((size_t)prompt_values * sizeof(float));
+    uint16_t *k_cache = (uint16_t *)malloc((size_t)cache_values * sizeof(uint16_t));
+    uint16_t *v_cache = (uint16_t *)malloc((size_t)cache_values * sizeof(uint16_t));
+    float *decode_out = (float *)malloc((size_t)HIDDEN * sizeof(float));
+    CHECK(q != NULL && k != NULL && v != NULL && expected_prefill != NULL && prefill_out != NULL &&
+          k_cache != NULL && v_cache != NULL && decode_out != NULL);
+
+    for (uint64_t i = 0u; i < prompt_values; ++i) {
+        q[i] = q_values[(i * 7u + i / 13u + 1u) % q_count];
+        k[i] = k_values[(i * 11u + i / 17u + 3u) % k_count];
+        v[i] = v_values[(i * 13u + i / 19u + 5u) % v_count];
+    }
+    CHECK(compute_prefill_attention_expected(q, k, v, TOKENS, expected_prefill) == 1);
+
+    char error[1024];
+    memset(error, 0, sizeof(error));
+    uocr_metal_context *ctx = uocr_metal_context_create(UOCR_TEST_METAL_RESOURCE_PATH, error, sizeof(error));
+    CHECK(ctx != NULL);
+
+    memset(prefill_out, 0, (size_t)prompt_values * sizeof(float));
+    CHECK(uocr_metal_context_diagnostic_prefill_attention_f16(ctx,
+                                                   q,
+                                                   k,
+                                                   v,
+                                                   TOKENS,
+                                                   UOCR_METAL_DENSE_OUTPUT_F32,
+                                                   prefill_out,
+                                                   error,
+                                                   sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    for (uint64_t i = 0u; i < prompt_values; ++i) {
+        CHECK(fabsf(prefill_out[i] - expected_prefill[i]) < 8.0e-4f);
+    }
+
+    CHECK(uocr_metal_context_diagnostic_write_kv_cache_f16(ctx,
+                                                k,
+                                                v,
+                                                NULL,
+                                                NULL,
+                                                TOKENS,
+                                                BATCH_SLOTS,
+                                                PROMPT_TOKEN_CAPACITY,
+                                                LAYER,
+                                                SLOT,
+                                                TOKENS,
+                                                0u,
+                                                k_cache,
+                                                v_cache,
+                                                error,
+                                                sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+
+    memset(decode_out, 0, (size_t)HIDDEN * sizeof(float));
+    CHECK(uocr_metal_context_diagnostic_decode_attention_f16(ctx,
+                                                  q + ((uint32_t)TOKENS - 1u) * (uint32_t)HIDDEN,
+                                                  k_cache,
+                                                  v_cache,
+                                                  BATCH_SLOTS,
+                                                  PROMPT_TOKEN_CAPACITY,
+                                                  LAYER,
+                                                  SLOT,
+                                                  TOKENS,
+                                                  0u,
+                                                  UOCR_METAL_DENSE_OUTPUT_F32,
+                                                  decode_out,
+                                                  error,
+                                                  sizeof(error)) == 1);
+    CHECK(error[0] == '\0');
+    for (uint32_t i = 0u; i < (uint32_t)HIDDEN; ++i) {
+        const uint64_t prefill_index = ((uint64_t)TOKENS - 1u) * (uint64_t)HIDDEN + (uint64_t)i;
+        CHECK(fabsf(decode_out[i] - expected_prefill[prefill_index]) < 1.0e-3f);
+        CHECK(fabsf(decode_out[i] - prefill_out[prefill_index]) < 1.0e-3f);
+    }
+
+    uocr_metal_context_destroy(ctx);
+    free(decode_out);
+    free(v_cache);
+    free(k_cache);
+    free(prefill_out);
+    free(expected_prefill);
+    free(v);
+    free(k);
     free(q);
     return 0;
 }
@@ -13085,7 +14982,7 @@ static int test_metal_recent_decoder_primitives_stress(void) {
             table[i] = half_pool[(i * 13u + i / 17u + 5u) % half_pool_count];
         }
         memset(out, 0, sizeof(out));
-        CHECK(uocr_metal_context_get_rows_f16(ctx,
+        CHECK(uocr_metal_context_diagnostic_get_rows_f16(ctx,
                                               table,
                                               TABLE_ROWS,
                                               HIDDEN,
@@ -13116,7 +15013,7 @@ static int test_metal_recent_decoder_primitives_stress(void) {
             image_features[i] = (uint16_t)(0x6000u + (i % 1024u));
         }
         memset(out, 0, sizeof(out));
-        CHECK(uocr_metal_context_assemble_prompt_f16(ctx,
+        CHECK(uocr_metal_context_diagnostic_assemble_prompt_f16(ctx,
                                                      table,
                                                      TABLE_ROWS,
                                                      HIDDEN,
@@ -13143,7 +15040,7 @@ static int test_metal_recent_decoder_primitives_stress(void) {
 
         const int32_t span_at_start_ids[TOKENS] = {-123, 999999, 3, 4, 5, 6, 7, 8, 9};
         memset(out, 0, sizeof(out));
-        CHECK(uocr_metal_context_assemble_prompt_f16(ctx,
+        CHECK(uocr_metal_context_diagnostic_assemble_prompt_f16(ctx,
                                                      table,
                                                      TABLE_ROWS,
                                                      HIDDEN,
@@ -13163,7 +15060,7 @@ static int test_metal_recent_decoder_primitives_stress(void) {
 
         const int32_t span_at_end_ids[TOKENS] = {0, 1, 2, 3, 4, 5, 6, -123, 999999};
         memset(out, 0, sizeof(out));
-        CHECK(uocr_metal_context_assemble_prompt_f16(ctx,
+        CHECK(uocr_metal_context_diagnostic_assemble_prompt_f16(ctx,
                                                      table,
                                                      TABLE_ROWS,
                                                      HIDDEN,
@@ -13181,7 +15078,7 @@ static int test_metal_recent_decoder_primitives_stress(void) {
             CHECK(out[8u * (uint32_t)HIDDEN + col] == image_features[(uint32_t)HIDDEN + col]);
         }
 
-        CHECK(uocr_metal_context_assemble_prompt_f16(ctx,
+        CHECK(uocr_metal_context_diagnostic_assemble_prompt_f16(ctx,
                                                      table,
                                                      TABLE_ROWS,
                                                      HIDDEN,
@@ -13195,7 +15092,7 @@ static int test_metal_recent_decoder_primitives_stress(void) {
                                                      sizeof(error)) == 0);
         CHECK(strstr(error, "UINT32_MAX image span start") != NULL);
 
-        CHECK(uocr_metal_context_assemble_prompt_f16(ctx,
+        CHECK(uocr_metal_context_diagnostic_assemble_prompt_f16(ctx,
                                                      table,
                                                      TABLE_ROWS,
                                                      HIDDEN,
@@ -13210,7 +15107,7 @@ static int test_metal_recent_decoder_primitives_stress(void) {
         CHECK(strstr(error, "requires image features") != NULL);
 
         const int32_t invalid_outside_span[TOKENS] = {0, TABLE_ROWS, 999999, -7, 123456, 2, 3, 4, 5};
-        CHECK(uocr_metal_context_assemble_prompt_f16(ctx,
+        CHECK(uocr_metal_context_diagnostic_assemble_prompt_f16(ctx,
                                                      table,
                                                      TABLE_ROWS,
                                                      HIDDEN,
@@ -13253,7 +15150,7 @@ static int test_metal_recent_decoder_primitives_stress(void) {
             }
         }
         memset(out, 0, sizeof(out));
-        CHECK(uocr_metal_context_rmsnorm_f16(ctx,
+        CHECK(uocr_metal_context_diagnostic_rmsnorm_f16(ctx,
                                              input,
                                              weight,
                                              ROWS,
@@ -13292,16 +15189,13 @@ static int test_metal_runtime_arenas(void) {
     uint64_t expected_decoder = 0u;
     uint64_t expected_router_topk = 0u;
     uint64_t expected_moe_intermediate = 0u;
-    uint64_t expected_vision = 0u;
+    const uint64_t expected_vision = 0u;
     uint64_t expected_logits = 0u;
     CHECK(uocr_estimate_kv_cache_bytes(1u, 16u, &expected_kv) == UOCR_OK);
     CHECK(uocr_estimate_prompt_embedding_bytes(1u, 16u, &expected_prompt) == UOCR_OK);
     CHECK(uocr_estimate_decoder_scratch_bytes(1u, 16u, &expected_decoder) == UOCR_OK);
     CHECK(uocr_estimate_moe_router_topk_bytes(1u, 16u, &expected_router_topk) == UOCR_OK);
     CHECK(uocr_estimate_moe_intermediate_bytes(1u, 16u, &expected_moe_intermediate) == UOCR_OK);
-    CHECK(uocr_estimate_vision_scratch_bytes_for_rows(16u,
-                                                       UOCR_GLOBAL_GRID_QUERIES * UOCR_GLOBAL_GRID_QUERIES,
-                                                       &expected_vision) == UOCR_OK);
     CHECK(uocr_estimate_logits_readback_bytes(1u, &expected_logits) == UOCR_OK);
 
     CHECK(uocr_metal_context_runtime_arena_capacity(ctx, UOCR_METAL_ARENA_KV_CACHE) == expected_kv);
@@ -13370,6 +15264,66 @@ static int test_metal_integrated_decoder_boundary(void) {
     return 0;
 }
 
+static int test_metal_vision_runner_requires_bindings(void) {
+    if (!uocr_metal_is_available()) {
+        return 0;
+    }
+
+    char error[1024];
+    memset(error, 0, sizeof(error));
+    uocr_metal_context *ctx = uocr_metal_context_create(UOCR_TEST_METAL_RESOURCE_PATH, error, sizeof(error));
+    CHECK(ctx != NULL);
+
+    const uint32_t n_tokens = 1u + UOCR_GLOBAL_VISUAL_TOKENS;
+    int32_t *input_ids = (int32_t *)calloc((size_t)n_tokens, sizeof(int32_t));
+    uint8_t *image_mask = (uint8_t *)calloc((size_t)n_tokens, sizeof(uint8_t));
+    uint16_t *pixels = (uint16_t *)calloc(3u, sizeof(uint16_t));
+    uint16_t *visual = (uint16_t *)calloc((size_t)UOCR_GLOBAL_VISUAL_TOKENS * (size_t)UOCR_HIDDEN_SIZE, sizeof(uint16_t));
+    CHECK(input_ids != NULL);
+    CHECK(image_mask != NULL);
+    CHECK(pixels != NULL);
+    CHECK(visual != NULL);
+
+    input_ids[0] = UOCR_TOKEN_BOS;
+    for (uint32_t i = 1u; i < n_tokens; ++i) {
+        input_ids[i] = UOCR_TOKEN_IMAGE;
+        image_mask[i] = 1u;
+    }
+    uocr_image_view view;
+    memset(&view, 0, sizeof(view));
+    view.pixels = pixels;
+    view.width = UOCR_GLOBAL_VIEW_SIZE;
+    view.height = UOCR_GLOBAL_VIEW_SIZE;
+    view.format = UOCR_PIXEL_F16_NCHW;
+    view.kind = UOCR_VIEW_GLOBAL;
+
+    uocr_prepared_request request;
+    memset(&request, 0, sizeof(request));
+    request.input_ids = input_ids;
+    request.image_mask = image_mask;
+    request.n_tokens = n_tokens;
+    request.views = &view;
+    request.n_views = 1u;
+    request.crop_grid_w = 1u;
+    request.crop_grid_h = 1u;
+
+    CHECK(uocr_metal_context_diagnostic_encode_visual_features_f16(ctx,
+                                                        &request,
+                                                        1u,
+                                                        visual,
+                                                        UOCR_GLOBAL_VISUAL_TOKENS,
+                                                        error,
+                                                        sizeof(error)) == 0);
+    CHECK(strstr(error, "requires validated fp16 vision tensor bindings") != NULL);
+
+    free(visual);
+    free(pixels);
+    free(image_mask);
+    free(input_ids);
+    uocr_metal_context_destroy(ctx);
+    return 0;
+}
+
 static int test_metal_decoder_binding_cache_full_model(void) {
     if (!uocr_metal_is_available()) {
         return 0;
@@ -13387,7 +15341,9 @@ static int test_metal_decoder_binding_cache_full_model(void) {
     enum {
         EXPECTED_DECODER_BINDINGS = 3u + (UOCR_DECODER_LAYERS * 6u) + 3u +
                                     ((UOCR_DECODER_LAYERS - 1u) *
-                                     (1u + 3u + UOCR_ROUTED_EXPERTS * 3u))
+                                     (1u + 3u + UOCR_ROUTED_EXPERTS * 3u)),
+        EXPECTED_VISION_BINDINGS = 2u + 2u + (UOCR_SAM_BLOCKS * 14u + 11u) +
+                                   (4u + UOCR_CLIP_BLOCKS * 12u)
     };
     const int32_t input_ids[3] = {UOCR_TOKEN_BOS, 42, 77};
     const uint8_t image_mask[3] = {0u, 0u, 0u};
@@ -13403,6 +15359,8 @@ static int test_metal_decoder_binding_cache_full_model(void) {
     CHECK(error[0] == '\0');
     CHECK(uocr_metal_context_decoder_bindings_ready(ctx) == 1);
     CHECK(uocr_metal_context_decoder_binding_count(ctx) == EXPECTED_DECODER_BINDINGS);
+    CHECK(uocr_metal_context_vision_bindings_ready(ctx) == 1);
+    CHECK(uocr_metal_context_vision_binding_count(ctx) == EXPECTED_VISION_BINDINGS);
     CHECK(uocr_metal_context_allocate_runtime_arenas(ctx, 1u, 8u, error, sizeof(error)) == 1);
 
     uocr_metal_decoder_request_f16 request;
@@ -13478,6 +15436,9 @@ static int test_metal_model_mapping(void) {
     CHECK(uocr_metal_context_tensor_binding_count(ctx) == 2u);
     CHECK(uocr_metal_context_decoder_binding_count(ctx) == 0u);
     CHECK(uocr_metal_context_decoder_bindings_ready(ctx) == 0);
+    CHECK(uocr_metal_context_vision_binding_count(ctx) == 0u);
+    CHECK(uocr_metal_context_vision_bindings_ready(ctx) == 0);
+    CHECK(strstr(uocr_metal_context_vision_binding_error(ctx), "missing") != NULL);
     CHECK(uocr_metal_context_model_view_bytes(ctx) == UOCR_TENSOR_DATA_ALIGNMENT);
 
     uocr_metal_model_view_info view_info;
@@ -13512,6 +15473,9 @@ static int test_metal_model_mapping(void) {
     CHECK(uocr_metal_context_tensor_binding_count(ctx) == 0u);
     CHECK(uocr_metal_context_decoder_binding_count(ctx) == 0u);
     CHECK(uocr_metal_context_decoder_bindings_ready(ctx) == 0);
+    CHECK(uocr_metal_context_vision_binding_count(ctx) == 0u);
+    CHECK(uocr_metal_context_vision_bindings_ready(ctx) == 0);
+    CHECK(strstr(uocr_metal_context_vision_binding_error(ctx), "no mapped model") != NULL);
     CHECK(uocr_metal_context_model_view_bytes(ctx) == 0u);
 
     uocr_metal_context_destroy(ctx);
@@ -13544,18 +15508,18 @@ static int test_public_engine_open_initializes_metal(void) {
     CHECK(report.recommended_working_set_bytes == uocr_metal_recommended_working_set_size());
     CHECK(report.memory_budget_bytes == uocr_metal_default_memory_budget_bytes(report.recommended_working_set_bytes));
     CHECK(report.memory_budget_bytes > 0u);
-    CHECK(report.category_live_bytes[UOCR_MEMORY_KV_CACHE] == report.estimated_kv_cache_bytes);
-    CHECK(report.category_live_bytes[UOCR_MEMORY_PROMPT_EMBEDDINGS] == report.estimated_prompt_embeddings_bytes);
-    CHECK(report.category_live_bytes[UOCR_MEMORY_VISION_SCRATCH] == report.estimated_vision_scratch_bytes);
-    CHECK(report.category_live_bytes[UOCR_MEMORY_DECODER_SCRATCH] == report.estimated_decoder_scratch_bytes);
-    CHECK(report.category_live_bytes[UOCR_MEMORY_MOE_SCRATCH] == report.estimated_moe_scratch_bytes);
-    CHECK(report.category_live_bytes[UOCR_MEMORY_LOGITS_READBACK] == report.estimated_logits_readback_bytes);
-    CHECK(report.total_live_bytes == report.estimated_kv_cache_bytes +
-                                     report.estimated_prompt_embeddings_bytes +
-                                     report.estimated_vision_scratch_bytes +
-                                     report.estimated_decoder_scratch_bytes +
-                                     report.estimated_moe_scratch_bytes +
-                                     report.estimated_logits_readback_bytes);
+    CHECK(report.estimated_kv_cache_bytes > 0u);
+    CHECK(report.estimated_prompt_embeddings_bytes > 0u);
+    CHECK(report.estimated_decoder_scratch_bytes > 0u);
+    CHECK(report.estimated_moe_scratch_bytes > 0u);
+    CHECK(report.estimated_logits_readback_bytes > 0u);
+    CHECK(report.category_live_bytes[UOCR_MEMORY_KV_CACHE] == 0u);
+    CHECK(report.category_live_bytes[UOCR_MEMORY_PROMPT_EMBEDDINGS] == 0u);
+    CHECK(report.category_live_bytes[UOCR_MEMORY_VISION_SCRATCH] == 0u);
+    CHECK(report.category_live_bytes[UOCR_MEMORY_DECODER_SCRATCH] == 0u);
+    CHECK(report.category_live_bytes[UOCR_MEMORY_MOE_SCRATCH] == 0u);
+    CHECK(report.category_live_bytes[UOCR_MEMORY_LOGITS_READBACK] == 0u);
+    CHECK(report.total_live_bytes == 0u);
 
     uocr_engine_close(engine);
     return 0;
@@ -13741,6 +15705,7 @@ static int test_public_metal_text_generated_ids_python_dump_parity(void) {
 int main(void) {
     CHECK(strcmp(uocr_metal_backend_name(), "metal") == 0);
     if (test_metal_smoke() != 0) return 1;
+    if (test_metal_compile_all_kernels() != 0) return 1;
     if (test_metal_named_scratch_buffers() != 0) return 1;
     if (test_metal_sam_patch_embed_f16() != 0) return 1;
     if (test_metal_sam_abs_pos_f16() != 0) return 1;
@@ -13772,6 +15737,7 @@ int main(void) {
     if (test_metal_sam_residuals_f16() != 0) return 1;
     if (test_metal_sam_transformer_block_f16() != 0) return 1;
     if (test_metal_get_rows_f16() != 0) return 1;
+    if (test_metal_get_rows_q8_0() != 0) return 1;
     if (test_metal_prompt_assembly_f16() != 0) return 1;
     if (test_metal_prompt_assembly_from_mapped_model_f16() != 0) return 1;
     if (test_metal_text_prompt_embedding_full_model_parity() != 0) return 1;
@@ -13798,13 +15764,19 @@ int main(void) {
     if (test_metal_eos_stop_after_greedy_selection() != 0) return 1;
     if (test_metal_select_next_token_f16() != 0) return 1;
     if (test_metal_dense_f16() != 0) return 1;
+    if (test_metal_dense_q8_0() != 0) return 1;
+    if (test_metal_dense_q4_k() != 0) return 1;
+    if (test_metal_quantized_dense_dot_edges() != 0) return 1;
     if (test_metal_attention_qkvo_f16() != 0) return 1;
     if (test_metal_attention_output_residual_f16() != 0) return 1;
     if (test_metal_dense_swiglu_f16() != 0) return 1;
     if (test_metal_moe_shared_experts_f16() != 0) return 1;
+    if (test_metal_moe_shared_experts_q8_0() != 0) return 1;
     if (test_metal_moe_router_f16() != 0) return 1;
     if (test_metal_moe_selected_experts_decode_f16() != 0) return 1;
+    if (test_metal_moe_selected_experts_decode_q4_k() != 0) return 1;
     if (test_metal_moe_selected_experts_prefill_f16() != 0) return 1;
+    if (test_metal_moe_selected_experts_prefill_q4_k() != 0) return 1;
     if (test_metal_moe_combine_f16() != 0) return 1;
     if (test_metal_rope_qk_f16() != 0) return 1;
     if (test_metal_prefill_attention_f16() != 0) return 1;
@@ -13812,9 +15784,11 @@ int main(void) {
     if (test_metal_kv_cache_layout_helpers() != 0) return 1;
     if (test_metal_kv_cache_write_f16() != 0) return 1;
     if (test_metal_decode_attention_f16() != 0) return 1;
+    if (test_metal_sdpa_prefill_decode_consistency_f16() != 0) return 1;
     if (test_metal_recent_decoder_primitives_stress() != 0) return 1;
     if (test_metal_runtime_arenas() != 0) return 1;
     if (test_metal_integrated_decoder_boundary() != 0) return 1;
+    if (test_metal_vision_runner_requires_bindings() != 0) return 1;
     if (test_metal_decoder_binding_cache_full_model() != 0) return 1;
     if (test_metal_model_mapping() != 0) return 1;
     if (test_public_engine_open_initializes_metal() != 0) return 1;

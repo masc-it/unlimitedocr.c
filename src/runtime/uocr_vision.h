@@ -24,6 +24,15 @@ typedef struct uocr_vision_chunk {
     uint32_t projected_tokens_per_view;
     uint32_t projected_token_start;
     uint32_t projected_token_count;
+    /*
+     * Destination range in the final visual-feature tensor.  Global chunks map
+     * to an exact contiguous range.  Local-crop chunks write a row-major subset
+     * of the stitched local block, so the range covers the whole local block;
+     * preserving this explicit placement lets local/global shape groups be
+     * encoded independently without changing decoder-visible feature order.
+     */
+    uint32_t final_token_start;
+    uint32_t final_token_count;
 } uocr_vision_chunk;
 
 typedef struct uocr_vision_schedule {
@@ -43,6 +52,26 @@ typedef int (*uocr_vision_project_chunk_f16_fn)(const uocr_vision_chunk *chunk,
                                                 void *user_data,
                                                 char *error,
                                                 size_t error_size);
+
+/*
+ * Return the production chunk limit for the fixed same-shape batching policy:
+ * all local 640x640 views in one chunk, and all global 1024x1024 views in one
+ * chunk for global-only requests. Invalid requests still return a safe non-zero
+ * default; validation errors are reported by uocr_plan_vision_schedule().
+ */
+uint32_t uocr_default_vision_max_views_per_chunk(const uocr_prepared_request *request);
+
+/*
+ * Build the fixed production schedule for same-shape batching. Crop-mode
+ * requests produce one local 640x640 chunk followed by one global 1024x1024
+ * chunk. Global-only requests produce one global 1024x1024 chunk.
+ */
+int uocr_plan_vision_schedule_same_shape(const uocr_prepared_request *request,
+                                         uocr_vision_chunk *chunks,
+                                         uint32_t chunk_capacity,
+                                         uocr_vision_schedule *out_schedule,
+                                         char *error,
+                                         size_t error_size);
 
 /*
  * Build the view-processing schedule used by the Metal vision bring-up path.

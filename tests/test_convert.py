@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
 import struct
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -9,14 +11,54 @@ import pytest
 from unlimitedocr_c.convert import (
     EXPECTED_TENSOR_COUNT,
     EXPECTED_TOTAL_BYTES,
+    MOE_EXPERT_PACKING_CONTRACT,
+    MOE_EXPERT_PACKING_LAYOUT,
+    MOE_ROUTED_EXPERT_COUNT,
+    MOE_ROUTED_LAYER_END_EXCLUSIVE,
+    MOE_ROUTED_LAYER_START,
+    PADDED_Q4_K_KERNEL_CONTRACT,
     PRESERVED_UNUSED_NORMAL_OCR_PREFIXES,
+    Q4_HAZARD_DENSE_LAYER0_DOWN,
+    Q4_HAZARD_DENSE_LAYER0_DOWN_COUNT,
+    Q4_HAZARD_DENSE_LAYER0_DOWN_NAME,
+    Q4_HAZARD_ROUTED_EXPERT_DOWN,
+    Q4_HAZARD_ROUTED_EXPERT_DOWN_COUNT,
+    Q4_HAZARD_ROUTED_EXPERT_DOWN_NAME,
+    Q4_UNALIGNED_HAZARD_CONTRACT,
+    ROW_MAJOR_LAYOUT_CONTRACT,
+    UOCR_LAYOUT_TRANSFORM_FLATTEN_LEADING_DIM,
+    UOCR_LAYOUT_TRANSFORM_IDENTITY,
+    UOCR_PROMOTION_NONE,
+    UOCR_PROMOTION_SENSITIVE,
+    UOCR_PROMOTION_UNALIGNED,
     UOCR_FILE_HEADER_SIZE,
+    UOCR_Q4_K_BLOCK_SIZE,
+    UOCR_Q4_K_TYPE_SIZE,
+    UOCR_Q8_0_BLOCK_SIZE,
+    UOCR_Q8_0_TYPE_SIZE,
+    UOCR_QPROFILE_DYN_Q8,
+    UOCR_QTYPE_REASON_FP16_BASELINE,
+    UOCR_QTYPE_REASON_POLICY,
+    UOCR_QTYPE_REASON_SENSITIVE,
+    UOCR_QTYPE_REASON_UNALIGNED,
     UOCR_SECTION_TENSOR_DATA,
     UOCR_TENSOR_DATA_ALIGNMENT,
+    UOCR_TENSOR_FLAG_FLATTENED_LEADING_DIM,
+    UOCR_TENSOR_FLAG_ROW_MAJOR,
+    UOCR_TENSOR_FLAG_TRANSPOSED,
     UOCR_TENSOR_PAYLOAD_ALIGNMENT,
+    UOCR_TENSOR_Q4_K,
+    UOCR_TENSOR_PADDED_Q4_K,
+    UOCR_TENSOR_Q8_0,
+    _TENSOR_DIRECTORY_HEADER_STRUCT,
+    _TENSOR_ENTRY_STRUCT,
+    _tensor_directory_bytes,
     build_dry_run_plan,
+    compare_single_tensor_conversion,
+    describe_padded_q4_k_design,
     filter_plan_tensors,
     is_preserved_unused_in_normal_ocr,
+    main as convert_main,
     write_uocr_model,
 )
 from unlimitedocr_c.tensor_registry import (
@@ -35,10 +77,53 @@ def _bf16_payload(values: np.ndarray) -> bytes:
     return ((fp32.view(np.dtype("<u4")) >> np.uint32(16)).astype(np.dtype("<u2"))).tobytes()
 
 
-def _f16_from_bf16_payload(payload: bytes) -> bytes:
+def _f32_from_bf16_payload(payload: bytes) -> np.ndarray:
     words = np.frombuffer(payload, dtype=np.dtype("<u2"))
-    fp32 = (words.astype(np.uint32) << np.uint32(16)).view(np.dtype("<f4"))
-    return fp32.astype(np.dtype("<f2")).tobytes()
+    return (words.astype(np.uint32) << np.uint32(16)).view(np.dtype("<f4"))
+
+
+def _f16_from_bf16_payload(payload: bytes) -> bytes:
+    return _f32_from_bf16_payload(payload).astype(np.dtype("<f2")).tobytes()
+
+
+def _round_away_from_zero(values: np.ndarray) -> np.ndarray:
+    return np.where(values >= 0.0, np.floor(values + 0.5), np.ceil(values - 0.5))
+
+
+def _q8_0_from_bf16_payload(payload: bytes, shape: tuple[int, ...], physical_shape: tuple[int, int]) -> bytes:
+    rows, physical_inner = physical_shape
+    logical_inner = int(np.prod(shape[1:]))
+    values = _f32_from_bf16_payload(payload).reshape(rows, logical_inner)
+    if physical_inner != logical_inner:
+        padded = np.zeros((rows, physical_inner), dtype=np.float32)
+        padded[:, :logical_inner] = values
+        values = padded
+    blocks = values.reshape(-1, UOCR_Q8_0_BLOCK_SIZE)
+    amax = np.max(np.abs(blocks), axis=1)
+    scales = amax / np.float32(127.0)
+    inv_scales = np.divide(
+        np.float32(1.0), scales, out=np.zeros_like(scales, dtype=np.float32), where=scales != 0.0
+    )
+    quantized = np.clip(_round_away_from_zero(blocks * inv_scales[:, None]), -128, 127).astype(np.int8)
+    packed = np.empty((blocks.shape[0], UOCR_Q8_0_TYPE_SIZE), dtype=np.uint8)
+    packed[:, :2] = scales.astype(np.dtype("<f2")).view(np.uint8).reshape(-1, 2)
+    packed[:, 2:] = quantized.view(np.uint8)
+    return packed.tobytes()
+
+
+def _read_length_prefixed_safetensors_header(path: Path) -> dict[str, object]:
+    data = path.read_bytes()
+    if len(data) < 8:
+        raise ValueError(f"{path} is too small to contain a safetensors header length")
+    (header_len,) = struct.unpack_from("<Q", data, 0)
+    start = 8
+    end = start + header_len
+    if end > len(data):
+        raise ValueError(f"{path} declares {header_len} header bytes but only has {len(data) - start}")
+    header = json.loads(data[start:end].decode("utf-8"))
+    if not isinstance(header, dict):
+        raise ValueError(f"{path} header is not a JSON object")
+    return header
 
 
 def _write_tiny_safetensors(hf_dir) -> tuple[dict[str, bytes], dict[str, tuple[int, ...]]]:
@@ -74,6 +159,79 @@ def _write_tiny_safetensors(hf_dir) -> tuple[dict[str, bytes], dict[str, tuple[i
     return payloads, {name: shape for name, (_values, shape) in tensors.items()}
 
 
+def _full_model_converter_hf_dir_or_skip() -> Path:
+    if os.environ.get("UOCR_RUN_LARGE_TESTS") != "1":
+        pytest.skip("set UOCR_RUN_LARGE_TESTS=1 to run the full-model converter smoke test")
+    hf_dir_env = os.environ.get("UOCR_HF_DIR")
+    if not hf_dir_env:
+        pytest.skip("set UOCR_HF_DIR to a local baidu/Unlimited-OCR checkout with full safetensors payload")
+    hf_dir = Path(hf_dir_env)
+    if not hf_dir.exists():
+        pytest.fail(f"UOCR_HF_DIR does not exist: {hf_dir}")
+    required = [
+        "config.json",
+        "processor_config.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "special_tokens_map.json",
+        "model.safetensors.index.json",
+        "model-00001-of-000001.safetensors",
+    ]
+    missing = [name for name in required if not (hf_dir / name).exists()]
+    if missing:
+        pytest.fail(f"UOCR_HF_DIR is missing required full-model files: {missing}")
+    return hf_dir
+
+
+def _write_stats_safetensors(hf_dir) -> tuple[bytes, np.ndarray]:
+    values = np.array([1.0, -2.5, np.nan, np.inf, -np.inf], dtype=np.float32)
+    payload = _bf16_payload(values)
+    header = {
+        "__metadata__": {"format": "pt"},
+        "model.image_newline": {"dtype": "BF16", "shape": [5], "data_offsets": [0, len(payload)]},
+    }
+    header_bytes = json.dumps(header, separators=(",", ":")).encode("utf-8")
+    with (hf_dir / "model.safetensors").open("wb") as f:
+        f.write(struct.pack("<Q", len(header_bytes)))
+        f.write(header_bytes)
+        f.write(payload)
+    index = {
+        "metadata": {"total_size": len(payload)},
+        "weight_map": {"model.image_newline": "model.safetensors"},
+    }
+    (hf_dir / "model.safetensors.index.json").write_text(json.dumps(index), encoding="utf-8")
+    return payload, values
+
+
+def test_cached_safetensors_header_current_checkpoint_facts() -> None:
+    context_dir = project_root() / "data/context"
+    header = _read_length_prefixed_safetensors_header(context_dir / "model.safetensors.header")
+    index = json.loads((context_dir / "model.safetensors.index.json").read_text(encoding="utf-8"))
+
+    entries = {name: meta for name, meta in header.items() if name != "__metadata__"}
+    assert len(entries) == EXPECTED_TENSOR_COUNT
+    assert len(index["weight_map"]) == EXPECTED_TENSOR_COUNT
+    assert set(index["weight_map"]) == set(entries)
+    assert set(index["weight_map"].values()) == {"model-00001-of-000001.safetensors"}
+    assert index["metadata"]["total_size"] == EXPECTED_TOTAL_BYTES
+
+    total_payload_bytes = 0
+    max_payload_end = 0
+    for name, meta in entries.items():
+        assert isinstance(meta, dict), name
+        assert meta.get("dtype") == "BF16", name
+        offsets = meta.get("data_offsets")
+        assert isinstance(offsets, list) and len(offsets) == 2, name
+        start, end = offsets
+        assert isinstance(start, int) and isinstance(end, int), name
+        assert 0 <= start < end <= EXPECTED_TOTAL_BYTES, name
+        total_payload_bytes += end - start
+        max_payload_end = max(max_payload_end, end)
+
+    assert total_payload_bytes == EXPECTED_TOTAL_BYTES
+    assert max_payload_end == EXPECTED_TOTAL_BYTES
+
+
 def test_fp16_converter_dry_run_against_cached_header() -> None:
     plan = build_dry_run_plan(project_root() / "data/context", qprofile="fp16")
 
@@ -81,7 +239,49 @@ def test_fp16_converter_dry_run_against_cached_header() -> None:
     assert plan.total_source_bytes == EXPECTED_TOTAL_BYTES
     assert plan.total_output_bytes == EXPECTED_TOTAL_BYTES
     assert plan.qtype_histogram == {"UOCR_TENSOR_F16": EXPECTED_TENSOR_COUNT}
+    assert plan.qtype_reason_histogram == {"fp16-baseline": EXPECTED_TENSOR_COUNT}
+    assert plan.promotion_reason_histogram == {"none": EXPECTED_TENSOR_COUNT}
     assert plan.usage_histogram == {"runtime": EXPECTED_TENSOR_COUNT - 1, "preserved-unused": 1}
+
+    source_metadata = plan.summary_dict()["source_metadata"]
+    assert source_metadata["config"]["validated"] is True
+    assert source_metadata["config"]["model_type"] == "unlimited-ocr"
+    assert source_metadata["config"]["torch_dtype"] == "bfloat16"
+    assert source_metadata["config"]["hidden_size"] == 1280
+    assert source_metadata["config"]["decoder_layers"] == 12
+    assert source_metadata["config"]["projector_in"] == 2048
+    assert source_metadata["config"]["projector_out"] == 1280
+    assert source_metadata["config"]["sam_layers"] == 12
+    assert source_metadata["config"]["clip_layers"] == 24
+    assert source_metadata["config"]["candidate_resolutions"] == [[1024, 1024]]
+    assert source_metadata["processor"]["validated"] is True
+    assert source_metadata["processor"]["processor_class"] == "UnlimitedOCRHFProcessor"
+    assert source_metadata["processor"]["image_mean"] == [0.5, 0.5, 0.5]
+    assert source_metadata["processor"]["image_std"] == [0.5, 0.5, 0.5]
+    assert source_metadata["processor"]["image_token"] == "<image>"
+    assert source_metadata["processor"]["patch_size"] == 16
+    assert source_metadata["processor"]["downsample_ratio"] == 4
+    assert source_metadata["tokenizer"]["validated"] is True
+    assert source_metadata["tokenizer"]["tokenizer_class"] == "LlamaTokenizerFast"
+    assert source_metadata["tokenizer"]["tokenizer_model_type"] == "BPE"
+    assert source_metadata["tokenizer"]["bpe_vocab_size"] == 128000
+    assert source_metadata["tokenizer"]["vocab_size"] == 129280
+    assert source_metadata["tokenizer"]["added_token_count"] == 830
+    assert source_metadata["tokenizer"]["special_token_ids"] == {"bos": 0, "eos": 1, "pad": 2, "image": 128815}
+    assert source_metadata["safetensors"]["tensor_count"] == EXPECTED_TENSOR_COUNT
+    assert source_metadata["safetensors"]["total_payload_bytes"] == EXPECTED_TOTAL_BYTES
+    assert source_metadata["safetensors"]["max_payload_end"] == EXPECTED_TOTAL_BYTES
+    assert source_metadata["safetensors"]["source_dtype"] == "BF16"
+    assert source_metadata["safetensors"]["dtype_counts"] == {"BF16": EXPECTED_TENSOR_COUNT}
+    assert source_metadata["safetensors"]["file_count"] == 1
+    assert source_metadata["safetensors"]["source_files"] == ["model-00001-of-000001.safetensors"]
+    assert all(len(value) == 64 for value in source_metadata["hashes"].values())
+
+    layout_summary = plan.summary_dict()["layout_transforms"]
+    assert layout_summary["contract"] == ROW_MAJOR_LAYOUT_CONTRACT
+    assert layout_summary["row_major_count"] == EXPECTED_TENSOR_COUNT
+    assert layout_summary["transposed_count"] == 0
+    assert layout_summary["by_transform"] == {"identity-row-major": EXPECTED_TENSOR_COUNT}
 
     preserved_unused = [tensor for tensor in plan.tensors if tensor.usage == "preserved-unused"]
     assert [tensor.name for tensor in preserved_unused] == ["model.vision_model.embeddings.patch_embedding.weight"]
@@ -111,6 +311,17 @@ def test_fp16_converter_dry_run_against_cached_header() -> None:
     assert lm_head.shape == (129_280, 1280)
     assert lm_head.source_dtype == "BF16"
     assert lm_head.output_dtype == "F16"
+    assert lm_head.qtype_reason == "fp16-baseline"
+    assert lm_head.qtype_reason_id == UOCR_QTYPE_REASON_FP16_BASELINE
+    assert lm_head.promotion_reason == "none"
+    assert lm_head.promotion_reason_id == UOCR_PROMOTION_NONE
+    assert lm_head.source_layout == "row-major"
+    assert lm_head.runtime_layout == "row-major"
+    assert lm_head.layout_transform == "identity-row-major"
+    assert lm_head.layout_transform_id == UOCR_LAYOUT_TRANSFORM_IDENTITY
+    assert lm_head.layout_flags == UOCR_TENSOR_FLAG_ROW_MAJOR
+    assert lm_head.transposed is False
+    assert "no transpose" in lm_head.layout_reason
 
     attn_q = plan.tensor_by_name("model.layers.3.self_attn.q_proj.weight")
     assert attn_q.tensor_id == tensor_id_layer_attn(3, TensorProjection.Q)
@@ -133,6 +344,333 @@ def test_fp16_converter_dry_run_against_cached_header() -> None:
     assert clip_patch.usage == "preserved-unused"
     assert "patch_embeds" in clip_patch.reason
     assert "provenance" in clip_patch.reason
+
+
+def test_fp16_converter_packs_routed_experts_interleaved_expert_major() -> None:
+    plan = build_dry_run_plan(project_root() / "data/context", qprofile="fp16")
+    summary = plan.summary_dict()["moe_expert_packing"]
+    assert summary["layout"] == MOE_EXPERT_PACKING_LAYOUT
+    assert summary["contract"] == MOE_EXPERT_PACKING_CONTRACT
+    assert summary["layer_start"] == MOE_ROUTED_LAYER_START
+    assert summary["layer_end_exclusive"] == MOE_ROUTED_LAYER_END_EXCLUSIVE
+    assert summary["expert_count"] == MOE_ROUTED_EXPERT_COUNT
+    assert summary["projection_order"] == ["GATE", "UP", "DOWN"]
+
+    projections = [
+        ("gate_proj", TensorProjection.GATE, "GATE"),
+        ("up_proj", TensorProjection.UP, "UP"),
+        ("down_proj", TensorProjection.DOWN, "DOWN"),
+    ]
+    for layer in range(MOE_ROUTED_LAYER_START, MOE_ROUTED_LAYER_END_EXCLUSIVE):
+        ordered = []
+        for expert in range(MOE_ROUTED_EXPERT_COUNT):
+            per_expert = []
+            for suffix, projection, projection_name in projections:
+                tensor = plan.tensor_by_name(f"model.layers.{layer}.mlp.experts.{expert}.{suffix}.weight")
+                assert tensor.tensor_id == tensor_id_moe_expert(layer, expert, projection)
+                assert tensor.family == "MOE_EXPERT"
+                assert tensor.layer == layer
+                assert tensor.expert == expert
+                assert tensor.projection == projection_name
+                per_expert.append(tensor)
+                ordered.append(tensor)
+
+            gate, up, down = per_expert
+            assert up.payload_offset == gate.payload_offset + gate.output_bytes
+            assert down.payload_offset == up.payload_offset + up.output_bytes
+
+        assert [tensor.tensor_id for tensor in ordered] == sorted(tensor.tensor_id for tensor in ordered)
+        previous_end = ordered[0].payload_offset
+        for tensor in ordered:
+            assert tensor.payload_offset == previous_end
+            previous_end = tensor.payload_offset + tensor.output_bytes
+
+
+def test_dyn_q8_converter_dry_run_records_quant_metadata() -> None:
+    plan = build_dry_run_plan(project_root() / "data/context", qprofile="dyn-q8")
+
+    assert plan.tensor_count == EXPECTED_TENSOR_COUNT
+    assert plan.total_source_bytes == EXPECTED_TOTAL_BYTES
+    assert plan.total_output_bytes < EXPECTED_TOTAL_BYTES
+    assert plan.summary_dict()["estimated_savings_bytes"] == EXPECTED_TOTAL_BYTES - plan.total_output_bytes
+    assert 0 < plan.summary_dict()["compression_ratio"] < 1
+    assert plan.qtype_histogram["UOCR_TENSOR_Q8_0"] > 0
+    assert plan.qtype_histogram["UOCR_TENSOR_F16"] > 0
+    width_summary = plan.summary_dict()["quantized_input_widths"]
+    assert width_summary["quantized_tensor_count"] == plan.qtype_histogram["UOCR_TENSOR_Q8_0"]
+    assert width_summary["padded_tensor_count"] > 0
+    assert width_summary["max_padding_width"] > 0
+    assert "logical_input_width" in width_summary["contract"]
+    layout_summary = plan.summary_dict()["layout_transforms"]
+    assert layout_summary["contract"] == ROW_MAJOR_LAYOUT_CONTRACT
+    assert layout_summary["row_major_count"] == EXPECTED_TENSOR_COUNT
+    assert layout_summary["transposed_count"] == 0
+    assert layout_summary["by_transform"]["identity-row-major"] > 0
+    assert layout_summary["by_transform"]["flatten-leading-dim-row-major"] > 0
+    assert plan.qtype_reason_histogram["policy"] == plan.qtype_histogram["UOCR_TENSOR_Q8_0"]
+    assert plan.qtype_reason_histogram["sensitive"] == plan.qtype_histogram["UOCR_TENSOR_F16"]
+    assert plan.promotion_reason_histogram["none"] == plan.qtype_histogram["UOCR_TENSOR_Q8_0"]
+    assert plan.promotion_reason_histogram["sensitive"] == plan.qtype_histogram["UOCR_TENSOR_F16"]
+
+    lm_head = plan.tensor_by_name("lm_head.weight")
+    assert lm_head.qtype == "UOCR_TENSOR_Q8_0"
+    assert lm_head.qtype_id == UOCR_TENSOR_Q8_0
+    assert lm_head.shape == (129_280, 1280)
+    assert lm_head.logical_shape == (129_280, 1280)
+    assert lm_head.physical_shape == (129_280, 1280)
+    assert lm_head.logical_input_width == 1280
+    assert lm_head.physical_input_width == 1280
+    assert lm_head.input_padding_width == 0
+    assert lm_head.block_size == UOCR_Q8_0_BLOCK_SIZE
+    assert lm_head.row_size == (1280 // UOCR_Q8_0_BLOCK_SIZE) * UOCR_Q8_0_TYPE_SIZE
+    assert lm_head.output_bytes == 129_280 * lm_head.row_size
+    assert lm_head.qtype_reason == "policy"
+    assert lm_head.qtype_reason_id == UOCR_QTYPE_REASON_POLICY
+    assert lm_head.promotion_reason == "none"
+    assert lm_head.promotion_reason_id == UOCR_PROMOTION_NONE
+
+    sam_patch = plan.tensor_by_name("model.sam_model.patch_embed.proj.weight")
+    assert sam_patch.qtype == "UOCR_TENSOR_Q8_0"
+    assert sam_patch.shape == (768, 3, 16, 16)
+    assert sam_patch.logical_shape == (768, 768)
+    assert sam_patch.physical_shape == (768, 768)
+    assert sam_patch.logical_input_width == 768
+    assert sam_patch.physical_input_width == 768
+    assert sam_patch.input_padding_width == 0
+    assert sam_patch.layout_transform == "flatten-leading-dim-row-major"
+    assert sam_patch.layout_transform_id == UOCR_LAYOUT_TRANSFORM_FLATTEN_LEADING_DIM
+    assert sam_patch.layout_flags == UOCR_TENSOR_FLAG_ROW_MAJOR | UOCR_TENSOR_FLAG_FLATTENED_LEADING_DIM
+    assert sam_patch.transposed is False
+    assert "flattened" in sam_patch.layout_reason
+    assert sam_patch.output_bytes == 768 * ((768 // UOCR_Q8_0_BLOCK_SIZE) * UOCR_Q8_0_TYPE_SIZE)
+
+    router = plan.tensor_by_name("model.layers.1.mlp.gate.weight")
+    assert router.qtype == "UOCR_TENSOR_F16"
+    assert router.logical_shape == router.shape
+    assert router.logical_input_width == 0
+    assert router.physical_input_width == 0
+    assert router.input_padding_width == 0
+    assert "router" in router.reason.lower()
+    assert router.qtype_reason == "sensitive"
+    assert router.qtype_reason_id == UOCR_QTYPE_REASON_SENSITIVE
+    assert router.promotion_reason == "sensitive"
+    assert router.promotion_reason_id == UOCR_PROMOTION_SENSITIVE
+
+    pos_embed = plan.tensor_by_name("model.sam_model.pos_embed")
+    assert pos_embed.qtype == "UOCR_TENSOR_F16"
+    assert pos_embed.logical_shape == pos_embed.shape
+    assert "pos" in pos_embed.reason.lower()
+
+    raw_patch = plan.tensor_by_name("model.vision_model.embeddings.patch_embedding.weight")
+    assert raw_patch.usage == "preserved-unused"
+    assert raw_patch.qtype == "UOCR_TENSOR_Q8_0"
+    assert raw_patch.shape == (1024, 3, 14, 14)
+    assert raw_patch.logical_shape == (1024, 588)
+    assert raw_patch.physical_shape == (1024, 608)
+    assert raw_patch.logical_input_width == 588
+    assert raw_patch.physical_input_width == 608
+    assert raw_patch.input_padding_width == 20
+    assert raw_patch.row_size == (608 // UOCR_Q8_0_BLOCK_SIZE) * UOCR_Q8_0_TYPE_SIZE
+    raw_patch_dict = raw_patch.as_dict()
+    assert raw_patch_dict["logical_input_width"] == 588
+    assert raw_patch_dict["physical_input_width"] == 608
+    assert raw_patch_dict["input_padding_width"] == 20
+
+    payload = _tensor_directory_bytes(filter_plan_tensors(plan, "model.sam_model.patch_embed.proj.weight"))
+    header_size = _TENSOR_DIRECTORY_HEADER_STRUCT.size
+    entry = _TENSOR_ENTRY_STRUCT.unpack_from(payload, header_size)
+    assert entry[6] == UOCR_TENSOR_Q8_0
+    assert entry[7] == (UOCR_TENSOR_FLAG_ROW_MAJOR | UOCR_TENSOR_FLAG_FLATTENED_LEADING_DIM)
+    assert (entry[7] & UOCR_TENSOR_FLAG_TRANSPOSED) == 0
+    assert entry[8] == 2
+    assert entry[9:13] == (768, 768, 0, 0)
+    assert entry[13:17] == (768, 768, 0, 0)
+    assert entry[25] == UOCR_QTYPE_REASON_POLICY
+    assert entry[26] == UOCR_PROMOTION_NONE
+
+
+def test_dyn_q4_converter_dry_run_uses_conservative_policy() -> None:
+    plan = build_dry_run_plan(project_root() / "data/context", qprofile="dyn-q4")
+    q8_plan = build_dry_run_plan(project_root() / "data/context", qprofile="dyn-q8")
+
+    assert plan.tensor_count == EXPECTED_TENSOR_COUNT
+    assert plan.total_source_bytes == EXPECTED_TOTAL_BYTES
+    assert 0 < plan.total_output_bytes < q8_plan.total_output_bytes
+    assert plan.qtype_histogram["UOCR_TENSOR_Q4_K"] > 0
+    assert plan.qtype_histogram["UOCR_TENSOR_Q8_0"] > 0
+    assert plan.qtype_histogram["UOCR_TENSOR_F16"] > 0
+    width_summary = plan.summary_dict()["quantized_input_widths"]
+    assert width_summary["quantized_tensor_count"] == (
+        plan.qtype_histogram["UOCR_TENSOR_Q4_K"] + plan.qtype_histogram["UOCR_TENSOR_Q8_0"]
+    )
+    assert width_summary["padded_tensor_count"] > 0
+    assert width_summary["max_padding_width"] > 0
+    assert plan.qtype_reason_histogram["policy"] == plan.qtype_histogram["UOCR_TENSOR_Q4_K"]
+    assert plan.qtype_reason_histogram["unaligned"] > 0
+    assert plan.qtype_reason_histogram["sensitive"] > 0
+    assert plan.promotion_reason_histogram["none"] == plan.qtype_histogram["UOCR_TENSOR_Q4_K"]
+    assert plan.promotion_reason_histogram["unaligned"] > 0
+    assert plan.promotion_reason_histogram["sensitive"] > 0
+
+    hazard_summary = plan.summary_dict()["q4_unaligned_hazards"]
+    assert hazard_summary["contract"] == Q4_UNALIGNED_HAZARD_CONTRACT
+    assert hazard_summary["block_size"] == UOCR_Q4_K_BLOCK_SIZE
+    assert hazard_summary["total_count"] == Q4_HAZARD_ROUTED_EXPERT_DOWN_COUNT + Q4_HAZARD_DENSE_LAYER0_DOWN_COUNT
+    assert hazard_summary["by_kind"] == {
+        Q4_HAZARD_DENSE_LAYER0_DOWN_NAME: Q4_HAZARD_DENSE_LAYER0_DOWN_COUNT,
+        Q4_HAZARD_ROUTED_EXPERT_DOWN_NAME: Q4_HAZARD_ROUTED_EXPERT_DOWN_COUNT,
+    }
+    assert hazard_summary["examples"][Q4_HAZARD_ROUTED_EXPERT_DOWN_NAME]["logical_input_width"] == 896
+    assert hazard_summary["examples"][Q4_HAZARD_ROUTED_EXPERT_DOWN_NAME]["required_physical_input_width"] == 1024
+    assert hazard_summary["examples"][Q4_HAZARD_DENSE_LAYER0_DOWN_NAME]["logical_input_width"] == 6848
+    assert hazard_summary["examples"][Q4_HAZARD_DENSE_LAYER0_DOWN_NAME]["required_physical_input_width"] == 6912
+
+    hazard_tensors = [tensor for tensor in plan.tensors if tensor.q4_hazard_id != 0]
+    assert len(hazard_tensors) == hazard_summary["total_count"]
+    assert {tensor.qtype for tensor in hazard_tensors} == {"UOCR_TENSOR_Q8_0"}
+    assert {tensor.qtype_reason for tensor in hazard_tensors} == {"unaligned"}
+    assert {tensor.promotion_reason for tensor in hazard_tensors} == {"unaligned"}
+
+    attn_q = plan.tensor_by_name("model.layers.3.self_attn.q_proj.weight")
+    assert attn_q.qtype == "UOCR_TENSOR_Q4_K"
+    assert attn_q.qtype_id == UOCR_TENSOR_Q4_K
+    assert attn_q.logical_shape == (1280, 1280)
+    assert attn_q.physical_shape == (1280, 1280)
+    assert attn_q.logical_input_width == 1280
+    assert attn_q.physical_input_width == 1280
+    assert attn_q.input_padding_width == 0
+    assert attn_q.q4_hazard == "none"
+    assert attn_q.q4_hazard_id == 0
+    assert attn_q.layout_transform == "identity-row-major"
+    assert attn_q.layout_transform_id == UOCR_LAYOUT_TRANSFORM_IDENTITY
+    assert attn_q.layout_flags == UOCR_TENSOR_FLAG_ROW_MAJOR
+    assert attn_q.transposed is False
+    assert attn_q.block_size == UOCR_Q4_K_BLOCK_SIZE
+    assert attn_q.row_size == (1280 // UOCR_Q4_K_BLOCK_SIZE) * UOCR_Q4_K_TYPE_SIZE
+    assert "attention projection" in attn_q.reason
+    assert attn_q.qtype_reason == "policy"
+    assert attn_q.qtype_reason_id == UOCR_QTYPE_REASON_POLICY
+    assert attn_q.promotion_reason == "none"
+    assert attn_q.promotion_reason_id == UOCR_PROMOTION_NONE
+
+    expert_gate = plan.tensor_by_name("model.layers.1.mlp.experts.7.gate_proj.weight")
+    assert expert_gate.qtype == "UOCR_TENSOR_Q4_K"
+    assert expert_gate.logical_shape == (896, 1280)
+    assert expert_gate.physical_shape == (896, 1280)
+    assert expert_gate.logical_input_width == 1280
+    assert expert_gate.physical_input_width == 1280
+    assert expert_gate.input_padding_width == 0
+    assert "routed expert gate/up" in expert_gate.reason
+
+    expert_down = plan.tensor_by_name("model.layers.1.mlp.experts.7.down_proj.weight")
+    assert expert_down.qtype == "UOCR_TENSOR_Q8_0"
+    assert expert_down.logical_shape == (1280, 896)
+    assert expert_down.physical_shape == (1280, 896)
+    assert expert_down.logical_input_width == 896
+    assert expert_down.physical_input_width == 896
+    assert expert_down.input_padding_width == 0
+    assert expert_down.q4_hazard == Q4_HAZARD_ROUTED_EXPERT_DOWN_NAME
+    assert expert_down.q4_hazard_id == Q4_HAZARD_ROUTED_EXPERT_DOWN
+    assert expert_down.q4_hazard_logical_input_width == 896
+    assert expert_down.q4_hazard_required_physical_input_width == 1024
+    assert expert_down.q4_hazard_padding_width == 128
+    assert expert_down.row_size == (896 // UOCR_Q8_0_BLOCK_SIZE) * UOCR_Q8_0_TYPE_SIZE
+    assert "routed expert down" in expert_down.reason
+    assert "Q8_0" in expert_down.reason
+    assert expert_down.qtype_reason == "unaligned"
+    assert expert_down.qtype_reason_id == UOCR_QTYPE_REASON_UNALIGNED
+    assert expert_down.promotion_reason == "unaligned"
+    assert expert_down.promotion_reason_id == UOCR_PROMOTION_UNALIGNED
+
+    dense_down = plan.tensor_by_name("model.layers.0.mlp.down_proj.weight")
+    assert dense_down.qtype == "UOCR_TENSOR_Q8_0"
+    assert dense_down.logical_shape == (1280, 6848)
+    assert dense_down.physical_shape == (1280, 6848)
+    assert dense_down.logical_input_width == 6848
+    assert dense_down.physical_input_width == 6848
+    assert dense_down.input_padding_width == 0
+    assert dense_down.q4_hazard == Q4_HAZARD_DENSE_LAYER0_DOWN_NAME
+    assert dense_down.q4_hazard_id == Q4_HAZARD_DENSE_LAYER0_DOWN
+    assert dense_down.q4_hazard_logical_input_width == 6848
+    assert dense_down.q4_hazard_required_physical_input_width == 6912
+    assert dense_down.q4_hazard_padding_width == 64
+    assert dense_down.row_size == (6848 // UOCR_Q8_0_BLOCK_SIZE) * UOCR_Q8_0_TYPE_SIZE
+    assert "dense layer-0 down" in dense_down.reason
+
+    shared_down = plan.tensor_by_name("model.layers.1.mlp.shared_experts.down_proj.weight")
+    assert shared_down.qtype == "UOCR_TENSOR_Q4_K"
+    assert shared_down.logical_shape == (1280, 1792)
+    assert shared_down.physical_shape == (1280, 1792)
+    assert shared_down.logical_input_width == 1792
+    assert shared_down.physical_input_width == 1792
+    assert shared_down.input_padding_width == 0
+    assert shared_down.row_size == (1792 // UOCR_Q4_K_BLOCK_SIZE) * UOCR_Q4_K_TYPE_SIZE
+    assert "shared expert down" in shared_down.reason
+
+    lm_head = plan.tensor_by_name("lm_head.weight")
+    assert lm_head.qtype == "UOCR_TENSOR_Q8_0"
+    assert "LM head" in lm_head.reason
+    assert lm_head.qtype_reason == "sensitive"
+    assert lm_head.qtype_reason_id == UOCR_QTYPE_REASON_SENSITIVE
+    assert lm_head.promotion_reason == "sensitive"
+    assert lm_head.promotion_reason_id == UOCR_PROMOTION_SENSITIVE
+
+    sam_patch = plan.tensor_by_name("model.sam_model.patch_embed.proj.weight")
+    assert sam_patch.qtype == "UOCR_TENSOR_Q8_0"
+    assert "vision weights" in sam_patch.reason
+
+    router = plan.tensor_by_name("model.layers.1.mlp.gate.weight")
+    assert router.qtype == "UOCR_TENSOR_F16"
+    assert "router" in router.reason.lower()
+    assert router.qtype_reason == "sensitive"
+    assert router.qtype_reason_id == UOCR_QTYPE_REASON_SENSITIVE
+    assert router.promotion_reason == "sensitive"
+    assert router.promotion_reason_id == UOCR_PROMOTION_SENSITIVE
+
+
+def test_padded_q4_k_design_is_explicit_and_disabled_by_default() -> None:
+    plan = build_dry_run_plan(project_root() / "data/context", qprofile="dyn-q4")
+    assert "UOCR_TENSOR_PADDED_Q4_K" not in plan.qtype_histogram
+
+    routed_down = plan.tensor_by_name("model.layers.1.mlp.experts.7.down_proj.weight")
+    assert routed_down.qtype == "UOCR_TENSOR_Q8_0"
+
+    routed_design = describe_padded_q4_k_design(routed_down.shape)
+    assert routed_design.qtype == "UOCR_TENSOR_PADDED_Q4_K"
+    assert routed_design.qtype_id == UOCR_TENSOR_PADDED_Q4_K
+    assert routed_design.logical_shape == (1280, 896)
+    assert routed_design.physical_shape == (1280, 1024)
+    assert routed_design.padding_cols == 128
+    assert routed_design.logical_input_width == 896
+    assert routed_design.physical_input_width == 1024
+    assert routed_design.input_padding_width == 128
+    assert routed_design.block_size == UOCR_Q4_K_BLOCK_SIZE
+    assert routed_design.row_size == (1024 // UOCR_Q4_K_BLOCK_SIZE) * UOCR_Q4_K_TYPE_SIZE
+    assert routed_design.output_bytes == 1280 * routed_design.row_size
+    assert "zero" in routed_design.kernel_contract
+    assert "logical inner width" in routed_design.kernel_contract
+    routed_design_dict = routed_design.as_dict()
+    assert routed_design_dict["kernel_contract"] == PADDED_Q4_K_KERNEL_CONTRACT
+    assert routed_design_dict["logical_input_width"] == 896
+    assert routed_design_dict["physical_input_width"] == 1024
+    assert routed_design_dict["input_padding_width"] == 128
+
+    dense_design = describe_padded_q4_k_design((1280, 6848))
+    assert dense_design.logical_shape == (1280, 6848)
+    assert dense_design.physical_shape == (1280, 6912)
+    assert dense_design.padding_cols == 64
+    assert dense_design.logical_input_width == 6848
+    assert dense_design.physical_input_width == 6912
+    assert dense_design.input_padding_width == 64
+    assert dense_design.row_size == (6912 // UOCR_Q4_K_BLOCK_SIZE) * UOCR_Q4_K_TYPE_SIZE
+
+    aligned_design = describe_padded_q4_k_design((1280, 1792))
+    assert aligned_design.logical_shape == (1280, 1792)
+    assert aligned_design.physical_shape == (1280, 1792)
+    assert aligned_design.padding_cols == 0
+    assert aligned_design.logical_input_width == 1792
+    assert aligned_design.physical_input_width == 1792
+    assert aligned_design.input_padding_width == 0
 
 
 def test_filter_plan_tensors_relayouts_single_tensor(tmp_path) -> None:
@@ -170,6 +708,211 @@ def test_write_uocr_model_streams_bf16_to_fp16_payload(tmp_path) -> None:
     for tensor in plan.tensors:
         actual = raw[tensor.payload_offset : tensor.payload_offset + tensor.output_bytes]
         assert actual == _f16_from_bf16_payload(payloads[tensor.name])
+
+
+def test_write_uocr_model_records_conversion_stats(tmp_path) -> None:
+    payload, _values = _write_stats_safetensors(tmp_path)
+    plan = build_dry_run_plan(tmp_path, qprofile="fp16", strict=False)
+    out = tmp_path / "stats.uocr"
+    stats_path = tmp_path / "stats.json"
+
+    write_uocr_model(plan, out, stats_path=stats_path)
+
+    report = json.loads(stats_path.read_text(encoding="utf-8"))
+    tensor = report["tensors"][0]
+    assert report["version"] == 1
+    assert report["model_path"] == str(out)
+    assert report["qprofile"] == "fp16"
+    assert report["tensor_count"] == 1
+    assert report["source_bytes"] == len(payload)
+    assert report["output_bytes"] == len(payload)
+    assert report["output_bytes_written"] == len(payload)
+    assert report["value_count"] == 5
+    assert report["finite_count"] == 2
+    assert report["source_nan_count"] == 1
+    assert report["source_posinf_count"] == 1
+    assert report["source_neginf_count"] == 1
+    assert report["source_nonfinite_count"] == 3
+    assert tensor["name"] == "model.image_newline"
+    assert tensor["source_dtype"] == "BF16"
+    assert tensor["output_dtype"] == "F16"
+    assert tensor["qtype"] == "UOCR_TENSOR_F16"
+    assert tensor["source_bytes"] == len(payload)
+    assert tensor["output_bytes"] == len(payload)
+    assert tensor["output_bytes_written"] == len(payload)
+    assert tensor["source_min"] == -2.5
+    assert tensor["source_max"] == 1.0
+    assert tensor["source_nan_count"] == 1
+    assert tensor["source_posinf_count"] == 1
+    assert tensor["source_neginf_count"] == 1
+    assert tensor["source_nonfinite_count"] == 3
+
+
+def test_write_uocr_model_streams_dyn_q8_payload(tmp_path) -> None:
+    payloads, _shapes = _write_tiny_safetensors(tmp_path)
+    plan = build_dry_run_plan(tmp_path, qprofile="dyn-q8", strict=False)
+    out = tmp_path / "tiny-q8.uocr"
+    stats_path = tmp_path / "tiny-q8.stats.json"
+
+    written = write_uocr_model(plan, out, stats_path=stats_path)
+
+    assert written == out
+    raw = out.read_bytes()
+    assert raw[:4] == b"UOCR"
+    assert len(raw) == plan.planned_file_size
+    assert struct.unpack_from("<I", raw, 20)[0] == UOCR_QPROFILE_DYN_Q8
+
+    q8_tensor = plan.tensor_by_name("model.sam_model.tiny_a.weight")
+    assert q8_tensor.qtype == "UOCR_TENSOR_Q8_0"
+    assert q8_tensor.logical_shape == (2, 2)
+    assert q8_tensor.physical_shape == (2, 32)
+    assert q8_tensor.logical_input_width == 2
+    assert q8_tensor.physical_input_width == 32
+    assert q8_tensor.input_padding_width == 30
+    assert q8_tensor.output_bytes == 2 * UOCR_Q8_0_TYPE_SIZE
+    actual_q8 = raw[q8_tensor.payload_offset : q8_tensor.payload_offset + q8_tensor.output_bytes]
+    expected_q8 = _q8_0_from_bf16_payload(payloads[q8_tensor.name], q8_tensor.shape, q8_tensor.physical_shape)
+    assert actual_q8 == expected_q8
+
+    f16_tensor = plan.tensor_by_name("model.vision_model.embeddings.patch_embedding.weight")
+    assert f16_tensor.qtype == "UOCR_TENSOR_F16"
+    actual_f16 = raw[f16_tensor.payload_offset : f16_tensor.payload_offset + f16_tensor.output_bytes]
+    assert actual_f16 == _f16_from_bf16_payload(payloads[f16_tensor.name])
+
+    directory = _tensor_directory_bytes(plan)
+    assert directory in raw
+
+    stats = json.loads(stats_path.read_text(encoding="utf-8"))
+    assert stats["qprofile"] == "dyn-q8"
+    assert stats["tensor_count"] == 2
+    q8_stats = {tensor["name"]: tensor for tensor in stats["tensors"]}[q8_tensor.name]
+    assert q8_stats["qtype"] == "UOCR_TENSOR_Q8_0"
+    assert q8_stats["source_min"] == -2.0
+    assert q8_stats["source_max"] == 3.5
+    assert q8_stats["source_nonfinite_count"] == 0
+    assert q8_stats["source_bytes"] == len(payloads[q8_tensor.name])
+    assert q8_stats["output_bytes_written"] == q8_tensor.output_bytes
+
+
+def test_compare_single_tensor_conversion_matches_fp16_and_reports_mismatch(tmp_path) -> None:
+    _write_tiny_safetensors(tmp_path)
+    plan = filter_plan_tensors(
+        build_dry_run_plan(tmp_path, qprofile="fp16", strict=False),
+        "model.sam_model.tiny_a.weight",
+    )
+    out = tmp_path / "tiny-single.uocr"
+    write_uocr_model(plan, out)
+
+    result = compare_single_tensor_conversion(plan, out)
+    assert result.matches is True
+    assert result.metadata_matches is True
+    assert result.payload_matches is True
+    assert result.expected_bytes == plan.tensors[0].output_bytes
+    assert result.actual_bytes == plan.tensors[0].output_bytes
+    assert result.compared_bytes == plan.tensors[0].output_bytes
+    assert result.expected_sha256 == result.actual_sha256
+    assert result.first_mismatch_offset is None
+    assert result.as_dict()["matches"] is True
+
+    raw = bytearray(out.read_bytes())
+    raw[plan.tensors[0].payload_offset + 3] ^= 0x7F
+    corrupt = tmp_path / "tiny-single-corrupt.uocr"
+    corrupt.write_bytes(raw)
+
+    mismatch = compare_single_tensor_conversion(plan, corrupt)
+    assert mismatch.matches is False
+    assert mismatch.metadata_matches is True
+    assert mismatch.payload_matches is False
+    assert mismatch.expected_sha256 != mismatch.actual_sha256
+    assert mismatch.first_mismatch_offset == 3
+    assert mismatch.expected_byte is not None
+    assert mismatch.actual_byte is not None
+
+
+def test_compare_single_tensor_conversion_matches_dyn_q8(tmp_path) -> None:
+    _write_tiny_safetensors(tmp_path)
+    plan = filter_plan_tensors(
+        build_dry_run_plan(tmp_path, qprofile="dyn-q8", strict=False),
+        "model.sam_model.tiny_a.weight",
+    )
+    out = tmp_path / "tiny-single-q8.uocr"
+    write_uocr_model(plan, out)
+
+    result = compare_single_tensor_conversion(plan, out)
+    assert result.matches is True
+    assert result.qtype == "UOCR_TENSOR_Q8_0"
+    assert result.expected_bytes == 2 * UOCR_Q8_0_TYPE_SIZE
+    assert result.expected_sha256 == result.actual_sha256
+
+
+def test_converter_cli_compare_single_tensor(tmp_path) -> None:
+    _write_tiny_safetensors(tmp_path)
+    tensor_name = "model.sam_model.tiny_a.weight"
+    plan = filter_plan_tensors(build_dry_run_plan(tmp_path, qprofile="fp16", strict=False), tensor_name)
+    out = tmp_path / "tiny-cli.uocr"
+    write_uocr_model(plan, out)
+
+    status = convert_main(
+        [
+            "--hf-dir",
+            str(tmp_path),
+            "--qprofile",
+            "fp16",
+            "--tensor",
+            tensor_name,
+            "--compare-uocr",
+            str(out),
+            "--relaxed-validation",
+        ]
+    )
+    assert status == 0
+
+
+def test_full_model_converter_smoke_streams_selected_real_tensors(tmp_path) -> None:
+    hf_dir = _full_model_converter_hf_dir_or_skip()
+
+    fp16_plan = build_dry_run_plan(hf_dir, qprofile="fp16")
+    assert fp16_plan.tensor_count == EXPECTED_TENSOR_COUNT
+    assert fp16_plan.total_source_bytes == EXPECTED_TOTAL_BYTES
+    assert fp16_plan.usage_histogram == {"runtime": EXPECTED_TENSOR_COUNT - 1, "preserved-unused": 1}
+    assert fp16_plan.summary_dict()["source_metadata"]["safetensors"]["source_files"] == [
+        "model-00001-of-000001.safetensors"
+    ]
+
+    fp16_selected = filter_plan_tensors(fp16_plan, "model.image_newline")
+    assert fp16_selected.tensor_count == 1
+    assert fp16_selected.tensors[0].qtype == "UOCR_TENSOR_F16"
+    fp16_out = tmp_path / "image_newline-fp16.uocr"
+    fp16_stats_path = tmp_path / "image_newline-fp16.stats.json"
+    write_uocr_model(fp16_selected, fp16_out, stats_path=fp16_stats_path)
+    fp16_compare = compare_single_tensor_conversion(fp16_selected, fp16_out)
+    assert fp16_compare.matches is True
+    fp16_stats = json.loads(fp16_stats_path.read_text(encoding="utf-8"))
+    assert fp16_stats["tensor_count"] == 1
+    assert fp16_stats["tensors"][0]["name"] == "model.image_newline"
+    assert fp16_stats["tensors"][0]["output_bytes_written"] == fp16_selected.tensors[0].output_bytes
+
+    q8_plan = build_dry_run_plan(hf_dir, qprofile="dyn-q8")
+    assert q8_plan.tensor_count == EXPECTED_TENSOR_COUNT
+    assert q8_plan.qtype_histogram["UOCR_TENSOR_Q8_0"] > 0
+    assert q8_plan.qtype_histogram["UOCR_TENSOR_F16"] > 0
+    q8_selected = filter_plan_tensors(q8_plan, "model.sam_model.patch_embed.proj.weight")
+    q8_tensor = q8_selected.tensors[0]
+    assert q8_tensor.qtype == "UOCR_TENSOR_Q8_0"
+    assert q8_tensor.logical_shape == (768, 768)
+    assert q8_tensor.physical_shape == (768, 768)
+    assert q8_tensor.output_bytes == 768 * ((768 // UOCR_Q8_0_BLOCK_SIZE) * UOCR_Q8_0_TYPE_SIZE)
+
+    q8_out = tmp_path / "sam-patch-q8.uocr"
+    q8_stats_path = tmp_path / "sam-patch-q8.stats.json"
+    write_uocr_model(q8_selected, q8_out, stats_path=q8_stats_path)
+    q8_compare = compare_single_tensor_conversion(q8_selected, q8_out)
+    assert q8_compare.matches is True
+    q8_stats = json.loads(q8_stats_path.read_text(encoding="utf-8"))
+    assert q8_stats["qprofile"] == "dyn-q8"
+    assert q8_stats["tensor_count"] == 1
+    assert q8_stats["tensors"][0]["qtype"] == "UOCR_TENSOR_Q8_0"
+    assert q8_stats["tensors"][0]["output_bytes_written"] == q8_tensor.output_bytes
 
 
 def test_write_uocr_model_requires_overwrite_for_existing_output(tmp_path) -> None:

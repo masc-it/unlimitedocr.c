@@ -22,7 +22,7 @@ extern "C" {
 
 #define UOCR_VERSION_MAJOR 0u
 #define UOCR_VERSION_MINOR 1u
-#define UOCR_VERSION_PATCH 0u
+#define UOCR_VERSION_PATCH 2u
 #define UOCR_ABI_VERSION ((UOCR_VERSION_MAJOR << 16) | (UOCR_VERSION_MINOR << 8) | UOCR_VERSION_PATCH)
 
 typedef struct uocr_engine uocr_engine;
@@ -51,13 +51,27 @@ typedef enum uocr_memory_category {
     UOCR_MEMORY_MODEL_VIEWS = 0,
     UOCR_MEMORY_KV_CACHE = 1,
     UOCR_MEMORY_PROMPT_EMBEDDINGS = 2,
-    UOCR_MEMORY_VISION_SCRATCH = 3,
-    UOCR_MEMORY_DECODER_SCRATCH = 4,
-    UOCR_MEMORY_MOE_SCRATCH = 5,
-    UOCR_MEMORY_LOGITS_READBACK = 6,
-    UOCR_MEMORY_TRANSIENT_BUFFERS = 7,
-    UOCR_MEMORY_CATEGORY_COUNT = 8
+    UOCR_MEMORY_VISION_GPU_WORKSPACE = 3,
+    UOCR_MEMORY_VISION_FINAL_FEATURES = 4,
+    UOCR_MEMORY_VISION_HOST_STAGING = 5,
+    UOCR_MEMORY_DECODER_SCRATCH = 6,
+    UOCR_MEMORY_MOE_SCRATCH = 7,
+    UOCR_MEMORY_LOGITS_READBACK = 8,
+    UOCR_MEMORY_TRANSIENT_BUFFERS = 9,
+    UOCR_MEMORY_CATEGORY_COUNT = 10,
+    UOCR_MEMORY_VISION_SCRATCH = UOCR_MEMORY_VISION_GPU_WORKSPACE
 } uocr_memory_category;
+
+#define UOCR_PROFILE_EVENT_NAME_SIZE 64u
+#define UOCR_PROFILE_MAX_EVENTS 256u
+
+typedef struct uocr_profile_event {
+    char name[UOCR_PROFILE_EVENT_NAME_SIZE];
+    uint64_t calls;
+    double total_ms;
+    double min_ms;
+    double max_ms;
+} uocr_profile_event;
 
 typedef struct uocr_memory_report {
     uint64_t category_live_bytes[UOCR_MEMORY_CATEGORY_COUNT];
@@ -68,6 +82,9 @@ typedef struct uocr_memory_report {
     uint64_t estimated_kv_cache_bytes;
     uint64_t estimated_prompt_embeddings_bytes;
     uint64_t estimated_vision_scratch_bytes;
+    uint64_t estimated_vision_gpu_workspace_bytes;
+    uint64_t estimated_vision_final_features_bytes;
+    uint64_t estimated_vision_host_staging_bytes;
     uint64_t estimated_decoder_scratch_bytes;
     uint64_t estimated_moe_scratch_bytes;
     uint64_t estimated_logits_readback_bytes;
@@ -76,7 +93,28 @@ typedef struct uocr_memory_report {
     uint64_t estimated_total_bytes;
     uint64_t memory_budget_bytes;
     uint64_t recommended_working_set_bytes;
+    uint64_t vision_workspace_capacity_bytes;
+    uint64_t vision_workspace_high_watermark_bytes;
 } uocr_memory_report;
+
+typedef struct uocr_profile_report {
+    uint32_t enabled;
+    uint32_t event_count;
+    uint32_t dropped_event_count;
+    uint32_t reserved0;
+    uint64_t generation_index;
+    uocr_profile_event events[UOCR_PROFILE_MAX_EVENTS];
+    uint64_t metal_buffer_allocation_count;
+    uint64_t metal_buffer_allocation_bytes;
+    uint64_t metal_command_buffer_count;
+    uint64_t metal_command_encoder_count;
+    uint64_t metal_command_buffer_wait_count;
+    uint64_t metal_mps_descriptor_count;
+    uint64_t metal_mps_ndarray_count;
+    uint64_t metal_nsarray_count;
+    uint64_t metal_transient_retain_object_count;
+    uocr_memory_report memory;
+} uocr_profile_report;
 
 typedef struct uocr_image_view {
     const void *pixels;          /* contiguous [3,H,W], normalized to [-1,1] */
@@ -109,6 +147,8 @@ typedef struct uocr_engine_opts {
     uint32_t max_batch;          /* 0 = default */
     uint32_t max_prompt_tokens;  /* 0 = default */
     uint32_t max_gen_tokens;     /* 0 = default */
+    uint32_t profile;            /* non-zero enables profiling; UOCR_PROFILE=1 also enables it */
+    uint32_t reserved0;
     uint64_t memory_budget_bytes;/* 0 = backend default */
 } uocr_engine_opts;
 
@@ -121,6 +161,8 @@ UOCR_API const char *uocr_last_error(const uocr_engine *engine);
 UOCR_API const char *uocr_engine_backend(const uocr_engine *engine);
 UOCR_API const char *uocr_memory_category_name(uocr_memory_category category);
 UOCR_API int uocr_engine_memory_report(const uocr_engine *engine, uocr_memory_report *out_report);
+UOCR_API int uocr_engine_profile_report(const uocr_engine *engine, uocr_profile_report *out_report);
+UOCR_API int uocr_engine_profile_reset(uocr_engine *engine);
 
 UOCR_API int uocr_generate_prepared(uocr_engine *engine,
                                     const uocr_prepared_request *requests,

@@ -1,6 +1,8 @@
 #include "model/uocr_model_file.h"
 
 #include "core/uocr_alloc.h"
+#include "model/uocr_tensor_registry.h"
+#include "quant/uocr_quant.h"
 
 #include <errno.h>
 #include <stdarg.h>
@@ -110,6 +112,44 @@ const char *uocr_tensor_qtype_name(uint32_t qtype) {
     }
 }
 
+const char *uocr_tensor_qtype_reason_name(uint32_t reason) {
+    switch (reason) {
+        case UOCR_TENSOR_QTYPE_REASON_UNKNOWN:
+            return "unknown";
+        case UOCR_TENSOR_QTYPE_REASON_FP16_BASELINE:
+            return "fp16-baseline";
+        case UOCR_TENSOR_QTYPE_REASON_POLICY:
+            return "policy";
+        case UOCR_TENSOR_QTYPE_REASON_SENSITIVE:
+            return "sensitive";
+        case UOCR_TENSOR_QTYPE_REASON_UNALIGNED:
+            return "unaligned";
+        case UOCR_TENSOR_QTYPE_REASON_CALIBRATION_DRIFT:
+            return "calibration-drift";
+        case UOCR_TENSOR_QTYPE_REASON_MANUAL_OVERRIDE:
+            return "manual-override";
+        default:
+            return "unknown";
+    }
+}
+
+const char *uocr_tensor_promotion_reason_name(uint32_t reason) {
+    switch (reason) {
+        case UOCR_TENSOR_PROMOTION_NONE:
+            return "none";
+        case UOCR_TENSOR_PROMOTION_SENSITIVE:
+            return "sensitive";
+        case UOCR_TENSOR_PROMOTION_UNALIGNED:
+            return "unaligned";
+        case UOCR_TENSOR_PROMOTION_CALIBRATION_DRIFT:
+            return "calibration-drift";
+        case UOCR_TENSOR_PROMOTION_MANUAL_OVERRIDE:
+            return "manual-override";
+        default:
+            return "unknown";
+    }
+}
+
 const char *uocr_tensor_usage_name(uint32_t usage) {
     switch (usage) {
         case UOCR_TENSOR_USAGE_RUNTIME:
@@ -189,6 +229,113 @@ const uocr_tensor_entry *uocr_model_file_find_tensor(const uocr_model_file *file
         }
     }
     return NULL;
+}
+
+int uocr_model_file_validate_full_fp16_accounting(const uocr_model_file *file, char *error, size_t error_size) {
+    if (file == NULL || file->header == NULL || file->provenance == NULL || file->tensors == NULL) {
+        return fail(error, error_size, "full fp16 accounting requires a loaded model with provenance and tensor directory");
+    }
+    if (file->header->qprofile != UOCR_QPROFILE_FP16 || file->provenance->qprofile != UOCR_QPROFILE_FP16) {
+        return fail(error,
+                    error_size,
+                    "full fp16 accounting requires qprofile fp16, got header=%u provenance=%u",
+                    file->header->qprofile,
+                    file->provenance->qprofile);
+    }
+    if (file->provenance->source_tensor_count != UOCR_SOURCE_TENSOR_COUNT) {
+        return fail(error,
+                    error_size,
+                    "full fp16 source tensor count mismatch: got %u expected %u",
+                    file->provenance->source_tensor_count,
+                    UOCR_SOURCE_TENSOR_COUNT);
+    }
+    if (file->tensor_count != UOCR_SOURCE_TENSOR_COUNT) {
+        return fail(error,
+                    error_size,
+                    "full fp16 tensor directory count mismatch: got %u expected %u",
+                    file->tensor_count,
+                    UOCR_SOURCE_TENSOR_COUNT);
+    }
+    if (file->provenance->runtime_tensor_count != UOCR_FP16_RUNTIME_TENSOR_COUNT ||
+        file->provenance->preserved_unused_tensor_count != UOCR_FP16_PRESERVED_UNUSED_TENSOR_COUNT ||
+        file->provenance->omitted_tensor_count != UOCR_FP16_OMITTED_TENSOR_COUNT) {
+        return fail(error,
+                    error_size,
+                    "full fp16 usage accounting mismatch: runtime=%u preserved-unused=%u omitted=%u expected=%u/%u/%u",
+                    file->provenance->runtime_tensor_count,
+                    file->provenance->preserved_unused_tensor_count,
+                    file->provenance->omitted_tensor_count,
+                    UOCR_FP16_RUNTIME_TENSOR_COUNT,
+                    UOCR_FP16_PRESERVED_UNUSED_TENSOR_COUNT,
+                    UOCR_FP16_OMITTED_TENSOR_COUNT);
+    }
+
+    const uocr_section_entry *tensor_data = uocr_model_file_find_section(file, UOCR_SECTION_TENSOR_DATA);
+    if (tensor_data == NULL) {
+        return fail(error, error_size, "full fp16 accounting requires a tensor-data section");
+    }
+    if (tensor_data->size != UOCR_FP16_TENSOR_PAYLOAD_BYTES) {
+        return fail(error,
+                    error_size,
+                    "full fp16 tensor-data byte mismatch: got %llu expected %llu",
+                    (unsigned long long)tensor_data->size,
+                    (unsigned long long)UOCR_FP16_TENSOR_PAYLOAD_BYTES);
+    }
+
+    uint32_t runtime = 0u;
+    uint32_t preserved = 0u;
+    uint32_t omitted = 0u;
+    uint64_t payload_bytes = 0u;
+    const uocr_tensor_entry *preserved_tensor = NULL;
+    for (uint32_t i = 0u; i < file->tensor_count; ++i) {
+        const uocr_tensor_entry *tensor = &file->tensors[i];
+        if (tensor->qtype != UOCR_TENSOR_F16) {
+            return fail(error,
+                        error_size,
+                        "full fp16 tensor %u id=%u has non-fp16 qtype %u",
+                        i,
+                        tensor->id,
+                        tensor->qtype);
+        }
+        if (tensor->usage == UOCR_TENSOR_USAGE_RUNTIME) {
+            ++runtime;
+        } else if (tensor->usage == UOCR_TENSOR_USAGE_PRESERVED_UNUSED) {
+            ++preserved;
+            preserved_tensor = tensor;
+        } else if (tensor->usage == UOCR_TENSOR_USAGE_OMITTED_WITH_REASON) {
+            ++omitted;
+        } else {
+            return fail(error, error_size, "full fp16 tensor %u id=%u has unknown usage %u", i, tensor->id, tensor->usage);
+        }
+        payload_bytes += tensor->payload_size;
+    }
+    if (runtime != UOCR_FP16_RUNTIME_TENSOR_COUNT || preserved != UOCR_FP16_PRESERVED_UNUSED_TENSOR_COUNT ||
+        omitted != UOCR_FP16_OMITTED_TENSOR_COUNT) {
+        return fail(error,
+                    error_size,
+                    "full fp16 tensor usage count mismatch: runtime=%u preserved-unused=%u omitted=%u expected=%u/%u/%u",
+                    runtime,
+                    preserved,
+                    omitted,
+                    UOCR_FP16_RUNTIME_TENSOR_COUNT,
+                    UOCR_FP16_PRESERVED_UNUSED_TENSOR_COUNT,
+                    UOCR_FP16_OMITTED_TENSOR_COUNT);
+    }
+    if (payload_bytes != UOCR_FP16_TENSOR_PAYLOAD_BYTES) {
+        return fail(error,
+                    error_size,
+                    "full fp16 tensor payload byte mismatch: got %llu expected %llu",
+                    (unsigned long long)payload_bytes,
+                    (unsigned long long)UOCR_FP16_TENSOR_PAYLOAD_BYTES);
+    }
+    if (preserved_tensor == NULL || preserved_tensor->id != UOCR_TENSOR_ID_VISION_CLIP_UNUSED_PATCH_EMBED_WEIGHT ||
+        preserved_tensor->family != UOCR_TENSOR_FAMILY_VISION_CLIP) {
+        return fail(error,
+                    error_size,
+                    "full fp16 preserved-unused tensor mismatch: expected CLIP patch embedding id %u",
+                    UOCR_TENSOR_ID_VISION_CLIP_UNUSED_PATCH_EMBED_WEIGHT);
+    }
+    return 0;
 }
 
 static int validate_config(const uocr_config_record *cfg, char *error, size_t error_size) {
@@ -390,17 +537,6 @@ static int validate_provenance(const uint8_t *bytes,
     return 0;
 }
 
-static uint64_t tensor_shape_elements(const uint32_t shape[UOCR_TENSOR_MAX_DIMS], uint32_t rank) {
-    uint64_t elements = 1u;
-    for (uint32_t i = 0u; i < rank; ++i) {
-        if (shape[i] == 0u || elements > UINT64_MAX / shape[i]) {
-            return 0u;
-        }
-        elements *= shape[i];
-    }
-    return elements;
-}
-
 static int validate_tensor_directory(const uint8_t *bytes,
                                      size_t file_size,
                                      const uocr_section_entry *directory_section,
@@ -472,6 +608,14 @@ static int validate_tensor_directory(const uint8_t *bytes,
         if (tensor->rank > UOCR_TENSOR_MAX_DIMS) {
             return fail(error, error_size, "tensor entry %u rank %u exceeds limit", i, tensor->rank);
         }
+        const uint32_t known_tensor_flags = UOCR_TENSOR_FLAG_ROW_MAJOR | UOCR_TENSOR_FLAG_TRANSPOSED |
+                                            UOCR_TENSOR_FLAG_FLATTENED_LEADING_DIM;
+        if ((tensor->flags & ~known_tensor_flags) != 0u) {
+            return fail(error, error_size, "tensor entry %u has unknown flags 0x%x", i, tensor->flags);
+        }
+        if ((tensor->flags & UOCR_TENSOR_FLAG_TRANSPOSED) != 0u) {
+            return fail(error, error_size, "tensor entry %u requests unsupported transposed layout", i);
+        }
         if (tensor->usage == UOCR_TENSOR_USAGE_OMITTED_WITH_REASON) {
             if (tensor->payload_offset != 0u || tensor->payload_size != 0u) {
                 return fail(error, error_size, "omitted tensor entry %u has payload bytes", i);
@@ -481,11 +625,12 @@ static int validate_tensor_directory(const uint8_t *bytes,
         if (tensor->usage != UOCR_TENSOR_USAGE_RUNTIME && tensor->usage != UOCR_TENSOR_USAGE_PRESERVED_UNUSED) {
             return fail(error, error_size, "tensor entry %u has unknown usage %u", i, tensor->usage);
         }
-        if (tensor->qtype != UOCR_TENSOR_F16 && tensor->qtype != UOCR_TENSOR_F32 &&
-            tensor->qtype != UOCR_TENSOR_Q8_0 && tensor->qtype != UOCR_TENSOR_Q4_K &&
-            tensor->qtype != UOCR_TENSOR_PADDED_Q4_K && tensor->qtype != UOCR_TENSOR_Q2_K &&
-            tensor->qtype != UOCR_TENSOR_IQ2_XXS) {
+        uocr_quant_type_info qtype_info;
+        if (!uocr_quant_get_type_info(tensor->qtype, &qtype_info)) {
             return fail(error, error_size, "tensor entry %u has unknown qtype %u", i, tensor->qtype);
+        }
+        if (!uocr_quant_is_enabled(tensor->qtype)) {
+            return fail(error, error_size, "tensor entry %u qtype %s is disabled", i, qtype_info.name);
         }
         if (tensor_data_section == NULL) {
             return fail(error, error_size, "tensor entry %u has payload but tensor-data section is missing", i);
@@ -501,21 +646,13 @@ static int validate_tensor_directory(const uint8_t *bytes,
                         (unsigned long long)tensor->payload_offset,
                         UOCR_TENSOR_PAYLOAD_ALIGNMENT);
         }
-        if (tensor->qtype == UOCR_TENSOR_F16 || tensor->qtype == UOCR_TENSOR_F32) {
-            const uint64_t elements = tensor_shape_elements(tensor->physical_shape, tensor->rank);
-            const uint64_t element_bytes = tensor->qtype == UOCR_TENSOR_F16 ? 2u : 4u;
-            if (elements == 0u || elements > UINT64_MAX / element_bytes) {
-                return fail(error, error_size, "tensor entry %u has invalid physical shape", i);
-            }
-            const uint64_t expected_payload_size = elements * element_bytes;
-            if (tensor->payload_size != expected_payload_size) {
-                return fail(error,
-                            error_size,
-                            "tensor entry %u payload size mismatch: got %llu expected %llu",
-                            i,
-                            (unsigned long long)tensor->payload_size,
-                            (unsigned long long)expected_payload_size);
-            }
+        char quant_error[256];
+        if (!uocr_quant_validate_tensor_entry(tensor, quant_error, sizeof(quant_error))) {
+            return fail(error,
+                        error_size,
+                        "tensor entry %u quantization metadata invalid: %s",
+                        i,
+                        quant_error);
         }
         if (!checked_range(tensor->payload_offset, tensor->payload_size, file_size)) {
             return fail(error, error_size, "tensor entry %u payload is out of range", i);

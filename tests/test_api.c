@@ -1,5 +1,6 @@
 #include "unlimitedocr.h"
 
+#include "model/uocr_constants.h"
 #include "model/uocr_format.h"
 #include "runtime/uocr_memory.h"
 #include "runtime/uocr_vision.h"
@@ -197,10 +198,10 @@ static int test_engine_memory_report(void) {
     CHECK(report.total_live_bytes == 0u);
     CHECK(report.estimated_kv_cache_bytes > 0u);
     CHECK(report.estimated_prompt_embeddings_bytes == 16u * 1280u * 2u);
-    CHECK(report.estimated_vision_scratch_bytes > 0u);
+    CHECK(report.estimated_vision_scratch_bytes == 0u);
     CHECK(report.estimated_decoder_scratch_bytes > 0u);
     CHECK(report.estimated_moe_scratch_bytes > 0u);
-    CHECK(report.estimated_logits_readback_bytes == 129280u * 4u + 4u);
+    CHECK(report.estimated_logits_readback_bytes == sizeof(int32_t) + sizeof(float));
     CHECK(report.estimated_safety_margin_bytes > 0u);
     CHECK(report.estimated_total_bytes == report.estimated_kv_cache_bytes +
                                             report.estimated_prompt_embeddings_bytes +
@@ -268,7 +269,18 @@ static int test_engine_rejects_model_over_budget(void) {
 
     uocr_engine *engine = uocr_engine_open(&opts);
     CHECK(engine == NULL);
-    CHECK(strstr(uocr_last_error(NULL), "tensor-data view estimate") != NULL);
+    const char *error = uocr_last_error(NULL);
+    CHECK(strstr(error, "engine admission rejected") != NULL);
+    CHECK(strstr(error, "exceeds budget") != NULL);
+    CHECK(strstr(error, "model=") != NULL);
+    CHECK(strstr(error, "kv=") != NULL);
+    CHECK(strstr(error, "prompt=") != NULL);
+    CHECK(strstr(error, "vision=") != NULL);
+    CHECK(strstr(error, "decoder=") != NULL);
+    CHECK(strstr(error, "moe=") != NULL);
+    CHECK(strstr(error, "logits=") != NULL);
+    CHECK(strstr(error, "transient=") != NULL);
+    CHECK(strstr(error, "safety=") != NULL);
     unlink(path);
     return 0;
 }
@@ -336,7 +348,17 @@ static int test_memory_budget_rejects_request(void) {
     const int status = uocr_generate_prepared(engine, &req, 1, &result);
     CHECK(status == UOCR_ERROR_OUT_OF_MEMORY);
     CHECK(result == NULL);
-    CHECK(strstr(uocr_last_error(engine), "exceeds budget") != NULL);
+    const char *error = uocr_last_error(engine);
+    CHECK(strstr(error, "request admission rejected") != NULL);
+    CHECK(strstr(error, "exceeds budget") != NULL);
+    CHECK(strstr(error, "model=") != NULL);
+    CHECK(strstr(error, "kv=") != NULL);
+    CHECK(strstr(error, "prompt=") != NULL);
+    CHECK(strstr(error, "vision=") != NULL);
+    CHECK(strstr(error, "decoder=") != NULL);
+    CHECK(strstr(error, "moe=") != NULL);
+    CHECK(strstr(error, "logits=") != NULL);
+    CHECK(strstr(error, "safety=") != NULL);
 
     uocr_memory_report report;
     memset(&report, 0, sizeof(report));
@@ -635,6 +657,44 @@ static int test_request_validation_rejects_bad_no_repeat_config(void) {
     return 0;
 }
 
+static int test_request_validation_rejects_sequence_position_overflow(void) {
+    uocr_engine_opts opts;
+    memset(&opts, 0, sizeof(opts));
+    opts.backend = "cpu-ref";
+    opts.max_batch = 1;
+    opts.max_prompt_tokens = 16;
+    opts.max_gen_tokens = UOCR_MAX_POSITIONS;
+
+    uocr_engine *engine = uocr_engine_open(&opts);
+    CHECK(engine != NULL);
+
+    const int32_t input_ids[] = {0, 42};
+    const uint8_t image_mask[] = {0, 0};
+    uocr_prepared_request req;
+    memset(&req, 0, sizeof(req));
+    req.input_ids = input_ids;
+    req.image_mask = image_mask;
+    req.n_tokens = 2;
+    req.crop_grid_w = 1;
+    req.crop_grid_h = 1;
+    req.max_new_tokens = UOCR_MAX_POSITIONS - 1u;
+
+    uocr_result *result = NULL;
+    int status = uocr_generate_prepared(engine, &req, 1, &result);
+    CHECK(status == UOCR_ERROR_INVALID_ARGUMENT);
+    CHECK(result == NULL);
+    CHECK(strstr(uocr_last_error(engine), "position budget") != NULL);
+
+    req.max_new_tokens = UOCR_MAX_POSITIONS - 2u;
+    status = uocr_generate_prepared(engine, &req, 1, &result);
+    CHECK(status == UOCR_ERROR_NOT_IMPLEMENTED);
+    CHECK(result == NULL);
+    CHECK(strstr(uocr_last_error(engine), "inference kernels") != NULL);
+
+    uocr_engine_close(engine);
+    return 0;
+}
+
 static int test_request_validation_rejects_bad_bos(void) {
     uocr_engine_opts opts;
     memset(&opts, 0, sizeof(opts));
@@ -682,6 +742,7 @@ int main(void) {
     if (test_request_validation_rejects_bad_visual_count() != 0) return 1;
     if (test_request_validation_accepts_upstream_no_repeat_defaults() != 0) return 1;
     if (test_request_validation_rejects_bad_no_repeat_config() != 0) return 1;
+    if (test_request_validation_rejects_sequence_position_overflow() != 0) return 1;
     if (test_request_validation_rejects_bad_bos() != 0) return 1;
     return 0;
 }

@@ -1,0 +1,10 @@
+#!/usr/bin/env python3
+"""Compare q8/q4 decoder layer dumps against fp16 golden dumps."""
+
+from __future__ import annotations
+
+from unlimitedocr_c.drift import main
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -6,7 +6,18 @@
 
 #include "model/uocr_model_file.h"
 #include "runtime/uocr_logits_processor.h"
+#include "runtime/uocr_memory.h"
+#include "runtime/uocr_profile.h"
 #include "unlimitedocr.h"
+
+/* Diagnostic CPU-pointer helpers allocate/copy/wait/read back for parity and
+ * probes. Production translation units must not see those prototypes unless
+ * they explicitly opt in, which keeps public OCR dispatch on integrated
+ * GPU-resident entry points.
+ */
+#ifndef UOCR_METAL_ENABLE_DIAGNOSTIC_API
+#define UOCR_METAL_ENABLE_DIAGNOSTIC_API 0
+#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -131,13 +142,83 @@ uint64_t uocr_metal_default_memory_budget_bytes(uint64_t recommended_working_set
 
 uocr_metal_context *uocr_metal_context_create(const char *resource_path, char *error, size_t error_size);
 void uocr_metal_context_destroy(uocr_metal_context *ctx);
+void uocr_metal_context_set_profile(uocr_metal_context *ctx, uocr_profile_state *profile);
+void uocr_metal_context_set_memory_tracker(uocr_metal_context *ctx, uocr_memory_tracker *memory_tracker);
 
 int uocr_metal_context_map_model(uocr_metal_context *ctx, const uocr_model_file *model, char *error, size_t error_size);
 void uocr_metal_context_unmap_model(uocr_metal_context *ctx);
 uint32_t uocr_metal_context_model_view_count(const uocr_metal_context *ctx);
 uint32_t uocr_metal_context_tensor_binding_count(const uocr_metal_context *ctx);
+uint32_t uocr_metal_context_library_function_count(const uocr_metal_context *ctx);
+uint32_t uocr_metal_context_pipeline_cache_count(const uocr_metal_context *ctx);
+int uocr_metal_context_compile_all_pipelines(uocr_metal_context *ctx,
+                                             uint32_t *out_pipeline_count,
+                                             char *error,
+                                             size_t error_size);
 uint32_t uocr_metal_context_decoder_binding_count(const uocr_metal_context *ctx);
 int uocr_metal_context_decoder_bindings_ready(const uocr_metal_context *ctx);
+uint32_t uocr_metal_context_vision_binding_count(const uocr_metal_context *ctx);
+int uocr_metal_context_vision_bindings_ready(const uocr_metal_context *ctx);
+const char *uocr_metal_context_vision_binding_error(const uocr_metal_context *ctx);
+
+#if UOCR_METAL_ENABLE_DIAGNOSTIC_API
+/* Diagnostic final-visual parity boundary. Production public OCR must call
+ * uocr_metal_context_generate_image_f16() so final visual rows stay in the
+ * reusable Metal vision workspace and are spliced directly into the prompt
+ * arena. This helper runs the same GPU-resident vision graph, then performs a
+ * synchronous host copy of [out_visual_rows,1280] solely for opt-in parity and
+ * probe code. max_views_per_chunk==0 means one view per chunk.
+ */
+int uocr_metal_context_diagnostic_encode_visual_features_f16(uocr_metal_context *ctx,
+                                                  const uocr_prepared_request *request,
+                                                  uint32_t max_views_per_chunk,
+                                                  uint16_t *out_visual_features_f16,
+                                                  uint32_t out_visual_rows,
+                                                  char *error,
+                                                  size_t error_size);
+
+/* Diagnostic SAM-stage parity boundary. Runs the same SAM path used by
+ * production vision for one public preprocessed view and writes the
+ * upstream sam_model(view) output without batch dimension as fp16 NCHW
+ * [1024,out_grid_h,out_grid_w]. This is intentionally internal/opt-in test
+ * surface, not a stable public OCR API.
+ */
+int uocr_metal_context_diagnostic_encode_sam_features_f16(uocr_metal_context *ctx,
+                                               const uocr_image_view *view,
+                                               uint16_t *out_sam_features_f16,
+                                               uint32_t out_grid_w,
+                                               uint32_t out_grid_h,
+                                               char *error,
+                                               size_t error_size);
+
+/* Diagnostic CLIP-stage parity boundary. Runs the same SAM+CLIP path used by
+ * production vision for one public preprocessed view and writes the upstream
+ * vision_model(view, sam_features) output without batch dimension as fp16
+ * [out_token_count,1024], including the leading class token. This is
+ * intentionally internal/opt-in test
+ * surface, not a stable public OCR API.
+ */
+int uocr_metal_context_diagnostic_encode_clip_features_f16(uocr_metal_context *ctx,
+                                                const uocr_image_view *view,
+                                                uint16_t *out_clip_features_f16,
+                                                uint32_t out_token_count,
+                                                char *error,
+                                                size_t error_size);
+
+/* Diagnostic projector-stage parity boundary. Runs the same SAM+CLIP+
+ * projector path used by production vision for one public preprocessed view
+ * and writes the upstream per-view projector output without batch dimension as
+ * fp16 [out_projected_rows,1280], before newline/view-separator formatting.
+ * This is intentionally internal/opt-in test surface, not a stable public OCR API.
+ */
+int uocr_metal_context_diagnostic_encode_projected_features_f16(uocr_metal_context *ctx,
+                                                     const uocr_image_view *view,
+                                                     uint16_t *out_projected_features_f16,
+                                                     uint32_t out_projected_rows,
+                                                     char *error,
+                                                     size_t error_size);
+#endif /* UOCR_METAL_ENABLE_DIAGNOSTIC_API */
+
 uint64_t uocr_metal_context_model_view_bytes(const uocr_metal_context *ctx);
 int uocr_metal_context_get_model_view_info(const uocr_metal_context *ctx,
                                            uint32_t view_index,
@@ -173,6 +254,8 @@ void uocr_metal_context_release_runtime_arenas(uocr_metal_context *ctx);
 uint64_t uocr_metal_context_runtime_arena_capacity(const uocr_metal_context *ctx,
                                                    uocr_metal_runtime_arena_slot slot);
 uint64_t uocr_metal_context_total_runtime_arena_capacity(const uocr_metal_context *ctx);
+uint32_t uocr_metal_context_runtime_arena_batch_slots(const uocr_metal_context *ctx);
+uint32_t uocr_metal_context_runtime_arena_prompt_token_capacity(const uocr_metal_context *ctx);
 int uocr_metal_context_get_kv_cache_layout(const uocr_metal_context *ctx,
                                            uocr_metal_kv_cache_layout *out_layout);
 int uocr_metal_kv_cache_offset(const uocr_metal_kv_cache_layout *layout,
@@ -218,11 +301,25 @@ int uocr_metal_context_generate_f16(uocr_metal_context *ctx,
                                     char *error,
                                     size_t error_size);
 
+/* Production public-image fp16 orchestration. Encodes vision rows into the
+ * reusable Metal vision workspace, then splices that Metal slice directly into
+ * the prompt arena before decoder prefill/decode. This avoids the old public
+ * image path's host visual-feature allocation and prompt re-upload.
+ */
+int uocr_metal_context_generate_image_f16(uocr_metal_context *ctx,
+                                          const uocr_prepared_request *request,
+                                          uint32_t max_views_per_chunk,
+                                          uint32_t slot,
+                                          uocr_metal_decoder_result_f16 *result,
+                                          char *error,
+                                          size_t error_size);
+
+#if UOCR_METAL_ENABLE_DIAGNOSTIC_API
 /* Diagnostic get-rows entry point used by synthetic tests. Runtime prompt
  * assembly should bind mmap-backed model buffers directly and reuse the same
  * kernels without uploading the embedding table through this helper.
  */
-int uocr_metal_context_get_rows_f16(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_get_rows_f16(uocr_metal_context *ctx,
                                     const uint16_t *table_f16,
                                     uint32_t table_rows,
                                     uint32_t row_width,
@@ -233,11 +330,28 @@ int uocr_metal_context_get_rows_f16(uocr_metal_context *ctx,
                                     char *error,
                                     size_t error_size);
 
+/* Diagnostic Q8_0 get-rows/dequant entry point. The packed table is row-major
+ * `[table_rows][physical_width / 32 blocks]`, with each block using the GGML
+ * Q8_0 layout: f16 scale followed by 32 signed int8 values. Only
+ * logical_width values are returned, so physical_width may be padded.
+ */
+int uocr_metal_context_diagnostic_get_rows_q8_0(uocr_metal_context *ctx,
+                                     const void *table_q8_0,
+                                     uint32_t table_rows,
+                                     uint32_t logical_width,
+                                     uint32_t physical_width,
+                                     const int32_t *row_ids,
+                                     uint32_t n_row_ids,
+                                     uocr_metal_get_rows_output_type output_type,
+                                     void *out,
+                                     char *error,
+                                     size_t error_size);
+
 /* Diagnostic prompt assembly helper for synthetic tests. image_span_start uses
  * UINT32_MAX when there is no image span. Runtime inference should bind the
  * mapped token-embedding tensor directly and write into the prompt arena.
  */
-int uocr_metal_context_assemble_prompt_f16(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_assemble_prompt_f16(uocr_metal_context *ctx,
                                            const uint16_t *embedding_table_f16,
                                            uint32_t table_rows,
                                            uint32_t hidden_size,
@@ -249,6 +363,7 @@ int uocr_metal_context_assemble_prompt_f16(uocr_metal_context *ctx,
                                            uint16_t *out_prompt_f16,
                                            char *error,
                                            size_t error_size);
+#endif /* UOCR_METAL_ENABLE_DIAGNOSTIC_API */
 
 /* Runtime prompt assembly helper. Binds the mmap-backed TOK_EMBED tensor from
  * mapped .uocr model views, uses fixed Unlimited-OCR vocab/hidden sizes, and
@@ -264,12 +379,13 @@ int uocr_metal_context_assemble_prompt_from_model_f16(uocr_metal_context *ctx,
                                                       char *error,
                                                       size_t error_size);
 
+#if UOCR_METAL_ENABLE_DIAGNOSTIC_API
 /* Diagnostic SAM patch-embedding helper for the Metal vision bring-up path.
  * Computes Conv2d weight [768,3,16,16], optional bias [768], stride 16, and
  * writes BHWC fp16 output [height/16,width/16,768], matching upstream
  * PatchEmbed.forward()'s NCHW -> BHWC layout conversion.
  */
-int uocr_metal_context_sam_patch_embed_f16(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_sam_patch_embed_f16(uocr_metal_context *ctx,
                                            const void *pixels,
                                            uocr_pixel_format pixel_format,
                                            uint32_t width,
@@ -287,7 +403,7 @@ int uocr_metal_context_sam_patch_embed_f16(uocr_metal_context *ctx,
  * not 64x64, the position table is resized with get_abs_pos_sam-style bicubic
  * interpolation, antialias=true, align_corners=false semantics.
  */
-int uocr_metal_context_sam_add_abs_pos_f16(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_sam_add_abs_pos_f16(uocr_metal_context *ctx,
                                            const uint16_t *patch_bhwc_f16,
                                            const uint16_t *pos_embed_f16,
                                            uint32_t grid_w,
@@ -300,7 +416,7 @@ int uocr_metal_context_sam_add_abs_pos_f16(uocr_metal_context *ctx,
  * dimension using fp32 mean/variance, applies fp16 weight+bias, and uses the
  * upstream SAM transformer epsilon 1e-6 for hidden size 768.
  */
-int uocr_metal_context_sam_layernorm_f16(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_sam_layernorm_f16(uocr_metal_context *ctx,
                                          const uint16_t *input_f16,
                                          const uint16_t *weight_f16,
                                          const uint16_t *bias_f16,
@@ -315,7 +431,7 @@ int uocr_metal_context_sam_layernorm_f16(uocr_metal_context *ctx,
  * writes separate Q/K/V tensors laid out [n_rows,12,64]. Dot products are
  * accumulated in fp32 before casting to the requested output type.
  */
-int uocr_metal_context_sam_qkv_f16(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_sam_qkv_f16(uocr_metal_context *ctx,
                                    const uint16_t *input_f16,
                                    const uint16_t *qkv_weight_f16,
                                    const uint16_t *qkv_bias_f16,
@@ -333,7 +449,7 @@ int uocr_metal_context_sam_qkv_f16(uocr_metal_context *ctx,
  * grid_h/grid_w are not multiples of 14. The padded dimensions and window
  * count are returned for block wiring and parity checks.
  */
-int uocr_metal_context_sam_window_partition_f16(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_sam_window_partition_f16(uocr_metal_context *ctx,
                                                 const uint16_t *input_bhwc_f16,
                                                 uint32_t grid_w,
                                                 uint32_t grid_h,
@@ -348,7 +464,7 @@ int uocr_metal_context_sam_window_partition_f16(uocr_metal_context *ctx,
  * using upstream window_unpartition() semantics and crops away bottom/right
  * padding, returning BHWC fp16 [grid_h,grid_w,768].
  */
-int uocr_metal_context_sam_window_unpartition_f16(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_sam_window_unpartition_f16(uocr_metal_context *ctx,
                                                   const uint16_t *windows_f16,
                                                   uint32_t grid_w,
                                                   uint32_t grid_h,
@@ -361,7 +477,7 @@ int uocr_metal_context_sam_window_unpartition_f16(uocr_metal_context *ctx,
  * [256,768,1,1] with no bias, accumulates in fp32, and writes NCHW output
  * [256,grid_h,grid_w] for the following LayerNorm2d/3x3 neck stages.
  */
-int uocr_metal_context_sam_neck_conv1x1_f16(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_sam_neck_conv1x1_f16(uocr_metal_context *ctx,
                                             const uint16_t *input_bhwc_f16,
                                             const uint16_t *weight_f16,
                                             uint32_t grid_w,
@@ -375,7 +491,7 @@ int uocr_metal_context_sam_neck_conv1x1_f16(uocr_metal_context *ctx,
  * [256,grid_h,grid_w], applies Conv2d weight [256,256,3,3] with padding=1,
  * stride=1, no bias, accumulates in fp32, and emits NCHW output.
  */
-int uocr_metal_context_sam_neck_conv3x3_f16(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_sam_neck_conv3x3_f16(uocr_metal_context *ctx,
                                             const uint16_t *input_nchw_f16,
                                             const uint16_t *weight_f16,
                                             uint32_t grid_w,
@@ -390,7 +506,7 @@ int uocr_metal_context_sam_neck_conv3x3_f16(uocr_metal_context *ctx,
  * for each spatial location, applies fp16 weight+bias [256], uses eps=1e-6,
  * and emits NCHW output.
  */
-int uocr_metal_context_sam_layernorm2d_f16(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_sam_layernorm2d_f16(uocr_metal_context *ctx,
                                            const uint16_t *input_nchw_f16,
                                            const uint16_t *weight_f16,
                                            const uint16_t *bias_f16,
@@ -406,7 +522,7 @@ int uocr_metal_context_sam_layernorm2d_f16(uocr_metal_context *ctx,
  * stride=2, no bias, accumulates in fp32, and emits NCHW output
  * [512,ceil(grid_h/2),ceil(grid_w/2)].
  */
-int uocr_metal_context_sam_net2_conv3x3_stride2_f16(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_sam_net2_conv3x3_stride2_f16(uocr_metal_context *ctx,
                                                     const uint16_t *input_nchw_f16,
                                                     const uint16_t *weight_f16,
                                                     uint32_t grid_w,
@@ -421,7 +537,7 @@ int uocr_metal_context_sam_net2_conv3x3_stride2_f16(uocr_metal_context *ctx,
  * stride=2, no bias, accumulates in fp32, and emits NCHW output
  * [1024,ceil(grid_h/2),ceil(grid_w/2)].
  */
-int uocr_metal_context_sam_net3_conv3x3_stride2_f16(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_sam_net3_conv3x3_stride2_f16(uocr_metal_context *ctx,
                                                     const uint16_t *input_nchw_f16,
                                                     const uint16_t *weight_f16,
                                                     uint32_t grid_w,
@@ -472,7 +588,7 @@ typedef struct uocr_metal_sam_transformer_block_f16 {
  * blocks run rel-pos attention over the full grid. Internal activations are
  * kept fp16 for the current Metal vision bring-up path.
  */
-int uocr_metal_context_sam_transformer_block_f16(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_sam_transformer_block_f16(uocr_metal_context *ctx,
                                                  const uint16_t *input_bhwc_f16,
                                                  const uocr_metal_sam_transformer_block_f16 *block,
                                                  uint32_t grid_w,
@@ -487,7 +603,7 @@ int uocr_metal_context_sam_transformer_block_f16(uocr_metal_context *ctx,
  * UOCR_SAM_BLOCKS entries in layer order; global attention is selected for
  * blocks 2, 5, 8, and 11.
  */
-int uocr_metal_context_sam_transformer_f16(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_sam_transformer_f16(uocr_metal_context *ctx,
                                            const uint16_t *input_bhwc_f16,
                                            const uocr_metal_sam_transformer_block_f16 *blocks,
                                            uint32_t block_count,
@@ -504,7 +620,7 @@ int uocr_metal_context_sam_transformer_f16(uocr_metal_context *ctx,
  * token-major [1 + grid_h*grid_w,1024] embeddings. This deliberately does not
  * use the raw-pixel CLIP patch_embedding weights.
  */
-int uocr_metal_context_clip_embed_sam_f16(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_clip_embed_sam_f16(uocr_metal_context *ctx,
                                           const uint16_t *sam_nchw_f16,
                                           const uint16_t *class_embedding_f16,
                                           uint32_t grid_w,
@@ -520,7 +636,7 @@ int uocr_metal_context_clip_embed_sam_f16(uocr_metal_context *ctx,
  * source grid with upstream bicubic interpolation, antialias=true, and
  * align_corners=false semantics when the target grid is 10x10.
  */
-int uocr_metal_context_clip_add_abs_pos_f16(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_clip_add_abs_pos_f16(uocr_metal_context *ctx,
                                             const uint16_t *tokens_f16,
                                             const uint16_t *pos_embed_f16,
                                             uint32_t grid_w,
@@ -535,7 +651,7 @@ int uocr_metal_context_clip_add_abs_pos_f16(uocr_metal_context *ctx,
  * vision_model.pre_layrnorm, and uses upstream epsilon 1e-5. The supported
  * token counts are 257 (16x16+CLS global view) and 101 (10x10+CLS local crop).
  */
-int uocr_metal_context_clip_pre_layernorm_f16(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_clip_pre_layernorm_f16(uocr_metal_context *ctx,
                                               const uint16_t *input_f16,
                                               const uint16_t *weight_f16,
                                               const uint16_t *bias_f16,
@@ -549,7 +665,7 @@ int uocr_metal_context_clip_pre_layernorm_f16(uocr_metal_context *ctx,
  * each ViT block. It uses the same fp32 mean/variance path as pre-LayerNorm,
  * hidden size 1024, and upstream epsilon 1e-5.
  */
-int uocr_metal_context_clip_layernorm_f16(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_clip_layernorm_f16(uocr_metal_context *ctx,
                                           const uint16_t *input_f16,
                                           const uint16_t *weight_f16,
                                           const uint16_t *bias_f16,
@@ -564,7 +680,7 @@ int uocr_metal_context_clip_layernorm_f16(uocr_metal_context *ctx,
  * writes separate Q/K/V tensors laid out [tokens,16,64]. Dot products are
  * accumulated in fp32 before casting to the requested output type.
  */
-int uocr_metal_context_clip_qkv_f16(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_clip_qkv_f16(uocr_metal_context *ctx,
                                     const uint16_t *input_f16,
                                     const uint16_t *qkv_weight_f16,
                                     const uint16_t *qkv_bias_f16,
@@ -580,7 +696,7 @@ int uocr_metal_context_clip_qkv_f16(uocr_metal_context *ctx,
  * [tokens,16,64]. The helper computes unmasked scaled dot-product attention
  * over all 257 or 101 tokens and writes [tokens,1024].
  */
-int uocr_metal_context_clip_attention_f16(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_clip_attention_f16(uocr_metal_context *ctx,
                                           const uint16_t *q_f16,
                                           const uint16_t *k_f16,
                                           const uint16_t *v_f16,
@@ -594,7 +710,7 @@ int uocr_metal_context_clip_attention_f16(uocr_metal_context *ctx,
  * [1024,1024] out_proj linear over [tokens,1024] attention results for either
  * 257-token global or 101-token local CLIP sequences.
  */
-int uocr_metal_context_clip_output_projection_f16(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_clip_output_projection_f16(uocr_metal_context *ctx,
                                                   const uint16_t *input_f16,
                                                   const uint16_t *weight_f16,
                                                   const uint16_t *bias_f16,
@@ -608,7 +724,7 @@ int uocr_metal_context_clip_output_projection_f16(uocr_metal_context *ctx,
  * [tokens,4096] tensors where tokens is 257 or 101. Computes
  * x * sigmoid(1.702*x) in fp32 before casting to the requested output type.
  */
-int uocr_metal_context_clip_quickgelu_f16(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_clip_quickgelu_f16(uocr_metal_context *ctx,
                                           const uint16_t *input_f16,
                                           uint32_t token_count,
                                           uocr_metal_dense_output_type output_type,
@@ -621,7 +737,7 @@ int uocr_metal_context_clip_quickgelu_f16(uocr_metal_context *ctx,
  * sequences. Intermediate activations are kept in fp16 to match the current
  * Metal fp16 vision bring-up path.
  */
-int uocr_metal_context_clip_mlp_f16(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_clip_mlp_f16(uocr_metal_context *ctx,
                                     const uint16_t *input_f16,
                                     const uint16_t *fc1_weight_f16,
                                     const uint16_t *fc1_bias_f16,
@@ -637,7 +753,7 @@ int uocr_metal_context_clip_mlp_f16(uocr_metal_context *ctx,
  * [tokens,1024] tensors with fp32 arithmetic before casting. Use it for both
  * x + out_proj(attention(norm1(x))) and x + MLP(norm2(x)).
  */
-int uocr_metal_context_clip_residual_add_f16(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_clip_residual_add_f16(uocr_metal_context *ctx,
                                              const uint16_t *base_f16,
                                              const uint16_t *update_f16,
                                              uint32_t token_count,
@@ -650,7 +766,7 @@ int uocr_metal_context_clip_residual_add_f16(uocr_metal_context *ctx,
  * x = x + out_proj(attention(qkv(layer_norm1(x))));
  * x = x + mlp(layer_norm2(x)). Internal block activations are kept fp16.
  */
-int uocr_metal_context_clip_transformer_block_f16(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_clip_transformer_block_f16(uocr_metal_context *ctx,
                                                   const uint16_t *input_f16,
                                                   const uocr_metal_clip_transformer_block_f16 *block,
                                                   uint32_t token_count,
@@ -662,7 +778,7 @@ int uocr_metal_context_clip_transformer_block_f16(uocr_metal_context *ctx,
 /* Diagnostic 24-block CLIP transformer helper for the SAM-output vision path.
  * The blocks array must contain UOCR_CLIP_BLOCKS entries in layer order.
  */
-int uocr_metal_context_clip_transformer_f16(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_clip_transformer_f16(uocr_metal_context *ctx,
                                             const uint16_t *input_f16,
                                             const uocr_metal_clip_transformer_block_f16 *blocks,
                                             uint32_t block_count,
@@ -676,7 +792,7 @@ int uocr_metal_context_clip_transformer_f16(uocr_metal_context *ctx,
  * without CLS and SAM net_3 NCHW feature-map tokens into token-major
  * [grid_h*grid_w,2048] rows: first 1024 CLIP channels, then 1024 SAM channels.
  */
-int uocr_metal_context_clip_sam_concat_f16(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_clip_sam_concat_f16(uocr_metal_context *ctx,
                                            const uint16_t *clip_tokens_f16,
                                            const uint16_t *sam_nchw_f16,
                                            uint32_t grid_w,
@@ -690,7 +806,7 @@ int uocr_metal_context_clip_sam_concat_f16(uocr_metal_context *ctx,
  * biased fp16 linear mapping from token-major [rows,2048] concat features to
  * [rows,1280] decoder-hidden visual features.
  */
-int uocr_metal_context_visual_projector_f16(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_visual_projector_f16(uocr_metal_context *ctx,
                                             const uint16_t *input_f16,
                                             const uint16_t *weight_f16,
                                             const uint16_t *bias_f16,
@@ -708,7 +824,7 @@ int uocr_metal_context_visual_projector_f16(uocr_metal_context *ctx,
  * remains a separate stage; callers should pass padded window tokens when
  * matching upstream window_partition() semantics.
  */
-int uocr_metal_context_sam_window_attention_f16(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_sam_window_attention_f16(uocr_metal_context *ctx,
                                                 const uint16_t *q_f16,
                                                 const uint16_t *k_f16,
                                                 const uint16_t *v_f16,
@@ -725,7 +841,7 @@ int uocr_metal_context_sam_window_attention_f16(uocr_metal_context *ctx,
  * 40x40 local grids. Relative-position bias is handled by the rel-pos helper
  * below.
  */
-int uocr_metal_context_sam_global_attention_f16(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_sam_global_attention_f16(uocr_metal_context *ctx,
                                                 const uint16_t *q_f16,
                                                 const uint16_t *k_f16,
                                                 const uint16_t *v_f16,
@@ -745,7 +861,7 @@ int uocr_metal_context_sam_global_attention_f16(uocr_metal_context *ctx,
  * runtime when the source length differs from 2*grid_{h,w}-1 (for example,
  * 64x64-trained global tables on a 40x40 local view).
  */
-int uocr_metal_context_sam_rel_pos_attention_f16(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_sam_rel_pos_attention_f16(uocr_metal_context *ctx,
                                                  const uint16_t *q_f16,
                                                  const uint16_t *k_f16,
                                                  const uint16_t *v_f16,
@@ -766,7 +882,7 @@ int uocr_metal_context_sam_rel_pos_attention_f16(uocr_metal_context *ctx,
  * to the requested output type. Use this for shortcut + attention update after
  * window unpartition and for the final x + MLP(norm2(x)) residual.
  */
-int uocr_metal_context_sam_residual_add_f16(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_sam_residual_add_f16(uocr_metal_context *ctx,
                                             const uint16_t *base_f16,
                                             const uint16_t *update_f16,
                                             uint32_t n_rows,
@@ -780,7 +896,7 @@ int uocr_metal_context_sam_residual_add_f16(uocr_metal_context *ctx,
  * [n_rows,768]. This matches the SAM Attention.proj step plus the first block
  * shortcut residual when the caller supplies tensors in the same row order.
  */
-int uocr_metal_context_sam_attention_project_residual_f16(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_sam_attention_project_residual_f16(uocr_metal_context *ctx,
                                                           const uint16_t *attention_context_f16,
                                                           const uint16_t *proj_weight_f16,
                                                           const uint16_t *proj_bias_f16,
@@ -798,7 +914,7 @@ int uocr_metal_context_sam_attention_project_residual_f16(uocr_metal_context *ct
  * products accumulate in fp32 and the post-GELU intermediate is stored as fp16
  * before lin2, matching the current fp16 activation policy for vision bring-up.
  */
-int uocr_metal_context_sam_mlp_f16(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_sam_mlp_f16(uocr_metal_context *ctx,
                                    const uint16_t *input_f16,
                                    const uint16_t *lin1_weight_f16,
                                    const uint16_t *lin1_bias_f16,
@@ -809,6 +925,7 @@ int uocr_metal_context_sam_mlp_f16(uocr_metal_context *ctx,
                                    void *out,
                                    char *error,
                                    size_t error_size);
+#endif /* UOCR_METAL_ENABLE_DIAGNOSTIC_API */
 
 /* Runtime prompt assembly into the persistent Metal prompt-embedding arena.
  * The arena must have been allocated with uocr_metal_context_allocate_runtime_arenas().
@@ -837,10 +954,11 @@ int uocr_metal_context_read_decoder_final_hidden_f16(uocr_metal_context *ctx,
                                                      char *error,
                                                      size_t error_size);
 
+#if UOCR_METAL_ENABLE_DIAGNOSTIC_API
 /* Diagnostic RMSNorm helper for synthetic tests. The kernel accumulates the
  * row variance in fp32 and applies fp16 learned weights.
  */
-int uocr_metal_context_rmsnorm_f16(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_rmsnorm_f16(uocr_metal_context *ctx,
                                    const uint16_t *input_f16,
                                    const uint16_t *weight_f16,
                                    uint32_t n_rows,
@@ -850,6 +968,7 @@ int uocr_metal_context_rmsnorm_f16(uocr_metal_context *ctx,
                                    void *out,
                                    char *error,
                                    size_t error_size);
+#endif /* UOCR_METAL_ENABLE_DIAGNOSTIC_API */
 
 /* Final decoder RMSNorm helper. Binds the mmap-backed FINAL_NORM tensor from
  * mapped .uocr model views, applies the fixed Unlimited-OCR hidden size and
@@ -933,12 +1052,13 @@ int uocr_metal_context_select_next_token_f16(uocr_metal_context *ctx,
                                              char *error,
                                              size_t error_size);
 
+#if UOCR_METAL_ENABLE_DIAGNOSTIC_API
 /* Diagnostic fp16 dense helper for synthetic tests. Computes
  * out[row, out_col] = dot(input[row, :], weight[out_col, :]) + optional bias,
  * where weights are row-major [out_features, in_features]. Dot products are
  * accumulated in fp32.
  */
-int uocr_metal_context_dense_f16(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_dense_f16(uocr_metal_context *ctx,
                                  const uint16_t *input_f16,
                                  const uint16_t *weight_f16,
                                  const uint16_t *bias_f16_or_null,
@@ -950,11 +1070,50 @@ int uocr_metal_context_dense_f16(uocr_metal_context *ctx,
                                  char *error,
                                  size_t error_size);
 
+/* Diagnostic Q8_0 dense helper. Computes
+ * out[row, out_col] = dot(input[row, :logical_in_features],
+ *                        dequant(weight[out_col, :logical_in_features])) + optional bias,
+ * where packed weights are row-major [out_features, physical_in_features / 32]
+ * GGML Q8_0 blocks. physical_in_features may include padded columns.
+ */
+int uocr_metal_context_diagnostic_dense_q8_0(uocr_metal_context *ctx,
+                                  const uint16_t *input_f16,
+                                  const void *weight_q8_0,
+                                  const uint16_t *bias_f16_or_null,
+                                  uint32_t input_rows,
+                                  uint32_t logical_in_features,
+                                  uint32_t physical_in_features,
+                                  uint32_t out_features,
+                                  uocr_metal_dense_output_type output_type,
+                                  void *out,
+                                  char *error,
+                                  size_t error_size);
+
+/* Diagnostic Q4_K/PADDED_Q4_K dense helper. Computes
+ * out[row, out_col] = dot(input[row, :logical_in_features],
+ *                        dequant(weight[out_col, :logical_in_features])) + optional bias,
+ * where packed weights are row-major [out_features, physical_in_features / 256]
+ * GGML Q4_K blocks. physical_in_features may include padded columns; those
+ * activation columns are treated as zero by never reading beyond logical width.
+ */
+int uocr_metal_context_diagnostic_dense_q4_k(uocr_metal_context *ctx,
+                                  const uint16_t *input_f16,
+                                  const void *weight_q4_k,
+                                  const uint16_t *bias_f16_or_null,
+                                  uint32_t input_rows,
+                                  uint32_t logical_in_features,
+                                  uint32_t physical_in_features,
+                                  uint32_t out_features,
+                                  uocr_metal_dense_output_type output_type,
+                                  void *out,
+                                  char *error,
+                                  size_t error_size);
+
 /* Diagnostic attention projection helper for synthetic tests. Computes the
  * decoder Q/K/V/O fp16 projections for hidden size 1280 with row-major
  * [1280,1280] weights and fp32 accumulation.
  */
-int uocr_metal_context_attention_qkvo_f16(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_attention_qkvo_f16(uocr_metal_context *ctx,
                                           const uint16_t *input_f16,
                                           const uint16_t *q_weight_f16,
                                           const uint16_t *k_weight_f16,
@@ -974,7 +1133,7 @@ int uocr_metal_context_attention_qkvo_f16(uocr_metal_context *ctx,
  * [n_tokens, 1280] and o_proj_weight is row-major [1280,1280]. Dot products
  * are accumulated in fp32 before the residual add.
  */
-int uocr_metal_context_attention_output_residual_f16(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_attention_output_residual_f16(uocr_metal_context *ctx,
                                                      const uint16_t *attention_context_f16,
                                                      const uint16_t *o_weight_f16,
                                                      const uint16_t *residual_f16,
@@ -990,7 +1149,7 @@ int uocr_metal_context_attention_output_residual_f16(uocr_metal_context *ctx,
  * Gate/up/down dot products accumulate in fp32, the SwiGLU intermediate is
  * stored as fp16, and residual_f16_or_null is added after down_proj when set.
  */
-int uocr_metal_context_dense_swiglu_f16(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_dense_swiglu_f16(uocr_metal_context *ctx,
                                         const uint16_t *input_f16,
                                         const uint16_t *gate_weight_f16,
                                         const uint16_t *up_weight_f16,
@@ -1009,7 +1168,7 @@ int uocr_metal_context_dense_swiglu_f16(uocr_metal_context *ctx,
  * the dense/routed MLP diagnostic policy. The caller adds this output to the
  * routed expert result in the following MoE-combine stage.
  */
-int uocr_metal_context_moe_shared_experts_f16(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_moe_shared_experts_f16(uocr_metal_context *ctx,
                                               const uint16_t *input_f16,
                                               const uint16_t *shared_gate_weight_f16,
                                               const uint16_t *shared_up_weight_f16,
@@ -1020,6 +1179,24 @@ int uocr_metal_context_moe_shared_experts_f16(uocr_metal_context *ctx,
                                               char *error,
                                               size_t error_size);
 
+/* Diagnostic Q8_0 shared-expert MLP helper. Gate/up/down weights are packed
+ * as row-major GGML Q8_0 blocks with logical shapes [1792,1280], [1792,1280],
+ * and [1280,1792]. The physical widths may be padded independently and are
+ * ignored beyond the logical OCR dimensions.
+ */
+int uocr_metal_context_diagnostic_moe_shared_experts_q8_0(uocr_metal_context *ctx,
+                                               const uint16_t *input_f16,
+                                               const void *shared_gate_weight_q8_0,
+                                               const void *shared_up_weight_q8_0,
+                                               const void *shared_down_weight_q8_0,
+                                               uint32_t physical_hidden_features,
+                                               uint32_t physical_intermediate_features,
+                                               uint32_t n_tokens,
+                                               uocr_metal_dense_output_type output_type,
+                                               void *out,
+                                               char *error,
+                                               size_t error_size);
+
 /* Diagnostic MoE router helper for synthetic decoder tests. Computes router
  * logits = hidden @ router_weight.T for [n_tokens,1280] hidden states and
  * [64,1280] fp16 router weights, accumulates logits in fp32, softmaxes over
@@ -1027,7 +1204,7 @@ int uocr_metal_context_moe_shared_experts_f16(uocr_metal_context *ctx,
  * renormalization or DS4-specific router transforms. logits_out_f32_or_null
  * and probs_out_f32_or_null are optional; top ids/weights are required.
  */
-int uocr_metal_context_moe_router_f16(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_moe_router_f16(uocr_metal_context *ctx,
                                       const uint16_t *input_f16,
                                       const uint16_t *router_weight_f16,
                                       uint32_t n_tokens,
@@ -1046,7 +1223,7 @@ int uocr_metal_context_moe_router_f16(uocr_metal_context *ctx,
  * fp32 router weights applied after each expert down projection. Shared
  * experts and decoder residual are intentionally separate plan items.
  */
-int uocr_metal_context_moe_selected_experts_decode_f16(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_moe_selected_experts_decode_f16(uocr_metal_context *ctx,
                                                        const uint16_t *input_f16,
                                                        const uint32_t *top_expert_ids,
                                                        const float *top_weights_f32,
@@ -1058,6 +1235,64 @@ int uocr_metal_context_moe_selected_experts_decode_f16(uocr_metal_context *ctx,
                                                        char *error,
                                                        size_t error_size);
 
+/* Diagnostic Q4_K selected-routed-expert decode helper. Gate/up weights are
+ * compacted in selected-rank-major order as GGML Q4_K rows
+ * [6,896,physical_hidden/256 blocks]. This legacy diagnostic variant keeps
+ * the routed down projection fp16; use the Q4_K+Q8_0 variant below for the
+ * dyn-q4 unaligned-down fallback. Only logical hidden columns participate in
+ * the dot product, so physical_hidden_features may be padded.
+ */
+int uocr_metal_context_diagnostic_moe_selected_experts_decode_q4_k(uocr_metal_context *ctx,
+                                                        const uint16_t *input_f16,
+                                                        const uint32_t *top_expert_ids,
+                                                        const float *top_weights_f32,
+                                                        const void *selected_gate_weight_q4_k,
+                                                        const void *selected_up_weight_q4_k,
+                                                        const uint16_t *selected_down_weight_f16,
+                                                        uint32_t physical_hidden_features,
+                                                        uocr_metal_dense_output_type output_type,
+                                                        void *out,
+                                                        char *error,
+                                                        size_t error_size);
+
+/* Diagnostic dyn-q4 fallback decode helper. Gate/up use Q4_K rows as above,
+ * while routed down-projection weights are selected-rank-major GGML Q8_0 rows
+ * [6,1280,physical_intermediate/32 blocks]. The logical routed-down input is
+ * 896; physical_intermediate_features may be padded for Q8_0 row layout.
+ */
+int uocr_metal_context_diagnostic_moe_selected_experts_decode_q4_k_q8_0(uocr_metal_context *ctx,
+                                                             const uint16_t *input_f16,
+                                                             const uint32_t *top_expert_ids,
+                                                             const float *top_weights_f32,
+                                                             const void *selected_gate_weight_q4_k,
+                                                             const void *selected_up_weight_q4_k,
+                                                             const void *selected_down_weight_q8_0,
+                                                             uint32_t physical_hidden_features,
+                                                             uint32_t physical_intermediate_features,
+                                                             uocr_metal_dense_output_type output_type,
+                                                             void *out,
+                                                             char *error,
+                                                             size_t error_size);
+
+/* Diagnostic optional padded-Q4 decode helper. Gate/up use selected-rank-major
+ * Q4_K rows [6,896,physical_hidden]; routed down weights use selected-rank-major
+ * PADDED_Q4_K rows [6,1280,physical_intermediate]. Only the logical 896 down
+ * input columns participate, so padded activation columns are zero by contract.
+ */
+int uocr_metal_context_diagnostic_moe_selected_experts_decode_q4_k_padded(uocr_metal_context *ctx,
+                                                               const uint16_t *input_f16,
+                                                               const uint32_t *top_expert_ids,
+                                                               const float *top_weights_f32,
+                                                               const void *selected_gate_weight_q4_k,
+                                                               const void *selected_up_weight_q4_k,
+                                                               const void *selected_down_weight_padded_q4_k,
+                                                               uint32_t physical_hidden_features,
+                                                               uint32_t physical_intermediate_features,
+                                                               uocr_metal_dense_output_type output_type,
+                                                               void *out,
+                                                               char *error,
+                                                               size_t error_size);
+
 /* Diagnostic token-batched routed-expert prefill helper. Weights are
  * expert-major [expert,out_row,input_col] for gate/up and
  * [expert,hidden_row,intermediate_col] for down. top_expert_ids/top_weights are
@@ -1065,7 +1300,7 @@ int uocr_metal_context_moe_selected_experts_decode_f16(uocr_metal_context *ctx,
  * it avoids CPU-side per-token selected-weight compaction and lets kernels read
  * expert-major slabs directly before later optimizing true expert grouping.
  */
-int uocr_metal_context_moe_selected_experts_prefill_f16(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_moe_selected_experts_prefill_f16(uocr_metal_context *ctx,
                                                         const uint16_t *input_f16,
                                                         const uint32_t *top_expert_ids,
                                                         const float *top_weights_f32,
@@ -1082,13 +1317,83 @@ int uocr_metal_context_moe_selected_experts_prefill_f16(uocr_metal_context *ctx,
                                                         char *error,
                                                         size_t error_size);
 
+/* Diagnostic token-batched Q4_K routed-expert prefill helper. Gate/up weights
+ * are expert-major Q4_K slabs [expert,intermediate,physical_hidden], while the
+ * routed down projection remains fp16 for fp16-vs-q4 diagnostics.
+ */
+int uocr_metal_context_diagnostic_moe_selected_experts_prefill_q4_k(uocr_metal_context *ctx,
+                                                         const uint16_t *input_f16,
+                                                         const uint32_t *top_expert_ids,
+                                                         const float *top_weights_f32,
+                                                         const void *expert_gate_weight_q4_k,
+                                                         const void *expert_up_weight_q4_k,
+                                                         const uint16_t *expert_down_weight_f16,
+                                                         uint32_t n_tokens,
+                                                         uint32_t hidden_size,
+                                                         uint32_t physical_hidden_size,
+                                                         uint32_t intermediate_size,
+                                                         uint32_t expert_count,
+                                                         uint32_t top_k,
+                                                         uocr_metal_dense_output_type output_type,
+                                                         void *out,
+                                                         char *error,
+                                                         size_t error_size);
+
+/* Diagnostic token-batched dyn-q4 fallback helper. Gate/up are expert-major
+ * Q4_K slabs [expert,intermediate,physical_hidden]; routed down weights are
+ * expert-major GGML Q8_0 rows [expert,hidden,physical_intermediate]. The
+ * logical intermediate width is retained, so padded Q8_0 columns are ignored.
+ */
+int uocr_metal_context_diagnostic_moe_selected_experts_prefill_q4_k_q8_0(uocr_metal_context *ctx,
+                                                              const uint16_t *input_f16,
+                                                              const uint32_t *top_expert_ids,
+                                                              const float *top_weights_f32,
+                                                              const void *expert_gate_weight_q4_k,
+                                                              const void *expert_up_weight_q4_k,
+                                                              const void *expert_down_weight_q8_0,
+                                                              uint32_t n_tokens,
+                                                              uint32_t hidden_size,
+                                                              uint32_t physical_hidden_size,
+                                                              uint32_t intermediate_size,
+                                                              uint32_t physical_intermediate_size,
+                                                              uint32_t expert_count,
+                                                              uint32_t top_k,
+                                                              uocr_metal_dense_output_type output_type,
+                                                              void *out,
+                                                              char *error,
+                                                              size_t error_size);
+
+/* Diagnostic optional padded-Q4 prefill helper. Gate/up are expert-major Q4_K
+ * slabs [expert,intermediate,physical_hidden]; routed down weights are
+ * expert-major PADDED_Q4_K rows [expert,hidden,physical_intermediate]. The
+ * logical intermediate width is retained and padded activation columns are zero.
+ */
+int uocr_metal_context_diagnostic_moe_selected_experts_prefill_q4_k_padded(uocr_metal_context *ctx,
+                                                                const uint16_t *input_f16,
+                                                                const uint32_t *top_expert_ids,
+                                                                const float *top_weights_f32,
+                                                                const void *expert_gate_weight_q4_k,
+                                                                const void *expert_up_weight_q4_k,
+                                                                const void *expert_down_weight_padded_q4_k,
+                                                                uint32_t n_tokens,
+                                                                uint32_t hidden_size,
+                                                                uint32_t physical_hidden_size,
+                                                                uint32_t intermediate_size,
+                                                                uint32_t physical_intermediate_size,
+                                                                uint32_t expert_count,
+                                                                uint32_t top_k,
+                                                                uocr_metal_dense_output_type output_type,
+                                                                void *out,
+                                                                char *error,
+                                                                size_t error_size);
+
 /* Diagnostic MoE combine helper for synthetic decoder tests. Computes the
  * elementwise sum of routed expert output and shared expert output for
  * [n_tokens,1280] fp16 rows. residual_f16_or_null is optional and is added
  * after the routed+shared MoE result when a full decoder-layer output is being
  * diagnosed; pass NULL to match the DeepSeekV2MoE module output itself.
  */
-int uocr_metal_context_moe_combine_f16(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_moe_combine_f16(uocr_metal_context *ctx,
                                        const uint16_t *routed_f16,
                                        const uint16_t *shared_f16,
                                        const uint16_t *residual_f16_or_null,
@@ -1103,7 +1408,7 @@ int uocr_metal_context_moe_combine_f16(uocr_metal_context *ctx,
  * [n_tokens, 10 heads, 128 dim], using monotonically increasing positions
  * starting at position_start and theta=10000.
  */
-int uocr_metal_context_rope_qk_f16(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_rope_qk_f16(uocr_metal_context *ctx,
                                    const uint16_t *q_f16,
                                    const uint16_t *k_f16,
                                    uint32_t n_tokens,
@@ -1119,7 +1424,7 @@ int uocr_metal_context_rope_qk_f16(uocr_metal_context *ctx,
  * [n_tokens, 10 heads, 128 dim]. The prompt remains fully attendable under a
  * standard lower-triangular causal mask, and softmax/dot products are fp32.
  */
-int uocr_metal_context_prefill_attention_f16(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_prefill_attention_f16(uocr_metal_context *ctx,
                                              const uint16_t *q_f16,
                                              const uint16_t *k_f16,
                                              const uint16_t *v_f16,
@@ -1134,7 +1439,7 @@ int uocr_metal_context_prefill_attention_f16(uocr_metal_context *ctx,
  * [total_tokens, 10 heads, 128 dim], and cu_seqlens has batch + 1 entries.
  * Causal masking is applied independently within each sequence.
  */
-int uocr_metal_context_prefill_attention_varlen_f16(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_prefill_attention_varlen_f16(uocr_metal_context *ctx,
                                                     const uint16_t *q_f16,
                                                     const uint16_t *k_f16,
                                                     const uint16_t *v_f16,
@@ -1154,7 +1459,7 @@ int uocr_metal_context_prefill_attention_varlen_f16(uocr_metal_context *ctx,
  * generated_count is the number of generated tokens already written to KV,
  * including the current decode token when called after the KV write.
  */
-int uocr_metal_context_decode_attention_f16(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_decode_attention_f16(uocr_metal_context *ctx,
                                             const uint16_t *q_f16,
                                             const uint16_t *k_cache_f16,
                                             const uint16_t *v_cache_f16,
@@ -1175,7 +1480,7 @@ int uocr_metal_context_decode_attention_f16(uocr_metal_context *ctx,
  * Prompt positions map directly; generated positions use a 128-token ring that
  * starts at the actual prompt_length, not at prompt_token_capacity.
  */
-int uocr_metal_context_write_kv_cache_f16(uocr_metal_context *ctx,
+int uocr_metal_context_diagnostic_write_kv_cache_f16(uocr_metal_context *ctx,
                                           const uint16_t *k_f16,
                                           const uint16_t *v_f16,
                                           const uint16_t *initial_k_cache_f16_or_null,
@@ -1191,6 +1496,7 @@ int uocr_metal_context_write_kv_cache_f16(uocr_metal_context *ctx,
                                           uint16_t *v_cache_out_f16,
                                           char *error,
                                           size_t error_size);
+#endif /* UOCR_METAL_ENABLE_DIAGNOSTIC_API */
 
 int uocr_metal_smoke_test(const char *resource_path, char *error, size_t error_size);
 

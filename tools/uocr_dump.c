@@ -1,6 +1,7 @@
 #include <stdio.h>
 
 #include "model/uocr_model_file.h"
+#include "quant/uocr_quant.h"
 #include "unlimitedocr.h"
 
 static void print_hash_prefix(const uint8_t hash[32]) {
@@ -115,12 +116,22 @@ int main(int argc, char **argv) {
         printf("... safetensors_index=");
         print_hash_prefix(model.provenance->safetensors_index_hash);
         printf("...\n");
+        if (model.header->qprofile == UOCR_QPROFILE_FP16) {
+            char exact_error[256];
+            if (uocr_model_file_validate_full_fp16_accounting(&model, exact_error, sizeof(exact_error)) == 0) {
+                printf("  full_fp16_accounting: ok\n");
+            } else {
+                printf("  full_fp16_accounting: not-current-full-model (%s)\n", exact_error);
+            }
+        }
     }
 
     if (model.tensor_count > 0u && model.tensors != NULL) {
         enum { TOP_TENSORS = 5 };
         uint32_t qtype_counts[64] = {0};
         uint64_t qtype_bytes[64] = {0};
+        uint32_t qtype_reason_counts[16] = {0};
+        uint32_t promotion_reason_counts[16] = {0};
         uint32_t usage_runtime = 0u;
         uint32_t usage_preserved = 0u;
         uint32_t usage_omitted = 0u;
@@ -139,6 +150,8 @@ int main(int argc, char **argv) {
                 qtype_counts[tensor->qtype]++;
                 qtype_bytes[tensor->qtype] += tensor->payload_size;
             }
+            if (tensor->qtype_reason < 16u) qtype_reason_counts[tensor->qtype_reason]++;
+            if (tensor->promotion_reason < 16u) promotion_reason_counts[tensor->promotion_reason]++;
             if (tensor->usage == UOCR_TENSOR_USAGE_RUNTIME) usage_runtime++;
             if (tensor->usage == UOCR_TENSOR_USAGE_PRESERVED_UNUSED) usage_preserved++;
             if (tensor->usage == UOCR_TENSOR_USAGE_OMITTED_WITH_REASON) usage_omitted++;
@@ -206,17 +219,42 @@ int main(int argc, char **argv) {
             printf(" %s=%llu", uocr_tensor_qtype_name(i), (unsigned long long)qtype_bytes[i]);
         }
         printf("\n");
+        printf("  qtype_reasons:");
+        for (uint32_t i = 0u; i < 16u; ++i) {
+            if (qtype_reason_counts[i] == 0u) continue;
+            printf(" %s=%u", uocr_tensor_qtype_reason_name(i), qtype_reason_counts[i]);
+        }
+        printf("\n");
+        printf("  promotion_reasons:");
+        for (uint32_t i = 0u; i < 16u; ++i) {
+            if (promotion_reason_counts[i] == 0u) continue;
+            printf(" %s=%u", uocr_tensor_promotion_reason_name(i), promotion_reason_counts[i]);
+        }
+        printf("\n");
         printf("  largest_tensors:\n");
         for (uint32_t i = 0u; i < top_count; ++i) {
             const uocr_tensor_entry *tensor = &model.tensors[top[i]];
-            printf("    [%u] id=%u family=%s qtype=%s offset=%llu size=%llu offset_alignment=%llu\n",
+            uint32_t logical_input_width = 0u;
+            uint32_t physical_input_width = 0u;
+            const int has_input_widths = uocr_quant_tensor_input_widths(tensor, &logical_input_width, &physical_input_width);
+            printf("    [%u] id=%u family=%s qtype=%s qtype_reason=%s promotion=%s flags=0x%x offset=%llu size=%llu offset_alignment=%llu",
                    i,
                    tensor->id,
                    uocr_tensor_family_name(tensor->family),
                    uocr_tensor_qtype_name(tensor->qtype),
+                   uocr_tensor_qtype_reason_name(tensor->qtype_reason),
+                   uocr_tensor_promotion_reason_name(tensor->promotion_reason),
+                   tensor->flags,
                    (unsigned long long)tensor->payload_offset,
                    (unsigned long long)tensor->payload_size,
                    (unsigned long long)natural_alignment(tensor->payload_offset));
+            if (has_input_widths) {
+                printf(" input_width=%u/%u padding=%u",
+                       logical_input_width,
+                       physical_input_width,
+                       physical_input_width - logical_input_width);
+            }
+            printf("\n");
         }
     }
 

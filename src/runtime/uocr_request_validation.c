@@ -69,6 +69,45 @@ uint32_t uocr_count_image_placeholders(const uocr_prepared_request *request) {
     return count;
 }
 
+static int validate_kv_and_position_budget(const uocr_prepared_request *request,
+                                           const uocr_request_limits *limits,
+                                           char *error,
+                                           size_t error_size) {
+    if (limits->max_position_tokens != 0u) {
+        if (request->n_tokens > limits->max_position_tokens ||
+            request->max_new_tokens > limits->max_position_tokens - request->n_tokens) {
+            return fail(error,
+                        error_size,
+                        "sequence length exceeds model position budget: prompt %u + max_new_tokens %u > %u",
+                        request->n_tokens,
+                        request->max_new_tokens,
+                        limits->max_position_tokens);
+        }
+    }
+
+    if (limits->max_prompt_tokens != 0u && limits->generated_ring_window != 0u) {
+        const uint32_t live_generated = request->max_new_tokens < limits->generated_ring_window ?
+                                            request->max_new_tokens :
+                                            limits->generated_ring_window;
+        const uint64_t required_cached_tokens = (uint64_t)request->n_tokens + (uint64_t)live_generated;
+        const uint64_t capacity_cached_tokens = (uint64_t)limits->max_prompt_tokens +
+                                                (uint64_t)limits->generated_ring_window;
+        if (required_cached_tokens > capacity_cached_tokens) {
+            return fail(error,
+                        error_size,
+                        "KV cache budget exceeded: request needs %llu cached tokens (prompt %u + live generated %u), capacity is %llu (prompt capacity %u + ring %u)",
+                        (unsigned long long)required_cached_tokens,
+                        request->n_tokens,
+                        live_generated,
+                        (unsigned long long)capacity_cached_tokens,
+                        limits->max_prompt_tokens,
+                        limits->generated_ring_window);
+        }
+    }
+
+    return UOCR_OK;
+}
+
 static int expected_visual_tokens(const uocr_prepared_request *request,
                                   uint32_t *out_expected,
                                   char *error,
@@ -191,6 +230,10 @@ int uocr_validate_prepared_request(const uocr_prepared_request *request,
                     request->max_new_tokens,
                     limits->max_gen_tokens);
     }
+    const int budget_status = validate_kv_and_position_budget(request, limits, error, error_size);
+    if (budget_status != UOCR_OK) {
+        return budget_status;
+    }
     if (request->input_ids[0] != UOCR_TOKEN_BOS) {
         return fail(error, error_size, "first token must be BOS id %d, got %d", UOCR_TOKEN_BOS, request->input_ids[0]);
     }
@@ -213,6 +256,8 @@ int uocr_validate_prepared_request(const uocr_prepared_request *request,
     }
 
     uint32_t image_placeholders = 0u;
+    uint32_t first_image = request->n_tokens;
+    uint32_t last_image = 0u;
     for (uint32_t i = 0u; i < request->n_tokens; ++i) {
         const int32_t token = request->input_ids[i];
         if (token < 0 || token >= (int32_t)UOCR_VOCAB_SIZE) {
@@ -230,8 +275,26 @@ int uocr_validate_prepared_request(const uocr_prepared_request *request,
                             token,
                             UOCR_TOKEN_IMAGE);
             }
+            if (first_image == request->n_tokens) {
+                first_image = i;
+            }
+            last_image = i;
             ++image_placeholders;
+        } else if (token == UOCR_TOKEN_IMAGE) {
+            return fail(error,
+                        error_size,
+                        "token %u is image token %d but image_mask is 0",
+                        i,
+                        UOCR_TOKEN_IMAGE);
         }
+    }
+    if (image_placeholders != 0u && last_image - first_image + 1u != image_placeholders) {
+        return fail(error,
+                    error_size,
+                    "image placeholders must be one contiguous span; first=%u last=%u count=%u",
+                    first_image,
+                    last_image,
+                    image_placeholders);
     }
 
     uint32_t expected_visual = 0u;

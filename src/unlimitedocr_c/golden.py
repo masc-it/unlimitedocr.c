@@ -35,6 +35,17 @@ LOGITS_TOPK_SCORES_BIN = "logits_topk_scores_f32.bin"
 GENERATED_IDS_BIN = "generated_ids_i32.bin"
 GENERATED_TEXT_TXT = "generated_text.txt"
 VISUAL_FEATURES_BIN = "visual_features_f16.bin"
+SAM_FEATURES_BIN = "sam_features_f16.bin"
+SAM_FEATURE_CHANNELS = 1024
+SAM_GLOBAL_GRID = 16
+SAM_LOCAL_GRID = 10
+CLIP_FEATURES_BIN = "clip_features_f16.bin"
+CLIP_HIDDEN_SIZE = 1024
+CLIP_GLOBAL_TOKENS = 257
+CLIP_LOCAL_TOKENS = 101
+PROJECTED_FEATURES_BIN = "projected_features_f16.bin"
+PROJECTED_GLOBAL_ROWS = SAM_GLOBAL_GRID * SAM_GLOBAL_GRID
+PROJECTED_LOCAL_ROWS = SAM_LOCAL_GRID * SAM_LOCAL_GRID
 TEXT_DECODER_LAYER_COUNT = 12
 DEFAULT_LOGITS_TOP_K = 16
 INPUT_IDS_BIN = "input_ids_i32.bin"
@@ -163,6 +174,24 @@ def router_top_weights_filename(layer: int) -> str:
     if layer <= 0 or layer >= TEXT_DECODER_LAYER_COUNT:
         raise ValueError(f"MoE router layer out of range: {layer}")
     return f"layer_{layer}_router_top_weights_f32.bin"
+
+
+def sam_features_filename(view_index: int) -> str:
+    if view_index < 0:
+        raise ValueError(f"view_index must be non-negative, got {view_index}")
+    return SAM_FEATURES_BIN if view_index == 0 else f"sam_features_view_{view_index}_f16.bin"
+
+
+def clip_features_filename(view_index: int) -> str:
+    if view_index < 0:
+        raise ValueError(f"view_index must be non-negative, got {view_index}")
+    return CLIP_FEATURES_BIN if view_index == 0 else f"clip_features_view_{view_index}_f16.bin"
+
+
+def projected_features_filename(view_index: int) -> str:
+    if view_index < 0:
+        raise ValueError(f"view_index must be non-negative, got {view_index}")
+    return PROJECTED_FEATURES_BIN if view_index == 0 else f"projected_features_view_{view_index}_f16.bin"
 
 
 def _read_json_if_exists(path: Path) -> dict[str, Any] | None:
@@ -1295,6 +1324,334 @@ def dump_text_generated_ids_fixture(
     }
     manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return out
+
+
+def _visual_feature_meta(manifest: dict[str, Any]) -> dict[str, Any]:
+    golden = manifest.get("golden_tensors", {}).get("visual_features", {}) if isinstance(manifest, dict) else {}
+    return golden if isinstance(golden, dict) else {}
+
+
+def _infer_visual_rows_from_manifest(manifest: dict[str, Any]) -> int | None:
+    if not isinstance(manifest, dict):
+        return None
+    for key in ("image_mask_count", "expected_visual_tokens", "visual_token_count"):
+        value = manifest.get(key)
+        if value is not None:
+            rows = int(value)
+            if rows > 0:
+                return rows
+    return None
+
+
+def load_visual_features_dump(
+    fixture_dir: str | Path,
+    *,
+    row_count: int | None = None,
+) -> NDArray[np.uint16]:
+    """Load a Python/HF final formatted visual-feature fixture.
+
+    The tensor contract is the final source buffer consumed by masked_scatter /
+    C prompt splicing: ``[image_tokens, 1280]`` fp16 bits after per-view
+    projection, local-crop stitching, image-newline insertion, and final
+    view-separator insertion. Shape metadata may also use upstream
+    ``[1,image_tokens,1280]``.
+    """
+
+    root = Path(fixture_dir)
+    manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+    if not isinstance(manifest, dict):
+        raise ValueError(f"expected manifest object in {root}")
+    meta = _visual_feature_meta(manifest)
+    filename = meta.get("file") if isinstance(meta, dict) else None
+    if not isinstance(filename, str):
+        filename = VISUAL_FEATURES_BIN
+
+    shape = meta.get("shape") if isinstance(meta, dict) else None
+    if isinstance(shape, list) and len(shape) == 2:
+        rows = int(shape[0])
+        hidden_size = int(shape[1])
+    elif isinstance(shape, list) and len(shape) == 3:
+        batch = int(shape[0])
+        if batch != 1:
+            raise ValueError(f"visual_features batch dimension must be 1, got {batch} in {root}")
+        rows = int(shape[1])
+        hidden_size = int(shape[2])
+    else:
+        inferred = row_count if row_count is not None else _infer_visual_rows_from_manifest(manifest)
+        if inferred is None:
+            raise ValueError(f"missing visual_features shape metadata in {root}")
+        rows = int(inferred)
+        hidden_size = HIDDEN_SIZE
+
+    if rows <= 0 or hidden_size != HIDDEN_SIZE:
+        raise ValueError(f"invalid visual_features shape [{rows}, {hidden_size}] in {root}")
+    if row_count is not None and rows != int(row_count):
+        raise ValueError(f"visual_features row count {rows} does not match expected {row_count}")
+    bits = np.fromfile(root / filename, dtype=np.dtype("<u2"))
+    expected_values = rows * hidden_size
+    if bits.size != expected_values:
+        raise ValueError(f"visual_features size mismatch: expected {expected_values} f16 values, got {bits.size}")
+    return bits.reshape((rows, hidden_size))
+
+
+def _infer_sam_grid_from_manifest(manifest: dict[str, Any], view_index: int) -> int | None:
+    views = manifest.get("views") if isinstance(manifest, dict) else None
+    if not isinstance(views, list) or view_index < 0 or view_index >= len(views):
+        return None
+    meta = views[view_index]
+    if not isinstance(meta, dict):
+        return None
+    width = int(meta.get("width", 0))
+    height = int(meta.get("height", 0))
+    kind = str(meta.get("kind", ""))
+    if width == 1024 and height == 1024 and kind == "global":
+        return SAM_GLOBAL_GRID
+    if width == 640 and height == 640 and kind == "local":
+        return SAM_LOCAL_GRID
+    return None
+
+
+def _sam_feature_meta(manifest: dict[str, Any], view_index: int) -> dict[str, Any]:
+    golden = manifest.get("golden_tensors", {}).get("sam_features", {}) if isinstance(manifest, dict) else {}
+    if not isinstance(golden, dict):
+        return {}
+    views = golden.get("views")
+    if isinstance(views, list):
+        if view_index < 0 or view_index >= len(views):
+            raise ValueError(f"sam_features view index {view_index} is outside manifest view metadata")
+        meta = views[view_index]
+        if not isinstance(meta, dict):
+            raise ValueError(f"invalid sam_features metadata for view {view_index}")
+        return meta
+    return golden
+
+
+def load_sam_features_dump(
+    fixture_dir: str | Path,
+    *,
+    view_index: int = 0,
+    grid_size: int | None = None,
+) -> NDArray[np.uint16]:
+    """Load a Python/HF SAM output fixture as uint16 fp16 bits.
+
+    The tensor contract is the upstream ``sam_model(view)`` output without the
+    batch dimension: ``[1024, grid, grid]`` in NCHW order, where ``grid`` is
+    ``16`` for a global ``1024`` view and ``10`` for a local ``640`` view.
+    """
+
+    if view_index < 0:
+        raise ValueError(f"view_index must be non-negative, got {view_index}")
+    root = Path(fixture_dir)
+    manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+    if not isinstance(manifest, dict):
+        raise ValueError(f"expected manifest object in {root}")
+    meta = _sam_feature_meta(manifest, view_index)
+    filename = meta.get("file") if isinstance(meta, dict) else None
+    if not isinstance(filename, str):
+        default_name = sam_features_filename(view_index)
+        if not (root / default_name).exists() and view_index != 0:
+            default_name = SAM_FEATURES_BIN
+        filename = default_name
+
+    shape = meta.get("shape") if isinstance(meta, dict) else None
+    if isinstance(shape, list) and len(shape) == 3:
+        channels = int(shape[0])
+        grid_h = int(shape[1])
+        grid_w = int(shape[2])
+    else:
+        inferred = grid_size if grid_size is not None else _infer_sam_grid_from_manifest(manifest, view_index)
+        if inferred is None:
+            raise ValueError(f"missing sam_features shape metadata in {root}")
+        channels = SAM_FEATURE_CHANNELS
+        grid_h = int(inferred)
+        grid_w = int(inferred)
+
+    if channels != SAM_FEATURE_CHANNELS or grid_h <= 0 or grid_w <= 0:
+        raise ValueError(f"invalid sam_features shape [{channels}, {grid_h}, {grid_w}] in {root}")
+    if grid_size is not None and (grid_h != int(grid_size) or grid_w != int(grid_size)):
+        raise ValueError(f"sam_features shape grid {grid_h}x{grid_w} does not match expected {grid_size}x{grid_size}")
+    bits = np.fromfile(root / filename, dtype=np.dtype("<u2"))
+    expected_values = channels * grid_h * grid_w
+    if bits.size != expected_values:
+        raise ValueError(f"sam_features size mismatch: expected {expected_values} f16 values, got {bits.size}")
+    return bits.reshape((channels, grid_h, grid_w))
+
+
+def _infer_clip_tokens_from_manifest(manifest: dict[str, Any], view_index: int) -> int | None:
+    views = manifest.get("views") if isinstance(manifest, dict) else None
+    if not isinstance(views, list) or view_index < 0 or view_index >= len(views):
+        return None
+    meta = views[view_index]
+    if not isinstance(meta, dict):
+        return None
+    width = int(meta.get("width", 0))
+    height = int(meta.get("height", 0))
+    kind = str(meta.get("kind", ""))
+    if width == 1024 and height == 1024 and kind == "global":
+        return CLIP_GLOBAL_TOKENS
+    if width == 640 and height == 640 and kind == "local":
+        return CLIP_LOCAL_TOKENS
+    return None
+
+
+def _clip_feature_meta(manifest: dict[str, Any], view_index: int) -> dict[str, Any]:
+    golden = manifest.get("golden_tensors", {}).get("clip_features", {}) if isinstance(manifest, dict) else {}
+    if not isinstance(golden, dict):
+        return {}
+    views = golden.get("views")
+    if isinstance(views, list):
+        if view_index < 0 or view_index >= len(views):
+            raise ValueError(f"clip_features view index {view_index} is outside manifest view metadata")
+        meta = views[view_index]
+        if not isinstance(meta, dict):
+            raise ValueError(f"invalid clip_features metadata for view {view_index}")
+        return meta
+    return golden
+
+
+def load_clip_features_dump(
+    fixture_dir: str | Path,
+    *,
+    view_index: int = 0,
+    token_count: int | None = None,
+) -> NDArray[np.uint16]:
+    """Load a Python/HF CLIP output fixture as uint16 fp16 bits.
+
+    The tensor contract is the upstream ``vision_model(view, sam_features)``
+    output including the class token, without the batch dimension:
+    ``[tokens, 1024]`` where ``tokens`` is ``257`` for global views and ``101``
+    for local views. Shape metadata may also use upstream ``[1,tokens,1024]``.
+    """
+
+    if view_index < 0:
+        raise ValueError(f"view_index must be non-negative, got {view_index}")
+    root = Path(fixture_dir)
+    manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+    if not isinstance(manifest, dict):
+        raise ValueError(f"expected manifest object in {root}")
+    meta = _clip_feature_meta(manifest, view_index)
+    filename = meta.get("file") if isinstance(meta, dict) else None
+    if not isinstance(filename, str):
+        default_name = clip_features_filename(view_index)
+        if not (root / default_name).exists() and view_index != 0:
+            default_name = CLIP_FEATURES_BIN
+        filename = default_name
+
+    shape = meta.get("shape") if isinstance(meta, dict) else None
+    if isinstance(shape, list) and len(shape) == 2:
+        tokens = int(shape[0])
+        hidden_size = int(shape[1])
+    elif isinstance(shape, list) and len(shape) == 3:
+        batch = int(shape[0])
+        if batch != 1:
+            raise ValueError(f"clip_features batch dimension must be 1, got {batch} in {root}")
+        tokens = int(shape[1])
+        hidden_size = int(shape[2])
+    else:
+        inferred = token_count if token_count is not None else _infer_clip_tokens_from_manifest(manifest, view_index)
+        if inferred is None:
+            raise ValueError(f"missing clip_features shape metadata in {root}")
+        tokens = int(inferred)
+        hidden_size = CLIP_HIDDEN_SIZE
+
+    if tokens <= 0 or hidden_size != CLIP_HIDDEN_SIZE:
+        raise ValueError(f"invalid clip_features shape [{tokens}, {hidden_size}] in {root}")
+    if token_count is not None and tokens != int(token_count):
+        raise ValueError(f"clip_features token count {tokens} does not match expected {token_count}")
+    bits = np.fromfile(root / filename, dtype=np.dtype("<u2"))
+    expected_values = tokens * hidden_size
+    if bits.size != expected_values:
+        raise ValueError(f"clip_features size mismatch: expected {expected_values} f16 values, got {bits.size}")
+    return bits.reshape((tokens, hidden_size))
+
+
+def _infer_projected_rows_from_manifest(manifest: dict[str, Any], view_index: int) -> int | None:
+    views = manifest.get("views") if isinstance(manifest, dict) else None
+    if not isinstance(views, list) or view_index < 0 or view_index >= len(views):
+        return None
+    meta = views[view_index]
+    if not isinstance(meta, dict):
+        return None
+    width = int(meta.get("width", 0))
+    height = int(meta.get("height", 0))
+    kind = str(meta.get("kind", ""))
+    if width == 1024 and height == 1024 and kind == "global":
+        return PROJECTED_GLOBAL_ROWS
+    if width == 640 and height == 640 and kind == "local":
+        return PROJECTED_LOCAL_ROWS
+    return None
+
+
+def _projected_feature_meta(manifest: dict[str, Any], view_index: int) -> dict[str, Any]:
+    golden = manifest.get("golden_tensors", {}).get("projected_features", {}) if isinstance(manifest, dict) else {}
+    if not isinstance(golden, dict):
+        return {}
+    views = golden.get("views")
+    if isinstance(views, list):
+        if view_index < 0 or view_index >= len(views):
+            raise ValueError(f"projected_features view index {view_index} is outside manifest view metadata")
+        meta = views[view_index]
+        if not isinstance(meta, dict):
+            raise ValueError(f"invalid projected_features metadata for view {view_index}")
+        return meta
+    return golden
+
+
+def load_projected_features_dump(
+    fixture_dir: str | Path,
+    *,
+    view_index: int = 0,
+    row_count: int | None = None,
+) -> NDArray[np.uint16]:
+    """Load a Python/HF per-view projector output fixture as uint16 fp16 bits.
+
+    The tensor contract is the upstream per-view ``projector`` output after
+    concatenating ``CLIP[:, 1:]`` with flattened SAM features, before newline
+    and view-separator formatting. The returned shape is ``[rows, 1280]`` where
+    rows is ``256`` for global views and ``100`` for local views. Shape metadata
+    may also use upstream ``[1,rows,1280]``.
+    """
+
+    if view_index < 0:
+        raise ValueError(f"view_index must be non-negative, got {view_index}")
+    root = Path(fixture_dir)
+    manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+    if not isinstance(manifest, dict):
+        raise ValueError(f"expected manifest object in {root}")
+    meta = _projected_feature_meta(manifest, view_index)
+    filename = meta.get("file") if isinstance(meta, dict) else None
+    if not isinstance(filename, str):
+        default_name = projected_features_filename(view_index)
+        if not (root / default_name).exists() and view_index != 0:
+            default_name = PROJECTED_FEATURES_BIN
+        filename = default_name
+
+    shape = meta.get("shape") if isinstance(meta, dict) else None
+    if isinstance(shape, list) and len(shape) == 2:
+        rows = int(shape[0])
+        hidden_size = int(shape[1])
+    elif isinstance(shape, list) and len(shape) == 3:
+        batch = int(shape[0])
+        if batch != 1:
+            raise ValueError(f"projected_features batch dimension must be 1, got {batch} in {root}")
+        rows = int(shape[1])
+        hidden_size = int(shape[2])
+    else:
+        inferred = row_count if row_count is not None else _infer_projected_rows_from_manifest(manifest, view_index)
+        if inferred is None:
+            raise ValueError(f"missing projected_features shape metadata in {root}")
+        rows = int(inferred)
+        hidden_size = HIDDEN_SIZE
+
+    if rows <= 0 or hidden_size != HIDDEN_SIZE:
+        raise ValueError(f"invalid projected_features shape [{rows}, {hidden_size}] in {root}")
+    if row_count is not None and rows != int(row_count):
+        raise ValueError(f"projected_features row count {rows} does not match expected {row_count}")
+    bits = np.fromfile(root / filename, dtype=np.dtype("<u2"))
+    expected_values = rows * hidden_size
+    if bits.size != expected_values:
+        raise ValueError(f"projected_features size mismatch: expected {expected_values} f16 values, got {bits.size}")
+    return bits.reshape((rows, hidden_size))
 
 
 def load_prompt_embedding_dump(fixture_dir: str | Path) -> PromptEmbeddingDump:

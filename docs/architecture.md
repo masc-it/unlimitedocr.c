@@ -288,13 +288,13 @@ LAYER[1..11].MOE.SHARED.{GATE,UP,DOWN}
 VISION.SAM.*, VISION.CLIP.*, PROJECTOR, IMAGE_NEWLINE, VIEW_SEPARATOR
 ```
 
-Routed experts should be packed expert-major for selected-expert kernels:
+Routed experts are packed as interleaved expert-major slabs for selected-expert kernels:
 
 ```text
-[layer][projection][expert][out_row][packed_input]
+[layer][expert][projection: gate, up, down][out_row][packed_input]
 ```
 
-For fused gate/up kernels, the converter may additionally create paired slabs or adjacent offsets so Metal can fetch selected expert `gate` and `up` together.
+This keeps each expert's `gate_proj`, `up_proj`, and `down_proj` payloads contiguous; Metal can fetch selected expert `gate` and `up` together for fused projection and use the same expert stride for the down projection.
 
 ### Quantized physical shapes
 
@@ -303,17 +303,19 @@ Store both logical and physical input width. This is important because DS4/GGML 
 - Q4_K-aligned examples: attention projections `1280`, LM head input `1280`, routed expert `gate/up` input `1280`, shared expert down input `1792`, projector input `2048`.
 - Not Q4_K-aligned: routed expert `down_proj` input `896`, dense layer-0 `down_proj` input `6848`.
 
-Initial policy should keep unaligned down projections in `Q8_0`, unless the converter emits `PADDED_Q4_K` and kernels zero-pad activations to the physical width.
+Initial policy keeps unaligned down projections in `Q8_0`, unless the converter emits `PADDED_Q4_K` and kernels zero-pad activations to the physical width. Converter plans expose `logical_input_width`, `physical_input_width`, and `input_padding_width` explicitly for every quantized tensor; the `.uocr` tensor directory stores the same contract as the final dimension of `logical_shape` and `physical_shape`, with C helpers to read those widths for Metal kernels. The converter also marks the two current plain-`Q4_K` hazards (`routed-expert-down` at `896`, `dense-layer0-down` at `6848`) and validates that `dyn-q4` keeps them as unaligned `Q8_0` fallbacks until a padded-q4 path is enabled.
 
 ## Converter design
 
 `uocr-convert` pipeline:
 
-1. Load `config.json`, `processor_config.json`, `tokenizer.json` metadata, and safetensors.
+1. Load `config.json`, `processor_config.json`, tokenizer metadata (`tokenizer.json`, `tokenizer_config.json`, `special_tokens_map.json`), and safetensors metadata; dry-run summaries record the validated source facts and SHA-256 hashes for provenance/debugging.
 2. Validate all expected tensor names and shapes.
 3. Map HF names to tensor registry ids.
 4. Convert BF16 -> fp16/f32 temporary rows.
 5. Pack tensors into runtime layout:
+   - preserve safetensors row-major order for rank-2 `[out,in]` matrices used by Metal kernels
+   - record tensor layout flags and transform metadata; v1 rejects transposed payloads unless a future kernel explicitly requires one
    - routed expert slabs
    - optional gate/up paired layout
    - contiguous vision/decoder arenas
@@ -325,7 +327,7 @@ Initial policy should keep unaligned down projections in `Q8_0`, unless the conv
    - SAM absolute pos for `64x64` and `40x40`
    - CLIP absolute pos for `16x16` and `10x10`
    - SAM relative-pos helpers for `40x40` if useful
-8. Emit `.uocr` with provenance and qtype decisions.
+8. Emit `.uocr` with provenance and qtype decisions. When writing from a real safetensors payload, `--conversion-stats` can emit a JSON sidecar with per-tensor source/output dtype, qtype, exact byte counts, finite min/max, and NaN/Inf counts gathered during bounded streaming conversion.
 
 Useful DS4 converter features to copy:
 

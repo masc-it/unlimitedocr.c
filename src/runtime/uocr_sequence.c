@@ -55,6 +55,7 @@ int uocr_build_sequence_state(const uocr_prepared_request *request,
 
     uocr_sequence_state state;
     memset(&state, 0, sizeof(state));
+    state.prompt_tokens = request->input_ids;
     state.prompt_token_count = request->n_tokens;
     state.max_new_tokens = request->max_new_tokens;
     state.no_repeat_ngram_size = request->no_repeat_ngram_size;
@@ -91,6 +92,59 @@ int uocr_build_sequence_state(const uocr_prepared_request *request,
     return UOCR_OK;
 }
 
+int uocr_sequence_attach_generation_buffers(uocr_sequence_state *state,
+                                            int32_t *generated_tokens,
+                                            uint32_t generated_capacity,
+                                            int32_t *token_history,
+                                            uint32_t token_history_capacity) {
+    if (state == NULL || state->prompt_tokens == NULL || token_history == NULL) {
+        return UOCR_ERROR_INVALID_ARGUMENT;
+    }
+    if (state->generated_count != 0u || state->position != state->prompt_token_count) {
+        return UOCR_ERROR_INVALID_ARGUMENT;
+    }
+    if (state->max_new_tokens != 0u && generated_tokens == NULL) {
+        return UOCR_ERROR_INVALID_ARGUMENT;
+    }
+    if (generated_capacity < state->max_new_tokens || token_history_capacity < state->prompt_token_count ||
+        token_history_capacity - state->prompt_token_count < state->max_new_tokens) {
+        return UOCR_ERROR_OUT_OF_MEMORY;
+    }
+    memcpy(token_history, state->prompt_tokens, (size_t)state->prompt_token_count * sizeof(int32_t));
+    state->generated_tokens = generated_tokens;
+    state->generated_capacity = generated_capacity;
+    state->token_history = token_history;
+    state->token_history_capacity = token_history_capacity;
+    state->token_history_count = state->prompt_token_count;
+    return UOCR_OK;
+}
+
+int uocr_sequence_no_repeat_config(const uocr_sequence_state *state,
+                                   uocr_no_repeat_ngram_config *out_config) {
+    if (out_config == NULL) {
+        return UOCR_ERROR_INVALID_ARGUMENT;
+    }
+    memset(out_config, 0, sizeof(*out_config));
+    if (state == NULL) {
+        return UOCR_ERROR_INVALID_ARGUMENT;
+    }
+    if (state->no_repeat_ngram_size == 0u) {
+        return UOCR_OK;
+    }
+    if (state->token_history != NULL) {
+        out_config->sequence = state->token_history;
+        out_config->sequence_len = state->token_history_count;
+    } else if (state->generated_count == 0u && state->prompt_tokens != NULL) {
+        out_config->sequence = state->prompt_tokens;
+        out_config->sequence_len = state->prompt_token_count;
+    } else {
+        return UOCR_ERROR_INVALID_ARGUMENT;
+    }
+    out_config->ngram_size = state->no_repeat_ngram_size;
+    out_config->window = state->no_repeat_window;
+    return UOCR_OK;
+}
+
 int uocr_sequence_generation_done(const uocr_sequence_state *state) {
     if (state == NULL) {
         return 1;
@@ -102,7 +156,12 @@ int uocr_sequence_accept_generated_token(uocr_sequence_state *state,
                                          int32_t token_id,
                                          int32_t *generated_tokens,
                                          uint32_t generated_capacity) {
-    if (state == NULL || generated_tokens == NULL) {
+    if (state == NULL) {
+        return UOCR_ERROR_INVALID_ARGUMENT;
+    }
+    int32_t *target_generated = generated_tokens != NULL ? generated_tokens : state->generated_tokens;
+    const uint32_t target_capacity = generated_tokens != NULL ? generated_capacity : state->generated_capacity;
+    if (target_generated == NULL) {
         return UOCR_ERROR_INVALID_ARGUMENT;
     }
     if (!sequence_token_id_valid(token_id)) {
@@ -111,14 +170,21 @@ int uocr_sequence_accept_generated_token(uocr_sequence_state *state,
     if (uocr_sequence_generation_done(state)) {
         return UOCR_ERROR_INVALID_ARGUMENT;
     }
-    if (state->generated_count >= generated_capacity) {
+    if (state->generated_count >= target_capacity) {
+        return UOCR_ERROR_OUT_OF_MEMORY;
+    }
+    if (state->token_history != NULL && state->token_history_count >= state->token_history_capacity) {
         return UOCR_ERROR_OUT_OF_MEMORY;
     }
     if (state->position == UINT32_MAX) {
         return UOCR_ERROR_INVALID_ARGUMENT;
     }
 
-    generated_tokens[state->generated_count] = token_id;
+    target_generated[state->generated_count] = token_id;
+    if (state->token_history != NULL) {
+        state->token_history[state->token_history_count] = token_id;
+        ++state->token_history_count;
+    }
     ++state->generated_count;
     ++state->position;
     if (token_id == UOCR_TOKEN_EOS) {

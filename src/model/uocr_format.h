@@ -52,6 +52,30 @@ typedef enum uocr_tensor_usage {
     UOCR_TENSOR_USAGE_OMITTED_WITH_REASON = 3
 } uocr_tensor_usage;
 
+typedef enum uocr_tensor_flags {
+    UOCR_TENSOR_FLAG_ROW_MAJOR = 1u << 0,
+    UOCR_TENSOR_FLAG_TRANSPOSED = 1u << 1,
+    UOCR_TENSOR_FLAG_FLATTENED_LEADING_DIM = 1u << 2
+} uocr_tensor_flags;
+
+typedef enum uocr_tensor_qtype_reason {
+    UOCR_TENSOR_QTYPE_REASON_UNKNOWN = 0,
+    UOCR_TENSOR_QTYPE_REASON_FP16_BASELINE = 1,
+    UOCR_TENSOR_QTYPE_REASON_POLICY = 2,
+    UOCR_TENSOR_QTYPE_REASON_SENSITIVE = 3,
+    UOCR_TENSOR_QTYPE_REASON_UNALIGNED = 4,
+    UOCR_TENSOR_QTYPE_REASON_CALIBRATION_DRIFT = 5,
+    UOCR_TENSOR_QTYPE_REASON_MANUAL_OVERRIDE = 6
+} uocr_tensor_qtype_reason;
+
+typedef enum uocr_tensor_promotion_reason {
+    UOCR_TENSOR_PROMOTION_NONE = 0,
+    UOCR_TENSOR_PROMOTION_SENSITIVE = 1,
+    UOCR_TENSOR_PROMOTION_UNALIGNED = 2,
+    UOCR_TENSOR_PROMOTION_CALIBRATION_DRIFT = 3,
+    UOCR_TENSOR_PROMOTION_MANUAL_OVERRIDE = 4
+} uocr_tensor_promotion_reason;
+
 typedef enum uocr_tensor_family {
     UOCR_TENSOR_FAMILY_UNKNOWN = 0,
     UOCR_TENSOR_FAMILY_TOK_EMBED = 1,
@@ -255,11 +279,11 @@ static inline uocr_config_record uocr_default_config_record(void) {
     cfg.rope_theta = UOCR_ROPE_THETA;
     cfg.max_positions = UOCR_MAX_POSITIONS;
     cfg.generated_ring_window = UOCR_GENERATED_RING_WINDOW;
-    cfg.dense_first_layers = 1u;
+    cfg.dense_first_layers = UOCR_DENSE_FIRST_LAYERS;
     cfg.routed_experts = UOCR_ROUTED_EXPERTS;
     cfg.moe_top_k = UOCR_MOE_TOP_K;
     cfg.moe_expert_intermediate = UOCR_MOE_EXPERT_INTERMEDIATE;
-    cfg.shared_experts = 2u;
+    cfg.shared_experts = UOCR_MOE_SHARED_EXPERTS;
     cfg.dense_layer0_intermediate = UOCR_DENSE_LAYER0_INTERMEDIATE;
     cfg.projector_in = UOCR_PROJECTOR_IN_SIZE;
     cfg.projector_out = UOCR_HIDDEN_SIZE;

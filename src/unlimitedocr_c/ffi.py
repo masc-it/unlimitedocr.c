@@ -12,7 +12,7 @@ from typing import Sequence
 import numpy as np
 from numpy.typing import NDArray
 
-from .frontend import PreparedRequest, project_root
+from .frontend import GLOBAL_VIEW_SIZE, LOCAL_VIEW_SIZE, PreparedRequest, project_root
 
 UOCR_OK = 0
 UOCR_ERROR_INVALID_ARGUMENT = -1
@@ -29,12 +29,18 @@ UOCR_VIEW_LOCAL = 1
 UOCR_MEMORY_MODEL_VIEWS = 0
 UOCR_MEMORY_KV_CACHE = 1
 UOCR_MEMORY_PROMPT_EMBEDDINGS = 2
-UOCR_MEMORY_VISION_SCRATCH = 3
-UOCR_MEMORY_DECODER_SCRATCH = 4
-UOCR_MEMORY_MOE_SCRATCH = 5
-UOCR_MEMORY_LOGITS_READBACK = 6
-UOCR_MEMORY_TRANSIENT_BUFFERS = 7
-UOCR_MEMORY_CATEGORY_COUNT = 8
+UOCR_MEMORY_VISION_GPU_WORKSPACE = 3
+UOCR_MEMORY_VISION_FINAL_FEATURES = 4
+UOCR_MEMORY_VISION_HOST_STAGING = 5
+UOCR_MEMORY_DECODER_SCRATCH = 6
+UOCR_MEMORY_MOE_SCRATCH = 7
+UOCR_MEMORY_LOGITS_READBACK = 8
+UOCR_MEMORY_TRANSIENT_BUFFERS = 9
+UOCR_MEMORY_CATEGORY_COUNT = 10
+UOCR_MEMORY_VISION_SCRATCH = UOCR_MEMORY_VISION_GPU_WORKSPACE
+
+UOCR_PROFILE_EVENT_NAME_SIZE = 64
+UOCR_PROFILE_MAX_EVENTS = 256
 
 
 class CMemoryReport(ct.Structure):
@@ -47,6 +53,9 @@ class CMemoryReport(ct.Structure):
         ("estimated_kv_cache_bytes", ct.c_uint64),
         ("estimated_prompt_embeddings_bytes", ct.c_uint64),
         ("estimated_vision_scratch_bytes", ct.c_uint64),
+        ("estimated_vision_gpu_workspace_bytes", ct.c_uint64),
+        ("estimated_vision_final_features_bytes", ct.c_uint64),
+        ("estimated_vision_host_staging_bytes", ct.c_uint64),
         ("estimated_decoder_scratch_bytes", ct.c_uint64),
         ("estimated_moe_scratch_bytes", ct.c_uint64),
         ("estimated_logits_readback_bytes", ct.c_uint64),
@@ -55,6 +64,39 @@ class CMemoryReport(ct.Structure):
         ("estimated_total_bytes", ct.c_uint64),
         ("memory_budget_bytes", ct.c_uint64),
         ("recommended_working_set_bytes", ct.c_uint64),
+        ("vision_workspace_capacity_bytes", ct.c_uint64),
+        ("vision_workspace_high_watermark_bytes", ct.c_uint64),
+    ]
+
+
+class CProfileEvent(ct.Structure):
+    _fields_ = [
+        ("name", ct.c_char * UOCR_PROFILE_EVENT_NAME_SIZE),
+        ("calls", ct.c_uint64),
+        ("total_ms", ct.c_double),
+        ("min_ms", ct.c_double),
+        ("max_ms", ct.c_double),
+    ]
+
+
+class CProfileReport(ct.Structure):
+    _fields_ = [
+        ("enabled", ct.c_uint32),
+        ("event_count", ct.c_uint32),
+        ("dropped_event_count", ct.c_uint32),
+        ("reserved0", ct.c_uint32),
+        ("generation_index", ct.c_uint64),
+        ("events", CProfileEvent * UOCR_PROFILE_MAX_EVENTS),
+        ("metal_buffer_allocation_count", ct.c_uint64),
+        ("metal_buffer_allocation_bytes", ct.c_uint64),
+        ("metal_command_buffer_count", ct.c_uint64),
+        ("metal_command_encoder_count", ct.c_uint64),
+        ("metal_command_buffer_wait_count", ct.c_uint64),
+        ("metal_mps_descriptor_count", ct.c_uint64),
+        ("metal_mps_ndarray_count", ct.c_uint64),
+        ("metal_nsarray_count", ct.c_uint64),
+        ("metal_transient_retain_object_count", ct.c_uint64),
+        ("memory", CMemoryReport),
     ]
 
 
@@ -91,6 +133,8 @@ class CEngineOpts(ct.Structure):
         ("max_batch", ct.c_uint32),
         ("max_prompt_tokens", ct.c_uint32),
         ("max_gen_tokens", ct.c_uint32),
+        ("profile", ct.c_uint32),
+        ("reserved0", ct.c_uint32),
         ("memory_budget_bytes", ct.c_uint64),
     ]
 
@@ -105,6 +149,9 @@ class MemoryReport:
     estimated_kv_cache_bytes: int
     estimated_prompt_embeddings_bytes: int
     estimated_vision_scratch_bytes: int
+    estimated_vision_gpu_workspace_bytes: int
+    estimated_vision_final_features_bytes: int
+    estimated_vision_host_staging_bytes: int
     estimated_decoder_scratch_bytes: int
     estimated_moe_scratch_bytes: int
     estimated_logits_readback_bytes: int
@@ -113,6 +160,72 @@ class MemoryReport:
     estimated_total_bytes: int
     memory_budget_bytes: int
     recommended_working_set_bytes: int
+    vision_workspace_capacity_bytes: int = 0
+    vision_workspace_high_watermark_bytes: int = 0
+
+
+@dataclass(frozen=True)
+class ProfileEvent:
+    name: str
+    calls: int
+    total_ms: float
+    min_ms: float
+    max_ms: float
+
+    def as_dict(self) -> dict[str, int | float | str]:
+        return {
+            "name": self.name,
+            "calls": self.calls,
+            "total_ms": self.total_ms,
+            "min_ms": self.min_ms,
+            "max_ms": self.max_ms,
+        }
+
+
+@dataclass(frozen=True)
+class ProfileReport:
+    enabled: bool
+    generation_index: int
+    events: tuple[ProfileEvent, ...]
+    dropped_event_count: int
+    metal_buffer_allocation_count: int
+    metal_buffer_allocation_bytes: int
+    metal_command_buffer_count: int
+    metal_command_encoder_count: int
+    metal_command_buffer_wait_count: int
+    metal_mps_descriptor_count: int
+    metal_mps_ndarray_count: int
+    metal_nsarray_count: int
+    metal_transient_retain_object_count: int
+    memory: MemoryReport
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "enabled": self.enabled,
+            "generation_index": self.generation_index,
+            "events": [event.as_dict() for event in self.events],
+            "dropped_event_count": self.dropped_event_count,
+            "metal_buffer_allocation_count": self.metal_buffer_allocation_count,
+            "metal_buffer_allocation_bytes": self.metal_buffer_allocation_bytes,
+            "metal_command_buffer_count": self.metal_command_buffer_count,
+            "metal_command_encoder_count": self.metal_command_encoder_count,
+            "metal_command_buffer_wait_count": self.metal_command_buffer_wait_count,
+            "metal_mps_descriptor_count": self.metal_mps_descriptor_count,
+            "metal_mps_ndarray_count": self.metal_mps_ndarray_count,
+            "metal_nsarray_count": self.metal_nsarray_count,
+            "metal_transient_retain_object_count": self.metal_transient_retain_object_count,
+            "memory": self.memory.__dict__,
+        }
+
+    def summary(self, *, limit: int = 12) -> str:
+        ordered = sorted(self.events, key=lambda event: event.total_ms, reverse=True)
+        event_bits = ", ".join(f"{event.name}={event.total_ms:.3f}ms/{event.calls}" for event in ordered[:limit])
+        return (
+            f"profile enabled={self.enabled} generation={self.generation_index} "
+            f"events=[{event_bits}] metal_buffers={self.metal_buffer_allocation_count} "
+            f"metal_commands={self.metal_command_buffer_count} encoders={self.metal_command_encoder_count} "
+            f"peak_memory={self.memory.total_peak_bytes}B"
+        )
 
 
 @dataclass(frozen=True)
@@ -124,6 +237,7 @@ class EngineOptions:
     max_prompt_tokens: int = 4096
     max_gen_tokens: int = 512
     memory_budget_bytes: int = 0
+    profile: bool = False
 
 
 @dataclass
@@ -184,6 +298,10 @@ def _bind_library(path: Path) -> ct.CDLL:
     lib.uocr_memory_category_name.restype = ct.c_char_p
     lib.uocr_engine_memory_report.argtypes = [ct.c_void_p, ct.POINTER(CMemoryReport)]
     lib.uocr_engine_memory_report.restype = ct.c_int
+    lib.uocr_engine_profile_report.argtypes = [ct.c_void_p, ct.POINTER(CProfileReport)]
+    lib.uocr_engine_profile_report.restype = ct.c_int
+    lib.uocr_engine_profile_reset.argtypes = [ct.c_void_p]
+    lib.uocr_engine_profile_reset.restype = ct.c_int
     lib.uocr_generate_prepared.argtypes = [ct.c_void_p, ct.POINTER(CPreparedRequest), ct.c_uint32, ct.POINTER(ct.c_void_p)]
     lib.uocr_generate_prepared.restype = ct.c_int
     lib.uocr_result_count.argtypes = [ct.c_void_p]
@@ -227,6 +345,87 @@ def _view_kind(kind: str) -> int:
     raise ValueError(f"unsupported view kind {kind!r}")
 
 
+def _validate_c_contiguous_array(name: str, array: np.ndarray, dtype: np.dtype[np.generic], ndim: int) -> None:
+    if array.dtype != dtype:
+        raise ValueError(f"{name} must have dtype {dtype}, got {array.dtype}")
+    if array.ndim != ndim:
+        raise ValueError(f"{name} must be {ndim}D, got shape {array.shape}")
+    if not array.flags.c_contiguous:
+        raise ValueError(f"{name} must be C-contiguous; v1 C ABI does not accept strides")
+
+
+def _validate_view_pixels(request: PreparedRequest) -> None:
+    for index, view in enumerate(request.views):
+        pixels = view.pixels
+        if view.format == "f16_nchw":
+            expected_dtype = np.dtype(np.float16)
+        elif view.format == "f32_nchw":
+            expected_dtype = np.dtype(np.float32)
+        else:
+            raise ValueError(f"unsupported pixel format {view.format!r}")
+        _validate_c_contiguous_array(f"view {index} pixels", pixels, expected_dtype, 3)
+        expected_shape = (3, int(view.height), int(view.width))
+        if pixels.shape != expected_shape:
+            raise ValueError(f"view {index} pixels must have shape {expected_shape}, got {pixels.shape}")
+        if view.kind == "global":
+            if view.width != GLOBAL_VIEW_SIZE or view.height != GLOBAL_VIEW_SIZE:
+                raise ValueError(
+                    f"global view {index} must be {GLOBAL_VIEW_SIZE}x{GLOBAL_VIEW_SIZE}, got {view.width}x{view.height}"
+                )
+        elif view.kind == "local":
+            if view.width != LOCAL_VIEW_SIZE or view.height != LOCAL_VIEW_SIZE:
+                raise ValueError(
+                    f"local view {index} must be {LOCAL_VIEW_SIZE}x{LOCAL_VIEW_SIZE}, got {view.width}x{view.height}"
+                )
+        else:
+            raise ValueError(f"unsupported view kind {view.kind!r}")
+
+
+def _validate_public_view_contract(request: PreparedRequest) -> None:
+    _validate_view_pixels(request)
+    if request.mode == "text-only":
+        if request.views:
+            raise ValueError("text-only requests must not include image views")
+        return
+    if request.mode == "base":
+        if request.crop_grid_w != 1 or request.crop_grid_h != 1:
+            raise ValueError(f"base image requests must use crop grid 1x1, got {request.crop_grid_w}x{request.crop_grid_h}")
+        if len(request.views) != 1 or request.views[0].kind != "global":
+            raise ValueError("base image requests must have exactly one global 1024x1024 view")
+        return
+    if request.mode == "multi-page-base":
+        if request.crop_grid_w != 1 or request.crop_grid_h != 1:
+            raise ValueError(
+                f"multi-page base requests must use crop grid 1x1, got {request.crop_grid_w}x{request.crop_grid_h}"
+            )
+        if not request.views:
+            raise ValueError("multi-page base requests require at least one global view")
+        for index, view in enumerate(request.views):
+            if view.kind != "global":
+                raise ValueError(f"multi-page base view {index} must be global")
+            if view.source_index != index:
+                raise ValueError(f"multi-page base view {index} must have source_index {index}, got {view.source_index}")
+        return
+    if request.mode == "gundam":
+        if request.crop_grid_w <= 0 or request.crop_grid_h <= 0:
+            raise ValueError(f"gundam requests require a positive crop grid, got {request.crop_grid_w}x{request.crop_grid_h}")
+        expected_locals = int(request.crop_grid_w) * int(request.crop_grid_h)
+        if expected_locals == 1:
+            if len(request.views) != 1 or request.views[0].kind != "global":
+                raise ValueError("gundam 1x1 requests must have exactly one global 1024x1024 view")
+            return
+        if len(request.views) != expected_locals + 1:
+            raise ValueError(
+                f"gundam crop grid {request.crop_grid_w}x{request.crop_grid_h} expects "
+                f"{expected_locals} local views plus one global view, got {len(request.views)} views"
+            )
+        for index, view in enumerate(request.views[:-1]):
+            if view.kind != "local":
+                raise ValueError(f"gundam crop view {index} must be local")
+        if request.views[-1].kind != "global":
+            raise ValueError("gundam crop final view must be the global view")
+
+
 def _copy_result_tokens(lib: ct.CDLL, result: ct.c_void_p) -> list[NDArray[np.int32]]:
     count = lib.uocr_result_count(result)
     outputs: list[NDArray[np.int32]] = []
@@ -242,17 +441,20 @@ def _copy_result_tokens(lib: ct.CDLL, result: ct.c_void_p) -> list[NDArray[np.in
 
 
 def as_c_request(request: PreparedRequest) -> _PreparedKeepalive:
-    input_ids = np.ascontiguousarray(request.input_ids, dtype=np.int32)
-    image_mask = np.ascontiguousarray(request.image_mask, dtype=np.uint8)
-    if input_ids.ndim != 1 or image_mask.ndim != 1 or input_ids.shape[0] != image_mask.shape[0]:
+    input_ids = request.input_ids
+    image_mask = request.image_mask
+    _validate_c_contiguous_array("input_ids", input_ids, np.dtype(np.int32), 1)
+    _validate_c_contiguous_array("image_mask", image_mask, np.dtype(np.uint8), 1)
+    if input_ids.shape[0] != image_mask.shape[0]:
         raise ValueError("input_ids and image_mask must be same-length 1D arrays")
+    _validate_public_view_contract(request)
 
     view_pixels: list[NDArray[np.float16] | NDArray[np.float32]] = []
     c_views: ct.Array[CImageView] | None = None
     if request.views:
         c_views = (CImageView * len(request.views))()
         for i, view in enumerate(request.views):
-            pixels = np.ascontiguousarray(view.pixels)
+            pixels = view.pixels
             view_pixels.append(pixels)
             c_views[i] = CImageView(
                 pixels=ct.c_void_p(int(pixels.ctypes.data)),
@@ -279,6 +481,7 @@ def as_c_request(request: PreparedRequest) -> _PreparedKeepalive:
 
 class Engine:
     def __init__(self, options: EngineOptions | None = None, *, library_path: str | Path | None = None) -> None:
+        self._handle: ct.c_void_p | None = None
         self._lib = load_library(library_path)
         opts = options or EngineOptions()
         c_opts = CEngineOpts(
@@ -288,6 +491,8 @@ class Engine:
             max_batch=opts.max_batch,
             max_prompt_tokens=opts.max_prompt_tokens,
             max_gen_tokens=opts.max_gen_tokens,
+            profile=1 if opts.profile else 0,
+            reserved0=0,
             memory_budget_bytes=opts.memory_budget_bytes,
         )
         self._handle = self._lib.uocr_engine_open(ct.byref(c_opts))
@@ -303,11 +508,8 @@ class Engine:
         raw = self._lib.uocr_memory_category_name(category)
         return raw.decode("utf-8") if raw else ""
 
-    def memory_report(self) -> MemoryReport:
-        report = CMemoryReport()
-        status = self._lib.uocr_engine_memory_report(self._handle, ct.byref(report))
-        if status != UOCR_OK:
-            raise RuntimeError(f"uocr_engine_memory_report failed ({status}): {self.last_error()}")
+    @staticmethod
+    def _memory_report_from_c(report: CMemoryReport) -> MemoryReport:
         return MemoryReport(
             category_live_bytes=tuple(int(report.category_live_bytes[i]) for i in range(UOCR_MEMORY_CATEGORY_COUNT)),
             category_peak_bytes=tuple(int(report.category_peak_bytes[i]) for i in range(UOCR_MEMORY_CATEGORY_COUNT)),
@@ -317,6 +519,9 @@ class Engine:
             estimated_kv_cache_bytes=int(report.estimated_kv_cache_bytes),
             estimated_prompt_embeddings_bytes=int(report.estimated_prompt_embeddings_bytes),
             estimated_vision_scratch_bytes=int(report.estimated_vision_scratch_bytes),
+            estimated_vision_gpu_workspace_bytes=int(report.estimated_vision_gpu_workspace_bytes),
+            estimated_vision_final_features_bytes=int(report.estimated_vision_final_features_bytes),
+            estimated_vision_host_staging_bytes=int(report.estimated_vision_host_staging_bytes),
             estimated_decoder_scratch_bytes=int(report.estimated_decoder_scratch_bytes),
             estimated_moe_scratch_bytes=int(report.estimated_moe_scratch_bytes),
             estimated_logits_readback_bytes=int(report.estimated_logits_readback_bytes),
@@ -325,11 +530,61 @@ class Engine:
             estimated_total_bytes=int(report.estimated_total_bytes),
             memory_budget_bytes=int(report.memory_budget_bytes),
             recommended_working_set_bytes=int(report.recommended_working_set_bytes),
+            vision_workspace_capacity_bytes=int(report.vision_workspace_capacity_bytes),
+            vision_workspace_high_watermark_bytes=int(report.vision_workspace_high_watermark_bytes),
+        )
+
+    def memory_report(self) -> MemoryReport:
+        report = CMemoryReport()
+        status = self._lib.uocr_engine_memory_report(self._handle, ct.byref(report))
+        if status != UOCR_OK:
+            raise RuntimeError(f"uocr_engine_memory_report failed ({status}): {self.last_error()}")
+        return self._memory_report_from_c(report)
+
+    def profile_reset(self) -> None:
+        status = self._lib.uocr_engine_profile_reset(self._handle)
+        if status != UOCR_OK:
+            raise RuntimeError(f"uocr_engine_profile_reset failed ({status}): {self.last_error()}")
+
+    def profile_report(self) -> ProfileReport:
+        report = CProfileReport()
+        status = self._lib.uocr_engine_profile_report(self._handle, ct.byref(report))
+        if status != UOCR_OK:
+            raise RuntimeError(f"uocr_engine_profile_report failed ({status}): {self.last_error()}")
+        event_count = min(int(report.event_count), UOCR_PROFILE_MAX_EVENTS)
+        events = []
+        for i in range(event_count):
+            event = report.events[i]
+            events.append(
+                ProfileEvent(
+                    name=bytes(event.name).split(b"\0", 1)[0].decode("utf-8", errors="replace"),
+                    calls=int(event.calls),
+                    total_ms=float(event.total_ms),
+                    min_ms=float(event.min_ms),
+                    max_ms=float(event.max_ms),
+                )
+            )
+        return ProfileReport(
+            enabled=bool(report.enabled),
+            generation_index=int(report.generation_index),
+            events=tuple(events),
+            dropped_event_count=int(report.dropped_event_count),
+            metal_buffer_allocation_count=int(report.metal_buffer_allocation_count),
+            metal_buffer_allocation_bytes=int(report.metal_buffer_allocation_bytes),
+            metal_command_buffer_count=int(report.metal_command_buffer_count),
+            metal_command_encoder_count=int(report.metal_command_encoder_count),
+            metal_command_buffer_wait_count=int(report.metal_command_buffer_wait_count),
+            metal_mps_descriptor_count=int(report.metal_mps_descriptor_count),
+            metal_mps_ndarray_count=int(report.metal_mps_ndarray_count),
+            metal_nsarray_count=int(report.metal_nsarray_count),
+            metal_transient_retain_object_count=int(report.metal_transient_retain_object_count),
+            memory=self._memory_report_from_c(report.memory),
         )
 
     def close(self) -> None:
-        if self._handle:
-            self._lib.uocr_engine_close(self._handle)
+        handle = getattr(self, "_handle", None)
+        if handle:
+            self._lib.uocr_engine_close(handle)
             self._handle = None
 
     def __enter__(self) -> "Engine":

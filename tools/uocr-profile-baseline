@@ -1,0 +1,7 @@
+#!/usr/bin/env python3
+"""Capture the docs/test.png public OCR profile baseline JSON."""
+
+from unlimitedocr_c.profile_baseline import main
+
+if __name__ == "__main__":
+    raise SystemExit(main())
