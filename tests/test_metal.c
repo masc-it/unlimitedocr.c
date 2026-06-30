@@ -11916,6 +11916,33 @@ static int test_metal_moe_interleaved_experts_combine_f16(void) {
         CHECK(fabsf(f16_bits_to_f32(out[i]) - f16_bits_to_f32(expected[i])) < 1.0e-3f);
     }
 
+    memset(out, 0, sizeof(out));
+    int decode_ok = uocr_metal_context_diagnostic_moe_interleaved_experts_combine_f16(ctx,
+                                                                 input,
+                                                                 top_ids,
+                                                                 top_weights,
+                                                                 gate_weight,
+                                                                 up_weight,
+                                                                 down_weight,
+                                                                 shared,
+                                                                 residual,
+                                                                 1u,
+                                                                 HIDDEN,
+                                                                 INTERMEDIATE,
+                                                                 EXPERTS,
+                                                                 TOP_K,
+                                                                 out,
+                                                                 error,
+                                                                 sizeof(error));
+    if (!decode_ok) {
+        fprintf(stderr, "decode-only MoE fused-combine diagnostic failed: %s\n", error);
+    }
+    CHECK(decode_ok == 1);
+    CHECK(error[0] == '\0');
+    for (uint32_t i = 0u; i < (uint32_t)HIDDEN; ++i) {
+        CHECK(fabsf(f16_bits_to_f32(out[i]) - f16_bits_to_f32(expected[i])) < 1.0e-3f);
+    }
+
     uint32_t bad_ids[TOKENS * TOP_K];
     memcpy(bad_ids, top_ids, sizeof(bad_ids));
     bad_ids[2] = EXPERTS;

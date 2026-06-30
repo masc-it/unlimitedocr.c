@@ -109,7 +109,7 @@ Completion notes:
 
 ## 3. Add Decode-Only MoE Kernel Variants
 
-Status: [ ] Not started
+Status: [x] Completed
 
 Details:
 - Add kernels dedicated to `n_tokens == 1` decode rather than reusing prefill kernels.
@@ -128,6 +128,22 @@ Acceptance criteria:
 - Prefill path continues using prompt-sized kernels.
 - Fallback to existing kernels remains available for debugging.
 - `metal.decode.moe_*` profile time is equal or lower.
+
+Completion notes:
+- Added decode-only routed MoE kernel entry points for the `n_tokens == 1` path:
+  - `uocr_moe_decode_interleaved_gate_up_one_f16`
+  - `uocr_moe_decode_interleaved_down_sum_combine_one_f16_to_f16`
+- The default decode path now dispatches the decode-specific gate/up entry point and continues to use the fused decode down/combine kernel from Task 2. The fully stripped down/combine-one variant is retained for diagnostics/follow-up because measurements showed the conservative fused path was faster on the current GPU.
+- Prefill remains on `uocr_moe_prefill_interleaved_gate_up_f16` and `uocr_moe_prefill_interleaved_down_sum_f16_to_f16`.
+- Added function-constant IDs for MoE expert/shared intermediate sizes for future decode-specialized kernels, following MSL p190-p193 scalar function-constant rules.
+- Focused parity coverage: `UOCR_METAL_TEST_FILTER=moe_interleaved_experts_combine_f16 ./build/test/test_metal` now exercises the decode-only `n_tokens == 1` diagnostic path.
+- Final Release probe artifacts:
+  - `data.tmp/probes/e2e_base_moe_decode_kernels.json`
+  - `data.tmp/probes/e2e_gundam_moe_decode_kernels.json`
+  - `data.tmp/probes/moe_decode_kernel_results.md`
+- Final probe summary versus Task 2:
+  - `base`: text parity true, 44 generated tokens, 7.058 native tok/s, decode loop `656.497 -> 653.218` ms, `metal.decode.moe_combine` absent; routed MoE stayed effectively neutral within the tiny profile bucket (`2.452 -> 2.493` ms over 473 calls).
+  - `gundam`: text parity true, 58 generated tokens, 1.515 native tok/s, layer kernels `36.500 -> 36.229` ms, `metal.decode.moe_combine` absent; routed MoE stayed effectively neutral within the tiny profile bucket (`3.335 -> 3.386` ms over 627 calls).
 
 ## 4. Replace Router Bitonic Sort with Deterministic Top-6 Selection
 
