@@ -5017,3 +5017,78 @@ kernel void uocr_mpp_matmul2d_f16_64x32_prototype(tensor<device half, dextents<i
     op.run(tile_a, tile_b, tile_c);
 }
 #endif
+
+/*
+ * Transpose BHWC → NCHW for fp16 tensors.
+ * input[batch][spatial][channels]  →  output[batch][channels][spatial]
+ *
+ * Dispatch:  (spatial, channels, batch)  as thread_position_in_grid.
+ */
+struct UocrTransposeBhwcToNchwDims {
+    uint batch_size;
+    uint spatial;
+    uint channels;
+};
+
+kernel void uocr_bhwc_to_nchw_f16(device const half *bhwc [[buffer(0)]],
+                                   device half *nchw [[buffer(1)]],
+                                   constant UocrTransposeBhwcToNchwDims &dims [[buffer(2)]],
+                                   uint3 gid [[thread_position_in_grid]]) {
+    const uint s = gid.x;
+    const uint c = gid.y;
+    const uint b = gid.z;
+    if (s >= dims.spatial || c >= dims.channels || b >= dims.batch_size) {
+        return;
+    }
+    const ulong src = ((ulong(b) * ulong(dims.spatial) + ulong(s)) * ulong(dims.channels) + ulong(c));
+    const ulong dst = ((ulong(b) * ulong(dims.channels) + ulong(c)) * ulong(dims.spatial) + ulong(s));
+    nchw[dst] = bhwc[src];
+}
+
+/*
+ * Extract non-overlapping 16x16 patches from an NCHW fp16 pixel buffer into
+ * row-major [B*grid_h*grid_w, 768] layout for MPS matmul with the SAM patch
+ * weight [768, 3*16*16].
+ *
+ * pixels  — NCHW fp16 [batch, 3, height, width]
+ * patches_out — row-major fp16 [batch * grid_h * grid_w, 768], contiguous.
+ * inner = channel * 256 + ky * 16 + kx  (0..767).
+ *
+ * Dispatch:  (inner, batch * patches)  as thread_position_in_grid.
+ */
+struct UocrExtractPatchesDims {
+    uint height;
+    uint width;
+    uint grid_h;
+    uint grid_w;
+};
+
+kernel void uocr_sam_extract_patches_f16(device const half *pixels [[buffer(0)]],
+                                         device half *patches_out [[buffer(1)]],
+                                         constant UocrExtractPatchesDims &dims [[buffer(2)]],
+                                         uint2 gid [[thread_position_in_grid]]) {
+    const uint inner = gid.x;
+    const uint patch = gid.y;
+    const uint patches_per_view = dims.grid_h * dims.grid_w;
+    if (inner >= 768u || patches_per_view == 0u) {
+        return;
+    }
+    const uint batch = patch / patches_per_view;
+    const uint patch_in_view = patch - batch * patches_per_view;
+    const uint patch_y = patch_in_view / dims.grid_w;
+    const uint patch_x = patch_in_view - patch_y * dims.grid_w;
+    const uint c = inner / 256u;
+    const uint rem = inner - c * 256u;
+    const uint ky = rem / 16u;
+    const uint kx = rem - ky * 16u;
+    const uint py = patch_y * 16u + ky;
+    const uint px = patch_x * 16u + kx;
+    if (py >= dims.height || px >= dims.width) {
+        return;
+    }
+    const ulong pixel_offset = (ulong(batch) * 3ul * ulong(dims.height) * ulong(dims.width) +
+                                ulong(c) * ulong(dims.height) * ulong(dims.width) +
+                                ulong(py) * ulong(dims.width) + ulong(px));
+    const ulong patch_offset = ulong(patch) * 768ul + ulong(inner);
+    patches_out[patch_offset] = pixels[pixel_offset];
+}

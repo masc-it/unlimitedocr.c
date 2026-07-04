@@ -386,6 +386,25 @@ static int metal_context_ensure_scratch_accounted(uocr_metal_context *ctx,
                                                   size_t error_size);
 static void metal_clear_mps_weight_ndarray_cache(uocr_metal_context *ctx);
 static void metal_clear_mps_workspace_ndarray_cache(uocr_metal_context *ctx);
+static int metal_mps_matmul_nt_f16_should_use(uint32_t rows, uint32_t in_features, uint32_t out_features);
+static int metal_run_bias_add_f16_inplace(uocr_metal_context *ctx,
+                                          uocr_metal_buffer_slice dst,
+                                          uocr_metal_buffer_slice bias,
+                                          uint32_t rows,
+                                          uint32_t cols,
+                                          const char *op_name,
+                                          char *error,
+                                          size_t error_size);
+static int metal_run_mps_matmul_nt_f16(uocr_metal_context *ctx,
+                                       uocr_metal_buffer_slice input,
+                                       uocr_metal_buffer_slice weight_nk,
+                                       uocr_metal_buffer_slice dst,
+                                       uint32_t rows,
+                                       uint32_t in_features,
+                                       uint32_t out_features,
+                                       const char *op_name,
+                                       char *error,
+                                       size_t error_size);
 static int metal_prebuild_mps_runtime_workspace_ndarrays(uocr_metal_context *ctx,
                                                          uint32_t n_tokens,
                                                          char *error,
@@ -4969,6 +4988,68 @@ static int metal_context_sam_neck_conv1x1_batch_f16_to_slice(uocr_metal_context 
     }
 }
 
+/*
+ * BHWC → NCHW transpose helper for fp16 vision tensors.
+ * input[batch][spatial][channels]  →  output[batch][channels][spatial]
+ *
+ * Takes raw buffer slices (no f16 pointer required) since this is a pure GPU
+ * operation called from the MPS conv1x1 path where the intermediate buffer
+ * may be private or temporary.
+ */
+static int metal_context_bhwc_to_nchw_f16(uocr_metal_context *ctx,
+                                           uocr_metal_buffer_slice input_bhwc,
+                                           uint32_t batch_size,
+                                           uint32_t spatial,
+                                           uint32_t channels,
+                                           uocr_metal_buffer_slice out_nchw,
+                                           char *error,
+                                           size_t error_size) {
+    uint64_t input_values = 0u;
+    uint64_t input_bytes = 0u;
+    uint64_t output_values = 0u;
+    uint64_t output_bytes = 0u;
+    if (!checked_mul_u64((uint64_t)batch_size, (uint64_t)spatial, &input_values) ||
+        !checked_mul_u64(input_values, (uint64_t)channels, &input_values) ||
+        !metal_vision_f16_bytes(input_values, &input_bytes) ||
+        !checked_mul_u64((uint64_t)batch_size, (uint64_t)channels, &output_values) ||
+        !checked_mul_u64(output_values, (uint64_t)spatial, &output_values) ||
+        !metal_vision_f16_bytes(output_values, &output_bytes) ||
+        !metal_slice_valid(input_bhwc, input_bytes) ||
+        !metal_slice_valid(out_nchw, output_bytes)) {
+        return metal_fail(error, error_size, "invalid Metal BHWC→NCHW transpose request");
+    }
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, "uocr_bhwc_to_nchw_f16", error, error_size);
+        if (pipeline == nil) {
+            return 0;
+        }
+        int owned_command_buffer = 0;
+        id<MTLCommandBuffer> cb = metal_command_buffer_for_op(ctx, &owned_command_buffer, "Metal BHWC→NCHW transpose", error, error_size);
+        if (cb == nil) {
+            return 0;
+        }
+        if (owned_command_buffer) {
+            cb.label = @"uocr_bhwc_to_nchw_transpose_command_buffer";
+        }
+        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
+        if (enc == nil) {
+            return metal_fail(error, error_size, "failed to create Metal BHWC→NCHW transpose encoder");
+        }
+        struct { uint32_t batch_size; uint32_t spatial; uint32_t channels; } dims;
+        dims.batch_size = batch_size;
+        dims.spatial = spatial;
+        dims.channels = channels;
+        [enc setComputePipelineState:pipeline];
+        [enc setBuffer:input_bhwc.buffer offset:input_bhwc.offset atIndex:0u];
+        [enc setBuffer:out_nchw.buffer offset:out_nchw.offset atIndex:1u];
+        [enc setBytes:&dims length:sizeof(dims) atIndex:2u];
+        [enc dispatchThreads:MTLSizeMake((NSUInteger)spatial, (NSUInteger)channels, (NSUInteger)batch_size)
+       threadsPerThreadgroup:MTLSizeMake(1u, 1u, 1u)];
+        [enc endEncoding];
+        return metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, "Metal BHWC→NCHW transpose", error, error_size);
+    }
+}
+
 static int metal_context_sam_layernorm2d_batch_f16_to_slice(uocr_metal_context *ctx,
                                                            uocr_metal_vision_workspace_slice input_nchw,
                                                            uocr_metal_vision_tensor_f16 weight,
@@ -5229,16 +5310,71 @@ static int metal_context_sam_neck_batch_f16_to_slice(uocr_metal_vision_project_c
     } while (0)
 
     const uint64_t sam_neck_start_ns = uocr_profile_now_ns();
-    RUN_BATCHED_SAM_NECK_STEP("SAM neck 1x1 convolution",
-                              metal_context_sam_neck_conv1x1_batch_f16_to_slice(ctx,
-                                                                                 input_bhwc,
-                                                                                 weights->sam_neck_conv1x1_weight,
-                                                                                 grid_w,
-                                                                                 grid_h,
-                                                                                 view_count,
-                                                                                 scratch->sam_neck_a_nchw,
-                                                                                 error,
-                                                                                 error_size));
+    /*
+     * Conv1x1 is a dense matrix multiply: BHWC [B*S, 768] @ weight [256, 768]^T.
+     * Use MPS matmul (produces BHWC output) then transpose to NCHW for the
+     * subsequent layernorm2d / conv3x3 stages.
+     */
+    const uint32_t conv1x1_spatial = grid_w * grid_h;
+    const uint32_t conv1x1_rows = conv1x1_spatial * view_count;
+    if (metal_mps_matmul_nt_f16_should_use(conv1x1_rows, UOCR_SAM_HIDDEN_SIZE, UOCR_SAM_NECK_CHANNELS)) {
+        const uint64_t temp_bytes = (uint64_t)conv1x1_rows * (uint64_t)UOCR_SAM_NECK_CHANNELS * 2u;
+        if (temp_bytes > (uint64_t)SIZE_MAX) {
+            return metal_fail(error, error_size, "Metal SAM neck 1x1 MPS temp buffer size overflow");
+        }
+        id<MTLBuffer> temp = nil;
+        @autoreleasepool {
+            temp = metal_new_buffer_with_length(ctx, (NSUInteger)temp_bytes, MTLResourceStorageModePrivate);
+            if (temp == nil) {
+                return metal_fail(error, error_size, "failed to allocate Metal SAM neck 1x1 MPS temp buffer");
+            }
+            temp.label = @"uocr_sam_neck_conv1x1_mps_temp";
+        }
+        uocr_metal_buffer_slice input_slice = { input_bhwc.buffer, input_bhwc.offset };
+        uocr_metal_buffer_slice weight_slice = { weights->sam_neck_conv1x1_weight.slice.buffer,
+                                                  weights->sam_neck_conv1x1_weight.slice.offset };
+        uocr_metal_buffer_slice temp_slice = { temp, 0u };
+        const int mps_ok = metal_run_mps_matmul_nt_f16(ctx,
+                                                       input_slice,
+                                                       weight_slice,
+                                                       temp_slice,
+                                                       conv1x1_rows,
+                                                       UOCR_SAM_HIDDEN_SIZE,
+                                                       UOCR_SAM_NECK_CHANNELS,
+                                                       "Metal SAM neck 1x1 MPS matmul",
+                                                       error,
+                                                       error_size);
+        if (mps_ok) {
+            uocr_metal_buffer_slice temp_bhwc = { temp, 0u };
+            uocr_metal_buffer_slice out_nchw_slice = { scratch->sam_neck_a_nchw.buffer, scratch->sam_neck_a_nchw.offset };
+            int transpose_ok = metal_context_bhwc_to_nchw_f16(ctx,
+                                                              temp_bhwc,
+                                                              view_count,
+                                                              conv1x1_spatial,
+                                                              UOCR_SAM_NECK_CHANNELS,
+                                                              out_nchw_slice,
+                                                              error,
+                                                              error_size);
+            [temp release];
+            if (!transpose_ok) {
+                return metal_fail(error, error_size, "Metal SAM neck 1x1 MPS transpose failed");
+            }
+        } else {
+            [temp release];
+            return 0;
+        }
+    } else {
+        RUN_BATCHED_SAM_NECK_STEP("SAM neck 1x1 convolution (fallback)",
+                                  metal_context_sam_neck_conv1x1_batch_f16_to_slice(ctx,
+                                                                                     input_bhwc,
+                                                                                     weights->sam_neck_conv1x1_weight,
+                                                                                     grid_w,
+                                                                                     grid_h,
+                                                                                     view_count,
+                                                                                     scratch->sam_neck_a_nchw,
+                                                                                     error,
+                                                                                     error_size));
+    }
     RUN_BATCHED_SAM_NECK_STEP("SAM neck LayerNorm2d-1",
                               metal_context_sam_layernorm2d_batch_f16_to_slice(ctx,
                                                                                scratch->sam_neck_a_nchw,
@@ -5996,78 +6132,116 @@ static int metal_context_sam_patch_embed_batch_f16_to_slice(uocr_metal_vision_pr
                    (size_t)pixel_bytes_per_view);
         }
 
-        const char *function_name = first->format == UOCR_PIXEL_F16_NCHW ?
-                                        "uocr_sam_patch_embed_f16_input" :
-                                        "uocr_sam_patch_embed_f32_input";
-        id<MTLComputePipelineState> pipeline = metal_get_pipeline(project->ctx, function_name, error, error_size);
-        if (pipeline == nil) {
-            [pixel_buffer release];
-            return 0;
-        }
-        const NSUInteger threads_x = metal_power2_threadgroup_width(256u, pipeline.maxTotalThreadsPerThreadgroup);
-        const uint64_t partial_bytes = (uint64_t)threads_x * (uint64_t)sizeof(float);
-        if (partial_bytes > (uint64_t)project->ctx->device.maxThreadgroupMemoryLength) {
-            [pixel_buffer release];
-            return metal_fail(error, error_size, "Metal batched SAM patch tiled reduction exceeds threadgroup memory limit");
-        }
-
-        int owned_command_buffer = 0;
-        id<MTLCommandBuffer> cb = metal_command_buffer_for_op(project->ctx,
-                                                              &owned_command_buffer,
-                                                              "Metal batched SAM patch",
-                                                              error,
-                                                              error_size);
-        if (cb == nil) {
-            [pixel_buffer release];
-            return 0;
-        }
-        if (owned_command_buffer) {
-            cb.label = @"uocr_sam_patch_embed_batch_command_buffer";
-        }
-        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(project->ctx, cb);
-        if (enc == nil) {
-            [pixel_buffer release];
-            return metal_fail(error, error_size, "failed to create Metal batched SAM patch encoder");
+        /*
+         * Replace the direct-convolution patch embed with:
+         *   1. Extract non-overlapping 16x16 patches from NCHW pixels
+         *      into row-major [B*patches, 768].
+         *   2. MPS matmul: patches @ weight^T  →  out_bhwc [B*patches, 768].
+         *   3. Add bias in-place.
+         *
+         * The custom kernel (threadgroup reduction) was slower than MPS matmul
+         * for these non-overlapping patches.
+         */
+        const uint32_t total_patches = (uint32_t)output_patches * chunk->view_count;
+        const uint64_t temp_patch_bytes = (uint64_t)total_patches * 768u * 2u;
+        id<MTLBuffer> patch_buffer = nil;
+        @autoreleasepool {
+            patch_buffer = metal_new_buffer_with_length(project->ctx, (NSUInteger)temp_patch_bytes, MTLResourceStorageModePrivate);
+            if (patch_buffer == nil) {
+                [pixel_buffer release];
+                return metal_fail(error, error_size, "failed to allocate Metal SAM patch extraction temp buffer");
+            }
+            patch_buffer.label = @"uocr_sam_patch_extraction_temp";
         }
 
-        uocr_metal_sam_patch_embed_params params;
-        memset(&params, 0, sizeof(params));
-        params.width = first->width;
-        params.height = first->height;
-        params.out_width = grid_w;
-        params.out_height = grid_h;
-        params.has_bias = 1u;
+        /* Step 1: extract patches */
+        {
+            id<MTLComputePipelineState> extract_pipeline = metal_get_pipeline(project->ctx, "uocr_sam_extract_patches_f16", error, error_size);
+            if (extract_pipeline == nil) {
+                [patch_buffer release];
+                [pixel_buffer release];
+                return 0;
+            }
+            int owned = 0;
+            id<MTLCommandBuffer> cb = metal_command_buffer_for_op(project->ctx, &owned, "Metal SAM patch extraction", error, error_size);
+            if (cb == nil) {
+                [patch_buffer release];
+                [pixel_buffer release];
+                return 0;
+            }
+            id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(project->ctx, cb);
+            if (enc == nil) {
+                [patch_buffer release];
+                [pixel_buffer release];
+                return metal_fail(error, error_size, "failed to create Metal SAM patch extraction encoder");
+            }
+            struct { uint32_t height; uint32_t width; uint32_t grid_h; uint32_t grid_w; } dims;
+            dims.height = first->height;
+            dims.width = first->width;
+            dims.grid_h = grid_h;
+            dims.grid_w = grid_w;
+            [enc setComputePipelineState:extract_pipeline];
+            [enc setBuffer:pixel_buffer offset:0u atIndex:0u];
+            [enc setBuffer:patch_buffer offset:0u atIndex:1u];
+            [enc setBytes:&dims length:sizeof(dims) atIndex:2u];
+            [enc dispatchThreads:MTLSizeMake(768u, (NSUInteger)total_patches, 1u)
+           threadsPerThreadgroup:MTLSizeMake(32u, 1u, 1u)];
+            [enc endEncoding];
+            const int extract_ok = metal_finish_command_buffer_for_op(project->ctx, cb, owned, "Metal SAM patch extraction", error, error_size);
+            if (!extract_ok) {
+                [patch_buffer release];
+                [pixel_buffer release];
+                return 0;
+            }
+        }
 
-        [enc setComputePipelineState:pipeline];
-        [enc setBuffer:pixel_buffer offset:0u atIndex:0u];
-        [enc setBuffer:project->weights->sam_patch_weight.slice.buffer offset:project->weights->sam_patch_weight.slice.offset atIndex:1u];
-        [enc setBuffer:project->weights->sam_patch_bias.slice.buffer offset:project->weights->sam_patch_bias.slice.offset atIndex:2u];
-        [enc setBuffer:out_bhwc.buffer offset:out_bhwc.offset atIndex:3u];
-        [enc setBytes:&params length:sizeof(params) atIndex:4u];
-        [enc setThreadgroupMemoryLength:(NSUInteger)partial_bytes atIndex:0u];
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)UOCR_SAM_HIDDEN_SIZE,
-                                              (NSUInteger)output_patches,
-                                              (NSUInteger)chunk->view_count)
-             threadsPerThreadgroup:MTLSizeMake(threads_x, 1u, 1u)];
-        [enc endEncoding];
-        if (!owned_command_buffer &&
-            !metal_retain_transient_until_completed(project->ctx, cb, pixel_buffer, error, error_size)) {
-            [pixel_buffer release];
-            return 0;
+        /* Step 2: MPS matmul  patches @ weight^T  →  out_bhwc */
+        {
+            uocr_metal_buffer_slice patch_slice = { patch_buffer, 0u };
+            uocr_metal_buffer_slice weight_slice = { project->weights->sam_patch_weight.slice.buffer,
+                                                     project->weights->sam_patch_weight.slice.offset };
+            uocr_metal_buffer_slice out_slice = { out_bhwc.buffer, out_bhwc.offset };
+            if (!metal_run_mps_matmul_nt_f16(project->ctx,
+                                             patch_slice,
+                                             weight_slice,
+                                             out_slice,
+                                             total_patches,
+                                             768u,
+                                             UOCR_SAM_HIDDEN_SIZE,
+                                             "Metal SAM patch embed MPS matmul",
+                                             error,
+                                             error_size)) {
+                [patch_buffer release];
+                [pixel_buffer release];
+                return 0;
+            }
         }
-        const int ok = metal_finish_command_buffer_for_op(project->ctx,
-                                                          cb,
-                                                          owned_command_buffer,
-                                                          "Metal batched SAM patch",
-                                                          error,
-                                                          error_size);
-        if (ok) {
-            *out_grid_w = grid_w;
-            *out_grid_h = grid_h;
-            metal_clear_error(error, error_size);
+
+        /* Step 3: bias add in-place */
+        {
+            uocr_metal_buffer_slice out_slice = { out_bhwc.buffer, out_bhwc.offset };
+            uocr_metal_buffer_slice bias_slice = { project->weights->sam_patch_bias.slice.buffer,
+                                                    project->weights->sam_patch_bias.slice.offset };
+            if (!metal_run_bias_add_f16_inplace(project->ctx,
+                                                out_slice,
+                                                bias_slice,
+                                                total_patches,
+                                                UOCR_SAM_HIDDEN_SIZE,
+                                                "Metal SAM patch embed bias",
+                                                error,
+                                                error_size)) {
+                [patch_buffer release];
+                [pixel_buffer release];
+                return 0;
+            }
         }
+
+        [patch_buffer release];
         [pixel_buffer release];
-        return ok;
+        *out_grid_w = grid_w;
+        *out_grid_h = grid_h;
+        metal_clear_error(error, error_size);
+        return 1;
     }
 }
 
