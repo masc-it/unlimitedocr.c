@@ -4812,6 +4812,112 @@ kernel void uocr_sam_rel_pos_logits_f16_to_f32(device const half *q_src [[buffer
 
 #define UOCR_SAM_REL_POS_TILE_KEYS 16u
 
+kernel void uocr_sam_global_attention_pack_qkv_f16(device const half *q_src [[buffer(0)]],
+                                                   device const half *k_src [[buffer(1)]],
+                                                   device const half *v_src [[buffer(2)]],
+                                                   device half *q_pack [[buffer(3)]],
+                                                   device half *k_pack [[buffer(4)]],
+                                                   device half *vt_pack [[buffer(5)]],
+                                                   constant UocrSamRelPosAttentionParams &params [[buffer(6)]],
+                                                   uint gid [[thread_position_in_grid]]) {
+    const uint total = params.batch_size * params.windows * params.heads * params.tokens_per_window * params.head_dim;
+    if (gid >= total || params.windows == 0u || params.tokens_per_window == 0u || params.heads == 0u || params.head_dim == 0u) {
+        return;
+    }
+    uint rem = gid;
+    const uint dim = rem % params.head_dim;
+    rem /= params.head_dim;
+    const uint token = rem % params.tokens_per_window;
+    rem /= params.tokens_per_window;
+    const uint head = rem % params.heads;
+    rem /= params.heads;
+    const uint window = rem % params.windows;
+    const uint batch = rem / params.windows;
+    const uint logical_head = (batch * params.windows + window) * params.heads + head;
+    const ulong src_index = uocr_sam_rel_pos_attention_index(params, batch, window, token, head, dim);
+    const ulong pack_index = (ulong(logical_head) * ulong(params.tokens_per_window) + ulong(token)) * ulong(params.head_dim) + ulong(dim);
+    q_pack[pack_index] = q_src[src_index];
+    k_pack[pack_index] = k_src[src_index];
+    vt_pack[(ulong(logical_head) * ulong(params.head_dim) + ulong(dim)) * ulong(params.tokens_per_window) + ulong(token)] = v_src[src_index];
+}
+
+kernel void uocr_sam_global_attention_softmax_f32_to_f16(device const float *logits [[buffer(0)]],
+                                                         device const float *rel_h_logits [[buffer(1)]],
+                                                         device const float *rel_w_logits [[buffer(2)]],
+                                                         device half *probs [[buffer(3)]],
+                                                         constant UocrSamRelPosAttentionParams &params [[buffer(4)]],
+                                                         threadgroup float *partials [[threadgroup(0)]],
+                                                         uint3 tg [[threadgroup_position_in_grid]],
+                                                         uint tid [[thread_index_in_threadgroup]],
+                                                         uint3 ntg3 [[threads_per_threadgroup]],
+                                                         ushort simd_width_u16 [[threads_per_simdgroup]]) {
+    const uint ntg = ntg3.x;
+    const uint query = tg.x;
+    const uint logical_head = tg.y;
+    const uint logical_heads = params.batch_size * params.windows * params.heads;
+    if (query >= params.tokens_per_window || logical_head >= logical_heads || params.grid_width == 0u ||
+        params.tokens_per_window != params.grid_width * params.grid_height) {
+        return;
+    }
+    const uint simd_width = uint(simd_width_u16);
+    const ulong row_base = (ulong(logical_head) * ulong(params.tokens_per_window) + ulong(query)) * ulong(params.tokens_per_window);
+    const ulong rel_base = ulong(logical_head) * ulong(params.tokens_per_window) + ulong(query);
+
+    float local_max = UOCR_FLASH_NEG_INF;
+    for (uint key = tid; key < params.tokens_per_window; key += ntg) {
+        const uint key_y = key / params.grid_width;
+        const uint key_x = key - key_y * params.grid_width;
+        const float score = logits[row_base + ulong(key)] * params.scale +
+                            rel_h_logits[rel_base * ulong(params.grid_height) + ulong(key_y)] +
+                            rel_w_logits[rel_base * ulong(params.grid_width) + ulong(key_x)];
+        local_max = max(local_max, score);
+    }
+    const float row_max = uocr_threadgroup_max(local_max, partials, tid, ntg, simd_width);
+
+    float local_sum = 0.0f;
+    for (uint key = tid; key < params.tokens_per_window; key += ntg) {
+        const uint key_y = key / params.grid_width;
+        const uint key_x = key - key_y * params.grid_width;
+        const float score = logits[row_base + ulong(key)] * params.scale +
+                            rel_h_logits[rel_base * ulong(params.grid_height) + ulong(key_y)] +
+                            rel_w_logits[rel_base * ulong(params.grid_width) + ulong(key_x)];
+        local_sum += exp(score - row_max);
+    }
+    const float row_sum = uocr_threadgroup_sum(local_sum, partials, tid, ntg, simd_width);
+    const float inv_sum = row_sum > 0.0f ? 1.0f / row_sum : 0.0f;
+
+    for (uint key = tid; key < params.tokens_per_window; key += ntg) {
+        const uint key_y = key / params.grid_width;
+        const uint key_x = key - key_y * params.grid_width;
+        const float score = logits[row_base + ulong(key)] * params.scale +
+                            rel_h_logits[rel_base * ulong(params.grid_height) + ulong(key_y)] +
+                            rel_w_logits[rel_base * ulong(params.grid_width) + ulong(key_x)];
+        probs[row_base + ulong(key)] = half(exp(score - row_max) * inv_sum);
+    }
+}
+
+kernel void uocr_sam_global_attention_unpack_f16(device const half *out_pack [[buffer(0)]],
+                                                 device half *dst [[buffer(1)]],
+                                                 constant UocrSamRelPosAttentionParams &params [[buffer(2)]],
+                                                 uint gid [[thread_position_in_grid]]) {
+    const uint total = params.batch_size * params.windows * params.heads * params.tokens_per_window * params.head_dim;
+    if (gid >= total || params.windows == 0u || params.tokens_per_window == 0u || params.heads == 0u || params.head_dim == 0u) {
+        return;
+    }
+    uint rem = gid;
+    const uint dim = rem % params.head_dim;
+    rem /= params.head_dim;
+    const uint token = rem % params.tokens_per_window;
+    rem /= params.tokens_per_window;
+    const uint logical_head = rem;
+    const uint head = logical_head % params.heads;
+    const uint logical_window = logical_head / params.heads;
+    const uint batch = logical_window / params.windows;
+    const uint window = logical_window - batch * params.windows;
+    const ulong pack_index = (ulong(logical_head) * ulong(params.tokens_per_window) + ulong(token)) * ulong(params.head_dim) + ulong(dim);
+    dst[uocr_sam_rel_pos_attention_index(params, batch, window, token, head, dim)] = out_pack[pack_index];
+}
+
 kernel void uocr_sam_rel_pos_attention_tiled_precomputed_f16_to_f16(device const half *q_src [[buffer(0)]],
                                                                      device const half *k_src [[buffer(1)]],
                                                                      device const half *v_src [[buffer(2)]],
