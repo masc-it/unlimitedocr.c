@@ -10687,66 +10687,105 @@ static int metal_run_packed_qkv_mps_f16(uocr_metal_context *ctx,
                                          const char *op_name,
                                          char *error,
                                          size_t error_size) {
-    uint64_t projection_values = 0u;
-    uint64_t projection_bytes = 0u;
-    uint64_t hidden_bytes = 0u;
-    if (ctx == NULL || rows == 0u || hidden_size == 0u ||
-        !checked_mul_u64((uint64_t)hidden_size, (uint64_t)hidden_size, &projection_values) ||
-        !checked_mul_u64(projection_values, 2u, &projection_bytes) ||
-        !checked_mul_u64((uint64_t)hidden_size, 2u, &hidden_bytes) ||
-        projection_bytes > (uint64_t)NSUIntegerMax || hidden_bytes > (uint64_t)NSUIntegerMax) {
+    if (ctx == NULL || rows == 0u || hidden_size == 0u) {
         return metal_fail(error, error_size, "invalid %s MPS QKV request", op_name != NULL ? op_name : "Metal");
     }
-    const int had_active_batch = metal_command_batch_active(ctx);
-    if (!metal_command_batch_begin(ctx, error, error_size)) {
-        return 0;
+    const uint32_t qkv_size = hidden_size * 3u;
+    uint64_t qkv_values = 0u;
+    uint64_t qkv_bytes = 0u;
+    uint64_t weight_values = 0u;
+    uint64_t weight_bytes = 0u;
+    uint64_t bias_bytes = 0u;
+    if (!checked_mul_u64((uint64_t)rows, (uint64_t)qkv_size, &qkv_values) ||
+        !metal_vision_f16_bytes(qkv_values, &qkv_bytes) ||
+        !checked_mul_u64((uint64_t)qkv_size, (uint64_t)hidden_size, &weight_values) ||
+        !metal_vision_f16_bytes(weight_values, &weight_bytes) ||
+        !checked_mul_u64((uint64_t)qkv_size, 2u, &bias_bytes) ||
+        qkv_bytes > (uint64_t)SIZE_MAX ||
+        !metal_slice_valid(packed_weight, weight_bytes) ||
+        !metal_slice_valid(packed_bias, bias_bytes)) {
+        return metal_fail(error, error_size, "invalid %s fused MPS QKV sizes", op_name != NULL ? op_name : "Metal");
     }
-    int ok = 1;
-    for (uint32_t projection = 0u; projection < 3u && ok; ++projection) {
-        uint64_t weight_offset = 0u;
-        uint64_t bias_offset = 0u;
-        if (!checked_mul_u64((uint64_t)projection, projection_bytes, &weight_offset) ||
-            !checked_mul_u64((uint64_t)projection, hidden_bytes, &bias_offset)) {
-            ok = metal_fail(error, error_size, "%s MPS QKV offset overflow", op_name != NULL ? op_name : "Metal");
-            break;
+
+    /*
+     * Fused QKV: one MPS matmul  src @ Wqkv^T  →  temp [rows, 3*hidden],
+     * then split into separate Q/K/V buffers.  This replaces 3 separate
+     * MPS matmul calls (Q, K, V) with 1, cutting 2 dispatches per block.
+     */
+    @autoreleasepool {
+        id<MTLBuffer> temp = metal_new_buffer_with_length(ctx, (NSUInteger)qkv_bytes, MTLResourceStorageModePrivate);
+        if (temp == nil) {
+            return metal_fail(error, error_size, "failed to allocate %s fused QKV temp buffer", op_name != NULL ? op_name : "Metal");
         }
-        uocr_metal_buffer_slice weight_slice = packed_weight;
-        uocr_metal_buffer_slice bias_slice = packed_bias;
-        if ((uint64_t)weight_slice.offset > (uint64_t)NSUIntegerMax - weight_offset ||
-            (uint64_t)bias_slice.offset > (uint64_t)NSUIntegerMax - bias_offset) {
-            ok = metal_fail(error, error_size, "%s MPS QKV offset exceeds NSUIntegerMax", op_name != NULL ? op_name : "Metal");
-            break;
-        }
-        weight_slice.offset += (NSUInteger)weight_offset;
-        bias_slice.offset += (NSUInteger)bias_offset;
-        uocr_metal_buffer_slice dst = projection == 0u ? q_dst : (projection == 1u ? k_dst : v_dst);
-        ok = metal_run_mps_matmul_nt_f16(ctx,
+        temp.label = @"uocr_qkv_fused_temp";
+
+        uocr_metal_buffer_slice temp_slice = { temp, 0u };
+
+        /* One fused MPS matmul:  src @ Wqkv^T  →  temp [rows, 3*hidden] */
+        if (!metal_run_mps_matmul_nt_f16(ctx,
                                          src,
-                                         weight_slice,
-                                         dst,
+                                         packed_weight,
+                                         temp_slice,
                                          rows,
                                          hidden_size,
-                                         hidden_size,
+                                         qkv_size,
                                          op_name,
                                          error,
-                                         error_size) &&
-             metal_run_bias_add_f16_inplace(ctx,
-                                            dst,
-                                            bias_slice,
+                                         error_size)) {
+            [temp release];
+            return 0;
+        }
+
+        /* Bias add on the fused output */
+        if (!metal_run_bias_add_f16_inplace(ctx,
+                                            temp_slice,
+                                            packed_bias,
                                             rows,
-                                            hidden_size,
+                                            qkv_size,
                                             op_name,
                                             error,
-                                            error_size);
-    }
-    if (!ok) {
-        if (!had_active_batch) {
-            metal_command_batch_abort(ctx);
+                                            error_size)) {
+            [temp release];
+            return 0;
         }
-        return 0;
-    }
-    if (!had_active_batch && !metal_command_batch_commit_and_wait(ctx, op_name != NULL ? op_name : "MPS QKV", error, error_size)) {
-        return 0;
+
+        /* Split kernel: temp → q_dst, k_dst, v_dst */
+        {
+            id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, "uocr_split_qkv_f16", error, error_size);
+            if (pipeline == nil) {
+                [temp release];
+                return 0;
+            }
+            int owned = 0;
+            id<MTLCommandBuffer> cb = metal_command_buffer_for_op(ctx, &owned, "Metal QKV split", error, error_size);
+            if (cb == nil) {
+                [temp release];
+                return 0;
+            }
+            id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
+            if (enc == nil) {
+                [temp release];
+                return metal_fail(error, error_size, "failed to create %s QKV split encoder", op_name != NULL ? op_name : "Metal");
+            }
+            struct { uint32_t rows; uint32_t hidden_size; } split_params;
+            split_params.rows = rows;
+            split_params.hidden_size = hidden_size;
+            [enc setComputePipelineState:pipeline];
+            [enc setBuffer:temp offset:0u atIndex:0u];
+            [enc setBuffer:q_dst.buffer offset:q_dst.offset atIndex:1u];
+            [enc setBuffer:k_dst.buffer offset:k_dst.offset atIndex:2u];
+            [enc setBuffer:v_dst.buffer offset:v_dst.offset atIndex:3u];
+            [enc setBytes:&split_params length:sizeof(split_params) atIndex:4u];
+            [enc dispatchThreads:MTLSizeMake((NSUInteger)hidden_size, (NSUInteger)rows, 1u)
+           threadsPerThreadgroup:MTLSizeMake(32u, 1u, 1u)];
+            [enc endEncoding];
+            if (!metal_finish_command_buffer_for_op(ctx, cb, owned, "Metal QKV split", error, error_size)) {
+                [temp release];
+                return 0;
+            }
+        }
+
+        [temp release];
     }
     return 1;
 }

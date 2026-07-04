@@ -5156,3 +5156,39 @@ kernel void uocr_sam_conv3x3_im2col_nchw_f16(device const half *src_nchw [[buffe
 
     cols[ulong(row) * ulong(k_total) + ulong(k)] = value;
 }
+
+struct UocrSplitQkvParams {
+    uint rows;
+    uint hidden_size;
+};
+
+/*
+ * Split a packed QKV buffer into separate Q, K, V.
+ *
+ * qkv:  [rows, 3 * hidden_size]  row-major,  q | k | v  concatenated along cols
+ * q:    [rows, hidden_size]
+ * k:    [rows, hidden_size]
+ * v:    [rows, hidden_size]
+ *
+ * Dispatch:  (col, row)  as thread_position_in_grid.
+ */
+kernel void uocr_split_qkv_f16(device const half *qkv [[buffer(0)]],
+                               device half *q [[buffer(1)]],
+                               device half *k [[buffer(2)]],
+                               device half *v [[buffer(3)]],
+                               constant UocrSplitQkvParams &params [[buffer(4)]],
+                               uint2 gid [[thread_position_in_grid]]) {
+    const uint col = gid.x;
+    const uint row = gid.y;
+
+    if (row >= params.rows || col >= params.hidden_size) {
+        return;
+    }
+
+    const ulong qkv_base = ulong(row) * ulong(params.hidden_size * 3u);
+    const ulong dst = ulong(row) * ulong(params.hidden_size) + ulong(col);
+
+    q[dst] = qkv[qkv_base + ulong(col)];
+    k[dst] = qkv[qkv_base + ulong(params.hidden_size) + ulong(col)];
+    v[dst] = qkv[qkv_base + ulong(params.hidden_size * 2u) + ulong(col)];
+}
