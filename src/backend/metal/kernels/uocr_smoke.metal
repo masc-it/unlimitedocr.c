@@ -1842,6 +1842,59 @@ kernel void uocr_sam_layernorm2d_f16_to_f32(device const half *src_nchw [[buffer
     dst_nchw[(ulong(batch) * ulong(params.channels) + ulong(tid)) * ulong(spatial_size) + ulong(spatial)] = value;
 }
 
+/*
+ * BHWC variant of layernorm2d.  Normalizes over channels at each spatial
+ * position, with channels contiguous in memory for better cache behavior.
+ *
+ * src/dst:  [batch, spatial_size, channels]  in BHWC layout.
+ * Dispatch: (spatial, 1, batch)  with threads = channels.
+ */
+kernel void uocr_sam_layernorm2d_bhwc_f16_to_f16(device const half *src_bhwc [[buffer(0)]],
+                                                  device const half *weight [[buffer(1)]],
+                                                  device const half *bias [[buffer(2)]],
+                                                  device half *dst_bhwc [[buffer(3)]],
+                                                  constant UocrSamLayerNorm2dParams &params [[buffer(4)]],
+                                                  threadgroup float *partials [[threadgroup(0)]],
+                                                  uint3 block [[threadgroup_position_in_grid]],
+                                                  uint tid [[thread_index_in_threadgroup]],
+                                                  uint3 ntg3 [[threads_per_threadgroup]],
+                                                  uint simd_width [[threads_per_simdgroup]]) {
+    const uint ntg = ntg3.x;
+    const uint spatial_size = params.grid_width * params.grid_height;
+    const uint spatial = block.x;
+    const uint batch = block.z;
+    /* All threads must participate in threadgroup_barrier inside
+     * uocr_threadgroup_sum2. Only skip threads past valid range. */
+    if (spatial >= spatial_size || batch >= params.batch_size) {
+        return;
+    }
+
+    const ulong src_base = (ulong(batch) * ulong(spatial_size) + ulong(spatial)) * ulong(params.channels);
+    float value = 0.0f;
+    if (tid < params.channels) {
+        value = float(src_bhwc[src_base + ulong(tid)]);
+    }
+    float value_sum = 0.0f;
+    float square_sum = 0.0f;
+    uocr_threadgroup_sum2(tid < params.channels ? value : 0.0f,
+                          tid < params.channels ? value * value : 0.0f,
+                          partials,
+                          partials + ntg,
+                          tid,
+                          ntg,
+                          simd_width,
+                          value_sum,
+                          square_sum);
+
+    const float inv_channels = 1.0f / float(params.channels);
+    const float mean = value_sum * inv_channels;
+    const float variance = max(square_sum * inv_channels - mean * mean, 0.0f);
+    if (tid < params.channels) {
+        const float result = (value - mean) * rsqrt(variance + params.eps) * float(weight[tid]) + float(bias[tid]);
+        dst_bhwc[src_base + ulong(tid)] = half(result);
+    }
+}
+
 struct UocrSamResidualParams {
     uint n_rows;
     uint hidden_size;
@@ -5191,4 +5244,86 @@ kernel void uocr_split_qkv_f16(device const half *qkv [[buffer(0)]],
     q[dst] = qkv[qkv_base + ulong(col)];
     k[dst] = qkv[qkv_base + ulong(params.hidden_size) + ulong(col)];
     v[dst] = qkv[qkv_base + ulong(params.hidden_size * 2u) + ulong(col)];
+}
+
+struct UocrConv3x3BhwcIm2ColParams {
+    uint input_width;
+    uint input_height;
+    uint output_width;
+    uint output_height;
+    uint channels;
+    uint stride;
+    uint batch_size;
+    uint reserved;
+};
+
+/*
+ * BHWC im2col for 3x3 convolutions with half4 vectorized channel writes.
+ *
+ * input:  [B, H, W, C]  BHWC fp16
+ * cols:   [B * OH * OW, 9 * C]  row-major, with kernel position as the
+ *         slowest dimension within each row (matching repacked weight layout).
+ *
+ * Each thread handles 4 channels (half4), dispatched as:
+ *   x = 9 * C4_count  (kernel_pos * C4_count + c4_group)
+ *   y = total_rows
+ */
+kernel void uocr_conv3x3_im2col_bhwc_f16(device const half *src_bhwc [[buffer(0)]],
+                                         device half *cols [[buffer(1)]],
+                                         constant UocrConv3x3BhwcIm2ColParams &p [[buffer(2)]],
+                                         uint2 gid [[thread_position_in_grid]]) {
+    const uint c4_index = gid.x;
+    const uint row = gid.y;
+
+    const uint c4_count = (p.channels + 3u) / 4u;
+    const uint kernel_pos = c4_index / c4_count;
+    const uint c_base = (c4_index - kernel_pos * c4_count) * 4u;
+
+    const uint out_spatial = p.output_width * p.output_height;
+    const uint total_rows = p.batch_size * out_spatial;
+
+    if (kernel_pos >= 9u || row >= total_rows || c_base >= p.channels) {
+        return;
+    }
+
+    const uint batch = row / out_spatial;
+    const uint s = row - batch * out_spatial;
+    const uint out_y = s / p.output_width;
+    const uint out_x = s - out_y * p.output_width;
+
+    const uint ky = kernel_pos / 3u;
+    const uint kx = kernel_pos - ky * 3u;
+
+    const int sy = int(out_y * p.stride) + int(ky) - 1;
+    const int sx = int(out_x * p.stride) + int(kx) - 1;
+
+    const ulong k_total = ulong(p.channels) * 9ul;
+    const ulong dst_base = ulong(row) * k_total + ulong(kernel_pos) * ulong(p.channels) + ulong(c_base);
+
+    half4 v = half4(half(0.0h));
+
+    if (sy >= 0 && sy < int(p.input_height) && sx >= 0 && sx < int(p.input_width)) {
+        const ulong src_base =
+            ((ulong(batch) * ulong(p.input_height) + ulong(uint(sy))) * ulong(p.input_width) + ulong(uint(sx))) *
+                ulong(p.channels) + ulong(c_base);
+
+        if (c_base + 3u < p.channels) {
+            v = half4(*reinterpret_cast<device const packed_half4 *>(src_bhwc + src_base));
+            *reinterpret_cast<device packed_half4 *>(cols + dst_base) = packed_half4(v);
+            return;
+        }
+        for (uint i = 0u; i < 4u && c_base + i < p.channels; ++i) {
+            cols[dst_base + ulong(i)] = src_bhwc[src_base + ulong(i)];
+        }
+        return;
+    }
+
+    /* Out-of-bounds: write zero */
+    if (c_base + 3u < p.channels) {
+        *reinterpret_cast<device packed_half4 *>(cols + dst_base) = packed_half4(v);
+    } else {
+        for (uint i = 0u; i < 4u && c_base + i < p.channels; ++i) {
+            cols[dst_base + ulong(i)] = half(0.0h);
+        }
+    }
 }

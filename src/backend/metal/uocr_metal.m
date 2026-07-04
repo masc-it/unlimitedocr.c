@@ -271,10 +271,13 @@ typedef struct uocr_metal_vision_weights_f16 {
     uocr_metal_vision_tensor_f16 sam_neck_norm1_weight;
     uocr_metal_vision_tensor_f16 sam_neck_norm1_bias;
     uocr_metal_vision_tensor_f16 sam_neck_conv3x3_weight;
+    uocr_metal_vision_tensor_f16 sam_neck_conv3x3_weight_ohwi;
     uocr_metal_vision_tensor_f16 sam_neck_norm2_weight;
     uocr_metal_vision_tensor_f16 sam_neck_norm2_bias;
     uocr_metal_vision_tensor_f16 sam_net2_weight;
+    uocr_metal_vision_tensor_f16 sam_net2_weight_ohwi;
     uocr_metal_vision_tensor_f16 sam_net3_weight;
+    uocr_metal_vision_tensor_f16 sam_net3_weight_ohwi;
     uocr_metal_vision_tensor_f16 clip_class_embedding;
     uocr_metal_vision_tensor_f16 clip_pos_embed;
     uocr_metal_vision_tensor_f16 clip_pos_embed_global;
@@ -1071,6 +1074,17 @@ typedef struct uocr_metal_conv3x3_im2col_params {
     uint32_t reserved;
 } uocr_metal_conv3x3_im2col_params;
 
+typedef struct uocr_metal_conv3x3_bhwc_im2col_params {
+    uint32_t input_width;
+    uint32_t input_height;
+    uint32_t output_width;
+    uint32_t output_height;
+    uint32_t channels;
+    uint32_t stride;
+    uint32_t batch_size;
+    uint32_t reserved;
+} uocr_metal_conv3x3_bhwc_im2col_params;
+
 typedef struct uocr_metal_clip_embed_sam_params {
     uint32_t grid_width;
     uint32_t grid_height;
@@ -1155,6 +1169,8 @@ _Static_assert(sizeof(uocr_metal_sam_conv3x3_stride2_params) == 36u,
 
 _Static_assert(sizeof(uocr_metal_conv3x3_im2col_params) == 32u,
                "uocr_metal_conv3x3_im2col_params ABI mismatch");
+_Static_assert(sizeof(uocr_metal_conv3x3_bhwc_im2col_params) == 32u,
+               "uocr_metal_conv3x3_bhwc_im2col_params ABI mismatch");
 _Static_assert(sizeof(uocr_metal_clip_embed_sam_params) == 20u,
                "uocr_metal_clip_embed_sam_params ABI mismatch");
 _Static_assert(sizeof(uocr_metal_clip_abs_pos_params) == 20u,
@@ -3217,6 +3233,51 @@ static int metal_validate_vision_tensor_metadata(const uocr_tensor_entry *tensor
     return 1;
 }
 
+/*
+ * Repack a 3x3 conv weight from [outC, inC, 3, 3] to [outC, 9, inC]
+ * for BHWC im2col compatibility.  Allocates a new shared buffer.
+ * The repacked layout has channels contiguous within each kernel position.
+ */
+static int metal_repack_conv3x3_ohwi(uocr_metal_context *ctx,
+                                     const uocr_metal_vision_tensor_f16 *src,
+                                     uocr_metal_vision_tensor_f16 *dst,
+                                     uint32_t out_c, uint32_t in_c,
+                                     char *error, size_t error_size) {
+    const uint64_t elements = (uint64_t)out_c * 9u * (uint64_t)in_c;
+    uint64_t bytes = 0u;
+    if (out_c == 0u || in_c == 0u || !checked_mul_u64(elements, 2u, &bytes) ||
+        bytes > (uint64_t)NSUIntegerMax || src->host_f16 == NULL) {
+        return metal_fail(error, error_size, "invalid Metal conv3x3 weight repack request");
+    }
+    @autoreleasepool {
+        id<MTLBuffer> buf = metal_new_buffer_with_length(ctx, (NSUInteger)bytes, MTLResourceStorageModeShared);
+        if (buf == nil || [buf contents] == NULL) {
+            [buf release];
+            return metal_fail(error, error_size, "failed to allocate repacked conv3x3 weight");
+        }
+        buf.label = @"uocr_conv3x3_weight_ohwi";
+        uint16_t *repacked = (uint16_t *)[buf contents];
+        const uint16_t *orig = src->host_f16;
+        for (uint32_t oc = 0u; oc < out_c; ++oc) {
+            for (uint32_t ky = 0u; ky < 3u; ++ky) {
+                for (uint32_t kx = 0u; kx < 3u; ++kx) {
+                    for (uint32_t ic = 0u; ic < in_c; ++ic) {
+                        const uint32_t src_idx = ((oc * in_c + ic) * 3u + ky) * 3u + kx;
+                        const uint32_t dst_idx = ((oc * 9u + ky * 3u + kx) * in_c) + ic;
+                        repacked[dst_idx] = orig[src_idx];
+                    }
+                }
+            }
+        }
+        memset(dst, 0, sizeof(*dst));
+        dst->slice.buffer = buf;
+        dst->slice.offset = 0u;
+        dst->byte_length = bytes;
+        dst->host_f16 = repacked;
+    }
+    return 1;
+}
+
 static int metal_append_vision_binding(uocr_metal_context *ctx,
                                        const uocr_model_file *model,
                                        uocr_metal_vision_binding_cache *cache,
@@ -3466,6 +3527,18 @@ static int metal_refresh_vision_binding_cache(uocr_metal_context *ctx,
     uocr_metal_vision_weights_f16 weights;
     const uint64_t direct_cache_start_ns = uocr_profile_now_ns();
     if (!metal_vision_weight_cache_build_direct(&cache, &weights, error, error_size) ||
+        !metal_repack_conv3x3_ohwi(ctx, &weights.sam_neck_conv3x3_weight,
+                                   &weights.sam_neck_conv3x3_weight_ohwi,
+                                   UOCR_SAM_NECK_CHANNELS, UOCR_SAM_NECK_CHANNELS,
+                                   error, error_size) ||
+        !metal_repack_conv3x3_ohwi(ctx, &weights.sam_net2_weight,
+                                   &weights.sam_net2_weight_ohwi,
+                                   UOCR_SAM_NET2_CHANNELS, UOCR_SAM_NECK_CHANNELS,
+                                   error, error_size) ||
+        !metal_repack_conv3x3_ohwi(ctx, &weights.sam_net3_weight,
+                                   &weights.sam_net3_weight_ohwi,
+                                   UOCR_SAM_NET3_CHANNELS, UOCR_SAM_NET2_CHANNELS,
+                                   error, error_size) ||
         !metal_precompute_sam_abs_pos_tables(ctx, &weights, error, error_size) ||
         !metal_precompute_sam_rel_pos_tables(ctx, &weights, error, error_size) ||
         !metal_precompute_clip_abs_pos_tables(ctx, &weights, error, error_size)) {
@@ -5163,6 +5236,78 @@ static int metal_context_sam_layernorm2d_batch_f16_to_slice(uocr_metal_context *
     }
 }
 
+/*
+ * BHWC variant of SAM LayerNorm2d.  Normalizes over channels at each spatial
+ * position; channels are contiguous in BHWC for better cache behavior.
+ */
+static int metal_context_sam_layernorm2d_bhwc_batch_f16_to_slice(uocr_metal_context *ctx,
+                                                                 uocr_metal_vision_workspace_slice input_bhwc,
+                                                                 uocr_metal_vision_tensor_f16 weight,
+                                                                 uocr_metal_vision_tensor_f16 bias,
+                                                                 uint32_t grid_w,
+                                                                 uint32_t grid_h,
+                                                                 uint32_t view_count,
+                                                                 uocr_metal_vision_workspace_slice out_bhwc,
+                                                                 char *error,
+                                                                 size_t error_size) {
+    uint64_t values_per_view = 0u;
+    uint64_t values = 0u;
+    uint64_t bytes = 0u;
+    const uint64_t parameter_bytes = (uint64_t)UOCR_SAM_NECK_CHANNELS * 2u;
+    if (view_count == 0u || !metal_vision_square_grid_values(grid_w, grid_h, UOCR_SAM_NECK_CHANNELS, &values_per_view) ||
+        !checked_mul_u64(values_per_view, (uint64_t)view_count, &values) ||
+        !metal_vision_f16_bytes(values, &bytes) ||
+        !metal_vision_require_workspace_slice_f16(input_bhwc, bytes, "SAM LayerNorm2d BHWC input", error, error_size) ||
+        !metal_vision_require_workspace_slice_f16(out_bhwc, bytes, "SAM LayerNorm2d BHWC output", error, error_size) ||
+        !metal_vision_require_tensor_slice_f16(weight, parameter_bytes, "SAM LayerNorm2d weight", error, error_size) ||
+        !metal_vision_require_tensor_slice_f16(bias, parameter_bytes, "SAM LayerNorm2d bias", error, error_size)) {
+        return 0;
+    }
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, "uocr_sam_layernorm2d_bhwc_f16_to_f16", error, error_size);
+        if (pipeline == nil) {
+            return 0;
+        }
+        NSUInteger threads_per_group = metal_power2_threadgroup_width(256u, pipeline.maxTotalThreadsPerThreadgroup);
+        if (threads_per_group < (NSUInteger)UOCR_SAM_NECK_CHANNELS) {
+            return metal_fail(error, error_size, "Metal SAM LayerNorm2d BHWC needs at least %u threads", UOCR_SAM_NECK_CHANNELS);
+        }
+        const uint64_t threadgroup_bytes = 2u * (uint64_t)threads_per_group * (uint64_t)sizeof(float);
+        if (threadgroup_bytes > (uint64_t)ctx->device.maxThreadgroupMemoryLength) {
+            return metal_fail(error, error_size, "Metal SAM LayerNorm2d BHWC threadgroup memory exceeds device limit");
+        }
+        int owned_command_buffer = 0;
+        id<MTLCommandBuffer> cb = metal_command_buffer_for_op(ctx, &owned_command_buffer, "Metal SAM LayerNorm2d BHWC batch", error, error_size);
+        if (cb == nil) {
+            return 0;
+        }
+        if (owned_command_buffer) {
+            cb.label = @"uocr_sam_layernorm2d_bhwc_batch_command_buffer";
+        }
+        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
+        if (enc == nil) {
+            return metal_fail(error, error_size, "failed to create Metal SAM LayerNorm2d BHWC command encoder");
+        }
+        uocr_metal_sam_layernorm2d_params params;
+        params.grid_width = grid_w;
+        params.grid_height = grid_h;
+        params.channels = UOCR_SAM_NECK_CHANNELS;
+        params.eps = 1.0e-6f;
+        params.batch_size = view_count;
+        [enc setComputePipelineState:pipeline];
+        [enc setBuffer:input_bhwc.buffer offset:input_bhwc.offset atIndex:0u];
+        [enc setBuffer:weight.slice.buffer offset:weight.slice.offset atIndex:1u];
+        [enc setBuffer:bias.slice.buffer offset:bias.slice.offset atIndex:2u];
+        [enc setBuffer:out_bhwc.buffer offset:out_bhwc.offset atIndex:3u];
+        [enc setBytes:&params length:sizeof(params) atIndex:4u];
+        [enc setThreadgroupMemoryLength:(NSUInteger)threadgroup_bytes atIndex:0u];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(grid_w * grid_h), 1u, (NSUInteger)view_count)
+             threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1u, 1u)];
+        [enc endEncoding];
+        return metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, "Metal SAM LayerNorm2d BHWC batch", error, error_size);
+    }
+}
+
 static int metal_context_sam_neck_conv3x3_batch_f16_to_slice(uocr_metal_context *ctx,
                                                              uocr_metal_vision_workspace_slice input_nchw,
                                                              uocr_metal_vision_tensor_f16 weight,
@@ -5392,23 +5537,29 @@ static int metal_context_sam_conv3x3_im2col_mps_batch_f16_to_slice(uocr_metal_co
     uocr_metal_vision_workspace_slice temp_bhwc_slice = scratch != NULL ? scratch->conv_bhwc_temp : (uocr_metal_vision_workspace_slice){0};
     int allocated_col = 0, allocated_temp = 0;
 
+    NSUInteger col_offset = 0u;
+    NSUInteger temp_offset = 0u;
+
     @autoreleasepool {
         id<MTLBuffer> col_buffer = nil;
         id<MTLBuffer> temp_bhwc = nil;
 
         if (col_slice.buffer != nil && col_slice.bytes >= col_bytes) {
             col_buffer = col_slice.buffer;
+            col_offset = col_slice.offset;
         } else {
             col_buffer = metal_new_buffer_with_length(ctx, (NSUInteger)col_bytes, MTLResourceStorageModePrivate);
             if (col_buffer == nil) {
                 return metal_fail(error, error_size, "failed to allocate Metal SAM im2col buffer");
             }
             col_buffer.label = @"uocr_sam_conv3x3_im2col";
+            col_offset = 0u;
             allocated_col = 1;
         }
 
         if (temp_bhwc_slice.buffer != nil && temp_bhwc_slice.bytes >= temp_bytes) {
             temp_bhwc = temp_bhwc_slice.buffer;
+            temp_offset = temp_bhwc_slice.offset;
         } else {
             temp_bhwc = metal_new_buffer_with_length(ctx, (NSUInteger)temp_bytes, MTLResourceStorageModePrivate);
             if (temp_bhwc == nil) {
@@ -5455,7 +5606,7 @@ static int metal_context_sam_conv3x3_im2col_mps_batch_f16_to_slice(uocr_metal_co
             params.batch_size = view_count;
             [enc setComputePipelineState:pipeline];
             [enc setBuffer:input_nchw.buffer offset:input_nchw.offset atIndex:0u];
-            [enc setBuffer:col_buffer offset:0u atIndex:1u];
+            [enc setBuffer:col_buffer offset:col_offset atIndex:1u];
             [enc setBytes:&params length:sizeof(params) atIndex:2u];
             [enc dispatchThreads:MTLSizeMake((NSUInteger)k_features, (NSUInteger)rows, 1u)
            threadsPerThreadgroup:MTLSizeMake(32u, 8u, 1u)];
@@ -5474,9 +5625,9 @@ static int metal_context_sam_conv3x3_im2col_mps_batch_f16_to_slice(uocr_metal_co
 
         /* Step 2: MPS matmul  cols @ weight^T  →  temp BHWC */
         {
-            uocr_metal_buffer_slice col_slice = { col_buffer, 0u };
+            uocr_metal_buffer_slice col_slice = { col_buffer, col_offset };
             uocr_metal_buffer_slice weight_slice = { weight.slice.buffer, weight.slice.offset };
-            uocr_metal_buffer_slice temp_slice = { temp_bhwc, 0u };
+            uocr_metal_buffer_slice temp_slice = { temp_bhwc, temp_offset };
             if (!metal_run_mps_matmul_nt_f16(ctx,
                                              col_slice,
                                              weight_slice,
@@ -5495,7 +5646,7 @@ static int metal_context_sam_conv3x3_im2col_mps_batch_f16_to_slice(uocr_metal_co
 
         /* Step 3: BHWC → NCHW transpose */
         {
-            uocr_metal_buffer_slice temp_slice = { temp_bhwc, 0u };
+            uocr_metal_buffer_slice temp_slice = { temp_bhwc, temp_offset };
             uocr_metal_buffer_slice out_slice = { out_nchw.buffer, out_nchw.offset };
             if (!metal_context_bhwc_to_nchw_f16(ctx,
                                                 temp_slice,
@@ -5513,6 +5664,121 @@ static int metal_context_sam_conv3x3_im2col_mps_batch_f16_to_slice(uocr_metal_co
 
         if (allocated_temp) [temp_bhwc release];
         if (allocated_col) [col_buffer release];
+        return 1;
+    }
+}
+
+/*
+ * BHWC variant of the im2col conv — reads BHWC input, uses the vectorized
+ * BHWC im2col kernel, MPS matmul with repacked weights, outputs BHWC.
+ * No BHWC→NCHW transpose needed.
+ */
+static int metal_context_sam_conv3x3_im2col_mps_bhwc_batch_f16_to_slice(uocr_metal_context *ctx,
+                                                                        uocr_metal_vision_workspace_slice input_bhwc,
+                                                                        uocr_metal_vision_tensor_f16 weight,
+                                                                        uint32_t input_w,
+                                                                        uint32_t input_h,
+                                                                        uint32_t channels,
+                                                                        uint32_t out_channels,
+                                                                        uint32_t stride,
+                                                                        uint32_t view_count,
+                                                                        uocr_metal_vision_workspace_slice out_bhwc,
+                                                                        const char *op_name,
+                                                                        uocr_metal_vision_workspace *scratch,
+                                                                        char *error,
+                                                                        size_t error_size) {
+    if (ctx == NULL || view_count == 0u || stride == 0u || stride > 2u || input_w == 0u || input_h == 0u ||
+        channels == 0u || out_channels == 0u) {
+        return metal_fail(error, error_size, "invalid Metal SAM BHWC im2col conv request");
+    }
+    const uint32_t output_w = (input_w + stride - 1u) / stride;
+    const uint32_t output_h = (input_h + stride - 1u) / stride;
+    const uint32_t output_spatial = output_w * output_h;
+    const uint32_t rows = output_spatial * view_count;
+    const uint32_t k_features = channels * 9u;
+
+    uint64_t col_values = 0u;
+    uint64_t col_bytes = 0u;
+    uint64_t output_values = 0u;
+    uint64_t output_bytes = 0u;
+    uint64_t weight_values = 0u;
+    uint64_t weight_bytes = 0u;
+    if (!checked_mul_u64((uint64_t)rows, (uint64_t)k_features, &col_values) ||
+        !metal_vision_f16_bytes(col_values, &col_bytes) ||
+        !checked_mul_u64((uint64_t)rows, (uint64_t)out_channels, &output_values) ||
+        !metal_vision_f16_bytes(output_values, &output_bytes) ||
+        !checked_mul_u64((uint64_t)out_channels, (uint64_t)k_features, &weight_values) ||
+        !metal_vision_f16_bytes(weight_values, &weight_bytes) ||
+        col_bytes > (uint64_t)SIZE_MAX) {
+        return metal_fail(error, error_size, "invalid Metal SAM BHWC im2col conv sizes");
+    }
+    if (!metal_slice_valid((uocr_metal_buffer_slice){input_bhwc.buffer, input_bhwc.offset}, input_bhwc.bytes) ||
+        !metal_vision_require_tensor_slice_f16(weight, weight_bytes, "SAM BHWC im2col weight", error, error_size) ||
+        !metal_slice_valid((uocr_metal_buffer_slice){out_bhwc.buffer, out_bhwc.offset}, output_bytes)) {
+        return metal_fail(error, error_size, "invalid Metal SAM BHWC im2col conv buffer");
+    }
+
+    /* Use preallocated workspace slices for im2col buffer. */
+    uocr_metal_vision_workspace_slice col_slice = scratch != NULL ? scratch->conv_im2col : (uocr_metal_vision_workspace_slice){0};
+    int allocated = 0;
+    NSUInteger col_offset = 0u;
+
+    @autoreleasepool {
+        id<MTLBuffer> col_buffer = nil;
+        if (col_slice.buffer != nil && col_slice.bytes >= col_bytes) {
+            col_buffer = col_slice.buffer;
+            col_offset = col_slice.offset;
+        } else {
+            col_buffer = metal_new_buffer_with_length(ctx, (NSUInteger)col_bytes, MTLResourceStorageModePrivate);
+            if (col_buffer == nil) return metal_fail(error, error_size, "failed to allocate SAM BHWC im2col buffer");
+            col_buffer.label = @"uocr_sam_conv3x3_im2col_bhwc";
+            col_offset = 0u;
+            allocated = 1;
+        }
+
+        /* Step 1: BHWC im2col */
+        {
+            id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, "uocr_conv3x3_im2col_bhwc_f16", error, error_size);
+            if (pipeline == nil) { if (allocated) [col_buffer release]; return 0; }
+            int owned = 0;
+            id<MTLCommandBuffer> cb = metal_command_buffer_for_op(ctx, &owned, "Metal SAM BHWC im2col", error, error_size);
+            if (cb == nil) { if (allocated) [col_buffer release]; return 0; }
+            id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
+            if (enc == nil) { if (allocated) [col_buffer release]; return metal_fail(error, error_size, "failed to create BHWC im2col encoder"); }
+            uocr_metal_conv3x3_bhwc_im2col_params p;
+            memset(&p, 0, sizeof(p));
+            p.input_width = input_w;
+            p.input_height = input_h;
+            p.output_width = output_w;
+            p.output_height = output_h;
+            p.channels = channels;
+            p.stride = stride;
+            p.batch_size = view_count;
+            const NSUInteger c4_count = ((NSUInteger)channels + 3u) / 4u;
+            [enc setComputePipelineState:pipeline];
+            [enc setBuffer:input_bhwc.buffer offset:input_bhwc.offset atIndex:0u];
+            [enc setBuffer:col_buffer offset:col_offset atIndex:1u];
+            [enc setBytes:&p length:sizeof(p) atIndex:2u];
+            [enc dispatchThreads:MTLSizeMake(9u * c4_count, (NSUInteger)rows, 1u)
+           threadsPerThreadgroup:MTLSizeMake(32u, 8u, 1u)];
+            [enc endEncoding];
+            if (!metal_finish_command_buffer_for_op(ctx, cb, owned, "Metal SAM BHWC im2col", error, error_size)) {
+                if (allocated) [col_buffer release]; return 0;
+            }
+        }
+
+        /* Step 2: MPS matmul  cols @ weight^T  →  out_bhwc (already BHWC) */
+        {
+            uocr_metal_buffer_slice cs = { col_buffer, col_offset };
+            uocr_metal_buffer_slice ws = { weight.slice.buffer, weight.slice.offset };
+            uocr_metal_buffer_slice os = { out_bhwc.buffer, out_bhwc.offset };
+            if (!metal_run_mps_matmul_nt_f16(ctx, cs, ws, os, rows, k_features, out_channels,
+                                             op_name, error, error_size)) {
+                if (allocated) [col_buffer release]; return 0;
+            }
+        }
+
+        if (allocated) [col_buffer release];
         return 1;
     }
 }
@@ -5552,137 +5818,91 @@ static int metal_context_sam_neck_batch_f16_to_slice(uocr_metal_vision_project_c
 
     const uint64_t sam_neck_start_ns = uocr_profile_now_ns();
     /*
-     * Conv1x1 is a dense matrix multiply: BHWC [B*S, 768] @ weight [256, 768]^T.
-     * Use MPS matmul (produces BHWC output) then transpose to NCHW for the
-     * subsequent layernorm2d / conv3x3 stages.
+     * Conv1x1: BHWC [B*S, 768] @ weight [256, 768]^T  →  BHWC.
+     * Output stays BHWC throughout the neck pipeline — no transpose.
      */
     const uint32_t conv1x1_spatial = grid_w * grid_h;
     const uint32_t conv1x1_rows = conv1x1_spatial * view_count;
     if (metal_mps_matmul_nt_f16_should_use(conv1x1_rows, UOCR_SAM_HIDDEN_SIZE, UOCR_SAM_NECK_CHANNELS)) {
-        const uint64_t temp_bytes = (uint64_t)conv1x1_rows * (uint64_t)UOCR_SAM_NECK_CHANNELS * 2u;
-        if (temp_bytes > (uint64_t)SIZE_MAX) {
-            return metal_fail(error, error_size, "Metal SAM neck 1x1 MPS temp buffer size overflow");
-        }
-        id<MTLBuffer> temp = nil;
-        @autoreleasepool {
-            temp = metal_new_buffer_with_length(ctx, (NSUInteger)temp_bytes, MTLResourceStorageModePrivate);
-            if (temp == nil) {
-                return metal_fail(error, error_size, "failed to allocate Metal SAM neck 1x1 MPS temp buffer");
-            }
-            temp.label = @"uocr_sam_neck_conv1x1_mps_temp";
-        }
         uocr_metal_buffer_slice input_slice = { input_bhwc.buffer, input_bhwc.offset };
         uocr_metal_buffer_slice weight_slice = { weights->sam_neck_conv1x1_weight.slice.buffer,
                                                   weights->sam_neck_conv1x1_weight.slice.offset };
-        uocr_metal_buffer_slice temp_slice = { temp, 0u };
-        const int mps_ok = metal_run_mps_matmul_nt_f16(ctx,
-                                                       input_slice,
-                                                       weight_slice,
-                                                       temp_slice,
-                                                       conv1x1_rows,
-                                                       UOCR_SAM_HIDDEN_SIZE,
-                                                       UOCR_SAM_NECK_CHANNELS,
-                                                       "Metal SAM neck 1x1 MPS matmul",
-                                                       error,
-                                                       error_size);
-        if (mps_ok) {
-            uocr_metal_buffer_slice temp_bhwc = { temp, 0u };
-            uocr_metal_buffer_slice out_nchw_slice = { scratch->sam_neck_a_nchw.buffer, scratch->sam_neck_a_nchw.offset };
-            int transpose_ok = metal_context_bhwc_to_nchw_f16(ctx,
-                                                              temp_bhwc,
-                                                              view_count,
-                                                              conv1x1_spatial,
-                                                              UOCR_SAM_NECK_CHANNELS,
-                                                              out_nchw_slice,
-                                                              error,
-                                                              error_size);
-            [temp release];
-            if (!transpose_ok) {
-                return metal_fail(error, error_size, "Metal SAM neck 1x1 MPS transpose failed");
-            }
-        } else {
-            [temp release];
+        uocr_metal_buffer_slice out_slice = { scratch->sam_neck_a_nchw.buffer, scratch->sam_neck_a_nchw.offset };
+        if (!metal_run_mps_matmul_nt_f16(ctx, input_slice, weight_slice, out_slice,
+                                         conv1x1_rows, UOCR_SAM_HIDDEN_SIZE, UOCR_SAM_NECK_CHANNELS,
+                                         "Metal SAM neck 1x1 MPS matmul", error, error_size)) {
             return 0;
         }
     } else {
-        RUN_BATCHED_SAM_NECK_STEP("SAM neck 1x1 convolution (fallback)",
-                                  metal_context_sam_neck_conv1x1_batch_f16_to_slice(ctx,
-                                                                                     input_bhwc,
-                                                                                     weights->sam_neck_conv1x1_weight,
-                                                                                     grid_w,
-                                                                                     grid_h,
-                                                                                     view_count,
-                                                                                     scratch->sam_neck_a_nchw,
-                                                                                     error,
-                                                                                     error_size));
+        return metal_fail(error, error_size, "Metal neck 1x1 requires MPS; threshold too high or MPS unavailable");
     }
-    RUN_BATCHED_SAM_NECK_STEP("SAM neck LayerNorm2d-1",
-                              metal_context_sam_layernorm2d_batch_f16_to_slice(ctx,
-                                                                               scratch->sam_neck_a_nchw,
-                                                                               weights->sam_neck_norm1_weight,
-                                                                               weights->sam_neck_norm1_bias,
-                                                                               grid_w,
-                                                                               grid_h,
-                                                                               view_count,
-                                                                               scratch->sam_neck_b_nchw,
-                                                                               error,
-                                                                               error_size));
-    RUN_BATCHED_SAM_NECK_STEP("SAM neck 3x3 convolution",
-                              metal_context_sam_conv3x3_im2col_mps_batch_f16_to_slice(ctx,
-                                                                                       scratch->sam_neck_b_nchw,
-                                                                                       weights->sam_neck_conv3x3_weight,
-                                                                                       grid_w,
-                                                                                       grid_h,
-                                                                                       UOCR_SAM_NECK_CHANNELS,
-                                                                                       UOCR_SAM_NECK_CHANNELS,
-                                                                                       1u,
-                                                                                       view_count,
-                                                                                       scratch->sam_neck_a_nchw,
-                                                                                       "Metal SAM neck 3x3 MPS",
-                                                                                       scratch,
-                                                                                       error,
-                                                                                       error_size));
-    RUN_BATCHED_SAM_NECK_STEP("SAM neck LayerNorm2d-2",
-                              metal_context_sam_layernorm2d_batch_f16_to_slice(ctx,
-                                                                               scratch->sam_neck_a_nchw,
-                                                                               weights->sam_neck_norm2_weight,
-                                                                               weights->sam_neck_norm2_bias,
-                                                                               grid_w,
-                                                                               grid_h,
-                                                                               view_count,
-                                                                               scratch->sam_neck_b_nchw,
-                                                                               error,
-                                                                               error_size));
-    RUN_BATCHED_SAM_NECK_STEP("SAM net_2 convolution",
-                              metal_context_sam_conv3x3_im2col_mps_batch_f16_to_slice(ctx,
-                                                                                       scratch->sam_neck_b_nchw,
-                                                                                       weights->sam_net2_weight,
-                                                                                       grid_w,
-                                                                                       grid_h,
-                                                                                       UOCR_SAM_NECK_CHANNELS,
-                                                                                       UOCR_SAM_NET2_CHANNELS,
-                                                                                       UOCR_SAM_NET_STRIDE,
-                                                                                       view_count,
-                                                                                       scratch->sam_net2_nchw,
-                                                                                       "Metal SAM net_2 3x3 stride-2 MPS",
-                                                                                       scratch,
-                                                                                       error,
-                                                                                       error_size));
-    RUN_BATCHED_SAM_NECK_STEP("SAM net_3 convolution",
-                              metal_context_sam_conv3x3_im2col_mps_batch_f16_to_slice(ctx,
-                                                                                       scratch->sam_net2_nchw,
-                                                                                       weights->sam_net3_weight,
-                                                                                       net2_grid_w,
-                                                                                       net2_grid_h,
-                                                                                       UOCR_SAM_NET2_CHANNELS,
-                                                                                       UOCR_SAM_NET3_CHANNELS,
-                                                                                       UOCR_SAM_NET_STRIDE,
-                                                                                       view_count,
-                                                                                       out_sam_nchw,
-                                                                                       "Metal SAM net_3 3x3 stride-2 MPS",
-                                                                                       scratch,
-                                                                                       error,
-                                                                                       error_size));
+    RUN_BATCHED_SAM_NECK_STEP("SAM neck LayerNorm2d-1 (BHWC)",
+                              metal_context_sam_layernorm2d_bhwc_batch_f16_to_slice(ctx,
+                                                                                   scratch->sam_neck_a_nchw,
+                                                                                   weights->sam_neck_norm1_weight,
+                                                                                   weights->sam_neck_norm1_bias,
+                                                                                   grid_w,
+                                                                                   grid_h,
+                                                                                   view_count,
+                                                                                   scratch->sam_neck_b_nchw,
+                                                                                   error,
+                                                                                   error_size));
+    RUN_BATCHED_SAM_NECK_STEP("SAM neck 3x3 convolution (BHWC)",
+                              metal_context_sam_conv3x3_im2col_mps_bhwc_batch_f16_to_slice(ctx,
+                                                                                           scratch->sam_neck_b_nchw,
+                                                                                           weights->sam_neck_conv3x3_weight_ohwi,
+                                                                                           grid_w,
+                                                                                           grid_h,
+                                                                                           UOCR_SAM_NECK_CHANNELS,
+                                                                                           UOCR_SAM_NECK_CHANNELS,
+                                                                                           1u,
+                                                                                           view_count,
+                                                                                           scratch->sam_neck_a_nchw,
+                                                                                           "Metal SAM neck 3x3 BHWC MPS",
+                                                                                           scratch,
+                                                                                           error,
+                                                                                           error_size));
+    RUN_BATCHED_SAM_NECK_STEP("SAM neck LayerNorm2d-2 (BHWC)",
+                              metal_context_sam_layernorm2d_bhwc_batch_f16_to_slice(ctx,
+                                                                                   scratch->sam_neck_a_nchw,
+                                                                                   weights->sam_neck_norm2_weight,
+                                                                                   weights->sam_neck_norm2_bias,
+                                                                                   grid_w,
+                                                                                   grid_h,
+                                                                                   view_count,
+                                                                                   scratch->sam_neck_b_nchw,
+                                                                                   error,
+                                                                                   error_size));
+    RUN_BATCHED_SAM_NECK_STEP("SAM net_2 convolution (BHWC)",
+                              metal_context_sam_conv3x3_im2col_mps_bhwc_batch_f16_to_slice(ctx,
+                                                                                           scratch->sam_neck_b_nchw,
+                                                                                           weights->sam_net2_weight_ohwi,
+                                                                                           grid_w,
+                                                                                           grid_h,
+                                                                                           UOCR_SAM_NECK_CHANNELS,
+                                                                                           UOCR_SAM_NET2_CHANNELS,
+                                                                                           UOCR_SAM_NET_STRIDE,
+                                                                                           view_count,
+                                                                                           scratch->sam_net2_nchw,
+                                                                                           "Metal SAM net_2 BHWC MPS",
+                                                                                           scratch,
+                                                                                           error,
+                                                                                           error_size));
+    RUN_BATCHED_SAM_NECK_STEP("SAM net_3 convolution (BHWC)",
+                              metal_context_sam_conv3x3_im2col_mps_bhwc_batch_f16_to_slice(ctx,
+                                                                                           scratch->sam_net2_nchw,
+                                                                                           weights->sam_net3_weight_ohwi,
+                                                                                           net2_grid_w,
+                                                                                           net2_grid_h,
+                                                                                           UOCR_SAM_NET2_CHANNELS,
+                                                                                           UOCR_SAM_NET3_CHANNELS,
+                                                                                           UOCR_SAM_NET_STRIDE,
+                                                                                           view_count,
+                                                                                           out_sam_nchw,
+                                                                                           "Metal SAM net_3 BHWC MPS",
+                                                                                           scratch,
+                                                                                           error,
+                                                                                           error_size));
     metal_profile_add_event_now(ctx, view_count > 1u ? "metal.vision.sam_neck_batch" : "metal.vision.sam_neck", sam_neck_start_ns);
     *out_grid_w = sam_grid_w;
     *out_grid_h = sam_grid_h;
@@ -6254,9 +6474,19 @@ static int metal_encode_one_view_clip_features_f16(uocr_metal_vision_project_con
         metal_profile_add_event_now_f(ctx, vision_step_start_ns__, "metal.vision.%s", step_name);    \
     } while (0)
 
+    /* Transpose neck BHWC output → NCHW (into clip_b) for CLIP embedding */
+    {
+        uocr_metal_buffer_slice bhwc_s = { out_sam_nchw.buffer, out_sam_nchw.offset };
+        uocr_metal_buffer_slice nchw_s = { scratch->clip_b.buffer, scratch->clip_b.offset };
+        if (!metal_context_bhwc_to_nchw_f16(ctx, bhwc_s, 1u,
+                                            sam_grid_w * sam_grid_h,
+                                            UOCR_SAM_NET3_CHANNELS,
+                                            nchw_s,
+                                            error, error_size)) { return 0; }
+    }
     RUN_VISION_STEP("CLIP SAM embedding",
                     metal_context_clip_embed_sam_f16_to_slice(ctx,
-                                                              out_sam_nchw,
+                                                              scratch->clip_b,
                                                               weights->clip_class_embedding,
                                                               sam_grid_w,
                                                               sam_grid_h,
@@ -6555,11 +6785,19 @@ static int metal_encode_one_view_projected_f16(uocr_metal_vision_project_context
         metal_profile_add_event_now_f(ctx, vision_step_start_ns__, "metal.vision.%s", step_name);    \
     } while (0)
 
+    /* Transpose neck BHWC → NCHW into sam_neck_b_nchw for concat */
+    {
+        uocr_metal_buffer_slice bhwc_s = { scratch->sam_net3_nchw.buffer, scratch->sam_net3_nchw.offset };
+        uocr_metal_buffer_slice nchw_s = { scratch->sam_neck_b_nchw.buffer, scratch->sam_neck_b_nchw.offset };
+        if (!metal_context_bhwc_to_nchw_f16(ctx, bhwc_s, 1u, sam_grid_w * sam_grid_h,
+                                            UOCR_SAM_NET3_CHANNELS, nchw_s,
+                                            error, error_size)) { return 0; }
+    }
     const uint64_t concat_start_ns = uocr_profile_now_ns();
     RUN_VISION_STEP("CLIP/SAM concat",
                     metal_context_clip_sam_concat_f16_to_slice(ctx,
                                                               scratch->clip_final,
-                                                              scratch->sam_net3_nchw,
+                                                              scratch->sam_neck_b_nchw,
                                                               sam_grid_w,
                                                               sam_grid_h,
                                                               scratch->concat,
@@ -6901,9 +7139,27 @@ static int metal_project_vision_chunk_f16(const uocr_vision_chunk *chunk,
         (void)metal_fail(error, error_size, "Metal batched SAM neck grid does not match projected token count");
         return UOCR_ERROR_INTERNAL;
     }
+
+    /* Transpose neck BHWC output → NCHW into stable sam_neck_b_nchw buffer.
+     * This NCHW copy is used by both CLIP embedding and concat. */
+    {
+        uocr_metal_buffer_slice bhwc_slice = { project->scratch->sam_net3_nchw.buffer, project->scratch->sam_net3_nchw.offset };
+        uocr_metal_buffer_slice nchw_slice = { project->scratch->sam_neck_b_nchw.buffer, project->scratch->sam_neck_b_nchw.offset };
+        if (!metal_context_bhwc_to_nchw_f16(project->ctx,
+                                            bhwc_slice,
+                                            chunk->view_count,
+                                            sam_grid_w * sam_grid_h,
+                                            UOCR_SAM_NET3_CHANNELS,
+                                            nchw_slice,
+                                            error,
+                                            error_size)) {
+            return UOCR_ERROR_INTERNAL;
+        }
+    }
+
     const uint64_t clip_frontend_start_ns = uocr_profile_now_ns();
     if (!metal_context_clip_embed_sam_batch_f16_to_slice(project->ctx,
-                                                        project->scratch->sam_net3_nchw,
+                                                        project->scratch->sam_neck_b_nchw,
                                                         project->weights->clip_class_embedding,
                                                         sam_grid_w,
                                                         sam_grid_h,
@@ -6948,7 +7204,7 @@ static int metal_project_vision_chunk_f16(const uocr_vision_chunk *chunk,
     const uint64_t concat_start_ns = uocr_profile_now_ns();
     if (!metal_context_clip_sam_concat_batch_f16_to_slice(project->ctx,
                                                          project->scratch->clip_final,
-                                                         project->scratch->sam_net3_nchw,
+                                                         project->scratch->sam_neck_b_nchw,
                                                          sam_grid_w,
                                                          sam_grid_h,
                                                          chunk->view_count,
