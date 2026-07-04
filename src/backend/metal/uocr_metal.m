@@ -39,6 +39,7 @@
 #define UOCR_METAL_MPS_MATMUL_SKINNY_OUT_FEATURES 128u
 #define UOCR_METAL_MPS_MATMUL_SKINNY_MIN_FLOPS 64000000ULL
 #define UOCR_METAL_MPS_MATMUL_MIN_FLOPS_ENV "UOCR_METAL_MPS_MATMUL_MIN_FLOPS"
+#define UOCR_METAL_VISION_PROFILE_DETAIL_ENV "UOCR_METAL_VISION_PROFILE_DETAIL"
 #ifndef UOCR_METAL_ENABLE_MOE_FUSED_DOWN_COMBINE
 #define UOCR_METAL_ENABLE_MOE_FUSED_DOWN_COMBINE 1
 #endif
@@ -557,6 +558,12 @@ static int metal_command_batch_commit_and_wait(uocr_metal_context *ctx,
                                                const char *op_name,
                                                char *error,
                                                size_t error_size);
+static int metal_vision_profile_detail_level(void);
+static int metal_vision_profile_checkpoint(uocr_metal_context *ctx,
+                                           const char *name,
+                                           int reopen_batch,
+                                           char *error,
+                                           size_t error_size);
 static int metal_wait_for_command_buffer_profiled(uocr_metal_context *ctx,
                                                   id<MTLCommandBuffer> cb,
                                                   const char *op_name,
@@ -5814,6 +5821,14 @@ static int metal_context_sam_neck_batch_f16_to_slice(uocr_metal_vision_project_c
             return metal_fail(error, error_size, "failed to compute Metal vision %s: %s", step_name, detail); \
         }                                                                                            \
         metal_profile_add_event_now_f(ctx, vision_step_start_ns__, "metal.vision.%s", step_name);    \
+        if (metal_vision_profile_detail_level() >= 3) {                                              \
+            char checkpoint_name[128];                                                               \
+            (void)snprintf(checkpoint_name, sizeof(checkpoint_name), "sam_neck.%s", step_name);      \
+            checkpoint_name[sizeof(checkpoint_name) - 1u] = '\0';                                    \
+            if (!metal_vision_profile_checkpoint(ctx, checkpoint_name, 1, error, error_size)) {       \
+                return 0;                                                                            \
+            }                                                                                        \
+        }                                                                                            \
     } while (0)
 
     const uint64_t sam_neck_start_ns = uocr_profile_now_ns();
@@ -5828,9 +5843,15 @@ static int metal_context_sam_neck_batch_f16_to_slice(uocr_metal_vision_project_c
         uocr_metal_buffer_slice weight_slice = { weights->sam_neck_conv1x1_weight.slice.buffer,
                                                   weights->sam_neck_conv1x1_weight.slice.offset };
         uocr_metal_buffer_slice out_slice = { scratch->sam_neck_a_nchw.buffer, scratch->sam_neck_a_nchw.offset };
+        const uint64_t conv1x1_start_ns = uocr_profile_now_ns();
         if (!metal_run_mps_matmul_nt_f16(ctx, input_slice, weight_slice, out_slice,
                                          conv1x1_rows, UOCR_SAM_HIDDEN_SIZE, UOCR_SAM_NECK_CHANNELS,
                                          "Metal SAM neck 1x1 MPS matmul", error, error_size)) {
+            return 0;
+        }
+        metal_profile_add_event_now(ctx, "metal.vision.SAM neck 1x1 convolution (BHWC)", conv1x1_start_ns);
+        if (metal_vision_profile_detail_level() >= 3 &&
+            !metal_vision_profile_checkpoint(ctx, "sam_neck.SAM neck 1x1 convolution (BHWC)", 1, error, error_size)) {
             return 0;
         }
     } else {
@@ -7071,6 +7092,14 @@ static int metal_project_vision_chunk_f16(const uocr_vision_chunk *chunk,
     }
 
     const uint64_t chunk_encode_start_ns = uocr_profile_now_ns();
+    const int vision_profile_detail = metal_vision_profile_detail_level();
+#define METAL_VISION_STAGE_CHECKPOINT(stage_name__)                                                    \
+    do {                                                                                                \
+        if (vision_profile_detail >= 1 &&                                                               \
+            !metal_vision_profile_checkpoint(project->ctx, (stage_name__), 1, error, error_size)) {     \
+            return UOCR_ERROR_INTERNAL;                                                                \
+        }                                                                                               \
+    } while (0)
     uint32_t batched_patch_grid_w = 0u;
     uint32_t batched_patch_grid_h = 0u;
     const uint64_t sam_patch_batch_start_ns = uocr_profile_now_ns();
@@ -7084,6 +7113,7 @@ static int metal_project_vision_chunk_f16(const uocr_vision_chunk *chunk,
         return UOCR_ERROR_INTERNAL;
     }
     metal_profile_add_event_now(project->ctx, "metal.vision.sam_patch_batch", sam_patch_batch_start_ns);
+    METAL_VISION_STAGE_CHECKPOINT("sam_patch_batch");
 
     const uint32_t projected_tokens_per_view = chunk->projected_tokens_per_view;
     const uint32_t clip_tokens_per_view = projected_tokens_per_view + UOCR_CLIP_CLASS_TOKENS;
@@ -7097,7 +7127,7 @@ static int metal_project_vision_chunk_f16(const uocr_vision_chunk *chunk,
     const uocr_metal_vision_tensor_f16 sam_pos_embed = metal_sam_abs_pos_table_for_grid(project->weights,
                                                                                         patch_grid_w,
                                                                                         patch_grid_h);
-    const uint64_t sam_transformer_batch_start_ns = uocr_profile_now_ns();
+    const uint64_t sam_abs_pos_batch_start_ns = uocr_profile_now_ns();
     if (!metal_context_sam_add_abs_pos_batch_f16_to_slice(project->ctx,
                                                          project->scratch->sam_patch_bhwc,
                                                          sam_pos_embed,
@@ -7106,8 +7136,14 @@ static int metal_project_vision_chunk_f16(const uocr_vision_chunk *chunk,
                                                          chunk->view_count,
                                                          project->scratch->sam_pos_bhwc,
                                                          error,
-                                                         error_size) ||
-        !metal_context_sam_transformer_batch_workspace_f16_to_slice(project->ctx,
+                                                         error_size)) {
+        return UOCR_ERROR_INTERNAL;
+    }
+    metal_profile_add_event_now(project->ctx, "metal.vision.sam_abs_pos_batch", sam_abs_pos_batch_start_ns);
+    METAL_VISION_STAGE_CHECKPOINT("sam_abs_pos_batch");
+
+    const uint64_t sam_transformer_batch_start_ns = uocr_profile_now_ns();
+    if (!metal_context_sam_transformer_batch_workspace_f16_to_slice(project->ctx,
                                                                     project->scratch->sam_pos_bhwc,
                                                                     project->weights->sam_block_slices,
                                                                     UOCR_SAM_BLOCKS,
@@ -7121,6 +7157,7 @@ static int metal_project_vision_chunk_f16(const uocr_vision_chunk *chunk,
         return UOCR_ERROR_INTERNAL;
     }
     metal_profile_add_event_now(project->ctx, "metal.vision.sam_transformer_batch", sam_transformer_batch_start_ns);
+    METAL_VISION_STAGE_CHECKPOINT("sam_transformer_batch");
     uint32_t sam_grid_w = 0u;
     uint32_t sam_grid_h = 0u;
     if (!metal_context_sam_neck_batch_f16_to_slice(project,
@@ -7135,6 +7172,7 @@ static int metal_project_vision_chunk_f16(const uocr_vision_chunk *chunk,
                                                    error_size)) {
         return UOCR_ERROR_INTERNAL;
     }
+    METAL_VISION_STAGE_CHECKPOINT("sam_neck_batch");
     if (sam_grid_w * sam_grid_h != projected_tokens_per_view) {
         (void)metal_fail(error, error_size, "Metal batched SAM neck grid does not match projected token count");
         return UOCR_ERROR_INTERNAL;
@@ -7145,6 +7183,7 @@ static int metal_project_vision_chunk_f16(const uocr_vision_chunk *chunk,
     {
         uocr_metal_buffer_slice bhwc_slice = { project->scratch->sam_net3_nchw.buffer, project->scratch->sam_net3_nchw.offset };
         uocr_metal_buffer_slice nchw_slice = { project->scratch->sam_neck_b_nchw.buffer, project->scratch->sam_neck_b_nchw.offset };
+        const uint64_t transpose_start_ns = uocr_profile_now_ns();
         if (!metal_context_bhwc_to_nchw_f16(project->ctx,
                                             bhwc_slice,
                                             chunk->view_count,
@@ -7155,6 +7194,8 @@ static int metal_project_vision_chunk_f16(const uocr_vision_chunk *chunk,
                                             error_size)) {
             return UOCR_ERROR_INTERNAL;
         }
+        metal_profile_add_event_now(project->ctx, "metal.vision.sam_neck_bhwc_to_nchw_batch", transpose_start_ns);
+        METAL_VISION_STAGE_CHECKPOINT("sam_neck_bhwc_to_nchw_batch");
     }
 
     const uint64_t clip_frontend_start_ns = uocr_profile_now_ns();
@@ -7187,6 +7228,7 @@ static int metal_project_vision_chunk_f16(const uocr_vision_chunk *chunk,
         return UOCR_ERROR_INTERNAL;
     }
     metal_profile_add_event_now(project->ctx, "metal.vision.clip_frontend_batch", clip_frontend_start_ns);
+    METAL_VISION_STAGE_CHECKPOINT("clip_frontend_batch");
     const uint64_t clip_transformer_start_ns = uocr_profile_now_ns();
     if (!metal_context_clip_transformer_batch_workspace_f16_to_slice(project->ctx,
                                                                      project->scratch->clip_a,
@@ -7201,6 +7243,7 @@ static int metal_project_vision_chunk_f16(const uocr_vision_chunk *chunk,
         return UOCR_ERROR_INTERNAL;
     }
     metal_profile_add_event_now(project->ctx, "metal.vision.clip_transformer_batch", clip_transformer_start_ns);
+    METAL_VISION_STAGE_CHECKPOINT("clip_transformer_batch");
     const uint64_t concat_start_ns = uocr_profile_now_ns();
     if (!metal_context_clip_sam_concat_batch_f16_to_slice(project->ctx,
                                                          project->scratch->clip_final,
@@ -7214,6 +7257,7 @@ static int metal_project_vision_chunk_f16(const uocr_vision_chunk *chunk,
         return UOCR_ERROR_INTERNAL;
     }
     metal_profile_add_event_now(project->ctx, "metal.vision.concat_batch", concat_start_ns);
+    METAL_VISION_STAGE_CHECKPOINT("concat_batch");
     const uint64_t projector_start_ns = uocr_profile_now_ns();
     if (!metal_context_visual_projector_f16_to_slice(project->ctx,
                                                     project->scratch->concat,
@@ -7226,9 +7270,12 @@ static int metal_project_vision_chunk_f16(const uocr_vision_chunk *chunk,
         return UOCR_ERROR_INTERNAL;
     }
     metal_profile_add_event_now(project->ctx, "metal.vision.projector_batch", projector_start_ns);
+    METAL_VISION_STAGE_CHECKPOINT("projector_batch");
     const uint64_t chunk_encode_end_ns = uocr_profile_now_ns();
     project->chunk_encode_ms += uocr_profile_elapsed_ms(chunk_encode_start_ns, chunk_encode_end_ns);
     metal_profile_add_event_now(project->ctx, "metal.vision.chunk_encode", chunk_encode_start_ns);
+
+#undef METAL_VISION_STAGE_CHECKPOINT
 
     return UOCR_OK;
 }
@@ -7445,6 +7492,14 @@ static int metal_context_encode_visual_features_to_workspace_f16(uocr_metal_cont
                 }
             }
             formatter_ns += uocr_profile_now_ns() - formatter_start_ns;
+            if (process_status == UOCR_OK && metal_vision_profile_detail_level() >= 1) {
+                const char *formatter_checkpoint = chunk->kind == UOCR_VISION_CHUNK_LOCAL ?
+                                                       "local_formatter" :
+                                                       "global_formatter";
+                if (!metal_vision_profile_checkpoint(ctx, formatter_checkpoint, 0, error, error_size)) {
+                    process_status = UOCR_ERROR_INTERNAL;
+                }
+            }
         }
 
         if (!had_active_batch) {
@@ -9305,6 +9360,62 @@ static int metal_command_batch_commit_and_wait(uocr_metal_context *ctx,
     const int ok = metal_wait_for_command_buffer_profiled(ctx, cb, op_name, error, error_size);
     [cb release];
     return ok;
+}
+
+static int metal_vision_profile_detail_level(void) {
+    static int cached = -1;
+    if (cached >= 0) {
+        return cached;
+    }
+    const char *env = getenv(UOCR_METAL_VISION_PROFILE_DETAIL_ENV);
+    if (env == NULL || env[0] == '\0' || strcmp(env, "0") == 0 || strcmp(env, "false") == 0 || strcmp(env, "off") == 0) {
+        cached = 0;
+        return cached;
+    }
+    if (strcmp(env, "stage") == 0 || strcmp(env, "stages") == 0 || strcmp(env, "true") == 0 || strcmp(env, "yes") == 0) {
+        cached = 1;
+        return cached;
+    }
+    if (strcmp(env, "block") == 0 || strcmp(env, "blocks") == 0) {
+        cached = 2;
+        return cached;
+    }
+    if (strcmp(env, "op") == 0 || strcmp(env, "ops") == 0 || strcmp(env, "operation") == 0 || strcmp(env, "operations") == 0) {
+        cached = 3;
+        return cached;
+    }
+    errno = 0;
+    char *end = NULL;
+    long parsed = strtol(env, &end, 0);
+    if (errno == 0 && end != env && end != NULL && *end == '\0' && parsed > 0) {
+        cached = parsed > 3 ? 3 : (int)parsed;
+    } else {
+        cached = 1;
+    }
+    return cached;
+}
+
+static int metal_vision_profile_checkpoint(uocr_metal_context *ctx,
+                                           const char *name,
+                                           int reopen_batch,
+                                           char *error,
+                                           size_t error_size) {
+    if (ctx == NULL || name == NULL || !metal_command_batch_active(ctx)) {
+        return 1;
+    }
+    char op_name[160];
+    (void)snprintf(op_name, sizeof(op_name), "Metal vision profile checkpoint %s", name);
+    op_name[sizeof(op_name) - 1u] = '\0';
+
+    const uint64_t wait_start_ns = uocr_profile_now_ns();
+    if (!metal_command_batch_commit_and_wait(ctx, op_name, error, error_size)) {
+        return 0;
+    }
+    metal_profile_add_event_now_f(ctx, wait_start_ns, "metal.vision.checkpoint_wait.%s", name);
+    if (reopen_batch && !metal_command_batch_begin(ctx, error, error_size)) {
+        return 0;
+    }
+    return 1;
 }
 
 static id<MTLCommandBuffer> metal_command_buffer_for_op(uocr_metal_context *ctx,
@@ -18768,6 +18879,14 @@ static int metal_context_clip_transformer_batch_block_workspace_f16_to_slice(uoc
             metal_copy_error_detail(detail, sizeof(detail), error);                                      \
             return metal_fail(error, error_size, "failed to compute Metal CLIP batch block %s: %s", step_name, detail); \
         }                                                                                               \
+        if (metal_vision_profile_detail_level() >= 3) {                                                 \
+            char checkpoint_name[96];                                                                   \
+            (void)snprintf(checkpoint_name, sizeof(checkpoint_name), "clip_batch_block.%s", step_name); \
+            checkpoint_name[sizeof(checkpoint_name) - 1u] = '\0';                                        \
+            if (!metal_vision_profile_checkpoint(ctx, checkpoint_name, 1, error, error_size)) {          \
+                return 0;                                                                               \
+            }                                                                                           \
+        }                                                                                               \
     } while (0)
 
     RUN_CLIP_BATCH_BLOCK_STEP("LayerNorm1",
@@ -18916,6 +19035,7 @@ static int metal_context_clip_transformer_batch_workspace_f16_to_slice(uocr_meta
     uocr_metal_vision_workspace_slice state_b = scratch->clip_a;
     uocr_metal_vision_workspace_slice next = state_a;
     const uint64_t clip_blocks_start_ns = uocr_profile_now_ns();
+    const int vision_profile_detail = metal_vision_profile_detail_level();
     for (uint32_t block_index = 0u; block_index < block_count; ++block_index) {
         const uint64_t block_start_ns = uocr_profile_now_ns();
         const int is_last = block_index + 1u == block_count;
@@ -18949,6 +19069,17 @@ static int metal_context_clip_transformer_batch_workspace_f16_to_slice(uocr_meta
                                       block_start_ns,
                                       view_count > 1u ? "metal.vision.clip_block_batch.%02u" : "metal.vision.clip_block.%02u",
                                       block_index);
+        if (vision_profile_detail == 2) {
+            char checkpoint_name[64];
+            (void)snprintf(checkpoint_name,
+                           sizeof(checkpoint_name),
+                           view_count > 1u ? "clip_block_batch.%02u" : "clip_block.%02u",
+                           block_index);
+            checkpoint_name[sizeof(checkpoint_name) - 1u] = '\0';
+            if (!metal_vision_profile_checkpoint(ctx, checkpoint_name, 1, error, error_size)) {
+                return 0;
+            }
+        }
     }
     metal_profile_add_event_now(ctx, view_count > 1u ? "metal.vision.clip_blocks_batch" : "metal.vision.clip_blocks", clip_blocks_start_ns);
     metal_clear_error(error, error_size);
@@ -20099,15 +20230,145 @@ static int metal_context_sam_rel_pos_attention_batch_f16_to_slice(uocr_metal_con
     const uint32_t target_h_length = 2u * grid_h - 1u;
     const uint32_t target_w_length = 2u * grid_w - 1u;
     const int rel_pos_tables_match_target = rel_pos_h_length == target_h_length && rel_pos_w_length == target_w_length;
-    const int use_tiled_global = n_windows == 1u && rel_pos_tables_match_target;
-    const int use_tiled_window = n_windows > 1u && grid_w == UOCR_SAM_WINDOW_SIZE && grid_h == UOCR_SAM_WINDOW_SIZE &&
-                                 rel_pos_tables_match_target;
-    const int use_tiled_attention = use_tiled_global || use_tiled_window;
-    const char *kernel_name = use_tiled_attention ?
-                              "uocr_sam_rel_pos_attention_tiled_f16_to_f16" :
-                              "uocr_sam_rel_pos_attention_flash_f16_to_f16";
-    const char *op_name = use_tiled_global ? "Metal SAM global tiled rel-pos attention" :
-                          (use_tiled_window ? "Metal SAM window tiled rel-pos attention" : "Metal SAM rel-pos batch attention");
+
+    uocr_metal_sam_rel_pos_attention_params params;
+    params.windows = n_windows;
+    params.grid_width = grid_w;
+    params.grid_height = grid_h;
+    params.tokens_per_window = (uint32_t)tokens;
+    params.heads = UOCR_SAM_ATTENTION_HEADS;
+    params.head_dim = UOCR_SAM_HEAD_DIM;
+    params.rel_pos_h_length = rel_pos_h_length;
+    params.rel_pos_w_length = rel_pos_w_length;
+    params.scale = 1.0f / sqrtf((float)UOCR_SAM_HEAD_DIM);
+    params.batch_size = view_count;
+    params.reserved1 = 0u;
+    params.reserved2 = 0u;
+
+    if (rel_pos_tables_match_target) {
+        const char *op_name = n_windows == 1u ?
+                                  "Metal SAM global precomputed rel-pos attention" :
+                                  "Metal SAM window precomputed rel-pos attention";
+        uint64_t rel_h_logit_count = 0u;
+        uint64_t rel_w_logit_count = 0u;
+        uint64_t rel_h_logit_bytes = 0u;
+        uint64_t rel_w_logit_bytes = 0u;
+        if (!checked_mul_u64(logical_windows, (uint64_t)UOCR_SAM_ATTENTION_HEADS, &rel_h_logit_count) ||
+            !checked_mul_u64(rel_h_logit_count, tokens, &rel_h_logit_count) ||
+            !checked_mul_u64(rel_h_logit_count, (uint64_t)grid_h, &rel_h_logit_count) ||
+            !checked_mul_u64(logical_windows, (uint64_t)UOCR_SAM_ATTENTION_HEADS, &rel_w_logit_count) ||
+            !checked_mul_u64(rel_w_logit_count, tokens, &rel_w_logit_count) ||
+            !checked_mul_u64(rel_w_logit_count, (uint64_t)grid_w, &rel_w_logit_count) ||
+            !checked_mul_u64(rel_h_logit_count, (uint64_t)sizeof(float), &rel_h_logit_bytes) ||
+            !checked_mul_u64(rel_w_logit_count, (uint64_t)sizeof(float), &rel_w_logit_bytes) ||
+            rel_h_logit_bytes > (uint64_t)NSUIntegerMax || rel_w_logit_bytes > (uint64_t)NSUIntegerMax ||
+            rel_h_logit_bytes > ctx->device.maxBufferLength || rel_w_logit_bytes > ctx->device.maxBufferLength) {
+            return metal_fail(error, error_size, "Metal SAM precomputed rel-pos logit buffer size overflow");
+        }
+
+        @autoreleasepool {
+            id<MTLComputePipelineState> logits_pipeline = metal_get_pipeline(ctx, "uocr_sam_rel_pos_logits_f16_to_f32", error, error_size);
+            id<MTLComputePipelineState> attention_pipeline = metal_get_pipeline(ctx,
+                                                                                "uocr_sam_rel_pos_attention_tiled_precomputed_f16_to_f16",
+                                                                                error,
+                                                                                error_size);
+            if (logits_pipeline == nil || attention_pipeline == nil) {
+                return 0;
+            }
+            NSUInteger logits_threads_per_group = 0u;
+            NSUInteger attention_threads_per_group = 0u;
+            if (!metal_flash_attention_threads_per_threadgroup(logits_pipeline,
+                                                               1u,
+                                                               UOCR_SAM_HEAD_DIM,
+                                                               "Metal SAM rel-pos logits",
+                                                               &logits_threads_per_group,
+                                                               error,
+                                                               error_size) ||
+                !metal_flash_attention_threads_per_threadgroup(attention_pipeline,
+                                                               UOCR_METAL_FLASH_Q_PER_TG,
+                                                               UOCR_SAM_HEAD_DIM,
+                                                               op_name,
+                                                               &attention_threads_per_group,
+                                                               error,
+                                                               error_size)) {
+                return 0;
+            }
+
+            id<MTLBuffer> rel_h_logits = metal_new_buffer_with_length(ctx,
+                                                                      (NSUInteger)rel_h_logit_bytes,
+                                                                      MTLResourceStorageModePrivate);
+            id<MTLBuffer> rel_w_logits = metal_new_buffer_with_length(ctx,
+                                                                      (NSUInteger)rel_w_logit_bytes,
+                                                                      MTLResourceStorageModePrivate);
+            if (rel_h_logits == nil || rel_w_logits == nil) {
+                [rel_w_logits release];
+                [rel_h_logits release];
+                return metal_fail(error, error_size, "failed to allocate Metal SAM precomputed rel-pos logits");
+            }
+            rel_h_logits.label = @"uocr_sam_rel_h_logits_f32";
+            rel_w_logits.label = @"uocr_sam_rel_w_logits_f32";
+
+            int owned_command_buffer = 0;
+            id<MTLCommandBuffer> cb = metal_command_buffer_for_op(ctx, &owned_command_buffer, op_name, error, error_size);
+            if (cb == nil) {
+                [rel_w_logits release];
+                [rel_h_logits release];
+                return 0;
+            }
+            if (!owned_command_buffer) {
+                if (!metal_retain_transient_until_completed(ctx, cb, rel_h_logits, error, error_size) ||
+                    !metal_retain_transient_until_completed(ctx, cb, rel_w_logits, error, error_size)) {
+                    [rel_w_logits release];
+                    [rel_h_logits release];
+                    return 0;
+                }
+            }
+
+            id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
+            if (enc == nil) {
+                [rel_w_logits release];
+                [rel_h_logits release];
+                return metal_fail(error, error_size, "failed to create Metal SAM precomputed rel-pos attention command encoder");
+            }
+
+            [enc setComputePipelineState:logits_pipeline];
+            [enc setBuffer:q.buffer offset:q.offset atIndex:0u];
+            [enc setBuffer:rel_pos_h.slice.buffer offset:rel_pos_h.slice.offset atIndex:1u];
+            [enc setBuffer:rel_pos_w.slice.buffer offset:rel_pos_w.slice.offset atIndex:2u];
+            [enc setBuffer:rel_h_logits offset:0u atIndex:3u];
+            [enc setBuffer:rel_w_logits offset:0u atIndex:4u];
+            [enc setBytes:&params length:sizeof(params) atIndex:5u];
+            [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)UOCR_SAM_ATTENTION_HEADS,
+                                                  (NSUInteger)tokens,
+                                                  (NSUInteger)logical_windows)
+                 threadsPerThreadgroup:MTLSizeMake(logits_threads_per_group, 1u, 1u)];
+
+            const NSUInteger query_blocks = (NSUInteger)(((uint32_t)tokens + UOCR_METAL_FLASH_Q_PER_TG - 1u) / UOCR_METAL_FLASH_Q_PER_TG);
+            const NSUInteger tile_keys = 16u;
+            const NSUInteger tile_bytes = tile_keys * (NSUInteger)UOCR_SAM_HEAD_DIM * sizeof(uint16_t);
+            [enc setComputePipelineState:attention_pipeline];
+            [enc setBuffer:q.buffer offset:q.offset atIndex:0u];
+            [enc setBuffer:k.buffer offset:k.offset atIndex:1u];
+            [enc setBuffer:v.buffer offset:v.offset atIndex:2u];
+            [enc setBuffer:rel_h_logits offset:0u atIndex:3u];
+            [enc setBuffer:rel_w_logits offset:0u atIndex:4u];
+            [enc setBuffer:out.buffer offset:out.offset atIndex:5u];
+            [enc setBytes:&params length:sizeof(params) atIndex:6u];
+            [enc setThreadgroupMemoryLength:tile_bytes atIndex:0u];
+            [enc setThreadgroupMemoryLength:tile_bytes atIndex:1u];
+            [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)UOCR_SAM_ATTENTION_HEADS, query_blocks, (NSUInteger)logical_windows)
+                 threadsPerThreadgroup:MTLSizeMake(attention_threads_per_group, 1u, 1u)];
+            [enc endEncoding];
+
+            const int result = metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, op_name, error, error_size);
+            [rel_w_logits release];
+            [rel_h_logits release];
+            return result;
+        }
+    }
+
+    const char *kernel_name = "uocr_sam_rel_pos_attention_flash_f16_to_f16";
+    const char *op_name = "Metal SAM rel-pos batch attention";
 
     @autoreleasepool {
         id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, kernel_name, error, error_size);
@@ -20134,20 +20395,6 @@ static int metal_context_sam_rel_pos_attention_batch_f16_to_slice(uocr_metal_con
             return metal_fail(error, error_size, "failed to create Metal SAM rel-pos batch attention command encoder");
         }
 
-        uocr_metal_sam_rel_pos_attention_params params;
-        params.windows = n_windows;
-        params.grid_width = grid_w;
-        params.grid_height = grid_h;
-        params.tokens_per_window = (uint32_t)tokens;
-        params.heads = UOCR_SAM_ATTENTION_HEADS;
-        params.head_dim = UOCR_SAM_HEAD_DIM;
-        params.rel_pos_h_length = rel_pos_h_length;
-        params.rel_pos_w_length = rel_pos_w_length;
-        params.scale = 1.0f / sqrtf((float)UOCR_SAM_HEAD_DIM);
-        params.batch_size = view_count;
-        params.reserved1 = 0u;
-        params.reserved2 = 0u;
-
         const NSUInteger query_blocks = (NSUInteger)(((uint32_t)tokens + UOCR_METAL_FLASH_Q_PER_TG - 1u) / UOCR_METAL_FLASH_Q_PER_TG);
         [enc setComputePipelineState:pipeline];
         [enc setBuffer:q.buffer offset:q.offset atIndex:0u];
@@ -20157,12 +20404,6 @@ static int metal_context_sam_rel_pos_attention_batch_f16_to_slice(uocr_metal_con
         [enc setBuffer:rel_pos_w.slice.buffer offset:rel_pos_w.slice.offset atIndex:4u];
         [enc setBuffer:out.buffer offset:out.offset atIndex:5u];
         [enc setBytes:&params length:sizeof(params) atIndex:6u];
-        if (use_tiled_attention) {
-            const NSUInteger tile_keys = 16u;
-            const NSUInteger tile_bytes = tile_keys * (NSUInteger)UOCR_SAM_HEAD_DIM * sizeof(uint16_t);
-            [enc setThreadgroupMemoryLength:tile_bytes atIndex:0u];
-            [enc setThreadgroupMemoryLength:tile_bytes atIndex:1u];
-        }
         [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)UOCR_SAM_ATTENTION_HEADS, query_blocks, (NSUInteger)logical_windows)
              threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1u, 1u)];
         [enc endEncoding];
@@ -20355,6 +20596,14 @@ static int metal_context_sam_transformer_batch_block_workspace_f16_to_slice(uocr
             char detail[512];                                                                           \
             metal_copy_error_detail(detail, sizeof(detail), error);                                      \
             return metal_fail(error, error_size, "failed to compute Metal SAM batch block %s: %s", step_name, detail); \
+        }                                                                                               \
+        if (metal_vision_profile_detail_level() >= 3) {                                                 \
+            char checkpoint_name[96];                                                                   \
+            (void)snprintf(checkpoint_name, sizeof(checkpoint_name), "sam_batch_block.%s", step_name);  \
+            checkpoint_name[sizeof(checkpoint_name) - 1u] = '\0';                                        \
+            if (!metal_vision_profile_checkpoint(ctx, checkpoint_name, 1, error, error_size)) {          \
+                return 0;                                                                               \
+            }                                                                                           \
         }                                                                                               \
     } while (0)
 
@@ -20607,6 +20856,7 @@ static int metal_context_sam_transformer_batch_workspace_f16_to_slice(uocr_metal
     uocr_metal_vision_workspace_slice state_b = scratch->sam_transformer_batch_bhwc;
     uocr_metal_vision_workspace_slice next = state_a;
     const uint64_t sam_blocks_start_ns = uocr_profile_now_ns();
+    const int vision_profile_detail = metal_vision_profile_detail_level();
     for (uint32_t block_index = 0u; block_index < block_count; ++block_index) {
         const uint64_t block_start_ns = uocr_profile_now_ns();
         const int is_last = block_index + 1u == block_count;
@@ -20642,6 +20892,17 @@ static int metal_context_sam_transformer_batch_workspace_f16_to_slice(uocr_metal
                                       block_start_ns,
                                       view_count > 1u ? "metal.vision.sam_block_batch.%02u" : "metal.vision.sam_block.%02u",
                                       block_index);
+        if (vision_profile_detail == 2) {
+            char checkpoint_name[64];
+            (void)snprintf(checkpoint_name,
+                           sizeof(checkpoint_name),
+                           view_count > 1u ? "sam_block_batch.%02u" : "sam_block.%02u",
+                           block_index);
+            checkpoint_name[sizeof(checkpoint_name) - 1u] = '\0';
+            if (!metal_vision_profile_checkpoint(ctx, checkpoint_name, 1, error, error_size)) {
+                return 0;
+            }
+        }
     }
     metal_profile_add_event_now(ctx, view_count > 1u ? "metal.vision.sam_blocks_batch" : "metal.vision.sam_blocks", sam_blocks_start_ns);
     metal_clear_error(error, error_size);
