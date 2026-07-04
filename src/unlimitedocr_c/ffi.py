@@ -12,7 +12,7 @@ from typing import Sequence
 import numpy as np
 from numpy.typing import NDArray
 
-from .frontend import GLOBAL_VIEW_SIZE, LOCAL_VIEW_SIZE, PreparedRequest, is_source_tree_package, project_root
+from .frontend import GLOBAL_VIEW_SIZE, LOCAL_VIEW_SIZE, PreparedRequest, SINGLE_PROMPT, default_tokenizer_path, is_source_tree_package, prepare_image, project_root
 
 UOCR_OK = 0
 UOCR_ERROR_INVALID_ARGUMENT = -1
@@ -238,6 +238,7 @@ class EngineOptions:
     max_gen_tokens: int = 512
     memory_budget_bytes: int = 0
     profile: bool = False
+    warmup: bool = True
 
 
 @dataclass
@@ -521,6 +522,9 @@ class Engine:
         if not self._handle:
             raise RuntimeError(self.last_error(global_error=True))
 
+        if opts.warmup and self.backend != "cpu-ref":
+            self._warmup()
+
     @property
     def backend(self) -> str:
         raw = self._lib.uocr_engine_backend(self._handle)
@@ -602,6 +606,29 @@ class Engine:
             metal_transient_retain_object_count=int(report.metal_transient_retain_object_count),
             memory=self._memory_report_from_c(report.memory),
         )
+
+    def _warmup(self) -> None:
+        """Run a synthetic generation to warm up Metal pipelines and MPS JIT kernels."""
+        try:
+            from PIL import Image, ImageDraw
+
+            img = Image.new("RGB", (224, 224), (255, 255, 255))
+            draw = ImageDraw.Draw(img)
+            draw.text((80, 40), "A", fill=(0, 0, 0))
+
+            request = prepare_image(
+                img,
+                prompt=SINGLE_PROMPT,
+                preset="base",
+                tokenizer_path=default_tokenizer_path(),
+                max_new_tokens=1,
+                dtype=np.float16,
+            )
+            _ = self.generate_prepared(request)
+            self.profile_reset()
+        except Exception as exc:
+            import warnings
+            warnings.warn(f"GPU warmup failed (non-fatal): {exc}")
 
     def close(self) -> None:
         handle = getattr(self, "_handle", None)
