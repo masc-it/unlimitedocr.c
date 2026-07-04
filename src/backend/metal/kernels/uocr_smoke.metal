@@ -5092,3 +5092,67 @@ kernel void uocr_sam_extract_patches_f16(device const half *pixels [[buffer(0)]]
     const ulong patch_offset = ulong(patch) * 768ul + ulong(inner);
     patches_out[patch_offset] = pixels[pixel_offset];
 }
+
+struct UocrConv3x3Im2ColParams {
+    uint input_width;
+    uint input_height;
+    uint output_width;
+    uint output_height;
+    uint in_channels;
+    uint stride;
+    uint batch_size;
+    uint reserved;
+};
+
+/*
+ * Converts NCHW fp16 input into row-major im2col:
+ *
+ * input:  [B, C, H, W]
+ * cols:   [B * OH * OW, C * 3 * 3]
+ *
+ * Padding behavior matches the current direct kernels:
+ * center = output_coord * stride, radius = 1, out-of-bounds = 0.
+ */
+kernel void uocr_sam_conv3x3_im2col_nchw_f16(device const half *src_nchw [[buffer(0)]],
+                                              device half *cols [[buffer(1)]],
+                                              constant UocrConv3x3Im2ColParams &params [[buffer(2)]],
+                                              uint2 gid [[thread_position_in_grid]]) {
+    const uint k = gid.x;
+    const uint row = gid.y;
+
+    const uint kernel_elems = 9u;
+    const uint k_total = params.in_channels * kernel_elems;
+    const uint out_spatial = params.output_width * params.output_height;
+    const uint total_rows = params.batch_size * out_spatial;
+
+    if (k >= k_total || row >= total_rows) {
+        return;
+    }
+
+    const uint batch = row / out_spatial;
+    const uint out_spatial_idx = row - batch * out_spatial;
+    const uint out_y = out_spatial_idx / params.output_width;
+    const uint out_x = out_spatial_idx - out_y * params.output_width;
+
+    const uint in_channel = k / kernel_elems;
+    const uint rem = k - in_channel * kernel_elems;
+    const uint ky = rem / 3u;
+    const uint kx = rem - ky * 3u;
+
+    const int sy = int(out_y * params.stride) + int(ky) - 1;
+    const int sx = int(out_x * params.stride) + int(kx) - 1;
+
+    half value = half(0.0h);
+
+    if (sy >= 0 && sy < int(params.input_height) &&
+        sx >= 0 && sx < int(params.input_width)) {
+        const uint input_spatial = params.input_width * params.input_height;
+        const ulong src_index =
+            (ulong(batch) * ulong(params.in_channels) + ulong(in_channel)) * ulong(input_spatial) +
+            ulong(uint(sy)) * ulong(params.input_width) +
+            ulong(uint(sx));
+        value = src_nchw[src_index];
+    }
+
+    cols[ulong(row) * ulong(k_total) + ulong(k)] = value;
+}
