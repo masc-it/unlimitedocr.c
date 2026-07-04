@@ -891,37 +891,40 @@ int uocr_model_file_open(const char *path, uocr_model_file *out, char *error, si
     memset(out, 0, sizeof(*out));
     out->fd = -1;
 
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) {
+    FILE *f = fopen(path, "rb");
+    if (f == NULL) {
         return fail(error, error_size, "failed to open '%s': %s", path, strerror(errno));
     }
-    struct stat st;
-    if (fstat(fd, &st) != 0) {
-        close(fd);
-        return fail(error, error_size, "failed to stat '%s': %s", path, strerror(errno));
+    if (fseek(f, 0, SEEK_END) != 0) {
+        fclose(f);
+        return fail(error, error_size, "failed to seek '%s'", path);
     }
-    if (st.st_size <= 0) {
-        close(fd);
-        return fail(error, error_size, "file '%s' is empty", path);
+    long file_size_long = ftell(f);
+    if (file_size_long < 0) {
+        fclose(f);
+        return fail(error, error_size, "failed to tell '%s'", path);
     }
-    const uint64_t file_size64 = (uint64_t)st.st_size;
-    if ((off_t)file_size64 != st.st_size || file_size64 > (uint64_t)SIZE_MAX) {
-        close(fd);
-        return fail(error, error_size, "file '%s' is too large for this platform", path);
+    if (fseek(f, 0, SEEK_SET) != 0) {
+        fclose(f);
+        return fail(error, error_size, "failed to rewind '%s'", path);
     }
-    const size_t file_size = (size_t)file_size64;
-    void *mapped = mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
-    if (mapped == MAP_FAILED) {
-        close(fd);
-        return fail(error, error_size, "failed to mmap '%s': %s", path, strerror(errno));
+    size_t file_size = (size_t)file_size_long;
+    uint8_t *buffer = (uint8_t *)uocr_malloc(file_size);
+    if (buffer == NULL) {
+        fclose(f);
+        return fail(error, error_size, "failed to allocate %llu bytes", (unsigned long long)file_size);
     }
-    if (uocr_model_file_validate_memory(mapped, file_size, out, error, error_size) != 0) {
-        munmap(mapped, file_size);
-        close(fd);
+    if (fread(buffer, 1u, file_size, f) != file_size) {
+        uocr_free(buffer);
+        fclose(f);
+        return fail(error, error_size, "failed to read '%s'", path);
+    }
+    fclose(f);
+    if (uocr_model_file_validate_memory(buffer, file_size, out, error, error_size) != 0) {
+        uocr_free(buffer);
         return -1;
     }
     out->owns_mapping = 1;
-    out->fd = fd;
     return 0;
 }
 #endif
@@ -936,14 +939,7 @@ void uocr_model_file_close(uocr_model_file *file) {
         }
         return;
     }
-#if defined(_WIN32)
     uocr_free((void *)file->data);
-#else
-    (void)munmap((void *)file->data, file->size);
-    if (file->fd >= 0) {
-        (void)close(file->fd);
-    }
-#endif
     memset(file, 0, sizeof(*file));
 #if !defined(_WIN32)
     file->fd = -1;
