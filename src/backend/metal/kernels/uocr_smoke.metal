@@ -2355,7 +2355,15 @@ kernel void uocr_no_repeat_collect_banned_i32(device const int *sequence [[buffe
     float sum = 0.0f;
     if (local_token < tile_tokens && token_id < vocab_size) {
         const ulong weight_base = ulong(token_id) * ulong(hidden_size);
-        for (uint k = lane; k < hidden_size; k += lanes) {
+        /* Vectorized half4 dot: process 4 channels per iteration */
+        for (uint k = lane * 4u; k + 3u < hidden_size; k += lanes * 4u) {
+            half4 hv = half4(*reinterpret_cast<threadgroup const packed_half4 *>(hidden_tg + k));
+            half4 wv = half4(*reinterpret_cast<device const packed_half4 *>(weight + weight_base + ulong(k)));
+            sum += dot(float4(hv), float4(wv));
+        }
+        /* Remainder: scalar tail for leftover channels */
+        const uint groups = hidden_size / (lanes * 4u);
+        for (uint k = groups * (lanes * 4u) + lane; k < hidden_size; k += lanes) {
             sum += float(hidden_tg[k]) * float(weight[weight_base + ulong(k)]);
         }
     }
