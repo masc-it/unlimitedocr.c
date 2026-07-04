@@ -2455,6 +2455,49 @@ kernel void uocr_argmax_f32(device const float *logits [[buffer(0)]],
     }
 }
 
+struct UocrArgmaxBannedParams {
+    uint vocab_size;
+    uint has_banned;
+    uint reserved0;
+    uint reserved1;
+};
+
+/**
+ * Single-row argmax over f32 logits with optional ban_flags.
+ * Outputs one token id and score via the last threadgroup reduction winner.
+ */
+kernel void uocr_argmax_f32_banned(device const float *logits [[buffer(0)]],
+                                   device const uchar *ban_flags [[buffer(1)]],
+                                   device int *token_id_out [[buffer(2)]],
+                                   device float *score_out [[buffer(3)]],
+                                   constant UocrArgmaxBannedParams &params [[buffer(4)]],
+                                   threadgroup float *scores [[threadgroup(0)]],
+                                   threadgroup uint *ids [[threadgroup(1)]],
+                                   uint tid [[thread_index_in_threadgroup]],
+                                   uint ntg [[threads_per_threadgroup]],
+                                   uint simd_width [[threads_per_simdgroup]]) {
+    float best_score = -INFINITY;
+    uint best_id = 0xffffffffu;
+
+    for (uint col = tid; col < params.vocab_size; col += ntg) {
+        float score = logits[col];
+        if (params.has_banned != 0u && ban_flags[col] != uchar(0u)) {
+            score = -INFINITY;
+        }
+        if (uocr_argmax_better(score, col, best_score, best_id)) {
+            best_score = score;
+            best_id = col;
+        }
+    }
+
+    uocr_threadgroup_argmax_pair(best_score, best_id, scores, ids, tid, ntg, simd_width);
+
+    if (tid == 0u) {
+        token_id_out[0] = int(best_id == 0xffffffffu ? 0u : best_id);
+        score_out[0] = best_id == 0xffffffffu ? -INFINITY : best_score;
+    }
+}
+
 struct UocrAttentionProjectionParams {
     uint n_tokens;
     uint hidden_size;

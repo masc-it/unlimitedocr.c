@@ -7838,6 +7838,8 @@ static const char *scratch_slot_name(uocr_metal_scratch_slot slot) {
             return "transient";
         case UOCR_METAL_SCRATCH_VISION_FINAL:
             return "vision-final";
+        case UOCR_METAL_SCRATCH_LM_HEAD_LOGITS:
+            return "lm-head-logits";
         default:
             return "unknown";
     }
@@ -7857,6 +7859,8 @@ static uocr_memory_category scratch_slot_memory_category(uocr_metal_scratch_slot
             return UOCR_MEMORY_TRANSIENT_BUFFERS;
         case UOCR_METAL_SCRATCH_VISION_FINAL:
             return UOCR_MEMORY_VISION_FINAL_FEATURES;
+        case UOCR_METAL_SCRATCH_LM_HEAD_LOGITS:
+            return UOCR_MEMORY_DECODER_SCRATCH;
         default:
             return UOCR_MEMORY_TRANSIENT_BUFFERS;
     }
@@ -10403,7 +10407,52 @@ static int metal_hidden_arena_token_slice(const uocr_metal_context *ctx,
 }
 
 static uint64_t metal_decode_selection_scratch_bytes_per_slot(void) {
-    return (uint64_t)UOCR_VOCAB_SIZE * (uint64_t)sizeof(float);
+    /* Room for f32 logits array (MPS LM head path) plus uchar ban_flags array:
+     *   logits:   VOCAB_SIZE * sizeof(float)
+     *   ban_flags: VOCAB_SIZE * sizeof(uchar)
+     * The custom fused path uses a subset (partial scores/ids + ban_flags). */
+    uint64_t logits_bytes = 0u;
+    uint64_t total = 0u;
+    if (!checked_mul_u64((uint64_t)UOCR_VOCAB_SIZE, (uint64_t)sizeof(float), &logits_bytes) ||
+        !checked_add_u64(logits_bytes, (uint64_t)UOCR_VOCAB_SIZE, &total)) {
+        return 0;
+    }
+    return total;
+}
+
+static int metal_lm_head_logits_scratch_slice(const uocr_metal_context *ctx,
+                                                uint32_t slot,
+                                                uocr_metal_buffer_slice *logits) {
+    if (ctx == NULL || logits == NULL || !ctx->has_kv_cache_layout || slot >= ctx->kv_cache_layout.batch_slots ||
+        ctx->scratch[UOCR_METAL_SCRATCH_LM_HEAD_LOGITS].buffer == nil) {
+        return 0;
+    }
+    const uint64_t slot_bytes = (uint64_t)UOCR_VOCAB_SIZE * (uint64_t)sizeof(float);
+    uint64_t offset = 0u;
+    if (!checked_mul_u64((uint64_t)slot, slot_bytes, &offset) || offset > (uint64_t)NSUIntegerMax) {
+        return 0;
+    }
+    logits->buffer = ctx->scratch[UOCR_METAL_SCRATCH_LM_HEAD_LOGITS].buffer;
+    logits->offset = (NSUInteger)offset;
+    return metal_slice_valid(*logits, slot_bytes);
+}
+
+/* Ban-flags offset within selection_scratch when using MPS LM head path.
+ * The MPS path layout: logits (VOCAB_SIZE*f32) then ban_flags (VOCAB_SIZE*uchar).
+ * The custom path uses a different sub-slice layout via metal_decode_selection_slices. */
+static int metal_mps_lm_head_ban_flags_slice(uocr_metal_buffer_slice selection_scratch,
+                                             uocr_metal_buffer_slice *ban_flags) {
+    if (ban_flags == NULL) {
+        return 0;
+    }
+    uint64_t ban_flags_offset = 0u;
+    if (!checked_mul_u64((uint64_t)UOCR_VOCAB_SIZE, (uint64_t)sizeof(float), &ban_flags_offset) ||
+        ban_flags_offset > (uint64_t)NSUIntegerMax) {
+        return 0;
+    }
+    ban_flags->buffer = selection_scratch.buffer;
+    ban_flags->offset = (NSUInteger)((uint64_t)selection_scratch.offset + ban_flags_offset);
+    return metal_slice_valid(*ban_flags, (uint64_t)UOCR_VOCAB_SIZE);
 }
 
 static int metal_decode_selection_scratch_slice(const uocr_metal_context *ctx,
@@ -10664,7 +10713,7 @@ static int metal_decode_selection_slices(uocr_metal_buffer_slice scratch,
     if (!checked_add_u64(cursor, partial_bytes, &cursor)) return 0;
 #undef METAL_SELECTION_ALIGN_CURSOR
 
-    const uint64_t scratch_bytes = (uint64_t)UOCR_VOCAB_SIZE * (uint64_t)sizeof(float);
+    const uint64_t scratch_bytes = metal_decode_selection_scratch_bytes_per_slot();
     if (cursor > scratch_bytes || !metal_slice_valid(scratch, scratch_bytes)) {
         return 0;
     }
@@ -11383,6 +11432,121 @@ static int metal_run_argmax_pairs_to_token(uocr_metal_context *ctx,
     }
 }
 
+/* Env var to select LM head backend: "custom" (default) or "mps". */
+#define UOCR_METAL_LM_HEAD_BACKEND_ENV "UOCR_METAL_LM_HEAD_SELECTION_BACKEND"
+
+static int metal_lm_head_backend_is_mps(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *env = getenv(UOCR_METAL_LM_HEAD_BACKEND_ENV);
+        cached = (env != NULL && strcmp(env, "mps") == 0) ? 1 : 0;
+    }
+    return cached;
+}
+
+/**
+ * MPS-based LM head: matmul(norm, lm_head_weight^T, out_features=vocab_size)
+ * produces f32 logits, then argmax with banned flags.
+ */
+static int metal_run_lm_head_mps_path(uocr_metal_context *ctx,
+                                      uocr_metal_buffer_slice norm,
+                                      uocr_metal_buffer_slice logits_slice,
+                                      uocr_metal_buffer_slice ban_flags,
+                                      uocr_metal_buffer_slice token_slot,
+                                      uocr_metal_buffer_slice score_slot,
+                                      char *error,
+                                      size_t error_size) {
+    const uocr_metal_decoder_binding *lm_head = metal_require_decoder_binding_index(ctx,
+                                                                                    ctx->decoder_bindings.lm_head,
+                                                                                    "LM head",
+                                                                                    error,
+                                                                                    error_size);
+    if (lm_head == NULL) {
+        return 0;
+    }
+    const uint64_t logits_bytes = (uint64_t)UOCR_VOCAB_SIZE * (uint64_t)sizeof(float);
+    if (!metal_slice_valid(norm, (uint64_t)UOCR_HIDDEN_SIZE * 2u) ||
+        !metal_slice_valid(logits_slice, logits_bytes) ||
+        !metal_slice_valid(ban_flags, (uint64_t)UOCR_VOCAB_SIZE) ||
+        !metal_slice_valid(token_slot, sizeof(int32_t)) ||
+        !metal_slice_valid(score_slot, sizeof(float))) {
+        return metal_fail(error, error_size, "invalid MPS LM head request");
+    }
+
+    /* Step 1: MPS matmul  [1, hidden] @ lm_head^T  →  [1, vocab] f32 logits */
+    uocr_metal_buffer_slice weight_slice = { lm_head->buffer, lm_head->offset };
+    if (!metal_run_mps_matmul_nt_f16_to_f32(ctx,
+                                            norm,
+                                            weight_slice,
+                                            logits_slice,
+                                            1u,
+                                            UOCR_HIDDEN_SIZE,
+                                            UOCR_VOCAB_SIZE,
+                                            "MPS LM head matmul",
+                                            error,
+                                            error_size)) {
+        return 0;
+    }
+
+    /* Step 2: argmax over logits with banned flags, write token + score */
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, "uocr_argmax_f32_banned", error, error_size);
+        if (pipeline == nil) {
+            return 0;
+        }
+        int owned = 0;
+        id<MTLCommandBuffer> cb = metal_command_buffer_for_op(ctx, &owned, "MPS LM head argmax", error, error_size);
+        if (cb == nil) {
+            return 0;
+        }
+        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
+        if (enc == nil) {
+            return metal_fail(error, error_size, "failed to create MPS LM head argmax encoder");
+        }
+        struct {
+            uint32_t vocab_size;
+            uint32_t has_banned;
+            uint32_t reserved0;
+            uint32_t reserved1;
+        } params;
+        params.vocab_size = UOCR_VOCAB_SIZE;
+        params.has_banned = (ban_flags.buffer != nil && metal_slice_valid(ban_flags, (uint64_t)UOCR_VOCAB_SIZE)) ? 1u : 0u;
+        params.reserved0 = 0u;
+        params.reserved1 = 0u;
+
+        const NSUInteger threads = 256u;
+        if (pipeline.maxTotalThreadsPerThreadgroup < threads) {
+            return metal_fail(error, error_size,
+                              "MPS LM head argmax requires %llu threads, device supports %llu",
+                              (unsigned long long)threads,
+                              (unsigned long long)pipeline.maxTotalThreadsPerThreadgroup);
+        }
+        const NSUInteger tg_mem = threads * (NSUInteger)(sizeof(float) + sizeof(uint32_t));
+        if ((NSUInteger)tg_mem > ctx->device.maxThreadgroupMemoryLength) {
+            return metal_fail(error, error_size,
+                              "MPS LM head argmax threadgroup memory %llu exceeds device limit %llu",
+                              (unsigned long long)tg_mem,
+                              (unsigned long long)ctx->device.maxThreadgroupMemoryLength);
+        }
+
+        [enc setComputePipelineState:pipeline];
+        [enc setBuffer:logits_slice.buffer offset:logits_slice.offset atIndex:0u];
+        [enc setBuffer:ban_flags.buffer offset:ban_flags.offset atIndex:1u];
+        [enc setBuffer:token_slot.buffer offset:token_slot.offset atIndex:2u];
+        [enc setBuffer:score_slot.buffer offset:score_slot.offset atIndex:3u];
+        [enc setBytes:&params length:sizeof(params) atIndex:4u];
+        [enc setThreadgroupMemoryLength:(NSUInteger)(threads * sizeof(float)) atIndex:0u];
+        [enc setThreadgroupMemoryLength:(NSUInteger)(threads * sizeof(uint32_t)) atIndex:1u];
+        [enc dispatchThreadgroups:MTLSizeMake(1u, 1u, 1u)
+             threadsPerThreadgroup:MTLSizeMake(threads, 1u, 1u)];
+        [enc endEncoding];
+        if (!metal_finish_command_buffer_for_op(ctx, cb, owned, "MPS LM head argmax", error, error_size)) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
 static int metal_run_rmsnorm_buffer_f16(uocr_metal_context *ctx,
                                         uocr_metal_buffer_slice src,
                                         const uocr_metal_decoder_binding *weight,
@@ -11493,48 +11657,88 @@ static int metal_select_next_token_from_hidden_slice_f16(uocr_metal_context *ctx
     metal_profile_add_event_now(ctx, "metal.decode.final_norm", final_norm_start_ns);
 
     const uint64_t no_repeat_start_ns = uocr_profile_now_ns();
-    if (!metal_run_no_repeat_collect_ban_flags_to_slice(ctx,
-                                                        no_repeat_sequence,
-                                                        selection_slices.ban_flags,
-                                                        sequence_len,
-                                                        no_repeat_ngram_size,
-                                                        no_repeat_window,
-                                                        banned_capacity,
-                                                        error,
-                                                        error_size)) {
-        return 0;
-    }
-    metal_profile_add_event_now(ctx, "metal.no_repeat", no_repeat_start_ns);
-    metal_profile_add_event_now(ctx, "metal.decode.no_repeat_collect", no_repeat_start_ns);
+    if (metal_lm_head_backend_is_mps()) {
+        /* MPS path: ban_flags at end of selection_scratch (after logits region) */
+        uocr_metal_buffer_slice mps_ban_flags;
+        if (!metal_mps_lm_head_ban_flags_slice(selection_scratch, &mps_ban_flags)) {
+            return metal_fail(error, error_size, "MPS LM head: failed to compute ban_flags slice");
+        }
+        if (!metal_run_no_repeat_collect_ban_flags_to_slice(ctx,
+                                                            no_repeat_sequence,
+                                                            mps_ban_flags,
+                                                            sequence_len,
+                                                            no_repeat_ngram_size,
+                                                            no_repeat_window,
+                                                            banned_capacity,
+                                                            error,
+                                                            error_size)) {
+            return 0;
+        }
+        metal_profile_add_event_now(ctx, "metal.no_repeat", no_repeat_start_ns);
+        metal_profile_add_event_now(ctx, "metal.decode.no_repeat_collect", no_repeat_start_ns);
 
-    const uint64_t lm_head_start_ns = uocr_profile_now_ns();
-    if (!metal_run_lm_head_argmax_f16(ctx,
-                                      norm_scratch,
-                                      selection_slices.ban_flags,
-                                      banned_capacity,
-                                      selection_slices.partial_scores,
-                                      selection_slices.partial_ids,
-                                      selection_slices.partial_count,
-                                      error,
-                                      error_size)) {
-        return 0;
-    }
-    metal_profile_add_event_now(ctx, "metal.lm_head_selection", lm_head_start_ns);
-    metal_profile_add_event_now(ctx, "metal.decode.lm_head_selection", lm_head_start_ns);
+        uint64_t lm_head_start_ns = uocr_profile_now_ns();
+        uocr_metal_buffer_slice lm_head_logits;
+        if (!metal_lm_head_logits_scratch_slice(ctx, 0u, &lm_head_logits)) {
+            return metal_fail(error, error_size, "MPS LM head: failed to get lm_head_logits slice");
+        }
+        if (!metal_run_lm_head_mps_path(ctx,
+                                        norm_scratch,
+                                        lm_head_logits,
+                                        mps_ban_flags,
+                                        token_slot,
+                                        score_slot,
+                                        error,
+                                        error_size)) {
+            return 0;
+        }
+        metal_profile_add_event_now(ctx, "metal.lm_head_selection", lm_head_start_ns);
+        metal_profile_add_event_now(ctx, "metal.decode.lm_head_selection", lm_head_start_ns);
+    } else {
+        /* Custom fused path */
+        if (!metal_run_no_repeat_collect_ban_flags_to_slice(ctx,
+                                                            no_repeat_sequence,
+                                                            selection_slices.ban_flags,
+                                                            sequence_len,
+                                                            no_repeat_ngram_size,
+                                                            no_repeat_window,
+                                                            banned_capacity,
+                                                            error,
+                                                            error_size)) {
+            return 0;
+        }
+        metal_profile_add_event_now(ctx, "metal.no_repeat", no_repeat_start_ns);
+        metal_profile_add_event_now(ctx, "metal.decode.no_repeat_collect", no_repeat_start_ns);
 
-    const uint64_t final_argmax_start_ns = uocr_profile_now_ns();
-    if (!metal_run_argmax_pairs_to_token(ctx,
-                                         selection_slices.partial_scores,
-                                         selection_slices.partial_ids,
-                                         selection_slices.partial_count,
-                                         token_slot,
-                                         score_slot,
-                                         error,
-                                         error_size)) {
-        return 0;
+        const uint64_t lm_head_start_ns = uocr_profile_now_ns();
+        if (!metal_run_lm_head_argmax_f16(ctx,
+                                          norm_scratch,
+                                          selection_slices.ban_flags,
+                                          banned_capacity,
+                                          selection_slices.partial_scores,
+                                          selection_slices.partial_ids,
+                                          selection_slices.partial_count,
+                                          error,
+                                          error_size)) {
+            return 0;
+        }
+        metal_profile_add_event_now(ctx, "metal.lm_head_selection", lm_head_start_ns);
+        metal_profile_add_event_now(ctx, "metal.decode.lm_head_selection", lm_head_start_ns);
+
+        const uint64_t final_argmax_start_ns = uocr_profile_now_ns();
+        if (!metal_run_argmax_pairs_to_token(ctx,
+                                             selection_slices.partial_scores,
+                                             selection_slices.partial_ids,
+                                             selection_slices.partial_count,
+                                             token_slot,
+                                             score_slot,
+                                             error,
+                                             error_size)) {
+            return 0;
+        }
+        metal_profile_add_event_now(ctx, "metal.lm_head_final_argmax", final_argmax_start_ns);
+        metal_profile_add_event_now(ctx, "metal.decode.lm_head_final_argmax", final_argmax_start_ns);
     }
-    metal_profile_add_event_now(ctx, "metal.lm_head_final_argmax", final_argmax_start_ns);
-    metal_profile_add_event_now(ctx, "metal.decode.lm_head_final_argmax", final_argmax_start_ns);
     if (metal_command_batch_active(ctx)) {
         const uint64_t command_wait_start_ns = uocr_profile_now_ns();
         if (!metal_command_batch_commit_and_wait(ctx, "integrated next-token selection", error, error_size)) {
@@ -13377,6 +13581,25 @@ static int metal_context_generate_f16_impl(uocr_metal_context *ctx,
                                            error_size)) {
         uocr_free(sequence);
         return metal_fail(error, error_size, "integrated Metal fp16 decode selection scratch allocation failed");
+    }
+
+    /* LM head logits buffer (MPS path): f32 [VOCAB_SIZE] per slot */
+    {
+        uint64_t lm_head_logits_slot = 0u;
+        uint64_t lm_head_logits_total = 0u;
+        if (!checked_mul_u64((uint64_t)UOCR_VOCAB_SIZE, (uint64_t)sizeof(float), &lm_head_logits_slot) ||
+            !checked_mul_u64(lm_head_logits_slot,
+                             (uint64_t)ctx->kv_cache_layout.batch_slots,
+                             &lm_head_logits_total) ||
+            !uocr_metal_context_ensure_scratch(ctx,
+                                               UOCR_METAL_SCRATCH_LM_HEAD_LOGITS,
+                                               lm_head_logits_total,
+                                               0,
+                                               error,
+                                               error_size)) {
+            uocr_free(sequence);
+            return metal_fail(error, error_size, "integrated Metal fp16 LM head logits scratch allocation failed");
+        }
     }
 
     uocr_metal_buffer_slice selection_scratch;
