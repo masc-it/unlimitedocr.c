@@ -4233,6 +4233,153 @@ kernel void uocr_moe_decode_interleaved_down_sum_combine_tile4_f16_to_f16(
     }
 }
 
+/**
+ * Decode-specialized down-combine that computes 8 adjacent output columns per
+ * threadgroup, reducing threadgroup count by ~8x vs scalar and reusing each
+ * mid[rank,k] load across eight down-projection weight columns.
+ */
+[[max_total_threads_per_threadgroup(256)]]
+kernel void uocr_moe_decode_interleaved_down_sum_combine_tile8_f16_to_f16(
+    device const half *mid [[buffer(0)]],
+    device const uint *top_expert_ids [[buffer(1)]],
+    device const float *top_weights [[buffer(2)]],
+    device const half *expert_slab [[buffer(3)]],
+    device const half *shared [[buffer(4)]],
+    device const half *residual [[buffer(5)]],
+    device half *dst [[buffer(6)]],
+    constant UocrMoeDecodeInterleavedParams &params [[buffer(7)]],
+    threadgroup float *partials [[threadgroup(0)]],
+    uint out_tile [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint ntg [[threads_per_threadgroup]],
+    uint simd_width [[threads_per_simdgroup]]) {
+    const uint tile_columns = 8u;
+    const uint hidden_size = uocr_fc_hidden_size_or(params.hidden_size);
+    const uint intermediate_size = uocr_fc_moe_expert_intermediate_or(params.intermediate_size);
+    const uint top_k = uocr_fc_moe_top_k_or(params.top_k);
+    const uint expert_count = uocr_fc_moe_experts_or(params.expert_count);
+
+    const uint out0 = out_tile * tile_columns;
+    const uint out1 = out0 + 1u;
+    const uint out2 = out0 + 2u;
+    const uint out3 = out0 + 3u;
+    const uint out4 = out0 + 4u;
+    const uint out5 = out0 + 5u;
+    const uint out6 = out0 + 6u;
+    const uint out7 = out0 + 7u;
+
+    const bool valid0 = out0 < hidden_size;
+    const bool valid1 = out1 < hidden_size;
+    const bool valid2 = out2 < hidden_size;
+    const bool valid3 = out3 < hidden_size;
+    const bool valid4 = out4 < hidden_size;
+    const bool valid5 = out5 < hidden_size;
+    const bool valid6 = out6 < hidden_size;
+    const bool valid7 = out7 < hidden_size;
+
+    float sum0 = 0.0f;
+    float sum1 = 0.0f;
+    float sum2 = 0.0f;
+    float sum3 = 0.0f;
+    float sum4 = 0.0f;
+    float sum5 = 0.0f;
+    float sum6 = 0.0f;
+    float sum7 = 0.0f;
+
+    for (uint rank = 0u; rank < top_k; ++rank) {
+        const uint expert = top_expert_ids[rank];
+        if (expert >= expert_count) {
+            continue;
+        }
+
+        const float route_weight = top_weights[rank];
+        const ulong mid_base = ulong(rank) * ulong(intermediate_size);
+        const ulong expert_base = ulong(expert) * ulong(params.expert_stride_values) +
+                                  ulong(params.down_offset_values);
+
+        const ulong w0 = expert_base + ulong(out0) * ulong(intermediate_size);
+        const ulong w1 = expert_base + ulong(out1) * ulong(intermediate_size);
+        const ulong w2 = expert_base + ulong(out2) * ulong(intermediate_size);
+        const ulong w3 = expert_base + ulong(out3) * ulong(intermediate_size);
+        const ulong w4 = expert_base + ulong(out4) * ulong(intermediate_size);
+        const ulong w5 = expert_base + ulong(out5) * ulong(intermediate_size);
+        const ulong w6 = expert_base + ulong(out6) * ulong(intermediate_size);
+        const ulong w7 = expert_base + ulong(out7) * ulong(intermediate_size);
+
+        float acc0 = 0.0f;
+        float acc1 = 0.0f;
+        float acc2 = 0.0f;
+        float acc3 = 0.0f;
+        float acc4 = 0.0f;
+        float acc5 = 0.0f;
+        float acc6 = 0.0f;
+        float acc7 = 0.0f;
+
+        for (uint k = tid; k < intermediate_size; k += ntg) {
+            const ulong kk = ulong(k);
+            const float m = float(mid[mid_base + kk]);
+
+            if (valid0) acc0 += m * float(expert_slab[w0 + kk]);
+            if (valid1) acc1 += m * float(expert_slab[w1 + kk]);
+            if (valid2) acc2 += m * float(expert_slab[w2 + kk]);
+            if (valid3) acc3 += m * float(expert_slab[w3 + kk]);
+            if (valid4) acc4 += m * float(expert_slab[w4 + kk]);
+            if (valid5) acc5 += m * float(expert_slab[w5 + kk]);
+            if (valid6) acc6 += m * float(expert_slab[w6 + kk]);
+            if (valid7) acc7 += m * float(expert_slab[w7 + kk]);
+        }
+
+        sum0 += acc0 * route_weight;
+        sum1 += acc1 * route_weight;
+        sum2 += acc2 * route_weight;
+        sum3 += acc3 * route_weight;
+        sum4 += acc4 * route_weight;
+        sum5 += acc5 * route_weight;
+        sum6 += acc6 * route_weight;
+        sum7 += acc7 * route_weight;
+    }
+
+    const float routed0 = uocr_threadgroup_sum(sum0, partials, tid, ntg, simd_width);
+    if (tid == 0u && valid0) {
+        dst[out0] = half(float(half(routed0)) + float(shared[out0]) + float(residual[out0]));
+    }
+
+    const float routed1 = uocr_threadgroup_sum(sum1, partials, tid, ntg, simd_width);
+    if (tid == 0u && valid1) {
+        dst[out1] = half(float(half(routed1)) + float(shared[out1]) + float(residual[out1]));
+    }
+
+    const float routed2 = uocr_threadgroup_sum(sum2, partials, tid, ntg, simd_width);
+    if (tid == 0u && valid2) {
+        dst[out2] = half(float(half(routed2)) + float(shared[out2]) + float(residual[out2]));
+    }
+
+    const float routed3 = uocr_threadgroup_sum(sum3, partials, tid, ntg, simd_width);
+    if (tid == 0u && valid3) {
+        dst[out3] = half(float(half(routed3)) + float(shared[out3]) + float(residual[out3]));
+    }
+
+    const float routed4 = uocr_threadgroup_sum(sum4, partials, tid, ntg, simd_width);
+    if (tid == 0u && valid4) {
+        dst[out4] = half(float(half(routed4)) + float(shared[out4]) + float(residual[out4]));
+    }
+
+    const float routed5 = uocr_threadgroup_sum(sum5, partials, tid, ntg, simd_width);
+    if (tid == 0u && valid5) {
+        dst[out5] = half(float(half(routed5)) + float(shared[out5]) + float(residual[out5]));
+    }
+
+    const float routed6 = uocr_threadgroup_sum(sum6, partials, tid, ntg, simd_width);
+    if (tid == 0u && valid6) {
+        dst[out6] = half(float(half(routed6)) + float(shared[out6]) + float(residual[out6]));
+    }
+
+    const float routed7 = uocr_threadgroup_sum(sum7, partials, tid, ntg, simd_width);
+    if (tid == 0u && valid7) {
+        dst[out7] = half(float(half(routed7)) + float(shared[out7]) + float(residual[out7]));
+    }
+}
+
 kernel void uocr_moe_prefill_interleaved_down_sum_f16_to_f32(device const half *mid [[buffer(0)]],
                                                              device const uint *top_expert_ids [[buffer(1)]],
                                                              device const float *top_weights [[buffer(2)]],

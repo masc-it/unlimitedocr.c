@@ -13326,7 +13326,7 @@ static int metal_run_moe_interleaved_decode_fused_combine_buffer_f16(uocr_metal_
                                                error_size);
             down_combine_pipeline = metal_get_pipeline_with_constants(ctx,
                                                                       use_tiled_routed_gate_up ?
-                                                                          "uocr_moe_decode_interleaved_down_sum_combine_tile4_f16_to_f16" :
+                                                                          UOCR_METAL_MOE_ROUTED_DOWN_COMBINE_KERNEL :
                                                                           "uocr_moe_decode_interleaved_down_sum_combine_one_f16_to_f16",
                                                                       constant_key,
                                                                       constants,
