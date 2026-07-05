@@ -1,6 +1,6 @@
 [project]
 name = "unlimitedocr-c"
-version = "0.2.1"
+version = "0.2.2"
 description = "Python frontend and native C/Metal inference engine for baidu/Unlimited-OCR"
 readme = "README.md"
 authors = [

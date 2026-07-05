@@ -106,7 +106,6 @@ def _download_converted_model(cache_dir: Path, filename: str) -> Path:
         repo_id=repo_id,
         filename=filename,
         revision=revision,
-        cache_dir=str(cache_dir / "huggingface"),
         local_files_only=_hf_local_files_only(),
     )
     return Path(downloaded).resolve()
@@ -125,7 +124,6 @@ def _download_and_convert_source_model(cache_dir: Path, filename: str) -> Path:
         snapshot_download(
             repo_id=source_repo_id,
             revision=revision,
-            cache_dir=str(cache_dir / "huggingface"),
             allow_patterns=[
                 "config.json",
                 "processor_config.json",

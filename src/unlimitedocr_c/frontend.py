@@ -216,7 +216,6 @@ def _download_tokenizer_context() -> Path:
         repo_id=repo_id,
         filename="tokenizer.json",
         revision=revision,
-        cache_dir=str(_cache_dir() / "huggingface"),
         local_files_only=_env_flag("UOCR_HF_LOCAL_FILES_ONLY", default=False),
     )
     cache_dir.mkdir(parents=True, exist_ok=True)
