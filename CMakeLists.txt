@@ -123,25 +123,47 @@ endif()
 
 if(UOCR_METAL_ENABLED)
     enable_language(OBJC)
-    set(UOCR_METAL_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/src/backend/metal/kernels/uocr_smoke.metal")
+    set(UOCR_METAL_KERNEL_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src/backend/metal/kernels")
     set(UOCR_METALLIB_OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/unlimitedocr.metallib")
+    file(GLOB UOCR_METAL_SOURCES "${UOCR_METAL_KERNEL_DIR}/*.metal")
     if(UOCR_METAL_ENABLE_MPP_TENSOROPS)
         set(UOCR_METAL_ENABLE_MPP_TENSOROPS_VALUE 1)
     else()
         set(UOCR_METAL_ENABLE_MPP_TENSOROPS_VALUE 0)
     endif()
+
     if(UOCR_METAL_PRECOMPILE)
         find_program(UOCR_XCRUN_EXECUTABLE xcrun)
         if(NOT UOCR_XCRUN_EXECUTABLE)
             message(FATAL_ERROR "UOCR_METAL_PRECOMPILE=ON requires xcrun")
         endif()
-        set(UOCR_METAL_AIR_OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/unlimitedocr.air")
+
+        # Compile each .metal to .air with include path for common.metal etc.
+        set(UOCR_METAL_AIR_FILES)
+        foreach(src ${UOCR_METAL_SOURCES})
+            get_filename_component(src_name ${src} NAME)
+            set(air_file "${CMAKE_CURRENT_BINARY_DIR}/${src_name}.air")
+            list(APPEND UOCR_METAL_AIR_FILES ${air_file})
+            add_custom_command(
+                OUTPUT ${air_file}
+                COMMAND "${UOCR_XCRUN_EXECUTABLE}" -sdk macosx metal
+                    -I"${UOCR_METAL_KERNEL_DIR}"
+                    -DUOCR_METAL_ENABLE_MPP_TENSOROPS=${UOCR_METAL_ENABLE_MPP_TENSOROPS_VALUE}
+                    ${UOCR_METAL_MATH_FLAGS}
+                    -c "${src}" -o "${air_file}"
+                DEPENDS ${src}
+                COMMENT "Compiling ${src_name} → ${src_name}.air"
+                VERBATIM)
+        endforeach()
+
+        # Link all .air into .metallib
+        set(UOCR_METAL_AIR_LIST "${UOCR_METALLIB_OUTPUT}.airlist")
         add_custom_command(
             OUTPUT "${UOCR_METALLIB_OUTPUT}"
-            COMMAND "${UOCR_XCRUN_EXECUTABLE}" -sdk macosx metal -c "${UOCR_METAL_SOURCE}" -DUOCR_METAL_ENABLE_MPP_TENSOROPS=${UOCR_METAL_ENABLE_MPP_TENSOROPS_VALUE} ${UOCR_METAL_MATH_FLAGS} -o "${UOCR_METAL_AIR_OUTPUT}"
-            COMMAND "${UOCR_XCRUN_EXECUTABLE}" -sdk macosx metallib "${UOCR_METAL_AIR_OUTPUT}" -o "${UOCR_METALLIB_OUTPUT}"
-            DEPENDS "${UOCR_METAL_SOURCE}"
-            COMMENT "Precompiling Metal shaders to ${UOCR_METALLIB_OUTPUT}"
+            COMMAND ${CMAKE_COMMAND} -E echo "linking metallib"
+            COMMAND "${UOCR_XCRUN_EXECUTABLE}" -sdk macosx metallib ${UOCR_METAL_AIR_FILES} -o "${UOCR_METALLIB_OUTPUT}"
+            DEPENDS ${UOCR_METAL_AIR_FILES}
+            COMMENT "Linking Metal library → unlimitedocr.metallib"
             VERBATIM)
         add_custom_target(unlimitedocr_metallib ALL DEPENDS "${UOCR_METALLIB_OUTPUT}")
     endif()
@@ -163,7 +185,7 @@ if(UOCR_METAL_ENABLED)
             UOCR_METAL_ENABLE_MPP_TENSOROPS=${UOCR_METAL_ENABLE_MPP_TENSOROPS_VALUE}
             UOCR_METAL_MATH_MODE=${UOCR_METAL_MATH_MODE_VALUE}
             UOCR_METAL_MATH_FP32_FAST=${UOCR_METAL_MATH_FP32_FAST_VALUE}
-            UOCR_DEFAULT_RESOURCE_PATH=\"${CMAKE_CURRENT_SOURCE_DIR}/src/backend/metal\"
+            UOCR_DEFAULT_RESOURCE_PATH=\"${UOCR_METAL_KERNEL_DIR}\"
             UOCR_DEFAULT_METALLIB_PATH=\"${UOCR_METALLIB_OUTPUT}\")
     target_link_libraries(uocr_metal
         PUBLIC

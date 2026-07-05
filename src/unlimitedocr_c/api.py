@@ -300,12 +300,11 @@ class UnlimitedOCR:
     Typical use is intentionally small:
 
     >>> from unlimitedocr_c import UnlimitedOCR
-    >>> ocr = UnlimitedOCR()
+    >>> ocr = UnlimitedOCR()  # resolves model, opens engine, runs GPU warmup
     >>> text = ocr.generate("page.png")
 
-    The constructor finds an existing `.uocr` model (env/local/cache) or downloads
-    one into a cache.  The native model is opened lazily on the first generation
-    and reused while its capacity fits later requests.
+    The constructor opens the native engine eagerly (GPU warmup).  The engine is
+    resized automatically if a later request needs more prompt/gen capacity.
     """
 
     def __init__(
@@ -331,6 +330,12 @@ class UnlimitedOCR:
         self._engine: Engine | None = None
         self._engine_prompt_capacity = 0
         self._engine_gen_capacity = 0
+
+        # Eagerly open the engine so warmup runs at construction time.
+        # Use maximum capacities so the engine is never recreated for any
+        # subsequent request — warmup runs exactly once.
+        print(f"model: {self._model_path}")
+        self._ensure_engine(prompt_capacity=DEFAULT_MAX_LENGTH, gen_capacity=DEFAULT_MAX_LENGTH)
 
     @property
     def model_path(self) -> Path:

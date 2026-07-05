@@ -610,6 +610,7 @@ class Engine:
     def _warmup(self) -> None:
         """Run a synthetic generation to warm up Metal pipelines and MPS JIT kernels."""
         try:
+            print("  warmup: compiling Metal pipelines...", end="", flush=True)
             from PIL import Image, ImageDraw
 
             img = Image.new("RGB", (224, 224), (255, 255, 255))
@@ -621,11 +622,12 @@ class Engine:
                 prompt=SINGLE_PROMPT,
                 preset="base",
                 tokenizer_path=default_tokenizer_path(),
-                max_new_tokens=1,
+                max_new_tokens=2,
                 dtype=np.float16,
             )
             _ = self.generate_prepared(request)
             self.profile_reset()
+            print(" done")
         except Exception as exc:
             import warnings
             warnings.warn(f"GPU warmup failed (non-fatal): {exc}")
