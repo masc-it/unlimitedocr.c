@@ -24,39 +24,13 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 
+
 #define UOCR_METAL_MPS_DATA_TYPE_FLOAT16 (0x10000000U | 16U)
 #define UOCR_METAL_MPS_DATA_TYPE_FLOAT32 (0x10000000U | 32U)
-#ifndef UOCR_METAL_MPS_MATMUL_MIN_FLOPS
-/*
- * Keep one-output-per-threadgroup GEMM out of large fp16 shapes while avoiding
- * MPS setup overhead on small decode MLPs. The lowered default admits moderate,
- * non-skinny GEMMs; the default skinny-output guard keeps the base-profile
- * router GEMM (277x1280x64, ~45M FLOPs) on the faster custom path. Setting
- * UOCR_METAL_MPS_MATMUL_MIN_FLOPS explicitly bypasses that guard for probes.
- */
-#define UOCR_METAL_MPS_MATMUL_MIN_FLOPS 32000000ULL
-#endif
-#define UOCR_METAL_MPS_MATMUL_SKINNY_OUT_FEATURES 128u
-#define UOCR_METAL_MPS_MATMUL_SKINNY_MIN_FLOPS 64000000ULL
-#define UOCR_METAL_MPS_MATMUL_MIN_FLOPS_ENV "UOCR_METAL_MPS_MATMUL_MIN_FLOPS"
 #define UOCR_METAL_VISION_PROFILE_DETAIL_ENV "UOCR_METAL_VISION_PROFILE_DETAIL"
 #define UOCR_METAL_DECODER_PROFILE_DETAIL_ENV "UOCR_METAL_DECODER_PROFILE_DETAIL"
 #define UOCR_METAL_DECODER_PROFILE_TOKEN_INDEX_ENV "UOCR_METAL_DECODER_PROFILE_TOKEN_INDEX"
-#ifndef UOCR_METAL_ENABLE_MOE_FUSED_DOWN_COMBINE
-#define UOCR_METAL_ENABLE_MOE_FUSED_DOWN_COMBINE 1
-#endif
-#ifndef UOCR_METAL_ENABLE_MOE_DECODE_KERNELS
-#define UOCR_METAL_ENABLE_MOE_DECODE_KERNELS 1
-#endif
-#ifndef UOCR_METAL_ENABLE_MOE_FUSED_ROUTER
-#define UOCR_METAL_ENABLE_MOE_FUSED_ROUTER 1
-#endif
-#ifndef UOCR_METAL_ENABLE_MOE_SHARED_GATE_UP_TILED
-#define UOCR_METAL_ENABLE_MOE_SHARED_GATE_UP_TILED 1
-#endif
-#ifndef UOCR_METAL_ENABLE_MOE_ROUTED_GATE_UP_TILED
-#define UOCR_METAL_ENABLE_MOE_ROUTED_GATE_UP_TILED 1
-#endif
+
 // Keep router top-k in the one-SIMD greedy path; this avoids the old
 // full-row bitonic-sort barriers for the fixed 64-expert/top-6 decode shape.
 #define UOCR_METAL_MOE_ROUTER_TOPK_THREADS 16u
@@ -374,7 +348,6 @@ struct uocr_metal_context {
     uint32_t mps_vision_workspace_prebuild_projected_row_capacity;
     uint32_t mps_vision_workspace_prebuild_local_view_count;
     uint32_t mps_vision_workspace_prebuild_global_view_count;
-    uint32_t public_mps_large_gemm_required_depth;
     NSMutableArray *transient_retains;
     uocr_metal_model_view *model_views;
     uint32_t model_view_count;
@@ -433,7 +406,6 @@ static int metal_context_ensure_scratch_accounted(uocr_metal_context *ctx,
                                                   size_t error_size);
 static void metal_clear_mps_weight_ndarray_cache(uocr_metal_context *ctx);
 static void metal_clear_mps_workspace_ndarray_cache(uocr_metal_context *ctx);
-static int metal_mps_matmul_nt_f16_should_use(uint32_t rows, uint32_t in_features, uint32_t out_features);
 static int metal_run_bias_add_f16_inplace(uocr_metal_context *ctx,
                                           uocr_metal_buffer_slice dst,
                                           uocr_metal_buffer_slice bias,
@@ -5445,24 +5417,20 @@ static int metal_context_sam_neck_batch_f16_to_slice(uocr_metal_vision_project_c
      */
     const uint32_t conv1x1_spatial = grid_w * grid_h;
     const uint32_t conv1x1_rows = conv1x1_spatial * view_count;
-    if (metal_mps_matmul_nt_f16_should_use(conv1x1_rows, UOCR_SAM_HIDDEN_SIZE, UOCR_SAM_NECK_CHANNELS)) {
-        uocr_metal_buffer_slice input_slice = { input_bhwc.buffer, input_bhwc.offset };
-        uocr_metal_buffer_slice weight_slice = { weights->sam_neck_conv1x1_weight.slice.buffer,
-                                                  weights->sam_neck_conv1x1_weight.slice.offset };
-        uocr_metal_buffer_slice out_slice = { scratch->sam_neck_a_nchw.buffer, scratch->sam_neck_a_nchw.offset };
-        const uint64_t conv1x1_start_ns = uocr_profile_now_ns();
-        if (!metal_run_mps_matmul_nt_f16(ctx, input_slice, weight_slice, out_slice,
-                                         conv1x1_rows, UOCR_SAM_HIDDEN_SIZE, UOCR_SAM_NECK_CHANNELS,
-                                         "Metal SAM neck 1x1 MPS matmul", error, error_size)) {
-            return 0;
-        }
-        metal_profile_add_event_now(ctx, "metal.vision.SAM neck 1x1 convolution (BHWC)", conv1x1_start_ns);
-        if (metal_vision_profile_detail_level() >= 3 &&
-            !metal_vision_profile_checkpoint(ctx, "sam_neck.SAM neck 1x1 convolution (BHWC)", 1, error, error_size)) {
-            return 0;
-        }
-    } else {
-        return metal_fail(error, error_size, "Metal neck 1x1 requires MPS; threshold too high or MPS unavailable");
+    uocr_metal_buffer_slice input_slice = { input_bhwc.buffer, input_bhwc.offset };
+    uocr_metal_buffer_slice weight_slice = { weights->sam_neck_conv1x1_weight.slice.buffer,
+                                              weights->sam_neck_conv1x1_weight.slice.offset };
+    uocr_metal_buffer_slice out_slice = { scratch->sam_neck_a_nchw.buffer, scratch->sam_neck_a_nchw.offset };
+    const uint64_t conv1x1_start_ns = uocr_profile_now_ns();
+    if (!metal_run_mps_matmul_nt_f16(ctx, input_slice, weight_slice, out_slice,
+                                     conv1x1_rows, UOCR_SAM_HIDDEN_SIZE, UOCR_SAM_NECK_CHANNELS,
+                                     "Metal SAM neck 1x1 MPS matmul", error, error_size)) {
+        return 0;
+    }
+    metal_profile_add_event_now(ctx, "metal.vision.SAM neck 1x1 convolution (BHWC)", conv1x1_start_ns);
+    if (metal_vision_profile_detail_level() >= 3 &&
+        !metal_vision_profile_checkpoint(ctx, "sam_neck.SAM neck 1x1 convolution (BHWC)", 1, error, error_size)) {
+        return 0;
     }
     RUN_BATCHED_SAM_NECK_STEP("SAM neck LayerNorm2d-1 (BHWC)",
                               metal_context_sam_layernorm2d_bhwc_batch_f16_to_slice(ctx,
@@ -8479,7 +8447,6 @@ typedef struct uocr_metal_hot_path_alloc_guard {
     uocr_alloc_guard core_alloc_guard;
     uint64_t scratch_capacity;
     uocr_metal_runtime_arena_guard runtime_arena;
-    NSUInteger pipeline_cache_count;
 } uocr_metal_hot_path_alloc_guard;
 
 static uocr_metal_runtime_arena_guard metal_runtime_arena_guard_begin(const uocr_metal_context *ctx) {
@@ -8528,7 +8495,6 @@ static uocr_metal_hot_path_alloc_guard metal_hot_path_alloc_guard_begin(const uo
     guard.core_alloc_guard = uocr_alloc_guard_begin();
     guard.scratch_capacity = uocr_metal_context_total_scratch_capacity(ctx);
     guard.runtime_arena = metal_runtime_arena_guard_begin(ctx);
-    guard.pipeline_cache_count = (ctx != NULL && ctx->pipeline_cache != nil) ? [ctx->pipeline_cache count] : 0u;
     return guard;
 }
 
@@ -8558,109 +8524,11 @@ static int metal_hot_path_alloc_guard_end(const uocr_metal_context *ctx,
     if (!metal_runtime_arena_guard_end(ctx, &guard->runtime_arena, label, error, error_size)) {
         return 0;
     }
-    const NSUInteger pipeline_cache_count = ctx->pipeline_cache != nil ? [ctx->pipeline_cache count] : 0u;
-    if (pipeline_cache_count != guard->pipeline_cache_count) {
-        return metal_fail(error,
-                          error_size,
-                          "%s grew Metal pipeline cache from %llu to %llu entries",
-                          label != NULL ? label : "Metal hot path",
-                          (unsigned long long)guard->pipeline_cache_count,
-                          (unsigned long long)pipeline_cache_count);
-    }
     return 1;
 }
 
 static int metal_mps_framework_available(void);
 static id metal_ensure_mps_matmul_kernel(uocr_metal_context *ctx, char *error, size_t error_size);
-
-static int metal_prewarm_integrated_decoder_pipelines(uocr_metal_context *ctx, char *error, size_t error_size) {
-    typedef struct uocr_metal_prewarm_pipeline {
-        const char *name;
-        int decoder_shape_specialized;
-    } uocr_metal_prewarm_pipeline;
-    static const uocr_metal_prewarm_pipeline pipeline_names[] = {
-        { "uocr_rmsnorm_f16_to_f16", 1 },
-        { "uocr_dense_f16_to_f32", 0 },
-        { "uocr_no_repeat_collect_banned_i32", 0 },
-        { "uocr_lm_head_argmax_f16", 1 },
-        { "uocr_argmax_pairs_f32", 0 },
-        { "uocr_get_rows_f16_to_f16", 0 },
-        { "uocr_assemble_prompt_text_f16", 0 },
-        { "uocr_assemble_prompt_text_skip_image_f16", 0 },
-        { "uocr_assemble_prompt_with_image_f16", 0 },
-        { "uocr_attention_qkvo_f16_to_f16", 1 },
-        { "uocr_rope_qk_f16_to_f16", 1 },
-        { "uocr_kv_cache_write_f16", 1 },
-        { "uocr_prefill_attention_flash_f16_to_f16", 1 },
-        { "uocr_decode_attention_flash_f16_to_f16", 1 },
-        { "uocr_attention_output_residual_f16_to_f16", 1 },
-        { "uocr_clip_residual_add_f16_to_f16", 0 },
-        { "uocr_dense_swiglu_gate_up_f16", 1 },
-        { "uocr_dense_swiglu_shared_gate_up_tile4_f16", 1 },
-        { "uocr_dense_swiglu_down_f16_to_f16", 1 },
-        { "uocr_moe_router_logits_f16_to_f32", 1 },
-        { "uocr_moe_router_softmax_topk_f32", 1 },
-        { "uocr_moe_router_decode_fused_f16", 1 },
-        { "uocr_moe_prefill_interleaved_gate_up_f16", 0 },
-        { "uocr_moe_prefill_interleaved_down_sum_f16_to_f16", 0 },
-        { "uocr_moe_decode_interleaved_gate_up_one_f16", 0 },
-        { "uocr_moe_decode_interleaved_gate_up_tile4_f16", 0 },
-        { "uocr_moe_decode_interleaved_down_sum_combine_f16_to_f16", 0 },
-        { "uocr_moe_decode_interleaved_down_sum_combine_one_f16_to_f16", 1 },
-        { "uocr_moe_decode_interleaved_down_sum_combine_tile4_f16_to_f16", 1 },
-        { "uocr_moe_decode_interleaved_down_sum_combine_tile8_f16_to_f16", 1 },
-        { "uocr_moe_combine_f16_to_f16", 1 },
-    };
-    @autoreleasepool {
-        for (uint32_t i = 0u; i < (uint32_t)(sizeof(pipeline_names) / sizeof(pipeline_names[0])); ++i) {
-            id<MTLComputePipelineState> pipeline = pipeline_names[i].decoder_shape_specialized ?
-                metal_get_decoder_shape_pipeline(ctx, pipeline_names[i].name, error, error_size) :
-                metal_get_pipeline(ctx, pipeline_names[i].name, error, error_size);
-            if (pipeline == nil) {
-                return 0;
-            }
-        }
-#if UOCR_METAL_ENABLE_MOE_DECODE_KERNELS
-        /* Decode may intentionally use a smaller effective top-k than the
-         * model/prefill top-k.  The hot decode path requests this exact
-         * specialization/key, so prewarm it here; otherwise the no-allocation
-         * guard sees the first decode token grow the pipeline cache. */
-        {
-            MTLFunctionConstantValues *constants = [MTLFunctionConstantValues new];
-            if (constants == nil) {
-                return metal_fail(error, error_size, "failed to allocate Metal decode MoE prewarm constants");
-            }
-            const uint32_t hidden_size = UOCR_HIDDEN_SIZE;
-            const uint32_t intermediate_size = UOCR_MOE_EXPERT_INTERMEDIATE;
-            const uint32_t expert_count = UOCR_ROUTED_EXPERTS;
-            const uint32_t top_k = UOCR_METAL_DECODE_MOE_TOP_K;
-            [constants setConstantValue:&hidden_size type:MTLDataTypeUInt atIndex:UOCR_METAL_FC_HIDDEN_SIZE];
-            [constants setConstantValue:&expert_count type:MTLDataTypeUInt atIndex:UOCR_METAL_FC_MOE_EXPERTS];
-            [constants setConstantValue:&top_k type:MTLDataTypeUInt atIndex:UOCR_METAL_FC_MOE_TOP_K];
-            [constants setConstantValue:&intermediate_size type:MTLDataTypeUInt atIndex:UOCR_METAL_FC_MOE_EXPERT_INTERMEDIATE];
-            NSString *constant_key = [NSString stringWithFormat:@"#integrated-moe-decode:h%u:i%u:e%u:k%u",
-                                      hidden_size,
-                                      intermediate_size,
-                                      expert_count,
-                                      top_k];
-            id<MTLComputePipelineState> pipeline = metal_get_pipeline_with_constants(ctx,
-                                                                                     UOCR_METAL_MOE_ROUTED_DOWN_COMBINE_KERNEL,
-                                                                                     constant_key,
-                                                                                     constants,
-                                                                                     error,
-                                                                                     error_size);
-            [constants release];
-            if (pipeline == nil) {
-                return 0;
-            }
-        }
-#endif
-        if (metal_mps_framework_available() && metal_ensure_mps_matmul_kernel(ctx, error, error_size) == nil) {
-            return 0;
-        }
-    }
-    return 1;
-}
 
 static int metal_prompt_arena_slot_offset(const uocr_metal_context *ctx,
                                           uint32_t slot,
@@ -9238,97 +9106,6 @@ static int metal_mps_framework_available(void) {
     return metal_mps_classes()->available;
 }
 
-static int metal_mps_matmul_nt_f16_flops(uint32_t rows,
-                                         uint32_t in_features,
-                                         uint32_t out_features,
-                                         uint64_t *out_flops) {
-    uint64_t tmp = 0u;
-    uint64_t flops = 0u;
-    if (out_flops == NULL || rows == 0u || in_features == 0u || out_features == 0u ||
-        !checked_mul_u64((uint64_t)rows, (uint64_t)in_features, &tmp) ||
-        !checked_mul_u64(tmp, (uint64_t)out_features, &flops) ||
-        !checked_mul_u64(flops, 2u, &flops)) {
-        return 0;
-    }
-    *out_flops = flops;
-    return 1;
-}
-
-static uint64_t metal_mps_matmul_min_flops(int *out_overridden) {
-    uint64_t threshold = UOCR_METAL_MPS_MATMUL_MIN_FLOPS;
-    int overridden = 0;
-    const char *env = getenv(UOCR_METAL_MPS_MATMUL_MIN_FLOPS_ENV);
-    if (env != NULL && env[0] != '\0') {
-        errno = 0;
-        char *end = NULL;
-        unsigned long long parsed = strtoull(env, &end, 0);
-        if (errno == 0 && end != env && end != NULL && *end == '\0') {
-            threshold = (uint64_t)parsed;
-            overridden = 1;
-        }
-    }
-    if (out_overridden != NULL) {
-        *out_overridden = overridden;
-    }
-    return threshold;
-}
-
-static int metal_mps_matmul_nt_f16_is_large(uint32_t rows, uint32_t in_features, uint32_t out_features) {
-    uint64_t flops = 0u;
-    int threshold_overridden = 0;
-    const uint64_t min_flops = metal_mps_matmul_min_flops(&threshold_overridden);
-    if (!metal_mps_matmul_nt_f16_flops(rows, in_features, out_features, &flops) || flops < min_flops) {
-        return 0;
-    }
-    if (!threshold_overridden && out_features < UOCR_METAL_MPS_MATMUL_SKINNY_OUT_FEATURES &&
-        flops < UOCR_METAL_MPS_MATMUL_SKINNY_MIN_FLOPS) {
-        return 0;
-    }
-    return 1;
-}
-
-static int metal_mps_matmul_nt_f16_should_use(uint32_t rows, uint32_t in_features, uint32_t out_features) {
-    return metal_mps_framework_available() && metal_mps_matmul_nt_f16_is_large(rows, in_features, out_features);
-}
-
-static void metal_public_mps_large_gemm_require_begin(uocr_metal_context *ctx) {
-    if (ctx != NULL && ctx->public_mps_large_gemm_required_depth != UINT32_MAX) {
-        ++ctx->public_mps_large_gemm_required_depth;
-    }
-}
-
-static void metal_public_mps_large_gemm_require_end(uocr_metal_context *ctx) {
-    if (ctx != NULL && ctx->public_mps_large_gemm_required_depth != 0u) {
-        --ctx->public_mps_large_gemm_required_depth;
-    }
-}
-
-static int metal_public_mps_matmul_fallback_allowed(uocr_metal_context *ctx,
-                                                    uint32_t rows,
-                                                    uint32_t in_features,
-                                                    uint32_t out_features,
-                                                    const char *op_name,
-                                                    char *error,
-                                                    size_t error_size) {
-    if (ctx == NULL || ctx->public_mps_large_gemm_required_depth == 0u ||
-        !metal_mps_matmul_nt_f16_is_large(rows, in_features, out_features)) {
-        return 1;
-    }
-    uint64_t flops = 0u;
-    (void)metal_mps_matmul_nt_f16_flops(rows, in_features, out_features, &flops);
-    if (!metal_mps_framework_available()) {
-        return metal_fail(error,
-                          error_size,
-                          "public Metal OCR requires MPSNDArray matmul for large %s (%ux%u x %u, %llu FLOPs), but MPS is unavailable",
-                          op_name != NULL ? op_name : "GEMM",
-                          rows,
-                          in_features,
-                          out_features,
-                          (unsigned long long)flops);
-    }
-    return 1;
-}
-
 static id metal_mps_descriptor_for_shape(uocr_metal_context *ctx,
                                          uint32_t rows,
                                          uint32_t cols,
@@ -9512,9 +9289,6 @@ static int metal_prebuild_mps_workspace_matmul_io(uocr_metal_context *ctx,
                                                   const char *label,
                                                   char *error,
                                                   size_t error_size) {
-    if (!metal_mps_matmul_nt_f16_should_use(rows, in_features, out_features)) {
-        return 1;
-    }
     const uint64_t dst_element_bytes = dst_data_type == UOCR_METAL_MPS_DATA_TYPE_FLOAT32 ? (uint64_t)sizeof(float) : 2u;
     uocr_metal_buffer_slice input_slice;
     uocr_metal_buffer_slice dst_slice;
@@ -10381,23 +10155,8 @@ static int metal_prebuild_mps_runtime_workspace_ndarrays(uocr_metal_context *ctx
     }
 
     const uint64_t start_ns = uocr_profile_now_ns();
-    const int use_attention_mps = metal_mps_matmul_nt_f16_should_use(n_tokens, UOCR_HIDDEN_SIZE, UOCR_HIDDEN_SIZE);
-    const int use_dense_down_mps = metal_mps_matmul_nt_f16_should_use(n_tokens,
-                                                                      UOCR_DENSE_LAYER0_INTERMEDIATE,
-                                                                      UOCR_HIDDEN_SIZE);
-    const int use_shared_down_mps = metal_mps_matmul_nt_f16_should_use(n_tokens,
-                                                                       UOCR_MOE_SHARED_INTERMEDIATE,
-                                                                       UOCR_HIDDEN_SIZE);
-    const int use_router_mps = metal_mps_matmul_nt_f16_should_use(n_tokens, UOCR_HIDDEN_SIZE, UOCR_ROUTED_EXPERTS);
-    if (!use_attention_mps && !use_dense_down_mps && !use_shared_down_mps && !use_router_mps) {
-        ctx->mps_runtime_workspace_prebuild_generation = ctx->mps_workspace_cache_generation;
-        ctx->mps_runtime_workspace_prebuild_token_count = n_tokens;
-        metal_profile_add_event_ms(ctx, "metal.mps.workspace_prebuild.runtime.not_used", 0.0);
-        return 1;
-    }
-
     for (uint32_t slot = 0u; slot < ctx->kv_cache_layout.batch_slots; ++slot) {
-        if (use_attention_mps) {
+        {
             uocr_metal_buffer_slice prompt;
             uint64_t prompt_bytes = 0u;
             if (!metal_prompt_arena_slice(ctx, slot, n_tokens, &prompt, &prompt_bytes)) {
@@ -10416,33 +10175,31 @@ static int metal_prebuild_mps_runtime_workspace_ndarrays(uocr_metal_context *ctx
             }
         }
 
-        if (use_attention_mps || use_dense_down_mps || use_shared_down_mps || use_router_mps) {
-            for (uint32_t segment = 0u; segment < UOCR_METAL_HIDDEN_SCRATCH_SEGMENTS; ++segment) {
-                uocr_metal_buffer_slice hidden;
-                uint64_t hidden_bytes = 0u;
-                if (!metal_hidden_arena_segment_slice(ctx, slot, segment, n_tokens, &hidden, &hidden_bytes)) {
-                    return metal_fail(error,
-                                      error_size,
-                                      "failed to prebuild Metal MPS hidden workspace NDArray for slot %u segment %u",
-                                      slot,
-                                      segment);
-                }
-                if (!metal_prebuild_mps_workspace_matrix_ndarray(ctx,
-                                                                 hidden,
-                                                                 hidden_bytes,
-                                                                 n_tokens,
-                                                                 UOCR_HIDDEN_SIZE,
-                                                                 UOCR_METAL_MPS_DATA_TYPE_FLOAT16,
-                                                                 "decoder hidden workspace",
-                                                                 error,
-                                                                 error_size)) {
-                    return 0;
-                }
+        for (uint32_t segment = 0u; segment < UOCR_METAL_HIDDEN_SCRATCH_SEGMENTS; ++segment) {
+            uocr_metal_buffer_slice hidden;
+            uint64_t hidden_bytes = 0u;
+            if (!metal_hidden_arena_segment_slice(ctx, slot, segment, n_tokens, &hidden, &hidden_bytes)) {
+                return metal_fail(error,
+                                  error_size,
+                                  "failed to prebuild Metal MPS hidden workspace NDArray for slot %u segment %u",
+                                  slot,
+                                  segment);
+            }
+            if (!metal_prebuild_mps_workspace_matrix_ndarray(ctx,
+                                                             hidden,
+                                                             hidden_bytes,
+                                                             n_tokens,
+                                                             UOCR_HIDDEN_SIZE,
+                                                             UOCR_METAL_MPS_DATA_TYPE_FLOAT16,
+                                                             "decoder hidden workspace",
+                                                             error,
+                                                             error_size)) {
+                return 0;
             }
         }
 
         uocr_metal_buffer_slice mid;
-        if (use_dense_down_mps) {
+        {
             const uint64_t dense_mid_bytes = (uint64_t)n_tokens * (uint64_t)UOCR_DENSE_LAYER0_INTERMEDIATE * 2u;
             if (!metal_moe_intermediate_slice(ctx, slot, dense_mid_bytes, &mid)) {
                 return metal_fail(error, error_size, "failed to prebuild Metal MPS dense-MLP intermediate workspace for slot %u", slot);
@@ -10459,7 +10216,7 @@ static int metal_prebuild_mps_runtime_workspace_ndarrays(uocr_metal_context *ctx
                 return 0;
             }
         }
-        if (use_shared_down_mps) {
+        {
             const uint64_t shared_mid_bytes = (uint64_t)n_tokens * (uint64_t)UOCR_MOE_SHARED_INTERMEDIATE * 2u;
             if (!metal_moe_intermediate_slice(ctx, slot, shared_mid_bytes, &mid)) {
                 return metal_fail(error, error_size, "failed to prebuild Metal MPS shared-expert intermediate workspace for slot %u", slot);
@@ -10477,7 +10234,7 @@ static int metal_prebuild_mps_runtime_workspace_ndarrays(uocr_metal_context *ctx
             }
         }
 
-        if (use_router_mps) {
+        {
             uocr_metal_buffer_slice router_logits;
             uocr_metal_buffer_slice top_ids;
             uocr_metal_buffer_slice top_weights;
@@ -11763,87 +11520,39 @@ static int metal_run_attention_qkv_buffer_f16(uocr_metal_context *ctx,
         output_values > (uint64_t)UINT32_MAX) {
         return metal_fail(error, error_size, "integrated attention QKV dispatch size overflow");
     }
-    if (metal_mps_matmul_nt_f16_should_use(n_tokens, UOCR_HIDDEN_SIZE, UOCR_HIDDEN_SIZE)) {
-        uocr_metal_buffer_slice q_weight_slice = { q_weight->buffer, q_weight->offset };
-        uocr_metal_buffer_slice k_weight_slice = { k_weight->buffer, k_weight->offset };
-        uocr_metal_buffer_slice v_weight_slice = { v_weight->buffer, v_weight->offset };
-        return metal_run_mps_matmul_nt_f16(ctx,
-                                           src,
-                                           q_weight_slice,
-                                           q_dst,
-                                           n_tokens,
-                                           UOCR_HIDDEN_SIZE,
-                                           UOCR_HIDDEN_SIZE,
-                                           "integrated attention Q MPS matmul",
-                                           error,
-                                           error_size) &&
-               metal_run_mps_matmul_nt_f16(ctx,
-                                           src,
-                                           k_weight_slice,
-                                           k_dst,
-                                           n_tokens,
-                                           UOCR_HIDDEN_SIZE,
-                                           UOCR_HIDDEN_SIZE,
-                                           "integrated attention K MPS matmul",
-                                           error,
-                                           error_size) &&
-               metal_run_mps_matmul_nt_f16(ctx,
-                                           src,
-                                           v_weight_slice,
-                                           v_dst,
-                                           n_tokens,
-                                           UOCR_HIDDEN_SIZE,
-                                           UOCR_HIDDEN_SIZE,
-                                           "integrated attention V MPS matmul",
-                                           error,
-                                           error_size);
-    }
-    if (!metal_public_mps_matmul_fallback_allowed(ctx,
-                                                  n_tokens,
-                                                  UOCR_HIDDEN_SIZE,
-                                                  UOCR_HIDDEN_SIZE,
-                                                  "integrated attention QKV",
-                                                  error,
-                                                  error_size)) {
-        return 0;
-    }
-    @autoreleasepool {
-        id<MTLComputePipelineState> pipeline = metal_get_decoder_shape_pipeline(ctx, "uocr_attention_qkvo_f16_to_f16", error, error_size);
-        if (pipeline == nil) {
-            return 0;
-        }
-        const NSUInteger threads = metal_power2_threadgroup_width(256u, pipeline.maxTotalThreadsPerThreadgroup);
-        int owned_command_buffer = 0;
-        id<MTLCommandBuffer> cb = metal_command_buffer_for_op(ctx, &owned_command_buffer, "integrated attention QKV", error, error_size);
-        if (cb == nil) {
-            return 0;
-        }
-        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
-        if (enc == nil) {
-            return metal_fail(error, error_size, "failed to create integrated attention QKV command encoder");
-        }
-        uocr_metal_attention_projection_params params;
-        params.n_tokens = n_tokens;
-        params.hidden_size = UOCR_HIDDEN_SIZE;
-        params.projection_count = 3u;
-        params.reserved = 0u;
-        [enc setComputePipelineState:pipeline];
-        [enc setBuffer:src.buffer offset:src.offset atIndex:0u];
-        [enc setBuffer:q_weight->buffer offset:q_weight->offset atIndex:1u];
-        [enc setBuffer:k_weight->buffer offset:k_weight->offset atIndex:2u];
-        [enc setBuffer:v_weight->buffer offset:v_weight->offset atIndex:3u];
-        [enc setBuffer:q_weight->buffer offset:q_weight->offset atIndex:4u];
-        [enc setBuffer:q_dst.buffer offset:q_dst.offset atIndex:5u];
-        [enc setBuffer:k_dst.buffer offset:k_dst.offset atIndex:6u];
-        [enc setBuffer:v_dst.buffer offset:v_dst.offset atIndex:7u];
-        [enc setBuffer:q_dst.buffer offset:q_dst.offset atIndex:8u];
-        [enc setBytes:&params length:sizeof(params) atIndex:9u];
-        [enc setThreadgroupMemoryLength:threads * sizeof(float) atIndex:0u];
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)output_values, 1u, 1u)
-             threadsPerThreadgroup:MTLSizeMake(threads, 1u, 1u)];
-        [enc endEncoding];
-        return metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, "integrated attention QKV", error, error_size);
-    }
+    uocr_metal_buffer_slice q_weight_slice = { q_weight->buffer, q_weight->offset };
+    uocr_metal_buffer_slice k_weight_slice = { k_weight->buffer, k_weight->offset };
+    uocr_metal_buffer_slice v_weight_slice = { v_weight->buffer, v_weight->offset };
+    return metal_run_mps_matmul_nt_f16(ctx,
+                                       src,
+                                       q_weight_slice,
+                                       q_dst,
+                                       n_tokens,
+                                       UOCR_HIDDEN_SIZE,
+                                       UOCR_HIDDEN_SIZE,
+                                       "integrated attention Q MPS matmul",
+                                       error,
+                                       error_size) &&
+           metal_run_mps_matmul_nt_f16(ctx,
+                                       src,
+                                       k_weight_slice,
+                                       k_dst,
+                                       n_tokens,
+                                       UOCR_HIDDEN_SIZE,
+                                       UOCR_HIDDEN_SIZE,
+                                       "integrated attention K MPS matmul",
+                                       error,
+                                       error_size) &&
+           metal_run_mps_matmul_nt_f16(ctx,
+                                       src,
+                                       v_weight_slice,
+                                       v_dst,
+                                       n_tokens,
+                                       UOCR_HIDDEN_SIZE,
+                                       UOCR_HIDDEN_SIZE,
+                                       "integrated attention V MPS matmul",
+                                       error,
+                                       error_size);
 }
 
 static int metal_run_rope_qk_buffer_f16(uocr_metal_context *ctx,
@@ -12132,68 +11841,25 @@ static int metal_run_attention_output_residual_buffer_f16(uocr_metal_context *ct
         !metal_buffer_range_valid(o_weight->buffer, o_weight->offset, weight_bytes) || output_values > UINT32_MAX) {
         return metal_fail(error, error_size, "invalid integrated attention output request");
     }
-    if (metal_mps_matmul_nt_f16_should_use(n_tokens, UOCR_HIDDEN_SIZE, UOCR_HIDDEN_SIZE)) {
-        uocr_metal_buffer_slice weight_slice = { o_weight->buffer, o_weight->offset };
-        return metal_run_mps_matmul_nt_f16(ctx,
-                                           context,
-                                           weight_slice,
-                                           dst,
-                                           n_tokens,
-                                           UOCR_HIDDEN_SIZE,
-                                           UOCR_HIDDEN_SIZE,
-                                           "integrated attention output MPS matmul",
-                                           error,
-                                           error_size) &&
-               metal_run_residual_add_f16(ctx,
-                                          dst,
-                                          residual,
-                                          dst,
-                                          (uint32_t)output_values,
-                                          "integrated attention output MPS residual add",
-                                          error,
-                                          error_size);
-    }
-    if (!metal_public_mps_matmul_fallback_allowed(ctx,
-                                                  n_tokens,
-                                                  UOCR_HIDDEN_SIZE,
-                                                  UOCR_HIDDEN_SIZE,
-                                                  "integrated attention output",
-                                                  error,
-                                                  error_size)) {
-        return 0;
-    }
-    @autoreleasepool {
-        id<MTLComputePipelineState> pipeline = metal_get_decoder_shape_pipeline(ctx, "uocr_attention_output_residual_f16_to_f16", error, error_size);
-        if (pipeline == nil) {
-            return 0;
-        }
-        const NSUInteger threads = metal_power2_threadgroup_width(256u, pipeline.maxTotalThreadsPerThreadgroup);
-        int owned_command_buffer = 0;
-        id<MTLCommandBuffer> cb = metal_command_buffer_for_op(ctx, &owned_command_buffer, "integrated attention output", error, error_size);
-        if (cb == nil) {
-            return 0;
-        }
-        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
-        if (enc == nil) {
-            return metal_fail(error, error_size, "failed to create integrated attention output command encoder");
-        }
-        uocr_metal_attention_output_params params;
-        params.n_tokens = n_tokens;
-        params.hidden_size = UOCR_HIDDEN_SIZE;
-        params.reserved0 = 0u;
-        params.reserved1 = 0u;
-        [enc setComputePipelineState:pipeline];
-        [enc setBuffer:context.buffer offset:context.offset atIndex:0u];
-        [enc setBuffer:o_weight->buffer offset:o_weight->offset atIndex:1u];
-        [enc setBuffer:residual.buffer offset:residual.offset atIndex:2u];
-        [enc setBuffer:dst.buffer offset:dst.offset atIndex:3u];
-        [enc setBytes:&params length:sizeof(params) atIndex:4u];
-        [enc setThreadgroupMemoryLength:threads * sizeof(float) atIndex:0u];
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)output_values, 1u, 1u)
-             threadsPerThreadgroup:MTLSizeMake(threads, 1u, 1u)];
-        [enc endEncoding];
-        return metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, "integrated attention output", error, error_size);
-    }
+    uocr_metal_buffer_slice weight_slice = { o_weight->buffer, o_weight->offset };
+    return metal_run_mps_matmul_nt_f16(ctx,
+                                       context,
+                                       weight_slice,
+                                       dst,
+                                       n_tokens,
+                                       UOCR_HIDDEN_SIZE,
+                                       UOCR_HIDDEN_SIZE,
+                                       "integrated attention output MPS matmul",
+                                       error,
+                                       error_size) &&
+           metal_run_residual_add_f16(ctx,
+                                      dst,
+                                      residual,
+                                      dst,
+                                      (uint32_t)output_values,
+                                      "integrated attention output MPS residual add",
+                                      error,
+                                      error_size);
 }
 
 static int metal_run_dense_swiglu_buffer_f16(uocr_metal_context *ctx,
@@ -12225,32 +11891,15 @@ static int metal_run_dense_swiglu_buffer_f16(uocr_metal_context *ctx,
         !metal_buffer_range_valid(down_weight->buffer, down_weight->offset, down_weight_bytes)) {
         return metal_fail(error, error_size, "invalid %s SwiGLU request", op_name);
     }
-    const int use_mps_down = metal_mps_matmul_nt_f16_should_use(n_tokens, intermediate_size, UOCR_HIDDEN_SIZE);
-    if (!use_mps_down &&
-        !metal_public_mps_matmul_fallback_allowed(ctx,
-                                                  n_tokens,
-                                                  intermediate_size,
-                                                  UOCR_HIDDEN_SIZE,
-                                                  op_name,
-                                                  error,
-                                                  error_size)) {
-        return 0;
-    }
     @autoreleasepool {
-#if UOCR_METAL_ENABLE_MOE_SHARED_GATE_UP_TILED
         const int use_tiled_shared_gate_up = n_tokens == 1u && intermediate_size == UOCR_MOE_SHARED_INTERMEDIATE;
-#else
-        const int use_tiled_shared_gate_up = 0;
-#endif
         id<MTLComputePipelineState> gate_pipeline = metal_get_decoder_shape_pipeline(ctx,
                                                                                      use_tiled_shared_gate_up ?
                                                                                          "uocr_dense_swiglu_shared_gate_up_tile4_f16" :
                                                                                          "uocr_dense_swiglu_gate_up_f16",
                                                                                      error,
                                                                                      error_size);
-        id<MTLComputePipelineState> down_pipeline = use_mps_down ? nil :
-            metal_get_decoder_shape_pipeline(ctx, "uocr_dense_swiglu_down_f16_to_f16", error, error_size);
-        if (gate_pipeline == nil || (!use_mps_down && down_pipeline == nil)) {
+        if (gate_pipeline == nil) {
             return 0;
         }
         if (use_tiled_shared_gate_up &&
@@ -12290,50 +11939,31 @@ static int metal_run_dense_swiglu_buffer_f16(uocr_metal_context *ctx,
              threadsPerThreadgroup:MTLSizeMake(gate_threads, 1u, 1u)];
         [enc endEncoding];
 
-        if (use_mps_down) {
-            uocr_metal_buffer_slice down_weight_slice = { down_weight->buffer, down_weight->offset };
-            if (!metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, op_name, error, error_size) ||
-                !metal_run_mps_matmul_nt_f16(ctx,
-                                             mid,
-                                             down_weight_slice,
-                                             dst,
-                                             n_tokens,
-                                             intermediate_size,
-                                             UOCR_HIDDEN_SIZE,
-                                             op_name,
-                                             error,
-                                             error_size)) {
-                return 0;
-            }
-            if (has_residual) {
-                return metal_run_residual_add_f16(ctx,
-                                                  dst,
-                                                  residual,
-                                                  dst,
-                                                  (uint32_t)down_values,
-                                                  op_name,
-                                                  error,
-                                                  error_size);
-            }
-            return 1;
+        uocr_metal_buffer_slice down_weight_slice = { down_weight->buffer, down_weight->offset };
+        if (!metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, op_name, error, error_size) ||
+            !metal_run_mps_matmul_nt_f16(ctx,
+                                         mid,
+                                         down_weight_slice,
+                                         dst,
+                                         n_tokens,
+                                         intermediate_size,
+                                         UOCR_HIDDEN_SIZE,
+                                         op_name,
+                                         error,
+                                         error_size)) {
+            return 0;
         }
-
-        enc = metal_compute_command_encoder(ctx, cb);
-        if (enc == nil) {
-            return metal_fail(error, error_size, "failed to create %s down command encoder", op_name);
+        if (has_residual) {
+            return metal_run_residual_add_f16(ctx,
+                                              dst,
+                                              residual,
+                                              dst,
+                                              (uint32_t)down_values,
+                                              op_name,
+                                              error,
+                                              error_size);
         }
-        const NSUInteger down_threads = metal_power2_threadgroup_width(256u, down_pipeline.maxTotalThreadsPerThreadgroup);
-        [enc setComputePipelineState:down_pipeline];
-        [enc setBuffer:mid.buffer offset:mid.offset atIndex:0u];
-        [enc setBuffer:down_weight->buffer offset:down_weight->offset atIndex:1u];
-        [enc setBuffer:(has_residual ? residual.buffer : input.buffer) offset:(has_residual ? residual.offset : input.offset) atIndex:2u];
-        [enc setBuffer:dst.buffer offset:dst.offset atIndex:3u];
-        [enc setBytes:&params length:sizeof(params) atIndex:4u];
-        [enc setThreadgroupMemoryLength:down_threads * sizeof(float) atIndex:0u];
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)down_values, 1u, 1u)
-             threadsPerThreadgroup:MTLSizeMake(down_threads, 1u, 1u)];
-        [enc endEncoding];
-        return metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, op_name, error, error_size);
+        return 1;
     }
 }
 
@@ -12365,31 +11995,13 @@ static int metal_run_moe_router_buffer_f16(uocr_metal_context *ctx,
     (void)logits_bytes;
     (void)top_ids_bytes;
     (void)top_weights_bytes;
-    const int use_mps_logits = metal_mps_matmul_nt_f16_should_use(n_tokens, UOCR_HIDDEN_SIZE, UOCR_ROUTED_EXPERTS);
-    if (!use_mps_logits &&
-        !metal_public_mps_matmul_fallback_allowed(ctx,
-                                                  n_tokens,
-                                                  UOCR_HIDDEN_SIZE,
-                                                  UOCR_ROUTED_EXPERTS,
-                                                  "integrated MoE router logits",
-                                                  error,
-                                                  error_size)) {
-        return 0;
-    }
     @autoreleasepool {
-#if UOCR_METAL_ENABLE_MOE_FUSED_ROUTER
-        const int use_fused_decode_router = !use_mps_logits && n_tokens == 1u;
-#else
-        const int use_fused_decode_router = 0;
-#endif
+        const int use_fused_decode_router = (n_tokens == 1u);
         id<MTLComputePipelineState> fused_pipeline = use_fused_decode_router ?
             metal_get_decoder_shape_pipeline(ctx, "uocr_moe_router_decode_fused_f16", error, error_size) : nil;
-        id<MTLComputePipelineState> logits_pipeline = (use_mps_logits || use_fused_decode_router) ? nil :
-            metal_get_decoder_shape_pipeline(ctx, "uocr_moe_router_logits_f16_to_f32", error, error_size);
         id<MTLComputePipelineState> topk_pipeline = use_fused_decode_router ? nil :
             metal_get_decoder_shape_pipeline(ctx, "uocr_moe_router_softmax_topk_f32", error, error_size);
         if ((use_fused_decode_router && fused_pipeline == nil) ||
-            (!use_mps_logits && !use_fused_decode_router && logits_pipeline == nil) ||
             (!use_fused_decode_router && topk_pipeline == nil)) {
             return 0;
         }
@@ -12410,9 +12022,8 @@ static int metal_run_moe_router_buffer_f16(uocr_metal_context *ctx,
         if (cb == nil) {
             return 0;
         }
-        id<MTLComputeCommandEncoder> enc = nil;
         if (use_fused_decode_router) {
-            enc = metal_compute_command_encoder(ctx, cb);
+            id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
             if (enc == nil) {
                 return metal_fail(error, error_size, "failed to create integrated MoE fused router encoder");
             }
@@ -12432,40 +12043,23 @@ static int metal_run_moe_router_buffer_f16(uocr_metal_context *ctx,
                  threadsPerThreadgroup:MTLSizeMake(fused_threads, 1u, 1u)];
             [enc endEncoding];
         } else {
-            if (use_mps_logits) {
-                uocr_metal_buffer_slice router_weight_slice = { router_weight->buffer, router_weight->offset };
-                const uint64_t router_mps_start_ns = uocr_profile_now_ns();
-                if (!metal_run_mps_matmul_nt_f16_to_f32(ctx,
-                                                        input,
-                                                        router_weight_slice,
-                                                        logits,
-                                                        n_tokens,
-                                                        UOCR_HIDDEN_SIZE,
-                                                        UOCR_ROUTED_EXPERTS,
-                                                        "integrated MoE router MPS logits",
-                                                        error,
-                                                        error_size)) {
-                    return 0;
-                }
-                metal_profile_add_event_now(ctx, "metal.prefill.moe_router_mps_logits", router_mps_start_ns);
-            } else {
-                enc = metal_compute_command_encoder(ctx, cb);
-                if (enc == nil) {
-                    return metal_fail(error, error_size, "failed to create integrated MoE router logits encoder");
-                }
-                const NSUInteger logits_threads = metal_power2_threadgroup_width(256u, logits_pipeline.maxTotalThreadsPerThreadgroup);
-                [enc setComputePipelineState:logits_pipeline];
-                [enc setBuffer:input.buffer offset:input.offset atIndex:0u];
-                [enc setBuffer:router_weight->buffer offset:router_weight->offset atIndex:1u];
-                [enc setBuffer:logits.buffer offset:logits.offset atIndex:2u];
-                [enc setBytes:&params length:sizeof(params) atIndex:3u];
-                [enc setThreadgroupMemoryLength:logits_threads * sizeof(float) atIndex:0u];
-                [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)router_values, 1u, 1u)
-                     threadsPerThreadgroup:MTLSizeMake(logits_threads, 1u, 1u)];
-                [enc endEncoding];
+            uocr_metal_buffer_slice router_weight_slice = { router_weight->buffer, router_weight->offset };
+            const uint64_t router_mps_start_ns = uocr_profile_now_ns();
+            if (!metal_run_mps_matmul_nt_f16_to_f32(ctx,
+                                                    input,
+                                                    router_weight_slice,
+                                                    logits,
+                                                    n_tokens,
+                                                    UOCR_HIDDEN_SIZE,
+                                                    UOCR_ROUTED_EXPERTS,
+                                                    "integrated MoE router MPS logits",
+                                                    error,
+                                                    error_size)) {
+                return 0;
             }
+            metal_profile_add_event_now(ctx, "metal.prefill.moe_router_mps_logits", router_mps_start_ns);
 
-            enc = metal_compute_command_encoder(ctx, cb);
+            id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
             if (enc == nil) {
                 return metal_fail(error, error_size, "failed to create integrated MoE router top-k encoder");
             }
@@ -12519,87 +12113,7 @@ static int metal_expert_interleaved_slab_for_layer(const uocr_metal_context *ctx
     return 1;
 }
 
-static int __attribute__((unused)) metal_run_moe_interleaved_buffer_f16(uocr_metal_context *ctx,
-                                                uocr_metal_buffer_slice input,
-                                                uocr_metal_buffer_slice top_ids,
-                                                uocr_metal_buffer_slice top_weights,
-                                                uocr_metal_buffer_slice expert_slab,
-                                                uint32_t slot,
-                                                uint32_t n_tokens,
-                                                uocr_metal_buffer_slice mid,
-                                                uocr_metal_buffer_slice dst,
-                                                char *error,
-                                                size_t error_size) {
-    (void)slot;
-    const uint64_t hidden_bytes = (uint64_t)n_tokens * (uint64_t)UOCR_HIDDEN_SIZE * 2u;
-    const uint64_t top_ids_bytes = (uint64_t)n_tokens * (uint64_t)UOCR_MOE_TOP_K * sizeof(uint32_t);
-    const uint64_t top_weights_bytes = (uint64_t)n_tokens * (uint64_t)UOCR_MOE_TOP_K * sizeof(float);
-    const uint64_t mid_bytes = (uint64_t)n_tokens * (uint64_t)UOCR_MOE_TOP_K * (uint64_t)UOCR_MOE_EXPERT_INTERMEDIATE * 2u;
-    const uint64_t projection_values = (uint64_t)UOCR_MOE_EXPERT_INTERMEDIATE * (uint64_t)UOCR_HIDDEN_SIZE;
-    const uint64_t slab_bytes = projection_values * 2u * 3u * (uint64_t)UOCR_ROUTED_EXPERTS;
-    uint64_t gate_values = (uint64_t)n_tokens * (uint64_t)UOCR_MOE_TOP_K * (uint64_t)UOCR_MOE_EXPERT_INTERMEDIATE;
-    uint64_t down_values = (uint64_t)n_tokens * (uint64_t)UOCR_HIDDEN_SIZE;
-    if (ctx == NULL || n_tokens == 0u || gate_values > UINT32_MAX || down_values > UINT32_MAX ||
-        !metal_slice_valid(input, hidden_bytes) || !metal_slice_valid(top_ids, top_ids_bytes) ||
-        !metal_slice_valid(top_weights, top_weights_bytes) || !metal_slice_valid(expert_slab, slab_bytes) ||
-        !metal_slice_valid(mid, mid_bytes) || !metal_slice_valid(dst, hidden_bytes)) {
-        return metal_fail(error, error_size, "invalid integrated routed MoE request");
-    }
-    @autoreleasepool {
-        id<MTLComputePipelineState> gate_pipeline = metal_get_pipeline(ctx, "uocr_moe_prefill_interleaved_gate_up_f16", error, error_size);
-        id<MTLComputePipelineState> down_pipeline = metal_get_pipeline(ctx, "uocr_moe_prefill_interleaved_down_sum_f16_to_f16", error, error_size);
-        if (gate_pipeline == nil || down_pipeline == nil) {
-            return 0;
-        }
-        int owned_command_buffer = 0;
-        id<MTLCommandBuffer> cb = metal_command_buffer_for_op(ctx, &owned_command_buffer, "integrated routed MoE", error, error_size);
-        if (cb == nil) {
-            return 0;
-        }
-        uocr_metal_moe_prefill_interleaved_params params;
-        params.n_tokens = n_tokens;
-        params.hidden_size = UOCR_HIDDEN_SIZE;
-        params.intermediate_size = UOCR_MOE_EXPERT_INTERMEDIATE;
-        params.expert_count = UOCR_ROUTED_EXPERTS;
-        params.top_k = UOCR_MOE_TOP_K;
-        params.expert_stride_values = (uint32_t)(projection_values * 3u);
-        params.up_offset_values = (uint32_t)projection_values;
-        params.down_offset_values = (uint32_t)(projection_values * 2u);
-        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
-        if (enc == nil) {
-            return metal_fail(error, error_size, "failed to create integrated routed MoE gate/up encoder");
-        }
-        const NSUInteger gate_threads = metal_power2_threadgroup_width(64u, gate_pipeline.maxTotalThreadsPerThreadgroup);
-        [enc setComputePipelineState:gate_pipeline];
-        [enc setBuffer:input.buffer offset:input.offset atIndex:0u];
-        [enc setBuffer:top_ids.buffer offset:top_ids.offset atIndex:1u];
-        [enc setBuffer:expert_slab.buffer offset:expert_slab.offset atIndex:2u];
-        [enc setBuffer:mid.buffer offset:mid.offset atIndex:3u];
-        [enc setBytes:&params length:sizeof(params) atIndex:4u];
-        [enc setThreadgroupMemoryLength:gate_threads * 2u * sizeof(float) atIndex:0u];
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)gate_values, 1u, 1u)
-             threadsPerThreadgroup:MTLSizeMake(gate_threads, 1u, 1u)];
-        [enc endEncoding];
 
-        enc = metal_compute_command_encoder(ctx, cb);
-        if (enc == nil) {
-            return metal_fail(error, error_size, "failed to create integrated routed MoE down encoder");
-        }
-        const NSUInteger down_threads = metal_power2_threadgroup_width(64u, down_pipeline.maxTotalThreadsPerThreadgroup);
-        [enc setComputePipelineState:down_pipeline];
-        [enc setBuffer:mid.buffer offset:mid.offset atIndex:0u];
-        [enc setBuffer:top_ids.buffer offset:top_ids.offset atIndex:1u];
-        [enc setBuffer:top_weights.buffer offset:top_weights.offset atIndex:2u];
-        [enc setBuffer:expert_slab.buffer offset:expert_slab.offset atIndex:3u];
-        [enc setBuffer:dst.buffer offset:dst.offset atIndex:4u];
-        [enc setBytes:&params length:sizeof(params) atIndex:5u];
-        [enc setThreadgroupMemoryLength:down_threads * sizeof(float) atIndex:0u];
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)down_values, 1u, 1u)
-             threadsPerThreadgroup:MTLSizeMake(down_threads, 1u, 1u)];
-        [enc endEncoding];
-        return metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, "integrated routed MoE", error, error_size);
-    }
-}
 
 static int metal_run_moe_interleaved_decode_fused_combine_buffer_f16(uocr_metal_context *ctx,
                                                                      uocr_metal_buffer_slice input,
@@ -12629,16 +12143,8 @@ static int metal_run_moe_interleaved_decode_fused_combine_buffer_f16(uocr_metal_
         return metal_fail(error, error_size, "invalid integrated routed MoE fused-combine request");
     }
     @autoreleasepool {
-#if UOCR_METAL_ENABLE_MOE_DECODE_KERNELS
         const int use_decode_kernels = (n_tokens == 1u);
-#else
-        const int use_decode_kernels = 0;
-#endif
-#if UOCR_METAL_ENABLE_MOE_ROUTED_GATE_UP_TILED
         const int use_tiled_routed_gate_up = use_decode_kernels;
-#else
-        const int use_tiled_routed_gate_up = 0;
-#endif
         /* Decode uses fewer routed experts (UOCR_METAL_DECODE_MOE_TOP_K) than
          * prefill (UOCR_MOE_TOP_K).  Buffers remain sized for the max top_k. */
         const uint32_t routed_top_k =
@@ -12777,57 +12283,7 @@ static int metal_run_moe_interleaved_decode_fused_combine_buffer_f16(uocr_metal_
     }
 }
 
-static int __attribute__((unused)) metal_run_moe_combine_buffer_f16(uocr_metal_context *ctx,
-                                            uocr_metal_buffer_slice routed,
-                                            uocr_metal_buffer_slice shared,
-                                            uocr_metal_buffer_slice residual,
-                                            uint32_t n_tokens,
-                                            uocr_metal_buffer_slice dst,
-                                            char *error,
-                                            size_t error_size) {
-    const uint64_t hidden_values = (uint64_t)n_tokens * (uint64_t)UOCR_HIDDEN_SIZE;
-    const uint64_t hidden_bytes = hidden_values * 2u;
-    if (ctx == NULL || n_tokens == 0u || hidden_values > UINT32_MAX || !metal_slice_valid(routed, hidden_bytes) ||
-        !metal_slice_valid(shared, hidden_bytes) || !metal_slice_valid(residual, hidden_bytes) ||
-        !metal_slice_valid(dst, hidden_bytes)) {
-        return metal_fail(error, error_size, "invalid integrated MoE combine request");
-    }
-    @autoreleasepool {
-        id<MTLComputePipelineState> pipeline = metal_get_decoder_shape_pipeline(ctx, "uocr_moe_combine_f16_to_f16", error, error_size);
-        if (pipeline == nil) {
-            return 0;
-        }
-        int owned_command_buffer = 0;
-        id<MTLCommandBuffer> cb = metal_command_buffer_for_op(ctx, &owned_command_buffer, "integrated MoE combine", error, error_size);
-        if (cb == nil) {
-            return 0;
-        }
-        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
-        if (enc == nil) {
-            return metal_fail(error, error_size, "failed to create integrated MoE combine command encoder");
-        }
-        uocr_metal_moe_combine_params params;
-        params.n_tokens = n_tokens;
-        params.hidden_size = UOCR_HIDDEN_SIZE;
-        params.has_residual = 1u;
-        params.reserved = 0u;
-        NSUInteger threads = pipeline.threadExecutionWidth;
-        if (threads == 0u) threads = 1u;
-        if (threads > 256u) threads = 256u;
-        [enc setComputePipelineState:pipeline];
-        [enc setBuffer:routed.buffer offset:routed.offset atIndex:0u];
-        [enc setBuffer:shared.buffer offset:shared.offset atIndex:1u];
-        const NSUInteger dispatch_values = (NSUInteger)((hidden_values + UOCR_METAL_HALF4_WIDTH - 1u) /
-                                                        UOCR_METAL_HALF4_WIDTH);
-        [enc setBuffer:residual.buffer offset:residual.offset atIndex:2u];
-        [enc setBuffer:dst.buffer offset:dst.offset atIndex:3u];
-        [enc setBytes:&params length:sizeof(params) atIndex:4u];
-        [enc dispatchThreads:MTLSizeMake(dispatch_values, 1u, 1u)
-       threadsPerThreadgroup:MTLSizeMake(threads, 1u, 1u)];
-        [enc endEncoding];
-        return metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, "integrated MoE combine", error, error_size);
-    }
-}
+
 
 static int metal_run_decoder_decode_one_f16(uocr_metal_context *ctx,
                                             uint32_t slot,
@@ -13071,7 +12527,6 @@ static int metal_run_decoder_decode_one_f16(uocr_metal_context *ctx,
             if (!metal_moe_intermediate_slice(ctx, slot, routed_mid_bytes, &mid)) {
                 return metal_fail(error, error_size, "integrated decode MoE routed intermediate slice is invalid");
             }
-#if UOCR_METAL_ENABLE_MOE_FUSED_DOWN_COMBINE
             RUN_DECODE_TIMED("metal.decode.moe_routed_experts",
                              metal_run_moe_interleaved_decode_fused_combine_buffer_f16(ctx,
                                                                                        norm,
@@ -13086,24 +12541,6 @@ static int metal_run_decoder_decode_one_f16(uocr_metal_context *ctx,
                                                                                        error,
                                                                                        error_size));
             DECODE_OP_CHECKPOINT("moe_routed");
-#else
-            RUN_DECODE_TIMED("metal.decode.moe_routed_experts",
-                             metal_run_moe_interleaved_buffer_f16(ctx,
-                                                                  norm,
-                                                                  top_ids,
-                                                                  top_weights,
-                                                                  expert_slab,
-                                                                  slot,
-                                                                  1u,
-                                                                  mid,
-                                                                  current,
-                                                                  error,
-                                                                  error_size));
-            DECODE_OP_CHECKPOINT("moe_routed");
-            RUN_DECODE_TIMED("metal.decode.moe_combine",
-                             metal_run_moe_combine_buffer_f16(ctx, current, v, q, 1u, output, error, error_size));
-            DECODE_OP_CHECKPOINT("moe_combine");
-#endif
         }
 
         current = output;
@@ -13598,14 +13035,6 @@ static int metal_context_generate_f16_impl(uocr_metal_context *ctx,
         }
     }
 
-    const uint64_t pipeline_prewarm_start_ns = uocr_profile_now_ns();
-    if (!metal_prewarm_integrated_decoder_pipelines(ctx, error, error_size)) {
-        char detail[512];
-        (void)snprintf(detail, sizeof(detail), "%s", (error != NULL && error[0] != '\0') ? error : "unknown error");
-        return metal_fail(error, error_size, "failed to prepare integrated Metal fp16 decoder pipelines: %s", detail);
-    }
-    metal_profile_add_event_now(ctx, "metal.pipeline_prewarm", pipeline_prewarm_start_ns);
-
     if (!metal_prebuild_mps_runtime_workspace_ndarrays(ctx, request->n_tokens, error, error_size)) {
         return 0;
     }
@@ -14017,7 +13446,6 @@ int uocr_metal_context_generate_f16(uocr_metal_context *ctx,
                                     uocr_metal_decoder_result_f16 *result,
                                     char *error,
                                     size_t error_size) {
-    metal_public_mps_large_gemm_require_begin(ctx);
     const int ok = metal_context_generate_f16_impl(ctx,
                                                   request,
                                                   nil,
@@ -14025,7 +13453,6 @@ int uocr_metal_context_generate_f16(uocr_metal_context *ctx,
                                                   result,
                                                   error,
                                                   error_size);
-    metal_public_mps_large_gemm_require_end(ctx);
     return ok;
 }
 
@@ -14176,7 +13603,6 @@ int uocr_metal_context_generate_image_f16(uocr_metal_context *ctx,
                                           uocr_metal_decoder_result_f16 *result,
                                           char *error,
                                           size_t error_size) {
-    metal_public_mps_large_gemm_require_begin(ctx);
     const int ok = metal_context_generate_image_f16_impl(ctx,
                                                         request,
                                                         max_views_per_chunk,
@@ -14186,7 +13612,6 @@ int uocr_metal_context_generate_image_f16(uocr_metal_context *ctx,
                                                         NULL,
                                                         error,
                                                         error_size);
-    metal_public_mps_large_gemm_require_end(ctx);
     return ok;
 }
 
@@ -14202,7 +13627,6 @@ int uocr_metal_context_generate_image_f16_deferred_runtime(uocr_metal_context *c
     if (prepare_runtime == NULL) {
         return metal_fail(error, error_size, "Metal deferred image generation requires a runtime preparation callback");
     }
-    metal_public_mps_large_gemm_require_begin(ctx);
     const int ok = metal_context_generate_image_f16_impl(ctx,
                                                         request,
                                                         max_views_per_chunk,
@@ -14212,7 +13636,6 @@ int uocr_metal_context_generate_image_f16_deferred_runtime(uocr_metal_context *c
                                                         prepare_user,
                                                         error,
                                                         error_size);
-    metal_public_mps_large_gemm_require_end(ctx);
     return ok;
 }
 
@@ -16077,8 +15500,7 @@ int uocr_metal_context_diagnostic_sam_qkv_f16(uocr_metal_context *ctx,
         metal_zero_buffer_range(k_dst, k_offset, (NSUInteger)output_bytes);
         metal_zero_buffer_range(v_dst, v_offset, (NSUInteger)output_bytes);
 
-        if (output_type == UOCR_METAL_DENSE_OUTPUT_F16 &&
-            metal_mps_matmul_nt_f16_should_use(n_rows, UOCR_SAM_HIDDEN_SIZE, UOCR_SAM_HIDDEN_SIZE)) {
+        if (output_type == UOCR_METAL_DENSE_OUTPUT_F16) {
             uocr_metal_buffer_slice src_slice = { src, src_offset };
             uocr_metal_buffer_slice weight_slice = { weight, weight_offset };
             uocr_metal_buffer_slice bias_slice = { bias, bias_offset };
@@ -16117,23 +15539,6 @@ int uocr_metal_context_diagnostic_sam_qkv_f16(uocr_metal_context *ctx,
             metal_clear_error(error, error_size);
             return 1;
         }
-        if (output_type == UOCR_METAL_DENSE_OUTPUT_F16 &&
-            !metal_public_mps_matmul_fallback_allowed(ctx,
-                                                      n_rows,
-                                                      UOCR_SAM_HIDDEN_SIZE,
-                                                      UOCR_SAM_HIDDEN_SIZE,
-                                                      "Metal SAM QKV",
-                                                      error,
-                                                      error_size)) {
-            [v_dst release];
-            [k_dst release];
-            [q_dst release];
-            [bias release];
-            [weight release];
-            [src release];
-            return 0;
-        }
-
         id<MTLCommandBuffer> cb = metal_new_command_buffer(ctx);
         if (cb == nil) {
             [v_dst release];
@@ -17917,8 +17322,7 @@ int uocr_metal_context_diagnostic_clip_qkv_f16(uocr_metal_context *ctx,
         metal_zero_buffer_range(k_dst, k_offset, (NSUInteger)output_bytes);
         metal_zero_buffer_range(v_dst, v_offset, (NSUInteger)output_bytes);
 
-        if (output_type == UOCR_METAL_DENSE_OUTPUT_F16 &&
-            metal_mps_matmul_nt_f16_should_use(token_count, UOCR_CLIP_HIDDEN_SIZE, UOCR_CLIP_HIDDEN_SIZE)) {
+        if (output_type == UOCR_METAL_DENSE_OUTPUT_F16) {
             uocr_metal_buffer_slice src_slice = { src, src_offset };
             uocr_metal_buffer_slice weight_slice = { weight, weight_offset };
             uocr_metal_buffer_slice bias_slice = { bias, bias_offset };
@@ -17946,18 +17350,6 @@ int uocr_metal_context_diagnostic_clip_qkv_f16(uocr_metal_context *ctx,
             result = 1;
             goto cleanup_clip_qkv;
         }
-        if (output_type == UOCR_METAL_DENSE_OUTPUT_F16 &&
-            !metal_public_mps_matmul_fallback_allowed(ctx,
-                                                      token_count,
-                                                      UOCR_CLIP_HIDDEN_SIZE,
-                                                      UOCR_CLIP_HIDDEN_SIZE,
-                                                      "Metal CLIP QKV",
-                                                      error,
-                                                      error_size)) {
-            result = 0;
-            goto cleanup_clip_qkv;
-        }
-
         uocr_metal_dense_params params;
         params.input_rows = token_count;
         params.in_features = UOCR_CLIP_HIDDEN_SIZE;
@@ -21225,43 +20617,7 @@ static int metal_context_sam_mlp_workspace_f16(uocr_metal_context *ctx,
         return 0;
     }
 
-    const int use_mps_lin1 = metal_mps_matmul_nt_f16_should_use(n_rows,
-                                                                UOCR_SAM_HIDDEN_SIZE,
-                                                                UOCR_SAM_MLP_INTERMEDIATE);
-    const int use_mps_lin2 = metal_mps_matmul_nt_f16_should_use(n_rows,
-                                                                UOCR_SAM_MLP_INTERMEDIATE,
-                                                                UOCR_SAM_HIDDEN_SIZE);
-    if (!use_mps_lin1 || !use_mps_lin2) {
-        if ((!use_mps_lin1 &&
-             !metal_public_mps_matmul_fallback_allowed(ctx,
-                                                       n_rows,
-                                                       UOCR_SAM_HIDDEN_SIZE,
-                                                       UOCR_SAM_MLP_INTERMEDIATE,
-                                                       "Metal SAM MLP lin1",
-                                                       error,
-                                                       error_size)) ||
-            (!use_mps_lin2 &&
-             !metal_public_mps_matmul_fallback_allowed(ctx,
-                                                       n_rows,
-                                                       UOCR_SAM_MLP_INTERMEDIATE,
-                                                       UOCR_SAM_HIDDEN_SIZE,
-                                                       "Metal SAM MLP lin2",
-                                                       error,
-                                                       error_size))) {
-            return 0;
-        }
-        return uocr_metal_context_diagnostic_sam_mlp_f16(ctx,
-                                              input.f16,
-                                              block->mlp_lin1_weight_f16,
-                                              block->mlp_lin1_bias_f16,
-                                              block->mlp_lin2_weight_f16,
-                                              block->mlp_lin2_bias_f16,
-                                              n_rows,
-                                              UOCR_METAL_DENSE_OUTPUT_F16,
-                                              out.f16,
-                                              error,
-                                              error_size);
-    }
+
 
     int result = 0;
     @autoreleasepool {
@@ -22417,8 +21773,7 @@ int uocr_metal_context_diagnostic_sam_attention_project_residual_f16(uocr_metal_
         }
         dst.label = @"uocr_sam_attention_project_residual_output";
 
-        if (output_type == UOCR_METAL_DENSE_OUTPUT_F16 &&
-            metal_mps_matmul_nt_f16_should_use(n_rows, UOCR_SAM_HIDDEN_SIZE, UOCR_SAM_HIDDEN_SIZE)) {
+        if (output_type == UOCR_METAL_DENSE_OUTPUT_F16) {
             uocr_metal_buffer_slice src_slice = { src, src_offset };
             uocr_metal_buffer_slice weight_slice = { weight, weight_offset };
             uocr_metal_buffer_slice bias_slice = { bias, bias_offset };
@@ -22457,18 +21812,6 @@ int uocr_metal_context_diagnostic_sam_attention_project_residual_f16(uocr_metal_
             result = 1;
             goto cleanup_attention_residual;
         }
-        if (output_type == UOCR_METAL_DENSE_OUTPUT_F16 &&
-            !metal_public_mps_matmul_fallback_allowed(ctx,
-                                                      n_rows,
-                                                      UOCR_SAM_HIDDEN_SIZE,
-                                                      UOCR_SAM_HIDDEN_SIZE,
-                                                      "Metal SAM attention projection",
-                                                      error,
-                                                      error_size)) {
-            result = 0;
-            goto cleanup_attention_residual;
-        }
-
         metal_zero_buffer_range(dst, dst_offset, (NSUInteger)output_bytes);
 
         cb = metal_new_command_buffer(ctx);
@@ -22895,8 +22238,7 @@ int uocr_metal_context_lm_head_f16(uocr_metal_context *ctx,
         }
         dst.label = @"uocr_lm_head_logits_f32";
 
-        const int use_mps_lm_head = metal_mps_matmul_nt_f16_should_use(n_rows, UOCR_HIDDEN_SIZE, UOCR_VOCAB_SIZE);
-        if (use_mps_lm_head) {
+        {
             uocr_metal_buffer_slice src_slice = { src, 0u };
             uocr_metal_buffer_slice weight_slice = { lm_head_weight, lm_head_offset };
             uocr_metal_buffer_slice dst_slice = { dst, 0u };
@@ -22916,73 +22258,6 @@ int uocr_metal_context_lm_head_f16(uocr_metal_context *ctx,
                 return 0;
             }
             metal_profile_add_event_now(ctx, "metal.lm_head.mps_matmul", lm_mps_start_ns);
-        } else {
-            if (!metal_public_mps_matmul_fallback_allowed(ctx,
-                                                          n_rows,
-                                                          UOCR_HIDDEN_SIZE,
-                                                          UOCR_VOCAB_SIZE,
-                                                          "Metal LM-head logits",
-                                                          error,
-                                                          error_size)) {
-                [dst release];
-                [src release];
-                return 0;
-            }
-            id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, "uocr_dense_f16_to_f32", error, error_size);
-            if (pipeline == nil) {
-                [dst release];
-                [src release];
-                return 0;
-            }
-            memset([dst contents], 0, (size_t)output_bytes);
-
-            id<MTLCommandBuffer> cb = metal_new_command_buffer(ctx);
-            if (cb == nil) {
-                [dst release];
-                [src release];
-                return metal_fail(error, error_size, "failed to create Metal LM-head command buffer");
-            }
-            cb.label = @"uocr_lm_head_command_buffer";
-
-            id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
-            if (enc == nil) {
-                [dst release];
-                [src release];
-                return metal_fail(error, error_size, "failed to create Metal LM-head command encoder");
-            }
-
-            uocr_metal_dense_params params;
-            params.input_rows = n_rows;
-            params.in_features = UOCR_HIDDEN_SIZE;
-            params.out_features = UOCR_VOCAB_SIZE;
-            params.has_bias = 0u;
-
-            const NSUInteger threads_per_group = metal_power2_threadgroup_width(256u, pipeline.maxTotalThreadsPerThreadgroup);
-            const uint64_t threadgroup_bytes = (uint64_t)threads_per_group * (uint64_t)sizeof(float);
-            if (threadgroup_bytes > (uint64_t)ctx->device.maxThreadgroupMemoryLength) {
-                [dst release];
-                [src release];
-                return metal_fail(error, error_size, "Metal LM-head threadgroup memory exceeds device limit");
-            }
-
-            [enc setComputePipelineState:pipeline];
-            [enc setBuffer:src offset:0u atIndex:0u];
-            [enc setBuffer:lm_head_weight offset:lm_head_offset atIndex:1u];
-            [enc setBuffer:lm_head_weight offset:lm_head_offset atIndex:2u];
-            [enc setBuffer:dst offset:0u atIndex:3u];
-            [enc setBytes:&params length:sizeof(params) atIndex:4u];
-            [enc setThreadgroupMemoryLength:threads_per_group * sizeof(float) atIndex:0u];
-            [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)output_values, 1u, 1u)
-                 threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1u, 1u)];
-            [enc endEncoding];
-
-            UOCR_METAL_COMMIT_AND_WAIT_PROFILED(ctx, cb);
-            if (cb.status == MTLCommandBufferStatusError) {
-                NSString *description = cb.error != nil ? [cb.error localizedDescription] : @"unknown command-buffer error";
-                [dst release];
-                [src release];
-                return metal_fail(error, error_size, "Metal LM-head command failed: %s", [description UTF8String]);
-            }
         }
 
         memcpy(logits_out_f32, [dst contents], (size_t)output_bytes);
@@ -23623,8 +22898,7 @@ int uocr_metal_context_diagnostic_dense_f16(uocr_metal_context *ctx,
         }
         dst.label = @"uocr_dense_output";
 
-        if (output_type == UOCR_METAL_DENSE_OUTPUT_F16 &&
-            metal_mps_matmul_nt_f16_should_use(input_rows, in_features, out_features)) {
+        if (output_type == UOCR_METAL_DENSE_OUTPUT_F16) {
             uocr_metal_buffer_slice src_slice = { src, src_offset };
             uocr_metal_buffer_slice weight_slice = { weight, weight_offset };
             uocr_metal_buffer_slice dst_slice = { dst, dst_offset };
@@ -23659,21 +22933,6 @@ int uocr_metal_context_diagnostic_dense_f16(uocr_metal_context *ctx,
             [src release];
             return ok;
         }
-        if (output_type == UOCR_METAL_DENSE_OUTPUT_F16 &&
-            !metal_public_mps_matmul_fallback_allowed(ctx,
-                                                      input_rows,
-                                                      in_features,
-                                                      out_features,
-                                                      "Metal dense",
-                                                      error,
-                                                      error_size)) {
-            [dst release];
-            [bias release];
-            [weight release];
-            [src release];
-            return 0;
-        }
-
         metal_zero_buffer_range(dst, dst_offset, (NSUInteger)output_bytes);
 
         id<MTLCommandBuffer> cb = metal_new_command_buffer(ctx);
@@ -24138,12 +23397,8 @@ static int metal_context_swiglu_f16(uocr_metal_context *ctx,
     }
 
     @autoreleasepool {
-#if UOCR_METAL_ENABLE_MOE_SHARED_GATE_UP_TILED
         const int use_tiled_shared_gate_up = n_tokens == 1u && intermediate_size == UOCR_MOE_SHARED_INTERMEDIATE &&
                                              residual_f16_or_null == NULL;
-#else
-        const int use_tiled_shared_gate_up = 0;
-#endif
         id<MTLComputePipelineState> gate_up_pipeline = metal_get_decoder_shape_pipeline(ctx,
                                                                                          use_tiled_shared_gate_up ?
                                                                                              "uocr_dense_swiglu_shared_gate_up_tile4_f16" :
@@ -24439,11 +23694,7 @@ int uocr_metal_context_diagnostic_moe_router_f16(uocr_metal_context *ctx,
     }
 
     @autoreleasepool {
-#if UOCR_METAL_ENABLE_MOE_FUSED_ROUTER
         const int use_fused_decode_router = n_tokens == 1u && logits_out_f32_or_null == NULL && probs_out_f32_or_null == NULL;
-#else
-        const int use_fused_decode_router = 0;
-#endif
         id<MTLComputePipelineState> fused_pipeline = use_fused_decode_router ?
             metal_get_decoder_shape_pipeline(ctx,
                                              "uocr_moe_router_decode_fused_f16",
@@ -25237,11 +24488,7 @@ int uocr_metal_context_diagnostic_moe_interleaved_experts_combine_f16(uocr_metal
 
     @autoreleasepool {
         const int use_decode_kernels = (n_tokens == 1u);
-#if UOCR_METAL_ENABLE_MOE_ROUTED_GATE_UP_TILED
         const int use_tiled_routed_gate_up = use_decode_kernels;
-#else
-        const int use_tiled_routed_gate_up = 0;
-#endif
         id<MTLComputePipelineState> gate_up_pipeline = nil;
         id<MTLComputePipelineState> down_combine_pipeline = nil;
         if (use_decode_kernels) {
