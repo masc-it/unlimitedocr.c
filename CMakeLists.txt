@@ -20,6 +20,7 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
 
 set(UOCR_ENABLE_METAL "AUTO" CACHE STRING "Enable Metal backend: AUTO, ON, or OFF")
 set_property(CACHE UOCR_ENABLE_METAL PROPERTY STRINGS AUTO ON OFF)
+option(UOCR_ENABLE_PROFILING "Enable profiling instrumentation in the Metal backend" OFF)
 option(UOCR_ENABLE_CUDA "Enable CUDA backend (placeholder; not implemented)" OFF)
 option(UOCR_ENABLE_CPU_REF "Enable CPU reference backend" ON)
 option(UOCR_BUILD_TOOLS "Build native tools" ON)
@@ -106,7 +107,9 @@ target_include_directories(uocr_core
 target_compile_definitions(uocr_core
     PUBLIC
         UOCR_HAVE_CPU_REF=$<BOOL:${UOCR_ENABLE_CPU_REF}>
-        UOCR_HAVE_METAL=$<BOOL:${UOCR_METAL_ENABLED}>)
+        UOCR_HAVE_METAL=$<BOOL:${UOCR_METAL_ENABLED}>
+    PRIVATE
+        UOCR_ENABLE_PROFILING=$<BOOL:${UOCR_ENABLE_PROFILING}>)
 set_target_properties(uocr_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 uocr_apply_common_warnings(uocr_core)
 uocr_apply_sanitizers(uocr_core)
@@ -155,6 +158,7 @@ if(UOCR_METAL_ENABLED)
             "${CMAKE_CURRENT_SOURCE_DIR}/src")
     target_compile_definitions(uocr_metal
         PRIVATE
+            UOCR_ENABLE_PROFILING=$<BOOL:${UOCR_ENABLE_PROFILING}>
             UOCR_METAL_RUNTIME_COMPILE=$<BOOL:${UOCR_METAL_RUNTIME_COMPILE}>
             UOCR_METAL_ENABLE_MPP_TENSOROPS=${UOCR_METAL_ENABLE_MPP_TENSOROPS_VALUE}
             UOCR_METAL_MATH_MODE=${UOCR_METAL_MATH_MODE_VALUE}
@@ -181,7 +185,8 @@ target_include_directories(unlimitedocr
         "${CMAKE_CURRENT_SOURCE_DIR}/src")
 target_compile_definitions(unlimitedocr
     PRIVATE
-        UOCR_BUILDING_SHARED=1)
+        UOCR_BUILDING_SHARED=1
+        UOCR_ENABLE_PROFILING=$<BOOL:${UOCR_ENABLE_PROFILING}>)
 target_link_libraries(unlimitedocr PRIVATE uocr_core)
 if(UOCR_METAL_ENABLED)
     target_link_libraries(unlimitedocr PRIVATE uocr_metal)

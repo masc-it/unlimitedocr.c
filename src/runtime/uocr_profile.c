@@ -11,6 +11,8 @@
 #include <windows.h>
 #endif
 
+#if UOCR_ENABLE_PROFILING
+
 static int profile_truthy_env_value(const char *value) {
     if (value == NULL || value[0] == '\0') {
         return 0;
@@ -218,3 +220,5 @@ void uocr_profile_add_metal_transient_retain_object(uocr_profile_state *profile)
         profile->report.metal_transient_retain_object_count += 1u;
     }
 }
+
+#endif /* UOCR_ENABLE_PROFILING */

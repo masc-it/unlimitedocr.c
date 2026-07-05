@@ -589,7 +589,7 @@ def main() -> int:
         for name, value in memory_payload["category_peak_bytes"].items():
             if value:
                 print(f"    {name:24s} {bytes_human(value)}")
-    if profile_payload is not None:
+    if profile_payload is not None and profile_payload.get("enabled"):
         print("\nTop native profile events:")
         for event in profile_payload["events"]:
             print(
