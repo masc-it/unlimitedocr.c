@@ -11,4 +11,4 @@ wheels/
 .venv
 data/
 data.tmp
-.env
+.envTesting/

@@ -396,6 +396,8 @@ struct uocr_metal_context {
     uocr_metal_decoder_binding_cache decoder_bindings;
     uocr_metal_decoder_layer_fast_bindings decoder_fast_bindings[UOCR_DECODER_LAYERS];
     int decoder_fast_bindings_valid;
+    uocr_metal_buffer_slice decoder_fast_expert_slabs[UOCR_DECODER_LAYERS];
+    int decoder_fast_expert_slabs_valid;
     char decoder_binding_error[256];
     uocr_metal_vision_binding_cache vision_bindings;
     uocr_metal_vision_weights_f16 vision_weights;
@@ -2541,6 +2543,7 @@ static void metal_invalidate_decoder_binding_cache(uocr_metal_context *ctx, cons
         return;
     }
     ctx->decoder_fast_bindings_valid = 0;
+    ctx->decoder_fast_expert_slabs_valid = 0;
     metal_decoder_binding_cache_init(&ctx->decoder_bindings);
     if (reason == NULL || reason[0] == '\0') {
         reason = "decoder tensor bindings are not validated";
@@ -3196,6 +3199,20 @@ static int metal_refresh_decoder_binding_cache(uocr_metal_context *ctx,
         }
     }
     ctx->decoder_fast_bindings_valid = 1;
+
+    /* Precompute per-layer expert slab slices so the decode and
+     * prefill loops can skip metal_expert_interleaved_slab_for_layer().
+     * Layer 0 has no MoE, so its entry is zero-initialised and never
+     * accessed (the decode loop branches on layer == 0u). */
+    for (uint32_t layer = 1u; layer < UOCR_DECODER_LAYERS; ++layer) {
+        const uocr_metal_decoder_expert_slab_cache *slab =
+            &ctx->decoder_bindings.layers[layer].expert_slab;
+        uocr_metal_buffer_slice *fast =
+            &ctx->decoder_fast_expert_slabs[layer];
+        fast->buffer = slab->buffer;
+        fast->offset = slab->offset;
+    }
+    ctx->decoder_fast_expert_slabs_valid = 1;
 
     return 1;
 }
@@ -13777,8 +13794,7 @@ static int metal_run_decoder_decode_one_f16(uocr_metal_context *ctx,
                                                                error,
                                                                error_size));
             DECODE_OP_CHECKPOINT("moe_shared");
-            RUN_DECODE_TIMED("metal.decode.moe_expert_slab",
-                             metal_expert_interleaved_slab_for_layer(ctx, layer, &expert_slab, error, error_size));
+            expert_slab = ctx->decoder_fast_expert_slabs[layer];
             if (!metal_moe_intermediate_slice(ctx, slot, routed_mid_bytes, &mid)) {
                 return metal_fail(error, error_size, "integrated decode MoE routed intermediate slice is invalid");
             }
@@ -14133,11 +14149,7 @@ static int metal_run_decoder_prefill_text_f16(uocr_metal_context *ctx,
                                                               "integrated MoE shared experts",
                                                               error,
                                                               error_size));
-            const uint64_t expert_slab_start_ns = uocr_profile_now_ns();
-            if (!metal_expert_interleaved_slab_for_layer(ctx, layer, &expert_slab, error, error_size)) {
-                return 0;
-            }
-            metal_profile_add_event_now(ctx, "metal.prefill.moe_expert_slab", expert_slab_start_ns);
+            expert_slab = ctx->decoder_fast_expert_slabs[layer];
             if (!metal_moe_intermediate_slice(ctx, slot, routed_mid_bytes, &mid)) {
                 return 0;
             }
