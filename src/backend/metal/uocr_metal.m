@@ -12124,18 +12124,21 @@ static int metal_run_decoder_decode_one_f16(uocr_metal_context *ctx,
                                                                 error,
                                                                 error_size));
         DECODE_OP_CHECKPOINT("attn_qkv");
-        RUN_DECODE_TIMED("metal.decode.rope_kv_write",
-                         metal_run_decode_rope_kv_write_one_f16(ctx,
-                                                                q,
-                                                                k,
-                                                                v,
-                                                                layer,
-                                                                slot,
-                                                                prompt_length,
-                                                                position,
-                                                                error,
-                                                                error_size));
-        DECODE_OP_CHECKPOINT("rope_kv_write");
+        RUN_DECODE_TIMED("metal.decode.rope",
+                         metal_run_rope_qk_buffer_f16(ctx, q, k, 1u, position, error, error_size));
+        DECODE_OP_CHECKPOINT("rope");
+        RUN_DECODE_TIMED("metal.decode.kv_write",
+                         metal_run_kv_write_buffer_f16(ctx,
+                                                       k,
+                                                       v,
+                                                       1u,
+                                                       layer,
+                                                       slot,
+                                                       prompt_length,
+                                                       position,
+                                                       error,
+                                                       error_size));
+        DECODE_OP_CHECKPOINT("kv_write");
         RUN_DECODE_TIMED("metal.decode.attention",
                          metal_run_decode_attention_buffer_f16(ctx,
                                                                q,
