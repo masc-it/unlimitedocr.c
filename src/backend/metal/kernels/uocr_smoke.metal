@@ -5572,6 +5572,71 @@ static inline void uocr_decode_attention_flash_impl(device const half *q_src,
     uocr_decode_attention_flash_impl(q_src, k_cache, v_cache, dst, params, head, lane, simd_width);
 }
 
+struct UocrDecodeRopeKvWriteParams {
+    uint heads;
+    uint head_dim;
+    uint position;
+    float freq_scale;
+    uint batch_slots;
+    uint cache_token_capacity;
+    uint layer;
+    uint slot;
+    uint prompt_length;
+    uint ring_window;
+    uint reserved[2];
+};
+
+[[max_total_threads_per_threadgroup(256)]] kernel void uocr_decode_rope_kv_write_one_f16(
+                                    device half *q_dst [[buffer(0)]],
+                                    device const half *k_src [[buffer(1)]],
+                                    device const half *v_src [[buffer(2)]],
+                                    device half *k_cache [[buffer(3)]],
+                                    device half *v_cache [[buffer(4)]],
+                                    constant UocrDecodeRopeKvWriteParams &params [[buffer(5)]],
+                                    uint gid [[thread_position_in_grid]]) {
+    const uint heads = uocr_fc_attention_heads_or(params.heads);
+    const uint head_dim = uocr_fc_head_dim_or(params.head_dim);
+    const float freq_scale = uocr_fc_rope_freq_scale_or(params.freq_scale);
+    const uint ring_window = uocr_fc_ring_window_or(params.ring_window);
+    const uint half_dim = head_dim >> 1u;
+    const uint total = heads * half_dim;
+    if (gid >= total) {
+        return;
+    }
+    const uint head = gid / half_dim;
+    const uint pair = gid % half_dim;
+    const uint a = pair;
+    const uint b = pair + half_dim;
+    const float angle = float(params.position) * exp2(float(pair) * freq_scale);
+    const float c = cos(angle);
+    const float s = sin(angle);
+
+    /* RoPE Q in-place */
+    const ulong base = (ulong(head)) * ulong(head_dim);
+    const float q0 = float(q_dst[base + ulong(a)]);
+    const float q1 = float(q_dst[base + ulong(b)]);
+    q_dst[base + ulong(a)] = half(q0 * c - q1 * s);
+    q_dst[base + ulong(b)] = half(q0 * s + q1 * c);
+
+    /* RoPE K and write to cache */
+    const float k0 = float(k_src[base + ulong(a)]);
+    const float k1 = float(k_src[base + ulong(b)]);
+    const uint position = params.position;
+    uint cache_token = position;
+    if (position >= params.prompt_length) {
+        cache_token = params.prompt_length + ((position - params.prompt_length) % ring_window);
+    }
+    if (cache_token < params.cache_token_capacity) {
+        const ulong dst_index = (((ulong(params.layer) * ulong(params.batch_slots) + ulong(params.slot)) *
+                                  ulong(params.cache_token_capacity) + ulong(cache_token)) *
+                                 ulong(heads) + ulong(head)) * ulong(head_dim);
+        k_cache[dst_index + ulong(a)] = half(k0 * c - k1 * s);
+        k_cache[dst_index + ulong(b)] = half(k0 * s + k1 * c);
+        v_cache[dst_index + ulong(a)] = v_src[base + ulong(a)];
+        v_cache[dst_index + ulong(b)] = v_src[base + ulong(b)];
+    }
+}
+
 struct UocrKVCacheWriteParams {
     uint n_tokens;
     uint batch_slots;

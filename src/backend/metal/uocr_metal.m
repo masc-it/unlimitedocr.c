@@ -1496,6 +1496,20 @@ typedef struct uocr_metal_decode_attention_params {
 _Static_assert(sizeof(uocr_metal_decode_attention_params) == 48u,
                "uocr_metal_decode_attention_params ABI mismatch");
 
+typedef struct uocr_metal_decode_rope_kv_write_params {
+    uint32_t heads;
+    uint32_t head_dim;
+    uint32_t position;
+    float freq_scale;
+    uint32_t batch_slots;
+    uint32_t cache_token_capacity;
+    uint32_t layer;
+    uint32_t slot;
+    uint32_t prompt_length;
+    uint32_t ring_window;
+    uint32_t reserved[2];
+} uocr_metal_decode_rope_kv_write_params;
+
 typedef struct uocr_metal_kv_cache_write_params {
     uint32_t n_tokens;
     uint32_t batch_slots;
@@ -11494,6 +11508,77 @@ static int metal_run_decoder_decode_chunk_f16(
 }
 
 
+static int metal_run_decode_rope_kv_write_one_f16(uocr_metal_context *ctx,
+                                                   uocr_metal_buffer_slice q,
+                                                   uocr_metal_buffer_slice k,
+                                                   uocr_metal_buffer_slice v,
+                                                   uint32_t layer,
+                                                   uint32_t slot,
+                                                   uint32_t prompt_length,
+                                                   uint32_t position,
+                                                   char *error,
+                                                   size_t error_size) {
+    const uint64_t hidden_bytes = (uint64_t)UOCR_HIDDEN_SIZE * 2u;
+    if (ctx == NULL || !ctx->has_kv_cache_layout || layer >= UOCR_DECODER_LAYERS ||
+        slot >= ctx->kv_cache_layout.batch_slots || prompt_length == 0u ||
+        prompt_length > ctx->kv_cache_layout.prompt_token_capacity ||
+        !metal_slice_valid(q, hidden_bytes) || !metal_slice_valid(k, hidden_bytes) ||
+        !metal_slice_valid(v, hidden_bytes)) {
+        return metal_fail(error, error_size, "invalid decode RoPE+KV-write request");
+    }
+    if (position > UOCR_MAX_POSITIONS) {
+        return metal_fail(error, error_size, "decode RoPE+KV-write position exceeds max");
+    }
+    id<MTLBuffer> kv = ctx->runtime_arenas[UOCR_METAL_ARENA_KV_CACHE].buffer;
+    if (!metal_buffer_range_valid(kv, (NSUInteger)ctx->kv_cache_layout.k_offset_bytes, ctx->kv_cache_layout.tensor_bytes) ||
+        !metal_buffer_range_valid(kv, (NSUInteger)ctx->kv_cache_layout.v_offset_bytes, ctx->kv_cache_layout.tensor_bytes)) {
+        return metal_fail(error, error_size, "decode RoPE+KV-write KV cache arena is invalid");
+    }
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline = metal_get_decoder_shape_pipeline(ctx, "uocr_decode_rope_kv_write_one_f16", error, error_size);
+        if (pipeline == nil) {
+            return 0;
+        }
+        NSUInteger threads = pipeline.threadExecutionWidth;
+        if (threads == 0u) threads = 1u;
+        if (threads > 256u) threads = 256u;
+        int owned_command_buffer = 0;
+        id<MTLCommandBuffer> cb = metal_command_buffer_for_op(ctx, &owned_command_buffer, "decode RoPE+KV-write", error, error_size);
+        if (cb == nil) {
+            return 0;
+        }
+        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
+        if (enc == nil) {
+            return metal_fail(error, error_size, "failed to create decode RoPE+KV-write command encoder");
+        }
+        uocr_metal_decode_rope_kv_write_params params;
+        params.heads = UOCR_ATTENTION_HEADS;
+        params.head_dim = UOCR_HEAD_DIM;
+        params.position = position;
+        params.freq_scale = -2.0f * log2f((float)UOCR_ROPE_THETA) / (float)UOCR_HEAD_DIM;
+        params.batch_slots = ctx->kv_cache_layout.batch_slots;
+        params.cache_token_capacity = ctx->kv_cache_layout.cache_token_capacity;
+        params.layer = layer;
+        params.slot = slot;
+        params.prompt_length = prompt_length;
+        params.ring_window = UOCR_GENERATED_RING_WINDOW;
+        params.reserved[0] = 0u;
+        params.reserved[1] = 0u;
+        [enc setComputePipelineState:pipeline];
+        [enc setBuffer:q.buffer offset:q.offset atIndex:0u];
+        [enc setBuffer:k.buffer offset:k.offset atIndex:1u];
+        [enc setBuffer:v.buffer offset:v.offset atIndex:2u];
+        [enc setBuffer:kv offset:(NSUInteger)ctx->kv_cache_layout.k_offset_bytes atIndex:3u];
+        [enc setBuffer:kv offset:(NSUInteger)ctx->kv_cache_layout.v_offset_bytes atIndex:4u];
+        [enc setBytes:&params length:sizeof(params) atIndex:5u];
+        const NSUInteger total_threads = (NSUInteger)UOCR_ATTENTION_HEADS * (NSUInteger)(UOCR_HEAD_DIM / 2u);
+        [enc dispatchThreads:MTLSizeMake(total_threads, 1u, 1u)
+       threadsPerThreadgroup:MTLSizeMake(threads, 1u, 1u)];
+        [enc endEncoding];
+        return metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, "decode RoPE+KV-write", error, error_size);
+    }
+}
+
 static int metal_run_decode_attention_qkv_one_f16(uocr_metal_context *ctx,
                                                    uocr_metal_buffer_slice src,
                                                    const uocr_metal_decoder_binding *q_weight,
@@ -12680,21 +12765,18 @@ static int metal_run_decoder_decode_one_f16(uocr_metal_context *ctx,
                                                                 error,
                                                                 error_size));
         DECODE_OP_CHECKPOINT("attn_qkv");
-        RUN_DECODE_TIMED("metal.decode.rope",
-                         metal_run_rope_qk_buffer_f16(ctx, q, k, 1u, position, error, error_size));
-        DECODE_OP_CHECKPOINT("rope");
-        RUN_DECODE_TIMED("metal.decode.kv_write",
-                         metal_run_kv_write_buffer_f16(ctx,
-                                                       k,
-                                                       v,
-                                                       1u,
-                                                       layer,
-                                                       slot,
-                                                       prompt_length,
-                                                       position,
-                                                       error,
-                                                       error_size));
-        DECODE_OP_CHECKPOINT("kv_write");
+        RUN_DECODE_TIMED("metal.decode.rope_kv_write",
+                         metal_run_decode_rope_kv_write_one_f16(ctx,
+                                                                q,
+                                                                k,
+                                                                v,
+                                                                layer,
+                                                                slot,
+                                                                prompt_length,
+                                                                position,
+                                                                error,
+                                                                error_size));
+        DECODE_OP_CHECKPOINT("rope_kv_write");
         RUN_DECODE_TIMED("metal.decode.attention",
                          metal_run_decode_attention_buffer_f16(ctx,
                                                                q,
