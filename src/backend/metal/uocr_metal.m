@@ -194,6 +194,22 @@ typedef struct uocr_metal_decoder_expert_slab_cache {
     uint64_t byte_length;
 } uocr_metal_decoder_expert_slab_cache;
 
+typedef struct uocr_metal_decoder_layer_fast_bindings {
+    const uocr_metal_decoder_binding *input_norm;
+    const uocr_metal_decoder_binding *post_attn_norm;
+    const uocr_metal_decoder_binding *q_proj;
+    const uocr_metal_decoder_binding *k_proj;
+    const uocr_metal_decoder_binding *v_proj;
+    const uocr_metal_decoder_binding *o_proj;
+    const uocr_metal_decoder_binding *dense_gate;
+    const uocr_metal_decoder_binding *dense_up;
+    const uocr_metal_decoder_binding *dense_down;
+    const uocr_metal_decoder_binding *moe_router;
+    const uocr_metal_decoder_binding *moe_shared_gate;
+    const uocr_metal_decoder_binding *moe_shared_up;
+    const uocr_metal_decoder_binding *moe_shared_down;
+} uocr_metal_decoder_layer_fast_bindings;
+
 typedef struct uocr_metal_decoder_layer_binding_cache {
     uint32_t input_norm;
     uint32_t post_attn_norm;
@@ -378,6 +394,8 @@ struct uocr_metal_context {
     uint32_t no_repeat_sequence_batch_slots;
     uint32_t no_repeat_sequence_token_capacity;
     uocr_metal_decoder_binding_cache decoder_bindings;
+    uocr_metal_decoder_layer_fast_bindings decoder_fast_bindings[UOCR_DECODER_LAYERS];
+    int decoder_fast_bindings_valid;
     char decoder_binding_error[256];
     uocr_metal_vision_binding_cache vision_bindings;
     uocr_metal_vision_weights_f16 vision_weights;
@@ -2522,6 +2540,7 @@ static void metal_invalidate_decoder_binding_cache(uocr_metal_context *ctx, cons
     if (ctx == NULL) {
         return;
     }
+    ctx->decoder_fast_bindings_valid = 0;
     metal_decoder_binding_cache_init(&ctx->decoder_bindings);
     if (reason == NULL || reason[0] == '\0') {
         reason = "decoder tensor bindings are not validated";
@@ -3142,6 +3161,42 @@ static int metal_refresh_decoder_binding_cache(uocr_metal_context *ctx,
     cache.valid = 1;
     ctx->decoder_bindings = cache;
     ctx->decoder_binding_error[0] = '\0';
+
+    /* Populate per-layer fast pointer bindings so the decode loop
+     * can skip metal_require_decoder_binding_index() for every
+     * token/layer.  Layer 0 uses dense MLP; layers 1-11 use MoE.
+     * Unused pointers are set to NULL. */
+    for (uint32_t layer = 0u; layer < UOCR_DECODER_LAYERS; ++layer) {
+        uocr_metal_decoder_layer_fast_bindings *fast =
+            &ctx->decoder_fast_bindings[layer];
+        uocr_metal_decoder_layer_binding_cache *idx =
+            &ctx->decoder_bindings.layers[layer];
+        fast->input_norm     = &ctx->decoder_bindings.tensors[idx->input_norm];
+        fast->post_attn_norm = &ctx->decoder_bindings.tensors[idx->post_attn_norm];
+        fast->q_proj         = &ctx->decoder_bindings.tensors[idx->q_proj];
+        fast->k_proj         = &ctx->decoder_bindings.tensors[idx->k_proj];
+        fast->v_proj         = &ctx->decoder_bindings.tensors[idx->v_proj];
+        fast->o_proj         = &ctx->decoder_bindings.tensors[idx->o_proj];
+        if (layer == 0u) {
+            fast->dense_gate  = &ctx->decoder_bindings.tensors[idx->dense_gate];
+            fast->dense_up    = &ctx->decoder_bindings.tensors[idx->dense_up];
+            fast->dense_down  = &ctx->decoder_bindings.tensors[idx->dense_down];
+            fast->moe_router      = NULL;
+            fast->moe_shared_gate = NULL;
+            fast->moe_shared_up   = NULL;
+            fast->moe_shared_down = NULL;
+        } else {
+            fast->dense_gate  = NULL;
+            fast->dense_up    = NULL;
+            fast->dense_down  = NULL;
+            fast->moe_router      = &ctx->decoder_bindings.tensors[idx->moe_router];
+            fast->moe_shared_gate = &ctx->decoder_bindings.tensors[idx->moe_shared_gate];
+            fast->moe_shared_up   = &ctx->decoder_bindings.tensors[idx->moe_shared_up];
+            fast->moe_shared_down = &ctx->decoder_bindings.tensors[idx->moe_shared_down];
+        }
+    }
+    ctx->decoder_fast_bindings_valid = 1;
+
     return 1;
 }
 
@@ -13568,37 +13623,14 @@ static int metal_run_decoder_decode_one_f16(uocr_metal_context *ctx,
         uocr_metal_buffer_slice output = k;
         const uint32_t output_segment = k_segment;
 
-        const uocr_metal_decoder_layer_binding_cache *layer_bindings = &ctx->decoder_bindings.layers[layer];
-        const uocr_metal_decoder_binding *input_norm = metal_require_decoder_binding_index(ctx,
-                                                                                           layer_bindings->input_norm,
-                                                                                           "decode input RMSNorm",
-                                                                                           error,
-                                                                                           error_size);
-        const uocr_metal_decoder_binding *post_norm = metal_require_decoder_binding_index(ctx,
-                                                                                          layer_bindings->post_attn_norm,
-                                                                                          "decode post-attention RMSNorm",
-                                                                                          error,
-                                                                                          error_size);
-        const uocr_metal_decoder_binding *q_weight = metal_require_decoder_binding_index(ctx,
-                                                                                         layer_bindings->q_proj,
-                                                                                         "decode attention q_proj",
-                                                                                         error,
-                                                                                         error_size);
-        const uocr_metal_decoder_binding *k_weight = metal_require_decoder_binding_index(ctx,
-                                                                                         layer_bindings->k_proj,
-                                                                                         "decode attention k_proj",
-                                                                                         error,
-                                                                                         error_size);
-        const uocr_metal_decoder_binding *v_weight = metal_require_decoder_binding_index(ctx,
-                                                                                         layer_bindings->v_proj,
-                                                                                         "decode attention v_proj",
-                                                                                         error,
-                                                                                         error_size);
-        const uocr_metal_decoder_binding *o_weight = metal_require_decoder_binding_index(ctx,
-                                                                                         layer_bindings->o_proj,
-                                                                                         "decode attention o_proj",
-                                                                                         error,
-                                                                                         error_size);
+        const uocr_metal_decoder_layer_fast_bindings *fast =
+            &ctx->decoder_fast_bindings[layer];
+        const uocr_metal_decoder_binding *input_norm = fast->input_norm;
+        const uocr_metal_decoder_binding *post_norm = fast->post_attn_norm;
+        const uocr_metal_decoder_binding *q_weight = fast->q_proj;
+        const uocr_metal_decoder_binding *k_weight = fast->k_proj;
+        const uocr_metal_decoder_binding *v_weight = fast->v_proj;
+        const uocr_metal_decoder_binding *o_weight = fast->o_proj;
         if (input_norm == NULL || post_norm == NULL || q_weight == NULL || k_weight == NULL || v_weight == NULL || o_weight == NULL) {
             return 0;
         }
@@ -13674,21 +13706,9 @@ static int metal_run_decoder_decode_one_f16(uocr_metal_context *ctx,
         DECODE_OP_CHECKPOINT("post_norm");
 
         if (layer == 0u) {
-            const uocr_metal_decoder_binding *gate = metal_require_decoder_binding_index(ctx,
-                                                                                         layer_bindings->dense_gate,
-                                                                                         "decode layer0 dense gate",
-                                                                                         error,
-                                                                                         error_size);
-            const uocr_metal_decoder_binding *up = metal_require_decoder_binding_index(ctx,
-                                                                                       layer_bindings->dense_up,
-                                                                                       "decode layer0 dense up",
-                                                                                       error,
-                                                                                       error_size);
-            const uocr_metal_decoder_binding *down = metal_require_decoder_binding_index(ctx,
-                                                                                         layer_bindings->dense_down,
-                                                                                         "decode layer0 dense down",
-                                                                                         error,
-                                                                                         error_size);
+            const uocr_metal_decoder_binding *gate = fast->dense_gate;
+            const uocr_metal_decoder_binding *up = fast->dense_up;
+            const uocr_metal_decoder_binding *down = fast->dense_down;
             const uint64_t mid_bytes = (uint64_t)UOCR_DENSE_LAYER0_INTERMEDIATE * 2u;
             uocr_metal_buffer_slice mid;
             if (gate == NULL || up == NULL || down == NULL) {
@@ -13714,26 +13734,10 @@ static int metal_run_decoder_decode_one_f16(uocr_metal_context *ctx,
                                                                error_size));
             DECODE_OP_CHECKPOINT("dense");
         } else {
-            const uocr_metal_decoder_binding *router = metal_require_decoder_binding_index(ctx,
-                                                                                           layer_bindings->moe_router,
-                                                                                           "decode MoE router",
-                                                                                           error,
-                                                                                           error_size);
-            const uocr_metal_decoder_binding *shared_gate = metal_require_decoder_binding_index(ctx,
-                                                                                                layer_bindings->moe_shared_gate,
-                                                                                                "decode MoE shared gate",
-                                                                                                error,
-                                                                                                error_size);
-            const uocr_metal_decoder_binding *shared_up = metal_require_decoder_binding_index(ctx,
-                                                                                              layer_bindings->moe_shared_up,
-                                                                                              "decode MoE shared up",
-                                                                                              error,
-                                                                                              error_size);
-            const uocr_metal_decoder_binding *shared_down = metal_require_decoder_binding_index(ctx,
-                                                                                                layer_bindings->moe_shared_down,
-                                                                                                "decode MoE shared down",
-                                                                                                error,
-                                                                                                error_size);
+            const uocr_metal_decoder_binding *router = fast->moe_router;
+            const uocr_metal_decoder_binding *shared_gate = fast->moe_shared_gate;
+            const uocr_metal_decoder_binding *shared_up = fast->moe_shared_up;
+            const uocr_metal_decoder_binding *shared_down = fast->moe_shared_down;
             uocr_metal_buffer_slice top_ids;
             uocr_metal_buffer_slice top_weights;
             uocr_metal_buffer_slice expert_slab;
