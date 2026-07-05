@@ -40,6 +40,7 @@
 #define UOCR_METAL_MPS_MATMUL_SKINNY_MIN_FLOPS 64000000ULL
 #define UOCR_METAL_MPS_MATMUL_MIN_FLOPS_ENV "UOCR_METAL_MPS_MATMUL_MIN_FLOPS"
 #define UOCR_METAL_VISION_PROFILE_DETAIL_ENV "UOCR_METAL_VISION_PROFILE_DETAIL"
+#define UOCR_METAL_DECODER_PROFILE_DETAIL_ENV "UOCR_METAL_DECODER_PROFILE_DETAIL"
 #ifndef UOCR_METAL_ENABLE_MOE_FUSED_DOWN_COMBINE
 #define UOCR_METAL_ENABLE_MOE_FUSED_DOWN_COMBINE 1
 #endif
@@ -564,6 +565,18 @@ static int metal_vision_profile_checkpoint(uocr_metal_context *ctx,
                                            int reopen_batch,
                                            char *error,
                                            size_t error_size);
+static int metal_decoder_profile_detail_level(void);
+static int metal_decoder_profile_checkpoint(uocr_metal_context *ctx,
+                                            const char *name,
+                                            int reopen_batch,
+                                            char *error,
+                                            size_t error_size);
+static int metal_decoder_profile_checkpoint_alias(uocr_metal_context *ctx,
+                                                  const char *name,
+                                                  const char *alias,
+                                                  int reopen_batch,
+                                                  char *error,
+                                                  size_t error_size);
 static int metal_wait_for_command_buffer_profiled(uocr_metal_context *ctx,
                                                   id<MTLCommandBuffer> cb,
                                                   const char *op_name,
@@ -9462,6 +9475,74 @@ static int metal_vision_profile_checkpoint(uocr_metal_context *ctx,
     return 1;
 }
 
+static int metal_decoder_profile_detail_level(void) {
+    static int cached = -1;
+    if (cached >= 0) {
+        return cached;
+    }
+    const char *env = getenv(UOCR_METAL_DECODER_PROFILE_DETAIL_ENV);
+    if (env == NULL || env[0] == '\0' || strcmp(env, "0") == 0 || strcmp(env, "false") == 0 || strcmp(env, "off") == 0) {
+        cached = 0;
+        return cached;
+    }
+    if (strcmp(env, "stage") == 0 || strcmp(env, "stages") == 0 || strcmp(env, "true") == 0 || strcmp(env, "yes") == 0) {
+        cached = 1;
+        return cached;
+    }
+    if (strcmp(env, "layer") == 0 || strcmp(env, "layers") == 0 || strcmp(env, "block") == 0 || strcmp(env, "blocks") == 0) {
+        cached = 2;
+        return cached;
+    }
+    if (strcmp(env, "op") == 0 || strcmp(env, "ops") == 0 || strcmp(env, "operation") == 0 || strcmp(env, "operations") == 0) {
+        cached = 3;
+        return cached;
+    }
+    errno = 0;
+    char *end = NULL;
+    long parsed = strtol(env, &end, 0);
+    if (errno == 0 && end != env && end != NULL && *end == '\0' && parsed > 0) {
+        cached = parsed > 3 ? 3 : (int)parsed;
+    } else {
+        cached = 1;
+    }
+    return cached;
+}
+
+static int metal_decoder_profile_checkpoint_alias(uocr_metal_context *ctx,
+                                                  const char *name,
+                                                  const char *alias,
+                                                  int reopen_batch,
+                                                  char *error,
+                                                  size_t error_size) {
+    if (ctx == NULL || name == NULL || !metal_command_batch_active(ctx)) {
+        return 1;
+    }
+    char op_name[160];
+    (void)snprintf(op_name, sizeof(op_name), "Metal decoder profile checkpoint %s", name);
+    op_name[sizeof(op_name) - 1u] = '\0';
+
+    const uint64_t wait_start_ns = uocr_profile_now_ns();
+    if (!metal_command_batch_commit_and_wait(ctx, op_name, error, error_size)) {
+        return 0;
+    }
+    metal_profile_add_event_now_f(ctx, wait_start_ns, "metal.decode.checkpoint_wait.%s", name);
+    if (alias != NULL && alias[0] != '\0') {
+        metal_profile_add_event_now_f(ctx, wait_start_ns, "metal.decode.checkpoint_wait.%s", alias);
+    }
+    if (reopen_batch && !metal_command_batch_begin(ctx, error, error_size)) {
+        return 0;
+    }
+    return 1;
+}
+
+static int metal_decoder_profile_checkpoint(uocr_metal_context *ctx,
+                                            const char *name,
+                                            int reopen_batch,
+                                            char *error,
+                                            size_t error_size) {
+    return metal_decoder_profile_checkpoint_alias(ctx, name, NULL, reopen_batch, error, error_size);
+}
+
 static id<MTLCommandBuffer> metal_command_buffer_for_op(uocr_metal_context *ctx,
                                                         int *out_owned,
                                                         const char *op_name,
@@ -11797,6 +11878,14 @@ static int metal_select_next_token_from_hidden_slice_f16(uocr_metal_context *ctx
         metal_profile_add_event_ms(ctx, "metal.decode.no_repeat_sequence_reuse", 0.0);
     }
 
+#define DECODER_SELECTION_CHECKPOINT(name__)                                            \
+    do {                                                                                \
+        if (metal_decoder_profile_detail_level() >= 3 &&                                \
+            !metal_decoder_profile_checkpoint(ctx, (name__), 1, error, error_size)) {   \
+            return 0;                                                                   \
+        }                                                                               \
+    } while (0)
+
     const uint64_t final_norm_start_ns = uocr_profile_now_ns();
     if (!metal_run_rmsnorm_buffer_f16(ctx,
                                       hidden,
@@ -11810,6 +11899,7 @@ static int metal_select_next_token_from_hidden_slice_f16(uocr_metal_context *ctx
     }
     metal_profile_add_event_now(ctx, "metal.final_norm", final_norm_start_ns);
     metal_profile_add_event_now(ctx, "metal.decode.final_norm", final_norm_start_ns);
+    DECODER_SELECTION_CHECKPOINT("selection.final_norm");
 
     const uint64_t no_repeat_start_ns = uocr_profile_now_ns();
     if (metal_lm_head_backend_is_mps()) {
@@ -11831,6 +11921,7 @@ static int metal_select_next_token_from_hidden_slice_f16(uocr_metal_context *ctx
         }
         metal_profile_add_event_now(ctx, "metal.no_repeat", no_repeat_start_ns);
         metal_profile_add_event_now(ctx, "metal.decode.no_repeat_collect", no_repeat_start_ns);
+        DECODER_SELECTION_CHECKPOINT("selection.no_repeat_collect");
 
         uint64_t lm_head_start_ns = uocr_profile_now_ns();
         uocr_metal_buffer_slice lm_head_logits;
@@ -11849,6 +11940,7 @@ static int metal_select_next_token_from_hidden_slice_f16(uocr_metal_context *ctx
         }
         metal_profile_add_event_now(ctx, "metal.lm_head_selection", lm_head_start_ns);
         metal_profile_add_event_now(ctx, "metal.decode.lm_head_selection", lm_head_start_ns);
+        DECODER_SELECTION_CHECKPOINT("selection.lm_head_mps");
     } else {
         /* Custom fused path */
         if (!metal_run_no_repeat_collect_ban_flags_to_slice(ctx,
@@ -11864,6 +11956,7 @@ static int metal_select_next_token_from_hidden_slice_f16(uocr_metal_context *ctx
         }
         metal_profile_add_event_now(ctx, "metal.no_repeat", no_repeat_start_ns);
         metal_profile_add_event_now(ctx, "metal.decode.no_repeat_collect", no_repeat_start_ns);
+        DECODER_SELECTION_CHECKPOINT("selection.no_repeat_collect");
 
         const uint64_t lm_head_start_ns = uocr_profile_now_ns();
         if (!metal_run_lm_head_argmax_f16(ctx,
@@ -11879,6 +11972,7 @@ static int metal_select_next_token_from_hidden_slice_f16(uocr_metal_context *ctx
         }
         metal_profile_add_event_now(ctx, "metal.lm_head_selection", lm_head_start_ns);
         metal_profile_add_event_now(ctx, "metal.decode.lm_head_selection", lm_head_start_ns);
+        DECODER_SELECTION_CHECKPOINT("selection.lm_head_custom");
 
         const uint64_t final_argmax_start_ns = uocr_profile_now_ns();
         if (!metal_run_argmax_pairs_to_token(ctx,
@@ -11893,6 +11987,7 @@ static int metal_select_next_token_from_hidden_slice_f16(uocr_metal_context *ctx
         }
         metal_profile_add_event_now(ctx, "metal.lm_head_final_argmax", final_argmax_start_ns);
         metal_profile_add_event_now(ctx, "metal.decode.lm_head_final_argmax", final_argmax_start_ns);
+        DECODER_SELECTION_CHECKPOINT("selection.final_argmax");
     }
     if (metal_command_batch_active(ctx)) {
         const uint64_t command_wait_start_ns = uocr_profile_now_ns();
@@ -11915,6 +12010,7 @@ static int metal_select_next_token_from_hidden_slice_f16(uocr_metal_context *ctx
     *score_out = *score_ptr;
     metal_profile_add_event_now(ctx, "metal.token_readback", token_readback_start_ns);
     metal_profile_add_event_now(ctx, "metal.decode.token_readback", token_readback_start_ns);
+#undef DECODER_SELECTION_CHECKPOINT
     return 1;
 }
 
@@ -12455,7 +12551,7 @@ static int metal_run_dense_swiglu_buffer_f16(uocr_metal_context *ctx,
         const NSUInteger gate_threads = use_tiled_shared_gate_up ?
             metal_power2_threadgroup_width((NSUInteger)UOCR_METAL_MOE_SHARED_GATE_UP_TILED_THREADS,
                                            gate_pipeline.maxTotalThreadsPerThreadgroup) :
-            metal_power2_threadgroup_width(256u, gate_pipeline.maxTotalThreadsPerThreadgroup);
+            metal_power2_threadgroup_width(64u, gate_pipeline.maxTotalThreadsPerThreadgroup);
         const NSUInteger gate_threadgroups = use_tiled_shared_gate_up ?
             (NSUInteger)n_tokens * ((NSUInteger)intermediate_size + (NSUInteger)UOCR_METAL_MOE_SHARED_GATE_UP_TILE_COLUMNS - 1u) /
                 (NSUInteger)UOCR_METAL_MOE_SHARED_GATE_UP_TILE_COLUMNS :
@@ -12700,7 +12796,7 @@ static int metal_expert_interleaved_slab_for_layer(const uocr_metal_context *ctx
     return 1;
 }
 
-static int metal_run_moe_interleaved_buffer_f16(uocr_metal_context *ctx,
+static int __attribute__((unused)) metal_run_moe_interleaved_buffer_f16(uocr_metal_context *ctx,
                                                 uocr_metal_buffer_slice input,
                                                 uocr_metal_buffer_slice top_ids,
                                                 uocr_metal_buffer_slice top_weights,
@@ -12750,7 +12846,7 @@ static int metal_run_moe_interleaved_buffer_f16(uocr_metal_context *ctx,
         if (enc == nil) {
             return metal_fail(error, error_size, "failed to create integrated routed MoE gate/up encoder");
         }
-        const NSUInteger gate_threads = metal_power2_threadgroup_width(256u, gate_pipeline.maxTotalThreadsPerThreadgroup);
+        const NSUInteger gate_threads = metal_power2_threadgroup_width(64u, gate_pipeline.maxTotalThreadsPerThreadgroup);
         [enc setComputePipelineState:gate_pipeline];
         [enc setBuffer:input.buffer offset:input.offset atIndex:0u];
         [enc setBuffer:top_ids.buffer offset:top_ids.offset atIndex:1u];
@@ -12766,7 +12862,7 @@ static int metal_run_moe_interleaved_buffer_f16(uocr_metal_context *ctx,
         if (enc == nil) {
             return metal_fail(error, error_size, "failed to create integrated routed MoE down encoder");
         }
-        const NSUInteger down_threads = metal_power2_threadgroup_width(256u, down_pipeline.maxTotalThreadsPerThreadgroup);
+        const NSUInteger down_threads = metal_power2_threadgroup_width(64u, down_pipeline.maxTotalThreadsPerThreadgroup);
         [enc setComputePipelineState:down_pipeline];
         [enc setBuffer:mid.buffer offset:mid.offset atIndex:0u];
         [enc setBuffer:top_ids.buffer offset:top_ids.offset atIndex:1u];
@@ -12862,7 +12958,7 @@ static int metal_run_moe_interleaved_decode_fused_combine_buffer_f16(uocr_metal_
         const NSUInteger gate_threads = use_tiled_routed_gate_up ?
             metal_power2_threadgroup_width((NSUInteger)UOCR_METAL_MOE_ROUTED_GATE_UP_TILED_THREADS,
                                            gate_pipeline.maxTotalThreadsPerThreadgroup) :
-            metal_power2_threadgroup_width(256u, gate_pipeline.maxTotalThreadsPerThreadgroup);
+            metal_power2_threadgroup_width(n_tokens == 1u ? 256u : 64u, gate_pipeline.maxTotalThreadsPerThreadgroup);
         const NSUInteger gate_threadgroups = use_tiled_routed_gate_up ?
             (NSUInteger)n_tokens * (NSUInteger)UOCR_MOE_TOP_K *
                 (((NSUInteger)UOCR_MOE_EXPERT_INTERMEDIATE + (NSUInteger)UOCR_METAL_MOE_ROUTED_GATE_UP_TILE_COLUMNS - 1u) /
@@ -12883,7 +12979,8 @@ static int metal_run_moe_interleaved_decode_fused_combine_buffer_f16(uocr_metal_
         if (enc == nil) {
             return metal_fail(error, error_size, "failed to create integrated routed MoE fused down/combine encoder");
         }
-        const NSUInteger down_threads = metal_power2_threadgroup_width(256u, down_combine_pipeline.maxTotalThreadsPerThreadgroup);
+        const NSUInteger down_threads = metal_power2_threadgroup_width(n_tokens == 1u ? 256u : 64u,
+                                                                       down_combine_pipeline.maxTotalThreadsPerThreadgroup);
         [enc setComputePipelineState:down_combine_pipeline];
         [enc setBuffer:mid.buffer offset:mid.offset atIndex:0u];
         [enc setBuffer:top_ids.buffer offset:top_ids.offset atIndex:1u];
@@ -12901,7 +12998,7 @@ static int metal_run_moe_interleaved_decode_fused_combine_buffer_f16(uocr_metal_
     }
 }
 
-static int metal_run_moe_combine_buffer_f16(uocr_metal_context *ctx,
+static int __attribute__((unused)) metal_run_moe_combine_buffer_f16(uocr_metal_context *ctx,
                                             uocr_metal_buffer_slice routed,
                                             uocr_metal_buffer_slice shared,
                                             uocr_metal_buffer_slice residual,
@@ -13246,6 +13343,14 @@ static int metal_run_decoder_decode_one_f16(uocr_metal_context *ctx,
         metal_profile_add_event_now(ctx, "metal.decode.layer", layer_start_ns);
         metal_profile_add_event_now(ctx, "metal.decode.layer_kernels", layer_start_ns);
         metal_profile_add_event_now_f(ctx, layer_start_ns, "metal.decode.layer.%02u", layer);
+        if (metal_decoder_profile_detail_level() >= 2) {
+            char checkpoint_name[64];
+            (void)snprintf(checkpoint_name, sizeof(checkpoint_name), "decode.layer.%02u", layer);
+            checkpoint_name[sizeof(checkpoint_name) - 1u] = '\0';
+            if (!metal_decoder_profile_checkpoint(ctx, checkpoint_name, 1, error, error_size)) {
+                return 0;
+            }
+        }
     }
 
     if (current_segment != 0u) {
@@ -13257,6 +13362,10 @@ static int metal_run_decoder_decode_one_f16(uocr_metal_context *ctx,
                                           "integrated decode final-hidden copy",
                                           error,
                                           error_size));
+        if (metal_decoder_profile_detail_level() >= 2 &&
+            !metal_decoder_profile_checkpoint(ctx, "decode.final_hidden_copy", 1, error, error_size)) {
+            return 0;
+        }
     }
 #undef RUN_DECODE_TIMED
     return 1;
@@ -13288,6 +13397,38 @@ static int metal_run_decoder_prefill_text_f16(uocr_metal_context *ctx,
 
     uocr_metal_buffer_slice current = prompt;
     uint32_t current_segment = UINT32_MAX;
+#define RUN_PREFILL_OP(checkpoint_suffix__, event_name__, expr__)                         \
+    do {                                                                                  \
+        const uint64_t op_start_ns__ = uocr_profile_now_ns();                             \
+        if (!(expr__)) {                                                                  \
+            return 0;                                                                     \
+        }                                                                                 \
+        metal_profile_add_event_now(ctx, (event_name__), op_start_ns__);                  \
+        if (metal_decoder_profile_detail_level() >= 3) {                                  \
+            char checkpoint_name__[96];                                                   \
+            char checkpoint_alias__[96];                                                  \
+            (void)snprintf(checkpoint_name__,                                             \
+                           sizeof(checkpoint_name__),                                     \
+                           "prefill.layer.%02u.%s",                                      \
+                           layer,                                                         \
+                           (checkpoint_suffix__));                                        \
+            checkpoint_name__[sizeof(checkpoint_name__) - 1u] = '\0';                     \
+            (void)snprintf(checkpoint_alias__,                                            \
+                           sizeof(checkpoint_alias__),                                    \
+                           "prefill.%s",                                                 \
+                           (checkpoint_suffix__));                                        \
+            checkpoint_alias__[sizeof(checkpoint_alias__) - 1u] = '\0';                   \
+            if (!metal_decoder_profile_checkpoint_alias(ctx,                               \
+                                                        checkpoint_name__,                \
+                                                        checkpoint_alias__,               \
+                                                        1,                                \
+                                                        error,                            \
+                                                        error_size)) {                    \
+                return 0;                                                                 \
+            }                                                                             \
+        }                                                                                 \
+    } while (0)
+
     for (uint32_t layer = 0u; layer < UOCR_DECODER_LAYERS; ++layer) {
         const uint64_t layer_start_ns = uocr_profile_now_ns();
         uint32_t available[UOCR_METAL_HIDDEN_SCRATCH_SEGMENTS];
@@ -13348,15 +13489,58 @@ static int metal_run_decoder_prefill_text_f16(uocr_metal_context *ctx,
             return 0;
         }
 
-        if (!metal_run_rmsnorm_buffer_f16(ctx, current, input_norm, n_tokens, norm, "integrated input RMSNorm", error, error_size) ||
-            !metal_run_attention_qkv_buffer_f16(ctx, norm, q_weight, k_weight, v_weight, n_tokens, q, k, v, error, error_size) ||
-            !metal_run_rope_qk_buffer_f16(ctx, q, k, n_tokens, 0u, error, error_size) ||
-            !metal_run_kv_write_buffer_f16(ctx, k, v, n_tokens, layer, slot, n_tokens, 0u, error, error_size) ||
-            !metal_run_prefill_attention_buffer_f16(ctx, q, k, v, n_tokens, norm, error, error_size) ||
-            !metal_run_attention_output_residual_buffer_f16(ctx, norm, o_weight, current, n_tokens, q, error, error_size) ||
-            !metal_run_rmsnorm_buffer_f16(ctx, q, post_norm, n_tokens, norm, "integrated post-attention RMSNorm", error, error_size)) {
-            return 0;
-        }
+        RUN_PREFILL_OP("attention_norm",
+                       "metal.prefill.attention_norm",
+                       metal_run_rmsnorm_buffer_f16(ctx,
+                                                    current,
+                                                    input_norm,
+                                                    n_tokens,
+                                                    norm,
+                                                    "integrated input RMSNorm",
+                                                    error,
+                                                    error_size));
+        RUN_PREFILL_OP("attention_qkv",
+                       "metal.prefill.attention_qkv",
+                       metal_run_attention_qkv_buffer_f16(ctx,
+                                                          norm,
+                                                          q_weight,
+                                                          k_weight,
+                                                          v_weight,
+                                                          n_tokens,
+                                                          q,
+                                                          k,
+                                                          v,
+                                                          error,
+                                                          error_size));
+        RUN_PREFILL_OP("rope",
+                       "metal.prefill.rope",
+                       metal_run_rope_qk_buffer_f16(ctx, q, k, n_tokens, 0u, error, error_size));
+        RUN_PREFILL_OP("kv_write",
+                       "metal.prefill.kv_write",
+                       metal_run_kv_write_buffer_f16(ctx, k, v, n_tokens, layer, slot, n_tokens, 0u, error, error_size));
+        RUN_PREFILL_OP("attention",
+                       "metal.prefill.attention",
+                       metal_run_prefill_attention_buffer_f16(ctx, q, k, v, n_tokens, norm, error, error_size));
+        RUN_PREFILL_OP("attention_output",
+                       "metal.prefill.attention_output",
+                       metal_run_attention_output_residual_buffer_f16(ctx,
+                                                                      norm,
+                                                                      o_weight,
+                                                                      current,
+                                                                      n_tokens,
+                                                                      q,
+                                                                      error,
+                                                                      error_size));
+        RUN_PREFILL_OP("post_attention_norm",
+                       "metal.prefill.post_attention_norm",
+                       metal_run_rmsnorm_buffer_f16(ctx,
+                                                    q,
+                                                    post_norm,
+                                                    n_tokens,
+                                                    norm,
+                                                    "integrated post-attention RMSNorm",
+                                                    error,
+                                                    error_size));
 
         if (layer == 0u) {
             const uocr_metal_decoder_binding *gate = metal_require_decoder_binding_index(ctx,
@@ -13377,23 +13561,25 @@ static int metal_run_decoder_prefill_text_f16(uocr_metal_context *ctx,
             const uint64_t mid_bytes = (uint64_t)n_tokens * (uint64_t)UOCR_DENSE_LAYER0_INTERMEDIATE * 2u;
             uocr_metal_buffer_slice mid;
             if (gate == NULL || up == NULL || down == NULL ||
-                !metal_moe_intermediate_slice(ctx, slot, mid_bytes, &mid) ||
-                !metal_run_dense_swiglu_buffer_f16(ctx,
-                                                   norm,
-                                                   gate,
-                                                   up,
-                                                   down,
-                                                   q,
-                                                   1,
-                                                   n_tokens,
-                                                   UOCR_DENSE_LAYER0_INTERMEDIATE,
-                                                   mid,
-                                                   output,
-                                                   "integrated layer0 dense SwiGLU",
-                                                   error,
-                                                   error_size)) {
+                !metal_moe_intermediate_slice(ctx, slot, mid_bytes, &mid)) {
                 return 0;
             }
+            RUN_PREFILL_OP("dense_mlp",
+                           "metal.prefill.dense_mlp",
+                           metal_run_dense_swiglu_buffer_f16(ctx,
+                                                              norm,
+                                                              gate,
+                                                              up,
+                                                              down,
+                                                              q,
+                                                              1,
+                                                              n_tokens,
+                                                              UOCR_DENSE_LAYER0_INTERMEDIATE,
+                                                              mid,
+                                                              output,
+                                                              "integrated layer0 dense SwiGLU",
+                                                              error,
+                                                              error_size));
         } else {
             const uocr_metal_decoder_binding *router = metal_require_decoder_binding_index(ctx,
                                                                                            layer_bindings->moe_router,
@@ -13422,52 +13608,87 @@ static int metal_run_decoder_prefill_text_f16(uocr_metal_context *ctx,
             const uint64_t routed_mid_bytes = (uint64_t)n_tokens * (uint64_t)UOCR_MOE_TOP_K *
                                               (uint64_t)UOCR_MOE_EXPERT_INTERMEDIATE * 2u;
             uocr_metal_buffer_slice mid;
-            if (router == NULL || shared_gate == NULL || shared_up == NULL || shared_down == NULL ||
-                !metal_run_moe_router_buffer_f16(ctx, norm, router, slot, n_tokens, &top_ids, &top_weights, error, error_size) ||
-                !metal_moe_intermediate_slice(ctx, slot, shared_mid_bytes, &mid) ||
-                !metal_run_dense_swiglu_buffer_f16(ctx,
-                                                   norm,
-                                                   shared_gate,
-                                                   shared_up,
-                                                   shared_down,
-                                                   q,
-                                                   0,
-                                                   n_tokens,
-                                                   UOCR_MOE_SHARED_INTERMEDIATE,
-                                                   mid,
-                                                   v,
-                                                   "integrated MoE shared experts",
-                                                   error,
-                                                   error_size) ||
-                !metal_expert_interleaved_slab_for_layer(ctx, layer, &expert_slab, error, error_size) ||
-                !metal_moe_intermediate_slice(ctx, slot, routed_mid_bytes, &mid) ||
-                !metal_run_moe_interleaved_buffer_f16(ctx,
-                                                      norm,
-                                                      top_ids,
-                                                      top_weights,
-                                                      expert_slab,
-                                                      slot,
-                                                      n_tokens,
-                                                      mid,
-                                                      current,
-                                                      error,
-                                                      error_size) ||
-                !metal_run_moe_combine_buffer_f16(ctx, current, v, q, n_tokens, output, error, error_size)) {
+            if (router == NULL || shared_gate == NULL || shared_up == NULL || shared_down == NULL) {
                 return 0;
             }
+            RUN_PREFILL_OP("moe_router",
+                           "metal.prefill.moe_router",
+                           metal_run_moe_router_buffer_f16(ctx,
+                                                           norm,
+                                                           router,
+                                                           slot,
+                                                           n_tokens,
+                                                           &top_ids,
+                                                           &top_weights,
+                                                           error,
+                                                           error_size));
+            if (!metal_moe_intermediate_slice(ctx, slot, shared_mid_bytes, &mid)) {
+                return 0;
+            }
+            RUN_PREFILL_OP("moe_shared_experts",
+                           "metal.prefill.moe_shared_experts",
+                           metal_run_dense_swiglu_buffer_f16(ctx,
+                                                              norm,
+                                                              shared_gate,
+                                                              shared_up,
+                                                              shared_down,
+                                                              q,
+                                                              0,
+                                                              n_tokens,
+                                                              UOCR_MOE_SHARED_INTERMEDIATE,
+                                                              mid,
+                                                              v,
+                                                              "integrated MoE shared experts",
+                                                              error,
+                                                              error_size));
+            const uint64_t expert_slab_start_ns = uocr_profile_now_ns();
+            if (!metal_expert_interleaved_slab_for_layer(ctx, layer, &expert_slab, error, error_size)) {
+                return 0;
+            }
+            metal_profile_add_event_now(ctx, "metal.prefill.moe_expert_slab", expert_slab_start_ns);
+            if (!metal_moe_intermediate_slice(ctx, slot, routed_mid_bytes, &mid)) {
+                return 0;
+            }
+            RUN_PREFILL_OP("moe_routed_fused",
+                           "metal.prefill.moe_routed_fused",
+                           metal_run_moe_interleaved_decode_fused_combine_buffer_f16(ctx,
+                                                                                     norm,
+                                                                                     top_ids,
+                                                                                     top_weights,
+                                                                                     expert_slab,
+                                                                                     n_tokens,
+                                                                                     mid,
+                                                                                     v,
+                                                                                     q,
+                                                                                     output,
+                                                                                     error,
+                                                                                     error_size));
         }
 
         current = output;
         current_segment = output_segment;
         metal_profile_add_event_now(ctx, "metal.prefill.layer", layer_start_ns);
         metal_profile_add_event_now_f(ctx, layer_start_ns, "metal.prefill.layer.%02u", layer);
+        if (metal_decoder_profile_detail_level() == 2) {
+            char checkpoint_name[64];
+            (void)snprintf(checkpoint_name, sizeof(checkpoint_name), "prefill.layer.%02u", layer);
+            checkpoint_name[sizeof(checkpoint_name) - 1u] = '\0';
+            if (!metal_decoder_profile_checkpoint(ctx, checkpoint_name, 1, error, error_size)) {
+                return 0;
+            }
+        }
     }
+#undef RUN_PREFILL_OP
 
     if (current_segment != 0u) {
         if (!metal_copy_slice(ctx, current, scratch[0], hidden_bytes, "integrated prefill final-hidden copy", error, error_size)) {
             return 0;
         }
         current_segment = 0u;
+        if (metal_decoder_profile_detail_level() >= 2 &&
+            !metal_decoder_profile_checkpoint(ctx, "prefill.final_hidden_copy", 1, error, error_size)) {
+            return 0;
+        }
     }
     metal_profile_add_event_now(ctx, "metal.prefill.command_encoding", prefill_command_encoding_start_ns);
     const uint64_t prefill_command_wait_start_ns = uocr_profile_now_ns();
@@ -13634,6 +13855,11 @@ static int metal_context_generate_f16_impl(uocr_metal_context *ctx,
     }
     metal_profile_add_event_now(ctx, "metal.prompt_assembly", prompt_assembly_start_ns);
     metal_profile_add_event_now(ctx, "metal.prefill.prompt_assembly", prompt_assembly_start_ns);
+    if (metal_decoder_profile_detail_level() >= 1 &&
+        !metal_decoder_profile_checkpoint(ctx, "prompt_assembly", 1, error, error_size)) {
+        metal_command_batch_abort(ctx);
+        return 0;
+    }
 
     const uocr_metal_hot_path_alloc_guard prefill_guard =
         metal_hot_path_alloc_guard_begin(ctx);
@@ -13836,6 +14062,12 @@ static int metal_context_generate_f16_impl(uocr_metal_context *ctx,
             UOCR_METAL_DECODE_LOOP_FAIL("integrated Metal fp16 decode command batch begin failed: %s", detail);
         }
         metal_profile_add_event_now(ctx, "metal.decode.command_encoding", selection_command_encoding_start_ns);
+        if (metal_decoder_profile_detail_level() >= 1 &&
+            !metal_decoder_profile_checkpoint(ctx, "decode_step_before_selection", 1, error, error_size)) {
+            char detail[512];
+            (void)snprintf(detail, sizeof(detail), "%s", (error != NULL && error[0] != '\0') ? error : "unknown error");
+            UOCR_METAL_DECODE_LOOP_FAIL("integrated Metal fp16 decode-step checkpoint failed: %s", detail);
+        }
         uint32_t token_id = UINT32_MAX;
         float score = 0.0f;
         uocr_no_repeat_ngram_config no_repeat_config;
