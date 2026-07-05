@@ -13,6 +13,9 @@ using namespace metal;
 
 // Shared infrastructure (function constants, helpers, threadgroup reductions)
 #define UOCR_HALF4_WIDTH 4u
+#define UOCR_FLASH_Q_PER_TG 4u
+#define UOCR_FLASH_MAX_LANE_VALUES 4u
+#define UOCR_FLASH_NEG_INF (-3.4028234663852886e38f)
 #define UOCR_FC_HIDDEN_SIZE 0
 #define UOCR_FC_ATTENTION_HEADS 1
 #define UOCR_FC_HEAD_DIM 2
@@ -119,6 +122,10 @@ static inline void uocr_store_half4(device half *ptr, ulong index, half4 value) 
 
 static inline half4 uocr_zero_half4() {
     return half4(half(0.0h), half(0.0h), half(0.0h), half(0.0h));
+}
+
+static inline uint uocr_flash_lane_dim(uint lane, uint component, uint simd_width) {
+    return lane + component * simd_width;
 }
 
 static inline uint uocr_simd_lane_from_tid(uint tid, uint simd_width) {

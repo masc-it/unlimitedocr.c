@@ -158,6 +158,80 @@ kernel void uocr_sam_attention_project_residual_f16_to_f16(device const half *sr
 }
 
 // SAM flash attention: window, rel_pos, global attention, tiled variants
+template <typename out_t>
+static inline void uocr_sam_window_attention_flash_impl(device const half *q_src,
+                                                        device const half *k_src,
+                                                        device const half *v_src,
+                                                        device out_t *dst,
+                                                        constant UocrSamWindowAttentionParams &params,
+                                                        uint3 tg,
+                                                        ushort lane_u16,
+                                                        ushort simdgroup_u16,
+                                                        ushort simd_width_u16) {
+    const uint lane = uint(lane_u16);
+    const uint simd_width = uint(simd_width_u16);
+    const uint query_in_block = uint(simdgroup_u16);
+    const uint head = tg.x;
+    const uint query_token = tg.y * UOCR_FLASH_Q_PER_TG + query_in_block;
+    const uint batch_size = uocr_sam_window_attention_batch_size(params);
+    const uint logical_window = tg.z;
+    const uint batch = params.windows == 0u ? 0u : logical_window / params.windows;
+    const uint window = params.windows == 0u ? 0u : logical_window - batch * params.windows;
+    if (query_in_block >= UOCR_FLASH_Q_PER_TG || params.windows == 0u || batch >= batch_size || window >= params.windows ||
+        query_token >= params.tokens_per_window || head >= params.heads ||
+        params.head_dim == 0u || params.head_dim > simd_width * UOCR_FLASH_MAX_LANE_VALUES) {
+        return;
+    }
+
+    float qv[UOCR_FLASH_MAX_LANE_VALUES];
+    float acc[UOCR_FLASH_MAX_LANE_VALUES];
+    for (uint i = 0u; i < UOCR_FLASH_MAX_LANE_VALUES; ++i) {
+        const uint dim = uocr_flash_lane_dim(lane, i, simd_width);
+        if (dim < params.head_dim) {
+            const ulong q_index = uocr_sam_window_attention_index(params, batch, window, query_token, head, dim);
+            qv[i] = float(q_src[q_index]);
+        } else {
+            qv[i] = 0.0f;
+        }
+        acc[i] = 0.0f;
+    }
+
+    float m = UOCR_FLASH_NEG_INF;
+    float l = 0.0f;
+    for (uint key_token = 0u; key_token < params.tokens_per_window; ++key_token) {
+        float local_dot = 0.0f;
+        for (uint i = 0u; i < UOCR_FLASH_MAX_LANE_VALUES; ++i) {
+            const uint dim = uocr_flash_lane_dim(lane, i, simd_width);
+            if (dim < params.head_dim) {
+                const ulong k_index = uocr_sam_window_attention_index(params, batch, window, key_token, head, dim);
+                local_dot += qv[i] * float(k_src[k_index]);
+            }
+        }
+        const float score = simd_sum(local_dot) * params.scale;
+        const float mnew = max(m, score);
+        const float corr = exp(m - mnew);
+        const float e = exp(score - mnew);
+        for (uint i = 0u; i < UOCR_FLASH_MAX_LANE_VALUES; ++i) {
+            const uint dim = uocr_flash_lane_dim(lane, i, simd_width);
+            if (dim < params.head_dim) {
+                const ulong v_index = uocr_sam_window_attention_index(params, batch, window, key_token, head, dim);
+                acc[i] = acc[i] * corr + e * float(v_src[v_index]);
+            }
+        }
+        l = l * corr + e;
+        m = mnew;
+    }
+
+    const float inv_l = l > 0.0f ? 1.0f / l : 0.0f;
+    for (uint i = 0u; i < UOCR_FLASH_MAX_LANE_VALUES; ++i) {
+        const uint dim = uocr_flash_lane_dim(lane, i, simd_width);
+        if (dim < params.head_dim) {
+            const ulong dst_index = uocr_sam_window_attention_index(params, batch, window, query_token, head, dim);
+            dst[dst_index] = out_t(acc[i] * inv_l);
+        }
+    }
+}
+
 kernel void uocr_sam_window_attention_flash_f16_to_f16(device const half *q_src [[buffer(0)]],
                                                        device const half *k_src [[buffer(1)]],
                                                        device const half *v_src [[buffer(2)]],
@@ -675,5 +749,3 @@ kernel void uocr_sam_rel_pos_attention_tiled_f16_to_f16(device const half *q_src
         }
     }
 }
-
-template <typename out_t>

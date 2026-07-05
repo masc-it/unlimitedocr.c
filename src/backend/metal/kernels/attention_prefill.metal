@@ -91,6 +91,7 @@ kernel void uocr_prefill_attention_varlen_f16_to_f16(device const half *q_src [[
 }
 
 // Prefill flash attention (template + f16/f32 kernels)
+template <typename out_t>
 static inline void uocr_prefill_attention_flash_impl(device const half *q_src,
                                                      device const half *k_src,
                                                      device const half *v_src,
@@ -185,5 +186,3 @@ static inline void uocr_prefill_attention_flash_impl(device const half *q_src,
                                                     ushort simd_width [[threads_per_simdgroup]]) {
     uocr_prefill_attention_flash_impl(q_src, k_src, v_src, dst, params, tg, lane, simdgroup, simd_width);
 }
-
-template <typename out_t>

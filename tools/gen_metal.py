@@ -1,50 +1,91 @@
 #!/usr/bin/env python3
-"""Concatenate all semantic .metal files into uocr_smoke.metal.
+"""Concatenate UnlimitedOCR Metal kernel fragments into one compilable source."""
 
-Usage: cd /Users/mascit/projects/unlimitedocr.c && python3 tools/gen_metal.py
+from __future__ import annotations
 
-Order: common.metal first, then alphasorted (but uocr_smoke.metal last,
-since it contains smoke kernels that reference everything else).
-"""
+import argparse
+from pathlib import Path
 
-import os, glob
+KERNELS = Path("src/backend/metal/kernels")
+DEFAULT_OUTPUT = KERNELS / "uocr_smoke.metal"
 
-KERNELS = "src/backend/metal/kernels"
-OUTPUT = f"{KERNELS}/uocr_smoke.metal"
+# This order keeps shared parameter/helper definitions before users.  The split
+# files are development fragments; the runtime/precompiled Metal library is a
+# single translation unit.
+ORDER = [
+    "common.metal",
+    "dense.metal",
+    "norm.metal",
+    "sam.metal",
+    "sam_attention.metal",
+    "sam_position.metal",
+    "attention_decode.metal",
+    "attention_prefill.metal",
+    "attention.metal",
+    "clip.metal",
+    "clip_sam.metal",
+    "embedding.metal",
+    "kv_cache.metal",
+    "layout.metal",
+    "moe.metal",
+    "prompt_assembly.metal",
+    "rope.metal",
+    "sampling.metal",
+    "sam_conv.metal",
+    "sam_window.metal",
+    "uocr_smoke.metal",
+    "mpp_prototypes.metal",
+]
 
-# Collect .metal files
-files = [f for f in os.listdir(KERNELS) if f.endswith(".metal")]
-files.sort()
 
-# Order: common.metal first, uocr_smoke.metal last
-if "common.metal" in files:
-    files.remove("common.metal")
-    files.insert(0, "common.metal")
-if "uocr_smoke.metal" in files:
-    files.remove("uocr_smoke.metal")
-    files.append("uocr_smoke.metal")
+def stripped_content(path: Path, *, is_common: bool) -> str:
+    content = path.read_text(encoding="utf-8")
+    if is_common:
+        return content.strip()
+    return "\n".join(
+        line for line in content.splitlines() if line.strip() != '#include "common.metal"'
+    ).strip()
 
-print(f"Concatenating {len(files)} files into {OUTPUT}:")
 
-lines_out = []
-lines_out.append(f"// uocr_smoke.metal — Auto-generated concatenation of all semantic kernel files.")
-lines_out.append(f"// Do not edit directly. Edit the source files in {KERNELS}/ and run tools/gen_metal.py")
-lines_out.append(f"// Generated from: {', '.join(files)}")
-lines_out.append("")
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--kernels", type=Path, default=KERNELS)
+    parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
+    args = parser.parse_args()
 
-for fname in files:
-    path = os.path.join(KERNELS, fname)
-    with open(path) as f:
-        content = f.read()
-    lines_out.append(f"// ═══════════════════════════════════════════")
-    lines_out.append(f"//  {fname}")
-    lines_out.append(f"// ═══════════════════════════════════════════")
-    lines_out.append("")
-    lines_out.append(content.strip())
-    lines_out.append("")
-    print(f"  {fname}")
+    kernels = args.kernels
+    output = args.output
+    available = {path.name for path in kernels.glob("*.metal")}
+    order = [name for name in ORDER if name in available]
+    for name in sorted(available - set(order)):
+        order.insert(-1, name)
 
-with open(OUTPUT, 'w') as f:
-    f.write('\n'.join(lines_out) + '\n')
+    lines: list[str] = [
+        "// Auto-generated UnlimitedOCR Metal translation unit.",
+        "// Edit src/backend/metal/kernels/*.metal and rerun tools/gen_metal.py.",
+        f"// Generated from: {', '.join(order)}",
+        "",
+    ]
+    for name in order:
+        source = kernels / name
+        if source.resolve(strict=False) == output.resolve(strict=False):
+            # When regenerating the source-tree smoke file, include the previous
+            # smoke/debug kernels once, then overwrite the file at the end.
+            pass
+        lines.extend([
+            "// ═══════════════════════════════════════════",
+            f"//  {name}",
+            "// ═══════════════════════════════════════════",
+            "",
+            stripped_content(source, is_common=(name == "common.metal")),
+            "",
+        ])
 
-print(f"\nDone. {OUTPUT} written ({len(lines_out)} lines).")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print(f"wrote {output} from {len(order)} Metal fragments")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
