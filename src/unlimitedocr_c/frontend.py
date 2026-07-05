@@ -226,15 +226,6 @@ def _download_tokenizer_context() -> Path:
 
 
 def default_context_dir() -> Path:
-    candidates = [
-        Path.cwd() / "data" / "context",
-        project_root() / "data" / "context",
-    ]
-    if not is_source_tree_package():
-        candidates.append(package_resource_dir() / "context")
-    for candidate in candidates:
-        if (candidate / "tokenizer.json").exists():
-            return candidate
     return _download_tokenizer_context()
 
 

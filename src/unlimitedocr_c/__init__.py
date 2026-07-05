@@ -1,7 +1,6 @@
 """Python helpers for the Unlimited-OCR C inference core."""
 
 from .api import (
-    DEFAULT_CONVERTED_MODEL_REPO_ID,
     DEFAULT_MODEL_FILENAME,
     DEFAULT_SOURCE_MODEL_REPO_ID,
     ImageSource,
@@ -142,7 +141,6 @@ from .parity_thresholds import (
 )
 
 __all__ = [
-    "DEFAULT_CONVERTED_MODEL_REPO_ID",
     "DEFAULT_MODEL_FILENAME",
     "DEFAULT_SOURCE_MODEL_REPO_ID",
     "ImageSource",

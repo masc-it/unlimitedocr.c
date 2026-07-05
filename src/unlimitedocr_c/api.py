@@ -37,7 +37,6 @@ ProfileName = Literal["base", "gundam"]
 ImageSource = str | os.PathLike[str] | bytes | bytearray | memoryview | IO[bytes] | Image.Image
 
 DEFAULT_MODEL_FILENAME = "unlimitedocr-fp16.uocr"
-DEFAULT_CONVERTED_MODEL_REPO_ID = "maurosciancalepore/unlimitedocr-c"
 DEFAULT_SOURCE_MODEL_REPO_ID = "baidu/Unlimited-OCR"
 DEFAULT_MAX_LENGTH = 32768
 DEFAULT_NO_REPEAT_NGRAM_SIZE = 35
@@ -79,36 +78,11 @@ def _require_existing_model(path: str | Path, *, source: str) -> Path:
 
 
 def _candidate_model_paths(cache_dir: Path, filename: str) -> list[Path]:
-    package_root = Path(__file__).resolve().parent
-    cwd = Path.cwd()
-    candidates = [
-        cwd / "dist" / filename,
-        cwd.parent / "dist" / filename,
-        project_root() / "dist" / filename,
-        cache_dir / filename,
-        cache_dir / "models" / filename,
-    ]
-    if not is_source_tree_package():
-        candidates.append(package_root / "resources" / "models" / filename)
-    return candidates
+    return [cache_dir / filename, cache_dir / "models" / filename]
 
 
 def _hf_local_files_only() -> bool:
     return _env_flag("UOCR_HF_LOCAL_FILES_ONLY", default=False)
-
-
-def _download_converted_model(cache_dir: Path, filename: str) -> Path:
-    from huggingface_hub import hf_hub_download
-
-    repo_id = os.environ.get("UOCR_MODEL_REPO_ID", DEFAULT_CONVERTED_MODEL_REPO_ID)
-    revision = os.environ.get("UOCR_MODEL_REVISION") or None
-    downloaded = hf_hub_download(
-        repo_id=repo_id,
-        filename=filename,
-        revision=revision,
-        local_files_only=_hf_local_files_only(),
-    )
-    return Path(downloaded).resolve()
 
 
 def _download_and_convert_source_model(cache_dir: Path, filename: str) -> Path:
@@ -155,15 +129,13 @@ def resolve_model_path(
     cache_dir: str | Path | None = None,
     download: bool = True,
 ) -> Path:
-    """Resolve a `.uocr` model path using env, local files, cache, and HF.
+    """Resolve a `.uocr` model path using env, local cache, and HF conversion.
 
     Resolution order:
     1. explicit ``model_path``
     2. ``UOCR_MODEL_PATH``
-    3. local development ``dist/unlimitedocr-fp16.uocr``
-    4. cache/package model locations
-    5. Hugging Face download of a preconverted `.uocr`
-    6. Hugging Face download of the upstream checkpoint followed by conversion
+    3. cache directory
+    4. Hugging Face download of the upstream checkpoint followed by conversion
     """
 
     if model_path is not None:
@@ -193,24 +165,14 @@ def resolve_model_path(
             + "\nSet UOCR_MODEL_PATH or enable download."
         )
 
-    errors: list[str] = []
     resolved_cache_dir.mkdir(parents=True, exist_ok=True)
-    try:
-        return _download_converted_model(resolved_cache_dir, filename)
-    except Exception as exc:  # pragma: no cover - network-dependent path
-        errors.append(f"preconverted model download failed: {exc}")
-
-    if _env_flag("UOCR_DISABLE_SOURCE_CONVERT", default=False):
-        raise ModelResolutionError("; ".join(errors))
-
     try:
         return _download_and_convert_source_model(resolved_cache_dir, filename)
     except Exception as exc:  # pragma: no cover - network/large-conversion path
-        errors.append(f"source checkpoint download/conversion failed: {exc}")
         raise ModelResolutionError(
             "could not prepare the UnlimitedOCR model automatically. "
-            + "; ".join(errors)
-            + ". Set UOCR_MODEL_PATH to a local .uocr file to bypass downloads."
+            f"source checkpoint download/conversion failed: {exc}. "
+            "Set UOCR_MODEL_PATH to a local .uocr file to bypass downloads."
         ) from exc
 
 
@@ -431,7 +393,6 @@ class UnlimitedOCR:
 
 
 __all__ = [
-    "DEFAULT_CONVERTED_MODEL_REPO_ID",
     "DEFAULT_MODEL_FILENAME",
     "DEFAULT_SOURCE_MODEL_REPO_ID",
     "ImageSource",
