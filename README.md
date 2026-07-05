@@ -7,6 +7,14 @@ Python handles the user-facing pieces — image loading, prompt construction,
 tokenization, and text decoding. The native library handles model loading, memory
 management, KV cache, logits processing, and GPU execution.
 
+## Installation
+
+```bash
+uv add unlimitedocr-c
+```
+
+> `unlimitedocr-c` is published on PyPI. Version `0.2.3` is the latest stable release.
+
 ## Quick start
 
 ```python
