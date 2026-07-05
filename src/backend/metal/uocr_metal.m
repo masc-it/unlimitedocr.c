@@ -11494,6 +11494,283 @@ static int metal_run_decoder_decode_chunk_f16(
 }
 
 
+static int metal_run_decode_attention_qkv_one_f16(uocr_metal_context *ctx,
+                                                   uocr_metal_buffer_slice src,
+                                                   const uocr_metal_decoder_binding *q_weight,
+                                                   const uocr_metal_decoder_binding *k_weight,
+                                                   const uocr_metal_decoder_binding *v_weight,
+                                                   uocr_metal_buffer_slice q_dst,
+                                                   uocr_metal_buffer_slice k_dst,
+                                                   uocr_metal_buffer_slice v_dst,
+                                                   char *error,
+                                                   size_t error_size) {
+    const uint64_t hidden_bytes = (uint64_t)UOCR_HIDDEN_SIZE * 2u;
+    const uint64_t weight_bytes = (uint64_t)UOCR_HIDDEN_SIZE * (uint64_t)UOCR_HIDDEN_SIZE * 2u;
+    if (ctx == NULL || q_weight == NULL || k_weight == NULL || v_weight == NULL ||
+        !metal_slice_valid(src, hidden_bytes) || !metal_slice_valid(q_dst, hidden_bytes) ||
+        !metal_slice_valid(k_dst, hidden_bytes) || !metal_slice_valid(v_dst, hidden_bytes) ||
+        !metal_buffer_range_valid(q_weight->buffer, q_weight->offset, weight_bytes) ||
+        !metal_buffer_range_valid(k_weight->buffer, k_weight->offset, weight_bytes) ||
+        !metal_buffer_range_valid(v_weight->buffer, v_weight->offset, weight_bytes)) {
+        return metal_fail(error, error_size, "invalid decode attention QKV request");
+    }
+    uint64_t output_values = (uint64_t)UOCR_HIDDEN_SIZE * 3u;
+    if (output_values > (uint64_t)UINT32_MAX) {
+        return metal_fail(error, error_size, "decode attention QKV dispatch size overflow");
+    }
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline = metal_get_decoder_shape_pipeline(ctx, "uocr_attention_qkvo_f16_to_f16", error, error_size);
+        if (pipeline == nil) {
+            return 0;
+        }
+        const NSUInteger threads = metal_power2_threadgroup_width(256u, pipeline.maxTotalThreadsPerThreadgroup);
+        int owned_command_buffer = 0;
+        id<MTLCommandBuffer> cb = metal_command_buffer_for_op(ctx, &owned_command_buffer, "decode attention QKV", error, error_size);
+        if (cb == nil) {
+            return 0;
+        }
+        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
+        if (enc == nil) {
+            return metal_fail(error, error_size, "failed to create decode attention QKV command encoder");
+        }
+        uocr_metal_attention_projection_params params;
+        params.n_tokens = 1u;
+        params.hidden_size = UOCR_HIDDEN_SIZE;
+        params.projection_count = 3u;
+        params.reserved = 0u;
+        [enc setComputePipelineState:pipeline];
+        [enc setBuffer:src.buffer offset:src.offset atIndex:0u];
+        [enc setBuffer:q_weight->buffer offset:q_weight->offset atIndex:1u];
+        [enc setBuffer:k_weight->buffer offset:k_weight->offset atIndex:2u];
+        [enc setBuffer:v_weight->buffer offset:v_weight->offset atIndex:3u];
+        [enc setBuffer:q_weight->buffer offset:q_weight->offset atIndex:4u];
+        [enc setBuffer:q_dst.buffer offset:q_dst.offset atIndex:5u];
+        [enc setBuffer:k_dst.buffer offset:k_dst.offset atIndex:6u];
+        [enc setBuffer:v_dst.buffer offset:v_dst.offset atIndex:7u];
+        [enc setBuffer:q_dst.buffer offset:q_dst.offset atIndex:8u];
+        [enc setBytes:&params length:sizeof(params) atIndex:9u];
+        [enc setThreadgroupMemoryLength:threads * sizeof(float) atIndex:0u];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)output_values, 1u, 1u)
+             threadsPerThreadgroup:MTLSizeMake(threads, 1u, 1u)];
+        [enc endEncoding];
+        return metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, "decode attention QKV", error, error_size);
+    }
+}
+
+static int metal_run_decode_attention_output_one_f16(uocr_metal_context *ctx,
+                                                     uocr_metal_buffer_slice context,
+                                                     const uocr_metal_decoder_binding *o_weight,
+                                                     uocr_metal_buffer_slice residual,
+                                                     uocr_metal_buffer_slice dst,
+                                                     char *error,
+                                                     size_t error_size) {
+    const uint64_t hidden_bytes = (uint64_t)UOCR_HIDDEN_SIZE * 2u;
+    const uint64_t weight_bytes = (uint64_t)UOCR_HIDDEN_SIZE * (uint64_t)UOCR_HIDDEN_SIZE * 2u;
+    uint64_t output_values = (uint64_t)UOCR_HIDDEN_SIZE;
+    if (ctx == NULL || o_weight == NULL || !metal_slice_valid(context, hidden_bytes) ||
+        !metal_slice_valid(residual, hidden_bytes) || !metal_slice_valid(dst, hidden_bytes) ||
+        !metal_buffer_range_valid(o_weight->buffer, o_weight->offset, weight_bytes) || output_values > UINT32_MAX) {
+        return metal_fail(error, error_size, "invalid decode attention output request");
+    }
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline = metal_get_decoder_shape_pipeline(ctx, "uocr_attention_output_residual_f16_to_f16", error, error_size);
+        if (pipeline == nil) {
+            return 0;
+        }
+        const NSUInteger threads = metal_power2_threadgroup_width(256u, pipeline.maxTotalThreadsPerThreadgroup);
+        int owned_command_buffer = 0;
+        id<MTLCommandBuffer> cb = metal_command_buffer_for_op(ctx, &owned_command_buffer, "decode attention output", error, error_size);
+        if (cb == nil) {
+            return 0;
+        }
+        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
+        if (enc == nil) {
+            return metal_fail(error, error_size, "failed to create decode attention output command encoder");
+        }
+        uocr_metal_attention_output_params params;
+        params.n_tokens = 1u;
+        params.hidden_size = UOCR_HIDDEN_SIZE;
+        params.reserved0 = 0u;
+        params.reserved1 = 0u;
+        [enc setComputePipelineState:pipeline];
+        [enc setBuffer:context.buffer offset:context.offset atIndex:0u];
+        [enc setBuffer:o_weight->buffer offset:o_weight->offset atIndex:1u];
+        [enc setBuffer:residual.buffer offset:residual.offset atIndex:2u];
+        [enc setBuffer:dst.buffer offset:dst.offset atIndex:3u];
+        [enc setBytes:&params length:sizeof(params) atIndex:4u];
+        [enc setThreadgroupMemoryLength:threads * sizeof(float) atIndex:0u];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)output_values, 1u, 1u)
+             threadsPerThreadgroup:MTLSizeMake(threads, 1u, 1u)];
+        [enc endEncoding];
+        return metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, "decode attention output", error, error_size);
+    }
+}
+
+static int metal_run_decode_dense_swiglu_one_f16(uocr_metal_context *ctx,
+                                                 uocr_metal_buffer_slice input,
+                                                 const uocr_metal_decoder_binding *gate_weight,
+                                                 const uocr_metal_decoder_binding *up_weight,
+                                                 const uocr_metal_decoder_binding *down_weight,
+                                                 uocr_metal_buffer_slice residual,
+                                                 int has_residual,
+                                                 uint32_t intermediate_size,
+                                                 uocr_metal_buffer_slice mid,
+                                                 uocr_metal_buffer_slice dst,
+                                                 const char *op_name,
+                                                 char *error,
+                                                 size_t error_size) {
+    const uint64_t hidden_bytes = (uint64_t)UOCR_HIDDEN_SIZE * 2u;
+    const uint64_t gate_weight_bytes = (uint64_t)intermediate_size * (uint64_t)UOCR_HIDDEN_SIZE * 2u;
+    const uint64_t down_weight_bytes = (uint64_t)UOCR_HIDDEN_SIZE * (uint64_t)intermediate_size * 2u;
+    const uint64_t mid_bytes = (uint64_t)intermediate_size * 2u;
+    uint64_t gate_values = (uint64_t)intermediate_size;
+    uint64_t down_values = (uint64_t)UOCR_HIDDEN_SIZE;
+    if (ctx == NULL || gate_weight == NULL || up_weight == NULL || down_weight == NULL ||
+        intermediate_size == 0u || gate_values > UINT32_MAX || down_values > UINT32_MAX ||
+        !metal_slice_valid(input, hidden_bytes) || !metal_slice_valid(mid, mid_bytes) ||
+        !metal_slice_valid(dst, hidden_bytes) || (has_residual && !metal_slice_valid(residual, hidden_bytes)) ||
+        !metal_buffer_range_valid(gate_weight->buffer, gate_weight->offset, gate_weight_bytes) ||
+        !metal_buffer_range_valid(up_weight->buffer, up_weight->offset, gate_weight_bytes) ||
+        !metal_buffer_range_valid(down_weight->buffer, down_weight->offset, down_weight_bytes)) {
+        return metal_fail(error, error_size, "invalid %s decode SwiGLU request", op_name);
+    }
+    @autoreleasepool {
+        id<MTLComputePipelineState> gate_pipeline = metal_get_decoder_shape_pipeline(ctx,
+                                                                                     "uocr_dense_swiglu_shared_gate_up_tile4_f16",
+                                                                                     error,
+                                                                                     error_size);
+        if (gate_pipeline == nil) {
+            return 0;
+        }
+        if (gate_pipeline.maxTotalThreadsPerThreadgroup < (NSUInteger)UOCR_METAL_MOE_SHARED_GATE_UP_TILED_THREADS) {
+            return metal_fail(error, error_size, "%s decode tiled shared gate/up pipeline does not support 1024 threads", op_name);
+        }
+        id<MTLComputePipelineState> down_pipeline = metal_get_decoder_shape_pipeline(ctx, "uocr_dense_swiglu_down_f16_to_f16", error, error_size);
+        if (down_pipeline == nil) {
+            return 0;
+        }
+        int owned_command_buffer = 0;
+        id<MTLCommandBuffer> cb = metal_command_buffer_for_op(ctx, &owned_command_buffer, op_name, error, error_size);
+        if (cb == nil) {
+            return 0;
+        }
+        uocr_metal_dense_swiglu_params params;
+        params.n_tokens = 1u;
+        params.hidden_size = UOCR_HIDDEN_SIZE;
+        params.intermediate_size = intermediate_size;
+        params.has_residual = has_residual ? 1u : 0u;
+        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
+        if (enc == nil) {
+            return metal_fail(error, error_size, "failed to create %s decode gate/up command encoder", op_name);
+        }
+        const NSUInteger gate_threads = metal_power2_threadgroup_width((NSUInteger)UOCR_METAL_MOE_SHARED_GATE_UP_TILED_THREADS,
+                                                                       gate_pipeline.maxTotalThreadsPerThreadgroup);
+        const NSUInteger gate_threadgroups = (NSUInteger)1u * ((NSUInteger)intermediate_size + (NSUInteger)UOCR_METAL_MOE_SHARED_GATE_UP_TILE_COLUMNS - 1u) /
+            (NSUInteger)UOCR_METAL_MOE_SHARED_GATE_UP_TILE_COLUMNS;
+        [enc setComputePipelineState:gate_pipeline];
+        [enc setBuffer:input.buffer offset:input.offset atIndex:0u];
+        [enc setBuffer:gate_weight->buffer offset:gate_weight->offset atIndex:1u];
+        [enc setBuffer:up_weight->buffer offset:up_weight->offset atIndex:2u];
+        [enc setBuffer:mid.buffer offset:mid.offset atIndex:3u];
+        [enc setBytes:&params length:sizeof(params) atIndex:4u];
+        [enc setThreadgroupMemoryLength:gate_threads * 2u * sizeof(float) atIndex:0u];
+        [enc dispatchThreadgroups:MTLSizeMake(gate_threadgroups, 1u, 1u)
+             threadsPerThreadgroup:MTLSizeMake(gate_threads, 1u, 1u)];
+        [enc endEncoding];
+
+        enc = metal_compute_command_encoder(ctx, cb);
+        if (enc == nil) {
+            return metal_fail(error, error_size, "failed to create %s decode down command encoder", op_name);
+        }
+        const NSUInteger down_threads = metal_power2_threadgroup_width(256u, down_pipeline.maxTotalThreadsPerThreadgroup);
+        [enc setComputePipelineState:down_pipeline];
+        [enc setBuffer:mid.buffer offset:mid.offset atIndex:0u];
+        [enc setBuffer:down_weight->buffer offset:down_weight->offset atIndex:1u];
+        [enc setBuffer:(has_residual ? residual.buffer : input.buffer) offset:(has_residual ? residual.offset : input.offset) atIndex:2u];
+        [enc setBuffer:dst.buffer offset:dst.offset atIndex:3u];
+        [enc setBytes:&params length:sizeof(params) atIndex:4u];
+        [enc setThreadgroupMemoryLength:down_threads * sizeof(float) atIndex:0u];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)down_values, 1u, 1u)
+             threadsPerThreadgroup:MTLSizeMake(down_threads, 1u, 1u)];
+        [enc endEncoding];
+        return metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, op_name, error, error_size);
+    }
+}
+
+static int metal_run_decode_moe_router_one_f16(uocr_metal_context *ctx,
+                                               uocr_metal_buffer_slice input,
+                                               const uocr_metal_decoder_binding *router_weight,
+                                               uint32_t slot,
+                                               uocr_metal_buffer_slice *top_ids_out,
+                                               uocr_metal_buffer_slice *top_weights_out,
+                                               char *error,
+                                               size_t error_size) {
+    const uint64_t hidden_bytes = (uint64_t)UOCR_HIDDEN_SIZE * 2u;
+    const uint64_t weight_bytes = (uint64_t)UOCR_ROUTED_EXPERTS * (uint64_t)UOCR_HIDDEN_SIZE * 2u;
+    uocr_metal_buffer_slice logits;
+    uocr_metal_buffer_slice top_ids;
+    uocr_metal_buffer_slice top_weights;
+    uint64_t logits_bytes = 0u;
+    uint64_t top_ids_bytes = 0u;
+    uint64_t top_weights_bytes = 0u;
+    if (ctx == NULL || router_weight == NULL || top_ids_out == NULL || top_weights_out == NULL ||
+        !metal_slice_valid(input, hidden_bytes) ||
+        !metal_buffer_range_valid(router_weight->buffer, router_weight->offset, weight_bytes) ||
+        !metal_router_arena_slices(ctx, slot, 1u, &logits, &top_ids, &top_weights,
+                                   &logits_bytes, &top_ids_bytes, &top_weights_bytes)) {
+        return metal_fail(error, error_size, "invalid decode MoE router request");
+    }
+    (void)logits_bytes;
+    (void)top_ids_bytes;
+    (void)top_weights_bytes;
+    @autoreleasepool {
+        id<MTLComputePipelineState> fused_pipeline = metal_get_decoder_shape_pipeline(ctx, "uocr_moe_router_decode_fused_f16", error, error_size);
+        if (fused_pipeline == nil) {
+            return 0;
+        }
+        if (fused_pipeline.maxTotalThreadsPerThreadgroup < 256u) {
+            return metal_fail(error, error_size, "decode MoE fused router pipeline does not support 256 threads");
+        }
+        uocr_metal_moe_router_params params;
+        params.n_tokens = 1u;
+        params.hidden_size = UOCR_HIDDEN_SIZE;
+        params.experts = UOCR_ROUTED_EXPERTS;
+        params.top_k = UOCR_MOE_TOP_K;
+
+        int owned_command_buffer = 0;
+        id<MTLCommandBuffer> cb = metal_command_buffer_for_op(ctx, &owned_command_buffer, "decode MoE router", error, error_size);
+        if (cb == nil) {
+            return 0;
+        }
+        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
+        if (enc == nil) {
+            return metal_fail(error, error_size, "failed to create decode MoE fused router encoder");
+        }
+        const NSUInteger fused_threads = metal_power2_threadgroup_width((NSUInteger)UOCR_METAL_MOE_ROUTER_FUSED_THREADS,
+                                                                        fused_pipeline.maxTotalThreadsPerThreadgroup);
+        const NSUInteger hidden_tg_bytes = (NSUInteger)UOCR_HIDDEN_SIZE * sizeof(uint16_t);
+        const NSUInteger scratch_tg_bytes = ((NSUInteger)UOCR_ROUTED_EXPERTS + fused_threads) * sizeof(float);
+        [enc setComputePipelineState:fused_pipeline];
+        [enc setBuffer:input.buffer offset:input.offset atIndex:0u];
+        [enc setBuffer:router_weight->buffer offset:router_weight->offset atIndex:1u];
+        [enc setBuffer:top_ids.buffer offset:top_ids.offset atIndex:2u];
+        [enc setBuffer:top_weights.buffer offset:top_weights.offset atIndex:3u];
+        [enc setBytes:&params length:sizeof(params) atIndex:4u];
+        [enc setThreadgroupMemoryLength:hidden_tg_bytes atIndex:0u];
+        [enc setThreadgroupMemoryLength:scratch_tg_bytes atIndex:1u];
+        [enc dispatchThreadgroups:MTLSizeMake(1u, 1u, 1u)
+             threadsPerThreadgroup:MTLSizeMake(fused_threads, 1u, 1u)];
+        [enc endEncoding];
+        if (!metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, "decode MoE router", error, error_size)) {
+            return 0;
+        }
+    }
+    *top_ids_out = top_ids;
+    *top_weights_out = top_weights;
+    return 1;
+}
+
+
 static int metal_run_attention_qkv_buffer_f16(uocr_metal_context *ctx,
                                               uocr_metal_buffer_slice src,
                                               const uocr_metal_decoder_binding *q_weight,
@@ -12392,17 +12669,16 @@ static int metal_run_decoder_decode_one_f16(uocr_metal_context *ctx,
                                                       error_size));
         DECODE_OP_CHECKPOINT("attn_norm");
         RUN_DECODE_TIMED("metal.decode.attention_projections",
-                         metal_run_attention_qkv_buffer_f16(ctx,
-                                                            norm,
-                                                            q_weight,
-                                                            k_weight,
-                                                            v_weight,
-                                                            1u,
-                                                            q,
-                                                            k,
-                                                            v,
-                                                            error,
-                                                            error_size));
+                         metal_run_decode_attention_qkv_one_f16(ctx,
+                                                                norm,
+                                                                q_weight,
+                                                                k_weight,
+                                                                v_weight,
+                                                                q,
+                                                                k,
+                                                                v,
+                                                                error,
+                                                                error_size));
         DECODE_OP_CHECKPOINT("attn_qkv");
         RUN_DECODE_TIMED("metal.decode.rope",
                          metal_run_rope_qk_buffer_f16(ctx, q, k, 1u, position, error, error_size));
@@ -12431,14 +12707,13 @@ static int metal_run_decoder_decode_one_f16(uocr_metal_context *ctx,
                                                                error_size));
         DECODE_OP_CHECKPOINT("attn");
         RUN_DECODE_TIMED("metal.decode.attention_projections",
-                         metal_run_attention_output_residual_buffer_f16(ctx,
-                                                                        norm,
-                                                                        o_weight,
-                                                                        current,
-                                                                        1u,
-                                                                        q,
-                                                                        error,
-                                                                        error_size));
+                         metal_run_decode_attention_output_one_f16(ctx,
+                                                                   norm,
+                                                                   o_weight,
+                                                                   current,
+                                                                   q,
+                                                                   error,
+                                                                   error_size));
         DECODE_OP_CHECKPOINT("attn_out");
         RUN_DECODE_TIMED("metal.decode.post_attention_norm",
                          metal_run_rmsnorm_buffer_f16(ctx,
@@ -12464,20 +12739,19 @@ static int metal_run_decoder_decode_one_f16(uocr_metal_context *ctx,
                 return metal_fail(error, error_size, "integrated decode layer0 dense MLP intermediate slice is invalid");
             }
             RUN_DECODE_TIMED("metal.decode.dense_mlp",
-                             metal_run_dense_swiglu_buffer_f16(ctx,
-                                                               norm,
-                                                               gate,
-                                                               up,
-                                                               down,
-                                                               q,
-                                                               1,
-                                                               1u,
-                                                               UOCR_DENSE_LAYER0_INTERMEDIATE,
-                                                               mid,
-                                                               output,
-                                                               "integrated decode layer0 dense SwiGLU",
-                                                               error,
-                                                               error_size));
+                             metal_run_decode_dense_swiglu_one_f16(ctx,
+                                                                   norm,
+                                                                   gate,
+                                                                   up,
+                                                                   down,
+                                                                   q,
+                                                                   1,
+                                                                   UOCR_DENSE_LAYER0_INTERMEDIATE,
+                                                                   mid,
+                                                                   output,
+                                                                   "integrated decode layer0 dense SwiGLU",
+                                                                   error,
+                                                                   error_size));
             DECODE_OP_CHECKPOINT("dense");
         } else {
             const uocr_metal_decoder_binding *router = fast->moe_router;
@@ -12494,34 +12768,32 @@ static int metal_run_decoder_decode_one_f16(uocr_metal_context *ctx,
                 return 0;
             }
             RUN_DECODE_TIMED("metal.decode.moe_router",
-                             metal_run_moe_router_buffer_f16(ctx,
-                                                             norm,
-                                                             router,
-                                                             slot,
-                                                             1u,
-                                                             &top_ids,
-                                                             &top_weights,
-                                                             error,
-                                                             error_size));
+                             metal_run_decode_moe_router_one_f16(ctx,
+                                                                 norm,
+                                                                 router,
+                                                                 slot,
+                                                                 &top_ids,
+                                                                 &top_weights,
+                                                                 error,
+                                                                 error_size));
             DECODE_OP_CHECKPOINT("moe_router");
             if (!metal_moe_intermediate_slice(ctx, slot, shared_mid_bytes, &mid)) {
                 return metal_fail(error, error_size, "integrated decode MoE shared intermediate slice is invalid");
             }
             RUN_DECODE_TIMED("metal.decode.moe_shared_experts",
-                             metal_run_dense_swiglu_buffer_f16(ctx,
-                                                               norm,
-                                                               shared_gate,
-                                                               shared_up,
-                                                               shared_down,
-                                                               q,
-                                                               0,
-                                                               1u,
-                                                               UOCR_MOE_SHARED_INTERMEDIATE,
-                                                               mid,
-                                                               v,
-                                                               "integrated decode MoE shared experts",
-                                                               error,
-                                                               error_size));
+                             metal_run_decode_dense_swiglu_one_f16(ctx,
+                                                                   norm,
+                                                                   shared_gate,
+                                                                   shared_up,
+                                                                   shared_down,
+                                                                   q,
+                                                                   0,
+                                                                   UOCR_MOE_SHARED_INTERMEDIATE,
+                                                                   mid,
+                                                                   v,
+                                                                   "integrated decode MoE shared experts",
+                                                                   error,
+                                                                   error_size));
             DECODE_OP_CHECKPOINT("moe_shared");
             expert_slab = ctx->decoder_fast_expert_slabs[layer];
             if (!metal_moe_intermediate_slice(ctx, slot, routed_mid_bytes, &mid)) {
