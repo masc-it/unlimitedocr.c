@@ -4443,17 +4443,7 @@ static int metal_prebuild_mps_vision_workspace_ndarrays(uocr_metal_context *ctx,
                                                         uint32_t global_view_count,
                                                         char *error,
                                                         size_t error_size);
-static int metal_context_sam_transformer_workspace_f16(uocr_metal_context *ctx,
-                                                       const uint16_t *input_bhwc_f16,
-                                                       const uocr_metal_sam_transformer_block_f16 *blocks,
-                                                       uint32_t block_count,
-                                                       uint32_t grid_w,
-                                                       uint32_t grid_h,
-                                                       uocr_metal_dense_output_type output_type,
-                                                       void *out_bhwc,
-                                                       uocr_metal_vision_workspace *scratch,
-                                                       char *error,
-                                                       size_t error_size);
+
 static int metal_context_sam_transformer_batch_workspace_f16_to_slice(uocr_metal_context *ctx,
                                                                       uocr_metal_vision_workspace_slice input_bhwc,
                                                                       const uocr_metal_sam_transformer_block_slices_f16 *blocks,
@@ -21624,82 +21614,6 @@ static int metal_context_sam_transformer_block_workspace_f16(uocr_metal_context 
 
 #undef RUN_SAM_WORKSPACE_BLOCK_STEP
 
-    return 1;
-}
-
-static int metal_context_sam_transformer_workspace_f16(uocr_metal_context *ctx,
-                                                       const uint16_t *input_bhwc_f16,
-                                                       const uocr_metal_sam_transformer_block_f16 *blocks,
-                                                       uint32_t block_count,
-                                                       uint32_t grid_w,
-                                                       uint32_t grid_h,
-                                                       uocr_metal_dense_output_type output_type,
-                                                       void *out_bhwc,
-                                                       uocr_metal_vision_workspace *scratch,
-                                                       char *error,
-                                                       size_t error_size) {
-    metal_clear_error(error, error_size);
-    if (ctx == NULL || input_bhwc_f16 == NULL || blocks == NULL || out_bhwc == NULL || scratch == NULL) {
-        return metal_fail(error, error_size, "invalid Metal SAM workspace transformer request");
-    }
-    if (block_count != UOCR_SAM_BLOCKS) {
-        return metal_fail(error, error_size, "invalid Metal SAM workspace transformer block count %u", block_count);
-    }
-    uint64_t hidden_bytes = 0u;
-    if (!metal_sam_transformer_activation_bytes(grid_w, grid_h, NULL, &hidden_bytes, error, error_size)) {
-        return 0;
-    }
-    if (!metal_vision_slice_has_bytes(scratch->sam_patch_bhwc, hidden_bytes) ||
-        !metal_vision_slice_has_bytes(scratch->sam_transformer_bhwc, hidden_bytes)) {
-        return metal_fail(error, error_size, "Metal SAM workspace transformer state scratch is too small");
-    }
-    for (uint32_t block_index = 0u; block_index < block_count; ++block_index) {
-        if (!metal_sam_transformer_block_has_weights(&blocks[block_index])) {
-            return metal_fail(error, error_size, "invalid Metal SAM workspace transformer block %u weights", block_index);
-        }
-    }
-
-    const uint16_t *current_f16 = input_bhwc_f16;
-    uint16_t *state_a_f16 = scratch->sam_patch_bhwc.f16;
-    uint16_t *state_b_f16 = scratch->sam_transformer_bhwc.f16;
-    uint16_t *next_f16 = state_a_f16;
-    const uint64_t sam_blocks_start_ns = uocr_profile_now_ns();
-    for (uint32_t block_index = 0u; block_index < block_count; ++block_index) {
-        const uint64_t block_start_ns = uocr_profile_now_ns();
-        const int is_last = block_index + 1u == block_count;
-        const uocr_metal_dense_output_type block_output_type = is_last ? output_type : UOCR_METAL_DENSE_OUTPUT_F16;
-        void *block_out = is_last ? out_bhwc : (void *)next_f16;
-        if (block_out == (const void *)current_f16) {
-            return metal_fail(error, error_size, "Metal SAM workspace transformer attempted in-place block output");
-        }
-        if (!metal_context_sam_transformer_block_workspace_f16(ctx,
-                                                               current_f16,
-                                                               &blocks[block_index],
-                                                               grid_w,
-                                                               grid_h,
-                                                               uocr_sam_block_uses_global_attention(block_index),
-                                                               block_output_type,
-                                                               block_out,
-                                                               scratch,
-                                                               error,
-                                                               error_size)) {
-            char detail[512];
-            metal_copy_error_detail(detail, sizeof(detail), error);
-            return metal_fail(error,
-                              error_size,
-                              "failed to compute Metal SAM workspace transformer block %u: %s",
-                              block_index,
-                              detail);
-        }
-        if (!is_last) {
-            current_f16 = (const uint16_t *)block_out;
-            next_f16 = (block_out == (void *)state_a_f16) ? state_b_f16 : state_a_f16;
-        }
-        metal_profile_add_event_now(ctx, "metal.vision.sam_block", block_start_ns);
-        metal_profile_add_event_now_f(ctx, block_start_ns, "metal.vision.sam_block.%02u", block_index);
-    }
-    metal_profile_add_event_now(ctx, "metal.vision.sam_blocks", sam_blocks_start_ns);
-    metal_clear_error(error, error_size);
     return 1;
 }
 
