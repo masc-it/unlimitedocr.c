@@ -11832,6 +11832,285 @@ static int metal_run_rmsnorm_buffer_f16(uocr_metal_context *ctx,
     }
 }
 
+/* ──────────────────────────────────────────────────────────────────────────
+ * Chunked decode: GPU-resident token generation
+ *
+ * Instead of commit/wait per token, we encode N decode steps into one
+ * command batch and commit once.  The GPU chains token → next_token
+ * internally without CPU readback until the chunk boundary.
+ *
+ * Each step in the chunk:
+ *   1. selection: final_norm → no_repeat_collect → lm_head → argmax
+ *      writes token to chunk_token_slots[step]
+ *   2. append:    blit token to no_repeat_sequence
+ *   3. embed:     get_rows(chunk_token_slots[step]) → decode_input
+ *   4. decode:    one decoder forward pass → new hidden state
+ *
+ * All operations use the active command batch; no commit/wait between steps.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+#define UOCR_METAL_DECODE_CHUNK_SIZE 8u
+
+/* Forward declarations needed by chunk decode (defined later in this file) */
+static int metal_run_decoder_decode_one_f16(uocr_metal_context *ctx,
+                                            uint32_t slot,
+                                            uint32_t prompt_length,
+                                            uint32_t generated_count_after_write,
+                                            char *error,
+                                            size_t error_size);
+
+/**
+ * Encode the selection kernel chain for one decode step into the active
+ * command batch, writing the chosen token/score into chunk_token_slots[step]
+ * and chunk_score_slots[step].  The hidden slice must point to the current
+ * decoder hidden state (scratch segment 0).  This is the chunk analogue of
+ * metal_select_next_token_from_hidden_slice_f16 minus the final commit/wait
+ * and CPU readback.
+ */
+static int metal_encode_chunk_step_selection_f16(
+    uocr_metal_context *ctx,
+    uocr_metal_buffer_slice hidden,
+    uocr_metal_buffer_slice norm_scratch,
+    uocr_metal_buffer_slice selection_scratch,
+    uocr_metal_buffer_slice chunk_token_out,   /* single int32 slot for this step */
+    uocr_metal_buffer_slice chunk_score_out,   /* single float slot for this step */
+    uocr_metal_buffer_slice no_repeat_sequence,
+    uint32_t sequence_len,
+    uint32_t no_repeat_ngram_size,
+    uint32_t no_repeat_window,
+    char *error,
+    size_t error_size) {
+    if (ctx == NULL ||
+        !metal_slice_valid(hidden, (uint64_t)UOCR_HIDDEN_SIZE * 2u) ||
+        !metal_slice_valid(norm_scratch, (uint64_t)UOCR_HIDDEN_SIZE * 2u) ||
+        !metal_slice_valid(selection_scratch, metal_decode_selection_scratch_bytes_per_slot()) ||
+        !metal_slice_valid(chunk_token_out, sizeof(int32_t)) ||
+        !metal_slice_valid(chunk_score_out, sizeof(float))) {
+        return metal_fail(error, error_size, "invalid chunk step selection request");
+    }
+
+    const uocr_metal_decoder_binding *final_norm =
+        metal_require_decoder_binding_index(ctx, ctx->decoder_bindings.final_norm,
+                                            "final norm", error, error_size);
+    if (final_norm == NULL) return 0;
+
+    const uint32_t banned_capacity = metal_no_repeat_candidate_count(
+        sequence_len, no_repeat_ngram_size, no_repeat_window);
+
+    uocr_metal_decode_selection_slices selection_slices;
+    if (!metal_decode_selection_slices(selection_scratch, banned_capacity, &selection_slices)) {
+        return metal_fail(error, error_size, "chunk step selection scratch layout is invalid");
+    }
+
+    if (!metal_run_rmsnorm_buffer_f16(ctx, hidden, final_norm, 1u, norm_scratch,
+                                      "chunk decode final RMSNorm", error, error_size)) {
+        return 0;
+    }
+
+    if (metal_lm_head_backend_is_mps()) {
+        /* MPS path: ban_flags at end of selection_scratch */
+        uocr_metal_buffer_slice mps_ban_flags;
+        if (!metal_mps_lm_head_ban_flags_slice(selection_scratch, &mps_ban_flags)) {
+            return metal_fail(error, error_size, "MPS chunk LM head: failed to compute ban_flags slice");
+        }
+        if (banned_capacity != 0u) {
+            if (!metal_run_no_repeat_collect_ban_flags_to_slice(ctx, no_repeat_sequence,
+                                                                mps_ban_flags,
+                                                                sequence_len,
+                                                                no_repeat_ngram_size,
+                                                                no_repeat_window,
+                                                                banned_capacity,
+                                                                error, error_size)) {
+                return 0;
+            }
+        }
+        uocr_metal_buffer_slice lm_head_logits;
+        if (!metal_lm_head_logits_scratch_slice(ctx, 0u, &lm_head_logits)) {
+            return metal_fail(error, error_size, "MPS chunk LM head: failed to get lm_head_logits slice");
+        }
+        if (!metal_run_lm_head_mps_path(ctx, norm_scratch, lm_head_logits, mps_ban_flags,
+                                        chunk_token_out, chunk_score_out, error, error_size)) {
+            return 0;
+        }
+    } else {
+        /* Custom fused path */
+        if (banned_capacity != 0u) {
+            if (!metal_run_no_repeat_collect_ban_flags_to_slice(ctx, no_repeat_sequence,
+                                                                selection_slices.ban_flags,
+                                                                sequence_len,
+                                                                no_repeat_ngram_size,
+                                                                no_repeat_window,
+                                                                banned_capacity,
+                                                                error, error_size)) {
+                return 0;
+            }
+        }
+        if (!metal_run_lm_head_argmax_f16(ctx, norm_scratch,
+                                          selection_slices.ban_flags,
+                                          banned_capacity,
+                                          selection_slices.partial_scores,
+                                          selection_slices.partial_ids,
+                                          selection_slices.partial_count,
+                                          error, error_size)) {
+            return 0;
+        }
+        if (!metal_run_argmax_pairs_to_token(ctx,
+                                             selection_slices.partial_scores,
+                                             selection_slices.partial_ids,
+                                             selection_slices.partial_count,
+                                             chunk_token_out,
+                                             chunk_score_out,
+                                             error, error_size)) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/**
+ * Run a full chunk of decode steps GPU-resident.
+ *
+ * Encodes `chunk_size` sequential decode iterations into one command batch
+ * with no CPU synchronization between steps.  After commit, reads back all
+ * token/score results via the CPU-visible chunk buffer.
+ *
+ * Arguments:
+ *   ctx                    – Metal context
+ *   slot                   – batch slot
+ *   prompt_length          – number of prompt tokens
+ *   generated_before_chunk – tokens already generated before this chunk
+ *   chunk_size             – number of decode steps in this chunk
+ *   hidden                 – current hidden state (segment 0) before first step
+ *   norm_scratch           – RMSNorm scratch segment
+ *   selection_scratch      – logits/ban_flags scratch
+ *   chunk_token_slots      – GPU buffer [chunk_size] int32, CPU-visible
+ *   chunk_score_slots      – GPU buffer [chunk_size] float,  CPU-visible
+ *   chunk_storage_bytes    – sizeof(chunk_token_slots + chunk_score_slots)
+ *   no_repeat_sequence     – GPU no-repeat sequence buffer
+ *   base_sequence_len      – sequence length before chunk started
+ *   no_repeat_ngram_size   – ngram size for no-repeat
+ *   no_repeat_window       – window for no-repeat
+ *   error/error_size       – error output
+ *
+ * Returns 1 on success, 0 on error.
+ */
+static int metal_run_decoder_decode_chunk_f16(
+    uocr_metal_context *ctx,
+    uint32_t slot,
+    uint32_t prompt_length,
+    uint32_t generated_before_chunk,
+    uint32_t chunk_size,
+    uocr_metal_buffer_slice hidden,
+    uocr_metal_buffer_slice norm_scratch,
+    uocr_metal_buffer_slice selection_scratch,
+    uocr_metal_buffer_slice chunk_token_slots,
+    uocr_metal_buffer_slice chunk_score_slots,
+    uocr_metal_buffer_slice no_repeat_sequence,
+    uint32_t base_sequence_len,
+    uint32_t no_repeat_ngram_size,
+    uint32_t no_repeat_window,
+    char *error,
+    size_t error_size) {
+    if (ctx == NULL || chunk_size == 0u || chunk_size > 128u ||
+        !metal_slice_valid(hidden, (uint64_t)UOCR_HIDDEN_SIZE * 2u) ||
+        !metal_slice_valid(norm_scratch, (uint64_t)UOCR_HIDDEN_SIZE * 2u) ||
+        !metal_slice_valid(selection_scratch, metal_decode_selection_scratch_bytes_per_slot()) ||
+        !metal_slice_valid(chunk_token_slots, (uint64_t)chunk_size * sizeof(int32_t)) ||
+        !metal_slice_valid(chunk_score_slots, (uint64_t)chunk_size * sizeof(float))) {
+        return metal_fail(error, error_size, "invalid chunk decode request");
+    }
+
+    /* Selection for step 0 reads the final prefill hidden.  Token embedding for
+     * the selected token must be written to decoder segment 0, because
+     * metal_run_decoder_decode_one_f16() always reads scratch[0].  After each
+     * decode_one, its final-hidden copy also leaves the next selection hidden
+     * in the same segment-0 slice. */
+    uocr_metal_buffer_slice decode_input;
+    uint64_t decode_input_bytes = 0u;
+    if (!metal_hidden_arena_segment_slice(ctx, slot, 0u, 1u, &decode_input, &decode_input_bytes) ||
+        decode_input_bytes != (uint64_t)UOCR_HIDDEN_SIZE * 2u) {
+        return metal_fail(error, error_size, "chunk decode input segment is invalid");
+    }
+    uocr_metal_buffer_slice current_hidden = hidden;
+
+    for (uint32_t step = 0u; step < chunk_size; ++step) {
+        const uint64_t step_start_ns = uocr_profile_now_ns();
+
+        /* 1. Selection: final_norm → no_repeat → lm_head → argmax
+         *    Writes to chunk_token_slots[step], chunk_score_slots[step]. */
+        {
+            uocr_metal_buffer_slice token_out = chunk_token_slots;
+            token_out.offset += (NSUInteger)((uint64_t)step * sizeof(int32_t));
+            uocr_metal_buffer_slice score_out = chunk_score_slots;
+            score_out.offset += (NSUInteger)((uint64_t)step * sizeof(float));
+
+            const uint32_t cur_sequence_len = base_sequence_len + step;
+            if (!metal_encode_chunk_step_selection_f16(ctx,
+                                                       current_hidden,
+                                                       norm_scratch,
+                                                       selection_scratch,
+                                                       token_out,
+                                                       score_out,
+                                                       no_repeat_sequence,
+                                                       cur_sequence_len,
+                                                       no_repeat_ngram_size,
+                                                       no_repeat_window,
+                                                       error, error_size)) {
+                return 0;
+            }
+        }
+        metal_profile_add_event_now(ctx, "metal.chunk.step.selection", step_start_ns);
+
+        /* 2. Append token to no_repeat_sequence at position = base_sequence_len + step */
+        {
+            const uint32_t append_pos = base_sequence_len + step;
+            uocr_metal_buffer_slice token_src = chunk_token_slots;
+            token_src.offset += (NSUInteger)((uint64_t)step * sizeof(int32_t));
+            uint64_t dst_offset = 0u;
+            if (!checked_mul_u64((uint64_t)append_pos, (uint64_t)sizeof(int32_t), &dst_offset) ||
+                dst_offset > (uint64_t)NSUIntegerMax) {
+                return metal_fail(error, error_size, "chunk no-repeat append offset overflow");
+            }
+            uocr_metal_buffer_slice dst_slice = no_repeat_sequence;
+            dst_slice.offset += (NSUInteger)dst_offset;
+            if (!metal_copy_slice(ctx, token_src, dst_slice, (uint64_t)sizeof(int32_t),
+                                  "chunk no-repeat sequence append", error, error_size)) {
+                return 0;
+            }
+        }
+        metal_profile_add_event_now(ctx, "metal.chunk.step.append", step_start_ns);
+
+        /* 3. Token embedding: get_rows from chunk_token_slots[step] → segment 0 */
+        {
+            uocr_metal_buffer_slice token_src = chunk_token_slots;
+            token_src.offset += (NSUInteger)((uint64_t)step * sizeof(int32_t));
+            if (!metal_run_token_embedding_from_token_slot_f16(ctx, token_src, decode_input,
+                                                               error, error_size)) {
+                return 0;
+            }
+        }
+        metal_profile_add_event_now(ctx, "metal.chunk.step.embed", step_start_ns);
+
+        /* 4. Decoder decode_one step.
+         *    Reads from segment 0 (just filled by embedding), writes final
+         *    output back to segment 0 via decode_one's internal final copy. */
+        {
+            const uint32_t generated_count_after = generated_before_chunk + step + 1u;
+            if (!metal_run_decoder_decode_one_f16(ctx, slot, prompt_length,
+                                                  generated_count_after,
+                                                  error, error_size)) {
+                return 0;
+            }
+        }
+        metal_profile_add_event_now(ctx, "metal.chunk.step.decode", step_start_ns);
+        metal_profile_add_event_now(ctx, "metal.chunk.step", step_start_ns);
+
+        current_hidden = decode_input;
+    }
+
+    return 1;
+}
+
 static int metal_select_next_token_from_hidden_slice_f16(uocr_metal_context *ctx,
                                                         uocr_metal_buffer_slice hidden,
                                                         uocr_metal_buffer_slice norm_scratch,
@@ -14053,158 +14332,152 @@ static int metal_context_generate_f16_impl(uocr_metal_context *ctx,
         goto decode_loop_done;                              \
     } while (0)
 
-    while (!uocr_sequence_generation_done(&sequence_state)) {
-        const uint64_t decode_iteration_start_ns = uocr_profile_now_ns();
-        const uint64_t selection_command_encoding_start_ns = uocr_profile_now_ns();
-        if (!metal_command_batch_begin(ctx, error, error_size)) {
-            char detail[512];
-            (void)snprintf(detail, sizeof(detail), "%s", (error != NULL && error[0] != '\0') ? error : "unknown error");
-            UOCR_METAL_DECODE_LOOP_FAIL("integrated Metal fp16 decode command batch begin failed: %s", detail);
-        }
-        metal_profile_add_event_now(ctx, "metal.decode.command_encoding", selection_command_encoding_start_ns);
-        if (metal_decoder_profile_detail_level() >= 1 &&
-            !metal_decoder_profile_checkpoint(ctx, "decode_step_before_selection", 1, error, error_size)) {
-            char detail[512];
-            (void)snprintf(detail, sizeof(detail), "%s", (error != NULL && error[0] != '\0') ? error : "unknown error");
-            UOCR_METAL_DECODE_LOOP_FAIL("integrated Metal fp16 decode-step checkpoint failed: %s", detail);
-        }
-        uint32_t token_id = UINT32_MAX;
-        float score = 0.0f;
-        uocr_no_repeat_ngram_config no_repeat_config;
-        const uint64_t no_repeat_state_start_ns = uocr_profile_now_ns();
-        const int no_repeat_status = uocr_sequence_no_repeat_config(&sequence_state, &no_repeat_config);
-        if (no_repeat_status != UOCR_OK) {
-            UOCR_METAL_DECODE_LOOP_FAIL("integrated Metal fp16 no-repeat state is invalid: %s",
-                                        uocr_status_string(no_repeat_status));
-        }
-        metal_profile_add_event_now(ctx, "metal.no_repeat_state", no_repeat_state_start_ns);
-        metal_profile_add_event_now(ctx, "metal.decode.no_repeat_state", no_repeat_state_start_ns);
-        const uint64_t token_selection_start_ns = uocr_profile_now_ns();
-        const uocr_metal_hot_path_alloc_guard token_selection_guard = metal_hot_path_alloc_guard_begin(ctx);
-        const int token_selection_ok = metal_select_next_token_from_hidden_slice_f16(ctx,
-                                                                                    hidden_for_selection,
-                                                                                    norm_scratch,
-                                                                                    selection_scratch,
-                                                                                    token_slot,
-                                                                                    score_slot,
-                                                                                    no_repeat_sequence,
-                                                                                    no_repeat_config.sequence != NULL ? no_repeat_config.sequence_len : sequence_state.token_history_count,
-                                                                                    no_repeat_config.ngram_size,
-                                                                                    no_repeat_config.window,
-                                                                                    &token_id,
-                                                                                    &score,
-                                                                                    error,
-                                                                                    error_size);
-        if (!metal_hot_path_alloc_guard_end(ctx,
-                                            &token_selection_guard,
-                                            "integrated Metal fp16 token-selection hot path",
-                                            error,
-                                            error_size)) {
-            char detail[512];
-            (void)snprintf(detail, sizeof(detail), "%s", (error != NULL && error[0] != '\0') ? error : "unknown error");
-            UOCR_METAL_DECODE_LOOP_FAIL("integrated Metal fp16 token-selection hot path guard failed: %s", detail);
-        }
-        if (!token_selection_ok) {
-            char detail[512];
-            (void)snprintf(detail, sizeof(detail), "%s", (error != NULL && error[0] != '\0') ? error : "unknown error");
-            UOCR_METAL_DECODE_LOOP_FAIL("integrated Metal fp16 next-token selection failed: %s", detail);
-        }
-        metal_profile_add_event_now(ctx, "metal.next_token_selection", token_selection_start_ns);
-        if (sequence_state.generated_count == 0u) {
-            metal_profile_add_event_now(ctx, "metal.first_token", token_selection_start_ns);
-        }
-        if (token_id >= UOCR_VOCAB_SIZE) {
-            UOCR_METAL_DECODE_LOOP_FAIL("integrated Metal fp16 selected invalid token id %u", token_id);
-        }
-
-        const uint64_t cpu_sequence_update_start_ns = uocr_profile_now_ns();
-        const uint32_t generated_index = sequence_state.generated_count;
-        const int accept_status = uocr_sequence_accept_generated_token(&sequence_state, (int32_t)token_id, NULL, 0u);
-        if (accept_status != UOCR_OK) {
-            UOCR_METAL_DECODE_LOOP_FAIL("integrated Metal fp16 generated-token state update failed: %s",
-                                        uocr_status_string(accept_status));
-        }
-        if (result->generated_scores_f32_or_null != NULL) {
-            result->generated_scores_f32_or_null[generated_index] = score;
-        }
-        result->generated_count = sequence_state.generated_count;
-        result->last_token_id = token_id;
-        result->last_score_f32 = score;
-        if (sequence_state.token_history_count == 0u || sequence_state.token_history_count > (uint32_t)sequence_len_u64) {
-            UOCR_METAL_DECODE_LOOP_FAIL("integrated Metal fp16 no-repeat sequence append index is invalid");
-        }
-        metal_profile_add_event_now(ctx, "metal.decode.cpu_sequence_update", cpu_sequence_update_start_ns);
-        if (sequence_state.eos) {
-            result->stopped_on_eos = 1u;
-            break;
-        }
-        if (uocr_sequence_generation_done(&sequence_state)) {
-            metal_profile_add_event_now(ctx, "metal.decode_iteration", decode_iteration_start_ns);
-            break;
-        }
-
-        metal_profile_add_event_ms(ctx, "metal.decode.token_slot_reuse", 0.0);
-        const uint64_t decode_command_encoding_start_ns = uocr_profile_now_ns();
-        if (!metal_command_batch_begin(ctx, error, error_size)) {
-            char detail[512];
-            (void)snprintf(detail, sizeof(detail), "%s", (error != NULL && error[0] != '\0') ? error : "unknown error");
-            UOCR_METAL_DECODE_LOOP_FAIL("integrated Metal fp16 decode command batch begin failed: %s", detail);
-        }
-        metal_profile_add_event_now(ctx, "metal.decode.command_encoding", decode_command_encoding_start_ns);
-        const uint64_t no_repeat_append_start_ns = uocr_profile_now_ns();
-        uocr_metal_buffer_slice no_repeat_append = no_repeat_sequence;
-        uint64_t no_repeat_append_offset = 0u;
-        if (!checked_mul_u64((uint64_t)(sequence_state.token_history_count - 1u),
-                             (uint64_t)sizeof(int32_t),
-                             &no_repeat_append_offset) ||
-            no_repeat_append_offset > (uint64_t)NSUIntegerMax ||
-            no_repeat_append.offset > NSUIntegerMax - (NSUInteger)no_repeat_append_offset) {
-            UOCR_METAL_DECODE_LOOP_FAIL("integrated Metal fp16 no-repeat sequence append offset is invalid");
-        }
-        no_repeat_append.offset += (NSUInteger)no_repeat_append_offset;
-        if (!metal_copy_slice(ctx,
-                              token_slot,
-                              no_repeat_append,
-                              (uint64_t)sizeof(int32_t),
-                              "integrated no-repeat sequence append",
-                              error,
-                              error_size)) {
-            char detail[512];
-            (void)snprintf(detail, sizeof(detail), "%s", (error != NULL && error[0] != '\0') ? error : "unknown error");
-            UOCR_METAL_DECODE_LOOP_FAIL("integrated Metal fp16 no-repeat sequence append failed: %s", detail);
-        }
-        metal_profile_add_event_now(ctx, "metal.decode.no_repeat_sequence_append", no_repeat_append_start_ns);
-        const uint64_t decode_step_start_ns = uocr_profile_now_ns();
-        uocr_metal_buffer_slice decode_input;
-        uint64_t decode_input_bytes = 0u;
-        if (!metal_hidden_arena_segment_slice(ctx, request->slot, 0u, 1u, &decode_input, &decode_input_bytes) ||
-            decode_input_bytes != (uint64_t)UOCR_HIDDEN_SIZE * 2u) {
-            UOCR_METAL_DECODE_LOOP_FAIL("integrated Metal fp16 generated-token embedding slice is invalid");
-        }
-        const uint64_t token_embedding_start_ns = uocr_profile_now_ns();
-        if (!metal_run_token_embedding_from_token_slot_f16(ctx, token_slot, decode_input, error, error_size)) {
-            char detail[512];
-            (void)snprintf(detail, sizeof(detail), "%s", (error != NULL && error[0] != '\0') ? error : "unknown error");
-            UOCR_METAL_DECODE_LOOP_FAIL("integrated Metal fp16 generated-token embedding failed: %s", detail);
-        }
-        metal_profile_add_event_now(ctx, "metal.decode.token_embedding", token_embedding_start_ns);
-        if (!metal_run_decoder_decode_one_f16(ctx,
-                                              request->slot,
-                                              request->n_tokens,
-                                              sequence_state.generated_count,
-                                              error,
-                                              error_size)) {
-            char detail[512];
-            (void)snprintf(detail, sizeof(detail), "%s", (error != NULL && error[0] != '\0') ? error : "unknown error");
-            UOCR_METAL_DECODE_LOOP_FAIL("integrated Metal fp16 decode step failed: %s", detail);
-        }
-        if (!metal_hidden_arena_segment_slice(ctx, request->slot, 0u, 1u, &hidden_for_selection, &one_hidden_bytes) ||
-            one_hidden_bytes != (uint64_t)UOCR_HIDDEN_SIZE * 2u) {
-            UOCR_METAL_DECODE_LOOP_FAIL("integrated Metal fp16 decode hidden slice is invalid");
-        }
-        metal_profile_add_event_now(ctx, "metal.decode_step", decode_step_start_ns);
-        metal_profile_add_event_now(ctx, "metal.decode_iteration", decode_iteration_start_ns);
+    /* ── Chunked decode: GPU-resident batch ───────────────────────── */
+    /* Allocate CPU-visible shared buffer for chunk token/score results.
+     * Worst case: one chunk of UOCR_METAL_DECODE_CHUNK_SIZE tokens. */
+    const uint32_t chunk_capacity = UOCR_METAL_DECODE_CHUNK_SIZE;
+    uint64_t chunk_buf_bytes = 0u;
+    if (!checked_mul_u64((uint64_t)chunk_capacity, (uint64_t)sizeof(int32_t), &chunk_buf_bytes) ||
+        !checked_add_u64(chunk_buf_bytes, (uint64_t)chunk_capacity * (uint64_t)sizeof(float), &chunk_buf_bytes) ||
+        chunk_buf_bytes > (uint64_t)SIZE_MAX || chunk_buf_bytes > (uint64_t)NSUIntegerMax) {
+        UOCR_METAL_DECODE_LOOP_FAIL("chunk buffer byte-size overflow");
     }
+    id<MTLBuffer> chunk_buffer = metal_new_buffer_with_length(ctx,
+                                                              (NSUInteger)chunk_buf_bytes,
+                                                              MTLResourceStorageModeShared);
+    if (chunk_buffer == nil) {
+        UOCR_METAL_DECODE_LOOP_FAIL("failed to allocate chunk decode buffer");
+    }
+    chunk_buffer.label = @"uocr_decode_chunk_results";
+    uocr_metal_buffer_slice chunk_tokens;
+    chunk_tokens.buffer = chunk_buffer;
+    chunk_tokens.offset = 0u;
+    uocr_metal_buffer_slice chunk_scores;
+    chunk_scores.buffer = chunk_buffer;
+    chunk_scores.offset = (NSUInteger)((uint64_t)chunk_capacity * sizeof(int32_t));
+
+    int chunk_loop_eos = 0;
+
+    while (!chunk_loop_eos && !uocr_sequence_generation_done(&sequence_state)) {
+        const uint64_t chunk_start_ns = uocr_profile_now_ns();
+        const uint32_t generated_before_chunk = sequence_state.generated_count;
+        const uint32_t total_remaining = request->max_new_tokens - generated_before_chunk;
+        const uint32_t this_chunk_size = total_remaining < chunk_capacity ? total_remaining : chunk_capacity;
+
+        /* Get no-repeat configuration for the first step of this chunk.
+         * Subsequent steps compute GPU-resident with updated sequence len. */
+        uocr_no_repeat_ngram_config no_repeat_config;
+        const int nr_status = uocr_sequence_no_repeat_config(&sequence_state, &no_repeat_config);
+        if (nr_status != UOCR_OK) {
+            [chunk_buffer release];
+            UOCR_METAL_DECODE_LOOP_FAIL("integrated Metal fp16 no-repeat state is invalid: %s",
+                                        uocr_status_string(nr_status));
+        }
+        const uint32_t base_sequence_len = no_repeat_config.sequence != NULL ?
+                                               no_repeat_config.sequence_len :
+                                               sequence_state.token_history_count;
+        const uint32_t nr_ngram_size = no_repeat_config.ngram_size;
+        const uint32_t nr_window = no_repeat_config.window;
+
+        /* Open a single command batch for the whole chunk */
+        if (!metal_command_batch_begin(ctx, error, error_size)) {
+            [chunk_buffer release];
+            char detail[512];
+            (void)snprintf(detail, sizeof(detail), "%s", (error != NULL && error[0] != '\0') ? error : "unknown error");
+            UOCR_METAL_DECODE_LOOP_FAIL("chunk decode command batch begin failed: %s", detail);
+        }
+
+        /* Encode this_chunk_size decode steps GPU-resident */
+        if (!metal_run_decoder_decode_chunk_f16(ctx,
+                                                request->slot,
+                                                request->n_tokens,
+                                                generated_before_chunk,
+                                                this_chunk_size,
+                                                hidden_for_selection,
+                                                norm_scratch,
+                                                selection_scratch,
+                                                chunk_tokens,
+                                                chunk_scores,
+                                                no_repeat_sequence,
+                                                base_sequence_len,
+                                                nr_ngram_size,
+                                                nr_window,
+                                                error, error_size)) {
+            [chunk_buffer release];
+            char detail[512];
+            (void)snprintf(detail, sizeof(detail), "%s", (error != NULL && error[0] != '\0') ? error : "unknown error");
+            UOCR_METAL_DECODE_LOOP_FAIL("chunk decode steps failed: %s", detail);
+        }
+
+        /* Commit and wait for the chunk to complete */
+        const uint64_t chunk_wait_start_ns = uocr_profile_now_ns();
+        if (!metal_command_batch_commit_and_wait(ctx, "chunk decode batch", error, error_size)) {
+            [chunk_buffer release];
+            char detail[512];
+            (void)snprintf(detail, sizeof(detail), "%s", (error != NULL && error[0] != '\0') ? error : "unknown error");
+            UOCR_METAL_DECODE_LOOP_FAIL("chunk decode commit/wait failed: %s", detail);
+        }
+        metal_profile_add_event_now(ctx, "metal.chunk.wait", chunk_wait_start_ns);
+        metal_profile_add_event_now(ctx, "metal.chunk", chunk_start_ns);
+
+        /* Read back tokens and scores from CPU-visible buffer */
+        volatile int32_t *tokens_ptr = (volatile int32_t *)[chunk_buffer contents];
+        volatile float *scores_ptr = (volatile float *)((uint8_t *)[chunk_buffer contents] +
+                                                         (NSUInteger)((uint64_t)chunk_capacity * sizeof(int32_t)));
+
+        for (uint32_t i = 0u; i < this_chunk_size; ++i) {
+            const int32_t token_id = (int32_t)tokens_ptr[i];
+            const float score = (float)scores_ptr[i];
+
+            if (token_id < 0 || (uint32_t)token_id >= UOCR_VOCAB_SIZE) {
+                [chunk_buffer release];
+                UOCR_METAL_DECODE_LOOP_FAIL("chunk decode selected invalid token id %d at step %u",
+                                            (int)token_id, i);
+            }
+            if (generated_before_chunk + i >= result->generated_capacity) {
+                [chunk_buffer release];
+                UOCR_METAL_DECODE_LOOP_FAIL("chunk decode generated count exceeds capacity");
+            }
+
+            const uint32_t gen_index = sequence_state.generated_count;
+            const int accept_status = uocr_sequence_accept_generated_token(
+                &sequence_state, token_id, NULL, 0u);
+            if (accept_status != UOCR_OK) {
+                [chunk_buffer release];
+                UOCR_METAL_DECODE_LOOP_FAIL("chunk decode accept generated token failed: %s",
+                                            uocr_status_string(accept_status));
+            }
+            if (result->generated_scores_f32_or_null != NULL) {
+                result->generated_scores_f32_or_null[gen_index] = score;
+            }
+            result->generated_count = sequence_state.generated_count;
+            result->last_token_id = (uint32_t)token_id;
+            result->last_score_f32 = score;
+
+            if (sequence_state.eos) {
+                result->stopped_on_eos = 1u;
+                chunk_loop_eos = 1;
+                /* Trim at EOS: the remaining tokens in this chunk beyond EOS
+                 * are junk; the caller sees generated_count as stopped. */
+                metal_profile_add_event_ms(ctx, "metal.chunk.eos_trim", 0.0);
+                break;
+            }
+        }
+
+        /* Update hidden_for_selection for the next chunk.
+         * After decode_one, the output is in segment 0. */
+        if (!chunk_loop_eos && !uocr_sequence_generation_done(&sequence_state)) {
+            if (!metal_hidden_arena_segment_slice(ctx, request->slot, 0u, 1u,
+                                                  &hidden_for_selection, &one_hidden_bytes) ||
+                one_hidden_bytes != (uint64_t)UOCR_HIDDEN_SIZE * 2u) {
+                [chunk_buffer release];
+                UOCR_METAL_DECODE_LOOP_FAIL("chunk decode hidden slice refresh failed");
+            }
+        }
+    }
+
+    [chunk_buffer release];
+    metal_profile_add_event_now(ctx, "metal.decode_loop", decode_loop_start_ns);
 
 decode_loop_done:
 #undef UOCR_METAL_DECODE_LOOP_FAIL
@@ -14223,7 +14496,6 @@ decode_loop_done:
         metal_command_batch_abort(ctx);
         return metal_fail(error, error_size, "%s", decode_loop_error);
     }
-    metal_profile_add_event_now(ctx, "metal.decode_loop", decode_loop_start_ns);
     metal_clear_error(error, error_size);
     return 1;
 }
