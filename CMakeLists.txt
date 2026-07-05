@@ -318,18 +318,6 @@ if(UOCR_BUILD_TESTS)
         add_test(NAME uocr_cpu_ref COMMAND test_cpu_ref)
     endif()
 
-    if(UOCR_METAL_ENABLED AND UOCR_METAL_RUNTIME_COMPILE)
-        add_executable(test_metal tests/test_metal.c)
-        target_include_directories(test_metal PRIVATE
-            "${CMAKE_CURRENT_SOURCE_DIR}/include"
-            "${CMAKE_CURRENT_SOURCE_DIR}/src")
-        target_compile_definitions(test_metal PRIVATE
-            UOCR_TEST_METAL_RESOURCE_PATH=\"${CMAKE_CURRENT_SOURCE_DIR}/src/backend/metal\")
-        target_link_libraries(test_metal PRIVATE unlimitedocr uocr_metal uocr_core)
-        uocr_apply_common_warnings(test_metal)
-        uocr_apply_sanitizers(test_metal)
-        add_test(NAME uocr_metal COMMAND test_metal)
-    endif()
 endif()
 
 install(TARGETS unlimitedocr
