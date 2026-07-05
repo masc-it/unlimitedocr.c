@@ -14,6 +14,8 @@ from threading import RLock
 from typing import Any, Iterable, Literal, Sequence
 import json
 import math
+import os
+import sys
 
 import numpy as np
 from numpy.typing import NDArray
@@ -183,6 +185,47 @@ def package_resource_dir() -> Path:
     return Path(__file__).resolve().parent / "resources"
 
 
+def _cache_dir() -> Path:
+    env = os.environ.get("UOCR_CACHE_DIR")
+    if env:
+        return Path(env).expanduser()
+    xdg_cache = os.environ.get("XDG_CACHE_HOME")
+    if xdg_cache:
+        return Path(xdg_cache).expanduser() / "unlimitedocr"
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Caches" / "unlimitedocr"
+    return Path.home() / ".cache" / "unlimitedocr"
+
+
+def _env_flag(name: str, *, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return default
+    return value.lower() not in {"0", "false", "no", "off"}
+
+
+def _download_tokenizer_context() -> Path:
+    from huggingface_hub import hf_hub_download
+
+    repo_id = os.environ.get("UOCR_TOKENIZER_REPO_ID") or os.environ.get(
+        "UOCR_SOURCE_MODEL_REPO_ID", "baidu/Unlimited-OCR"
+    )
+    revision = os.environ.get("UOCR_TOKENIZER_REVISION") or os.environ.get("UOCR_SOURCE_MODEL_REVISION") or None
+    cache_dir = _cache_dir() / "context"
+    downloaded = hf_hub_download(
+        repo_id=repo_id,
+        filename="tokenizer.json",
+        revision=revision,
+        cache_dir=str(_cache_dir() / "huggingface"),
+        local_files_only=_env_flag("UOCR_HF_LOCAL_FILES_ONLY", default=False),
+    )
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    tokenizer_path = cache_dir / "tokenizer.json"
+    if not tokenizer_path.exists():
+        tokenizer_path.write_bytes(Path(downloaded).read_bytes())
+    return cache_dir
+
+
 def default_context_dir() -> Path:
     candidates = [
         Path.cwd() / "data" / "context",
@@ -193,7 +236,7 @@ def default_context_dir() -> Path:
     for candidate in candidates:
         if (candidate / "tokenizer.json").exists():
             return candidate
-    return candidates[-1]
+    return _download_tokenizer_context()
 
 
 def default_tokenizer_path() -> Path:

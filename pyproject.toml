@@ -1,7 +1,7 @@
 [project]
 name = "unlimitedocr-c"
-version = "0.1.0"
-description = "Python frontend and C inference core scaffolding for baidu/Unlimited-OCR"
+version = "0.2.1"
+description = "Python frontend and native C/Metal inference engine for baidu/Unlimited-OCR"
 readme = "README.md"
 authors = [
     { name = "Mauro Sciancalepore", email = "maurosciancalepore98@gmail.com" }
