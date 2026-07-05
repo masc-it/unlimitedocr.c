@@ -91,7 +91,9 @@ class RssSampler:
         self.max_rss = 0
         self.samples: list[tuple[str, int]] = []
         self._stop = threading.Event()
-        self._thread = threading.Thread(target=self._run, name="rss-sampler", daemon=True)
+        self._thread = threading.Thread(
+            target=self._run, name="rss-sampler", daemon=True
+        )
 
     def _rss(self) -> int:
         rss = int(self.process.memory_info().rss)
@@ -124,7 +126,9 @@ def default_release_library() -> Path | None:
 
 def default_release_resource() -> str | None:
     release = ROOT / "build" / "release"
-    if (release / "unlimitedocr.metallib").exists() or (release / "kernels" / "uocr_smoke.metal").exists():
+    if (release / "unlimitedocr.metallib").exists() or (
+        release / "kernels" / "uocr_smoke.metal"
+    ).exists():
         return str(release)
     return default_resource_path("metal")
 
@@ -150,15 +154,23 @@ def memory_report_dict(memory: MemoryReport) -> dict[str, Any]:
         "estimated_total_bytes": memory.estimated_total_bytes,
         "vision_workspace_capacity_bytes": memory.vision_workspace_capacity_bytes,
         "vision_workspace_high_watermark_bytes": memory.vision_workspace_high_watermark_bytes,
-        "category_peak_bytes": dict(zip(MEMORY_CATEGORIES, memory.category_peak_bytes, strict=False)),
-        "category_live_bytes": dict(zip(MEMORY_CATEGORIES, memory.category_live_bytes, strict=False)),
+        "category_peak_bytes": dict(
+            zip(MEMORY_CATEGORIES, memory.category_peak_bytes, strict=False)
+        ),
+        "category_live_bytes": dict(
+            zip(MEMORY_CATEGORIES, memory.category_live_bytes, strict=False)
+        ),
     }
 
 
-def profile_report_dict(report: ProfileReport | None, limit: int) -> dict[str, Any] | None:
+def profile_report_dict(
+    report: ProfileReport | None, limit: int
+) -> dict[str, Any] | None:
     if report is None:
         return None
-    events = sorted(report.events, key=lambda event: event.total_ms, reverse=True)[:limit]
+    events = sorted(report.events, key=lambda event: event.total_ms, reverse=True)[
+        :limit
+    ]
     return {
         "enabled": report.enabled,
         "generation_index": report.generation_index,
@@ -236,7 +248,11 @@ def vision_schedule_dict(request: PreparedRequest) -> dict[str, Any]:
     global_views = [view for view in request.views if view.kind == "global"]
     local_count = len(local_views)
     global_count = len(global_views)
-    max_views_per_chunk = min(local_count, local_max_views_per_chunk()) if local_count else (global_count or 1)
+    max_views_per_chunk = (
+        min(local_count, local_max_views_per_chunk())
+        if local_count
+        else (global_count or 1)
+    )
     request_max_view_size = _view_max_size(list(request.views))
 
     chunks: list[dict[str, Any]] = []
@@ -254,16 +270,21 @@ def vision_schedule_dict(request: PreparedRequest) -> dict[str, Any]:
                 kind="global",
                 first_view=first,
                 view_count=count,
-                view_max_size=_view_max_size(global_views[first:first + count]),
+                view_max_size=_view_max_size(global_views[first : first + count]),
                 projected_grid=GLOBAL_QUERIES,
                 projected_token_start=projected_start,
                 final_token_start=first * GLOBAL_VISUAL_TOKENS,
                 final_token_count=count * GLOBAL_VISUAL_TOKENS,
             )
     else:
-        local_visual_rows = (LOCAL_QUERIES * request.crop_grid_w + 1) * (LOCAL_QUERIES * request.crop_grid_h)
+        local_visual_rows = (LOCAL_QUERIES * request.crop_grid_w + 1) * (
+            LOCAL_QUERIES * request.crop_grid_h
+        )
         final_visual_rows = local_visual_rows + GLOBAL_VISUAL_TOKENS
-        projected_rows_total = local_count * LOCAL_QUERIES * LOCAL_QUERIES + GLOBAL_QUERIES * GLOBAL_QUERIES
+        projected_rows_total = (
+            local_count * LOCAL_QUERIES * LOCAL_QUERIES
+            + GLOBAL_QUERIES * GLOBAL_QUERIES
+        )
         for first in range(0, local_count, max_views_per_chunk):
             count = min(max_views_per_chunk, local_count - first)
             projected_start += _append_vision_chunk(
@@ -271,7 +292,7 @@ def vision_schedule_dict(request: PreparedRequest) -> dict[str, Any]:
                 kind="local",
                 first_view=first,
                 view_count=count,
-                view_max_size=_view_max_size(local_views[first:first + count]),
+                view_max_size=_view_max_size(local_views[first : first + count]),
                 projected_grid=LOCAL_QUERIES,
                 projected_token_start=projected_start,
                 final_token_start=0,
@@ -291,9 +312,14 @@ def vision_schedule_dict(request: PreparedRequest) -> dict[str, Any]:
             )
 
     max_chunk_views = max((chunk["view_count"] for chunk in chunks), default=0)
-    max_chunk_projected_rows = max((chunk["projected_token_count"] for chunk in chunks), default=0)
+    max_chunk_projected_rows = max(
+        (chunk["projected_token_count"] for chunk in chunks), default=0
+    )
     chunk_shapes: dict[str, dict[str, Any]] = {}
-    for kind, grid, default_size in (("local", LOCAL_QUERIES, LOCAL_VIEW_SIZE), ("global", GLOBAL_QUERIES, GLOBAL_VIEW_SIZE)):
+    for kind, grid, default_size in (
+        ("local", LOCAL_QUERIES, LOCAL_VIEW_SIZE),
+        ("global", GLOBAL_QUERIES, GLOBAL_VIEW_SIZE),
+    ):
         kind_chunks = [chunk for chunk in chunks if chunk["kind"] == kind]
         if not kind_chunks:
             continue
@@ -301,8 +327,12 @@ def vision_schedule_dict(request: PreparedRequest) -> dict[str, Any]:
             "chunk_count": len(kind_chunks),
             "view_count": local_count if kind == "local" else global_count,
             "max_chunk_views": max(chunk["view_count"] for chunk in kind_chunks),
-            "max_chunk_projected_rows": max(chunk["projected_token_count"] for chunk in kind_chunks),
-            "max_view_size": max(max(chunk["view_max_size"], default_size) for chunk in kind_chunks),
+            "max_chunk_projected_rows": max(
+                chunk["projected_token_count"] for chunk in kind_chunks
+            ),
+            "max_view_size": max(
+                max(chunk["view_max_size"], default_size) for chunk in kind_chunks
+            ),
             "projected_grid_w": grid,
             "projected_grid_h": grid,
             "projected_tokens_per_view": grid * grid,
@@ -342,16 +372,42 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--image", type=Path, default=ROOT / "docs" / "test.png")
     parser.add_argument("--profile", choices=sorted(PRESETS), default="base")
-    parser.add_argument("--model", type=Path, default=None, help=".uocr model path; defaults to normal UnlimitedOCR resolution")
+    parser.add_argument(
+        "--model",
+        type=Path,
+        default=None,
+        help=".uocr model path; defaults to normal UnlimitedOCR resolution",
+    )
     parser.add_argument("--backend", default="metal")
-    parser.add_argument("--library", type=Path, default=default_release_library(), help="native library path; defaults to build/release")
-    parser.add_argument("--resource", type=Path, default=None, help="Metal resource path; defaults to build/release metallib when present")
-    parser.add_argument("--max-new-tokens", type=int, default=None, help="override generation length; omit to mimic demo.ipynb")
+    parser.add_argument(
+        "--library",
+        type=Path,
+        default=default_release_library(),
+        help="native library path; defaults to build/release",
+    )
+    parser.add_argument(
+        "--resource",
+        type=Path,
+        default=None,
+        help="Metal resource path; defaults to build/release metallib when present",
+    )
+    parser.add_argument(
+        "--max-new-tokens",
+        type=int,
+        default=None,
+        help="override generation length; omit to mimic demo.ipynb",
+    )
     parser.add_argument("--memory-budget-bytes", type=int, default=0)
     parser.add_argument("--profile-events", type=int, default=20)
     parser.add_argument("--rss-interval", type=float, default=0.05)
-    parser.add_argument("--no-download", action="store_true", help="do not download/convert a missing model")
-    parser.add_argument("--json", action="store_true", help="emit machine-readable JSON only")
+    parser.add_argument(
+        "--no-download",
+        action="store_true",
+        help="do not download/convert a missing model",
+    )
+    parser.add_argument(
+        "--json", action="store_true", help="emit machine-readable JSON only"
+    )
     return parser.parse_args()
 
 
@@ -394,13 +450,19 @@ def main() -> int:
         timings["prepare_request_s"] = perf_counter() - t
         sampler.checkpoint("after_prepare")
 
-        resource_path = str(args.resource) if args.resource is not None else default_release_resource()
+        resource_path = (
+            str(args.resource)
+            if args.resource is not None
+            else default_release_resource()
+        )
         library_path = str(args.library) if args.library is not None else None
 
         t = perf_counter()
         engine = Engine(
             EngineOptions(
-                model_path=str(model_path) if args.backend.lower() != "cpu-ref" else None,
+                model_path=str(model_path)
+                if args.backend.lower() != "cpu-ref"
+                else None,
                 backend=args.backend,
                 resource_path=resource_path,
                 max_batch=1,
@@ -450,12 +512,16 @@ def main() -> int:
         "backend": args.backend,
         "profile": args.profile,
         "library_path": str(args.library) if args.library is not None else None,
-        "resource_path": str(args.resource) if args.resource is not None else default_release_resource(),
+        "resource_path": str(args.resource)
+        if args.resource is not None
+        else default_release_resource(),
         "prompt_tokens": request.n_tokens,
         "max_new_tokens": request.max_new_tokens,
         "vision_schedule": vision_schedule_dict(request),
         "generated_tokens": generated_count,
-        "tokens_per_second_native": (generated_count / timings["generate_native_s"]) if timings.get("generate_native_s", 0.0) > 0.0 else None,
+        "tokens_per_second_native": (generated_count / timings["generate_native_s"])
+        if timings.get("generate_native_s", 0.0) > 0.0
+        else None,
         "timings_s": timings,
         "rss_peak_bytes": sampler.max_rss,
         "rss_checkpoints_bytes": dict(sampler.samples),
@@ -473,7 +539,9 @@ def main() -> int:
     print(f"image:    {payload['image']}")
     print(f"library:  {payload['library_path']}")
     print(f"resource: {payload['resource_path']}")
-    print(f"request:  profile={args.profile} prompt_tokens={request.n_tokens} max_new_tokens={request.max_new_tokens}")
+    print(
+        f"request:  profile={args.profile} prompt_tokens={request.n_tokens} max_new_tokens={request.max_new_tokens}"
+    )
     schedule = payload["vision_schedule"]
     print(
         "vision:   "
@@ -490,7 +558,9 @@ def main() -> int:
             f"max_chunk_projected_rows={shape['max_chunk_projected_rows']} "
             f"max_view_size={shape['max_view_size']} grid={shape['projected_grid_w']}x{shape['projected_grid_h']}"
         )
-    print(f"output:   generated_tokens={generated_count} native_tok_s={payload['tokens_per_second_native']:.3f}")
+    print(
+        f"output:   generated_tokens={generated_count} native_tok_s={payload['tokens_per_second_native']:.3f}"
+    )
     print("\nTimings:")
     for name, seconds in timings.items():
         print(f"  {name:28s} {seconds * 1000.0:10.3f} ms")
@@ -500,11 +570,21 @@ def main() -> int:
     print(f"  {'sampled_peak':28s} {bytes_human(sampler.max_rss):>12s}")
     if memory_payload is not None:
         print("\nNative memory:")
-        print(f"  total_live                 {bytes_human(memory_payload['total_live_bytes'])}")
-        print(f"  total_peak                 {bytes_human(memory_payload['total_peak_bytes'])}")
-        print(f"  recommended_working_set    {bytes_human(memory_payload['recommended_working_set_bytes'])}")
-        print(f"  vision_workspace_capacity  {bytes_human(memory_payload['vision_workspace_capacity_bytes'])}")
-        print(f"  vision_workspace_highwater {bytes_human(memory_payload['vision_workspace_high_watermark_bytes'])}")
+        print(
+            f"  total_live                 {bytes_human(memory_payload['total_live_bytes'])}"
+        )
+        print(
+            f"  total_peak                 {bytes_human(memory_payload['total_peak_bytes'])}"
+        )
+        print(
+            f"  recommended_working_set    {bytes_human(memory_payload['recommended_working_set_bytes'])}"
+        )
+        print(
+            f"  vision_workspace_capacity  {bytes_human(memory_payload['vision_workspace_capacity_bytes'])}"
+        )
+        print(
+            f"  vision_workspace_highwater {bytes_human(memory_payload['vision_workspace_high_watermark_bytes'])}"
+        )
         print("  category peaks:")
         for name, value in memory_payload["category_peak_bytes"].items():
             if value:
@@ -518,7 +598,7 @@ def main() -> int:
                 f"min={event['min_ms']:.3f} max={event['max_ms']:.3f}"
             )
     print("\nText preview:")
-    print(decoded[:1000])
+    print(decoded)
     return 0
 
 
