@@ -57,9 +57,10 @@ at this Release build explicitly.
 ```python
 from unlimitedocr_c import UnlimitedOCR
 
-with UnlimitedOCR() as ocr:
-    text = ocr.generate("page.png", profile="base")
-    print(text)
+ocr = UnlimitedOCR()
+text = ocr.generate("page.png", profile="base")
+print(text)
+ocr.close()
 ```
 
 `UnlimitedOCR()` resolves the model automatically. Resolution order is:
