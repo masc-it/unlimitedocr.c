@@ -80,7 +80,7 @@
 #endif
 
 #ifndef UOCR_METAL_DECODE_MOE_TOP_K
-#define UOCR_METAL_DECODE_MOE_TOP_K 4u
+#define UOCR_METAL_DECODE_MOE_TOP_K 2u
 #endif
 
 #if UOCR_METAL_DECODE_MOE_TOP_K < 1u || UOCR_METAL_DECODE_MOE_TOP_K > UOCR_MOE_TOP_K
@@ -9116,7 +9116,7 @@ static int metal_prewarm_integrated_decoder_pipelines(uocr_metal_context *ctx, c
                                       expert_count,
                                       top_k];
             id<MTLComputePipelineState> pipeline = metal_get_pipeline_with_constants(ctx,
-                                                                                     "uocr_moe_decode_interleaved_down_sum_combine_tile4_f16_to_f16",
+                                                                                     UOCR_METAL_MOE_ROUTED_DOWN_COMBINE_KERNEL,
                                                                                      constant_key,
                                                                                      constants,
                                                                                      error,
