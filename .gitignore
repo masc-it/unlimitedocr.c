@@ -11,4 +11,8 @@ wheels/
 .venv
 data/
 data.tmp
-.envTesting/
+.env
+Testing/
+
+# pi agent workspace
+.pi/
