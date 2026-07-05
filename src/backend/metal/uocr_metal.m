@@ -65,7 +65,27 @@
 #define UOCR_METAL_MOE_SHARED_GATE_UP_TILED_THREADS 1024u
 #define UOCR_METAL_MOE_ROUTED_GATE_UP_TILE_COLUMNS 4u
 #define UOCR_METAL_MOE_ROUTED_GATE_UP_TILED_THREADS 256u
-#define UOCR_METAL_MOE_ROUTED_DOWN_COMBINE_TILE_COLUMNS 4u
+#define UOCR_METAL_MOE_ROUTED_DOWN_COMBINE_TILE_COLUMNS 8u
+
+/* Select the down-combine kernel name based on tile columns.
+ * Tile8: 160 threadgroups (1280/8), better mid reuse but higher register pressure.
+ * Tile4: 320 threadgroups (1280/4), lower register pressure.
+ */
+#if UOCR_METAL_MOE_ROUTED_DOWN_COMBINE_TILE_COLUMNS == 8u
+#define UOCR_METAL_MOE_ROUTED_DOWN_COMBINE_KERNEL \
+    "uocr_moe_decode_interleaved_down_sum_combine_tile8_f16_to_f16"
+#else
+#define UOCR_METAL_MOE_ROUTED_DOWN_COMBINE_KERNEL \
+    "uocr_moe_decode_interleaved_down_sum_combine_tile4_f16_to_f16"
+#endif
+
+#ifndef UOCR_METAL_DECODE_MOE_TOP_K
+#define UOCR_METAL_DECODE_MOE_TOP_K 4u
+#endif
+
+#if UOCR_METAL_DECODE_MOE_TOP_K < 1u || UOCR_METAL_DECODE_MOE_TOP_K > UOCR_MOE_TOP_K
+#error "UOCR_METAL_DECODE_MOE_TOP_K must be in [1, UOCR_MOE_TOP_K]"
+#endif
 #define UOCR_METAL_FLASH_Q_PER_TG 4u
 #define UOCR_METAL_FLASH_MAX_LANE_VALUES 4u
 #define UOCR_METAL_HALF4_WIDTH 4u
@@ -9060,6 +9080,7 @@ static int metal_prewarm_integrated_decoder_pipelines(uocr_metal_context *ctx, c
         { "uocr_moe_decode_interleaved_down_sum_combine_f16_to_f16", 0 },
         { "uocr_moe_decode_interleaved_down_sum_combine_one_f16_to_f16", 1 },
         { "uocr_moe_decode_interleaved_down_sum_combine_tile4_f16_to_f16", 1 },
+        { "uocr_moe_decode_interleaved_down_sum_combine_tile8_f16_to_f16", 1 },
         { "uocr_moe_combine_f16_to_f16", 1 },
     };
     @autoreleasepool {
@@ -9071,6 +9092,41 @@ static int metal_prewarm_integrated_decoder_pipelines(uocr_metal_context *ctx, c
                 return 0;
             }
         }
+#if UOCR_METAL_ENABLE_MOE_DECODE_KERNELS
+        /* Decode may intentionally use a smaller effective top-k than the
+         * model/prefill top-k.  The hot decode path requests this exact
+         * specialization/key, so prewarm it here; otherwise the no-allocation
+         * guard sees the first decode token grow the pipeline cache. */
+        {
+            MTLFunctionConstantValues *constants = [MTLFunctionConstantValues new];
+            if (constants == nil) {
+                return metal_fail(error, error_size, "failed to allocate Metal decode MoE prewarm constants");
+            }
+            const uint32_t hidden_size = UOCR_HIDDEN_SIZE;
+            const uint32_t intermediate_size = UOCR_MOE_EXPERT_INTERMEDIATE;
+            const uint32_t expert_count = UOCR_ROUTED_EXPERTS;
+            const uint32_t top_k = UOCR_METAL_DECODE_MOE_TOP_K;
+            [constants setConstantValue:&hidden_size type:MTLDataTypeUInt atIndex:UOCR_METAL_FC_HIDDEN_SIZE];
+            [constants setConstantValue:&expert_count type:MTLDataTypeUInt atIndex:UOCR_METAL_FC_MOE_EXPERTS];
+            [constants setConstantValue:&top_k type:MTLDataTypeUInt atIndex:UOCR_METAL_FC_MOE_TOP_K];
+            [constants setConstantValue:&intermediate_size type:MTLDataTypeUInt atIndex:UOCR_METAL_FC_MOE_EXPERT_INTERMEDIATE];
+            NSString *constant_key = [NSString stringWithFormat:@"#integrated-moe-decode:h%u:i%u:e%u:k%u",
+                                      hidden_size,
+                                      intermediate_size,
+                                      expert_count,
+                                      top_k];
+            id<MTLComputePipelineState> pipeline = metal_get_pipeline_with_constants(ctx,
+                                                                                     "uocr_moe_decode_interleaved_down_sum_combine_tile4_f16_to_f16",
+                                                                                     constant_key,
+                                                                                     constants,
+                                                                                     error,
+                                                                                     error_size);
+            [constants release];
+            if (pipeline == nil) {
+                return 0;
+            }
+        }
+#endif
         if (metal_mps_framework_available() && metal_ensure_mps_matmul_kernel(ctx, error, error_size) == nil) {
             return 0;
         }
@@ -13238,6 +13294,10 @@ static int metal_run_moe_interleaved_decode_fused_combine_buffer_f16(uocr_metal_
 #else
         const int use_tiled_routed_gate_up = 0;
 #endif
+        /* Decode uses fewer routed experts (UOCR_METAL_DECODE_MOE_TOP_K) than
+         * prefill (UOCR_MOE_TOP_K).  Buffers remain sized for the max top_k. */
+        const uint32_t routed_top_k =
+            use_decode_kernels ? (uint32_t)UOCR_METAL_DECODE_MOE_TOP_K : (uint32_t)UOCR_MOE_TOP_K;
         id<MTLComputePipelineState> gate_pipeline = nil;
         id<MTLComputePipelineState> down_combine_pipeline = nil;
         if (use_decode_kernels) {
@@ -13248,7 +13308,7 @@ static int metal_run_moe_interleaved_decode_fused_combine_buffer_f16(uocr_metal_
             const uint32_t hidden_size = UOCR_HIDDEN_SIZE;
             const uint32_t intermediate_size = UOCR_MOE_EXPERT_INTERMEDIATE;
             const uint32_t expert_count = UOCR_ROUTED_EXPERTS;
-            const uint32_t top_k = UOCR_MOE_TOP_K;
+            const uint32_t top_k = routed_top_k;
             [constants setConstantValue:&hidden_size type:MTLDataTypeUInt atIndex:UOCR_METAL_FC_HIDDEN_SIZE];
             [constants setConstantValue:&expert_count type:MTLDataTypeUInt atIndex:UOCR_METAL_FC_MOE_EXPERTS];
             [constants setConstantValue:&top_k type:MTLDataTypeUInt atIndex:UOCR_METAL_FC_MOE_TOP_K];
@@ -13304,7 +13364,7 @@ static int metal_run_moe_interleaved_decode_fused_combine_buffer_f16(uocr_metal_
         prefill_params.hidden_size = UOCR_HIDDEN_SIZE;
         prefill_params.intermediate_size = UOCR_MOE_EXPERT_INTERMEDIATE;
         prefill_params.expert_count = UOCR_ROUTED_EXPERTS;
-        prefill_params.top_k = UOCR_MOE_TOP_K;
+        prefill_params.top_k = routed_top_k;
         prefill_params.expert_stride_values = (uint32_t)(projection_values * 3u);
         prefill_params.up_offset_values = (uint32_t)projection_values;
         prefill_params.down_offset_values = (uint32_t)(projection_values * 2u);
@@ -13312,7 +13372,7 @@ static int metal_run_moe_interleaved_decode_fused_combine_buffer_f16(uocr_metal_
         decode_params.hidden_size = UOCR_HIDDEN_SIZE;
         decode_params.intermediate_size = UOCR_MOE_EXPERT_INTERMEDIATE;
         decode_params.expert_count = UOCR_ROUTED_EXPERTS;
-        decode_params.top_k = UOCR_MOE_TOP_K;
+        decode_params.top_k = routed_top_k;
         decode_params.expert_stride_values = (uint32_t)(projection_values * 3u);
         decode_params.up_offset_values = (uint32_t)projection_values;
         decode_params.down_offset_values = (uint32_t)(projection_values * 2u);
@@ -13328,10 +13388,10 @@ static int metal_run_moe_interleaved_decode_fused_combine_buffer_f16(uocr_metal_
                                            gate_pipeline.maxTotalThreadsPerThreadgroup) :
             metal_power2_threadgroup_width(n_tokens == 1u ? 256u : 64u, gate_pipeline.maxTotalThreadsPerThreadgroup);
         const NSUInteger gate_threadgroups = use_tiled_routed_gate_up ?
-            (NSUInteger)n_tokens * (NSUInteger)UOCR_MOE_TOP_K *
+            (NSUInteger)n_tokens * (NSUInteger)routed_top_k *
                 (((NSUInteger)UOCR_MOE_EXPERT_INTERMEDIATE + (NSUInteger)UOCR_METAL_MOE_ROUTED_GATE_UP_TILE_COLUMNS - 1u) /
                  (NSUInteger)UOCR_METAL_MOE_ROUTED_GATE_UP_TILE_COLUMNS) :
-            (NSUInteger)gate_values;
+            (NSUInteger)n_tokens * (NSUInteger)routed_top_k * (NSUInteger)UOCR_MOE_EXPERT_INTERMEDIATE;
         [enc setComputePipelineState:gate_pipeline];
         [enc setBuffer:input.buffer offset:input.offset atIndex:0u];
         [enc setBuffer:top_ids.buffer offset:top_ids.offset atIndex:1u];
