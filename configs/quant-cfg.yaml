@@ -62,7 +62,7 @@ modules:
   - name: visual_projector
     family: PROJECTOR
     projections: [WEIGHT]
-    supported: false
+    supported: true
 
   - name: clip_mlp
     family: VISION_CLIP

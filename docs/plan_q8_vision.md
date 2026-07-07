@@ -384,12 +384,12 @@ Current path: `metal_context_visual_projector_f16_to_slice()` runs MPS matmul
 
 Checklist:
 
-* [ ] Add fused Q8 projector kernel: fp16 input `[rows,2048]`, Q8 weight
+* [x] Add fused Q8 projector kernel: fp16 input `[rows,2048]`, Q8 weight
       `[1280,2048]`, fp16 bias `[1280]`, fp16 output `[rows,1280]`.
-* [ ] Accumulate in fp32, add bias, write fp16.
-* [ ] Dispatch Q8 projector when `projector_weight.qtype == UOCR_TENSOR_Q8_0`.
-* [ ] Keep projector bias fp16.
-* [ ] Flip `visual_projector.supported: true` only after end-to-end QA.
+* [x] Accumulate in fp32, add bias, write fp16.
+* [x] Dispatch Q8 projector when `projector_weight.qtype == UOCR_TENSOR_Q8_0`.
+* [x] Keep projector bias fp16.
+* [x] Enable `visual_projector.supported: true` for end-to-end QA.
 
 ### 4.3 CLIP MLP Q8
 
@@ -564,7 +564,7 @@ Already-QA'd Q8 modules:
   LM head
 
 New vision-Q8 target modules, QA-gated in order:
-  visual projector                      pending
+  visual projector                      enabled for user QA
   CLIP MLP fc1/fc2                      pending
   CLIP attention QKV/O                  pending
   SAM MLP lin1/lin2                     pending

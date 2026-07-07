@@ -243,6 +243,13 @@ typedef struct uocr_metal_vision_tensor_f16 {
     uocr_metal_buffer_slice slice;
     uint64_t byte_length;
     const uint16_t *host_f16;
+    uint32_t qtype;
+    uint32_t rows;
+    uint32_t cols;
+    uint32_t group_size;
+    uint32_t groups_per_row;
+    uocr_metal_buffer_slice scale_slice;
+    uint64_t scale_byte_length;
 } uocr_metal_vision_tensor_f16;
 
 typedef struct uocr_metal_sam_transformer_block_slices_f16 {
@@ -1203,6 +1210,17 @@ typedef struct uocr_metal_clip_sam_concat_params {
     uint32_t projector_in_size;
 } uocr_metal_clip_sam_concat_params;
 
+typedef struct uocr_metal_projector_q8_params {
+    uint32_t n_rows;
+    uint32_t input_size;
+    uint32_t output_size;
+    uint32_t group_size;
+    uint32_t groups_per_row;
+    uint32_t reserved0;
+    uint32_t reserved1;
+    uint32_t reserved2;
+} uocr_metal_projector_q8_params;
+
 typedef struct uocr_metal_sam_layernorm2d_params {
     uint32_t grid_width;
     uint32_t grid_height;
@@ -1272,6 +1290,8 @@ _Static_assert(sizeof(uocr_metal_clip_abs_pos_params) == 20u,
                "uocr_metal_clip_abs_pos_params ABI mismatch");
 _Static_assert(sizeof(uocr_metal_clip_sam_concat_params) == 16u,
                "uocr_metal_clip_sam_concat_params ABI mismatch");
+_Static_assert(sizeof(uocr_metal_projector_q8_params) == 32u,
+               "uocr_metal_projector_q8_params ABI mismatch");
 _Static_assert(sizeof(uocr_metal_get_rows_q8_params) == 32u,
                "uocr_metal_get_rows_q8_params ABI mismatch");
 _Static_assert(sizeof(uocr_metal_sam_layernorm2d_params) == 20u,
@@ -3788,6 +3808,9 @@ static int metal_repack_conv3x3_ohwi(uocr_metal_context *ctx,
         dst->slice.offset = 0u;
         dst->byte_length = bytes;
         dst->host_f16 = repacked;
+        dst->qtype = UOCR_TENSOR_F16;
+        dst->rows = out_c;
+        dst->cols = 9u * in_c;
     }
     return 1;
 }
@@ -4154,12 +4177,12 @@ static uint32_t metal_clip_sorted_layer_index_for_layer(uint32_t layer) {
     return 17u + (layer - 3u);
 }
 
-static int metal_vision_tensor_from_binding_cache_f16(const uocr_metal_vision_binding_cache *cache,
-                                                      uint32_t tensor_id,
-                                                      const char *role,
-                                                      uocr_metal_vision_tensor_f16 *out_tensor,
-                                                      char *error,
-                                                      size_t error_size) {
+static int metal_vision_tensor_from_binding_cache(const uocr_metal_vision_binding_cache *cache,
+                                                   uint32_t tensor_id,
+                                                   const char *role,
+                                                   uocr_metal_vision_tensor_f16 *out_tensor,
+                                                   char *error,
+                                                   size_t error_size) {
     if (out_tensor == NULL) {
         return metal_fail(error, error_size, "invalid Metal vision tensor slice output");
     }
@@ -4171,17 +4194,6 @@ static int metal_vision_tensor_from_binding_cache_f16(const uocr_metal_vision_bi
     if (binding == NULL) {
         return metal_fail(error, error_size, "missing validated %s binding for tensor %u", role, tensor_id);
     }
-    if (binding->qtype != UOCR_TENSOR_F16) {
-        return metal_fail(error,
-                          error_size,
-                          "%s tensor %u is %s, but the current Metal vision call site requires fp16; add a fused Q8 kernel before enabling this module",
-                          role,
-                          tensor_id,
-                          uocr_tensor_qtype_name(binding->qtype));
-    }
-    if ((binding->payload_size % 2u) != 0u || ((uint64_t)binding->offset % 2u) != 0u) {
-        return metal_fail(error, error_size, "%s tensor %u has an unaligned fp16 payload", role, tensor_id);
-    }
     if (binding->buffer == nil) {
         return metal_fail(error, error_size, "vision tensor %u has a nil Metal buffer binding", tensor_id);
     }
@@ -4192,17 +4204,64 @@ static int metal_vision_tensor_from_binding_cache_f16(const uocr_metal_vision_bi
                           role,
                           tensor_id);
     }
-    const uint8_t *contents = (const uint8_t *)[binding->buffer contents];
-    if (contents == NULL) {
+    if (binding->qtype == UOCR_TENSOR_Q8_0) {
+        if (binding->scale_buffer == nil || binding->scale_size == 0u ||
+            !metal_buffer_range_valid(binding->scale_buffer, binding->scale_offset, binding->scale_size)) {
+            return metal_fail(error, error_size, "%s tensor %u has an invalid q8 scale binding", role, tensor_id);
+        }
+    } else if (binding->qtype != UOCR_TENSOR_F16) {
         return metal_fail(error,
                           error_size,
-                          "vision tensor %u is not CPU-visible for the current host-pointer vision helpers",
-                          tensor_id);
+                          "%s tensor %u has unsupported qtype %s",
+                          role,
+                          tensor_id,
+                          uocr_tensor_qtype_name(binding->qtype));
     }
+
     out_tensor->slice.buffer = binding->buffer;
     out_tensor->slice.offset = binding->offset;
     out_tensor->byte_length = binding->payload_size;
-    out_tensor->host_f16 = (const uint16_t *)(const void *)(contents + binding->offset);
+    out_tensor->qtype = binding->qtype;
+    out_tensor->rows = binding->rows;
+    out_tensor->cols = binding->cols;
+    out_tensor->group_size = binding->group_size;
+    out_tensor->groups_per_row = binding->groups_per_row;
+    out_tensor->scale_slice.buffer = binding->scale_buffer;
+    out_tensor->scale_slice.offset = binding->scale_offset;
+    out_tensor->scale_byte_length = binding->scale_size;
+    if (binding->qtype == UOCR_TENSOR_F16) {
+        if ((binding->payload_size % 2u) != 0u || ((uint64_t)binding->offset % 2u) != 0u) {
+            return metal_fail(error, error_size, "%s tensor %u has an unaligned fp16 payload", role, tensor_id);
+        }
+        const uint8_t *contents = (const uint8_t *)[binding->buffer contents];
+        if (contents == NULL) {
+            return metal_fail(error,
+                              error_size,
+                              "vision tensor %u is not CPU-visible for the current host-pointer vision helpers",
+                              tensor_id);
+        }
+        out_tensor->host_f16 = (const uint16_t *)(const void *)(contents + binding->offset);
+    }
+    return 1;
+}
+
+static int metal_vision_tensor_from_binding_cache_f16(const uocr_metal_vision_binding_cache *cache,
+                                                      uint32_t tensor_id,
+                                                      const char *role,
+                                                      uocr_metal_vision_tensor_f16 *out_tensor,
+                                                      char *error,
+                                                      size_t error_size) {
+    if (!metal_vision_tensor_from_binding_cache(cache, tensor_id, role, out_tensor, error, error_size)) {
+        return 0;
+    }
+    if (out_tensor->qtype != UOCR_TENSOR_F16 || out_tensor->host_f16 == NULL) {
+        return metal_fail(error,
+                          error_size,
+                          "%s tensor %u is %s, but the current Metal vision call site requires fp16; add a fused Q8 kernel before enabling this module",
+                          role != NULL ? role : "vision tensor",
+                          tensor_id,
+                          uocr_tensor_qtype_name(out_tensor->qtype));
+    }
     return 1;
 }
 
@@ -4236,7 +4295,14 @@ static int metal_vision_weight_cache_build_direct(const uocr_metal_vision_bindin
 
     ASSIGN_VISION_TENSOR(image_newline, UOCR_TENSOR_ID_IMAGE_NEWLINE, "image newline");
     ASSIGN_VISION_TENSOR(view_separator, UOCR_TENSOR_ID_VIEW_SEPARATOR, "view separator");
-    ASSIGN_VISION_TENSOR(projector_weight, UOCR_TENSOR_ID_PROJECTOR_WEIGHT, "visual projector weight");
+    if (!metal_vision_tensor_from_binding_cache(binding_cache,
+                                                UOCR_TENSOR_ID_PROJECTOR_WEIGHT,
+                                                "visual projector weight",
+                                                &out_weights->projector_weight,
+                                                error,
+                                                error_size)) {
+        return 0;
+    }
     ASSIGN_VISION_TENSOR(projector_bias, UOCR_TENSOR_ID_PROJECTOR_BIAS, "visual projector bias");
 
     const uint32_t sam_extra = UOCR_TENSOR_ID_VISION_SAM_BASE + UOCR_SAM_BLOCKS * 14u;
@@ -4949,8 +5015,8 @@ static int metal_vision_require_tensor_slice_f16(uocr_metal_vision_tensor_f16 te
                                                  const char *label,
                                                  char *error,
                                                  size_t error_size) {
-    if (tensor.slice.buffer == nil || tensor.host_f16 == NULL || byte_length == 0u || byte_length > tensor.byte_length ||
-        !metal_slice_valid(tensor.slice, byte_length)) {
+    if (tensor.qtype != UOCR_TENSOR_F16 || tensor.slice.buffer == nil || tensor.host_f16 == NULL ||
+        byte_length == 0u || byte_length > tensor.byte_length || !metal_slice_valid(tensor.slice, byte_length)) {
         return metal_fail(error, error_size, "invalid Metal vision %s tensor slice", label != NULL ? label : "weight");
     }
     return 1;
@@ -5095,6 +5161,7 @@ static int metal_precompute_sam_abs_pos_tables(uocr_metal_context *ctx,
         weights->sam_pos_embed_local.slice.offset = 0u;
         weights->sam_pos_embed_local.byte_length = target_bytes;
         weights->sam_pos_embed_local.host_f16 = (const uint16_t *)[local_buffer contents];
+        weights->sam_pos_embed_local.qtype = UOCR_TENSOR_F16;
         metal_profile_add_event_ms(ctx, "metal.vision.sam_abs_pos_precompute.local", 0.0);
     }
     return 1;
@@ -5298,11 +5365,13 @@ static int metal_precompute_sam_rel_pos_tables(uocr_metal_context *ctx,
             block->rel_pos_h_local.slice.offset = rel_h_offsets[layer];
             block->rel_pos_h_local.byte_length = table_bytes;
             block->rel_pos_h_local.host_f16 = (const uint16_t *)(const void *)(contents + rel_h_offsets[layer]);
+            block->rel_pos_h_local.qtype = UOCR_TENSOR_F16;
             block->rel_pos_h_local_length = target_length;
             block->rel_pos_w_local.slice.buffer = local_buffer;
             block->rel_pos_w_local.slice.offset = rel_w_offsets[layer];
             block->rel_pos_w_local.byte_length = table_bytes;
             block->rel_pos_w_local.host_f16 = (const uint16_t *)(const void *)(contents + rel_w_offsets[layer]);
+            block->rel_pos_w_local.qtype = UOCR_TENSOR_F16;
             block->rel_pos_w_local_length = target_length;
         }
         metal_profile_add_event_ms(ctx, "metal.vision.sam_rel_pos_precompute.local", 0.0);
@@ -5442,6 +5511,7 @@ static int metal_precompute_clip_abs_pos_tables(uocr_metal_context *ctx,
         weights->clip_pos_embed_local.slice.offset = 0u;
         weights->clip_pos_embed_local.byte_length = target_bytes;
         weights->clip_pos_embed_local.host_f16 = (const uint16_t *)[local_buffer contents];
+        weights->clip_pos_embed_local.qtype = UOCR_TENSOR_F16;
         metal_profile_add_event_ms(ctx, "metal.vision.clip_abs_pos_precompute.local", 0.0);
     }
     return 1;
@@ -6239,6 +6309,97 @@ static int metal_context_clip_sam_concat_f16_to_slice(uocr_metal_context *ctx,
                                                            error_size);
 }
 
+static int metal_run_visual_projector_q8_0_to_slice(uocr_metal_context *ctx,
+                                                     uocr_metal_vision_workspace_slice input,
+                                                     uocr_metal_vision_tensor_f16 weight,
+                                                     uocr_metal_vision_tensor_f16 bias,
+                                                     uint32_t n_rows,
+                                                     uocr_metal_vision_workspace_slice out_rows,
+                                                     char *error,
+                                                     size_t error_size) {
+    uint64_t input_values = 0u;
+    uint64_t input_bytes = 0u;
+    uint64_t output_values = 0u;
+    uint64_t output_bytes = 0u;
+    const uint64_t qweight_bytes = (uint64_t)UOCR_HIDDEN_SIZE * (uint64_t)UOCR_PROJECTOR_IN_SIZE;
+    const uint64_t qscale_bytes = uocr_q8_0_qscale_bytes(UOCR_HIDDEN_SIZE,
+                                                         UOCR_PROJECTOR_IN_SIZE,
+                                                         UOCR_Q8_GROUP_SIZE_DEFAULT);
+    const uint64_t bias_bytes = (uint64_t)UOCR_HIDDEN_SIZE * 2u;
+    if (qscale_bytes == 0u ||
+        !checked_mul_u64((uint64_t)n_rows, (uint64_t)UOCR_PROJECTOR_IN_SIZE, &input_values) ||
+        !checked_mul_u64((uint64_t)n_rows, (uint64_t)UOCR_HIDDEN_SIZE, &output_values) ||
+        !metal_vision_f16_bytes(input_values, &input_bytes) ||
+        !metal_vision_f16_bytes(output_values, &output_bytes) ||
+        !metal_vision_require_workspace_slice(input, input_bytes, "visual projector input", error, error_size) ||
+        !metal_vision_require_workspace_slice(out_rows, output_bytes, "visual projector output", error, error_size) ||
+        weight.qtype != UOCR_TENSOR_Q8_0 || weight.rows != UOCR_HIDDEN_SIZE || weight.cols != UOCR_PROJECTOR_IN_SIZE ||
+        weight.group_size != UOCR_Q8_GROUP_SIZE_DEFAULT ||
+        weight.groups_per_row != UOCR_PROJECTOR_IN_SIZE / UOCR_Q8_GROUP_SIZE_DEFAULT ||
+        weight.slice.buffer == nil || weight.byte_length != qweight_bytes || !metal_slice_valid(weight.slice, qweight_bytes) ||
+        weight.scale_slice.buffer == nil || weight.scale_byte_length != qscale_bytes ||
+        !metal_slice_valid(weight.scale_slice, qscale_bytes) ||
+        !metal_vision_require_tensor_slice_f16(bias, bias_bytes, "visual projector bias", error, error_size)) {
+        return metal_fail(error, error_size, "invalid Metal visual projector q8_0 inputs");
+    }
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, "uocr_visual_projector_tile4_q8_0_to_f16", error, error_size);
+        if (pipeline == nil) {
+            return 0;
+        }
+        int owned_command_buffer = 0;
+        id<MTLCommandBuffer> cb = metal_command_buffer_for_op(ctx,
+                                                              &owned_command_buffer,
+                                                              "Metal visual projector Q8",
+                                                              error,
+                                                              error_size);
+        if (cb == nil) {
+            return 0;
+        }
+        if (owned_command_buffer) {
+            cb.label = @"uocr_visual_projector_q8_command_buffer";
+        }
+        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
+        if (enc == nil) {
+            return metal_fail(error, error_size, "failed to create Metal visual projector Q8 encoder");
+        }
+        uocr_metal_projector_q8_params params;
+        memset(&params, 0, sizeof(params));
+        params.n_rows = n_rows;
+        params.input_size = UOCR_PROJECTOR_IN_SIZE;
+        params.output_size = UOCR_HIDDEN_SIZE;
+        params.group_size = UOCR_Q8_GROUP_SIZE_DEFAULT;
+        params.groups_per_row = UOCR_PROJECTOR_IN_SIZE / UOCR_Q8_GROUP_SIZE_DEFAULT;
+        const NSUInteger threads = 1024u;
+        if (pipeline.maxTotalThreadsPerThreadgroup < threads) {
+            return metal_fail(error, error_size, "Metal visual projector Q8 pipeline does not support 1024-thread groups");
+        }
+        [enc setComputePipelineState:pipeline];
+        [enc setBuffer:input.buffer offset:input.offset atIndex:0u];
+        [enc setBuffer:weight.slice.buffer offset:weight.slice.offset atIndex:1u];
+        [enc setBuffer:weight.scale_slice.buffer offset:weight.scale_slice.offset atIndex:2u];
+        [enc setBuffer:bias.slice.buffer offset:bias.slice.offset atIndex:3u];
+        [enc setBuffer:out_rows.buffer offset:out_rows.offset atIndex:4u];
+        [enc setBytes:&params length:sizeof(params) atIndex:5u];
+        [enc setThreadgroupMemoryLength:threads * sizeof(float) atIndex:0u];
+        const NSUInteger tiles_per_row = ((NSUInteger)UOCR_HIDDEN_SIZE + 3u) / 4u;
+        const uint64_t q8_start_ns = uocr_profile_now_ns();
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_rows * tiles_per_row, 1u, 1u)
+            threadsPerThreadgroup:MTLSizeMake(threads, 1u, 1u)];
+        [enc endEncoding];
+        const int ok = metal_finish_command_buffer_for_op(ctx,
+                                                          cb,
+                                                          owned_command_buffer,
+                                                          "Metal visual projector Q8",
+                                                          error,
+                                                          error_size);
+        if (ok) {
+            metal_profile_add_event_now(ctx, "metal.vision.projector_q8", q8_start_ns);
+        }
+        return ok;
+    }
+}
+
 static int metal_context_visual_projector_f16_to_slice(uocr_metal_context *ctx,
                                                        uocr_metal_vision_workspace_slice input,
                                                        uocr_metal_vision_tensor_f16 weight,
@@ -6247,6 +6408,16 @@ static int metal_context_visual_projector_f16_to_slice(uocr_metal_context *ctx,
                                                        uocr_metal_vision_workspace_slice out_rows,
                                                        char *error,
                                                        size_t error_size) {
+    if (weight.qtype == UOCR_TENSOR_Q8_0) {
+        return metal_run_visual_projector_q8_0_to_slice(ctx,
+                                                        input,
+                                                        weight,
+                                                        bias,
+                                                        n_rows,
+                                                        out_rows,
+                                                        error,
+                                                        error_size);
+    }
     uint64_t input_values = 0u;
     uint64_t input_bytes = 0u;
     uint64_t output_values = 0u;
