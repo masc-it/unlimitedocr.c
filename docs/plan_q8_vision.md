@@ -371,7 +371,7 @@ Checklist:
 * [ ] Add focused fragments, not a monolithic file:
   * [x] `projector_q8.metal`
   * [x] `clip_q8.metal`
-  * [ ] `sam_q8.metal`
+  * [x] `sam_q8.metal`
   * optional later: `sam_conv_q8.metal`
 * [x] Add fragments to `tools/gen_metal.py` near the matching fp16 files.
 * [x] Regenerate `src/backend/metal/kernels/uocr_smoke.metal`.
@@ -427,14 +427,15 @@ Current path: SAM transformer MLP uses MPS matmul for lin1/lin2 around GELU.
 
 Checklist:
 
-* [ ] Add Q8 SAM lin1 kernel: fp16 hidden `[tokens,768]`, Q8 weight
-      `[3072,768]`, fp16 bias, GELU, fp16 intermediate.
-* [ ] Add Q8 SAM lin2 kernel: fp16 intermediate `[tokens,3072]`, Q8 weight
+* [x] Add Q8 SAM lin1 kernel: fp16 hidden `[tokens,768]`, Q8 weight
+      `[3072,768]`, fp16 bias, erf-GELU (matching the fp16 path), fp16
+      intermediate.
+* [x] Add Q8 SAM lin2 kernel: fp16 intermediate `[tokens,3072]`, Q8 weight
       `[768,3072]`, fp16 bias, residual output fp16.
-* [ ] Support both global and windowed SAM block token layouts used by current
-      kernels.
-* [ ] Preserve SAM LayerNorm fp16.
-* [ ] Flip `sam_mlp.supported: true` only after QA.
+* [x] Support both global and windowed SAM block token layouts used by current
+      kernels (the MLP operates on flat token rows shared by both paths).
+* [x] Preserve SAM LayerNorm fp16.
+* [x] Enable `sam_mlp.supported: true` for end-to-end QA.
 
 ### 4.6 SAM attention Q8
 
@@ -531,12 +532,12 @@ Checklist:
    * wire dispatch;
    * enable `clip_mlp` and QA.
 
-5. **CLIP attention Q8** — implemented, awaiting QA
+5. **CLIP attention Q8** — complete (QA'd)
    * implement QKV/O Q8 kernels;
    * wire dispatch;
    * enable `clip_attention` and QA.
 
-6. **SAM MLP Q8**
+6. **SAM MLP Q8** — implemented, awaiting QA
    * implement lin1/lin2 Q8 kernels;
    * wire dispatch for global/window block usage;
    * enable `sam_mlp` and QA.
@@ -567,8 +568,8 @@ Already-QA'd Q8 modules:
 New vision-Q8 target modules, QA-gated in order:
   visual projector                      QA'd
   CLIP MLP fc1/fc2                      QA'd
-  CLIP attention QKV/O                  enabled for user QA
-  SAM MLP lin1/lin2                     pending
+  CLIP attention QKV/O                  QA'd
+  SAM MLP lin1/lin2                     enabled for user QA
   SAM attention QKV/O                   pending
 
 Still fp16 in first vision deliverable:

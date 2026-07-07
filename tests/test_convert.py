@@ -272,11 +272,11 @@ def test_vision_registry_roles_are_stable_for_rank2_linears() -> None:
 
 def test_mixed_q8_default_cfg_only_quantizes_runtime_supported_modules() -> None:
     cfg = load_default_quant_config()
-    for name in ("visual_projector", "clip_mlp", "clip_attention"):
+    for name in ("visual_projector", "clip_mlp", "clip_attention", "sam_mlp"):
         module = cfg.module_by_name(name)
         assert module is not None
         assert module.supported is True
-    for name in ("sam_mlp", "sam_attention"):
+    for name in ("sam_attention", "sam_patch_embed", "sam_neck_convs"):
         module = cfg.module_by_name(name)
         assert module is not None
         assert module.supported is False
@@ -307,7 +307,8 @@ def test_mixed_q8_default_cfg_only_quantizes_runtime_supported_modules() -> None
     assert clip_fc1.row_size == 1024
     assert clip_qkv.qtype_id == UOCR_TENSOR_Q8_0
     assert clip_qkv.row_size == 1024
-    assert sam_fc1.qtype == UOCR_TENSOR_F16_NAME
+    assert sam_fc1.qtype_id == UOCR_TENSOR_Q8_0
+    assert sam_fc1.row_size == 768
     assert sam_qkv.qtype == UOCR_TENSOR_F16_NAME
 
 

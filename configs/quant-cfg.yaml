@@ -77,7 +77,7 @@ modules:
   - name: sam_mlp
     family: VISION_SAM
     projections: [VISION_MLP_FC1, VISION_MLP_FC2]
-    supported: false
+    supported: true
 
   - name: sam_attention
     family: VISION_SAM

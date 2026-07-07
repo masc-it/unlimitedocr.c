@@ -1226,6 +1226,11 @@ enum {
     UOCR_METAL_CLIP_Q8_ACT_QUICKGELU = 1u
 };
 
+enum {
+    UOCR_METAL_SAM_Q8_ACT_NONE = 0u,
+    UOCR_METAL_SAM_Q8_ACT_GELU_ERF = 1u
+};
+
 typedef struct uocr_metal_clip_linear_q8_params {
     uint32_t n_rows;
     uint32_t input_size;
@@ -2347,7 +2352,7 @@ static int metal_precompute_clip_abs_pos_tables(uocr_metal_context *ctx,
 static const uocr_metal_vision_weights_f16 *metal_require_vision_weights_f16(const uocr_metal_context *ctx,
                                                                              char *error,
                                                                              size_t error_size);
-static int metal_sam_transformer_block_has_weights(const uocr_metal_sam_transformer_block_f16 *block);
+static int metal_sam_transformer_block_slices_have_weights(const uocr_metal_sam_transformer_block_slices_f16 *block);
 static int metal_clip_transformer_block_slices_ready(const uocr_metal_clip_transformer_block_slices_f16 *block);
 static void metal_copy_error_detail(char *detail, size_t detail_size, const char *error);
 
@@ -4358,6 +4363,20 @@ static int metal_vision_weight_cache_build_direct(const uocr_metal_vision_bindin
         host_block->host_field = direct_block->block_field.host_f16;                                    \
     } while (0)
 
+/* MLP lin1/lin2 weights may be Q8_0; the fused Q8 kernel path consumes qweight/qscale slices. */
+#define ASSIGN_SAM_BLOCK_WEIGHT_ANY_QTYPE(block_field, tensor_id, role, host_field)                    \
+    do {                                                                                                \
+        if (!metal_vision_tensor_from_binding_cache(binding_cache,                                      \
+                                                    (tensor_id),                                        \
+                                                    (role),                                             \
+                                                    &(direct_block->block_field),                       \
+                                                    error,                                              \
+                                                    error_size)) {                                      \
+            return 0;                                                                                   \
+        }                                                                                               \
+        host_block->host_field = direct_block->block_field.host_f16;                                    \
+    } while (0)
+
     for (uint32_t layer = 0u; layer < UOCR_SAM_BLOCKS; ++layer) {
         const uint32_t base = UOCR_TENSOR_ID_VISION_SAM_BASE + metal_sam_sorted_block_index_for_layer(layer) * 14u;
         uocr_metal_sam_transformer_block_slices_f16 *direct_block = &out_weights->sam_block_slices[layer];
@@ -4369,9 +4388,9 @@ static int metal_vision_weight_cache_build_direct(const uocr_metal_vision_bindin
         ASSIGN_SAM_BLOCK_TENSOR(rel_pos_h, base + 4u, "SAM relative position H", rel_pos_h_f16);
         ASSIGN_SAM_BLOCK_TENSOR(rel_pos_w, base + 5u, "SAM relative position W", rel_pos_w_f16);
         ASSIGN_SAM_BLOCK_TENSOR(mlp_lin1_bias, base + 6u, "SAM MLP lin1 bias", mlp_lin1_bias_f16);
-        ASSIGN_SAM_BLOCK_TENSOR(mlp_lin1_weight, base + 7u, "SAM MLP lin1 weight", mlp_lin1_weight_f16);
+        ASSIGN_SAM_BLOCK_WEIGHT_ANY_QTYPE(mlp_lin1_weight, base + 7u, "SAM MLP lin1 weight", mlp_lin1_weight_f16);
         ASSIGN_SAM_BLOCK_TENSOR(mlp_lin2_bias, base + 8u, "SAM MLP lin2 bias", mlp_lin2_bias_f16);
-        ASSIGN_SAM_BLOCK_TENSOR(mlp_lin2_weight, base + 9u, "SAM MLP lin2 weight", mlp_lin2_weight_f16);
+        ASSIGN_SAM_BLOCK_WEIGHT_ANY_QTYPE(mlp_lin2_weight, base + 9u, "SAM MLP lin2 weight", mlp_lin2_weight_f16);
         ASSIGN_SAM_BLOCK_TENSOR(norm1_bias, base + 10u, "SAM norm1 bias", norm1_bias_f16);
         ASSIGN_SAM_BLOCK_TENSOR(norm1_weight, base + 11u, "SAM norm1 weight", norm1_weight_f16);
         ASSIGN_SAM_BLOCK_TENSOR(norm2_bias, base + 12u, "SAM norm2 bias", norm2_bias_f16);
@@ -4380,12 +4399,13 @@ static int metal_vision_weight_cache_build_direct(const uocr_metal_vision_bindin
         direct_block->rel_pos_w_length = direct_block->rel_pos_h_length;
         host_block->rel_pos_h_length = direct_block->rel_pos_h_length;
         host_block->rel_pos_w_length = direct_block->rel_pos_w_length;
-        if (!metal_sam_transformer_block_has_weights(host_block)) {
+        if (!metal_sam_transformer_block_slices_have_weights(direct_block)) {
             return metal_fail(error, error_size, "incomplete SAM transformer block %u direct vision bindings", layer);
         }
     }
 
 #undef ASSIGN_SAM_BLOCK_TENSOR
+#undef ASSIGN_SAM_BLOCK_WEIGHT_ANY_QTYPE
 
 #define ASSIGN_CLIP_BLOCK_TENSOR(block_field, tensor_id, role, host_field)                             \
     do {                                                                                                \
@@ -16250,7 +16270,7 @@ static int sam_window_partition_geometry(uint32_t grid_w,
     *out_n_windows = (uint32_t)n_windows;
     return 1;
 }
-static int metal_clip_weight_slice_ready(const uocr_metal_vision_tensor_f16 *weight) {
+static int metal_vision_weight_slice_ready(const uocr_metal_vision_tensor_f16 *weight) {
     if (weight == NULL) {
         return 0;
     }
@@ -16273,10 +16293,10 @@ static int metal_clip_transformer_block_slices_ready(const uocr_metal_clip_trans
                                 block->ln2_weight.host_f16 != NULL && block->ln2_bias.host_f16 != NULL &&
                                 block->mlp_fc1_bias.host_f16 != NULL && block->mlp_fc2_bias.host_f16 != NULL;
     return fixed_f16_ready &&
-           metal_clip_weight_slice_ready(&block->qkv_weight) &&
-           metal_clip_weight_slice_ready(&block->out_proj_weight) &&
-           metal_clip_weight_slice_ready(&block->mlp_fc1_weight) &&
-           metal_clip_weight_slice_ready(&block->mlp_fc2_weight);
+           metal_vision_weight_slice_ready(&block->qkv_weight) &&
+           metal_vision_weight_slice_ready(&block->out_proj_weight) &&
+           metal_vision_weight_slice_ready(&block->mlp_fc1_weight) &&
+           metal_vision_weight_slice_ready(&block->mlp_fc2_weight);
 }
 
 static void metal_copy_error_detail(char *detail, size_t detail_size, const char *error) {
@@ -16384,29 +16404,32 @@ static int metal_context_clip_attention_batch_f16_to_slice(uocr_metal_context *c
 }
 
 /*
- * Fused Q8_0 CLIP linear: out = act(src @ qweightᵀ + bias).
+ * Fused Q8_0 vision linear: out = act(src @ qweightᵀ + bias).
  * Reads int8 qweights and fp16 scales in-kernel; no dequantized weight buffer.
+ * pipeline_name selects the family-specific kernel (CLIP QuickGELU vs SAM
+ * erf-GELU activation semantics); both share the same parameter ABI.
  */
-static int metal_run_clip_linear_q8_0(uocr_metal_context *ctx,
-                                      uocr_metal_buffer_slice input,
-                                      uocr_metal_vision_tensor_f16 weight,
-                                      uocr_metal_vision_tensor_f16 bias,
-                                      uint32_t n_rows,
-                                      uint32_t input_size,
-                                      uint32_t output_size,
-                                      uint32_t activation,
-                                      uocr_metal_buffer_slice out,
-                                      const char *op_name,
-                                      char *error,
-                                      size_t error_size) {
+static int metal_run_vision_linear_q8_0(uocr_metal_context *ctx,
+                                        const char *pipeline_name,
+                                        uocr_metal_buffer_slice input,
+                                        uocr_metal_vision_tensor_f16 weight,
+                                        uocr_metal_vision_tensor_f16 bias,
+                                        uint32_t n_rows,
+                                        uint32_t input_size,
+                                        uint32_t output_size,
+                                        uint32_t activation,
+                                        uocr_metal_buffer_slice out,
+                                        const char *op_name,
+                                        char *error,
+                                        size_t error_size) {
     const uint64_t bias_bytes = (uint64_t)output_size * 2u;
-    if (ctx == NULL || n_rows == 0u ||
+    if (ctx == NULL || n_rows == 0u || pipeline_name == NULL ||
         !metal_vision_require_weight_q8(weight, output_size, input_size, op_name, error, error_size) ||
         !metal_vision_require_tensor_slice_f16(bias, bias_bytes, op_name, error, error_size)) {
         return 0;
     }
     @autoreleasepool {
-        id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, "uocr_clip_linear_tile4_q8_0_to_f16", error, error_size);
+        id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, pipeline_name, error, error_size);
         if (pipeline == nil) {
             return 0;
         }
@@ -16556,8 +16579,9 @@ static int metal_context_clip_mlp_batch_workspace_f16_to_slice(uocr_metal_contex
     int ok;
     const uint64_t fc1_start_ns = uocr_profile_now_ns();
     if (fc1_is_q8) {
-        ok = metal_run_clip_linear_q8_0(ctx,
-                                        input_slice,
+        ok = metal_run_vision_linear_q8_0(ctx,
+                                          "uocr_clip_linear_tile4_q8_0_to_f16",
+                                          input_slice,
                                         block->mlp_fc1_weight,
                                         block->mlp_fc1_bias,
                                         rows,
@@ -16594,8 +16618,9 @@ static int metal_context_clip_mlp_batch_workspace_f16_to_slice(uocr_metal_contex
     if (ok) {
         const uint64_t fc2_start_ns = uocr_profile_now_ns();
         if (fc2_is_q8) {
-            ok = metal_run_clip_linear_q8_0(ctx,
-                                            fc1_dst_slice,
+            ok = metal_run_vision_linear_q8_0(ctx,
+                                              "uocr_clip_linear_tile4_q8_0_to_f16",
+                                              fc1_dst_slice,
                                             block->mlp_fc2_weight,
                                             block->mlp_fc2_bias,
                                             rows,
@@ -16775,8 +16800,9 @@ static int metal_context_clip_transformer_batch_block_workspace_f16_to_slice(uoc
     if (out_proj_is_q8) {
         const uint64_t out_proj_q8_start_ns = uocr_profile_now_ns();
         RUN_CLIP_BATCH_BLOCK_STEP("output projection",
-                                  metal_run_clip_linear_q8_0(ctx,
-                                                             (uocr_metal_buffer_slice){scratch->clip_block_attention.buffer, scratch->clip_block_attention.offset},
+                                  metal_run_vision_linear_q8_0(ctx,
+                                                               "uocr_clip_linear_tile4_q8_0_to_f16",
+                                                               (uocr_metal_buffer_slice){scratch->clip_block_attention.buffer, scratch->clip_block_attention.offset},
                                                              block->out_proj_weight,
                                                              block->out_proj_bias,
                                                              rows,
@@ -16951,17 +16977,6 @@ static int metal_context_clip_transformer_batch_workspace_f16_to_slice(uocr_meta
 static int metal_vision_slice_has_bytes(uocr_metal_vision_workspace_slice slice, uint64_t bytes) {
     return slice.buffer != nil && bytes != 0u && bytes <= slice.bytes;
 }
-static int metal_sam_transformer_block_has_weights(const uocr_metal_sam_transformer_block_f16 *block) {
-    return block != NULL && block->norm1_weight_f16 != NULL && block->norm1_bias_f16 != NULL &&
-           block->qkv_weight_f16 != NULL && block->qkv_bias_f16 != NULL &&
-           block->proj_weight_f16 != NULL && block->proj_bias_f16 != NULL &&
-           block->rel_pos_h_f16 != NULL && block->rel_pos_w_f16 != NULL &&
-           block->rel_pos_h_length != 0u && block->rel_pos_w_length != 0u &&
-           block->norm2_weight_f16 != NULL && block->norm2_bias_f16 != NULL &&
-           block->mlp_lin1_weight_f16 != NULL && block->mlp_lin1_bias_f16 != NULL &&
-           block->mlp_lin2_weight_f16 != NULL && block->mlp_lin2_bias_f16 != NULL;
-}
-
 static int metal_sam_transformer_activation_bytes(uint32_t grid_w,
                                                   uint32_t grid_h,
                                                   uint64_t *row_count,
@@ -16987,6 +17002,10 @@ static int metal_sam_transformer_activation_bytes(uint32_t grid_w,
     }
     return 1;
 }
+/*
+ * MLP lin1/lin2 weights may be f16 or Q8_0 (dtype-aware slices); all other SAM
+ * block tensors must be CPU-visible fp16.
+ */
 static int metal_sam_transformer_block_slices_have_weights(const uocr_metal_sam_transformer_block_slices_f16 *block) {
     return block != NULL && block->norm1_weight.host_f16 != NULL && block->norm1_bias.host_f16 != NULL &&
            block->qkv_weight.host_f16 != NULL && block->qkv_bias.host_f16 != NULL &&
@@ -16994,8 +17013,8 @@ static int metal_sam_transformer_block_slices_have_weights(const uocr_metal_sam_
            block->rel_pos_h.host_f16 != NULL && block->rel_pos_w.host_f16 != NULL &&
            block->rel_pos_h_length != 0u && block->rel_pos_w_length != 0u &&
            block->norm2_weight.host_f16 != NULL && block->norm2_bias.host_f16 != NULL &&
-           block->mlp_lin1_weight.host_f16 != NULL && block->mlp_lin1_bias.host_f16 != NULL &&
-           block->mlp_lin2_weight.host_f16 != NULL && block->mlp_lin2_bias.host_f16 != NULL;
+           metal_vision_weight_slice_ready(&block->mlp_lin1_weight) && block->mlp_lin1_bias.host_f16 != NULL &&
+           metal_vision_weight_slice_ready(&block->mlp_lin2_weight) && block->mlp_lin2_bias.host_f16 != NULL;
 }
 
 static int metal_context_sam_window_partition_batch_f16_to_slice(uocr_metal_context *ctx,
@@ -17658,6 +17677,8 @@ static int metal_context_sam_mlp_batch_workspace_f16_to_slice(uocr_metal_context
     const uint64_t lin1_bias_bytes = (uint64_t)UOCR_SAM_MLP_INTERMEDIATE * 2u;
     const uint64_t lin2_weight_bytes = (uint64_t)UOCR_SAM_HIDDEN_SIZE * (uint64_t)UOCR_SAM_MLP_INTERMEDIATE * 2u;
     const uint64_t lin2_bias_bytes = (uint64_t)UOCR_SAM_HIDDEN_SIZE * 2u;
+    const int lin1_is_q8 = block != NULL && block->mlp_lin1_weight.qtype == UOCR_TENSOR_Q8_0;
+    const int lin2_is_q8 = block != NULL && block->mlp_lin2_weight.qtype == UOCR_TENSOR_Q8_0;
     if (ctx == NULL || !metal_sam_transformer_block_slices_have_weights(block) || rows == 0u ||
         !checked_mul_u64((uint64_t)rows, (uint64_t)UOCR_SAM_HIDDEN_SIZE, &hidden_values) ||
         !metal_vision_f16_bytes(hidden_values, &hidden_bytes) ||
@@ -17667,9 +17688,11 @@ static int metal_context_sam_mlp_batch_workspace_f16_to_slice(uocr_metal_context
         !metal_vision_require_workspace_slice(input, hidden_bytes, "SAM batch MLP input", error, error_size) ||
         !metal_vision_require_workspace_slice(intermediate, intermediate_bytes, "SAM batch MLP intermediate", error, error_size) ||
         !metal_vision_require_workspace_slice(out, hidden_bytes, "SAM batch MLP output", error, error_size) ||
-        !metal_vision_require_tensor_slice_f16(block->mlp_lin1_weight, lin1_weight_bytes, "SAM MLP lin1 weight", error, error_size) ||
+        (!lin1_is_q8 &&
+         !metal_vision_require_tensor_slice_f16(block->mlp_lin1_weight, lin1_weight_bytes, "SAM MLP lin1 weight", error, error_size)) ||
         !metal_vision_require_tensor_slice_f16(block->mlp_lin1_bias, lin1_bias_bytes, "SAM MLP lin1 bias", error, error_size) ||
-        !metal_vision_require_tensor_slice_f16(block->mlp_lin2_weight, lin2_weight_bytes, "SAM MLP lin2 weight", error, error_size) ||
+        (!lin2_is_q8 &&
+         !metal_vision_require_tensor_slice_f16(block->mlp_lin2_weight, lin2_weight_bytes, "SAM MLP lin2 weight", error, error_size)) ||
         !metal_vision_require_tensor_slice_f16(block->mlp_lin2_bias, lin2_bias_bytes, "SAM MLP lin2 bias", error, error_size)) {
         return 0;
     }
@@ -17677,42 +17700,87 @@ static int metal_context_sam_mlp_batch_workspace_f16_to_slice(uocr_metal_context
     uocr_metal_buffer_slice input_slice = { input.buffer, input.offset };
     uocr_metal_buffer_slice intermediate_slice = { intermediate.buffer, intermediate.offset };
     uocr_metal_buffer_slice out_slice = { out.buffer, out.offset };
-    if (!metal_run_mps_matmul_nt_f16(ctx,
-                                     input_slice,
-                                     block->mlp_lin1_weight.slice,
-                                     intermediate_slice,
-                                     rows,
-                                     UOCR_SAM_HIDDEN_SIZE,
-                                     UOCR_SAM_MLP_INTERMEDIATE,
-                                     "Metal SAM batch MLP lin1 MPS matmul",
-                                     error,
-                                     error_size) ||
-        !metal_run_bias_gelu_f16_inplace(ctx,
+
+    int ok;
+    const uint64_t lin1_start_ns = uocr_profile_now_ns();
+    if (lin1_is_q8) {
+        ok = metal_run_vision_linear_q8_0(ctx,
+                                          "uocr_sam_linear_tile4_q8_0_to_f16",
+                                          input_slice,
+                                          block->mlp_lin1_weight,
+                                          block->mlp_lin1_bias,
+                                          rows,
+                                          UOCR_SAM_HIDDEN_SIZE,
+                                          UOCR_SAM_MLP_INTERMEDIATE,
+                                          UOCR_METAL_SAM_Q8_ACT_GELU_ERF,
+                                          intermediate_slice,
+                                          "Metal SAM batch MLP lin1 Q8",
+                                          error,
+                                          error_size);
+        if (ok) {
+            metal_profile_add_event_now(ctx, "metal.vision.sam_mlp_q8.lin1", lin1_start_ns);
+        }
+    } else {
+        ok = metal_run_mps_matmul_nt_f16(ctx,
+                                         input_slice,
+                                         block->mlp_lin1_weight.slice,
                                          intermediate_slice,
-                                         block->mlp_lin1_bias.slice,
                                          rows,
+                                         UOCR_SAM_HIDDEN_SIZE,
                                          UOCR_SAM_MLP_INTERMEDIATE,
-                                         "Metal SAM batch MLP lin1 bias GELU",
+                                         "Metal SAM batch MLP lin1 MPS matmul",
                                          error,
-                                         error_size) ||
-        !metal_run_mps_matmul_nt_f16(ctx,
-                                     intermediate_slice,
-                                     block->mlp_lin2_weight.slice,
-                                     out_slice,
-                                     rows,
-                                     UOCR_SAM_MLP_INTERMEDIATE,
-                                     UOCR_SAM_HIDDEN_SIZE,
-                                     "Metal SAM batch MLP lin2 MPS matmul",
-                                     error,
-                                     error_size) ||
-        !metal_run_bias_add_f16_inplace(ctx,
-                                        out_slice,
-                                        block->mlp_lin2_bias.slice,
-                                        rows,
-                                        UOCR_SAM_HIDDEN_SIZE,
-                                        "Metal SAM batch MLP lin2 bias add",
-                                        error,
-                                        error_size)) {
+                                         error_size) &&
+             metal_run_bias_gelu_f16_inplace(ctx,
+                                             intermediate_slice,
+                                             block->mlp_lin1_bias.slice,
+                                             rows,
+                                             UOCR_SAM_MLP_INTERMEDIATE,
+                                             "Metal SAM batch MLP lin1 bias GELU",
+                                             error,
+                                             error_size);
+    }
+    if (ok) {
+        const uint64_t lin2_start_ns = uocr_profile_now_ns();
+        if (lin2_is_q8) {
+            ok = metal_run_vision_linear_q8_0(ctx,
+                                              "uocr_sam_linear_tile4_q8_0_to_f16",
+                                              intermediate_slice,
+                                              block->mlp_lin2_weight,
+                                              block->mlp_lin2_bias,
+                                              rows,
+                                              UOCR_SAM_MLP_INTERMEDIATE,
+                                              UOCR_SAM_HIDDEN_SIZE,
+                                              UOCR_METAL_SAM_Q8_ACT_NONE,
+                                              out_slice,
+                                              "Metal SAM batch MLP lin2 Q8",
+                                              error,
+                                              error_size);
+            if (ok) {
+                metal_profile_add_event_now(ctx, "metal.vision.sam_mlp_q8.lin2", lin2_start_ns);
+            }
+        } else {
+            ok = metal_run_mps_matmul_nt_f16(ctx,
+                                             intermediate_slice,
+                                             block->mlp_lin2_weight.slice,
+                                             out_slice,
+                                             rows,
+                                             UOCR_SAM_MLP_INTERMEDIATE,
+                                             UOCR_SAM_HIDDEN_SIZE,
+                                             "Metal SAM batch MLP lin2 MPS matmul",
+                                             error,
+                                             error_size) &&
+                 metal_run_bias_add_f16_inplace(ctx,
+                                                out_slice,
+                                                block->mlp_lin2_bias.slice,
+                                                rows,
+                                                UOCR_SAM_HIDDEN_SIZE,
+                                                "Metal SAM batch MLP lin2 bias add",
+                                                error,
+                                                error_size);
+        }
+    }
+    if (!ok) {
         char detail[512];
         metal_copy_error_detail(detail, sizeof(detail), error);
         return metal_fail(error, error_size, "failed to compute Metal SAM batch MLP: %s", detail);
