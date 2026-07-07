@@ -44,12 +44,12 @@ modules:
   - name: dense_mlp
     family: LAYER_DENSE_MLP
     projections: [GATE, UP, DOWN]
-    supported: false
+    supported: true
 
   - name: moe_shared
     family: MOE_SHARED
     projections: [GATE, UP, DOWN]
-    supported: false
+    supported: true
 
   - name: moe_routed_experts
     family: MOE_EXPERT

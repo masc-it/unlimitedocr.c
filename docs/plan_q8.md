@@ -311,9 +311,9 @@ Current gate+up is fused and down projection is a separate MPS/custom path depen
 Checklist:
 
 * [x] Add fused Q8 gate+up SwiGLU kernels that read two Q8 weight views, dequantize inside the dot loops, apply SwiGLU, and write fp16 mid.
-* [ ] Add fused Q8 down projection kernels for fp16 mid → fp16 hidden; no dequantized down-weight buffer is allowed.
+* [x] Add fused Q8 down projection kernels for fp16 mid → fp16 hidden; no dequantized down-weight buffer is allowed.
 * [x] Implement a fused Q8 version of the current tiled shared-expert decode kernel so decode keeps the same tile-column scheduling.
-* [ ] Route `metal_run_decode_dense_swiglu_one_f16()` and `metal_run_dense_swiglu_buffer_f16()` through dtype-aware fp16/Q8 variants.
+* [x] Route `metal_run_decode_dense_swiglu_one_f16()` and `metal_run_dense_swiglu_buffer_f16()` through dtype-aware fp16/Q8 variants.
 
 ### 4.5 Routed MoE experts
 

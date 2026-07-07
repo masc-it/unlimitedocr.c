@@ -246,13 +246,15 @@ def test_mixed_q8_default_cfg_only_quantizes_runtime_supported_modules() -> None
     attn_o = plan.tensor_by_name("model.layers.3.self_attn.o_proj.weight")
     expert_gate = plan.tensor_by_name("model.layers.1.mlp.experts.0.gate_proj.weight")
     shared_gate = plan.tensor_by_name("model.layers.1.mlp.shared_experts.gate_proj.weight")
+    dense_gate = plan.tensor_by_name("model.layers.0.mlp.gate_proj.weight")
     assert tok_embed.qtype_id == UOCR_TENSOR_Q8_0
     assert attn_q.qtype_id == UOCR_TENSOR_Q8_0
     assert attn_o.qtype_id == UOCR_TENSOR_Q8_0
+    assert dense_gate.qtype_id == UOCR_TENSOR_Q8_0
+    assert shared_gate.qtype_id == UOCR_TENSOR_Q8_0
     # Modules without fused Q8 runtime kernels stay fp16 under the default cfg.
     assert lm_head.qtype == "UOCR_TENSOR_F16"
     assert expert_gate.qtype == "UOCR_TENSOR_F16"
-    assert shared_gate.qtype == "UOCR_TENSOR_F16"
 
 
 def test_tensor_directory_bytes_records_fp16_metadata() -> None:

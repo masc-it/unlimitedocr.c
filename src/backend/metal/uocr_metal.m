@@ -12285,6 +12285,139 @@ static int metal_run_attention_output_residual_buffer_f16(uocr_metal_context *ct
                                       error_size);
 }
 
+static int metal_run_dense_swiglu_buffer_q8_0(uocr_metal_context *ctx,
+                                             uocr_metal_buffer_slice input,
+                                             const uocr_metal_decoder_binding *gate_weight,
+                                             const uocr_metal_decoder_binding *up_weight,
+                                             const uocr_metal_decoder_binding *down_weight,
+                                             uocr_metal_buffer_slice residual,
+                                             int has_residual,
+                                             uint32_t n_tokens,
+                                             uint32_t intermediate_size,
+                                             uocr_metal_buffer_slice mid,
+                                             uocr_metal_buffer_slice dst,
+                                             const char *op_name,
+                                             char *error,
+                                             size_t error_size);
+
+static int metal_run_dense_swiglu_buffer_q8_0(uocr_metal_context *ctx,
+                                             uocr_metal_buffer_slice input,
+                                             const uocr_metal_decoder_binding *gate_weight,
+                                             const uocr_metal_decoder_binding *up_weight,
+                                             const uocr_metal_decoder_binding *down_weight,
+                                             uocr_metal_buffer_slice residual,
+                                             int has_residual,
+                                             uint32_t n_tokens,
+                                             uint32_t intermediate_size,
+                                             uocr_metal_buffer_slice mid,
+                                             uocr_metal_buffer_slice dst,
+                                             const char *op_name,
+                                             char *error,
+                                             size_t error_size) {
+    const char *op = op_name != NULL ? op_name : "Metal Q8 SwiGLU";
+    const uint64_t hidden_bytes = (uint64_t)n_tokens * (uint64_t)UOCR_HIDDEN_SIZE * 2u;
+    const uint64_t gate_qweight_bytes = uocr_q8_0_qweight_bytes(intermediate_size, UOCR_HIDDEN_SIZE);
+    const uint64_t gate_qscale_bytes = uocr_q8_0_qscale_bytes(intermediate_size, UOCR_HIDDEN_SIZE, UOCR_Q8_GROUP_SIZE_DEFAULT);
+    const uint64_t down_qweight_bytes = uocr_q8_0_qweight_bytes(UOCR_HIDDEN_SIZE, intermediate_size);
+    const uint64_t down_qscale_bytes = uocr_q8_0_qscale_bytes(UOCR_HIDDEN_SIZE, intermediate_size, UOCR_Q8_GROUP_SIZE_DEFAULT);
+    const uint64_t mid_bytes = (uint64_t)n_tokens * (uint64_t)intermediate_size * 2u;
+    uint64_t gate_values = (uint64_t)n_tokens * (uint64_t)intermediate_size;
+    uint64_t down_values = (uint64_t)n_tokens * (uint64_t)UOCR_HIDDEN_SIZE;
+
+    if (ctx == NULL || gate_weight == NULL || up_weight == NULL || down_weight == NULL || n_tokens == 0u ||
+        intermediate_size == 0u || gate_values > UINT32_MAX || down_values > UINT32_MAX ||
+        gate_weight->qtype != UOCR_TENSOR_Q8_0 || up_weight->qtype != UOCR_TENSOR_Q8_0 ||
+        down_weight->qtype != UOCR_TENSOR_Q8_0 ||
+        gate_weight->payload_size != gate_qweight_bytes || gate_weight->scale_size != gate_qscale_bytes ||
+        up_weight->payload_size != gate_qweight_bytes || up_weight->scale_size != gate_qscale_bytes ||
+        down_weight->payload_size != down_qweight_bytes || down_weight->scale_size != down_qscale_bytes ||
+        !metal_slice_valid(input, hidden_bytes) || !metal_slice_valid(mid, mid_bytes) ||
+        !metal_slice_valid(dst, hidden_bytes) || (has_residual && !metal_slice_valid(residual, hidden_bytes)) ||
+        !metal_buffer_range_valid(gate_weight->buffer, gate_weight->offset, gate_qweight_bytes) ||
+        !metal_buffer_range_valid(gate_weight->scale_buffer, gate_weight->scale_offset, gate_qscale_bytes) ||
+        !metal_buffer_range_valid(up_weight->buffer, up_weight->offset, gate_qweight_bytes) ||
+        !metal_buffer_range_valid(up_weight->scale_buffer, up_weight->scale_offset, gate_qscale_bytes) ||
+        !metal_buffer_range_valid(down_weight->buffer, down_weight->offset, down_qweight_bytes) ||
+        !metal_buffer_range_valid(down_weight->scale_buffer, down_weight->scale_offset, down_qscale_bytes)) {
+        return metal_fail(error, error_size, "invalid %s request", op);
+    }
+
+    const uint32_t groups_per_row_hidden = UOCR_HIDDEN_SIZE / UOCR_Q8_GROUP_SIZE_DEFAULT;
+    const uint32_t groups_per_row_inter = intermediate_size / UOCR_Q8_GROUP_SIZE_DEFAULT;
+
+    @autoreleasepool {
+        /* Prefill uses the non-tiled gate+up kernel; the tiled variant is
+         * decode-only (n_tokens == 1). */
+        id<MTLComputePipelineState> gate_pipeline = metal_get_decoder_shape_pipeline(ctx,
+                                                                                     "uocr_dense_swiglu_gate_up_q8_0_to_f16",
+                                                                                     error,
+                                                                                     error_size);
+        if (gate_pipeline == nil) {
+            return 0;
+        }
+        id<MTLComputePipelineState> down_pipeline = metal_get_decoder_shape_pipeline(ctx, "uocr_dense_swiglu_down_q8_0_to_f16", error, error_size);
+        if (down_pipeline == nil) {
+            return 0;
+        }
+        int owned_command_buffer = 0;
+        id<MTLCommandBuffer> cb = metal_command_buffer_for_op(ctx, &owned_command_buffer, op, error, error_size);
+        if (cb == nil) {
+            return 0;
+        }
+
+        uocr_metal_dense_swiglu_q8_params gate_params;
+        gate_params.n_tokens = n_tokens;
+        gate_params.hidden_size = UOCR_HIDDEN_SIZE;
+        gate_params.intermediate_size = intermediate_size;
+        gate_params.has_residual = has_residual ? 1u : 0u;
+        gate_params.group_size = UOCR_Q8_GROUP_SIZE_DEFAULT;
+        gate_params.groups_per_row = groups_per_row_hidden;
+        gate_params.reserved0 = 0u;
+        gate_params.reserved1 = 0u;
+
+        uocr_metal_dense_swiglu_q8_params down_params = gate_params;
+        down_params.groups_per_row = groups_per_row_inter;
+
+        /* gate + up → mid */
+        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
+        if (enc == nil) {
+            return metal_fail(error, error_size, "failed to create %s gate/up command encoder", op);
+        }
+        const NSUInteger gate_threads = metal_power2_threadgroup_width(64u, gate_pipeline.maxTotalThreadsPerThreadgroup);
+        [enc setComputePipelineState:gate_pipeline];
+        [enc setBuffer:input.buffer offset:input.offset atIndex:0u];
+        [enc setBuffer:gate_weight->buffer offset:gate_weight->offset atIndex:1u];
+        [enc setBuffer:up_weight->buffer offset:up_weight->offset atIndex:2u];
+        [enc setBuffer:gate_weight->scale_buffer offset:gate_weight->scale_offset atIndex:3u];
+        [enc setBuffer:up_weight->scale_buffer offset:up_weight->scale_offset atIndex:4u];
+        [enc setBuffer:mid.buffer offset:mid.offset atIndex:5u];
+        [enc setBytes:&gate_params length:sizeof(gate_params) atIndex:6u];
+        [enc setThreadgroupMemoryLength:gate_threads * 2u * sizeof(float) atIndex:0u];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)gate_values, 1u, 1u)
+             threadsPerThreadgroup:MTLSizeMake(gate_threads, 1u, 1u)];
+        [enc endEncoding];
+
+        /* down → dst (+ residual) */
+        enc = metal_compute_command_encoder(ctx, cb);
+        if (enc == nil) {
+            return metal_fail(error, error_size, "failed to create %s down command encoder", op);
+        }
+        const NSUInteger down_threads = metal_power2_threadgroup_width(256u, down_pipeline.maxTotalThreadsPerThreadgroup);
+        [enc setComputePipelineState:down_pipeline];
+        [enc setBuffer:mid.buffer offset:mid.offset atIndex:0u];
+        [enc setBuffer:down_weight->buffer offset:down_weight->offset atIndex:1u];
+        [enc setBuffer:down_weight->scale_buffer offset:down_weight->scale_offset atIndex:2u];
+        [enc setBuffer:(has_residual ? residual.buffer : input.buffer) offset:(has_residual ? residual.offset : input.offset) atIndex:3u];
+        [enc setBuffer:dst.buffer offset:dst.offset atIndex:4u];
+        [enc setBytes:&down_params length:sizeof(down_params) atIndex:5u];
+        [enc setThreadgroupMemoryLength:down_threads * sizeof(float) atIndex:0u];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)down_values, 1u, 1u)
+             threadsPerThreadgroup:MTLSizeMake(down_threads, 1u, 1u)];
+        [enc endEncoding];
+        return metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, op, error, error_size);
+    }
+}
+
 static int metal_run_dense_swiglu_buffer_f16(uocr_metal_context *ctx,
                                              uocr_metal_buffer_slice input,
                                              const uocr_metal_decoder_binding *gate_weight,
@@ -12299,14 +12432,22 @@ static int metal_run_dense_swiglu_buffer_f16(uocr_metal_context *ctx,
                                              const char *op_name,
                                              char *error,
                                              size_t error_size) {
+    if (ctx == NULL || gate_weight == NULL || up_weight == NULL || down_weight == NULL || n_tokens == 0u) {
+        return metal_fail(error, error_size, "invalid %s SwiGLU request", op_name);
+    }
+    if (gate_weight->qtype == UOCR_TENSOR_Q8_0 && up_weight->qtype == UOCR_TENSOR_Q8_0 &&
+        down_weight->qtype == UOCR_TENSOR_Q8_0) {
+        return metal_run_dense_swiglu_buffer_q8_0(ctx, input, gate_weight, up_weight, down_weight,
+                                                 residual, has_residual, n_tokens, intermediate_size,
+                                                 mid, dst, op_name, error, error_size);
+    }
     const uint64_t hidden_bytes = (uint64_t)n_tokens * (uint64_t)UOCR_HIDDEN_SIZE * 2u;
     const uint64_t gate_weight_bytes = (uint64_t)intermediate_size * (uint64_t)UOCR_HIDDEN_SIZE * 2u;
     const uint64_t down_weight_bytes = (uint64_t)UOCR_HIDDEN_SIZE * (uint64_t)intermediate_size * 2u;
     const uint64_t mid_bytes = (uint64_t)n_tokens * (uint64_t)intermediate_size * 2u;
     uint64_t gate_values = (uint64_t)n_tokens * (uint64_t)intermediate_size;
     uint64_t down_values = (uint64_t)n_tokens * (uint64_t)UOCR_HIDDEN_SIZE;
-    if (ctx == NULL || gate_weight == NULL || up_weight == NULL || down_weight == NULL || n_tokens == 0u ||
-        intermediate_size == 0u || gate_values > UINT32_MAX || down_values > UINT32_MAX ||
+    if (intermediate_size == 0u || gate_values > UINT32_MAX || down_values > UINT32_MAX ||
         !metal_slice_valid(input, hidden_bytes) || !metal_slice_valid(mid, mid_bytes) ||
         !metal_slice_valid(dst, hidden_bytes) || (has_residual && !metal_slice_valid(residual, hidden_bytes)) ||
         !metal_buffer_range_valid(gate_weight->buffer, gate_weight->offset, gate_weight_bytes) ||
