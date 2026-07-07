@@ -249,8 +249,8 @@ Performance rule: every Q8 compute path must be fused. A Q8 kernel must read int
 
 Checklist:
 
-* [ ] Add Q8 kernel code to a new fragment: `src/backend/metal/kernels/q8.metal`.
-* [ ] Add `q8.metal` to `tools/gen_metal.py` `ORDER` immediately after `dense.metal`.
+* [ ] Add Q8 kernel code as focused sibling fragments under `src/backend/metal/kernels/` (for example `embedding_q8.metal`, `lm_head_q8.metal`, `attention_q8.metal`, `dense_q8.metal`, `moe_q8.metal`) instead of a single monolithic `q8.metal`.
+* [ ] Add each Q8 fragment to `tools/gen_metal.py` `ORDER` near its fp16 counterpart (for example `embedding_q8.metal` immediately after `embedding.metal`).
 * [ ] Regenerate `src/backend/metal/kernels/uocr_smoke.metal` so runtime source compilation sees the new kernels.
 * [ ] Precompiled builds are already covered by CMake glob dependencies, but still depend on `gen_metal.py` ordering.
 
