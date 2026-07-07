@@ -15,6 +15,7 @@ DEFAULT_OUTPUT = KERNELS / "uocr_smoke.metal"
 ORDER = [
     "common.metal",
     "dense.metal",
+    "dense_q8.metal",
     "norm.metal",
     "sam.metal",
     "sam_attention.metal",
