@@ -113,12 +113,13 @@ def _download_and_convert_source_model(
     *,
     qprofile: str = "fp16",
     quant_cfg_path: str | Path | None = None,
+    force: bool = False,
 ) -> Path:
     from huggingface_hub import snapshot_download
     from .quant_cfg import load_default_quant_config, load_quant_config
 
     out_path = cache_dir / filename
-    if out_path.exists():
+    if out_path.exists() and not force:
         return out_path.resolve()
 
     source_repo_id = os.environ.get("UOCR_SOURCE_MODEL_REPO_ID", DEFAULT_SOURCE_MODEL_REPO_ID)
@@ -160,6 +161,7 @@ def resolve_model_path(
     download: bool = True,
     quant: str | None = None,
     quant_cfg_path: str | Path | None = None,
+    force_reconvert: bool = False,
 ) -> Path:
     """Resolve a `.uocr` model path using env, local cache, and HF conversion.
 
@@ -172,6 +174,11 @@ def resolve_model_path(
     ``quant`` selects the conversion profile when downloading/converting:
     ``None``/``"fp16"`` keeps the fp16 baseline; ``"q8"`` produces a
     runtime-safe mixed-Q8_0 model gated by ``configs/quant-cfg.yaml``.
+
+    ``force_reconvert`` deletes any cached model for the selected ``quant`` and
+    re-runs conversion.  This is useful when ``configs/quant-cfg.yaml`` has
+    changed and the cached model is stale.  It has no effect when
+    ``model_path``/``UOCR_MODEL_PATH`` is set.
     """
 
     if model_path is not None:
@@ -186,6 +193,12 @@ def resolve_model_path(
         "UOCR_MODEL_FILENAME", DEFAULT_MODEL_FILENAME
     )
     resolved_cache_dir = Path(cache_dir).expanduser() if cache_dir is not None else default_cache_dir()
+
+    if force_reconvert:
+        for candidate in _candidate_model_paths(resolved_cache_dir, filename):
+            candidate = candidate.expanduser()
+            if candidate.exists() and candidate.is_file():
+                candidate.unlink()
 
     seen: set[Path] = set()
     for candidate in _candidate_model_paths(resolved_cache_dir, filename):
@@ -211,6 +224,7 @@ def resolve_model_path(
             filename,
             qprofile=qprofile,
             quant_cfg_path=quant_cfg_path,
+            force=force_reconvert,
         )
     except Exception as exc:  # pragma: no cover - network/large-conversion path
         raise ModelResolutionError(
@@ -324,6 +338,7 @@ class UnlimitedOCR:
         request_timeout: float = 30.0,
         quant: str | None = None,
         quant_cfg_path: str | Path | None = None,
+        force_reconvert: bool = False,
     ) -> None:
         self._model_path = resolve_model_path(
             model_path,
@@ -331,6 +346,7 @@ class UnlimitedOCR:
             download=download,
             quant=quant,
             quant_cfg_path=quant_cfg_path,
+            force_reconvert=force_reconvert,
         )
         self._backend = backend.lower()
         self._memory_budget_bytes = int(memory_budget_bytes)
