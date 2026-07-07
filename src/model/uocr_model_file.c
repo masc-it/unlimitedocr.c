@@ -49,6 +49,14 @@ static int checked_section_relative_range(uint64_t offset, uint64_t size, uint64
     return 1;
 }
 
+static int checked_section_absolute_range(uint64_t offset, uint64_t size, const uocr_section_entry *section) {
+    if (section == NULL || offset < section->offset) {
+        return 0;
+    }
+    const uint64_t rel = offset - section->offset;
+    return checked_section_relative_range(rel, size, section->size);
+}
+
 static int hash_is_nonzero(const uint8_t hash[32]) {
     for (size_t i = 0u; i < 32u; ++i) {
         if (hash[i] != 0u) {
@@ -79,6 +87,8 @@ const char *uocr_qprofile_name(uint32_t qprofile) {
     switch (qprofile) {
         case UOCR_QPROFILE_FP16:
             return "fp16";
+        case UOCR_QPROFILE_MIXED_Q8_0:
+            return "mixed-q8_0";
         default:
             return "unknown";
     }
@@ -90,6 +100,8 @@ const char *uocr_tensor_qtype_name(uint32_t qtype) {
             return "f16";
         case UOCR_TENSOR_F32:
             return "f32";
+        case UOCR_TENSOR_Q8_0:
+            return "q8_0";
         default:
             return "unknown";
     }
@@ -567,8 +579,128 @@ static int validate_fp16_tensor_entry(const uocr_tensor_entry *tensor,
     return 0;
 }
 
+static int validate_q8_tensor_entry(const uocr_tensor_entry *tensor,
+                                    uint32_t index,
+                                    const uocr_section_entry *tensor_data_section,
+                                    size_t file_size,
+                                    char *error,
+                                    size_t error_size) {
+    if (tensor->qtype != UOCR_TENSOR_Q8_0) {
+        return fail(error, error_size, "tensor entry %u has non-q8_0 qtype %u", index, tensor->qtype);
+    }
+    if (tensor->rank != 2u) {
+        return fail(error, error_size, "tensor entry %u rank %u is invalid for q8_0", index, tensor->rank);
+    }
+    const uint32_t rows = tensor->logical_shape[0];
+    const uint32_t cols = tensor->logical_shape[1];
+    if (rows == 0u || cols == 0u || tensor->physical_shape[0] == 0u || tensor->physical_shape[1] == 0u) {
+        return fail(error, error_size, "tensor entry %u has zero q8_0 shape dimension", index);
+    }
+    if (tensor->physical_shape[0] != rows || tensor->physical_shape[1] != cols) {
+        return fail(error,
+                    error_size,
+                    "tensor entry %u q8_0 physical shape differs from logical shape",
+                    index);
+    }
+    if ((tensor->flags & UOCR_TENSOR_FLAG_ROW_MAJOR) == 0u ||
+        (tensor->flags & (UOCR_TENSOR_FLAG_TRANSPOSED | UOCR_TENSOR_FLAG_FLATTENED_LEADING_DIM)) != 0u) {
+        return fail(error, error_size, "tensor entry %u q8_0 tensor must be row-major and not transformed", index);
+    }
+    if (tensor->block_size != UOCR_Q8_GROUP_SIZE_DEFAULT) {
+        return fail(error,
+                    error_size,
+                    "tensor entry %u q8_0 block size mismatch: got %u expected %u",
+                    index,
+                    tensor->block_size,
+                    UOCR_Q8_GROUP_SIZE_DEFAULT);
+    }
+    if ((cols % UOCR_Q8_GROUP_SIZE_DEFAULT) != 0u) {
+        return fail(error,
+                    error_size,
+                    "tensor entry %u q8_0 cols %u are not divisible by group size %u",
+                    index,
+                    cols,
+                    UOCR_Q8_GROUP_SIZE_DEFAULT);
+    }
+    if (tensor->row_size != cols) {
+        return fail(error,
+                    error_size,
+                    "tensor entry %u q8_0 row size mismatch: got %u expected %u",
+                    index,
+                    tensor->row_size,
+                    cols);
+    }
+
+    uint64_t expected_payload_size = 0u;
+    if (!checked_mul_u64((uint64_t)rows, (uint64_t)cols, &expected_payload_size)) {
+        return fail(error, error_size, "tensor entry %u q8_0 payload size overflows", index);
+    }
+    if (tensor->payload_size != expected_payload_size) {
+        return fail(error,
+                    error_size,
+                    "tensor entry %u q8_0 payload size mismatch: got %llu expected %llu",
+                    index,
+                    (unsigned long long)tensor->payload_size,
+                    (unsigned long long)expected_payload_size);
+    }
+
+    uint64_t group_count = 0u;
+    uint64_t expected_scale_size = 0u;
+    if (!checked_mul_u64((uint64_t)rows, (uint64_t)(cols / UOCR_Q8_GROUP_SIZE_DEFAULT), &group_count) ||
+        !checked_mul_u64(group_count, (uint64_t)sizeof(uint16_t), &expected_scale_size)) {
+        return fail(error, error_size, "tensor entry %u q8_0 scale size overflows", index);
+    }
+    if (tensor->scale_size != expected_scale_size) {
+        return fail(error,
+                    error_size,
+                    "tensor entry %u q8_0 scale size mismatch: got %llu expected %llu",
+                    index,
+                    (unsigned long long)tensor->scale_size,
+                    (unsigned long long)expected_scale_size);
+    }
+    if ((tensor->payload_offset % UOCR_TENSOR_PAYLOAD_ALIGNMENT) != 0u) {
+        return fail(error,
+                    error_size,
+                    "tensor entry %u q8_0 payload offset %llu is not aligned to %u",
+                    index,
+                    (unsigned long long)tensor->payload_offset,
+                    UOCR_TENSOR_PAYLOAD_ALIGNMENT);
+    }
+    if ((tensor->scale_offset % UOCR_TENSOR_PAYLOAD_ALIGNMENT) != 0u) {
+        return fail(error,
+                    error_size,
+                    "tensor entry %u q8_0 scale offset %llu is not aligned to %u",
+                    index,
+                    (unsigned long long)tensor->scale_offset,
+                    UOCR_TENSOR_PAYLOAD_ALIGNMENT);
+    }
+    if (!checked_range(tensor->payload_offset, tensor->payload_size, file_size)) {
+        return fail(error, error_size, "tensor entry %u payload is out of range", index);
+    }
+    if (!checked_range(tensor->scale_offset, tensor->scale_size, file_size)) {
+        return fail(error, error_size, "tensor entry %u q8_0 scale is out of range", index);
+    }
+    if (!checked_section_absolute_range(tensor->payload_offset, tensor->payload_size, tensor_data_section)) {
+        return fail(error, error_size, "tensor entry %u payload is outside tensor-data section", index);
+    }
+    if (!checked_section_absolute_range(tensor->scale_offset, tensor->scale_size, tensor_data_section)) {
+        return fail(error, error_size, "tensor entry %u q8_0 scale is outside tensor-data section", index);
+    }
+    if (tensor->min_offset != 0u || tensor->min_size != 0u) {
+        return fail(error, error_size, "tensor entry %u q8_0 tensor has min metadata", index);
+    }
+    if (tensor->qtype_reason != UOCR_TENSOR_QTYPE_REASON_UNKNOWN) {
+        return fail(error, error_size, "tensor entry %u has unknown q8_0 qtype reason %u", index, tensor->qtype_reason);
+    }
+    if (tensor->promotion_reason != UOCR_TENSOR_PROMOTION_NONE) {
+        return fail(error, error_size, "tensor entry %u has non-empty q8_0 promotion reason %u", index, tensor->promotion_reason);
+    }
+    return 0;
+}
+
 static int validate_tensor_directory(const uint8_t *bytes,
                                      size_t file_size,
+                                     uint32_t qprofile,
                                      const uocr_section_entry *directory_section,
                                      const uocr_section_entry *tensor_data_section,
                                      uocr_model_file *view,
@@ -650,6 +782,10 @@ static int validate_tensor_directory(const uint8_t *bytes,
             if (tensor->payload_offset != 0u || tensor->payload_size != 0u) {
                 return fail(error, error_size, "omitted tensor entry %u has payload bytes", i);
             }
+            if (tensor->scale_offset != 0u || tensor->scale_size != 0u ||
+                tensor->min_offset != 0u || tensor->min_size != 0u) {
+                return fail(error, error_size, "omitted tensor entry %u has quantization bytes", i);
+            }
             continue;
         }
         if (tensor->usage != UOCR_TENSOR_USAGE_RUNTIME && tensor->usage != UOCR_TENSOR_USAGE_PRESERVED_UNUSED) {
@@ -669,17 +805,30 @@ static int validate_tensor_directory(const uint8_t *bytes,
                         (unsigned long long)tensor->payload_offset,
                         UOCR_TENSOR_PAYLOAD_ALIGNMENT);
         }
-        if (validate_fp16_tensor_entry(tensor, i, error, error_size) != 0) {
-            return -1;
+        if (qprofile == UOCR_QPROFILE_FP16) {
+            if (validate_fp16_tensor_entry(tensor, i, error, error_size) != 0) {
+                return -1;
+            }
+        } else if (qprofile == UOCR_QPROFILE_MIXED_Q8_0) {
+            if (tensor->qtype == UOCR_TENSOR_F16) {
+                if (validate_fp16_tensor_entry(tensor, i, error, error_size) != 0) {
+                    return -1;
+                }
+            } else if (tensor->qtype == UOCR_TENSOR_Q8_0) {
+                if (validate_q8_tensor_entry(tensor, i, tensor_data_section, file_size, error, error_size) != 0) {
+                    return -1;
+                }
+            } else {
+                return fail(error, error_size, "tensor entry %u has unsupported qtype %u for mixed-q8_0", i, tensor->qtype);
+            }
+        } else {
+            return fail(error, error_size, "unsupported qprofile %u while validating tensor directory", qprofile);
         }
         if (!checked_range(tensor->payload_offset, tensor->payload_size, file_size)) {
             return fail(error, error_size, "tensor entry %u payload is out of range", i);
         }
-        if (tensor_data_section != NULL) {
-            if (tensor->payload_offset < tensor_data_section->offset ||
-                tensor->payload_offset + tensor->payload_size > tensor_data_section->offset + tensor_data_section->size) {
-                return fail(error, error_size, "tensor entry %u payload is outside tensor-data section", i);
-            }
+        if (!checked_section_absolute_range(tensor->payload_offset, tensor->payload_size, tensor_data_section)) {
+            return fail(error, error_size, "tensor entry %u payload is outside tensor-data section", i);
         }
     }
 
@@ -731,8 +880,8 @@ int uocr_model_file_validate_memory(const void *data, size_t size, uocr_model_fi
     if (header->required_alignment == 0u) {
         return fail(error, error_size, "required alignment must be non-zero");
     }
-    if (header->qprofile != UOCR_QPROFILE_FP16) {
-        return fail(error, error_size, "only fp16 .uocr models are supported, got qprofile %u", header->qprofile);
+    if (header->qprofile != UOCR_QPROFILE_FP16 && header->qprofile != UOCR_QPROFILE_MIXED_Q8_0) {
+        return fail(error, error_size, "unsupported .uocr qprofile %u", header->qprofile);
     }
     if (header->section_count == 0u) {
         return fail(error, error_size, "section_count must be non-zero");
@@ -826,7 +975,7 @@ int uocr_model_file_validate_memory(const void *data, size_t size, uocr_model_fi
 
     const uocr_section_entry *directory_section = uocr_model_file_find_section(&view, UOCR_SECTION_TENSOR_DIRECTORY);
     const uocr_section_entry *tensor_data_section = uocr_model_file_find_section(&view, UOCR_SECTION_TENSOR_DATA);
-    if (validate_tensor_directory(bytes, size, directory_section, tensor_data_section, &view, error, error_size) != 0) {
+    if (validate_tensor_directory(bytes, size, header->qprofile, directory_section, tensor_data_section, &view, error, error_size) != 0) {
         return -1;
     }
 

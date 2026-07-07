@@ -70,7 +70,9 @@ UOCR_SECTION_TENSOR_DATA = 5
 UOCR_FORMAT_VERSION = 1
 UOCR_ENDIAN_MARKER = 0x01020304
 UOCR_QPROFILE_FP16 = 1
+UOCR_QPROFILE_MIXED_Q8_0 = 2
 UOCR_TOKENIZER_FLAG_C_V1_NOT_REQUIRED = 1 << 0
+UOCR_PROVENANCE_FLAG_JSON_PAYLOAD = 1 << 0
 UOCR_TOKENIZER_METADATA_MAGIC = 0x4B4F5455
 UOCR_PROVENANCE_MAGIC = 0x564F5250
 UOCR_TENSOR_DIR_MAGIC = 0x52494454
@@ -97,14 +99,40 @@ UOCR_PROMOTION_NONE = 0
 
 UOCR_TENSOR_F16 = 1
 UOCR_TENSOR_F32 = 2
+UOCR_TENSOR_Q8_0 = 3
 
-CONVERTER_VERSION = (0, 1, 0)
+UOCR_Q8_GROUP_SIZE_DEFAULT = 64
+UOCR_Q8_MIN = -127
+UOCR_Q8_MAX = 127
+
+CONVERTER_VERSION = (0, 2, 0)
+
+QUANT_POLICY_EMBEDDINGS_DECODER = "embeddings+decoder"
+Q8_CANDIDATE_FAMILIES = frozenset({
+    TensorFamily.TOK_EMBED,
+    TensorFamily.LM_HEAD,
+    TensorFamily.LAYER_ATTN,
+    TensorFamily.LAYER_DENSE_MLP,
+    TensorFamily.MOE_EXPERT,
+    TensorFamily.MOE_SHARED,
+})
+Q8_CANDIDATE_PROJECTIONS = frozenset({
+    TensorProjection.WEIGHT,
+    TensorProjection.Q,
+    TensorProjection.K,
+    TensorProjection.V,
+    TensorProjection.O,
+    TensorProjection.GATE,
+    TensorProjection.UP,
+    TensorProjection.DOWN,
+})
 
 CLIP_PIXEL_PATCH_EMBEDDING_PREFIX = "model.vision_model.embeddings.patch_embedding."
 PRESERVED_UNUSED_NORMAL_OCR_PREFIXES: tuple[str, ...] = (CLIP_PIXEL_PATCH_EMBEDDING_PREFIX,)
 
 QPROFILE_IDS: Mapping[str, int] = {
     "fp16": UOCR_QPROFILE_FP16,
+    "mixed-q8_0": UOCR_QPROFILE_MIXED_Q8_0,
 }
 
 QTYPE_REASON_NAMES: Mapping[int, str] = {
@@ -253,6 +281,11 @@ class TensorPlan:
     output_bytes: int
     payload_offset: int
     payload_alignment: int
+    scale_offset: int
+    scale_size: int
+    qweight_bytes: int
+    qscale_bytes: int
+    fp16_equivalent_bytes: int
     block_size: int
     row_size: int
     tensor_id: int
@@ -292,6 +325,11 @@ class TensorPlan:
             "output_bytes": self.output_bytes,
             "payload_offset": self.payload_offset,
             "payload_alignment": self.payload_alignment,
+            "scale_offset": self.scale_offset,
+            "scale_size": self.scale_size,
+            "qweight_bytes": self.qweight_bytes,
+            "qscale_bytes": self.qscale_bytes,
+            "fp16_equivalent_bytes": self.fp16_equivalent_bytes,
             "block_size": self.block_size,
             "row_size": self.row_size,
             "tensor_id": self.tensor_id,
@@ -404,6 +442,8 @@ class TensorConversionStats:
     output_bytes: int
     output_bytes_written: int
     payload_offset: int
+    scale_offset: int
+    scale_size: int
     value_count: int
     finite_count: int
     source_min: float | None
@@ -428,6 +468,8 @@ class TensorConversionStats:
             "output_bytes": self.output_bytes,
             "output_bytes_written": self.output_bytes_written,
             "payload_offset": self.payload_offset,
+            "scale_offset": self.scale_offset,
+            "scale_size": self.scale_size,
             "value_count": self.value_count,
             "finite_count": self.finite_count,
             "source_min": self.source_min,
@@ -457,6 +499,8 @@ class TensorCompareResult:
     first_mismatch_offset: int | None
     expected_byte: int | None
     actual_byte: int | None
+    dequant_max_abs_error: float | None = None
+    dequant_rmse: float | None = None
 
     @property
     def metadata_matches(self) -> bool:
@@ -486,6 +530,8 @@ class TensorCompareResult:
             "first_mismatch_offset": self.first_mismatch_offset,
             "expected_byte": self.expected_byte,
             "actual_byte": self.actual_byte,
+            "dequant_max_abs_error": self.dequant_max_abs_error,
+            "dequant_rmse": self.dequant_rmse,
         }
 
 
@@ -502,6 +548,8 @@ class _UocrTensorPayloadView:
     payload_size: int
     block_size: int
     row_size: int
+    scale_offset: int
+    scale_size: int
     qtype_reason_id: int
     promotion_reason_id: int
 
@@ -549,6 +597,7 @@ class DryRunPlan:
             "metadata_bytes": self.metadata_bytes,
             "sections": [section.as_dict() for section in self.sections],
             "source_metadata": self.source_metadata.as_dict(),
+            "q8_summary": q8_summary(self.tensors),
             "qtype_histogram": dict(self.qtype_histogram),
             "qtype_reason_histogram": dict(self.qtype_reason_histogram),
             "promotion_reason_histogram": dict(self.promotion_reason_histogram),
@@ -624,6 +673,29 @@ def _fp16_tensor_metadata(
     return shape, shape, source_bytes, 0, 0, UOCR_TENSOR_F16, "F16"
 
 
+def q8_qweight_bytes(shape: tuple[int, ...], group_size: int = UOCR_Q8_GROUP_SIZE_DEFAULT) -> int:
+    if len(shape) != 2:
+        raise ValueError(f"Q8_0 tensors must be rank-2, got shape {shape!r}")
+    rows, cols = (int(shape[0]), int(shape[1]))
+    if rows <= 0 or cols <= 0:
+        raise ValueError(f"Q8_0 tensors require positive dimensions, got shape {shape!r}")
+    if group_size <= 0:
+        raise ValueError(f"Q8_0 group size must be positive, got {group_size}")
+    if cols % group_size != 0:
+        raise ValueError(f"Q8_0 columns ({cols}) must be divisible by group size {group_size}")
+    return rows * cols
+
+
+def q8_qscale_bytes(shape: tuple[int, ...], group_size: int = UOCR_Q8_GROUP_SIZE_DEFAULT) -> int:
+    _ = q8_qweight_bytes(shape, group_size)
+    rows, cols = (int(shape[0]), int(shape[1]))
+    return rows * (cols // group_size) * np.dtype("<f2").itemsize
+
+
+def q8_total_bytes(shape: tuple[int, ...], group_size: int = UOCR_Q8_GROUP_SIZE_DEFAULT) -> int:
+    return q8_qweight_bytes(shape, group_size) + q8_qscale_bytes(shape, group_size)
+
+
 def _align_up(value: int, alignment: int) -> int:
     if alignment <= 0:
         raise ValueError("alignment must be positive")
@@ -651,9 +723,27 @@ def _family_histogram(tensors: Iterable[TensorPlan]) -> dict[str, int]:
     return dict(Counter(t.family for t in tensors))
 
 
+def q8_summary(tensors: Iterable[TensorPlan]) -> dict[str, Any]:
+    tensors_tuple = tuple(tensors)
+    q8_tensors = tuple(t for t in tensors_tuple if t.qtype_id == UOCR_TENSOR_Q8_0)
+    qweight_bytes = sum(t.output_bytes for t in q8_tensors)
+    qscale_bytes = sum(t.scale_size for t in q8_tensors)
+    fp16_equivalent_bytes = sum(t.fp16_equivalent_bytes for t in q8_tensors)
+    q8_total = qweight_bytes + qscale_bytes
+    return {
+        "tensor_count": len(q8_tensors),
+        "qweight_bytes": qweight_bytes,
+        "qscale_bytes": qscale_bytes,
+        "total_bytes": q8_total,
+        "fp16_equivalent_bytes": fp16_equivalent_bytes,
+        "estimated_savings_bytes": fp16_equivalent_bytes - q8_total,
+        "by_family": dict(Counter(t.family for t in q8_tensors)),
+    }
+
+
 def _layout_metadata_for_tensor(shape: tuple[int, ...], qtype_id: int) -> tuple[str, str, int, int, bool, str]:
-    if qtype_id != UOCR_TENSOR_F16:
-        raise ValueError(f"only fp16 tensor payloads are supported, got qtype id {qtype_id}")
+    if qtype_id not in {UOCR_TENSOR_F16, UOCR_TENSOR_Q8_0}:
+        raise ValueError(f"unsupported tensor qtype id {qtype_id}")
     _ = shape
     return (
         "row-major",
@@ -695,7 +785,7 @@ def _validate_layout_transform_contract(tensors: Iterable[TensorPlan]) -> None:
         if not (tensor.layout_flags & UOCR_TENSOR_FLAG_ROW_MAJOR):
             raise ValueError(f"tensor {tensor.name} is missing the row-major layout flag")
         if tensor.logical_shape != tensor.shape or tensor.physical_shape != tensor.shape:
-            raise ValueError(f"fp16 tensor {tensor.name} must preserve source shape without layout conversion")
+            raise ValueError(f"tensor {tensor.name} must preserve source shape without layout conversion")
 
 
 def _validate_moe_expert_interleaved_layout(tensors: Iterable[TensorPlan], *, require_complete: bool) -> None:
@@ -733,6 +823,7 @@ def _validate_moe_expert_interleaved_layout(tensors: Iterable[TensorPlan], *, re
             continue
 
         previous_end: int | None = None
+        previous_scale_end: int | None = None
         for expert in range(MOE_ROUTED_EXPERT_COUNT):
             for projection_index, projection in enumerate(MOE_EXPERT_PROJECTION_ORDER):
                 tensor = expected[expert * len(MOE_EXPERT_PROJECTION_ORDER) + projection_index]
@@ -751,9 +842,22 @@ def _validate_moe_expert_interleaved_layout(tensors: Iterable[TensorPlan], *, re
                         f"expected payload offset {previous_end}, got {tensor.payload_offset}"
                     )
                 previous_end = tensor.payload_offset + tensor.output_bytes
+                if tensor.qtype_id == UOCR_TENSOR_Q8_0:
+                    if tensor.scale_size <= 0 or tensor.scale_offset <= 0:
+                        raise ValueError(f"MoE expert-major Q8 tensor {tensor.name} is missing scale payload")
+                    if previous_scale_end is not None and tensor.scale_offset != previous_scale_end:
+                        raise ValueError(
+                            f"MoE expert-major layer {layer} scale slab is not contiguous before {tensor.name}: "
+                            f"expected scale offset {previous_scale_end}, got {tensor.scale_offset}"
+                        )
+                    previous_scale_end = tensor.scale_offset + tensor.scale_size
 
 
-def _layout_dry_run_file(tensors: tuple[TensorPlan, ...]) -> tuple[tuple[SectionPlan, ...], tuple[TensorPlan, ...], int, int]:
+def _layout_dry_run_file(
+    tensors: tuple[TensorPlan, ...],
+    *,
+    provenance_json_size: int = 0,
+) -> tuple[tuple[SectionPlan, ...], tuple[TensorPlan, ...], int, int]:
     """Assign deterministic `.uocr` section and payload offsets for dry-run planning.
 
     The converter will later stream bytes into this layout.  Planning it now lets
@@ -766,20 +870,61 @@ def _layout_dry_run_file(tensors: tuple[TensorPlan, ...]) -> tuple[tuple[Section
     config_offset = _align_up(section_dir_offset + section_count * UOCR_SECTION_ENTRY_SIZE, 8)
     tokenizer_offset = _align_up(config_offset + UOCR_CONFIG_RECORD_SIZE, 8)
     provenance_offset = _align_up(tokenizer_offset + UOCR_TOKENIZER_METADATA_RECORD_SIZE, 8)
-    tensor_dir_offset = _align_up(provenance_offset + UOCR_PROVENANCE_RECORD_SIZE, 8)
+    provenance_size = UOCR_PROVENANCE_RECORD_SIZE + max(0, provenance_json_size)
+    tensor_dir_offset = _align_up(provenance_offset + provenance_size, 8)
     tensor_dir_size = UOCR_TENSOR_DIRECTORY_HEADER_SIZE + len(tensors) * UOCR_TENSOR_ENTRY_SIZE
     tensor_data_offset = _align_up(tensor_dir_offset + tensor_dir_size, UOCR_TENSOR_DATA_ALIGNMENT)
 
     cursor = tensor_data_offset
-    laid_out: list[TensorPlan] = []
-    for tensor in tensors:
-        if tensor.usage_id == 3 or tensor.output_bytes == 0:
-            laid_out.append(replace(tensor, payload_offset=0, payload_alignment=0))
+    laid_out_by_id: dict[int, TensorPlan] = {}
+    index = 0
+    while index < len(tensors):
+        tensor = tensors[index]
+        if tensor.usage_id == UOCR_TENSOR_USAGE_OMITTED_WITH_REASON or tensor.output_bytes == 0:
+            laid_out_by_id[tensor.tensor_id] = replace(
+                tensor,
+                payload_offset=0,
+                payload_alignment=0,
+                scale_offset=0,
+            )
+            index += 1
             continue
-        cursor = _align_up(cursor, UOCR_TENSOR_PAYLOAD_ALIGNMENT)
-        laid_out.append(replace(tensor, payload_offset=cursor, payload_alignment=UOCR_TENSOR_PAYLOAD_ALIGNMENT))
-        cursor += tensor.output_bytes
 
+        group = [tensor]
+        if tensor.qtype_id == UOCR_TENSOR_Q8_0 and tensor.family == TensorFamily.MOE_EXPERT.name:
+            layer = tensor.layer
+            lookahead = index + 1
+            while (
+                lookahead < len(tensors)
+                and tensors[lookahead].qtype_id == UOCR_TENSOR_Q8_0
+                and tensors[lookahead].family == TensorFamily.MOE_EXPERT.name
+                and tensors[lookahead].layer == layer
+            ):
+                group.append(tensors[lookahead])
+                lookahead += 1
+        else:
+            lookahead = index + 1
+
+        for item in group:
+            cursor = _align_up(cursor, UOCR_TENSOR_PAYLOAD_ALIGNMENT)
+            laid_out_by_id[item.tensor_id] = replace(
+                item,
+                payload_offset=cursor,
+                payload_alignment=UOCR_TENSOR_PAYLOAD_ALIGNMENT,
+            )
+            cursor += item.output_bytes
+
+        for item in group:
+            if item.scale_size == 0:
+                continue
+            cursor = _align_up(cursor, UOCR_TENSOR_PAYLOAD_ALIGNMENT)
+            current = laid_out_by_id[item.tensor_id]
+            laid_out_by_id[item.tensor_id] = replace(current, scale_offset=cursor)
+            cursor += item.scale_size
+
+        index = lookahead
+
+    laid_out = [laid_out_by_id[tensor.tensor_id] for tensor in tensors]
     tensor_data_size = cursor - tensor_data_offset
     sections = (
         SectionPlan(UOCR_SECTION_CONFIG, SECTION_NAMES[UOCR_SECTION_CONFIG], config_offset, UOCR_CONFIG_RECORD_SIZE, 8),
@@ -794,7 +939,7 @@ def _layout_dry_run_file(tensors: tuple[TensorPlan, ...]) -> tuple[tuple[Section
             UOCR_SECTION_PROVENANCE,
             SECTION_NAMES[UOCR_SECTION_PROVENANCE],
             provenance_offset,
-            UOCR_PROVENANCE_RECORD_SIZE,
+            provenance_size,
             8,
         ),
         SectionPlan(
@@ -1202,9 +1347,31 @@ def _reason_name(reason_names: Mapping[int, str], reason_id: int) -> str:
     return reason_names.get(reason_id, "unknown")
 
 
-def _make_tensor_plan(name: str, entry: Mapping[str, Any], qprofile: str, registry_entry: TensorRegistryEntry) -> TensorPlan:
-    if qprofile != "fp16":
+def _is_mixed_q8_candidate(registry_entry: TensorRegistryEntry, shape: tuple[int, ...], usage_id: int) -> bool:
+    if usage_id != UOCR_TENSOR_USAGE_RUNTIME or len(shape) != 2:
+        return False
+    if registry_entry.family not in Q8_CANDIDATE_FAMILIES:
+        return False
+    if registry_entry.projection not in Q8_CANDIDATE_PROJECTIONS:
+        return False
+    return registry_entry.family != TensorFamily.MOE_ROUTER
+
+
+def _make_tensor_plan(
+    name: str,
+    entry: Mapping[str, Any],
+    qprofile: str,
+    registry_entry: TensorRegistryEntry,
+    *,
+    quant_group_size: int = UOCR_Q8_GROUP_SIZE_DEFAULT,
+    quant_policy: str = QUANT_POLICY_EMBEDDINGS_DECODER,
+) -> TensorPlan:
+    if qprofile not in QPROFILE_IDS:
         raise ValueError(f"unknown qprofile {qprofile!r}")
+    if quant_group_size != UOCR_Q8_GROUP_SIZE_DEFAULT:
+        raise ValueError(f"only Q8_0 group size {UOCR_Q8_GROUP_SIZE_DEFAULT} is supported, got {quant_group_size}")
+    if quant_policy != QUANT_POLICY_EMBEDDINGS_DECODER:
+        raise ValueError(f"unsupported quantization policy {quant_policy!r}; expected {QUANT_POLICY_EMBEDDINGS_DECODER!r}")
 
     shape = tuple(int(dim) for dim in entry["shape"])
     offsets = (int(entry["data_offsets"][0]), int(entry["data_offsets"][1]))
@@ -1217,8 +1384,27 @@ def _make_tensor_plan(name: str, entry: Mapping[str, Any], qprofile: str, regist
     logical_shape, physical_shape, output_bytes, block_size, row_size, qtype_id, output_dtype = _fp16_tensor_metadata(
         shape, source_bytes
     )
+    qweight_bytes = output_bytes
+    qscale_bytes = 0
+    scale_size = 0
     qtype_reason_id = UOCR_QTYPE_REASON_FP16_BASELINE
     promotion_reason_id = UOCR_PROMOTION_NONE
+
+    if qprofile == "mixed-q8_0" and _is_mixed_q8_candidate(registry_entry, shape, usage_id):
+        qweight_bytes = q8_qweight_bytes(shape, quant_group_size)
+        qscale_bytes = q8_qscale_bytes(shape, quant_group_size)
+        logical_shape = shape
+        physical_shape = shape
+        output_bytes = qweight_bytes
+        scale_size = qscale_bytes
+        block_size = quant_group_size
+        row_size = int(shape[1])
+        qtype_id = UOCR_TENSOR_Q8_0
+        qtype = "UOCR_TENSOR_Q8_0"
+        output_dtype = "Q8_0"
+        qtype_reason_id = UOCR_QTYPE_REASON_UNKNOWN
+        reason = f"mixed-q8_0 {quant_policy} rank-2 decoder/embedding weight"
+
     (
         source_layout,
         runtime_layout,
@@ -1242,6 +1428,11 @@ def _make_tensor_plan(name: str, entry: Mapping[str, Any], qprofile: str, regist
         output_bytes=output_bytes,
         payload_offset=0,
         payload_alignment=UOCR_TENSOR_PAYLOAD_ALIGNMENT,
+        scale_offset=0,
+        scale_size=scale_size,
+        qweight_bytes=qweight_bytes,
+        qscale_bytes=qscale_bytes,
+        fp16_equivalent_bytes=source_bytes,
         block_size=block_size,
         row_size=row_size,
         tensor_id=registry_entry.tensor_id,
@@ -1270,13 +1461,16 @@ def _make_tensor_plan(name: str, entry: Mapping[str, Any], qprofile: str, regist
 
 def _relayout_plan(plan: DryRunPlan, tensors: Iterable[TensorPlan]) -> DryRunPlan:
     ordered = tuple(sorted(tensors, key=lambda tensor: tensor.tensor_id))
-    sections, laid_out, planned_file_size, metadata_bytes = _layout_dry_run_file(ordered)
+    sections, laid_out, planned_file_size, metadata_bytes = _layout_dry_run_file(
+        ordered,
+        provenance_json_size=len(_provenance_json_payload(plan.qprofile, plan.source_metadata)),
+    )
     _validate_layout_transform_contract(laid_out)
     return replace(
         plan,
         tensors=laid_out,
         total_source_bytes=sum(t.source_bytes for t in laid_out),
-        total_output_bytes=sum(t.output_bytes for t in laid_out),
+        total_output_bytes=sum(t.output_bytes + t.scale_size for t in laid_out),
         planned_file_size=planned_file_size,
         metadata_bytes=metadata_bytes,
         sections=sections,
@@ -1318,10 +1512,16 @@ def build_dry_run_plan(
     header_path: str | Path | None = None,
     index_path: str | Path | None = None,
     strict: bool = True,
+    quant_group_size: int = UOCR_Q8_GROUP_SIZE_DEFAULT,
+    quant_policy: str = QUANT_POLICY_EMBEDDINGS_DECODER,
 ) -> DryRunPlan:
     hf_dir = Path(hf_dir)
     if qprofile not in QPROFILE_IDS:
         raise ValueError(f"unknown qprofile {qprofile!r}")
+    if quant_group_size != UOCR_Q8_GROUP_SIZE_DEFAULT:
+        raise ValueError(f"only --quant-group-size {UOCR_Q8_GROUP_SIZE_DEFAULT} is supported, got {quant_group_size}")
+    if quant_policy != QUANT_POLICY_EMBEDDINGS_DECODER:
+        raise ValueError(f"unsupported --quant-policy {quant_policy!r}; expected {QUANT_POLICY_EMBEDDINGS_DECODER!r}")
 
     header = _read_safetensors_header(Path(header_path) if header_path is not None else _default_header_path(hf_dir))
     entries: dict[str, Mapping[str, Any]] = {
@@ -1342,14 +1542,17 @@ def build_dry_run_plan(
         validate_registry_shapes(registry, {name: tuple(int(dim) for dim in entry["shape"]) for name, entry in entries.items()})
 
     tensors = tuple(
-        _make_tensor_plan(name, entries[name], qprofile, registry[name])
+        _make_tensor_plan(
+            name,
+            entries[name],
+            qprofile,
+            registry[name],
+            quant_group_size=quant_group_size,
+            quant_policy=quant_policy,
+        )
         for name in sorted(entries, key=lambda key: registry[key].tensor_id)
     )
-    sections, tensors, planned_file_size, metadata_bytes = _layout_dry_run_file(tensors)
-    _validate_layout_transform_contract(tensors)
-    _validate_moe_expert_interleaved_layout(tensors, require_complete=strict)
     total_source_bytes = sum(t.source_bytes for t in tensors)
-    total_output_bytes = sum(t.output_bytes for t in tensors)
     if strict and total_source_bytes != EXPECTED_TOTAL_BYTES:
         raise ValueError(
             f"source payload byte count mismatch: got {total_source_bytes}, expected {EXPECTED_TOTAL_BYTES}"
@@ -1378,6 +1581,15 @@ def build_dry_run_plan(
         index_path=index_file,
         strict=strict,
     )
+
+    provenance_json_size = len(_provenance_json_payload(qprofile, source_metadata))
+    sections, tensors, planned_file_size, metadata_bytes = _layout_dry_run_file(
+        tensors,
+        provenance_json_size=provenance_json_size,
+    )
+    _validate_layout_transform_contract(tensors)
+    _validate_moe_expert_interleaved_layout(tensors, require_complete=strict)
+    total_output_bytes = sum(t.output_bytes + t.scale_size for t in tensors)
 
     return DryRunPlan(
         hf_dir=hf_dir,
@@ -1443,6 +1655,30 @@ def _usage_counts(plan: DryRunPlan) -> tuple[int, int, int]:
     return runtime, preserved, omitted
 
 
+def _converter_version_string() -> str:
+    return ".".join(str(part) for part in CONVERTER_VERSION)
+
+
+def _provenance_json_payload(qprofile: str, source_metadata: SourceMetadata | None) -> bytes:
+    if qprofile != "mixed-q8_0":
+        return b""
+    source_hash = ""
+    if source_metadata is not None:
+        source_hash = str(source_metadata.hashes.get("safetensors_index_sha256", ""))
+    payload = {
+        "quantization": {
+            "mode": "mixed-q8_0",
+            "group_size": UOCR_Q8_GROUP_SIZE_DEFAULT,
+            "policy": QUANT_POLICY_EMBEDDINGS_DECODER,
+            "lm_head_qtype": "q8_0",
+            "router_qtype": "fp16",
+            "converter_version": _converter_version_string(),
+            "source_model_hash": source_hash,
+        }
+    }
+    return json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+
+
 def _tokenizer_metadata_bytes(tokenizer_hash: bytes) -> bytes:
     return _TOKENIZER_METADATA_STRUCT.pack(
         UOCR_TOKENIZER_METADATA_MAGIC,
@@ -1471,11 +1707,13 @@ def _provenance_bytes(
     safetensors_file_count: int,
 ) -> bytes:
     runtime, preserved, omitted = _usage_counts(plan)
-    return _PROVENANCE_RECORD_STRUCT.pack(
+    json_payload = _provenance_json_payload(plan.qprofile, plan.source_metadata)
+    json_offset = UOCR_PROVENANCE_RECORD_SIZE if json_payload else 0
+    record = _PROVENANCE_RECORD_STRUCT.pack(
         UOCR_PROVENANCE_MAGIC,
         UOCR_FORMAT_VERSION,
         UOCR_PROVENANCE_RECORD_SIZE,
-        0,
+        UOCR_PROVENANCE_FLAG_JSON_PAYLOAD if json_payload else 0,
         len(plan.tensors),
         runtime,
         preserved,
@@ -1490,9 +1728,10 @@ def _provenance_bytes(
         tokenizer_hash,
         index_hash,
         bytes(32),
-        0,
-        0,
+        json_offset,
+        len(json_payload),
     )
+    return record + json_payload
 
 
 def _tensor_directory_bytes(plan: DryRunPlan) -> bytes:
@@ -1524,8 +1763,8 @@ def _tensor_directory_bytes(plan: DryRunPlan) -> bytes:
             tensor.output_bytes,
             tensor.block_size,
             tensor.row_size,
-            0,
-            0,
+            tensor.scale_offset,
+            tensor.scale_size,
             0,
             0,
             tensor.qtype_reason_id,
@@ -1604,6 +1843,8 @@ def _tensor_conversion_stats(
         output_bytes=tensor.output_bytes,
         output_bytes_written=output_bytes_written,
         payload_offset=tensor.payload_offset,
+        scale_offset=tensor.scale_offset,
+        scale_size=tensor.scale_size,
         value_count=value_stats.value_count,
         finite_count=value_stats.finite_count,
         source_min=value_stats.min_value,
@@ -1628,7 +1869,7 @@ def _conversion_stats_report(
         "qprofile": plan.qprofile,
         "tensor_count": len(tensors),
         "source_bytes": sum(tensor.source_bytes for tensor in tensors),
-        "output_bytes": sum(tensor.output_bytes for tensor in tensors),
+        "output_bytes": sum(tensor.output_bytes + tensor.scale_size for tensor in tensors),
         "output_bytes_written": sum(tensor.output_bytes_written for tensor in tensors),
         "value_count": sum(tensor.value_count for tensor in tensors),
         "finite_count": sum(tensor.finite_count for tensor in tensors),
@@ -1678,6 +1919,73 @@ def _stream_bf16_to_f16(
         dst.write(payload)
         bytes_written += len(payload)
         remaining -= len(raw)
+    return bytes_written
+
+
+def _stream_bf16_to_q8_0(
+    src: BinaryIO,
+    dst: BinaryIO,
+    tensor: TensorPlan,
+    *,
+    stats: _StreamingValueStats | None = None,
+    chunk_source_bytes: int = 8 * 1024 * 1024,
+) -> int:
+    if tensor.qtype_id != UOCR_TENSOR_Q8_0:
+        raise ValueError(f"tensor {tensor.name} is not Q8_0")
+    if len(tensor.shape) != 2:
+        raise ValueError(f"Q8_0 tensor {tensor.name} must be rank-2")
+    rows, cols = tensor.shape
+    group_size = tensor.block_size
+    if group_size != UOCR_Q8_GROUP_SIZE_DEFAULT or cols % group_size != 0:
+        raise ValueError(f"Q8_0 tensor {tensor.name} has unsupported group metadata")
+    row_source_bytes = cols * np.dtype("<u2").itemsize
+    if tensor.source_bytes != rows * row_source_bytes:
+        raise ValueError(f"Q8_0 tensor {tensor.name} source byte count does not match shape")
+
+    rows_per_chunk = max(1, chunk_source_bytes // row_source_bytes)
+    rows_done = 0
+    qweight_pos = tensor.payload_offset
+    qscale_pos = tensor.scale_offset
+    bytes_written = 0
+    groups_per_row = cols // group_size
+
+    while rows_done < rows:
+        batch_rows = min(rows - rows_done, rows_per_chunk)
+        raw_size = batch_rows * row_source_bytes
+        raw = src.read(raw_size)
+        if len(raw) != raw_size:
+            raise EOFError(f"unexpected end of safetensors payload while quantizing {tensor.name}")
+        values = _bf16_bytes_to_f32(raw).reshape(batch_rows, cols)
+        if stats is not None:
+            stats.update(values)
+        if not np.all(np.isfinite(values)):
+            raise ValueError(f"Q8_0 tensor {tensor.name} contains non-finite values")
+
+        grouped = values.reshape(batch_rows, groups_per_row, group_size)
+        max_abs = np.max(np.abs(grouped), axis=2)
+        scales = max_abs / np.float32(UOCR_Q8_MAX)
+        scales = np.where(max_abs == 0.0, np.float32(1.0), scales).astype(np.float32, copy=False)
+        quantized = np.rint(grouped / scales[:, :, None])
+        quantized = np.clip(quantized, UOCR_Q8_MIN, UOCR_Q8_MAX).astype(np.int8, copy=False)
+
+        qweight_payload = quantized.reshape(batch_rows, cols).tobytes()
+        qscale_payload = scales.astype(np.dtype("<f2"), copy=False).tobytes()
+
+        dst.seek(qweight_pos)
+        dst.write(qweight_payload)
+        qweight_pos += len(qweight_payload)
+        bytes_written += len(qweight_payload)
+
+        dst.seek(qscale_pos)
+        dst.write(qscale_payload)
+        qscale_pos += len(qscale_payload)
+        bytes_written += len(qscale_payload)
+        rows_done += batch_rows
+
+    if qweight_pos != tensor.payload_offset + tensor.output_bytes:
+        raise IOError(f"Q8_0 tensor {tensor.name} wrote an unexpected qweight byte count")
+    if qscale_pos != tensor.scale_offset + tensor.scale_size:
+        raise IOError(f"Q8_0 tensor {tensor.name} wrote an unexpected qscale byte count")
     return bytes_written
 
 
@@ -1755,6 +2063,8 @@ def _read_uocr_tensor_payload_view(model_path: str | Path, tensor_id: int) -> _U
                 payload_size=int(entry[18]),
                 block_size=int(entry[19]),
                 row_size=int(entry[20]),
+                scale_offset=int(entry[21]),
+                scale_size=int(entry[22]),
                 qtype_reason_id=int(entry[25]),
                 promotion_reason_id=int(entry[26]),
             )
@@ -1782,6 +2092,59 @@ def _iter_expected_converted_tensor_chunks(
         remaining -= wanted
 
 
+def _expected_q8_0_chunk(values: np.ndarray, tensor: TensorPlan) -> tuple[bytes, bytes, float, float, int]:
+    rows, cols = values.shape
+    group_size = tensor.block_size
+    groups_per_row = cols // group_size
+    grouped = values.reshape(rows, groups_per_row, group_size)
+    max_abs = np.max(np.abs(grouped), axis=2)
+    scales = max_abs / np.float32(UOCR_Q8_MAX)
+    scales = np.where(max_abs == 0.0, np.float32(1.0), scales).astype(np.float32, copy=False)
+    quantized = np.rint(grouped / scales[:, :, None])
+    quantized = np.clip(quantized, UOCR_Q8_MIN, UOCR_Q8_MAX).astype(np.int8, copy=False)
+    scale_f16 = scales.astype(np.dtype("<f2"), copy=False)
+    dequant = quantized.astype(np.float32) * scale_f16.astype(np.float32)[:, :, None]
+    diff = dequant.reshape(rows, cols) - values
+    sq_error = float(np.sum(diff * diff, dtype=np.float64))
+    max_abs_error = float(np.max(np.abs(diff))) if diff.size else 0.0
+    return (
+        quantized.reshape(rows, cols).tobytes(),
+        scale_f16.tobytes(),
+        max_abs_error,
+        sq_error,
+        int(diff.size),
+    )
+
+
+def _iter_expected_q8_0_tensor_chunks(
+    src: BinaryIO,
+    tensor: TensorPlan,
+    *,
+    chunk_source_bytes: int = 8 * 1024 * 1024,
+) -> Iterable[tuple[bytes, bytes, float, float, int]]:
+    if tensor.qtype_id != UOCR_TENSOR_Q8_0:
+        raise ValueError(f"tensor {tensor.name} is not Q8_0")
+    if len(tensor.shape) != 2:
+        raise ValueError(f"Q8_0 tensor {tensor.name} must be rank-2")
+    rows, cols = tensor.shape
+    if tensor.block_size != UOCR_Q8_GROUP_SIZE_DEFAULT or cols % tensor.block_size != 0:
+        raise ValueError(f"Q8_0 tensor {tensor.name} has unsupported group metadata")
+    row_source_bytes = cols * np.dtype("<u2").itemsize
+    rows_per_chunk = max(1, chunk_source_bytes // row_source_bytes)
+    rows_done = 0
+    while rows_done < rows:
+        batch_rows = min(rows - rows_done, rows_per_chunk)
+        wanted = batch_rows * row_source_bytes
+        raw = src.read(wanted)
+        if len(raw) != wanted:
+            raise EOFError(f"unexpected end of safetensors payload while reading {tensor.name}")
+        values = _bf16_bytes_to_f32(raw).reshape(batch_rows, cols)
+        if not np.all(np.isfinite(values)):
+            raise ValueError(f"Q8_0 tensor {tensor.name} contains non-finite values")
+        yield _expected_q8_0_chunk(values, tensor)
+        rows_done += batch_rows
+
+
 def _metadata_mismatches_for_compare(
     plan: DryRunPlan, tensor: TensorPlan, view: _UocrTensorPayloadView
 ) -> tuple[str, ...]:
@@ -1805,6 +2168,10 @@ def _metadata_mismatches_for_compare(
         mismatches.append(f"block_size actual={view.block_size} expected={tensor.block_size}")
     if view.row_size != tensor.row_size:
         mismatches.append(f"row_size actual={view.row_size} expected={tensor.row_size}")
+    if view.scale_offset != tensor.scale_offset:
+        mismatches.append(f"scale_offset actual={view.scale_offset} expected={tensor.scale_offset}")
+    if view.scale_size != tensor.scale_size:
+        mismatches.append(f"scale_size actual={view.scale_size} expected={tensor.scale_size}")
     if view.qtype_reason_id != tensor.qtype_reason_id:
         mismatches.append(f"qtype_reason_id actual={view.qtype_reason_id} expected={tensor.qtype_reason_id}")
     if view.promotion_reason_id != tensor.promotion_reason_id:
@@ -1831,7 +2198,7 @@ def compare_single_tensor_conversion(
     tensor = plan.tensors[0]
     if tensor.usage_id == UOCR_TENSOR_USAGE_OMITTED_WITH_REASON:
         raise ValueError(f"tensor {tensor.name} has no payload to compare")
-    if tensor.qtype_id != UOCR_TENSOR_F16:
+    if tensor.qtype_id not in {UOCR_TENSOR_F16, UOCR_TENSOR_Q8_0}:
         raise NotImplementedError(f"single-tensor compare for qtype {tensor.qtype} is not implemented")
 
     model = Path(model_path)
@@ -1845,49 +2212,67 @@ def compare_single_tensor_conversion(
     first_mismatch_offset: int | None = None
     expected_byte: int | None = None
     actual_byte: int | None = None
+    dequant_max_abs_error: float | None = None
+    dequant_sq_error = 0.0
+    dequant_value_count = 0
+
+    def compare_bytes(expected_chunk: bytes, actual_chunk: bytes, logical_offset: int) -> None:
+        nonlocal first_mismatch_offset, expected_byte, actual_byte
+        expected_hash.update(expected_chunk)
+        actual_hash.update(actual_chunk)
+        if first_mismatch_offset is not None or actual_chunk == expected_chunk:
+            return
+        limit = min(len(actual_chunk), len(expected_chunk))
+        for index in range(limit):
+            if actual_chunk[index] != expected_chunk[index]:
+                first_mismatch_offset = logical_offset + index
+                expected_byte = expected_chunk[index]
+                actual_byte = actual_chunk[index]
+                return
+        first_mismatch_offset = logical_offset + limit
+        expected_byte = expected_chunk[limit] if limit < len(expected_chunk) else None
+        actual_byte = actual_chunk[limit] if limit < len(actual_chunk) else None
 
     with source.open("rb") as src, model.open("rb") as actual:
         src.seek(data_start + tensor.source_offsets[0])
-        actual.seek(view.payload_offset)
-        for expected_chunk in _iter_expected_converted_tensor_chunks(
-            src, tensor, chunk_source_bytes=chunk_source_bytes
-        ):
-            expected_hash.update(expected_chunk)
-            actual_chunk = actual.read(len(expected_chunk))
-            actual_hash.update(actual_chunk)
-            if first_mismatch_offset is None and actual_chunk != expected_chunk:
-                limit = min(len(actual_chunk), len(expected_chunk))
-                for index in range(limit):
-                    if actual_chunk[index] != expected_chunk[index]:
-                        first_mismatch_offset = compared_bytes + index
-                        expected_byte = expected_chunk[index]
-                        actual_byte = actual_chunk[index]
-                        break
-                if first_mismatch_offset is None:
-                    first_mismatch_offset = compared_bytes + limit
-                    expected_byte = expected_chunk[limit] if limit < len(expected_chunk) else None
-                    actual_byte = actual_chunk[limit] if limit < len(actual_chunk) else None
-            compared_bytes += len(expected_chunk)
+        if tensor.qtype_id == UOCR_TENSOR_F16:
+            actual.seek(view.payload_offset)
+            for expected_chunk in _iter_expected_converted_tensor_chunks(
+                src, tensor, chunk_source_bytes=chunk_source_bytes
+            ):
+                actual_chunk = actual.read(len(expected_chunk))
+                compare_bytes(expected_chunk, actual_chunk, compared_bytes)
+                compared_bytes += len(expected_chunk)
+        else:
+            qweight_pos = view.payload_offset
+            qscale_pos = view.scale_offset
+            scale_compared = 0
+            for expected_qweight, expected_qscale, max_abs_error, sq_error, value_count in _iter_expected_q8_0_tensor_chunks(
+                src, tensor, chunk_source_bytes=chunk_source_bytes
+            ):
+                dequant_max_abs_error = max(max_abs_error, dequant_max_abs_error or 0.0)
+                dequant_sq_error += sq_error
+                dequant_value_count += value_count
 
-        if view.payload_size > compared_bytes:
-            remaining = view.payload_size - compared_bytes
-            if first_mismatch_offset is None:
-                first_mismatch_offset = compared_bytes
-                expected_byte = None
-            while remaining:
-                chunk = actual.read(min(remaining, 1024 * 1024))
-                if not chunk:
-                    break
-                if actual_byte is None:
-                    actual_byte = chunk[0]
-                actual_hash.update(chunk)
-                remaining -= len(chunk)
+                actual.seek(qweight_pos)
+                actual_qweight = actual.read(len(expected_qweight))
+                compare_bytes(expected_qweight, actual_qweight, compared_bytes)
+                qweight_pos += len(expected_qweight)
+                compared_bytes += len(expected_qweight)
 
-    payload_matches = (
-        first_mismatch_offset is None
-        and compared_bytes == tensor.output_bytes
-        and view.payload_size == tensor.output_bytes
-    )
+                actual.seek(qscale_pos)
+                actual_qscale = actual.read(len(expected_qscale))
+                compare_bytes(expected_qscale, actual_qscale, tensor.output_bytes + scale_compared)
+                qscale_pos += len(expected_qscale)
+                scale_compared += len(expected_qscale)
+            compared_bytes += scale_compared
+
+    expected_bytes = tensor.output_bytes + tensor.scale_size
+    actual_bytes = view.payload_size + view.scale_size
+    if first_mismatch_offset is None and actual_bytes != expected_bytes:
+        first_mismatch_offset = min(actual_bytes, expected_bytes)
+    dequant_rmse = math.sqrt(dequant_sq_error / dequant_value_count) if dequant_value_count else None
+    payload_matches = first_mismatch_offset is None and compared_bytes == expected_bytes and actual_bytes == expected_bytes
     return TensorCompareResult(
         name=tensor.name,
         tensor_id=tensor.tensor_id,
@@ -1895,8 +2280,8 @@ def compare_single_tensor_conversion(
         qtype_id=tensor.qtype_id,
         model_path=str(model),
         source_path=str(source),
-        expected_bytes=tensor.output_bytes,
-        actual_bytes=view.payload_size,
+        expected_bytes=expected_bytes,
+        actual_bytes=actual_bytes,
         compared_bytes=compared_bytes,
         expected_sha256=expected_hash.hexdigest(),
         actual_sha256=actual_hash.hexdigest(),
@@ -1905,6 +2290,8 @@ def compare_single_tensor_conversion(
         first_mismatch_offset=first_mismatch_offset,
         expected_byte=expected_byte,
         actual_byte=actual_byte,
+        dequant_max_abs_error=dequant_max_abs_error,
+        dequant_rmse=dequant_rmse,
     )
 
 
@@ -1918,15 +2305,14 @@ def write_uocr_model(
 ) -> Path:
     """Stream a planned `.uocr` file to disk.
 
-    The writer supports the fp16 baseline.  It converts each BF16 safetensors
-    range to fp16 in bounded chunks and writes directly into the mmap-friendly
-    layout produced by :func:`build_dry_run_plan`.  When ``stats_path`` is
-    supplied, the same chunks are also summarized into per-tensor conversion
-    statistics without creating a full-model temporary array.
+    The writer supports fp16 and mixed Q8_0 plans.  It converts each BF16
+    safetensors range in bounded chunks and writes directly into the
+    mmap-friendly layout produced by :func:`build_dry_run_plan`.  Q8 tensors are
+    quantized row-major without materializing a full tensor-sized copy.
     """
 
-    if plan.qprofile != "fp16":
-        raise NotImplementedError("only fp16 .uocr writing is implemented")
+    if plan.qprofile not in QPROFILE_IDS:
+        raise ValueError(f"unknown qprofile {plan.qprofile!r}")
     if plan.tensor_count == 0:
         raise ValueError("cannot write a .uocr with no tensors")
 
@@ -1990,19 +2376,21 @@ def write_uocr_model(
                 if tensor.usage_id == UOCR_TENSOR_USAGE_OMITTED_WITH_REASON:
                     continue
                 src.seek(data_start + tensor.source_offsets[0])
-                dst.seek(tensor.payload_offset)
-                before = dst.tell()
                 value_stats = _StreamingValueStats() if conversion_stats is not None else None
-                if tensor.qtype_id != UOCR_TENSOR_F16:
+                if tensor.qtype_id == UOCR_TENSOR_F16:
+                    dst.seek(tensor.payload_offset)
+                    output_bytes_written = _stream_bf16_to_f16(
+                        src, dst, source_bytes=tensor.source_bytes, stats=value_stats
+                    )
+                    expected_written = tensor.output_bytes
+                elif tensor.qtype_id == UOCR_TENSOR_Q8_0:
+                    output_bytes_written = _stream_bf16_to_q8_0(src, dst, tensor, stats=value_stats)
+                    expected_written = tensor.output_bytes + tensor.scale_size
+                else:
                     raise NotImplementedError(f"writing qtype {tensor.qtype} is not implemented")
-                output_bytes_written = _stream_bf16_to_f16(
-                    src, dst, source_bytes=tensor.source_bytes, stats=value_stats
-                )
-                written = dst.tell() - before
-                if written != tensor.output_bytes or output_bytes_written != tensor.output_bytes:
+                if output_bytes_written != expected_written:
                     raise IOError(
-                        f"tensor {tensor.name} wrote {written}/{output_bytes_written} bytes, "
-                        f"expected {tensor.output_bytes}"
+                        f"tensor {tensor.name} wrote {output_bytes_written} bytes, expected {expected_written}"
                     )
                 if conversion_stats is not None and value_stats is not None:
                     conversion_stats.append(
@@ -2044,6 +2432,14 @@ def _print_summary(plan: DryRunPlan, *, dry_run: bool) -> None:
     tensor_data = next((section for section in plan.sections if section.section_type == UOCR_SECTION_TENSOR_DATA), None)
     if tensor_data is not None:
         print(f"tensor data: offset={tensor_data.offset} size={tensor_data.size} alignment={tensor_data.alignment}")
+    q8 = q8_summary(plan.tensors)
+    if q8["tensor_count"]:
+        print(
+            "q8: "
+            f"tensors={q8['tensor_count']} qweight_bytes={q8['qweight_bytes']} "
+            f"qscale_bytes={q8['qscale_bytes']} fp16_equivalent_bytes={q8['fp16_equivalent_bytes']} "
+            f"estimated_savings_bytes={q8['estimated_savings_bytes']}"
+        )
     print(f"qtypes: {dict(plan.qtype_histogram)}")
     print(f"qtype reasons: {dict(plan.qtype_reason_histogram)}")
     print(f"promotion reasons: {dict(plan.promotion_reason_histogram)}")
@@ -2064,7 +2460,7 @@ def _write_dump(plan: DryRunPlan, path: str) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Plan an Unlimited-OCR conversion or write an fp16 .uocr file")
+    parser = argparse.ArgumentParser(description="Plan or write an Unlimited-OCR .uocr file")
     parser.add_argument("--hf-dir", type=Path, default=project_root() / "data/context")
     parser.add_argument("--header", type=Path, default=None, help="optional safetensors header/cache path")
     parser.add_argument("--index", type=Path, default=None, help="optional safetensors index path")
@@ -2074,9 +2470,11 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="explicit source .safetensors payload for --out or --compare-uocr",
     )
-    parser.add_argument("--qprofile", choices=["fp16"], default="fp16")
+    parser.add_argument("--qprofile", choices=["fp16", "mixed-q8_0"], default="fp16")
+    parser.add_argument("--quant-group-size", type=int, default=UOCR_Q8_GROUP_SIZE_DEFAULT)
+    parser.add_argument("--quant-policy", choices=[QUANT_POLICY_EMBEDDINGS_DECODER], default=QUANT_POLICY_EMBEDDINGS_DECODER)
     parser.add_argument("--dry-run", action="store_true", help="plan only; does not require full weights")
-    parser.add_argument("--out", type=Path, default=None, help="write an fp16 .uocr file to this path")
+    parser.add_argument("--out", type=Path, default=None, help="write a .uocr file to this path")
     parser.add_argument(
         "--compare-uocr",
         type=Path,
@@ -2092,6 +2490,7 @@ def main(argv: list[str] | None = None) -> int:
         help="write per-tensor conversion statistics JSON while writing --out",
     )
     parser.add_argument("--dump-plan", nargs="?", const="-", default=None, help="write full JSON plan to path or stdout")
+    parser.add_argument("--dump-quant-summary", nargs="?", const="-", default=None, help="write Q8 summary JSON to path or stdout")
     parser.add_argument(
         "--relaxed-validation",
         action="store_true",
@@ -2111,11 +2510,21 @@ def main(argv: list[str] | None = None) -> int:
         header_path=args.header,
         index_path=args.index,
         strict=not args.relaxed_validation,
+        quant_group_size=args.quant_group_size,
+        quant_policy=args.quant_policy,
     )
     plan = filter_plan_tensors(plan, args.tensor)
     _print_summary(plan, dry_run=args.dry_run or args.out is None)
     if args.dump_plan is not None:
         _write_dump(plan, args.dump_plan)
+    if args.dump_quant_summary is not None:
+        payload = json.dumps(q8_summary(plan.tensors), indent=2, sort_keys=True)
+        if args.dump_quant_summary == "-":
+            print(payload)
+        else:
+            out = Path(args.dump_quant_summary)
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_text(payload + "\n", encoding="utf-8")
     if args.out is not None:
         written = write_uocr_model(
             plan,
@@ -2138,6 +2547,11 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(f"compare expected_sha256={comparison.expected_sha256}")
         print(f"compare actual_sha256={comparison.actual_sha256}")
+        if comparison.dequant_max_abs_error is not None:
+            print(
+                "compare dequant: "
+                f"max_abs_error={comparison.dequant_max_abs_error:.8g} rmse={comparison.dequant_rmse:.8g}"
+            )
         if not comparison.metadata_matches:
             print("compare metadata mismatches:")
             for mismatch in comparison.metadata_mismatches:

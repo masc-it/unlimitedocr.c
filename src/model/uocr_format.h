@@ -13,7 +13,8 @@
 #define UOCR_TENSOR_PAYLOAD_ALIGNMENT 16u
 
 typedef enum uocr_qprofile_id {
-    UOCR_QPROFILE_FP16 = 1
+    UOCR_QPROFILE_FP16 = 1,
+    UOCR_QPROFILE_MIXED_Q8_0 = 2
 } uocr_qprofile_id;
 
 typedef enum uocr_section_type {
@@ -35,8 +36,31 @@ typedef enum uocr_provenance_flags {
 
 typedef enum uocr_tensor_qtype {
     UOCR_TENSOR_F16 = 1,
-    UOCR_TENSOR_F32 = 2
+    UOCR_TENSOR_F32 = 2,
+    UOCR_TENSOR_Q8_0 = 3
 } uocr_tensor_qtype;
+
+#define UOCR_Q8_GROUP_SIZE_DEFAULT 64u
+#define UOCR_Q8_MIN (-127)
+#define UOCR_Q8_MAX 127
+
+static inline uint64_t uocr_q8_0_qweight_bytes(uint32_t rows, uint32_t cols) {
+    return (uint64_t)rows * (uint64_t)cols;
+}
+
+static inline uint64_t uocr_q8_0_qscale_bytes(uint32_t rows, uint32_t cols, uint32_t group_size) {
+    if (group_size == 0u || (cols % group_size) != 0u) {
+        return 0u;
+    }
+    return (uint64_t)rows * (uint64_t)(cols / group_size) * (uint64_t)sizeof(uint16_t);
+}
+
+static inline uint64_t uocr_q8_0_total_bytes(uint32_t rows, uint32_t cols, uint32_t group_size) {
+    if (group_size == 0u || (cols % group_size) != 0u) {
+        return 0u;
+    }
+    return uocr_q8_0_qweight_bytes(rows, cols) + uocr_q8_0_qscale_bytes(rows, cols, group_size);
+}
 
 typedef enum uocr_tensor_usage {
     UOCR_TENSOR_USAGE_RUNTIME = 1,

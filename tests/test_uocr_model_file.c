@@ -302,6 +302,147 @@ static int write_synthetic_uocr_with_tensors(const char *path, synthetic_tensor_
     return failed ? 1 : 0;
 }
 
+typedef enum synthetic_q8_corruption {
+    SYNTHETIC_Q8_OK = 0,
+    SYNTHETIC_Q8_BAD_SCALE_ALIGNMENT = 1
+} synthetic_q8_corruption;
+
+static int write_synthetic_mixed_q8_uocr(const char *path, synthetic_q8_corruption corruption) {
+    static const char provenance_json[] =
+        "{\"quantization\":{\"mode\":\"mixed-q8_0\",\"group_size\":64,\"policy\":\"embeddings+decoder\"}}";
+    const uint64_t section_dir_offset = sizeof(uocr_file_header);
+    const uint32_t section_count = 5u;
+    const uint64_t config_offset = section_dir_offset + section_count * sizeof(uocr_section_entry);
+    const uint64_t tokenizer_offset = align_up_u64(config_offset + sizeof(uocr_config_record), 8u);
+    const uint64_t tokenizer_size = sizeof(uocr_tokenizer_metadata_record);
+    const uint64_t provenance_offset = align_up_u64(tokenizer_offset + tokenizer_size, 8u);
+    const uint64_t provenance_size = sizeof(uocr_provenance_record) + sizeof(provenance_json) - 1u;
+    const uint64_t tensor_dir_offset = align_up_u64(provenance_offset + provenance_size, 8u);
+    const uint64_t tensor_dir_size = sizeof(uocr_tensor_directory_header) + sizeof(uocr_tensor_entry);
+    const uint64_t tensor_data_offset = align_up_u64(tensor_dir_offset + tensor_dir_size, UOCR_TENSOR_DATA_ALIGNMENT);
+    const uint64_t qweight_size = 2u * 64u;
+    const uint64_t qscale_size = 2u * sizeof(uint16_t);
+    const uint64_t qscale_offset = tensor_data_offset + qweight_size;
+    const uint64_t tensor_data_size = qweight_size + qscale_size;
+    const uint64_t file_size = tensor_data_offset + tensor_data_size;
+
+    uint8_t *buffer = (uint8_t *)calloc(1u, (size_t)file_size);
+    if (buffer == NULL) {
+        return 1;
+    }
+
+    uocr_file_header *header = (uocr_file_header *)(void *)buffer;
+    memcpy(header->magic, UOCR_FILE_MAGIC, 4u);
+    header->version = UOCR_FORMAT_VERSION;
+    header->header_size = (uint32_t)sizeof(uocr_file_header);
+    header->endian_marker = UOCR_ENDIAN_MARKER;
+    header->required_alignment = UOCR_TENSOR_DATA_ALIGNMENT;
+    header->qprofile = UOCR_QPROFILE_MIXED_Q8_0;
+    header->section_count = section_count;
+    header->file_size = file_size;
+    header->section_dir_offset = section_dir_offset;
+
+    uocr_section_entry *sections = (uocr_section_entry *)(void *)(buffer + section_dir_offset);
+    sections[0].type = UOCR_SECTION_CONFIG;
+    sections[0].offset = config_offset;
+    sections[0].size = sizeof(uocr_config_record);
+    sections[0].alignment = 8u;
+    sections[1].type = UOCR_SECTION_TOKENIZER_METADATA;
+    sections[1].offset = tokenizer_offset;
+    sections[1].size = tokenizer_size;
+    sections[1].alignment = 8u;
+    sections[2].type = UOCR_SECTION_PROVENANCE;
+    sections[2].offset = provenance_offset;
+    sections[2].size = provenance_size;
+    sections[2].alignment = 8u;
+    sections[3].type = UOCR_SECTION_TENSOR_DIRECTORY;
+    sections[3].offset = tensor_dir_offset;
+    sections[3].size = tensor_dir_size;
+    sections[3].alignment = 8u;
+    sections[4].type = UOCR_SECTION_TENSOR_DATA;
+    sections[4].offset = tensor_data_offset;
+    sections[4].size = tensor_data_size;
+    sections[4].alignment = UOCR_TENSOR_DATA_ALIGNMENT;
+
+    uocr_config_record config = uocr_default_config_record();
+    memcpy(buffer + config_offset, &config, sizeof(config));
+
+    uocr_tokenizer_metadata_record *tokenizer = (uocr_tokenizer_metadata_record *)(void *)(buffer + tokenizer_offset);
+    tokenizer->magic = UOCR_TOKENIZER_METADATA_MAGIC;
+    tokenizer->version = UOCR_FORMAT_VERSION;
+    tokenizer->record_size = (uint32_t)sizeof(uocr_tokenizer_metadata_record);
+    tokenizer->flags = UOCR_TOKENIZER_FLAG_C_V1_NOT_REQUIRED;
+    fill_hash(tokenizer->tokenizer_hash, 0x10u);
+    tokenizer->vocab_size = UOCR_VOCAB_SIZE;
+    tokenizer->bpe_vocab_size = UOCR_BPE_VOCAB_SIZE;
+    tokenizer->added_token_count = UOCR_ADDED_TOKEN_COUNT;
+    tokenizer->bos_token_id = (uint32_t)UOCR_TOKEN_BOS;
+    tokenizer->eos_token_id = (uint32_t)UOCR_TOKEN_EOS;
+    tokenizer->pad_token_id = (uint32_t)UOCR_TOKEN_PAD;
+    tokenizer->image_token_id = (uint32_t)UOCR_TOKEN_IMAGE;
+
+    uocr_provenance_record *provenance = (uocr_provenance_record *)(void *)(buffer + provenance_offset);
+    provenance->magic = UOCR_PROVENANCE_MAGIC;
+    provenance->version = UOCR_FORMAT_VERSION;
+    provenance->record_size = (uint32_t)sizeof(uocr_provenance_record);
+    provenance->flags = UOCR_PROVENANCE_FLAG_JSON_PAYLOAD;
+    provenance->source_tensor_count = 1u;
+    provenance->runtime_tensor_count = 1u;
+    provenance->preserved_unused_tensor_count = 0u;
+    provenance->omitted_tensor_count = 0u;
+    provenance->safetensors_file_count = 1u;
+    provenance->qprofile = UOCR_QPROFILE_MIXED_Q8_0;
+    provenance->converter_version_major = 0u;
+    provenance->converter_version_minor = 2u;
+    provenance->converter_version_patch = 0u;
+    fill_hash(provenance->config_hash, 0x30u);
+    fill_hash(provenance->tokenizer_hash, 0x10u);
+    fill_hash(provenance->safetensors_index_hash, 0x50u);
+    provenance->json_offset = sizeof(uocr_provenance_record);
+    provenance->json_size = sizeof(provenance_json) - 1u;
+    memcpy(buffer + provenance_offset + provenance->json_offset, provenance_json, sizeof(provenance_json) - 1u);
+
+    uocr_tensor_directory_header *dir = (uocr_tensor_directory_header *)(void *)(buffer + tensor_dir_offset);
+    dir->magic = UOCR_TENSOR_DIR_MAGIC;
+    dir->version = UOCR_FORMAT_VERSION;
+    dir->entry_size = (uint32_t)sizeof(uocr_tensor_entry);
+    dir->tensor_count = 1u;
+
+    uocr_tensor_entry *tensor = (uocr_tensor_entry *)(void *)(buffer + tensor_dir_offset + sizeof(*dir));
+    tensor->id = UOCR_TENSOR_ID_TOK_EMBED;
+    tensor->family = UOCR_TENSOR_FAMILY_TOK_EMBED;
+    tensor->layer = -1;
+    tensor->expert = -1;
+    tensor->projection = UOCR_TENSOR_PROJ_WEIGHT;
+    tensor->usage = UOCR_TENSOR_USAGE_RUNTIME;
+    tensor->qtype = UOCR_TENSOR_Q8_0;
+    tensor->flags = UOCR_TENSOR_FLAG_ROW_MAJOR;
+    tensor->rank = 2u;
+    tensor->logical_shape[0] = 2u;
+    tensor->logical_shape[1] = 64u;
+    tensor->physical_shape[0] = 2u;
+    tensor->physical_shape[1] = 64u;
+    tensor->payload_offset = tensor_data_offset;
+    tensor->payload_size = qweight_size;
+    tensor->block_size = UOCR_Q8_GROUP_SIZE_DEFAULT;
+    tensor->row_size = 64u;
+    tensor->scale_offset = corruption == SYNTHETIC_Q8_BAD_SCALE_ALIGNMENT ? qscale_offset + 2u : qscale_offset;
+    tensor->scale_size = qscale_size;
+    tensor->qtype_reason = UOCR_TENSOR_QTYPE_REASON_UNKNOWN;
+    tensor->promotion_reason = UOCR_TENSOR_PROMOTION_NONE;
+
+    FILE *f = fopen(path, "wb");
+    if (f == NULL) {
+        free(buffer);
+        perror("fopen");
+        return 1;
+    }
+    int failed = fwrite(buffer, 1u, (size_t)file_size, f) != (size_t)file_size;
+    failed |= fclose(f) != 0;
+    free(buffer);
+    return failed ? 1 : 0;
+}
+
 static int make_temp_path(char *path, size_t path_size) {
     const char *template_path = "/tmp/uocr-model-file-XXXXXX";
     if (strlen(template_path) + 1u > path_size) {
@@ -470,6 +611,40 @@ static int test_rejects_bad_tensor_data_alignment(void) {
     return 0;
 }
 
+static int test_valid_mixed_q8_tensor_directory(void) {
+    char path[128];
+    CHECK(make_temp_path(path, sizeof(path)) == 0);
+    CHECK(write_synthetic_mixed_q8_uocr(path, SYNTHETIC_Q8_OK) == 0);
+
+    char error[512];
+    uocr_model_file model;
+    CHECK(uocr_model_file_open(path, &model, error, sizeof(error)) == 0);
+    CHECK(model.header->qprofile == UOCR_QPROFILE_MIXED_Q8_0);
+    CHECK(strcmp(uocr_qprofile_name(model.header->qprofile), "mixed-q8_0") == 0);
+    CHECK(model.tensor_count == 1u);
+    CHECK(model.tensors[0].qtype == UOCR_TENSOR_Q8_0);
+    CHECK(strcmp(uocr_tensor_qtype_name(model.tensors[0].qtype), "q8_0") == 0);
+    CHECK(model.tensors[0].block_size == UOCR_Q8_GROUP_SIZE_DEFAULT);
+    CHECK(model.tensors[0].payload_size == 128u);
+    CHECK(model.tensors[0].scale_size == 4u);
+    uocr_model_file_close(&model);
+    unlink(path);
+    return 0;
+}
+
+static int test_rejects_bad_q8_scale_alignment(void) {
+    char path[128];
+    CHECK(make_temp_path(path, sizeof(path)) == 0);
+    CHECK(write_synthetic_mixed_q8_uocr(path, SYNTHETIC_Q8_BAD_SCALE_ALIGNMENT) == 0);
+
+    char error[512];
+    uocr_model_file model;
+    CHECK(uocr_model_file_open(path, &model, error, sizeof(error)) != 0);
+    CHECK(strstr(error, "scale offset") != NULL);
+    unlink(path);
+    return 0;
+}
+
 static int test_full_fp16_accounting_validator_accepts_current_contract(void) {
     uocr_model_file model;
     uocr_file_header header;
@@ -587,6 +762,9 @@ int main(void) {
     CHECK(uocr_tensor_id_layer_attn(3u, UOCR_TENSOR_PROJ_Q) == 13010u);
     CHECK(uocr_tensor_id_moe_expert(1u, 7u, UOCR_TENSOR_PROJ_DOWN) == 11123u);
     CHECK(UOCR_TENSOR_ID_VISION_CLIP_UNUSED_PATCH_EMBED_WEIGHT == 200001u);
+    CHECK(uocr_q8_0_qweight_bytes(2u, 64u) == 128u);
+    CHECK(uocr_q8_0_qscale_bytes(2u, 64u, UOCR_Q8_GROUP_SIZE_DEFAULT) == 4u);
+    CHECK(uocr_q8_0_total_bytes(2u, 64u, UOCR_Q8_GROUP_SIZE_DEFAULT) == 132u);
 
     if (test_rejects_bad_endian_marker() != 0) return 1;
     if (test_rejects_zero_required_alignment() != 0) return 1;
@@ -597,6 +775,8 @@ int main(void) {
     if (test_rejects_tensor_payload_outside_tensor_data_section() != 0) return 1;
     if (test_rejects_transposed_tensor_layout() != 0) return 1;
     if (test_rejects_bad_tensor_data_alignment() != 0) return 1;
+    if (test_valid_mixed_q8_tensor_directory() != 0) return 1;
+    if (test_rejects_bad_q8_scale_alignment() != 0) return 1;
     if (test_full_fp16_accounting_validator_accepts_current_contract() != 0) return 1;
     if (test_full_fp16_accounting_validator_rejects_incomplete_model() != 0) return 1;
     if (test_full_fp16_accounting_validator_rejects_wrong_preserved_tensor() != 0) return 1;
