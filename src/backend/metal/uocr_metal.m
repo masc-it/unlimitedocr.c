@@ -4383,9 +4383,9 @@ static int metal_vision_weight_cache_build_direct(const uocr_metal_vision_bindin
         uocr_metal_sam_transformer_block_slices_f16 *direct_block = &out_weights->sam_block_slices[layer];
         uocr_metal_sam_transformer_block_f16 *host_block = &out_weights->sam_blocks[layer];
         ASSIGN_SAM_BLOCK_TENSOR(proj_bias, base + 0u, "SAM attention projection bias", proj_bias_f16);
-        ASSIGN_SAM_BLOCK_TENSOR(proj_weight, base + 1u, "SAM attention projection weight", proj_weight_f16);
+        ASSIGN_SAM_BLOCK_WEIGHT_ANY_QTYPE(proj_weight, base + 1u, "SAM attention projection weight", proj_weight_f16);
         ASSIGN_SAM_BLOCK_TENSOR(qkv_bias, base + 2u, "SAM attention qkv bias", qkv_bias_f16);
-        ASSIGN_SAM_BLOCK_TENSOR(qkv_weight, base + 3u, "SAM attention qkv weight", qkv_weight_f16);
+        ASSIGN_SAM_BLOCK_WEIGHT_ANY_QTYPE(qkv_weight, base + 3u, "SAM attention qkv weight", qkv_weight_f16);
         ASSIGN_SAM_BLOCK_TENSOR(rel_pos_h, base + 4u, "SAM relative position H", rel_pos_h_f16);
         ASSIGN_SAM_BLOCK_TENSOR(rel_pos_w, base + 5u, "SAM relative position W", rel_pos_w_f16);
         ASSIGN_SAM_BLOCK_TENSOR(mlp_lin1_bias, base + 6u, "SAM MLP lin1 bias", mlp_lin1_bias_f16);
@@ -16625,10 +16625,11 @@ static int metal_run_vision_linear_q8_0(uocr_metal_context *ctx,
 }
 
 /*
- * Fused Q8_0 CLIP QKV projection: packed [3*hidden, hidden] Q8 weight, fp16
- * bias, direct writes into split Q/K/V buffers via the GEMM split epilogue.
+ * Fused Q8_0 vision QKV projection (CLIP and SAM): packed [3*hidden, hidden]
+ * Q8 weight, fp16 bias, direct writes into split Q/K/V buffers via the GEMM
+ * split epilogue.
  */
-static int metal_run_clip_qkv_q8_0(uocr_metal_context *ctx,
+static int metal_run_vision_qkv_q8_0(uocr_metal_context *ctx,
                                    uocr_metal_buffer_slice input,
                                    uocr_metal_vision_tensor_f16 weight,
                                    uocr_metal_vision_tensor_f16 bias,
@@ -16877,7 +16878,7 @@ static int metal_context_clip_transformer_batch_block_workspace_f16_to_slice(uoc
     if (qkv_is_q8) {
         const uint64_t qkv_q8_start_ns = uocr_profile_now_ns();
         RUN_CLIP_BATCH_BLOCK_STEP("QKV",
-                                  metal_run_clip_qkv_q8_0(ctx,
+                                  metal_run_vision_qkv_q8_0(ctx,
                                                           (uocr_metal_buffer_slice){scratch->clip_block_norm1.buffer, scratch->clip_block_norm1.offset},
                                                           block->qkv_weight,
                                                           block->qkv_bias,
@@ -17120,13 +17121,13 @@ static int metal_sam_transformer_activation_bytes(uint32_t grid_w,
     return 1;
 }
 /*
- * MLP lin1/lin2 weights may be f16 or Q8_0 (dtype-aware slices); all other SAM
- * block tensors must be CPU-visible fp16.
+ * QKV/projection and MLP lin1/lin2 weights may be f16 or Q8_0 (dtype-aware
+ * slices); all other SAM block tensors must be CPU-visible fp16.
  */
 static int metal_sam_transformer_block_slices_have_weights(const uocr_metal_sam_transformer_block_slices_f16 *block) {
     return block != NULL && block->norm1_weight.host_f16 != NULL && block->norm1_bias.host_f16 != NULL &&
-           block->qkv_weight.host_f16 != NULL && block->qkv_bias.host_f16 != NULL &&
-           block->proj_weight.host_f16 != NULL && block->proj_bias.host_f16 != NULL &&
+           metal_vision_weight_slice_ready(&block->qkv_weight) && block->qkv_bias.host_f16 != NULL &&
+           metal_vision_weight_slice_ready(&block->proj_weight) && block->proj_bias.host_f16 != NULL &&
            block->rel_pos_h.host_f16 != NULL && block->rel_pos_w.host_f16 != NULL &&
            block->rel_pos_h_length != 0u && block->rel_pos_w_length != 0u &&
            block->norm2_weight.host_f16 != NULL && block->norm2_bias.host_f16 != NULL &&
@@ -17971,6 +17972,8 @@ static int metal_context_sam_transformer_batch_block_workspace_f16_to_slice(uocr
     const uint64_t projection_weight_bytes = (uint64_t)UOCR_SAM_HIDDEN_SIZE * (uint64_t)UOCR_SAM_HIDDEN_SIZE * 2u;
     const uint64_t rel_h_bytes = (uint64_t)block->rel_pos_h_length * (uint64_t)UOCR_SAM_HEAD_DIM * 2u;
     const uint64_t rel_w_bytes = (uint64_t)block->rel_pos_w_length * (uint64_t)UOCR_SAM_HEAD_DIM * 2u;
+    const int qkv_is_q8 = block->qkv_weight.qtype == UOCR_TENSOR_Q8_0;
+    const int proj_is_q8 = block->proj_weight.qtype == UOCR_TENSOR_Q8_0;
     if (!checked_mul_u64((uint64_t)rows, (uint64_t)UOCR_SAM_HIDDEN_SIZE, &hidden_values) ||
         hidden_values > (uint64_t)UINT32_MAX || !metal_vision_f16_bytes(hidden_values, &hidden_bytes) ||
         !checked_mul_u64((uint64_t)attention_rows, (uint64_t)UOCR_SAM_HIDDEN_SIZE, &attention_values) ||
@@ -17993,9 +17996,11 @@ static int metal_context_sam_transformer_batch_block_workspace_f16_to_slice(uocr
         !metal_vision_require_workspace_slice(scratch->sam_block_mlp_bhwc, hidden_bytes, "SAM batch block MLP", error, error_size) ||
         !metal_vision_require_tensor_slice_f16(block->norm1_weight, parameter_bytes, "SAM block norm1 weight", error, error_size) ||
         !metal_vision_require_tensor_slice_f16(block->norm1_bias, parameter_bytes, "SAM block norm1 bias", error, error_size) ||
-        !metal_vision_require_tensor_slice_f16(block->qkv_weight, qkv_weight_bytes, "SAM block QKV weight", error, error_size) ||
+        (!qkv_is_q8 &&
+         !metal_vision_require_tensor_slice_f16(block->qkv_weight, qkv_weight_bytes, "SAM block QKV weight", error, error_size)) ||
         !metal_vision_require_tensor_slice_f16(block->qkv_bias, qkv_bias_bytes, "SAM block QKV bias", error, error_size) ||
-        !metal_vision_require_tensor_slice_f16(block->proj_weight, projection_weight_bytes, "SAM block projection weight", error, error_size) ||
+        (!proj_is_q8 &&
+         !metal_vision_require_tensor_slice_f16(block->proj_weight, projection_weight_bytes, "SAM block projection weight", error, error_size)) ||
         !metal_vision_require_tensor_slice_f16(block->proj_bias, parameter_bytes, "SAM block projection bias", error, error_size) ||
         !metal_vision_require_tensor_slice_f16(block->rel_pos_h, rel_h_bytes, "SAM block relative position H", error, error_size) ||
         !metal_vision_require_tensor_slice_f16(block->rel_pos_w, rel_w_bytes, "SAM block relative position W", error, error_size) ||
@@ -18038,19 +18043,37 @@ static int metal_context_sam_transformer_batch_block_workspace_f16_to_slice(uocr
                                                                                         error_size));
 
     if (use_global_attention) {
-        RUN_SAM_BATCH_BLOCK_STEP("QKV",
-                                 metal_run_packed_qkv_mps_f16(ctx,
+        if (qkv_is_q8) {
+            const uint64_t qkv_q8_start_ns = uocr_profile_now_ns();
+            RUN_SAM_BATCH_BLOCK_STEP("QKV",
+                                     metal_run_vision_qkv_q8_0(ctx,
                                                                (uocr_metal_buffer_slice){scratch->sam_block_norm1_bhwc.buffer, scratch->sam_block_norm1_bhwc.offset},
-                                                               block->qkv_weight.slice,
-                                                               block->qkv_bias.slice,
+                                                               block->qkv_weight,
+                                                               block->qkv_bias,
+                                                               rows,
+                                                               UOCR_SAM_HIDDEN_SIZE,
                                                                (uocr_metal_buffer_slice){scratch->sam_block_q.buffer, scratch->sam_block_q.offset},
                                                                (uocr_metal_buffer_slice){scratch->sam_block_k.buffer, scratch->sam_block_k.offset},
                                                                (uocr_metal_buffer_slice){scratch->sam_block_v.buffer, scratch->sam_block_v.offset},
-                                                               rows,
-                                                               UOCR_SAM_HIDDEN_SIZE,
-                                                               "Metal SAM batch global QKV MPS matmul",
+                                                               "Metal SAM batch global QKV Q8",
                                                                error,
                                                                error_size));
+            metal_profile_add_event_now(ctx, "metal.vision.sam_attention_q8.qkv", qkv_q8_start_ns);
+        } else {
+            RUN_SAM_BATCH_BLOCK_STEP("QKV",
+                                     metal_run_packed_qkv_mps_f16(ctx,
+                                                                   (uocr_metal_buffer_slice){scratch->sam_block_norm1_bhwc.buffer, scratch->sam_block_norm1_bhwc.offset},
+                                                                   block->qkv_weight.slice,
+                                                                   block->qkv_bias.slice,
+                                                                   (uocr_metal_buffer_slice){scratch->sam_block_q.buffer, scratch->sam_block_q.offset},
+                                                                   (uocr_metal_buffer_slice){scratch->sam_block_k.buffer, scratch->sam_block_k.offset},
+                                                                   (uocr_metal_buffer_slice){scratch->sam_block_v.buffer, scratch->sam_block_v.offset},
+                                                                   rows,
+                                                                   UOCR_SAM_HIDDEN_SIZE,
+                                                                   "Metal SAM batch global QKV MPS matmul",
+                                                                   error,
+                                                                   error_size));
+        }
         const uocr_metal_sam_rel_pos_table_pair_f16 rel_pos = metal_sam_rel_pos_table_for_grid(block, grid_w, grid_h);
         RUN_SAM_BATCH_BLOCK_STEP("relative-position attention",
                                  metal_context_sam_rel_pos_attention_batch_f16_to_slice(ctx,
@@ -18069,25 +18092,43 @@ static int metal_context_sam_transformer_batch_block_workspace_f16_to_slice(uocr
                                                                                        scratch,
                                                                                        error,
                                                                                        error_size));
-        RUN_SAM_BATCH_BLOCK_STEP("output projection",
-                                 metal_run_mps_matmul_nt_f16(ctx,
-                                                             (uocr_metal_buffer_slice){scratch->sam_block_attention.buffer, scratch->sam_block_attention.offset},
-                                                             block->proj_weight.slice,
-                                                             (uocr_metal_buffer_slice){scratch->sam_block_attention_bhwc.buffer, scratch->sam_block_attention_bhwc.offset},
-                                                             rows,
-                                                             UOCR_SAM_HIDDEN_SIZE,
-                                                             UOCR_SAM_HIDDEN_SIZE,
-                                                             "Metal SAM batch global output projection MPS matmul",
-                                                             error,
-                                                             error_size) &&
-                                 metal_run_bias_add_f16_inplace(ctx,
-                                                                (uocr_metal_buffer_slice){scratch->sam_block_attention_bhwc.buffer, scratch->sam_block_attention_bhwc.offset},
-                                                                block->proj_bias.slice,
-                                                                rows,
-                                                                UOCR_SAM_HIDDEN_SIZE,
-                                                                "Metal SAM batch global output projection bias",
-                                                                error,
-                                                                error_size));
+        if (proj_is_q8) {
+            const uint64_t proj_q8_start_ns = uocr_profile_now_ns();
+            RUN_SAM_BATCH_BLOCK_STEP("output projection",
+                                     metal_run_vision_linear_q8_0(ctx,
+                                                                  (uocr_metal_buffer_slice){scratch->sam_block_attention.buffer, scratch->sam_block_attention.offset},
+                                                                  block->proj_weight,
+                                                                  block->proj_bias,
+                                                                  rows,
+                                                                  UOCR_SAM_HIDDEN_SIZE,
+                                                                  UOCR_SAM_HIDDEN_SIZE,
+                                                                  UOCR_METAL_VISION_Q8_ACT_NONE,
+                                                                  (uocr_metal_buffer_slice){scratch->sam_block_attention_bhwc.buffer, scratch->sam_block_attention_bhwc.offset},
+                                                                  "Metal SAM batch global output projection Q8",
+                                                                  error,
+                                                                  error_size));
+            metal_profile_add_event_now(ctx, "metal.vision.sam_attention_q8.proj", proj_q8_start_ns);
+        } else {
+            RUN_SAM_BATCH_BLOCK_STEP("output projection",
+                                     metal_run_mps_matmul_nt_f16(ctx,
+                                                                 (uocr_metal_buffer_slice){scratch->sam_block_attention.buffer, scratch->sam_block_attention.offset},
+                                                                 block->proj_weight.slice,
+                                                                 (uocr_metal_buffer_slice){scratch->sam_block_attention_bhwc.buffer, scratch->sam_block_attention_bhwc.offset},
+                                                                 rows,
+                                                                 UOCR_SAM_HIDDEN_SIZE,
+                                                                 UOCR_SAM_HIDDEN_SIZE,
+                                                                 "Metal SAM batch global output projection MPS matmul",
+                                                                 error,
+                                                                 error_size) &&
+                                     metal_run_bias_add_f16_inplace(ctx,
+                                                                    (uocr_metal_buffer_slice){scratch->sam_block_attention_bhwc.buffer, scratch->sam_block_attention_bhwc.offset},
+                                                                    block->proj_bias.slice,
+                                                                    rows,
+                                                                    UOCR_SAM_HIDDEN_SIZE,
+                                                                    "Metal SAM batch global output projection bias",
+                                                                    error,
+                                                                    error_size));
+        }
         RUN_SAM_BATCH_BLOCK_STEP("attention residual",
                                  metal_run_residual_add_f16(ctx,
                                                             (uocr_metal_buffer_slice){input_bhwc.buffer, input_bhwc.offset},
@@ -18116,19 +18157,37 @@ static int metal_context_sam_transformer_batch_block_workspace_f16_to_slice(uocr
         if (actual_windows != n_windows || actual_padded_w != padded_w || actual_padded_h != padded_h) {
             return metal_fail(error, error_size, "Metal SAM batch window geometry changed during partition");
         }
-        RUN_SAM_BATCH_BLOCK_STEP("window QKV",
-                                 metal_run_packed_qkv_mps_f16(ctx,
+        if (qkv_is_q8) {
+            const uint64_t qkv_q8_start_ns = uocr_profile_now_ns();
+            RUN_SAM_BATCH_BLOCK_STEP("window QKV",
+                                     metal_run_vision_qkv_q8_0(ctx,
                                                                (uocr_metal_buffer_slice){scratch->sam_block_window_tokens.buffer, scratch->sam_block_window_tokens.offset},
-                                                               block->qkv_weight.slice,
-                                                               block->qkv_bias.slice,
+                                                               block->qkv_weight,
+                                                               block->qkv_bias,
+                                                               attention_rows,
+                                                               UOCR_SAM_HIDDEN_SIZE,
                                                                (uocr_metal_buffer_slice){scratch->sam_block_q.buffer, scratch->sam_block_q.offset},
                                                                (uocr_metal_buffer_slice){scratch->sam_block_k.buffer, scratch->sam_block_k.offset},
                                                                (uocr_metal_buffer_slice){scratch->sam_block_v.buffer, scratch->sam_block_v.offset},
-                                                               attention_rows,
-                                                               UOCR_SAM_HIDDEN_SIZE,
-                                                               "Metal SAM batch window QKV MPS matmul",
+                                                               "Metal SAM batch window QKV Q8",
                                                                error,
                                                                error_size));
+            metal_profile_add_event_now(ctx, "metal.vision.sam_attention_q8.qkv", qkv_q8_start_ns);
+        } else {
+            RUN_SAM_BATCH_BLOCK_STEP("window QKV",
+                                     metal_run_packed_qkv_mps_f16(ctx,
+                                                                   (uocr_metal_buffer_slice){scratch->sam_block_window_tokens.buffer, scratch->sam_block_window_tokens.offset},
+                                                                   block->qkv_weight.slice,
+                                                                   block->qkv_bias.slice,
+                                                                   (uocr_metal_buffer_slice){scratch->sam_block_q.buffer, scratch->sam_block_q.offset},
+                                                                   (uocr_metal_buffer_slice){scratch->sam_block_k.buffer, scratch->sam_block_k.offset},
+                                                                   (uocr_metal_buffer_slice){scratch->sam_block_v.buffer, scratch->sam_block_v.offset},
+                                                                   attention_rows,
+                                                                   UOCR_SAM_HIDDEN_SIZE,
+                                                                   "Metal SAM batch window QKV MPS matmul",
+                                                                   error,
+                                                                   error_size));
+        }
         const uocr_metal_sam_rel_pos_table_pair_f16 rel_pos = metal_sam_rel_pos_table_for_grid(block,
                                                                                                   UOCR_SAM_WINDOW_SIZE,
                                                                                                   UOCR_SAM_WINDOW_SIZE);
@@ -18149,25 +18208,43 @@ static int metal_context_sam_transformer_batch_block_workspace_f16_to_slice(uocr
                                                                                        scratch,
                                                                                        error,
                                                                                        error_size));
-        RUN_SAM_BATCH_BLOCK_STEP("window output projection",
-                                 metal_run_mps_matmul_nt_f16(ctx,
-                                                             (uocr_metal_buffer_slice){scratch->sam_block_attention.buffer, scratch->sam_block_attention.offset},
-                                                             block->proj_weight.slice,
-                                                             (uocr_metal_buffer_slice){scratch->sam_block_projected_windows.buffer, scratch->sam_block_projected_windows.offset},
-                                                             attention_rows,
-                                                             UOCR_SAM_HIDDEN_SIZE,
-                                                             UOCR_SAM_HIDDEN_SIZE,
-                                                             "Metal SAM batch window output projection MPS matmul",
-                                                             error,
-                                                             error_size) &&
-                                 metal_run_bias_add_f16_inplace(ctx,
-                                                                (uocr_metal_buffer_slice){scratch->sam_block_projected_windows.buffer, scratch->sam_block_projected_windows.offset},
-                                                                block->proj_bias.slice,
-                                                                attention_rows,
-                                                                UOCR_SAM_HIDDEN_SIZE,
-                                                                "Metal SAM batch window output projection bias",
-                                                                error,
-                                                                error_size));
+        if (proj_is_q8) {
+            const uint64_t proj_q8_start_ns = uocr_profile_now_ns();
+            RUN_SAM_BATCH_BLOCK_STEP("window output projection",
+                                     metal_run_vision_linear_q8_0(ctx,
+                                                                  (uocr_metal_buffer_slice){scratch->sam_block_attention.buffer, scratch->sam_block_attention.offset},
+                                                                  block->proj_weight,
+                                                                  block->proj_bias,
+                                                                  attention_rows,
+                                                                  UOCR_SAM_HIDDEN_SIZE,
+                                                                  UOCR_SAM_HIDDEN_SIZE,
+                                                                  UOCR_METAL_VISION_Q8_ACT_NONE,
+                                                                  (uocr_metal_buffer_slice){scratch->sam_block_projected_windows.buffer, scratch->sam_block_projected_windows.offset},
+                                                                  "Metal SAM batch window output projection Q8",
+                                                                  error,
+                                                                  error_size));
+            metal_profile_add_event_now(ctx, "metal.vision.sam_attention_q8.proj", proj_q8_start_ns);
+        } else {
+            RUN_SAM_BATCH_BLOCK_STEP("window output projection",
+                                     metal_run_mps_matmul_nt_f16(ctx,
+                                                                 (uocr_metal_buffer_slice){scratch->sam_block_attention.buffer, scratch->sam_block_attention.offset},
+                                                                 block->proj_weight.slice,
+                                                                 (uocr_metal_buffer_slice){scratch->sam_block_projected_windows.buffer, scratch->sam_block_projected_windows.offset},
+                                                                 attention_rows,
+                                                                 UOCR_SAM_HIDDEN_SIZE,
+                                                                 UOCR_SAM_HIDDEN_SIZE,
+                                                                 "Metal SAM batch window output projection MPS matmul",
+                                                                 error,
+                                                                 error_size) &&
+                                     metal_run_bias_add_f16_inplace(ctx,
+                                                                    (uocr_metal_buffer_slice){scratch->sam_block_projected_windows.buffer, scratch->sam_block_projected_windows.offset},
+                                                                    block->proj_bias.slice,
+                                                                    attention_rows,
+                                                                    UOCR_SAM_HIDDEN_SIZE,
+                                                                    "Metal SAM batch window output projection bias",
+                                                                    error,
+                                                                    error_size));
+        }
         RUN_SAM_BATCH_BLOCK_STEP("window unpartition",
                                  metal_context_sam_window_unpartition_batch_f16_to_slice(ctx,
                                                                                          scratch->sam_block_projected_windows,

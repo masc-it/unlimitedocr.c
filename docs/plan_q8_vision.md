@@ -465,13 +465,14 @@ are custom kernels.
 
 Checklist:
 
-* [ ] Add Q8 SAM QKV kernels for global and window attention paths.
-* [ ] Add Q8 SAM output projection kernels for global and window attention
-      paths.
-* [ ] Preserve relative-position tables, attention masks/window packing, and
+* [x] Add Q8 SAM QKV dispatch for global and window attention paths (shared
+      tiled-GEMM QKV-split kernel; hidden 768, packed `[2304,768]` weight).
+* [x] Add Q8 SAM output projection dispatch for global and window attention
+      paths (`[768,768]` via the shared tiled GEMM with bias epilogue).
+* [x] Preserve relative-position tables, attention masks/window packing, and
       residual handling unchanged.
-* [ ] Dispatch Q8 only when the block's QKV and output weights are Q8_0.
-* [ ] Flip `sam_attention.supported: true` only after QA.
+* [x] Dispatch Q8 per projection when the weight is Q8_0.
+* [x] Enable `sam_attention.supported: true` for end-to-end QA.
 
 ### 4.7 Optional later: SAM patch and conv Q8
 
@@ -562,7 +563,7 @@ Checklist:
    * wire dispatch for global/window block usage;
    * enable `sam_mlp` and QA.
 
-7. **SAM attention Q8**
+7. **SAM attention Q8** — implemented, awaiting QA
    * implement global/window QKV/O Q8 kernels;
    * wire dispatch;
    * enable `sam_attention` and QA.
@@ -590,7 +591,7 @@ New vision-Q8 target modules, QA-gated in order:
   CLIP MLP fc1/fc2                      QA'd
   CLIP attention QKV/O                  QA'd
   SAM MLP lin1/lin2                     QA'd (perf-fixed GEMM)
-  SAM attention QKV/O                   pending
+  SAM attention QKV/O                   enabled for user QA
 
 Still fp16 in first vision deliverable:
   SAM patch embedding and neck/net convs

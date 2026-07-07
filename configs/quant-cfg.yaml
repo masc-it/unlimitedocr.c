@@ -82,7 +82,7 @@ modules:
   - name: sam_attention
     family: VISION_SAM
     projections: [VISION_ATTN_QKV, VISION_ATTN_O]
-    supported: false
+    supported: true
 
   - name: sam_patch_embed
     family: VISION_SAM
