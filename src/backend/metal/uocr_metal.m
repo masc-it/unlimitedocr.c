@@ -220,10 +220,17 @@ typedef struct uocr_metal_decoder_binding_cache {
 
 typedef struct uocr_metal_vision_binding {
     uint32_t tensor_id;
-    uint32_t reserved;
+    uint32_t qtype;
+    uint32_t rows;
+    uint32_t cols;
+    uint32_t group_size;
+    uint32_t groups_per_row;
     id<MTLBuffer> buffer;
     NSUInteger offset;
     uint64_t payload_size;
+    id<MTLBuffer> scale_buffer;
+    NSUInteger scale_offset;
+    uint64_t scale_size;
 } uocr_metal_vision_binding;
 
 typedef struct uocr_metal_vision_binding_cache {
@@ -3592,6 +3599,25 @@ static void metal_invalidate_vision_binding_cache(uocr_metal_context *ctx, const
     (void)snprintf(ctx->vision_binding_error, sizeof(ctx->vision_binding_error), "%s", reason);
 }
 
+static int metal_vision_tensor_allows_q8(uint32_t family,
+                                          uint32_t projection,
+                                          uint32_t rank,
+                                          const uint32_t dims[UOCR_TENSOR_MAX_DIMS]) {
+    if (rank != 2u || dims == NULL || dims[0] == 0u || dims[1] == 0u || (dims[1] % UOCR_Q8_GROUP_SIZE_DEFAULT) != 0u) {
+        return 0;
+    }
+    if (family == UOCR_TENSOR_FAMILY_PROJECTOR) {
+        return projection == UOCR_TENSOR_PROJ_WEIGHT;
+    }
+    if (family == UOCR_TENSOR_FAMILY_VISION_SAM || family == UOCR_TENSOR_FAMILY_VISION_CLIP) {
+        return projection == UOCR_TENSOR_PROJ_VISION_ATTN_QKV ||
+               projection == UOCR_TENSOR_PROJ_VISION_ATTN_O ||
+               projection == UOCR_TENSOR_PROJ_VISION_MLP_FC1 ||
+               projection == UOCR_TENSOR_PROJ_VISION_MLP_FC2;
+    }
+    return 0;
+}
+
 static int metal_validate_vision_tensor_metadata(const uocr_tensor_entry *tensor,
                                                  uint32_t tensor_id,
                                                  const char *role,
@@ -3621,10 +3647,18 @@ static int metal_validate_vision_tensor_metadata(const uocr_tensor_entry *tensor
                           tensor_id,
                           uocr_tensor_usage_name(tensor->usage));
     }
-    if (tensor->qtype != UOCR_TENSOR_F16) {
+    if (tensor->qtype != UOCR_TENSOR_F16 && tensor->qtype != UOCR_TENSOR_Q8_0) {
         return metal_fail(error,
                           error_size,
-                          "%s %u has unsupported qtype %s; production Metal vision requires f16",
+                          "%s %u has unsupported qtype %s",
+                          role,
+                          tensor_id,
+                          uocr_tensor_qtype_name(tensor->qtype));
+    }
+    if (tensor->qtype == UOCR_TENSOR_Q8_0 && !metal_vision_tensor_allows_q8(family, projection, rank, dims)) {
+        return metal_fail(error,
+                          error_size,
+                          "%s %u cannot use qtype %s for this family/projection",
                           role,
                           tensor_id,
                           uocr_tensor_qtype_name(tensor->qtype));
@@ -3694,6 +3728,22 @@ static int metal_validate_vision_tensor_metadata(const uocr_tensor_entry *tensor
                           (unsigned long long)tensor->payload_size,
                           (unsigned long long)expected_payload_size);
     }
+    if (tensor->qtype == UOCR_TENSOR_F16) {
+        if (tensor->scale_offset != 0u || tensor->scale_size != 0u || tensor->block_size != 0u || tensor->row_size != 0u) {
+            return metal_fail(error, error_size, "%s %u f16 tensor has quantization metadata", role, tensor_id);
+        }
+    } else {
+        const uint32_t cols = dims[1];
+        const uint64_t expected_scale_size = uocr_q8_0_qscale_bytes(dims[0], cols, UOCR_Q8_GROUP_SIZE_DEFAULT);
+        if (expected_scale_size == 0u || tensor->block_size != UOCR_Q8_GROUP_SIZE_DEFAULT ||
+            tensor->row_size != cols || tensor->scale_size != expected_scale_size) {
+            return metal_fail(error,
+                              error_size,
+                              "%s %u q8_0 packing metadata mismatch",
+                              role,
+                              tensor_id);
+        }
+    }
     return 1;
 }
 
@@ -3758,11 +3808,29 @@ static int metal_append_vision_binding(uocr_metal_context *ctx,
     if (ctx == NULL || model == NULL || cache == NULL || cache->count >= UOCR_METAL_VISION_REQUIRED_TENSOR_COUNT) {
         return metal_fail(error, error_size, "vision tensor binding cache overflow");
     }
+    const uocr_tensor_entry *tensor = uocr_model_file_find_tensor(model, tensor_id);
+    if (tensor == NULL) {
+        return metal_validate_vision_tensor_metadata(tensor,
+                                                     tensor_id,
+                                                     role,
+                                                     family,
+                                                     layer,
+                                                     expert,
+                                                     projection,
+                                                     rank,
+                                                     dims,
+                                                     0u,
+                                                     error,
+                                                     error_size);
+    }
     uint64_t expected_payload_size = 0u;
-    if (!metal_tensor_expected_payload_bytes(rank, dims, &expected_payload_size)) {
+    if (tensor->qtype == UOCR_TENSOR_Q8_0) {
+        if (rank != 2u || !checked_mul_u64((uint64_t)dims[0], (uint64_t)dims[1], &expected_payload_size)) {
+            return metal_fail(error, error_size, "vision tensor %u expected q8 byte-size overflow", tensor_id);
+        }
+    } else if (!metal_tensor_expected_payload_bytes(rank, dims, &expected_payload_size)) {
         return metal_fail(error, error_size, "vision tensor %u expected byte-size overflow", tensor_id);
     }
-    const uocr_tensor_entry *tensor = uocr_model_file_find_tensor(model, tensor_id);
     if (!metal_validate_vision_tensor_metadata(tensor,
                                                tensor_id,
                                                role,
@@ -3784,12 +3852,25 @@ static int metal_append_vision_binding(uocr_metal_context *ctx,
         return 0;
     }
 
+    id<MTLBuffer> scale_buffer = nil;
+    NSUInteger scale_offset = 0u;
+    if (!metal_get_mapped_tensor_scale_buffer(ctx, tensor_id, tensor->scale_size, &scale_buffer, &scale_offset, error, error_size)) {
+        return 0;
+    }
+
     uocr_metal_vision_binding *binding = &cache->tensors[cache->count++];
     binding->tensor_id = tensor_id;
-    binding->reserved = 0u;
+    binding->qtype = tensor->qtype;
+    binding->rows = rank >= 1u ? dims[0] : 0u;
+    binding->cols = rank >= 2u ? dims[1] : 0u;
+    binding->group_size = tensor->block_size;
+    binding->groups_per_row = (tensor->qtype == UOCR_TENSOR_Q8_0 && tensor->block_size != 0u) ? dims[1] / tensor->block_size : 0u;
     binding->buffer = buffer;
     binding->offset = offset;
     binding->payload_size = expected_payload_size;
+    binding->scale_buffer = scale_buffer;
+    binding->scale_offset = scale_offset;
+    binding->scale_size = tensor->scale_size;
     return 1;
 }
 
@@ -4089,6 +4170,14 @@ static int metal_vision_tensor_from_binding_cache_f16(const uocr_metal_vision_bi
     const uocr_metal_vision_binding *binding = metal_find_vision_binding_in_cache(cache, tensor_id);
     if (binding == NULL) {
         return metal_fail(error, error_size, "missing validated %s binding for tensor %u", role, tensor_id);
+    }
+    if (binding->qtype != UOCR_TENSOR_F16) {
+        return metal_fail(error,
+                          error_size,
+                          "%s tensor %u is %s, but the current Metal vision call site requires fp16; add a fused Q8 kernel before enabling this module",
+                          role,
+                          tensor_id,
+                          uocr_tensor_qtype_name(binding->qtype));
     }
     if ((binding->payload_size % 2u) != 0u || ((uint64_t)binding->offset % 2u) != 0u) {
         return metal_fail(error, error_size, "%s tensor %u has an unaligned fp16 payload", role, tensor_id);

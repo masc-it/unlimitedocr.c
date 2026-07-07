@@ -335,11 +335,11 @@ typedef struct uocr_metal_vision_weight_view {
 
 Checklist:
 
-* [ ] Store qtype, rows, cols, group_size, groups_per_row for vision weights.
-* [ ] Resolve both qweight and qscale buffers for Q8 vision tensors.
-* [ ] Keep `host_f16` only for fp16 tensors; never expose Q8 as fp16 host data.
-* [ ] Keep precomputed SAM/CLIP position tables fp16.
-* [ ] Keep CPU-side conv repack code fp16 until conv Q8 support lands.
+* [x] Store qtype, rows, cols, group_size, groups_per_row for vision weights.
+* [x] Resolve both qweight and qscale buffers for Q8 vision tensors.
+* [x] Keep `host_f16` only for fp16 tensors; never expose Q8 as fp16 host data.
+* [x] Keep precomputed SAM/CLIP position tables fp16.
+* [x] Keep CPU-side conv repack code fp16 until conv Q8 support lands.
 
 ### 3.2 Validation and fallback
 
@@ -349,10 +349,10 @@ falling back through MPS.
 
 Checklist:
 
-* [ ] Add `metal_vision_tensor_allows_q8(family, projection, rank, dims)`.
-* [ ] Require fp16 for disabled/unsupported roles.
-* [ ] Fail with clear errors when a Q8 tensor reaches an fp16-only path.
-* [ ] Keep all existing fp16 vision tests passing unchanged.
+* [x] Add `metal_vision_tensor_allows_q8(family, projection, rank, dims)`.
+* [x] Require fp16 for disabled/unsupported roles.
+* [x] Fail with clear errors when a Q8 tensor reaches an fp16-only path.
+* [x] Keep all existing fp16 vision tests passing unchanged.
 
 ---
 
@@ -515,7 +515,7 @@ Checklist:
    * add disabled vision modules to `configs/quant-cfg.yaml`;
    * add converter dry-run tests.
 
-2. **Vision loader groundwork**
+2. **Vision loader groundwork** — complete
    * add dtype-aware vision weight views;
    * allow Q8 only for selected roles;
    * keep fp16 vision path passing.
