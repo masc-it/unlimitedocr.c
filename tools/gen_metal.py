@@ -25,6 +25,7 @@ ORDER = [
     "clip.metal",
     "clip_sam.metal",
     "embedding.metal",
+    "embedding_q8.metal",
     "kv_cache.metal",
     "layout.metal",
     "moe.metal",
@@ -33,7 +34,7 @@ ORDER = [
     "sampling.metal",
     "sam_conv.metal",
     "sam_window.metal",
-    "uocr_smoke.metal",
+    "smoke.metal",
     "mpp_prototypes.metal",
 ]
 
@@ -56,6 +57,10 @@ def main() -> int:
     kernels = args.kernels
     output = args.output
     available = {path.name for path in kernels.glob("*.metal")}
+    # uocr_smoke.metal is the generated runtime translation unit, not a source
+    # fragment.  Keep smoke/debug kernels in smoke.metal to make regeneration
+    # idempotent and avoid recursively embedding an older generated file.
+    available.discard(DEFAULT_OUTPUT.name)
     order = [name for name in ORDER if name in available]
     for name in sorted(available - set(order)):
         order.insert(-1, name)
@@ -68,10 +73,6 @@ def main() -> int:
     ]
     for name in order:
         source = kernels / name
-        if source.resolve(strict=False) == output.resolve(strict=False):
-            # When regenerating the source-tree smoke file, include the previous
-            # smoke/debug kernels once, then overwrite the file at the end.
-            pass
         lines.extend([
             "// ═══════════════════════════════════════════",
             f"//  {name}",

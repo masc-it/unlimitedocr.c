@@ -249,10 +249,10 @@ Performance rule: every Q8 compute path must be fused. A Q8 kernel must read int
 
 Checklist:
 
-* [ ] Add Q8 kernel code as focused sibling fragments under `src/backend/metal/kernels/` (for example `embedding_q8.metal`, `lm_head_q8.metal`, `attention_q8.metal`, `dense_q8.metal`, `moe_q8.metal`) instead of a single monolithic `q8.metal`.
-* [ ] Add each Q8 fragment to `tools/gen_metal.py` `ORDER` near its fp16 counterpart (for example `embedding_q8.metal` immediately after `embedding.metal`).
-* [ ] Regenerate `src/backend/metal/kernels/uocr_smoke.metal` so runtime source compilation sees the new kernels.
-* [ ] Precompiled builds are already covered by CMake glob dependencies, but still depend on `gen_metal.py` ordering.
+* [x] Add Q8 kernel code as focused sibling fragments under `src/backend/metal/kernels/` (for example `embedding_q8.metal`, `lm_head_q8.metal`, `attention_q8.metal`, `dense_q8.metal`, `moe_q8.metal`) instead of a single monolithic `q8.metal`.
+* [x] Add each Q8 fragment to `tools/gen_metal.py` `ORDER` near its fp16 counterpart (for example `embedding_q8.metal` immediately after `embedding.metal`).
+* [x] Regenerate `src/backend/metal/kernels/uocr_smoke.metal` so runtime source compilation sees the new kernels.
+* [x] Precompiled builds are already covered by CMake glob dependencies, but still depend on `gen_metal.py` ordering.
 
 ### 4.2 Q8 embedding
 
@@ -260,9 +260,9 @@ Current fp16 embedding path uses `uocr_get_rows_f16_to_f16` over `model.embed_to
 
 Checklist:
 
-* [ ] Add fused `uocr_get_rows_q8_0_to_f16_h1280_g64`; it reads qweight/qscale and writes fp16 token embeddings without a dequantized table.
-* [ ] Add a dtype-aware embedding wrapper in `uocr_metal.m` for prompt assembly and generated-token embedding.
-* [ ] Preserve output layout `[tokens, 1280]` fp16 and image-feature splice layout.
+* [x] Add fused `uocr_get_rows_q8_0_to_f16_h1280_g64`; it reads qweight/qscale and writes fp16 token embeddings without a dequantized table.
+* [x] Add a dtype-aware embedding wrapper in `uocr_metal.m` for prompt assembly and generated-token embedding.
+* [x] Preserve output layout `[tokens, 1280]` fp16 and image-feature splice layout.
 
 ### 4.3 Attention projections
 
