@@ -483,12 +483,13 @@ static int generate_metal_text_fp16(uocr_engine *engine,
     if (!engine->has_model_file || engine->model_file.header == NULL) {
         return set_engine_errorf(engine,
                                  UOCR_ERROR_NOT_IMPLEMENTED,
-                                 "Metal fp16 text generation requires a mapped fp16 .uocr model");
+                                 "Metal text generation requires a mapped .uocr model");
     }
-    if (engine->model_file.header->qprofile != UOCR_QPROFILE_FP16) {
+    if (engine->model_file.header->qprofile != UOCR_QPROFILE_FP16 &&
+        engine->model_file.header->qprofile != UOCR_QPROFILE_MIXED_Q8_0) {
         return set_engine_errorf(engine,
                                  UOCR_ERROR_NOT_IMPLEMENTED,
-                                 "Metal text generation currently supports only fp16 .uocr models, got %s",
+                                 "Metal text generation currently supports fp16 and mixed-q8_0 .uocr models, got %s",
                                  uocr_qprofile_name(engine->model_file.header->qprofile));
     }
     if (!uocr_metal_context_decoder_bindings_ready(engine->metal)) {
@@ -592,12 +593,13 @@ static int generate_metal_image_fp16(uocr_engine *engine,
     if (!engine->has_model_file || engine->model_file.header == NULL) {
         return set_engine_errorf(engine,
                                  UOCR_ERROR_NOT_IMPLEMENTED,
-                                 "Metal fp16 image generation requires a mapped fp16 .uocr model");
+                                 "Metal image generation requires a mapped .uocr model");
     }
-    if (engine->model_file.header->qprofile != UOCR_QPROFILE_FP16) {
+    if (engine->model_file.header->qprofile != UOCR_QPROFILE_FP16 &&
+        engine->model_file.header->qprofile != UOCR_QPROFILE_MIXED_Q8_0) {
         return set_engine_errorf(engine,
                                  UOCR_ERROR_NOT_IMPLEMENTED,
-                                 "Metal image generation currently supports only fp16 .uocr models, got %s",
+                                 "Metal image generation currently supports fp16 and mixed-q8_0 .uocr models, got %s",
                                  uocr_qprofile_name(engine->model_file.header->qprofile));
     }
     if (!uocr_metal_context_decoder_bindings_ready(engine->metal)) {
@@ -952,11 +954,13 @@ uocr_engine *uocr_engine_open(const uocr_engine_opts *opts) {
             uocr_engine_close(engine);
             return NULL;
         }
-        if (engine->has_model_file && engine->model_file.header->qprofile == UOCR_QPROFILE_FP16 &&
+        if (engine->has_model_file &&
+            (engine->model_file.header->qprofile == UOCR_QPROFILE_FP16 ||
+             engine->model_file.header->qprofile == UOCR_QPROFILE_MIXED_Q8_0) &&
             !uocr_metal_context_vision_bindings_ready(engine->metal)) {
             set_engine_errorf(engine,
                               UOCR_ERROR_NOT_IMPLEMENTED,
-                              "Metal fp16 image generation requires complete validated vision tensor bindings: %s",
+                              "Metal image generation requires complete validated vision tensor bindings: %s",
                               uocr_metal_context_vision_binding_error(engine->metal));
             uocr_engine_close(engine);
             return NULL;
