@@ -202,10 +202,10 @@ Current Metal mapping ignores `scale_offset/scale_size`; fix this before any Q8 
 
 Checklist:
 
-* [ ] Update `payload_tensor_count()`/span planning to count every non-empty tensor byte range: fp16 payloads, Q8 qweights, and Q8 qscales.
-* [ ] Update `build_payload_spans()` to emit separate spans for qweight and qscale ranges.
-* [ ] Update binding construction so a Q8 tensor can resolve both qweight and qscale to Metal buffers/offsets.
-* [ ] Keep `ctx->model_view_bytes = tensor_data->size` and use the tensor-data section size consistently for admission and reports.
+* [x] Update `payload_tensor_count()`/span planning to count every non-empty tensor byte range: fp16 payloads, Q8 qweights, and Q8 qscales.
+* [x] Update `build_payload_spans()` to emit separate spans for qweight and qscale ranges.
+* [x] Update binding construction so a Q8 tensor can resolve both qweight and qscale to Metal buffers/offsets.
+* [x] Keep `ctx->model_view_bytes = tensor_data->size` and use the tensor-data section size consistently for admission and reports.
 
 ### 3.2 Weight-view abstraction
 
@@ -232,10 +232,10 @@ typedef struct uocr_metal_weight_view {
 
 Checklist:
 
-* [ ] Store qtype/shape in decoder binding cache.
-* [ ] Allow fp16 and Q8_0 in `metal_validate_decoder_tensor_metadata()` for selected families.
-* [ ] Keep strict fp16 requirements for norms and router.
-* [ ] Update expert slab cache for Q8: routed MoE kernels currently assume one fp16 expert-major slab; Q8 needs qweight slab plus qscale slab and new stride math.
+* [x] Store qtype/shape in decoder binding cache.
+* [x] Allow fp16 and Q8_0 in `metal_validate_decoder_tensor_metadata()` for selected families.
+* [x] Keep strict fp16 requirements for norms and router.
+* [x] Update expert slab cache for Q8: routed MoE kernels currently assume one fp16 expert-major slab; Q8 needs qweight slab plus qscale slab and new stride math.
 
 ---
 

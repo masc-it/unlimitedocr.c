@@ -126,6 +126,10 @@ typedef struct uocr_metal_tensor_binding_internal {
     uint32_t view_index;
     uint64_t inner_offset;
     uint64_t payload_size;
+    uint32_t scale_view_index;
+    uint32_t reserved;
+    uint64_t scale_inner_offset;
+    uint64_t scale_size;
 } uocr_metal_tensor_binding_internal;
 
 typedef struct uocr_metal_buffer_slice {
@@ -145,20 +149,30 @@ _Static_assert(UOCR_METAL_VISION_REQUIRED_TENSOR_COUNT == 475u, "unexpected Meta
 
 typedef struct uocr_metal_decoder_binding {
     uint32_t tensor_id;
-    uint32_t reserved;
+    uint32_t qtype;
+    uint32_t rows;
+    uint32_t cols;
+    uint32_t group_size;
+    uint32_t groups_per_row;
     id<MTLBuffer> buffer;
     NSUInteger offset;
     uint64_t payload_size;
+    id<MTLBuffer> scale_buffer;
+    NSUInteger scale_offset;
+    uint64_t scale_size;
 } uocr_metal_decoder_binding;
 
 #define UOCR_METAL_DECODER_BINDING_INDEX_INVALID UINT32_MAX
 
 typedef struct uocr_metal_decoder_expert_slab_cache {
     int valid;
-    uint32_t reserved;
+    uint32_t qtype;
     id<MTLBuffer> buffer;
     NSUInteger offset;
     uint64_t byte_length;
+    id<MTLBuffer> scale_buffer;
+    NSUInteger scale_offset;
+    uint64_t scale_byte_length;
 } uocr_metal_decoder_expert_slab_cache;
 
 typedef struct uocr_metal_decoder_layer_fast_bindings {
@@ -300,11 +314,18 @@ typedef struct uocr_metal_vision_weights_f16 {
 typedef struct uocr_metal_payload_span {
     uint32_t tensor_index;
     uint32_t tensor_id;
+    uint32_t range_kind;
+    uint32_t reserved;
     uint64_t payload_start;
     uint64_t payload_end;
     uint64_t page_start;
     uint64_t page_end;
 } uocr_metal_payload_span;
+
+enum {
+    UOCR_METAL_PAYLOAD_RANGE_DATA = 0u,
+    UOCR_METAL_PAYLOAD_RANGE_SCALE = 1u
+};
 
 typedef struct uocr_metal_scratch_buffer {
     id<MTLBuffer> buffer;
@@ -762,6 +783,18 @@ static int payload_span_compare(const void *a, const void *b) {
         return -1;
     }
     if (pa->tensor_id > pb->tensor_id) {
+        return 1;
+    }
+    if (pa->range_kind < pb->range_kind) {
+        return -1;
+    }
+    if (pa->range_kind > pb->range_kind) {
+        return 1;
+    }
+    if (pa->payload_start < pb->payload_start) {
+        return -1;
+    }
+    if (pa->payload_start > pb->payload_start) {
         return 1;
     }
     return 0;
@@ -1948,11 +1981,77 @@ static int payload_tensor_count(const uocr_model_file *model, uint32_t *out_coun
     uint32_t count = 0u;
     for (uint32_t i = 0u; i < model->tensor_count; ++i) {
         const uocr_tensor_entry *tensor = &model->tensors[i];
+        if (tensor->usage == UOCR_TENSOR_USAGE_OMITTED_WITH_REASON) {
+            continue;
+        }
+        if (tensor->payload_size != 0u) {
+            ++count;
+        }
+        if (tensor->scale_size != 0u) {
+            ++count;
+        }
+    }
+    *out_count = count;
+    return 1;
+}
+
+static int mapped_tensor_binding_count(const uocr_model_file *model, uint32_t *out_count) {
+    if (model == NULL || out_count == NULL) {
+        return 0;
+    }
+    uint32_t count = 0u;
+    for (uint32_t i = 0u; i < model->tensor_count; ++i) {
+        const uocr_tensor_entry *tensor = &model->tensors[i];
         if (tensor->usage != UOCR_TENSOR_USAGE_OMITTED_WITH_REASON && tensor->payload_size != 0u) {
             ++count;
         }
     }
     *out_count = count;
+    return 1;
+}
+
+static int append_payload_span(uocr_metal_payload_span *spans,
+                               uint32_t payload_count,
+                               uint32_t *out,
+                               uint32_t tensor_index,
+                               uint32_t tensor_id,
+                               uint32_t range_kind,
+                               uint64_t range_offset,
+                               uint64_t range_size,
+                               uint64_t page_size,
+                               uint64_t file_size,
+                               char *error,
+                               size_t error_size) {
+    if (spans == NULL || out == NULL || *out >= payload_count || range_size == 0u) {
+        return metal_fail(error, error_size, "invalid Metal model payload span append");
+    }
+    uint64_t payload_end = 0u;
+    uint64_t page_end = 0u;
+    if (!checked_add_u64(range_offset, range_size, &payload_end) ||
+        !align_up_u64_checked(payload_end, page_size, &page_end)) {
+        return metal_fail(error,
+                          error_size,
+                          "tensor %u payload range overflows during Metal view planning",
+                          tensor_id);
+    }
+    if (page_end > file_size) {
+        page_end = file_size;
+    }
+    if (page_end < payload_end) {
+        return metal_fail(error,
+                          error_size,
+                          "tensor %u payload end exceeds mapped file during Metal view planning",
+                          tensor_id);
+    }
+
+    spans[*out].tensor_index = tensor_index;
+    spans[*out].tensor_id = tensor_id;
+    spans[*out].range_kind = range_kind;
+    spans[*out].payload_start = range_offset;
+    spans[*out].payload_end = payload_end;
+    spans[*out].page_start = align_down_u64(range_offset, page_size);
+    spans[*out].page_end = page_end;
+    ++(*out);
     return 1;
 }
 
@@ -1970,40 +2069,46 @@ static uocr_metal_payload_span *build_payload_spans(const uocr_model_file *model
     uint32_t out = 0u;
     for (uint32_t i = 0u; i < model->tensor_count; ++i) {
         const uocr_tensor_entry *tensor = &model->tensors[i];
-        if (tensor->usage == UOCR_TENSOR_USAGE_OMITTED_WITH_REASON || tensor->payload_size == 0u) {
+        if (tensor->usage == UOCR_TENSOR_USAGE_OMITTED_WITH_REASON) {
             continue;
         }
-
-        uint64_t payload_end = 0u;
-        uint64_t page_end = 0u;
-        if (!checked_add_u64(tensor->payload_offset, tensor->payload_size, &payload_end) ||
-            !align_up_u64_checked(payload_end, page_size, &page_end)) {
+        if (tensor->payload_size != 0u &&
+            !append_payload_span(spans,
+                                 payload_count,
+                                 &out,
+                                 i,
+                                 tensor->id,
+                                 UOCR_METAL_PAYLOAD_RANGE_DATA,
+                                 tensor->payload_offset,
+                                 tensor->payload_size,
+                                 page_size,
+                                 (uint64_t)model->size,
+                                 error,
+                                 error_size)) {
             free(spans);
-            (void)metal_fail(error,
-                             error_size,
-                             "tensor %u payload range overflows during Metal view planning",
-                             tensor->id);
             return NULL;
         }
-        if (page_end > (uint64_t)model->size) {
-            page_end = (uint64_t)model->size;
-        }
-        if (page_end < payload_end) {
+        if (tensor->scale_size != 0u &&
+            !append_payload_span(spans,
+                                 payload_count,
+                                 &out,
+                                 i,
+                                 tensor->id,
+                                 UOCR_METAL_PAYLOAD_RANGE_SCALE,
+                                 tensor->scale_offset,
+                                 tensor->scale_size,
+                                 page_size,
+                                 (uint64_t)model->size,
+                                 error,
+                                 error_size)) {
             free(spans);
-            (void)metal_fail(error,
-                             error_size,
-                             "tensor %u payload end exceeds mapped file during Metal view planning",
-                             tensor->id);
             return NULL;
         }
-
-        spans[out].tensor_index = i;
-        spans[out].tensor_id = tensor->id;
-        spans[out].payload_start = tensor->payload_offset;
-        spans[out].payload_end = payload_end;
-        spans[out].page_start = align_down_u64(tensor->payload_offset, page_size);
-        spans[out].page_end = page_end;
-        ++out;
+    }
+    if (out != payload_count) {
+        free(spans);
+        (void)metal_fail(error, error_size, "Metal payload span count mismatch: got %u expected %u", out, payload_count);
+        return NULL;
     }
 
     qsort(spans, payload_count, sizeof(spans[0]), payload_span_compare);
@@ -2191,13 +2296,18 @@ static uocr_metal_tensor_binding_internal *build_tensor_bindings(const uocr_mode
         if (tensor->usage == UOCR_TENSOR_USAGE_OMITTED_WITH_REASON || tensor->payload_size == 0u) {
             continue;
         }
+        if (out >= binding_count) {
+            free(bindings);
+            (void)metal_fail(error, error_size, "Metal tensor binding count overflow");
+            return NULL;
+        }
         uint32_t view_index = 0u;
         uint64_t inner_offset = 0u;
         if (!find_view_for_payload(views, view_count, tensor->payload_offset, tensor->payload_size, &view_index, &inner_offset)) {
             free(bindings);
             (void)metal_fail(error,
                              error_size,
-                             "tensor %u was not covered by any Metal model view",
+                             "tensor %u qweight/payload was not covered by any Metal model view",
                              tensor->id);
             return NULL;
         }
@@ -2205,7 +2315,29 @@ static uocr_metal_tensor_binding_internal *build_tensor_bindings(const uocr_mode
         bindings[out].view_index = view_index;
         bindings[out].inner_offset = inner_offset;
         bindings[out].payload_size = tensor->payload_size;
+        bindings[out].scale_view_index = UINT32_MAX;
+        bindings[out].scale_inner_offset = 0u;
+        bindings[out].scale_size = tensor->scale_size;
+        if (tensor->scale_size != 0u) {
+            uint32_t scale_view_index = 0u;
+            uint64_t scale_inner_offset = 0u;
+            if (!find_view_for_payload(views, view_count, tensor->scale_offset, tensor->scale_size, &scale_view_index, &scale_inner_offset)) {
+                free(bindings);
+                (void)metal_fail(error,
+                                 error_size,
+                                 "tensor %u qscale was not covered by any Metal model view",
+                                 tensor->id);
+                return NULL;
+            }
+            bindings[out].scale_view_index = scale_view_index;
+            bindings[out].scale_inner_offset = scale_inner_offset;
+        }
         ++out;
+    }
+    if (out != binding_count) {
+        free(bindings);
+        (void)metal_fail(error, error_size, "Metal tensor binding count mismatch: got %u expected %u", out, binding_count);
+        return NULL;
     }
     return bindings;
 }
@@ -2273,6 +2405,10 @@ int uocr_metal_context_map_model(uocr_metal_context *ctx, const uocr_model_file 
     if (!payload_tensor_count(model, &payload_count) || payload_count == 0u) {
         return metal_fail(error, error_size, ".uocr model has no tensor payloads to map");
     }
+    uint32_t tensor_binding_count = 0u;
+    if (!mapped_tensor_binding_count(model, &tensor_binding_count) || tensor_binding_count == 0u) {
+        return metal_fail(error, error_size, ".uocr model has no tensor bindings to map");
+    }
 
     long page_size_long = sysconf(_SC_PAGESIZE);
     if (page_size_long <= 0) {
@@ -2302,7 +2438,7 @@ int uocr_metal_context_map_model(uocr_metal_context *ctx, const uocr_model_file 
     }
 
     uocr_metal_tensor_binding_internal *bindings =
-        build_tensor_bindings(model, views, view_count, payload_count, error, error_size);
+        build_tensor_bindings(model, views, view_count, tensor_binding_count, error, error_size);
     if (bindings == NULL) {
         free(views);
         return 0;
@@ -2340,7 +2476,7 @@ int uocr_metal_context_map_model(uocr_metal_context *ctx, const uocr_model_file 
     ctx->model_views = views;
     ctx->model_view_count = view_count;
     ctx->tensor_bindings = bindings;
-    ctx->tensor_binding_count = payload_count;
+    ctx->tensor_binding_count = tensor_binding_count;
     ctx->model_view_bytes = tensor_data->size;
 
     char decoder_error[256];
@@ -2484,6 +2620,47 @@ int uocr_metal_context_get_tensor_binding(const uocr_metal_context *ctx,
     return 1;
 }
 
+static int metal_get_mapped_tensor_scale_buffer(const uocr_metal_context *ctx,
+                                                uint32_t tensor_id,
+                                                uint64_t expected_scale_size,
+                                                id<MTLBuffer> *out_buffer,
+                                                NSUInteger *out_offset,
+                                                char *error,
+                                                size_t error_size) {
+    if (out_buffer == NULL || out_offset == NULL) {
+        return metal_fail(error, error_size, "invalid Metal mapped tensor scale output request");
+    }
+    *out_buffer = nil;
+    *out_offset = 0u;
+    if (expected_scale_size == 0u) {
+        return 1;
+    }
+    if (ctx == NULL || ctx->model_views == NULL || ctx->model_view_count == 0u) {
+        return metal_fail(error, error_size, "Metal mapped tensor %u scale requires mapped model views", tensor_id);
+    }
+    const uocr_metal_tensor_binding_internal *binding = metal_find_tensor_binding(ctx, tensor_id);
+    if (binding == NULL) {
+        return metal_fail(error, error_size, "Metal mapped tensor %u is not present in mapped model views", tensor_id);
+    }
+    if (binding->scale_size != expected_scale_size) {
+        return metal_fail(error,
+                          error_size,
+                          "Metal mapped tensor %u scale size mismatch: got %llu expected %llu",
+                          tensor_id,
+                          (unsigned long long)binding->scale_size,
+                          (unsigned long long)expected_scale_size);
+    }
+    if (binding->scale_view_index >= ctx->model_view_count || ctx->model_views[binding->scale_view_index].buffer == nil) {
+        return metal_fail(error, error_size, "Metal mapped tensor %u has an invalid model-view scale binding", tensor_id);
+    }
+    if (binding->scale_inner_offset > (uint64_t)NSUIntegerMax) {
+        return metal_fail(error, error_size, "Metal mapped tensor %u scale offset exceeds platform limit", tensor_id);
+    }
+    *out_buffer = ctx->model_views[binding->scale_view_index].buffer;
+    *out_offset = (NSUInteger)binding->scale_inner_offset;
+    return 1;
+}
+
 static int metal_get_mapped_tensor_buffer(const uocr_metal_context *ctx,
                                           uint32_t tensor_id,
                                           uint64_t expected_payload_size,
@@ -2580,6 +2757,27 @@ static int metal_tensor_expected_payload_bytes(uint32_t rank,
     return checked_mul_u64(values, 2u, out_bytes);
 }
 
+static int metal_decoder_tensor_allows_q8(uint32_t family, uint32_t projection, uint32_t rank) {
+    if (rank != 2u) {
+        return 0;
+    }
+    switch (family) {
+        case UOCR_TENSOR_FAMILY_TOK_EMBED:
+        case UOCR_TENSOR_FAMILY_LM_HEAD:
+            return projection == UOCR_TENSOR_PROJ_WEIGHT;
+        case UOCR_TENSOR_FAMILY_LAYER_ATTN:
+            return projection == UOCR_TENSOR_PROJ_Q || projection == UOCR_TENSOR_PROJ_K ||
+                   projection == UOCR_TENSOR_PROJ_V || projection == UOCR_TENSOR_PROJ_O;
+        case UOCR_TENSOR_FAMILY_LAYER_DENSE_MLP:
+        case UOCR_TENSOR_FAMILY_MOE_EXPERT:
+        case UOCR_TENSOR_FAMILY_MOE_SHARED:
+            return projection == UOCR_TENSOR_PROJ_GATE || projection == UOCR_TENSOR_PROJ_UP ||
+                   projection == UOCR_TENSOR_PROJ_DOWN;
+        default:
+            return 0;
+    }
+}
+
 static int metal_validate_decoder_tensor_metadata(const uocr_tensor_entry *tensor,
                                                   uint32_t tensor_id,
                                                   uint32_t family,
@@ -2604,10 +2802,17 @@ static int metal_validate_decoder_tensor_metadata(const uocr_tensor_entry *tenso
                           tensor_id,
                           uocr_tensor_usage_name(tensor->usage));
     }
-    if (tensor->qtype != UOCR_TENSOR_F16) {
+    if (tensor->qtype != UOCR_TENSOR_F16 && tensor->qtype != UOCR_TENSOR_Q8_0) {
         return metal_fail(error,
                           error_size,
-                          "decoder tensor %u has unsupported qtype %s; integrated fp16 decoder requires f16",
+                          "decoder tensor %u has unsupported qtype %s",
+                          tensor_id,
+                          uocr_tensor_qtype_name(tensor->qtype));
+    }
+    if (tensor->qtype == UOCR_TENSOR_Q8_0 && !metal_decoder_tensor_allows_q8(family, projection, rank)) {
+        return metal_fail(error,
+                          error_size,
+                          "decoder tensor %u cannot use qtype %s for this family/projection",
                           tensor_id,
                           uocr_tensor_qtype_name(tensor->qtype));
     }
@@ -2660,6 +2865,20 @@ static int metal_validate_decoder_tensor_metadata(const uocr_tensor_entry *tenso
                           (unsigned long long)tensor->payload_size,
                           (unsigned long long)expected_payload_size);
     }
+    if (tensor->qtype == UOCR_TENSOR_F16) {
+        if (tensor->scale_offset != 0u || tensor->scale_size != 0u || tensor->block_size != 0u || tensor->row_size != 0u) {
+            return metal_fail(error, error_size, "decoder f16 tensor %u has quantization metadata", tensor_id);
+        }
+    } else {
+        const uint32_t cols = dims[1];
+        const uint64_t expected_scale_size = uocr_q8_0_qscale_bytes(dims[0], cols, UOCR_Q8_GROUP_SIZE_DEFAULT);
+        if (tensor->block_size != UOCR_Q8_GROUP_SIZE_DEFAULT || tensor->row_size != cols || tensor->scale_size != expected_scale_size) {
+            return metal_fail(error,
+                              error_size,
+                              "decoder q8_0 tensor %u packing metadata mismatch",
+                              tensor_id);
+        }
+    }
     return 1;
 }
 
@@ -2678,11 +2897,28 @@ static int metal_append_decoder_binding(uocr_metal_context *ctx,
     if (ctx == NULL || model == NULL || cache == NULL || cache->count >= UOCR_METAL_DECODER_REQUIRED_TENSOR_COUNT) {
         return metal_fail(error, error_size, "decoder tensor binding cache overflow");
     }
+    const uocr_tensor_entry *tensor = uocr_model_file_find_tensor(model, tensor_id);
+    if (tensor == NULL) {
+        return metal_validate_decoder_tensor_metadata(tensor,
+                                                      tensor_id,
+                                                      family,
+                                                      layer,
+                                                      expert,
+                                                      projection,
+                                                      rank,
+                                                      dims,
+                                                      0u,
+                                                      error,
+                                                      error_size);
+    }
     uint64_t expected_payload_size = 0u;
-    if (!metal_tensor_expected_payload_bytes(rank, dims, &expected_payload_size)) {
+    if (tensor->qtype == UOCR_TENSOR_Q8_0) {
+        if (rank != 2u || !checked_mul_u64((uint64_t)dims[0], (uint64_t)dims[1], &expected_payload_size)) {
+            return metal_fail(error, error_size, "decoder tensor %u expected q8 byte-size overflow", tensor_id);
+        }
+    } else if (!metal_tensor_expected_payload_bytes(rank, dims, &expected_payload_size)) {
         return metal_fail(error, error_size, "decoder tensor %u expected byte-size overflow", tensor_id);
     }
-    const uocr_tensor_entry *tensor = uocr_model_file_find_tensor(model, tensor_id);
     if (!metal_validate_decoder_tensor_metadata(tensor,
                                                 tensor_id,
                                                 family,
@@ -2702,13 +2938,25 @@ static int metal_append_decoder_binding(uocr_metal_context *ctx,
     if (!metal_get_mapped_tensor_buffer(ctx, tensor_id, expected_payload_size, &buffer, &offset, error, error_size)) {
         return 0;
     }
+    id<MTLBuffer> scale_buffer = nil;
+    NSUInteger scale_offset = 0u;
+    if (!metal_get_mapped_tensor_scale_buffer(ctx, tensor_id, tensor->scale_size, &scale_buffer, &scale_offset, error, error_size)) {
+        return 0;
+    }
 
     uocr_metal_decoder_binding *binding = &cache->tensors[cache->count++];
     binding->tensor_id = tensor_id;
-    binding->reserved = 0u;
+    binding->qtype = tensor->qtype;
+    binding->rows = rank >= 1u ? dims[0] : 0u;
+    binding->cols = rank >= 2u ? dims[1] : 0u;
+    binding->group_size = tensor->block_size;
+    binding->groups_per_row = (tensor->qtype == UOCR_TENSOR_Q8_0 && tensor->block_size != 0u) ? dims[1] / tensor->block_size : 0u;
     binding->buffer = buffer;
     binding->offset = offset;
     binding->payload_size = expected_payload_size;
+    binding->scale_buffer = scale_buffer;
+    binding->scale_offset = scale_offset;
+    binding->scale_size = tensor->scale_size;
     return 1;
 }
 
@@ -2793,8 +3041,6 @@ static int metal_decoder_binding_cache_validate_expert_slab(const uocr_metal_dec
     memset(out_slab, 0, sizeof(*out_slab));
     const uint64_t projection_values = (uint64_t)UOCR_MOE_EXPERT_INTERMEDIATE * (uint64_t)UOCR_HIDDEN_SIZE;
     const uint64_t projection_bytes = projection_values * 2u;
-    const uint64_t expert_stride_bytes = projection_bytes * 3u;
-    const uint64_t total_bytes = expert_stride_bytes * (uint64_t)UOCR_ROUTED_EXPERTS;
 
     uint32_t gate0_index = UOCR_METAL_DECODER_BINDING_INDEX_INVALID;
     if (!metal_decoder_binding_cache_require_index(cache,
@@ -2806,15 +3052,35 @@ static int metal_decoder_binding_cache_validate_expert_slab(const uocr_metal_dec
         return 0;
     }
     const uocr_metal_decoder_binding *gate0 = &cache->tensors[gate0_index];
-    if (gate0->offset > NSUIntegerMax || !metal_buffer_range_valid(gate0->buffer, gate0->offset, total_bytes)) {
+    const uint32_t slab_qtype = gate0->qtype;
+    const uint64_t projection_data_bytes = slab_qtype == UOCR_TENSOR_Q8_0 ? projection_values : projection_bytes;
+    const uint64_t expert_data_stride_bytes = projection_data_bytes * 3u;
+    const uint64_t total_data_bytes = expert_data_stride_bytes * (uint64_t)UOCR_ROUTED_EXPERTS;
+    const uint64_t projection_scale_bytes = slab_qtype == UOCR_TENSOR_Q8_0
+                                                ? uocr_q8_0_qscale_bytes(UOCR_MOE_EXPERT_INTERMEDIATE,
+                                                                         UOCR_HIDDEN_SIZE,
+                                                                         UOCR_Q8_GROUP_SIZE_DEFAULT)
+                                                : 0u;
+    const uint64_t expert_scale_stride_bytes = projection_scale_bytes * 3u;
+    const uint64_t total_scale_bytes = expert_scale_stride_bytes * (uint64_t)UOCR_ROUTED_EXPERTS;
+    if (gate0->offset > NSUIntegerMax || !metal_buffer_range_valid(gate0->buffer, gate0->offset, total_data_bytes)) {
         return metal_fail(error,
                           error_size,
                           "integrated MoE expert slab for layer %u is not contiguous in one Metal view",
                           layer);
     }
+    if (slab_qtype == UOCR_TENSOR_Q8_0 &&
+        (gate0->scale_buffer == nil || gate0->scale_offset > NSUIntegerMax ||
+         !metal_buffer_range_valid(gate0->scale_buffer, gate0->scale_offset, total_scale_bytes))) {
+        return metal_fail(error,
+                          error_size,
+                          "integrated MoE expert qscale slab for layer %u is not contiguous in one Metal view",
+                          layer);
+    }
 
     for (uint32_t expert = 0u; expert < UOCR_ROUTED_EXPERTS; ++expert) {
-        const uint64_t base = (uint64_t)gate0->offset + (uint64_t)expert * expert_stride_bytes;
+        const uint64_t base = (uint64_t)gate0->offset + (uint64_t)expert * expert_data_stride_bytes;
+        const uint64_t scale_base = (uint64_t)gate0->scale_offset + (uint64_t)expert * expert_scale_stride_bytes;
         uint32_t gate_index = UOCR_METAL_DECODER_BINDING_INDEX_INVALID;
         uint32_t up_index = UOCR_METAL_DECODER_BINDING_INDEX_INVALID;
         uint32_t down_index = UOCR_METAL_DECODER_BINDING_INDEX_INVALID;
@@ -2841,21 +3107,37 @@ static int metal_decoder_binding_cache_validate_expert_slab(const uocr_metal_dec
         const uocr_metal_decoder_binding *gate = &cache->tensors[gate_index];
         const uocr_metal_decoder_binding *up = &cache->tensors[up_index];
         const uocr_metal_decoder_binding *down = &cache->tensors[down_index];
-        if (gate->buffer != gate0->buffer || up->buffer != gate0->buffer || down->buffer != gate0->buffer ||
-            (uint64_t)gate->offset != base || (uint64_t)up->offset != base + projection_bytes ||
-            (uint64_t)down->offset != base + 2u * projection_bytes) {
+        if (gate->qtype != slab_qtype || up->qtype != slab_qtype || down->qtype != slab_qtype ||
+            gate->buffer != gate0->buffer || up->buffer != gate0->buffer || down->buffer != gate0->buffer ||
+            (uint64_t)gate->offset != base || (uint64_t)up->offset != base + projection_data_bytes ||
+            (uint64_t)down->offset != base + 2u * projection_data_bytes) {
             return metal_fail(error,
                               error_size,
                               "integrated MoE expert tensors for layer %u are not interleaved-contiguous at expert %u",
                               layer,
                               expert);
         }
+        if (slab_qtype == UOCR_TENSOR_Q8_0 &&
+            (gate->scale_buffer != gate0->scale_buffer || up->scale_buffer != gate0->scale_buffer ||
+             down->scale_buffer != gate0->scale_buffer || (uint64_t)gate->scale_offset != scale_base ||
+             (uint64_t)up->scale_offset != scale_base + projection_scale_bytes ||
+             (uint64_t)down->scale_offset != scale_base + 2u * projection_scale_bytes)) {
+            return metal_fail(error,
+                              error_size,
+                              "integrated MoE expert qscale tensors for layer %u are not interleaved-contiguous at expert %u",
+                              layer,
+                              expert);
+        }
     }
 
     out_slab->valid = 1;
+    out_slab->qtype = slab_qtype;
     out_slab->buffer = gate0->buffer;
     out_slab->offset = gate0->offset;
-    out_slab->byte_length = total_bytes;
+    out_slab->byte_length = total_data_bytes;
+    out_slab->scale_buffer = gate0->scale_buffer;
+    out_slab->scale_offset = gate0->scale_offset;
+    out_slab->scale_byte_length = total_scale_bytes;
     return 1;
 }
 
