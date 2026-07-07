@@ -12892,11 +12892,11 @@ static int metal_run_moe_interleaved_decode_fused_combine_buffer_q8_0(
         [enc setBuffer:shared.buffer offset:shared.offset atIndex:5u];
         [enc setBuffer:residual.buffer offset:residual.offset atIndex:6u];
         [enc setBuffer:dst.buffer offset:dst.offset atIndex:7u];
-        [enc setBytes:&params length:sizeof(params) atIndex:8u];
+        [enc setBytes:&prefill_params length:sizeof(prefill_params) atIndex:8u];
         [enc setThreadgroupMemoryLength:down_threads * sizeof(float) atIndex:0u];
         {
             const NSUInteger down_threadgroups = use_tiled_routed_gate_up ?
-                ((NSUInteger)UOCR_HIDDEN_SIZE + 4u - 1u) / 4u :
+                (NSUInteger)n_tokens * (((NSUInteger)UOCR_HIDDEN_SIZE + 4u - 1u) / 4u) :
                 (NSUInteger)down_values;
             [enc dispatchThreadgroups:MTLSizeMake(down_threadgroups, 1u, 1u)
                  threadsPerThreadgroup:MTLSizeMake(down_threads, 1u, 1u)];

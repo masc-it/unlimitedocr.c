@@ -222,9 +222,9 @@ kernel void uocr_moe_decode_interleaved_gate_up_tile4_q8_0_to_f16(
     }
 }
 
-// Decode routed-expert down/combine (single-token, non-tiled).
-// One threadgroup per output column.  Loops over selected experts, dequantizes
-// down qweight inside the dot, weights by top_weights, sums, adds shared+residual.
+// Routed-expert down/combine (works for both decode and prefill).
+// One threadgroup per (token, out_col).  Uses the prefill params struct
+// which has n_tokens.  For decode (n_tokens==1), token is always 0.
 [[max_total_threads_per_threadgroup(256)]]
 kernel void uocr_moe_decode_interleaved_down_sum_combine_one_q8_0_to_f16(
     device const half *mid [[buffer(0)]],
@@ -235,24 +235,30 @@ kernel void uocr_moe_decode_interleaved_down_sum_combine_one_q8_0_to_f16(
     device const half *shared [[buffer(5)]],
     device const half *residual [[buffer(6)]],
     device half *dst [[buffer(7)]],
-    constant UocrMoeDecodeInterleavedQ8Params &params [[buffer(8)]],
+    constant UocrMoePrefillInterleavedQ8Params &params [[buffer(8)]],
     threadgroup float *partials [[threadgroup(0)]],
-    uint out_col [[threadgroup_position_in_grid]],
+    uint output_index [[threadgroup_position_in_grid]],
     uint tid [[thread_index_in_threadgroup]],
     uint ntg [[threads_per_threadgroup]],
     uint simd_width [[threads_per_simdgroup]]) {
-    const uint intermediate_size = uocr_fc_moe_expert_intermediate_or(params.intermediate_size);
-    const uint top_k = uocr_fc_moe_top_k_or(params.top_k);
+    const uint intermediate_size = params.intermediate_size;
+    const uint top_k = params.top_k;
+    const uint hidden_size = params.hidden_size;
     const uint group_size = params.group_size;
     const uint groups_per_row_inter = intermediate_size / group_size;
+    const uint token = output_index / hidden_size;
+    const uint out_col = output_index - token * hidden_size;
+    if (token >= params.n_tokens || out_col >= hidden_size) {
+        return;
+    }
     float sum = 0.0f;
     for (uint rank = 0u; rank < top_k; ++rank) {
-        const uint expert = top_expert_ids[rank];
+        const uint expert = top_expert_ids[token * top_k + rank];
         if (expert >= params.expert_count) {
             continue;
         }
         float expert_sum = 0.0f;
-        const ulong mid_base = ulong(rank) * ulong(intermediate_size);
+        const ulong mid_base = (ulong(token) * ulong(top_k) + ulong(rank)) * ulong(intermediate_size);
         const ulong expert_base = ulong(expert) * ulong(params.expert_stride_values);
         const ulong expert_scale_base = ulong(expert) * ulong(params.expert_scale_stride_values);
         const ulong down_w_base = expert_base + ulong(params.down_offset_values) + ulong(out_col) * ulong(intermediate_size);
@@ -262,15 +268,17 @@ kernel void uocr_moe_decode_interleaved_down_sum_combine_one_q8_0_to_f16(
             const float q = float(int(expert_qweight[down_w_base + ulong(k)]));
             expert_sum += float(mid[mid_base + ulong(k)]) * (q * scale);
         }
-        sum += expert_sum * top_weights[rank];
+        sum += expert_sum * top_weights[token * top_k + rank];
     }
     const float routed = uocr_threadgroup_sum(sum, partials, tid, ntg, simd_width);
     if (tid == 0u) {
-        dst[out_col] = half(routed + float(shared[out_col]) + float(residual[out_col]));
+        const uint dst_index = token * hidden_size + out_col;
+        dst[dst_index] = half(routed + float(shared[dst_index]) + float(residual[dst_index]));
     }
 }
 
 // Decode routed-expert down/combine tiled (4 columns per threadgroup).
+// Uses the prefill params struct for token indexing.
 [[max_total_threads_per_threadgroup(256)]]
 kernel void uocr_moe_decode_interleaved_down_sum_combine_tile4_q8_0_to_f16(
     device const half *mid [[buffer(0)]],
@@ -281,20 +289,23 @@ kernel void uocr_moe_decode_interleaved_down_sum_combine_tile4_q8_0_to_f16(
     device const half *shared [[buffer(5)]],
     device const half *residual [[buffer(6)]],
     device half *dst [[buffer(7)]],
-    constant UocrMoeDecodeInterleavedQ8Params &params [[buffer(8)]],
+    constant UocrMoePrefillInterleavedQ8Params &params [[buffer(8)]],
     threadgroup float *partials [[threadgroup(0)]],
     uint out_tile [[threadgroup_position_in_grid]],
     uint tid [[thread_index_in_threadgroup]],
     uint ntg [[threads_per_threadgroup]],
     uint simd_width [[threads_per_simdgroup]]) {
     const uint tile_columns = 4u;
-    const uint hidden_size = uocr_fc_hidden_size_or(params.hidden_size);
-    const uint intermediate_size = uocr_fc_moe_expert_intermediate_or(params.intermediate_size);
-    const uint top_k = uocr_fc_moe_top_k_or(params.top_k);
+    const uint hidden_size = params.hidden_size;
+    const uint intermediate_size = params.intermediate_size;
+    const uint top_k = params.top_k;
     const uint group_size = params.group_size;
     const uint groups_per_row_inter = intermediate_size / group_size;
-    const uint out_col0 = out_tile * tile_columns;
-    if (out_col0 >= hidden_size || ntg != 256u) {
+    const uint tiles_per_token = (hidden_size + tile_columns - 1u) / tile_columns;
+    const uint token = out_tile / tiles_per_token;
+    const uint tile = out_tile - token * tiles_per_token;
+    const uint out_col0 = tile * tile_columns;
+    if (token >= params.n_tokens || out_col0 >= hidden_size || ntg != 256u) {
         return;
     }
     const uint out_col1 = out_col0 + 1u;
@@ -307,11 +318,11 @@ kernel void uocr_moe_decode_interleaved_down_sum_combine_tile4_q8_0_to_f16(
 
     float sum0 = 0.0f, sum1 = 0.0f, sum2 = 0.0f, sum3 = 0.0f;
     for (uint rank = 0u; rank < top_k; ++rank) {
-        const uint expert = top_expert_ids[rank];
+        const uint expert = top_expert_ids[token * top_k + rank];
         if (expert >= params.expert_count) {
             continue;
         }
-        const ulong mid_base = ulong(rank) * ulong(intermediate_size);
+        const ulong mid_base = (ulong(token) * ulong(top_k) + ulong(rank)) * ulong(intermediate_size);
         const ulong expert_base = ulong(expert) * ulong(params.expert_stride_values);
         const ulong expert_scale_base = ulong(expert) * ulong(params.expert_scale_stride_values);
         float e0 = 0.0f, e1 = 0.0f, e2 = 0.0f, e3 = 0.0f;
@@ -340,18 +351,18 @@ kernel void uocr_moe_decode_interleaved_down_sum_combine_tile4_q8_0_to_f16(
                 e3 += m * (float(int(expert_qweight[dw])) * float(expert_qscale[ds]));
             }
         }
-        sum0 += e0 * top_weights[rank];
-        sum1 += e1 * top_weights[rank];
-        sum2 += e2 * top_weights[rank];
-        sum3 += e3 * top_weights[rank];
+        sum0 += e0 * top_weights[token * top_k + rank];
+        sum1 += e1 * top_weights[token * top_k + rank];
+        sum2 += e2 * top_weights[token * top_k + rank];
+        sum3 += e3 * top_weights[token * top_k + rank];
     }
 
     float v0 = uocr_threadgroup_sum(sum0, partials, tid, ntg, simd_width);
-    if (tid == 0u && valid0) dst[out_col0] = half(v0 + float(shared[out_col0]) + float(residual[out_col0]));
+    if (tid == 0u && valid0) { const uint idx = token * hidden_size + out_col0; dst[idx] = half(v0 + float(shared[idx]) + float(residual[idx])); }
     float v1 = uocr_threadgroup_sum(sum1, partials, tid, ntg, simd_width);
-    if (tid == 0u && valid1) dst[out_col1] = half(v1 + float(shared[out_col1]) + float(residual[out_col1]));
+    if (tid == 0u && valid1) { const uint idx = token * hidden_size + out_col1; dst[idx] = half(v1 + float(shared[idx]) + float(residual[idx])); }
     float v2 = uocr_threadgroup_sum(sum2, partials, tid, ntg, simd_width);
-    if (tid == 0u && valid2) dst[out_col2] = half(v2 + float(shared[out_col2]) + float(residual[out_col2]));
+    if (tid == 0u && valid2) { const uint idx = token * hidden_size + out_col2; dst[idx] = half(v2 + float(shared[idx]) + float(residual[idx])); }
     float v3 = uocr_threadgroup_sum(sum3, partials, tid, ntg, simd_width);
-    if (tid == 0u && valid3) dst[out_col3] = half(v3 + float(shared[out_col3]) + float(residual[out_col3]));
+    if (tid == 0u && valid3) { const uint idx = token * hidden_size + out_col3; dst[idx] = half(v3 + float(shared[idx]) + float(residual[idx])); }
 }
