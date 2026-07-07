@@ -1210,37 +1210,26 @@ typedef struct uocr_metal_clip_sam_concat_params {
     uint32_t projector_in_size;
 } uocr_metal_clip_sam_concat_params;
 
-typedef struct uocr_metal_projector_q8_params {
-    uint32_t n_rows;
-    uint32_t input_size;
-    uint32_t output_size;
-    uint32_t group_size;
-    uint32_t groups_per_row;
-    uint32_t reserved0;
-    uint32_t reserved1;
-    uint32_t reserved2;
-} uocr_metal_projector_q8_params;
-
 enum {
-    UOCR_METAL_CLIP_Q8_ACT_NONE = 0u,
-    UOCR_METAL_CLIP_Q8_ACT_QUICKGELU = 1u
+    UOCR_METAL_VISION_Q8_ACT_NONE = 0u,
+    UOCR_METAL_VISION_Q8_ACT_QUICKGELU = 1u,
+    UOCR_METAL_VISION_Q8_ACT_GELU_ERF = 2u
 };
 
-enum {
-    UOCR_METAL_SAM_Q8_ACT_NONE = 0u,
-    UOCR_METAL_SAM_Q8_ACT_GELU_ERF = 1u
-};
+#define UOCR_METAL_VISION_GEMM_Q8_BM 64u
+#define UOCR_METAL_VISION_GEMM_Q8_BN 32u
+#define UOCR_METAL_VISION_GEMM_Q8_THREADS 128u
 
-typedef struct uocr_metal_clip_linear_q8_params {
-    uint32_t n_rows;
-    uint32_t input_size;
-    uint32_t output_size;
-    uint32_t group_size;
+typedef struct uocr_metal_vision_gemm_q8_params {
+    uint32_t m;
+    uint32_t k;
+    uint32_t n;
     uint32_t groups_per_row;
     uint32_t activation;
+    uint32_t split_size;
     uint32_t reserved0;
     uint32_t reserved1;
-} uocr_metal_clip_linear_q8_params;
+} uocr_metal_vision_gemm_q8_params;
 
 typedef struct uocr_metal_sam_layernorm2d_params {
     uint32_t grid_width;
@@ -1311,10 +1300,8 @@ _Static_assert(sizeof(uocr_metal_clip_abs_pos_params) == 20u,
                "uocr_metal_clip_abs_pos_params ABI mismatch");
 _Static_assert(sizeof(uocr_metal_clip_sam_concat_params) == 16u,
                "uocr_metal_clip_sam_concat_params ABI mismatch");
-_Static_assert(sizeof(uocr_metal_projector_q8_params) == 32u,
-               "uocr_metal_projector_q8_params ABI mismatch");
-_Static_assert(sizeof(uocr_metal_clip_linear_q8_params) == 32u,
-               "uocr_metal_clip_linear_q8_params ABI mismatch");
+_Static_assert(sizeof(uocr_metal_vision_gemm_q8_params) == 32u,
+               "uocr_metal_vision_gemm_q8_params ABI mismatch");
 _Static_assert(sizeof(uocr_metal_get_rows_q8_params) == 32u,
                "uocr_metal_get_rows_q8_params ABI mismatch");
 _Static_assert(sizeof(uocr_metal_sam_layernorm2d_params) == 20u,
@@ -6383,6 +6370,82 @@ static int metal_context_clip_sam_concat_f16_to_slice(uocr_metal_context *ctx,
                                                            error_size);
 }
 
+/*
+ * Fused Q8_0 vision GEMM: dst = act(src @ qweightᵀ + bias).
+ * Tiled simdgroup-MMA kernel; each Q8 weight tile is dequantized once per
+ * 64-row block into threadgroup memory (no dequantized global buffers).
+ * split_size == 0 writes a single [m, n] output; otherwise columns are routed
+ * into dst0/dst1/dst2 with per-projection width split_size (fused QKV).
+ */
+static int metal_run_vision_gemm_q8_0(uocr_metal_context *ctx,
+                                      uocr_metal_buffer_slice input,
+                                      uocr_metal_vision_tensor_f16 weight,
+                                      uocr_metal_vision_tensor_f16 bias,
+                                      uint32_t n_rows,
+                                      uint32_t input_size,
+                                      uint32_t output_size,
+                                      uint32_t activation,
+                                      uint32_t split_size,
+                                      uocr_metal_buffer_slice dst0,
+                                      uocr_metal_buffer_slice dst1,
+                                      uocr_metal_buffer_slice dst2,
+                                      const char *op_name,
+                                      char *error,
+                                      size_t error_size) {
+    const uint64_t bias_bytes = (uint64_t)output_size * 2u;
+    if (ctx == NULL || n_rows == 0u || (input_size % 32u) != 0u ||
+        (split_size != 0u && (output_size != split_size * 3u)) ||
+        !metal_vision_require_weight_q8(weight, output_size, input_size, op_name, error, error_size) ||
+        !metal_vision_require_tensor_slice_f16(bias, bias_bytes, op_name, error, error_size)) {
+        return 0;
+    }
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, "uocr_vision_gemm_q8_0_to_f16", error, error_size);
+        if (pipeline == nil) {
+            return 0;
+        }
+        if (pipeline.maxTotalThreadsPerThreadgroup < UOCR_METAL_VISION_GEMM_Q8_THREADS) {
+            return metal_fail(error, error_size, "%s pipeline does not support 128-thread groups", op_name);
+        }
+        int owned_command_buffer = 0;
+        id<MTLCommandBuffer> cb = metal_command_buffer_for_op(ctx, &owned_command_buffer, op_name, error, error_size);
+        if (cb == nil) {
+            return 0;
+        }
+        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
+        if (enc == nil) {
+            return metal_fail(error, error_size, "failed to create %s encoder", op_name);
+        }
+        uocr_metal_vision_gemm_q8_params params;
+        memset(&params, 0, sizeof(params));
+        params.m = n_rows;
+        params.k = input_size;
+        params.n = output_size;
+        params.groups_per_row = input_size / UOCR_Q8_GROUP_SIZE_DEFAULT;
+        params.activation = activation;
+        params.split_size = split_size;
+        if (split_size == 0u) {
+            dst1 = dst0;
+            dst2 = dst0;
+        }
+        [enc setComputePipelineState:pipeline];
+        [enc setBuffer:input.buffer offset:input.offset atIndex:0u];
+        [enc setBuffer:weight.slice.buffer offset:weight.slice.offset atIndex:1u];
+        [enc setBuffer:weight.scale_slice.buffer offset:weight.scale_slice.offset atIndex:2u];
+        [enc setBuffer:bias.slice.buffer offset:bias.slice.offset atIndex:3u];
+        [enc setBuffer:dst0.buffer offset:dst0.offset atIndex:4u];
+        [enc setBuffer:dst1.buffer offset:dst1.offset atIndex:5u];
+        [enc setBuffer:dst2.buffer offset:dst2.offset atIndex:6u];
+        [enc setBytes:&params length:sizeof(params) atIndex:7u];
+        const NSUInteger col_tiles = ((NSUInteger)output_size + UOCR_METAL_VISION_GEMM_Q8_BN - 1u) / UOCR_METAL_VISION_GEMM_Q8_BN;
+        const NSUInteger row_tiles = ((NSUInteger)n_rows + UOCR_METAL_VISION_GEMM_Q8_BM - 1u) / UOCR_METAL_VISION_GEMM_Q8_BM;
+        [enc dispatchThreadgroups:MTLSizeMake(col_tiles, row_tiles, 1u)
+            threadsPerThreadgroup:MTLSizeMake(UOCR_METAL_VISION_GEMM_Q8_THREADS, 1u, 1u)];
+        [enc endEncoding];
+        return metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, op_name, error, error_size);
+    }
+}
+
 static int metal_run_visual_projector_q8_0_to_slice(uocr_metal_context *ctx,
                                                      uocr_metal_vision_workspace_slice input,
                                                      uocr_metal_vision_tensor_f16 weight,
@@ -6395,73 +6458,36 @@ static int metal_run_visual_projector_q8_0_to_slice(uocr_metal_context *ctx,
     uint64_t input_bytes = 0u;
     uint64_t output_values = 0u;
     uint64_t output_bytes = 0u;
-    const uint64_t bias_bytes = (uint64_t)UOCR_HIDDEN_SIZE * 2u;
     if (!checked_mul_u64((uint64_t)n_rows, (uint64_t)UOCR_PROJECTOR_IN_SIZE, &input_values) ||
         !checked_mul_u64((uint64_t)n_rows, (uint64_t)UOCR_HIDDEN_SIZE, &output_values) ||
         !metal_vision_f16_bytes(input_values, &input_bytes) ||
         !metal_vision_f16_bytes(output_values, &output_bytes) ||
         !metal_vision_require_workspace_slice(input, input_bytes, "visual projector input", error, error_size) ||
-        !metal_vision_require_workspace_slice(out_rows, output_bytes, "visual projector output", error, error_size) ||
-        !metal_vision_require_weight_q8(weight, UOCR_HIDDEN_SIZE, UOCR_PROJECTOR_IN_SIZE, "visual projector weight", error, error_size) ||
-        !metal_vision_require_tensor_slice_f16(bias, bias_bytes, "visual projector bias", error, error_size)) {
+        !metal_vision_require_workspace_slice(out_rows, output_bytes, "visual projector output", error, error_size)) {
         return metal_fail(error, error_size, "invalid Metal visual projector q8_0 inputs");
     }
-    @autoreleasepool {
-        id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, "uocr_visual_projector_tile4_q8_0_to_f16", error, error_size);
-        if (pipeline == nil) {
-            return 0;
-        }
-        int owned_command_buffer = 0;
-        id<MTLCommandBuffer> cb = metal_command_buffer_for_op(ctx,
-                                                              &owned_command_buffer,
-                                                              "Metal visual projector Q8",
-                                                              error,
-                                                              error_size);
-        if (cb == nil) {
-            return 0;
-        }
-        if (owned_command_buffer) {
-            cb.label = @"uocr_visual_projector_q8_command_buffer";
-        }
-        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
-        if (enc == nil) {
-            return metal_fail(error, error_size, "failed to create Metal visual projector Q8 encoder");
-        }
-        uocr_metal_projector_q8_params params;
-        memset(&params, 0, sizeof(params));
-        params.n_rows = n_rows;
-        params.input_size = UOCR_PROJECTOR_IN_SIZE;
-        params.output_size = UOCR_HIDDEN_SIZE;
-        params.group_size = UOCR_Q8_GROUP_SIZE_DEFAULT;
-        params.groups_per_row = UOCR_PROJECTOR_IN_SIZE / UOCR_Q8_GROUP_SIZE_DEFAULT;
-        const NSUInteger threads = 1024u;
-        if (pipeline.maxTotalThreadsPerThreadgroup < threads) {
-            return metal_fail(error, error_size, "Metal visual projector Q8 pipeline does not support 1024-thread groups");
-        }
-        [enc setComputePipelineState:pipeline];
-        [enc setBuffer:input.buffer offset:input.offset atIndex:0u];
-        [enc setBuffer:weight.slice.buffer offset:weight.slice.offset atIndex:1u];
-        [enc setBuffer:weight.scale_slice.buffer offset:weight.scale_slice.offset atIndex:2u];
-        [enc setBuffer:bias.slice.buffer offset:bias.slice.offset atIndex:3u];
-        [enc setBuffer:out_rows.buffer offset:out_rows.offset atIndex:4u];
-        [enc setBytes:&params length:sizeof(params) atIndex:5u];
-        [enc setThreadgroupMemoryLength:threads * sizeof(float) atIndex:0u];
-        const NSUInteger tiles_per_row = ((NSUInteger)UOCR_HIDDEN_SIZE + 3u) / 4u;
-        const uint64_t q8_start_ns = uocr_profile_now_ns();
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_rows * tiles_per_row, 1u, 1u)
-            threadsPerThreadgroup:MTLSizeMake(threads, 1u, 1u)];
-        [enc endEncoding];
-        const int ok = metal_finish_command_buffer_for_op(ctx,
-                                                          cb,
-                                                          owned_command_buffer,
-                                                          "Metal visual projector Q8",
-                                                          error,
-                                                          error_size);
-        if (ok) {
-            metal_profile_add_event_now(ctx, "metal.vision.projector_q8", q8_start_ns);
-        }
-        return ok;
+    const uocr_metal_buffer_slice input_slice = { input.buffer, input.offset };
+    const uocr_metal_buffer_slice out_slice = { out_rows.buffer, out_rows.offset };
+    const uint64_t q8_start_ns = uocr_profile_now_ns();
+    if (!metal_run_vision_gemm_q8_0(ctx,
+                                    input_slice,
+                                    weight,
+                                    bias,
+                                    n_rows,
+                                    UOCR_PROJECTOR_IN_SIZE,
+                                    UOCR_HIDDEN_SIZE,
+                                    UOCR_METAL_VISION_Q8_ACT_NONE,
+                                    0u,
+                                    out_slice,
+                                    out_slice,
+                                    out_slice,
+                                    "Metal visual projector Q8",
+                                    error,
+                                    error_size)) {
+        return 0;
     }
+    metal_profile_add_event_now(ctx, "metal.vision.projector_q8", q8_start_ns);
+    return 1;
 }
 
 static int metal_context_visual_projector_f16_to_slice(uocr_metal_context *ctx,
@@ -16404,13 +16430,10 @@ static int metal_context_clip_attention_batch_f16_to_slice(uocr_metal_context *c
 }
 
 /*
- * Fused Q8_0 vision linear: out = act(src @ qweightᵀ + bias).
- * Reads int8 qweights and fp16 scales in-kernel; no dequantized weight buffer.
- * pipeline_name selects the family-specific kernel (CLIP QuickGELU vs SAM
- * erf-GELU activation semantics); both share the same parameter ABI.
+ * Fused Q8_0 vision linear: out = act(src @ qweightᵀ + bias) via the tiled
+ * simdgroup-MMA GEMM kernel.
  */
 static int metal_run_vision_linear_q8_0(uocr_metal_context *ctx,
-                                        const char *pipeline_name,
                                         uocr_metal_buffer_slice input,
                                         uocr_metal_vision_tensor_f16 weight,
                                         uocr_metal_vision_tensor_f16 bias,
@@ -16422,57 +16445,26 @@ static int metal_run_vision_linear_q8_0(uocr_metal_context *ctx,
                                         const char *op_name,
                                         char *error,
                                         size_t error_size) {
-    const uint64_t bias_bytes = (uint64_t)output_size * 2u;
-    if (ctx == NULL || n_rows == 0u || pipeline_name == NULL ||
-        !metal_vision_require_weight_q8(weight, output_size, input_size, op_name, error, error_size) ||
-        !metal_vision_require_tensor_slice_f16(bias, bias_bytes, op_name, error, error_size)) {
-        return 0;
-    }
-    @autoreleasepool {
-        id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, pipeline_name, error, error_size);
-        if (pipeline == nil) {
-            return 0;
-        }
-        const NSUInteger threads = 1024u;
-        if (pipeline.maxTotalThreadsPerThreadgroup < threads) {
-            return metal_fail(error, error_size, "%s pipeline does not support 1024-thread groups", op_name);
-        }
-        int owned_command_buffer = 0;
-        id<MTLCommandBuffer> cb = metal_command_buffer_for_op(ctx, &owned_command_buffer, op_name, error, error_size);
-        if (cb == nil) {
-            return 0;
-        }
-        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
-        if (enc == nil) {
-            return metal_fail(error, error_size, "failed to create %s encoder", op_name);
-        }
-        uocr_metal_clip_linear_q8_params params;
-        memset(&params, 0, sizeof(params));
-        params.n_rows = n_rows;
-        params.input_size = input_size;
-        params.output_size = output_size;
-        params.group_size = UOCR_Q8_GROUP_SIZE_DEFAULT;
-        params.groups_per_row = input_size / UOCR_Q8_GROUP_SIZE_DEFAULT;
-        params.activation = activation;
-        [enc setComputePipelineState:pipeline];
-        [enc setBuffer:input.buffer offset:input.offset atIndex:0u];
-        [enc setBuffer:weight.slice.buffer offset:weight.slice.offset atIndex:1u];
-        [enc setBuffer:weight.scale_slice.buffer offset:weight.scale_slice.offset atIndex:2u];
-        [enc setBuffer:bias.slice.buffer offset:bias.slice.offset atIndex:3u];
-        [enc setBuffer:out.buffer offset:out.offset atIndex:4u];
-        [enc setBytes:&params length:sizeof(params) atIndex:5u];
-        [enc setThreadgroupMemoryLength:threads * sizeof(float) atIndex:0u];
-        const NSUInteger tiles_per_row = ((NSUInteger)output_size + 3u) / 4u;
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_rows * tiles_per_row, 1u, 1u)
-            threadsPerThreadgroup:MTLSizeMake(threads, 1u, 1u)];
-        [enc endEncoding];
-        return metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, op_name, error, error_size);
-    }
+    return metal_run_vision_gemm_q8_0(ctx,
+                                      input,
+                                      weight,
+                                      bias,
+                                      n_rows,
+                                      input_size,
+                                      output_size,
+                                      activation,
+                                      0u,
+                                      out,
+                                      out,
+                                      out,
+                                      op_name,
+                                      error,
+                                      error_size);
 }
 
 /*
  * Fused Q8_0 CLIP QKV projection: packed [3*hidden, hidden] Q8 weight, fp16
- * bias, direct writes into split Q/K/V buffers.
+ * bias, direct writes into split Q/K/V buffers via the GEMM split epilogue.
  */
 static int metal_run_clip_qkv_q8_0(uocr_metal_context *ctx,
                                    uocr_metal_buffer_slice input,
@@ -16486,55 +16478,21 @@ static int metal_run_clip_qkv_q8_0(uocr_metal_context *ctx,
                                    const char *op_name,
                                    char *error,
                                    size_t error_size) {
-    const uint32_t qkv_size = hidden_size * 3u;
-    const uint64_t bias_bytes = (uint64_t)qkv_size * 2u;
-    if (ctx == NULL || n_rows == 0u || hidden_size == 0u ||
-        !metal_vision_require_weight_q8(weight, qkv_size, hidden_size, op_name, error, error_size) ||
-        !metal_vision_require_tensor_slice_f16(bias, bias_bytes, op_name, error, error_size)) {
-        return 0;
-    }
-    @autoreleasepool {
-        id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, "uocr_clip_qkv_tile4_q8_0_to_f16", error, error_size);
-        if (pipeline == nil) {
-            return 0;
-        }
-        const NSUInteger threads = 1024u;
-        if (pipeline.maxTotalThreadsPerThreadgroup < threads) {
-            return metal_fail(error, error_size, "%s pipeline does not support 1024-thread groups", op_name);
-        }
-        int owned_command_buffer = 0;
-        id<MTLCommandBuffer> cb = metal_command_buffer_for_op(ctx, &owned_command_buffer, op_name, error, error_size);
-        if (cb == nil) {
-            return 0;
-        }
-        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
-        if (enc == nil) {
-            return metal_fail(error, error_size, "failed to create %s encoder", op_name);
-        }
-        uocr_metal_clip_linear_q8_params params;
-        memset(&params, 0, sizeof(params));
-        params.n_rows = n_rows;
-        params.input_size = hidden_size;
-        params.output_size = qkv_size;
-        params.group_size = UOCR_Q8_GROUP_SIZE_DEFAULT;
-        params.groups_per_row = hidden_size / UOCR_Q8_GROUP_SIZE_DEFAULT;
-        params.activation = UOCR_METAL_CLIP_Q8_ACT_NONE;
-        [enc setComputePipelineState:pipeline];
-        [enc setBuffer:input.buffer offset:input.offset atIndex:0u];
-        [enc setBuffer:weight.slice.buffer offset:weight.slice.offset atIndex:1u];
-        [enc setBuffer:weight.scale_slice.buffer offset:weight.scale_slice.offset atIndex:2u];
-        [enc setBuffer:bias.slice.buffer offset:bias.slice.offset atIndex:3u];
-        [enc setBuffer:q_dst.buffer offset:q_dst.offset atIndex:4u];
-        [enc setBuffer:k_dst.buffer offset:k_dst.offset atIndex:5u];
-        [enc setBuffer:v_dst.buffer offset:v_dst.offset atIndex:6u];
-        [enc setBytes:&params length:sizeof(params) atIndex:7u];
-        [enc setThreadgroupMemoryLength:threads * sizeof(float) atIndex:0u];
-        const NSUInteger tiles_per_row = ((NSUInteger)qkv_size + 3u) / 4u;
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_rows * tiles_per_row, 1u, 1u)
-            threadsPerThreadgroup:MTLSizeMake(threads, 1u, 1u)];
-        [enc endEncoding];
-        return metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, op_name, error, error_size);
-    }
+    return metal_run_vision_gemm_q8_0(ctx,
+                                      input,
+                                      weight,
+                                      bias,
+                                      n_rows,
+                                      hidden_size,
+                                      hidden_size * 3u,
+                                      UOCR_METAL_VISION_Q8_ACT_NONE,
+                                      hidden_size,
+                                      q_dst,
+                                      k_dst,
+                                      v_dst,
+                                      op_name,
+                                      error,
+                                      error_size);
 }
 
 static int metal_context_clip_mlp_batch_workspace_f16_to_slice(uocr_metal_context *ctx,
@@ -16580,14 +16538,13 @@ static int metal_context_clip_mlp_batch_workspace_f16_to_slice(uocr_metal_contex
     const uint64_t fc1_start_ns = uocr_profile_now_ns();
     if (fc1_is_q8) {
         ok = metal_run_vision_linear_q8_0(ctx,
-                                          "uocr_clip_linear_tile4_q8_0_to_f16",
                                           input_slice,
                                         block->mlp_fc1_weight,
                                         block->mlp_fc1_bias,
                                         rows,
                                         UOCR_CLIP_HIDDEN_SIZE,
                                         UOCR_CLIP_MLP_INTERMEDIATE,
-                                        UOCR_METAL_CLIP_Q8_ACT_QUICKGELU,
+                                        UOCR_METAL_VISION_Q8_ACT_QUICKGELU,
                                         fc1_dst_slice,
                                         "Metal CLIP batch MLP fc1 Q8",
                                         error,
@@ -16619,14 +16576,13 @@ static int metal_context_clip_mlp_batch_workspace_f16_to_slice(uocr_metal_contex
         const uint64_t fc2_start_ns = uocr_profile_now_ns();
         if (fc2_is_q8) {
             ok = metal_run_vision_linear_q8_0(ctx,
-                                              "uocr_clip_linear_tile4_q8_0_to_f16",
                                               fc1_dst_slice,
                                             block->mlp_fc2_weight,
                                             block->mlp_fc2_bias,
                                             rows,
                                             UOCR_CLIP_MLP_INTERMEDIATE,
                                             UOCR_CLIP_HIDDEN_SIZE,
-                                            UOCR_METAL_CLIP_Q8_ACT_NONE,
+                                            UOCR_METAL_VISION_Q8_ACT_NONE,
                                             out_slice,
                                             "Metal CLIP batch MLP fc2 Q8",
                                             error,
@@ -16801,14 +16757,13 @@ static int metal_context_clip_transformer_batch_block_workspace_f16_to_slice(uoc
         const uint64_t out_proj_q8_start_ns = uocr_profile_now_ns();
         RUN_CLIP_BATCH_BLOCK_STEP("output projection",
                                   metal_run_vision_linear_q8_0(ctx,
-                                                               "uocr_clip_linear_tile4_q8_0_to_f16",
                                                                (uocr_metal_buffer_slice){scratch->clip_block_attention.buffer, scratch->clip_block_attention.offset},
                                                              block->out_proj_weight,
                                                              block->out_proj_bias,
                                                              rows,
                                                              UOCR_CLIP_HIDDEN_SIZE,
                                                              UOCR_CLIP_HIDDEN_SIZE,
-                                                             UOCR_METAL_CLIP_Q8_ACT_NONE,
+                                                             UOCR_METAL_VISION_Q8_ACT_NONE,
                                                              (uocr_metal_buffer_slice){scratch->clip_block_projected.buffer, scratch->clip_block_projected.offset},
                                                              "Metal CLIP batch output projection Q8",
                                                              error,
@@ -17705,14 +17660,13 @@ static int metal_context_sam_mlp_batch_workspace_f16_to_slice(uocr_metal_context
     const uint64_t lin1_start_ns = uocr_profile_now_ns();
     if (lin1_is_q8) {
         ok = metal_run_vision_linear_q8_0(ctx,
-                                          "uocr_sam_linear_tile4_q8_0_to_f16",
                                           input_slice,
                                           block->mlp_lin1_weight,
                                           block->mlp_lin1_bias,
                                           rows,
                                           UOCR_SAM_HIDDEN_SIZE,
                                           UOCR_SAM_MLP_INTERMEDIATE,
-                                          UOCR_METAL_SAM_Q8_ACT_GELU_ERF,
+                                          UOCR_METAL_VISION_Q8_ACT_GELU_ERF,
                                           intermediate_slice,
                                           "Metal SAM batch MLP lin1 Q8",
                                           error,
@@ -17744,14 +17698,13 @@ static int metal_context_sam_mlp_batch_workspace_f16_to_slice(uocr_metal_context
         const uint64_t lin2_start_ns = uocr_profile_now_ns();
         if (lin2_is_q8) {
             ok = metal_run_vision_linear_q8_0(ctx,
-                                              "uocr_sam_linear_tile4_q8_0_to_f16",
                                               intermediate_slice,
                                               block->mlp_lin2_weight,
                                               block->mlp_lin2_bias,
                                               rows,
                                               UOCR_SAM_MLP_INTERMEDIATE,
                                               UOCR_SAM_HIDDEN_SIZE,
-                                              UOCR_METAL_SAM_Q8_ACT_NONE,
+                                              UOCR_METAL_VISION_Q8_ACT_NONE,
                                               out_slice,
                                               "Metal SAM batch MLP lin2 Q8",
                                               error,

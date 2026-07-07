@@ -368,11 +368,17 @@ CPU or GPU and must not run MPS matmul on dequantized global-memory weights.
 
 Checklist:
 
-* [ ] Add focused fragments, not a monolithic file:
-  * [x] `projector_q8.metal`
-  * [x] `clip_q8.metal`
-  * [x] `sam_q8.metal`
-  * optional later: `sam_conv_q8.metal`
+* [x] Vision Q8 GEMM lives in one shared fragment, `vision_gemm_q8.metal`.
+      The first-pass per-module GEMV-style fragments (`projector_q8.metal`,
+      `clip_q8.metal`, `sam_q8.metal`) were replaced after profiling: vision
+      call sites are multi-row GEMMs (up to 4096 token rows), and per-output
+      dot-product kernels re-read the full weight matrix per row (~10 GB per
+      SAM block linear) and were reduction-bound.  The shared kernel is a
+      tiled simdgroup-MMA GEMM (64x32 output tile, BK=32, fp16 MMA with fp32
+      accumulators, aliased 8 KB threadgroup staging, half4 A-loads) with a
+      bias + activation (+ optional QKV split) epilogue.  Measured on SAM lin1
+      `[4096,768]->[3072]`: ~2.2 TFLOP/s vs ~3.0 TFLOP/s MPS fp16, while
+      reading half the weight bytes.  Optional later: `sam_conv_q8.metal`.
 * [x] Add fragments to `tools/gen_metal.py` near the matching fp16 files.
 * [x] Regenerate `src/backend/metal/kernels/uocr_smoke.metal`.
 * [x] Verify both source-compiled and precompiled Metal builds.
@@ -569,7 +575,7 @@ New vision-Q8 target modules, QA-gated in order:
   visual projector                      QA'd
   CLIP MLP fc1/fc2                      QA'd
   CLIP attention QKV/O                  QA'd
-  SAM MLP lin1/lin2                     enabled for user QA
+  SAM MLP lin1/lin2                     enabled for user QA (perf-fixed GEMM)
   SAM attention QKV/O                   pending
 
 Still fp16 in first vision deliverable:
