@@ -411,8 +411,8 @@ passes an end-to-end OCR run against the fp16 baseline.
 7. **Routed MoE Q8** ✅
    * Q8 expert slabs and selected-expert kernels are wired and enabled.
 
-8. **LM head Q8**
-   * fused Q8 LM-head argmax is wired and enabled for QA.
+8. **LM head Q8** ✅
+   * fused Q8 LM-head argmax is wired, enabled, and QA'd on a real Q8 model.
 
 9. **Docs/tests/profiling**
    * converter docs;
@@ -437,15 +437,15 @@ Quantized families (runtime-supported subset, gated by configs/quant-cfg.yaml):
   decoder dense MLP                     ✅ QA'd
   decoder MoE routed experts            ✅ QA'd
   decoder MoE shared experts            ✅ QA'd
-  LM head                               enabled for QA
+  LM head                               ✅ QA'd
   router                                always fp16
 
 Runtime:
   Metal fused Q8 embedding              ✅
-  fused Q8 attention/dense/MoE/LM-head paths integrated at current call sites
-  as their modules pass QA; no standalone dequantization kernels and no
-  dequantized Q8 weight buffers; fp16 activations, KV cache, image features,
-  runtime arenas; fp16 vision/projector/norm/router paths unchanged.
+  fused Q8 attention/dense/MoE/LM-head paths integrated and QA'd at current
+  call sites; no standalone dequantization kernels and no dequantized Q8
+  weight buffers; fp16 activations, KV cache, image features, runtime arenas;
+  fp16 vision/projector/norm/router paths unchanged.
 
 User API:
   UnlimitedOCR(quant="q8") resolves/produces a cache-cached mixed-q8_0 model
