@@ -1,0 +1,58 @@
+# quant-cfg.yaml — runtime-supported Q8_0 modules for the Metal backend.
+#
+# The converter quantizes only the (family, projection) pairs listed here with
+# `supported: true`.  Grow this list as fused Q8 Metal kernels land; a module
+# stays `supported: false` until every decode and prefill path that consumes it
+# has a fused Q8 kernel.
+#
+# Keys:
+#   version     config schema version (currently 1)
+#   group_size  Q8_0 block/group size; must match UOCR_Q8_GROUP_SIZE_DEFAULT
+#   modules     ordered list of module specs
+#     name         human-readable module id (stable, used in summaries)
+#     family       TensorFamily enum name
+#     projections  list of TensorProjection enum names this module covers
+#     supported    whether the runtime can consume Q8_0 weights for this module
+#
+# Note: attention_qkv covers Q/K/V.  Prefill has a fused Q8 QKV kernel, but the
+# same weights feed the decode QKV path which is still fp16-only, so the module
+# remains unsupported until decode QKV lands.
+
+version: 1
+group_size: 64
+
+modules:
+  - name: token_embedding
+    family: TOK_EMBED
+    projections: [WEIGHT]
+    supported: true
+
+  - name: lm_head
+    family: LM_HEAD
+    projections: [WEIGHT]
+    supported: false
+
+  - name: attention_qkv
+    family: LAYER_ATTN
+    projections: [Q, K, V]
+    supported: false
+
+  - name: attention_output
+    family: LAYER_ATTN
+    projections: [O]
+    supported: false
+
+  - name: dense_mlp
+    family: LAYER_DENSE_MLP
+    projections: [GATE, UP, DOWN]
+    supported: false
+
+  - name: moe_shared
+    family: MOE_SHARED
+    projections: [GATE, UP, DOWN]
+    supported: false
+
+  - name: moe_routed_experts
+    family: MOE_EXPERT
+    projections: [GATE, UP, DOWN]
+    supported: false

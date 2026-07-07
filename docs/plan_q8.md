@@ -130,10 +130,18 @@ uv run tools/uocr-convert \
   --qprofile mixed-q8_0 \
   --quant-group-size 64 \
   --quant-policy embeddings+decoder \
+  --quant-cfg configs/quant-cfg.yaml \
   --out unlimitedocr-mixed-q8_0.uocr \
   --overwrite \
   --dump-quant-summary
 ```
+
+The runtime-supported Q8 module subset is governed by `configs/quant-cfg.yaml`
+(see `src/unlimitedocr_c/quant_cfg.py`).  The converter quantizes only the
+`(family, projection)` pairs marked `supported: true` there, so a model
+converted with `mixed-q8_0` only uses Q8 for modules with fused Metal kernels.
+Grow the cfg as kernels land; the `embeddings+decoder` policy still defines the
+full candidate universe.
 
 Checklist:
 
@@ -141,7 +149,8 @@ Checklist:
 * [x] Do not add a separate `--quant` alias; `--qprofile mixed-q8_0` is the single converter switch for this deliverable.
 * [x] Add `--quant-group-size`, default `64`.
 * [x] Add `--quant-policy embeddings+decoder` as the only accepted Q8 policy for this deliverable; reject other policy strings with a clear error.
-* [x] Quantize LM head unconditionally under `mixed-q8_0`.
+* [x] Add `--quant-cfg` (default `configs/quant-cfg.yaml`) gating which modules are actually quantized to the runtime-supported subset.
+* [x] Quantize LM head unconditionally under `mixed-q8_0` *when the cfg marks it supported* (currently `supported: false` until the Q8 LM-head kernel lands).
 * [x] Keep router weights fp16 unconditionally under `mixed-q8_0`.
 * [x] Add `--dump-quant-summary` and `--dry-run` behavior consistent with existing planning.
 * [x] Bump `CONVERTER_VERSION` to `(0, 2, 0)`.

@@ -41,6 +41,7 @@ from unlimitedocr_c.convert import (
     write_uocr_model,
 )
 from unlimitedocr_c.frontend import project_root
+from unlimitedocr_c.quant_cfg import all_supported_quant_config
 from unlimitedocr_c.tensor_registry import TENSOR_ID_LM_HEAD, TENSOR_ID_TOK_EMBED, TensorFamily, TensorProjection, tensor_id_layer_attn
 
 
@@ -196,7 +197,11 @@ def test_fp16_converter_dry_run_against_cached_header() -> None:
 
 
 def test_mixed_q8_converter_dry_run_plans_decoder_quantization() -> None:
-    plan = build_dry_run_plan(project_root() / "data/context", qprofile="mixed-q8_0")
+    plan = build_dry_run_plan(
+        project_root() / "data/context",
+        qprofile="mixed-q8_0",
+        quant_cfg=all_supported_quant_config(),
+    )
     summary = q8_summary(plan.tensors)
     assert plan.qprofile == "mixed-q8_0"
     assert summary["tensor_count"] > 0
@@ -233,6 +238,21 @@ def test_mixed_q8_converter_dry_run_plans_decoder_quantization() -> None:
     assert all(a.scale_offset + a.scale_size == b.scale_offset for a, b in zip(layer1_experts, layer1_experts[1:]))
 
 
+def test_mixed_q8_default_cfg_only_quantizes_runtime_supported_modules() -> None:
+    plan = build_dry_run_plan(project_root() / "data/context", qprofile="mixed-q8_0")
+    tok_embed = plan.tensor_by_name("model.embed_tokens.weight")
+    lm_head = plan.tensor_by_name("lm_head.weight")
+    attn_q = plan.tensor_by_name("model.layers.3.self_attn.q_proj.weight")
+    expert_gate = plan.tensor_by_name("model.layers.1.mlp.experts.0.gate_proj.weight")
+    shared_gate = plan.tensor_by_name("model.layers.1.mlp.shared_experts.gate_proj.weight")
+    assert tok_embed.qtype_id == UOCR_TENSOR_Q8_0
+    # Modules without fused Q8 runtime kernels stay fp16 under the default cfg.
+    assert lm_head.qtype == "UOCR_TENSOR_F16"
+    assert attn_q.qtype == "UOCR_TENSOR_F16"
+    assert expert_gate.qtype == "UOCR_TENSOR_F16"
+    assert shared_gate.qtype == "UOCR_TENSOR_F16"
+
+
 def test_tensor_directory_bytes_records_fp16_metadata() -> None:
     plan = filter_plan_tensors(build_dry_run_plan(project_root() / "data/context", qprofile="fp16"), "lm_head.weight")
     raw = _tensor_directory_bytes(plan)
@@ -256,7 +276,12 @@ def test_tensor_directory_bytes_records_fp16_metadata() -> None:
 
 def test_tensor_directory_bytes_records_q8_metadata() -> None:
     plan = filter_plan_tensors(
-        build_dry_run_plan(project_root() / "data/context", qprofile="mixed-q8_0"), "lm_head.weight"
+        build_dry_run_plan(
+            project_root() / "data/context",
+            qprofile="mixed-q8_0",
+            quant_cfg=all_supported_quant_config(),
+        ),
+        "lm_head.weight",
     )
     raw = _tensor_directory_bytes(plan)
     entry = _TENSOR_ENTRY_STRUCT.unpack_from(raw, _TENSOR_DIRECTORY_HEADER_STRUCT.size)
@@ -290,7 +315,12 @@ def test_write_uocr_model_streams_tiny_fp16_payloads(tmp_path: Path) -> None:
 
 def test_write_uocr_model_streams_tiny_q8_payloads(tmp_path: Path) -> None:
     source_values = _write_tiny_q8_safetensors(tmp_path)
-    plan = build_dry_run_plan(tmp_path, qprofile="mixed-q8_0", strict=False)
+    plan = build_dry_run_plan(
+        tmp_path,
+        qprofile="mixed-q8_0",
+        strict=False,
+        quant_cfg=all_supported_quant_config(),
+    )
     tensor = plan.tensor_by_name("lm_head.weight")
     assert tensor.qtype_id == UOCR_TENSOR_Q8_0
     out = tmp_path / "tiny-q8.uocr"
@@ -320,7 +350,12 @@ def test_compare_single_tensor_conversion_fp16(tmp_path: Path) -> None:
 
 def test_compare_single_tensor_conversion_q8(tmp_path: Path) -> None:
     _write_tiny_q8_safetensors(tmp_path)
-    plan = build_dry_run_plan(tmp_path, qprofile="mixed-q8_0", strict=False)
+    plan = build_dry_run_plan(
+        tmp_path,
+        qprofile="mixed-q8_0",
+        strict=False,
+        quant_cfg=all_supported_quant_config(),
+    )
     filtered = filter_plan_tensors(plan, "lm_head.weight")
     out = tmp_path / "tiny-q8.uocr"
     write_uocr_model(plan, out, overwrite=True)

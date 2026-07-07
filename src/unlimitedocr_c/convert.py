@@ -24,6 +24,7 @@ from typing import Any, BinaryIO, Iterable, Mapping
 import numpy as np
 
 from .frontend import project_root
+from .quant_cfg import QuantConfig, load_default_quant_config, load_quant_config
 from .tensor_registry import (
     TensorFamily,
     TensorProjection,
@@ -108,7 +109,11 @@ UOCR_Q8_MAX = 127
 CONVERTER_VERSION = (0, 2, 0)
 
 QUANT_POLICY_EMBEDDINGS_DECODER = "embeddings+decoder"
-Q8_CANDIDATE_FAMILIES = frozenset({
+#: Candidate (family, projection) universe for the ``embeddings+decoder`` policy.
+#: The runtime-safe subset actually quantized is governed by ``configs/quant-cfg.yaml``
+#: (see :mod:`unlimitedocr_c.quant_cfg``); this constant only documents which
+#: families/projections the policy considers at all.
+Q8_POLICY_CANDIDATE_FAMILIES = frozenset({
     TensorFamily.TOK_EMBED,
     TensorFamily.LM_HEAD,
     TensorFamily.LAYER_ATTN,
@@ -116,7 +121,7 @@ Q8_CANDIDATE_FAMILIES = frozenset({
     TensorFamily.MOE_EXPERT,
     TensorFamily.MOE_SHARED,
 })
-Q8_CANDIDATE_PROJECTIONS = frozenset({
+Q8_POLICY_CANDIDATE_PROJECTIONS = frozenset({
     TensorProjection.WEIGHT,
     TensorProjection.Q,
     TensorProjection.K,
@@ -1347,14 +1352,17 @@ def _reason_name(reason_names: Mapping[int, str], reason_id: int) -> str:
     return reason_names.get(reason_id, "unknown")
 
 
-def _is_mixed_q8_candidate(registry_entry: TensorRegistryEntry, shape: tuple[int, ...], usage_id: int) -> bool:
+def _is_mixed_q8_candidate(
+    registry_entry: TensorRegistryEntry,
+    shape: tuple[int, ...],
+    usage_id: int,
+    quant_cfg: QuantConfig,
+) -> bool:
     if usage_id != UOCR_TENSOR_USAGE_RUNTIME or len(shape) != 2:
         return False
-    if registry_entry.family not in Q8_CANDIDATE_FAMILIES:
+    if registry_entry.family == TensorFamily.MOE_ROUTER:
         return False
-    if registry_entry.projection not in Q8_CANDIDATE_PROJECTIONS:
-        return False
-    return registry_entry.family != TensorFamily.MOE_ROUTER
+    return quant_cfg.is_supported(registry_entry.family, registry_entry.projection)
 
 
 def _make_tensor_plan(
@@ -1365,6 +1373,7 @@ def _make_tensor_plan(
     *,
     quant_group_size: int = UOCR_Q8_GROUP_SIZE_DEFAULT,
     quant_policy: str = QUANT_POLICY_EMBEDDINGS_DECODER,
+    quant_cfg: QuantConfig | None = None,
 ) -> TensorPlan:
     if qprofile not in QPROFILE_IDS:
         raise ValueError(f"unknown qprofile {qprofile!r}")
@@ -1372,6 +1381,7 @@ def _make_tensor_plan(
         raise ValueError(f"only Q8_0 group size {UOCR_Q8_GROUP_SIZE_DEFAULT} is supported, got {quant_group_size}")
     if quant_policy != QUANT_POLICY_EMBEDDINGS_DECODER:
         raise ValueError(f"unsupported quantization policy {quant_policy!r}; expected {QUANT_POLICY_EMBEDDINGS_DECODER!r}")
+    cfg = quant_cfg if quant_cfg is not None else load_default_quant_config()
 
     shape = tuple(int(dim) for dim in entry["shape"])
     offsets = (int(entry["data_offsets"][0]), int(entry["data_offsets"][1]))
@@ -1390,7 +1400,7 @@ def _make_tensor_plan(
     qtype_reason_id = UOCR_QTYPE_REASON_FP16_BASELINE
     promotion_reason_id = UOCR_PROMOTION_NONE
 
-    if qprofile == "mixed-q8_0" and _is_mixed_q8_candidate(registry_entry, shape, usage_id):
+    if qprofile == "mixed-q8_0" and _is_mixed_q8_candidate(registry_entry, shape, usage_id, cfg):
         qweight_bytes = q8_qweight_bytes(shape, quant_group_size)
         qscale_bytes = q8_qscale_bytes(shape, quant_group_size)
         logical_shape = shape
@@ -1514,6 +1524,7 @@ def build_dry_run_plan(
     strict: bool = True,
     quant_group_size: int = UOCR_Q8_GROUP_SIZE_DEFAULT,
     quant_policy: str = QUANT_POLICY_EMBEDDINGS_DECODER,
+    quant_cfg: QuantConfig | None = None,
 ) -> DryRunPlan:
     hf_dir = Path(hf_dir)
     if qprofile not in QPROFILE_IDS:
@@ -1522,6 +1533,7 @@ def build_dry_run_plan(
         raise ValueError(f"only --quant-group-size {UOCR_Q8_GROUP_SIZE_DEFAULT} is supported, got {quant_group_size}")
     if quant_policy != QUANT_POLICY_EMBEDDINGS_DECODER:
         raise ValueError(f"unsupported --quant-policy {quant_policy!r}; expected {QUANT_POLICY_EMBEDDINGS_DECODER!r}")
+    cfg = quant_cfg if quant_cfg is not None else load_default_quant_config()
 
     header = _read_safetensors_header(Path(header_path) if header_path is not None else _default_header_path(hf_dir))
     entries: dict[str, Mapping[str, Any]] = {
@@ -1549,6 +1561,7 @@ def build_dry_run_plan(
             registry[name],
             quant_group_size=quant_group_size,
             quant_policy=quant_policy,
+            quant_cfg=cfg,
         )
         for name in sorted(entries, key=lambda key: registry[key].tensor_id)
     )
@@ -2473,6 +2486,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--qprofile", choices=["fp16", "mixed-q8_0"], default="fp16")
     parser.add_argument("--quant-group-size", type=int, default=UOCR_Q8_GROUP_SIZE_DEFAULT)
     parser.add_argument("--quant-policy", choices=[QUANT_POLICY_EMBEDDINGS_DECODER], default=QUANT_POLICY_EMBEDDINGS_DECODER)
+    parser.add_argument(
+        "--quant-cfg",
+        type=Path,
+        default=None,
+        help="path to quant-cfg.yaml; defaults to configs/quant-cfg.yaml (runtime-supported Q8 modules)",
+    )
     parser.add_argument("--dry-run", action="store_true", help="plan only; does not require full weights")
     parser.add_argument("--out", type=Path, default=None, help="write a .uocr file to this path")
     parser.add_argument(
@@ -2512,6 +2531,7 @@ def main(argv: list[str] | None = None) -> int:
         strict=not args.relaxed_validation,
         quant_group_size=args.quant_group_size,
         quant_policy=args.quant_policy,
+        quant_cfg=load_quant_config(args.quant_cfg) if args.quant_cfg is not None else None,
     )
     plan = filter_plan_tensors(plan, args.tensor)
     _print_summary(plan, dry_run=args.dry_run or args.out is None)

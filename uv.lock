@@ -527,6 +527,7 @@ dependencies = [
     { name = "huggingface-hub" },
     { name = "numpy" },
     { name = "pillow" },
+    { name = "pyyaml" },
     { name = "safetensors" },
     { name = "tokenizers" },
 ]
@@ -542,6 +543,7 @@ requires-dist = [
     { name = "numpy", specifier = ">=2" },
     { name = "pillow", specifier = ">=10" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8" },
+    { name = "pyyaml", specifier = ">=6" },
     { name = "safetensors", specifier = ">=0.4" },
     { name = "tokenizers", specifier = ">=0.20" },
 ]
