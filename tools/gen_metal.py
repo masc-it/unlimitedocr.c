@@ -25,6 +25,7 @@ ORDER = [
     "attention.metal",
     "attention_q8.metal",
     "clip.metal",
+    "clip_q8.metal",
     "clip_sam.metal",
     "projector_q8.metal",
     "embedding.metal",

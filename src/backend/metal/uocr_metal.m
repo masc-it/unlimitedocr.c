@@ -1221,6 +1221,22 @@ typedef struct uocr_metal_projector_q8_params {
     uint32_t reserved2;
 } uocr_metal_projector_q8_params;
 
+enum {
+    UOCR_METAL_CLIP_Q8_ACT_NONE = 0u,
+    UOCR_METAL_CLIP_Q8_ACT_QUICKGELU = 1u
+};
+
+typedef struct uocr_metal_clip_linear_q8_params {
+    uint32_t n_rows;
+    uint32_t input_size;
+    uint32_t output_size;
+    uint32_t group_size;
+    uint32_t groups_per_row;
+    uint32_t activation;
+    uint32_t reserved0;
+    uint32_t reserved1;
+} uocr_metal_clip_linear_q8_params;
+
 typedef struct uocr_metal_sam_layernorm2d_params {
     uint32_t grid_width;
     uint32_t grid_height;
@@ -1292,6 +1308,8 @@ _Static_assert(sizeof(uocr_metal_clip_sam_concat_params) == 16u,
                "uocr_metal_clip_sam_concat_params ABI mismatch");
 _Static_assert(sizeof(uocr_metal_projector_q8_params) == 32u,
                "uocr_metal_projector_q8_params ABI mismatch");
+_Static_assert(sizeof(uocr_metal_clip_linear_q8_params) == 32u,
+               "uocr_metal_clip_linear_q8_params ABI mismatch");
 _Static_assert(sizeof(uocr_metal_get_rows_q8_params) == 32u,
                "uocr_metal_get_rows_q8_params ABI mismatch");
 _Static_assert(sizeof(uocr_metal_sam_layernorm2d_params) == 20u,
@@ -2330,7 +2348,7 @@ static const uocr_metal_vision_weights_f16 *metal_require_vision_weights_f16(con
                                                                              char *error,
                                                                              size_t error_size);
 static int metal_sam_transformer_block_has_weights(const uocr_metal_sam_transformer_block_f16 *block);
-static int metal_clip_transformer_block_has_weights(const uocr_metal_clip_transformer_block_f16 *block);
+static int metal_clip_transformer_block_slices_ready(const uocr_metal_clip_transformer_block_slices_f16 *block);
 static void metal_copy_error_detail(char *detail, size_t detail_size, const char *error);
 
 static uocr_metal_tensor_binding_internal *build_tensor_bindings(const uocr_model_file *model,
@@ -4382,6 +4400,20 @@ static int metal_vision_weight_cache_build_direct(const uocr_metal_vision_bindin
         host_block->host_field = direct_block->block_field.host_f16;                                    \
     } while (0)
 
+/* MLP fc1/fc2 weights may be Q8_0; the fused Q8 kernel path consumes qweight/qscale slices. */
+#define ASSIGN_CLIP_BLOCK_WEIGHT_ANY_QTYPE(block_field, tensor_id, role, host_field)                   \
+    do {                                                                                                \
+        if (!metal_vision_tensor_from_binding_cache(binding_cache,                                      \
+                                                    (tensor_id),                                        \
+                                                    (role),                                             \
+                                                    &(direct_block->block_field),                       \
+                                                    error,                                              \
+                                                    error_size)) {                                      \
+            return 0;                                                                                   \
+        }                                                                                               \
+        host_block->host_field = direct_block->block_field.host_f16;                                    \
+    } while (0)
+
     for (uint32_t layer = 0u; layer < UOCR_CLIP_BLOCKS; ++layer) {
         const uint32_t base = UOCR_TENSOR_ID_VISION_CLIP_BASE + 5u + metal_clip_sorted_layer_index_for_layer(layer) * 12u;
         uocr_metal_clip_transformer_block_slices_f16 *direct_block = &out_weights->clip_block_slices[layer];
@@ -4391,19 +4423,20 @@ static int metal_vision_weight_cache_build_direct(const uocr_metal_vision_bindin
         ASSIGN_CLIP_BLOCK_TENSOR(ln2_bias, base + 2u, "CLIP layer_norm2 bias", ln2_bias_f16);
         ASSIGN_CLIP_BLOCK_TENSOR(ln2_weight, base + 3u, "CLIP layer_norm2 weight", ln2_weight_f16);
         ASSIGN_CLIP_BLOCK_TENSOR(mlp_fc1_bias, base + 4u, "CLIP MLP fc1 bias", mlp_fc1_bias_f16);
-        ASSIGN_CLIP_BLOCK_TENSOR(mlp_fc1_weight, base + 5u, "CLIP MLP fc1 weight", mlp_fc1_weight_f16);
+        ASSIGN_CLIP_BLOCK_WEIGHT_ANY_QTYPE(mlp_fc1_weight, base + 5u, "CLIP MLP fc1 weight", mlp_fc1_weight_f16);
         ASSIGN_CLIP_BLOCK_TENSOR(mlp_fc2_bias, base + 6u, "CLIP MLP fc2 bias", mlp_fc2_bias_f16);
-        ASSIGN_CLIP_BLOCK_TENSOR(mlp_fc2_weight, base + 7u, "CLIP MLP fc2 weight", mlp_fc2_weight_f16);
+        ASSIGN_CLIP_BLOCK_WEIGHT_ANY_QTYPE(mlp_fc2_weight, base + 7u, "CLIP MLP fc2 weight", mlp_fc2_weight_f16);
         ASSIGN_CLIP_BLOCK_TENSOR(out_proj_bias, base + 8u, "CLIP attention output bias", out_proj_bias_f16);
         ASSIGN_CLIP_BLOCK_TENSOR(out_proj_weight, base + 9u, "CLIP attention output weight", out_proj_weight_f16);
         ASSIGN_CLIP_BLOCK_TENSOR(qkv_bias, base + 10u, "CLIP attention qkv bias", qkv_bias_f16);
         ASSIGN_CLIP_BLOCK_TENSOR(qkv_weight, base + 11u, "CLIP attention qkv weight", qkv_weight_f16);
-        if (!metal_clip_transformer_block_has_weights(host_block)) {
+        if (!metal_clip_transformer_block_slices_ready(direct_block)) {
             return metal_fail(error, error_size, "incomplete CLIP transformer block %u direct vision bindings", layer);
         }
     }
 
 #undef ASSIGN_CLIP_BLOCK_TENSOR
+#undef ASSIGN_CLIP_BLOCK_WEIGHT_ANY_QTYPE
 
     out_weights->valid = 1;
     out_weights->count = binding_cache->count;
@@ -5018,6 +5051,27 @@ static int metal_vision_require_tensor_slice_f16(uocr_metal_vision_tensor_f16 te
     if (tensor.qtype != UOCR_TENSOR_F16 || tensor.slice.buffer == nil || tensor.host_f16 == NULL ||
         byte_length == 0u || byte_length > tensor.byte_length || !metal_slice_valid(tensor.slice, byte_length)) {
         return metal_fail(error, error_size, "invalid Metal vision %s tensor slice", label != NULL ? label : "weight");
+    }
+    return 1;
+}
+
+static int metal_vision_require_weight_q8(uocr_metal_vision_tensor_f16 tensor,
+                                          uint32_t rows,
+                                          uint32_t cols,
+                                          const char *label,
+                                          char *error,
+                                          size_t error_size) {
+    const uint64_t qweight_bytes = (uint64_t)rows * (uint64_t)cols;
+    const uint64_t qscale_bytes = uocr_q8_0_qscale_bytes(rows, cols, UOCR_Q8_GROUP_SIZE_DEFAULT);
+    if (tensor.qtype != UOCR_TENSOR_Q8_0 || rows == 0u || cols == 0u || qscale_bytes == 0u ||
+        tensor.rows != rows || tensor.cols != cols ||
+        tensor.group_size != UOCR_Q8_GROUP_SIZE_DEFAULT ||
+        tensor.groups_per_row != cols / UOCR_Q8_GROUP_SIZE_DEFAULT ||
+        tensor.slice.buffer == nil || tensor.byte_length != qweight_bytes ||
+        !metal_slice_valid(tensor.slice, qweight_bytes) ||
+        tensor.scale_slice.buffer == nil || tensor.scale_byte_length != qscale_bytes ||
+        !metal_slice_valid(tensor.scale_slice, qscale_bytes)) {
+        return metal_fail(error, error_size, "invalid Metal vision %s q8_0 tensor slice", label != NULL ? label : "weight");
     }
     return 1;
 }
@@ -6321,24 +6375,14 @@ static int metal_run_visual_projector_q8_0_to_slice(uocr_metal_context *ctx,
     uint64_t input_bytes = 0u;
     uint64_t output_values = 0u;
     uint64_t output_bytes = 0u;
-    const uint64_t qweight_bytes = (uint64_t)UOCR_HIDDEN_SIZE * (uint64_t)UOCR_PROJECTOR_IN_SIZE;
-    const uint64_t qscale_bytes = uocr_q8_0_qscale_bytes(UOCR_HIDDEN_SIZE,
-                                                         UOCR_PROJECTOR_IN_SIZE,
-                                                         UOCR_Q8_GROUP_SIZE_DEFAULT);
     const uint64_t bias_bytes = (uint64_t)UOCR_HIDDEN_SIZE * 2u;
-    if (qscale_bytes == 0u ||
-        !checked_mul_u64((uint64_t)n_rows, (uint64_t)UOCR_PROJECTOR_IN_SIZE, &input_values) ||
+    if (!checked_mul_u64((uint64_t)n_rows, (uint64_t)UOCR_PROJECTOR_IN_SIZE, &input_values) ||
         !checked_mul_u64((uint64_t)n_rows, (uint64_t)UOCR_HIDDEN_SIZE, &output_values) ||
         !metal_vision_f16_bytes(input_values, &input_bytes) ||
         !metal_vision_f16_bytes(output_values, &output_bytes) ||
         !metal_vision_require_workspace_slice(input, input_bytes, "visual projector input", error, error_size) ||
         !metal_vision_require_workspace_slice(out_rows, output_bytes, "visual projector output", error, error_size) ||
-        weight.qtype != UOCR_TENSOR_Q8_0 || weight.rows != UOCR_HIDDEN_SIZE || weight.cols != UOCR_PROJECTOR_IN_SIZE ||
-        weight.group_size != UOCR_Q8_GROUP_SIZE_DEFAULT ||
-        weight.groups_per_row != UOCR_PROJECTOR_IN_SIZE / UOCR_Q8_GROUP_SIZE_DEFAULT ||
-        weight.slice.buffer == nil || weight.byte_length != qweight_bytes || !metal_slice_valid(weight.slice, qweight_bytes) ||
-        weight.scale_slice.buffer == nil || weight.scale_byte_length != qscale_bytes ||
-        !metal_slice_valid(weight.scale_slice, qscale_bytes) ||
+        !metal_vision_require_weight_q8(weight, UOCR_HIDDEN_SIZE, UOCR_PROJECTOR_IN_SIZE, "visual projector weight", error, error_size) ||
         !metal_vision_require_tensor_slice_f16(bias, bias_bytes, "visual projector bias", error, error_size)) {
         return metal_fail(error, error_size, "invalid Metal visual projector q8_0 inputs");
     }
@@ -16206,13 +16250,26 @@ static int sam_window_partition_geometry(uint32_t grid_w,
     *out_n_windows = (uint32_t)n_windows;
     return 1;
 }
-static int metal_clip_transformer_block_has_weights(const uocr_metal_clip_transformer_block_f16 *block) {
-    return block != NULL && block->ln1_weight_f16 != NULL && block->ln1_bias_f16 != NULL &&
-           block->qkv_weight_f16 != NULL && block->qkv_bias_f16 != NULL &&
-           block->out_proj_weight_f16 != NULL && block->out_proj_bias_f16 != NULL &&
-           block->ln2_weight_f16 != NULL && block->ln2_bias_f16 != NULL &&
-           block->mlp_fc1_weight_f16 != NULL && block->mlp_fc1_bias_f16 != NULL &&
-           block->mlp_fc2_weight_f16 != NULL && block->mlp_fc2_bias_f16 != NULL;
+/*
+ * fc1/fc2 weights may be f16 or Q8_0 (dtype-aware slices); all other CLIP
+ * block tensors must be CPU-visible fp16.
+ */
+static int metal_clip_transformer_block_slices_ready(const uocr_metal_clip_transformer_block_slices_f16 *block) {
+    if (block == NULL) {
+        return 0;
+    }
+    const int fixed_f16_ready = block->ln1_weight.host_f16 != NULL && block->ln1_bias.host_f16 != NULL &&
+                                block->qkv_weight.host_f16 != NULL && block->qkv_bias.host_f16 != NULL &&
+                                block->out_proj_weight.host_f16 != NULL && block->out_proj_bias.host_f16 != NULL &&
+                                block->ln2_weight.host_f16 != NULL && block->ln2_bias.host_f16 != NULL &&
+                                block->mlp_fc1_bias.host_f16 != NULL && block->mlp_fc2_bias.host_f16 != NULL;
+    const int fc1_ready = block->mlp_fc1_weight.qtype == UOCR_TENSOR_Q8_0
+                              ? block->mlp_fc1_weight.slice.buffer != nil && block->mlp_fc1_weight.scale_slice.buffer != nil
+                              : block->mlp_fc1_weight.host_f16 != NULL;
+    const int fc2_ready = block->mlp_fc2_weight.qtype == UOCR_TENSOR_Q8_0
+                              ? block->mlp_fc2_weight.slice.buffer != nil && block->mlp_fc2_weight.scale_slice.buffer != nil
+                              : block->mlp_fc2_weight.host_f16 != NULL;
+    return fixed_f16_ready && fc1_ready && fc2_ready;
 }
 
 static void metal_copy_error_detail(char *detail, size_t detail_size, const char *error) {
@@ -16319,6 +16376,70 @@ static int metal_context_clip_attention_batch_f16_to_slice(uocr_metal_context *c
     }
 }
 
+/*
+ * Fused Q8_0 CLIP linear: out = act(src @ qweightᵀ + bias).
+ * Reads int8 qweights and fp16 scales in-kernel; no dequantized weight buffer.
+ */
+static int metal_run_clip_linear_q8_0(uocr_metal_context *ctx,
+                                      uocr_metal_buffer_slice input,
+                                      uocr_metal_vision_tensor_f16 weight,
+                                      uocr_metal_vision_tensor_f16 bias,
+                                      uint32_t n_rows,
+                                      uint32_t input_size,
+                                      uint32_t output_size,
+                                      uint32_t activation,
+                                      uocr_metal_buffer_slice out,
+                                      const char *op_name,
+                                      char *error,
+                                      size_t error_size) {
+    const uint64_t bias_bytes = (uint64_t)output_size * 2u;
+    if (ctx == NULL || n_rows == 0u ||
+        !metal_vision_require_weight_q8(weight, output_size, input_size, op_name, error, error_size) ||
+        !metal_vision_require_tensor_slice_f16(bias, bias_bytes, op_name, error, error_size)) {
+        return 0;
+    }
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, "uocr_clip_linear_tile4_q8_0_to_f16", error, error_size);
+        if (pipeline == nil) {
+            return 0;
+        }
+        const NSUInteger threads = 1024u;
+        if (pipeline.maxTotalThreadsPerThreadgroup < threads) {
+            return metal_fail(error, error_size, "%s pipeline does not support 1024-thread groups", op_name);
+        }
+        int owned_command_buffer = 0;
+        id<MTLCommandBuffer> cb = metal_command_buffer_for_op(ctx, &owned_command_buffer, op_name, error, error_size);
+        if (cb == nil) {
+            return 0;
+        }
+        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
+        if (enc == nil) {
+            return metal_fail(error, error_size, "failed to create %s encoder", op_name);
+        }
+        uocr_metal_clip_linear_q8_params params;
+        memset(&params, 0, sizeof(params));
+        params.n_rows = n_rows;
+        params.input_size = input_size;
+        params.output_size = output_size;
+        params.group_size = UOCR_Q8_GROUP_SIZE_DEFAULT;
+        params.groups_per_row = input_size / UOCR_Q8_GROUP_SIZE_DEFAULT;
+        params.activation = activation;
+        [enc setComputePipelineState:pipeline];
+        [enc setBuffer:input.buffer offset:input.offset atIndex:0u];
+        [enc setBuffer:weight.slice.buffer offset:weight.slice.offset atIndex:1u];
+        [enc setBuffer:weight.scale_slice.buffer offset:weight.scale_slice.offset atIndex:2u];
+        [enc setBuffer:bias.slice.buffer offset:bias.slice.offset atIndex:3u];
+        [enc setBuffer:out.buffer offset:out.offset atIndex:4u];
+        [enc setBytes:&params length:sizeof(params) atIndex:5u];
+        [enc setThreadgroupMemoryLength:threads * sizeof(float) atIndex:0u];
+        const NSUInteger tiles_per_row = ((NSUInteger)output_size + 3u) / 4u;
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_rows * tiles_per_row, 1u, 1u)
+            threadsPerThreadgroup:MTLSizeMake(threads, 1u, 1u)];
+        [enc endEncoding];
+        return metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, op_name, error, error_size);
+    }
+}
+
 static int metal_context_clip_mlp_batch_workspace_f16_to_slice(uocr_metal_context *ctx,
                                                                uocr_metal_vision_workspace_slice input_tokens,
                                                                const uocr_metal_clip_transformer_block_slices_f16 *block,
@@ -16335,6 +16456,8 @@ static int metal_context_clip_mlp_batch_workspace_f16_to_slice(uocr_metal_contex
     const uint64_t fc1_bias_bytes = (uint64_t)UOCR_CLIP_MLP_INTERMEDIATE * 2u;
     const uint64_t fc2_weight_bytes = (uint64_t)UOCR_CLIP_HIDDEN_SIZE * (uint64_t)UOCR_CLIP_MLP_INTERMEDIATE * 2u;
     const uint64_t fc2_bias_bytes = (uint64_t)UOCR_CLIP_HIDDEN_SIZE * 2u;
+    const int fc1_is_q8 = block != NULL && block->mlp_fc1_weight.qtype == UOCR_TENSOR_Q8_0;
+    const int fc2_is_q8 = block != NULL && block->mlp_fc2_weight.qtype == UOCR_TENSOR_Q8_0;
     if (ctx == NULL || block == NULL || rows == 0u || scratch == NULL ||
         !checked_mul_u64((uint64_t)rows, (uint64_t)UOCR_CLIP_HIDDEN_SIZE, &hidden_values) ||
         !metal_vision_f16_bytes(hidden_values, &hidden_bytes) ||
@@ -16343,9 +16466,11 @@ static int metal_context_clip_mlp_batch_workspace_f16_to_slice(uocr_metal_contex
         !metal_vision_require_workspace_slice(input_tokens, hidden_bytes, "CLIP batch MLP input", error, error_size) ||
         !metal_vision_require_workspace_slice(out_tokens, hidden_bytes, "CLIP batch MLP output", error, error_size) ||
         !metal_vision_require_workspace_slice(scratch->clip_mlp_activated, mid_bytes, "CLIP batch MLP activation", error, error_size) ||
-        !metal_vision_require_tensor_slice_f16(block->mlp_fc1_weight, fc1_weight_bytes, "CLIP MLP fc1 weight", error, error_size) ||
+        (!fc1_is_q8 &&
+         !metal_vision_require_tensor_slice_f16(block->mlp_fc1_weight, fc1_weight_bytes, "CLIP MLP fc1 weight", error, error_size)) ||
         !metal_vision_require_tensor_slice_f16(block->mlp_fc1_bias, fc1_bias_bytes, "CLIP MLP fc1 bias", error, error_size) ||
-        !metal_vision_require_tensor_slice_f16(block->mlp_fc2_weight, fc2_weight_bytes, "CLIP MLP fc2 weight", error, error_size) ||
+        (!fc2_is_q8 &&
+         !metal_vision_require_tensor_slice_f16(block->mlp_fc2_weight, fc2_weight_bytes, "CLIP MLP fc2 weight", error, error_size)) ||
         !metal_vision_require_tensor_slice_f16(block->mlp_fc2_bias, fc2_bias_bytes, "CLIP MLP fc2 bias", error, error_size)) {
         return 0;
     }
@@ -16353,42 +16478,85 @@ static int metal_context_clip_mlp_batch_workspace_f16_to_slice(uocr_metal_contex
     uocr_metal_buffer_slice input_slice = { input_tokens.buffer, input_tokens.offset };
     uocr_metal_buffer_slice fc1_dst_slice = { scratch->clip_mlp_activated.buffer, scratch->clip_mlp_activated.offset };
     uocr_metal_buffer_slice out_slice = { out_tokens.buffer, out_tokens.offset };
-    if (!metal_run_mps_matmul_nt_f16(ctx,
-                                     input_slice,
-                                     block->mlp_fc1_weight.slice,
-                                     fc1_dst_slice,
-                                     rows,
-                                     UOCR_CLIP_HIDDEN_SIZE,
-                                     UOCR_CLIP_MLP_INTERMEDIATE,
-                                     "Metal CLIP batch MLP fc1 MPS matmul",
-                                     error,
-                                     error_size) ||
-        !metal_run_bias_quickgelu_f16_inplace(ctx,
-                                              fc1_dst_slice,
-                                              block->mlp_fc1_bias.slice,
-                                              rows,
-                                              UOCR_CLIP_MLP_INTERMEDIATE,
-                                              "Metal CLIP batch MLP fused bias QuickGELU",
-                                              error,
-                                              error_size) ||
-        !metal_run_mps_matmul_nt_f16(ctx,
-                                     fc1_dst_slice,
-                                     block->mlp_fc2_weight.slice,
-                                     out_slice,
-                                     rows,
-                                     UOCR_CLIP_MLP_INTERMEDIATE,
-                                     UOCR_CLIP_HIDDEN_SIZE,
-                                     "Metal CLIP batch MLP fc2 MPS matmul",
-                                     error,
-                                     error_size) ||
-        !metal_run_bias_add_f16_inplace(ctx,
-                                        out_slice,
-                                        block->mlp_fc2_bias.slice,
+
+    int ok;
+    const uint64_t fc1_start_ns = uocr_profile_now_ns();
+    if (fc1_is_q8) {
+        ok = metal_run_clip_linear_q8_0(ctx,
+                                        input_slice,
+                                        block->mlp_fc1_weight,
+                                        block->mlp_fc1_bias,
                                         rows,
                                         UOCR_CLIP_HIDDEN_SIZE,
-                                        "Metal CLIP batch MLP fc2 bias",
+                                        UOCR_CLIP_MLP_INTERMEDIATE,
+                                        UOCR_METAL_CLIP_Q8_ACT_QUICKGELU,
+                                        fc1_dst_slice,
+                                        "Metal CLIP batch MLP fc1 Q8",
                                         error,
-                                        error_size)) {
+                                        error_size);
+        if (ok) {
+            metal_profile_add_event_now(ctx, "metal.vision.clip_mlp_q8.fc1", fc1_start_ns);
+        }
+    } else {
+        ok = metal_run_mps_matmul_nt_f16(ctx,
+                                         input_slice,
+                                         block->mlp_fc1_weight.slice,
+                                         fc1_dst_slice,
+                                         rows,
+                                         UOCR_CLIP_HIDDEN_SIZE,
+                                         UOCR_CLIP_MLP_INTERMEDIATE,
+                                         "Metal CLIP batch MLP fc1 MPS matmul",
+                                         error,
+                                         error_size) &&
+             metal_run_bias_quickgelu_f16_inplace(ctx,
+                                                  fc1_dst_slice,
+                                                  block->mlp_fc1_bias.slice,
+                                                  rows,
+                                                  UOCR_CLIP_MLP_INTERMEDIATE,
+                                                  "Metal CLIP batch MLP fused bias QuickGELU",
+                                                  error,
+                                                  error_size);
+    }
+    if (ok) {
+        const uint64_t fc2_start_ns = uocr_profile_now_ns();
+        if (fc2_is_q8) {
+            ok = metal_run_clip_linear_q8_0(ctx,
+                                            fc1_dst_slice,
+                                            block->mlp_fc2_weight,
+                                            block->mlp_fc2_bias,
+                                            rows,
+                                            UOCR_CLIP_MLP_INTERMEDIATE,
+                                            UOCR_CLIP_HIDDEN_SIZE,
+                                            UOCR_METAL_CLIP_Q8_ACT_NONE,
+                                            out_slice,
+                                            "Metal CLIP batch MLP fc2 Q8",
+                                            error,
+                                            error_size);
+            if (ok) {
+                metal_profile_add_event_now(ctx, "metal.vision.clip_mlp_q8.fc2", fc2_start_ns);
+            }
+        } else {
+            ok = metal_run_mps_matmul_nt_f16(ctx,
+                                             fc1_dst_slice,
+                                             block->mlp_fc2_weight.slice,
+                                             out_slice,
+                                             rows,
+                                             UOCR_CLIP_MLP_INTERMEDIATE,
+                                             UOCR_CLIP_HIDDEN_SIZE,
+                                             "Metal CLIP batch MLP fc2 MPS matmul",
+                                             error,
+                                             error_size) &&
+                 metal_run_bias_add_f16_inplace(ctx,
+                                                out_slice,
+                                                block->mlp_fc2_bias.slice,
+                                                rows,
+                                                UOCR_CLIP_HIDDEN_SIZE,
+                                                "Metal CLIP batch MLP fc2 bias",
+                                                error,
+                                                error_size);
+        }
+    }
+    if (!ok) {
         char detail[512];
         metal_copy_error_detail(detail, sizeof(detail), error);
         return metal_fail(error, error_size, "failed to compute Metal CLIP batch MLP: %s", detail);

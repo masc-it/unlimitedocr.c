@@ -272,10 +272,11 @@ def test_vision_registry_roles_are_stable_for_rank2_linears() -> None:
 
 def test_mixed_q8_default_cfg_only_quantizes_runtime_supported_modules() -> None:
     cfg = load_default_quant_config()
-    projector_module = cfg.module_by_name("visual_projector")
-    assert projector_module is not None
-    assert projector_module.supported is True
-    for name in ("clip_mlp", "clip_attention", "sam_mlp", "sam_attention"):
+    for name in ("visual_projector", "clip_mlp"):
+        module = cfg.module_by_name(name)
+        assert module is not None
+        assert module.supported is True
+    for name in ("clip_attention", "sam_mlp", "sam_attention"):
         module = cfg.module_by_name(name)
         assert module is not None
         assert module.supported is False
@@ -302,7 +303,8 @@ def test_mixed_q8_default_cfg_only_quantizes_runtime_supported_modules() -> None
     assert lm_head.qtype_id == UOCR_TENSOR_Q8_0
     assert projector.qtype_id == UOCR_TENSOR_Q8_0
     assert projector.block_size == UOCR_Q8_GROUP_SIZE_DEFAULT
-    assert clip_fc1.qtype == UOCR_TENSOR_F16_NAME
+    assert clip_fc1.qtype_id == UOCR_TENSOR_Q8_0
+    assert clip_fc1.row_size == 1024
     assert clip_qkv.qtype == UOCR_TENSOR_F16_NAME
     assert sam_fc1.qtype == UOCR_TENSOR_F16_NAME
     assert sam_qkv.qtype == UOCR_TENSOR_F16_NAME

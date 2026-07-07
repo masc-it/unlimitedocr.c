@@ -67,7 +67,7 @@ modules:
   - name: clip_mlp
     family: VISION_CLIP
     projections: [VISION_MLP_FC1, VISION_MLP_FC2]
-    supported: false
+    supported: true
 
   - name: clip_attention
     family: VISION_CLIP

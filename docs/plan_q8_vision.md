@@ -369,13 +369,13 @@ CPU or GPU and must not run MPS matmul on dequantized global-memory weights.
 Checklist:
 
 * [ ] Add focused fragments, not a monolithic file:
-  * `projector_q8.metal`
-  * `clip_q8.metal`
-  * `sam_q8.metal`
+  * [x] `projector_q8.metal`
+  * [x] `clip_q8.metal`
+  * [ ] `sam_q8.metal`
   * optional later: `sam_conv_q8.metal`
-* [ ] Add fragments to `tools/gen_metal.py` near the matching fp16 files.
-* [ ] Regenerate `src/backend/metal/kernels/uocr_smoke.metal`.
-* [ ] Verify both source-compiled and precompiled Metal builds.
+* [x] Add fragments to `tools/gen_metal.py` near the matching fp16 files.
+* [x] Regenerate `src/backend/metal/kernels/uocr_smoke.metal`.
+* [x] Verify both source-compiled and precompiled Metal builds.
 
 ### 4.2 Visual projector Q8
 
@@ -389,7 +389,7 @@ Checklist:
 * [x] Accumulate in fp32, add bias, write fp16.
 * [x] Dispatch Q8 projector when `projector_weight.qtype == UOCR_TENSOR_Q8_0`.
 * [x] Keep projector bias fp16.
-* [x] Enable `visual_projector.supported: true` for end-to-end QA.
+* [x] Enable `visual_projector.supported: true`; end-to-end QA passed.
 
 ### 4.3 CLIP MLP Q8
 
@@ -397,12 +397,13 @@ Current path: CLIP MLP uses MPS matmuls for fc1/fc2 around GELU.
 
 Checklist:
 
-* [ ] Add Q8 fc1 kernel: fp16 hidden → fp16 intermediate with bias and GELU.
-* [ ] Add Q8 fc2 kernel: fp16 intermediate → fp16 hidden update, preserving
+* [x] Add Q8 fc1 kernel: fp16 hidden → fp16 intermediate with bias and
+      QuickGELU (matching the fp16 path activation).
+* [x] Add Q8 fc2 kernel: fp16 intermediate → fp16 hidden update, preserving
       residual/add semantics at current call sites.
-* [ ] Dispatch when both fc1/fc2 weights for the block are Q8_0.
-* [ ] Preserve CLIP LayerNorm and biases fp16.
-* [ ] Flip `clip_mlp.supported: true` only after QA.
+* [x] Dispatch per-linear when the fc1/fc2 weight is Q8_0.
+* [x] Preserve CLIP LayerNorm and biases fp16.
+* [x] Enable `clip_mlp.supported: true` for end-to-end QA.
 
 ### 4.4 CLIP attention Q8
 
@@ -520,12 +521,12 @@ Checklist:
    * allow Q8 only for selected roles;
    * keep fp16 vision path passing.
 
-3. **Visual projector Q8**
+3. **Visual projector Q8** — complete (QA'd)
    * implement `projector_q8.metal`;
    * wire dtype-aware dispatch;
    * enable `visual_projector` and QA.
 
-4. **CLIP MLP Q8**
+4. **CLIP MLP Q8** — implemented, awaiting QA
    * implement fc1/fc2 Q8 kernels;
    * wire dispatch;
    * enable `clip_mlp` and QA.
@@ -564,8 +565,8 @@ Already-QA'd Q8 modules:
   LM head
 
 New vision-Q8 target modules, QA-gated in order:
-  visual projector                      enabled for user QA
-  CLIP MLP fc1/fc2                      pending
+  visual projector                      QA'd
+  CLIP MLP fc1/fc2                      enabled for user QA
   CLIP attention QKV/O                  pending
   SAM MLP lin1/lin2                     pending
   SAM attention QKV/O                   pending
