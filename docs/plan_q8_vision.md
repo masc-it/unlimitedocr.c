@@ -387,12 +387,16 @@ Checklist:
       `uocr_decoder_gemm_residual_q8_0_to_f16` for O/down,
       `uocr_decoder_swiglu_gate_up_gemm_q8_0_to_f16` fused gate/up), dispatched
       only when `n_tokens > 1`; decode keeps the GEMV kernels.
-* [ ] Known remaining prefill hotspot: routed-MoE prefill still uses the
-      per-(token, expert) GEMV kernels.  This matches the pre-existing fp16
-      custom MoE prefill path (Q8 reads half the bytes, so it is not a
-      regression), but a proper fix needs an expert-bucketed tiled GEMM
-      (mul_mm_id style: bucket token rows by expert, then run the tiled GEMM
-      per bucket) plus extra gate/up/down scratch.  Follow-up.
+* [x] Routed-MoE prefill now uses an expert-bucketed tiled GEMM
+      (mul_mm_id style) in `gemm_q8.metal`: a single-threadgroup bucketing
+      kernel sorts (token, expert) pairs by expert (histogram + prefix sums +
+      scatter into transient scratch), then bucketed gate/up SwiGLU and down
+      GEMMs run per bucket with gathered A rows, followed by a lightweight
+      weighted-combine kernel (shared experts + residual).  down_out lives in
+      transient scratch (pairs x hidden fp16).  Overdispatched tile slots
+      resolve their bucket via a tile-prefix binary search.  Measured at 1024
+      prompt tokens: ~528 ms -> ~29 ms per MoE layer (~18x).  Decode
+      (n_tokens == 1) keeps the GEMV kernels.
 * [x] Add fragments to `tools/gen_metal.py` near the matching fp16 files.
 * [x] Regenerate `src/backend/metal/kernels/uocr_smoke.metal`.
 * [x] Verify both source-compiled and precompiled Metal builds.
@@ -563,7 +567,7 @@ Checklist:
    * wire dispatch for global/window block usage;
    * enable `sam_mlp` and QA.
 
-7. **SAM attention Q8** — implemented, awaiting QA
+7. **SAM attention Q8** — complete (QA'd)
    * implement global/window QKV/O Q8 kernels;
    * wire dispatch;
    * enable `sam_attention` and QA.
@@ -591,7 +595,7 @@ New vision-Q8 target modules, QA-gated in order:
   CLIP MLP fc1/fc2                      QA'd
   CLIP attention QKV/O                  QA'd
   SAM MLP lin1/lin2                     QA'd (perf-fixed GEMM)
-  SAM attention QKV/O                   enabled for user QA
+  SAM attention QKV/O                   QA'd
 
 Still fp16 in first vision deliverable:
   SAM patch embedding and neck/net convs
