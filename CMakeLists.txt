@@ -338,6 +338,17 @@ if(UOCR_BUILD_TESTS)
     uocr_apply_sanitizers(test_vision)
     add_test(NAME uocr_vision COMMAND test_vision)
 
+    if(UOCR_METAL_ENABLED)
+        add_executable(test_metal tests/test_metal.c)
+        target_include_directories(test_metal PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/include"
+            "${CMAKE_CURRENT_SOURCE_DIR}/src")
+        target_link_libraries(test_metal PRIVATE unlimitedocr)
+        uocr_apply_common_warnings(test_metal)
+        uocr_apply_sanitizers(test_metal)
+        add_test(NAME uocr_metal COMMAND test_metal)
+    endif()
+
     if(UOCR_ENABLE_CPU_REF)
         add_executable(test_cpu_ref tests/test_cpu_ref.c)
         target_include_directories(test_cpu_ref PRIVATE
