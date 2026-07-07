@@ -4427,9 +4427,9 @@ static int metal_vision_weight_cache_build_direct(const uocr_metal_vision_bindin
         ASSIGN_CLIP_BLOCK_TENSOR(mlp_fc2_bias, base + 6u, "CLIP MLP fc2 bias", mlp_fc2_bias_f16);
         ASSIGN_CLIP_BLOCK_WEIGHT_ANY_QTYPE(mlp_fc2_weight, base + 7u, "CLIP MLP fc2 weight", mlp_fc2_weight_f16);
         ASSIGN_CLIP_BLOCK_TENSOR(out_proj_bias, base + 8u, "CLIP attention output bias", out_proj_bias_f16);
-        ASSIGN_CLIP_BLOCK_TENSOR(out_proj_weight, base + 9u, "CLIP attention output weight", out_proj_weight_f16);
+        ASSIGN_CLIP_BLOCK_WEIGHT_ANY_QTYPE(out_proj_weight, base + 9u, "CLIP attention output weight", out_proj_weight_f16);
         ASSIGN_CLIP_BLOCK_TENSOR(qkv_bias, base + 10u, "CLIP attention qkv bias", qkv_bias_f16);
-        ASSIGN_CLIP_BLOCK_TENSOR(qkv_weight, base + 11u, "CLIP attention qkv weight", qkv_weight_f16);
+        ASSIGN_CLIP_BLOCK_WEIGHT_ANY_QTYPE(qkv_weight, base + 11u, "CLIP attention qkv weight", qkv_weight_f16);
         if (!metal_clip_transformer_block_slices_ready(direct_block)) {
             return metal_fail(error, error_size, "incomplete CLIP transformer block %u direct vision bindings", layer);
         }
@@ -16250,26 +16250,33 @@ static int sam_window_partition_geometry(uint32_t grid_w,
     *out_n_windows = (uint32_t)n_windows;
     return 1;
 }
+static int metal_clip_weight_slice_ready(const uocr_metal_vision_tensor_f16 *weight) {
+    if (weight == NULL) {
+        return 0;
+    }
+    if (weight->qtype == UOCR_TENSOR_Q8_0) {
+        return weight->slice.buffer != nil && weight->scale_slice.buffer != nil;
+    }
+    return weight->host_f16 != NULL;
+}
+
 /*
- * fc1/fc2 weights may be f16 or Q8_0 (dtype-aware slices); all other CLIP
- * block tensors must be CPU-visible fp16.
+ * QKV/output-projection and MLP fc1/fc2 weights may be f16 or Q8_0
+ * (dtype-aware slices); all other CLIP block tensors must be CPU-visible fp16.
  */
 static int metal_clip_transformer_block_slices_ready(const uocr_metal_clip_transformer_block_slices_f16 *block) {
     if (block == NULL) {
         return 0;
     }
     const int fixed_f16_ready = block->ln1_weight.host_f16 != NULL && block->ln1_bias.host_f16 != NULL &&
-                                block->qkv_weight.host_f16 != NULL && block->qkv_bias.host_f16 != NULL &&
-                                block->out_proj_weight.host_f16 != NULL && block->out_proj_bias.host_f16 != NULL &&
+                                block->qkv_bias.host_f16 != NULL && block->out_proj_bias.host_f16 != NULL &&
                                 block->ln2_weight.host_f16 != NULL && block->ln2_bias.host_f16 != NULL &&
                                 block->mlp_fc1_bias.host_f16 != NULL && block->mlp_fc2_bias.host_f16 != NULL;
-    const int fc1_ready = block->mlp_fc1_weight.qtype == UOCR_TENSOR_Q8_0
-                              ? block->mlp_fc1_weight.slice.buffer != nil && block->mlp_fc1_weight.scale_slice.buffer != nil
-                              : block->mlp_fc1_weight.host_f16 != NULL;
-    const int fc2_ready = block->mlp_fc2_weight.qtype == UOCR_TENSOR_Q8_0
-                              ? block->mlp_fc2_weight.slice.buffer != nil && block->mlp_fc2_weight.scale_slice.buffer != nil
-                              : block->mlp_fc2_weight.host_f16 != NULL;
-    return fixed_f16_ready && fc1_ready && fc2_ready;
+    return fixed_f16_ready &&
+           metal_clip_weight_slice_ready(&block->qkv_weight) &&
+           metal_clip_weight_slice_ready(&block->out_proj_weight) &&
+           metal_clip_weight_slice_ready(&block->mlp_fc1_weight) &&
+           metal_clip_weight_slice_ready(&block->mlp_fc2_weight);
 }
 
 static void metal_copy_error_detail(char *detail, size_t detail_size, const char *error) {
@@ -16433,6 +16440,73 @@ static int metal_run_clip_linear_q8_0(uocr_metal_context *ctx,
         [enc setBytes:&params length:sizeof(params) atIndex:5u];
         [enc setThreadgroupMemoryLength:threads * sizeof(float) atIndex:0u];
         const NSUInteger tiles_per_row = ((NSUInteger)output_size + 3u) / 4u;
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_rows * tiles_per_row, 1u, 1u)
+            threadsPerThreadgroup:MTLSizeMake(threads, 1u, 1u)];
+        [enc endEncoding];
+        return metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, op_name, error, error_size);
+    }
+}
+
+/*
+ * Fused Q8_0 CLIP QKV projection: packed [3*hidden, hidden] Q8 weight, fp16
+ * bias, direct writes into split Q/K/V buffers.
+ */
+static int metal_run_clip_qkv_q8_0(uocr_metal_context *ctx,
+                                   uocr_metal_buffer_slice input,
+                                   uocr_metal_vision_tensor_f16 weight,
+                                   uocr_metal_vision_tensor_f16 bias,
+                                   uint32_t n_rows,
+                                   uint32_t hidden_size,
+                                   uocr_metal_buffer_slice q_dst,
+                                   uocr_metal_buffer_slice k_dst,
+                                   uocr_metal_buffer_slice v_dst,
+                                   const char *op_name,
+                                   char *error,
+                                   size_t error_size) {
+    const uint32_t qkv_size = hidden_size * 3u;
+    const uint64_t bias_bytes = (uint64_t)qkv_size * 2u;
+    if (ctx == NULL || n_rows == 0u || hidden_size == 0u ||
+        !metal_vision_require_weight_q8(weight, qkv_size, hidden_size, op_name, error, error_size) ||
+        !metal_vision_require_tensor_slice_f16(bias, bias_bytes, op_name, error, error_size)) {
+        return 0;
+    }
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, "uocr_clip_qkv_tile4_q8_0_to_f16", error, error_size);
+        if (pipeline == nil) {
+            return 0;
+        }
+        const NSUInteger threads = 1024u;
+        if (pipeline.maxTotalThreadsPerThreadgroup < threads) {
+            return metal_fail(error, error_size, "%s pipeline does not support 1024-thread groups", op_name);
+        }
+        int owned_command_buffer = 0;
+        id<MTLCommandBuffer> cb = metal_command_buffer_for_op(ctx, &owned_command_buffer, op_name, error, error_size);
+        if (cb == nil) {
+            return 0;
+        }
+        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
+        if (enc == nil) {
+            return metal_fail(error, error_size, "failed to create %s encoder", op_name);
+        }
+        uocr_metal_clip_linear_q8_params params;
+        memset(&params, 0, sizeof(params));
+        params.n_rows = n_rows;
+        params.input_size = hidden_size;
+        params.output_size = qkv_size;
+        params.group_size = UOCR_Q8_GROUP_SIZE_DEFAULT;
+        params.groups_per_row = hidden_size / UOCR_Q8_GROUP_SIZE_DEFAULT;
+        params.activation = UOCR_METAL_CLIP_Q8_ACT_NONE;
+        [enc setComputePipelineState:pipeline];
+        [enc setBuffer:input.buffer offset:input.offset atIndex:0u];
+        [enc setBuffer:weight.slice.buffer offset:weight.slice.offset atIndex:1u];
+        [enc setBuffer:weight.scale_slice.buffer offset:weight.scale_slice.offset atIndex:2u];
+        [enc setBuffer:bias.slice.buffer offset:bias.slice.offset atIndex:3u];
+        [enc setBuffer:q_dst.buffer offset:q_dst.offset atIndex:4u];
+        [enc setBuffer:k_dst.buffer offset:k_dst.offset atIndex:5u];
+        [enc setBuffer:v_dst.buffer offset:v_dst.offset atIndex:6u];
+        [enc setBytes:&params length:sizeof(params) atIndex:7u];
+        [enc setThreadgroupMemoryLength:threads * sizeof(float) atIndex:0u];
+        const NSUInteger tiles_per_row = ((NSUInteger)qkv_size + 3u) / 4u;
         [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_rows * tiles_per_row, 1u, 1u)
             threadsPerThreadgroup:MTLSizeMake(threads, 1u, 1u)];
         [enc endEncoding];
@@ -16610,11 +16684,15 @@ static int metal_context_clip_transformer_batch_block_workspace_f16_to_slice(uoc
     const uint64_t qkv_weight_bytes = (uint64_t)UOCR_CLIP_QKV_SIZE * (uint64_t)UOCR_CLIP_HIDDEN_SIZE * 2u;
     const uint64_t qkv_bias_bytes = (uint64_t)UOCR_CLIP_QKV_SIZE * 2u;
     const uint64_t projection_weight_bytes = (uint64_t)UOCR_CLIP_HIDDEN_SIZE * (uint64_t)UOCR_CLIP_HIDDEN_SIZE * 2u;
+    const int qkv_is_q8 = block->qkv_weight.qtype == UOCR_TENSOR_Q8_0;
+    const int out_proj_is_q8 = block->out_proj_weight.qtype == UOCR_TENSOR_Q8_0;
     if (!metal_vision_require_tensor_slice_f16(block->ln1_weight, hidden_parameter_bytes, "CLIP block ln1 weight", error, error_size) ||
         !metal_vision_require_tensor_slice_f16(block->ln1_bias, hidden_parameter_bytes, "CLIP block ln1 bias", error, error_size) ||
-        !metal_vision_require_tensor_slice_f16(block->qkv_weight, qkv_weight_bytes, "CLIP block QKV weight", error, error_size) ||
+        (!qkv_is_q8 &&
+         !metal_vision_require_tensor_slice_f16(block->qkv_weight, qkv_weight_bytes, "CLIP block QKV weight", error, error_size)) ||
         !metal_vision_require_tensor_slice_f16(block->qkv_bias, qkv_bias_bytes, "CLIP block QKV bias", error, error_size) ||
-        !metal_vision_require_tensor_slice_f16(block->out_proj_weight, projection_weight_bytes, "CLIP block output projection weight", error, error_size) ||
+        (!out_proj_is_q8 &&
+         !metal_vision_require_tensor_slice_f16(block->out_proj_weight, projection_weight_bytes, "CLIP block output projection weight", error, error_size)) ||
         !metal_vision_require_tensor_slice_f16(block->out_proj_bias, hidden_parameter_bytes, "CLIP block output projection bias", error, error_size) ||
         !metal_vision_require_tensor_slice_f16(block->ln2_weight, hidden_parameter_bytes, "CLIP block ln2 weight", error, error_size) ||
         !metal_vision_require_tensor_slice_f16(block->ln2_bias, hidden_parameter_bytes, "CLIP block ln2 bias", error, error_size)) {
@@ -16653,19 +16731,37 @@ static int metal_context_clip_transformer_batch_block_workspace_f16_to_slice(uoc
                                                                                          "Metal CLIP batch LayerNorm1",
                                                                                          error,
                                                                                          error_size));
-    RUN_CLIP_BATCH_BLOCK_STEP("QKV",
-                              metal_run_packed_qkv_mps_f16(ctx,
-                                                            (uocr_metal_buffer_slice){scratch->clip_block_norm1.buffer, scratch->clip_block_norm1.offset},
-                                                            block->qkv_weight.slice,
-                                                            block->qkv_bias.slice,
-                                                            (uocr_metal_buffer_slice){scratch->clip_block_q.buffer, scratch->clip_block_q.offset},
-                                                            (uocr_metal_buffer_slice){scratch->clip_block_k.buffer, scratch->clip_block_k.offset},
-                                                            (uocr_metal_buffer_slice){scratch->clip_block_v.buffer, scratch->clip_block_v.offset},
-                                                            rows,
-                                                            UOCR_CLIP_HIDDEN_SIZE,
-                                                            "Metal CLIP batch QKV MPS matmul",
-                                                            error,
-                                                            error_size));
+    if (qkv_is_q8) {
+        const uint64_t qkv_q8_start_ns = uocr_profile_now_ns();
+        RUN_CLIP_BATCH_BLOCK_STEP("QKV",
+                                  metal_run_clip_qkv_q8_0(ctx,
+                                                          (uocr_metal_buffer_slice){scratch->clip_block_norm1.buffer, scratch->clip_block_norm1.offset},
+                                                          block->qkv_weight,
+                                                          block->qkv_bias,
+                                                          rows,
+                                                          UOCR_CLIP_HIDDEN_SIZE,
+                                                          (uocr_metal_buffer_slice){scratch->clip_block_q.buffer, scratch->clip_block_q.offset},
+                                                          (uocr_metal_buffer_slice){scratch->clip_block_k.buffer, scratch->clip_block_k.offset},
+                                                          (uocr_metal_buffer_slice){scratch->clip_block_v.buffer, scratch->clip_block_v.offset},
+                                                          "Metal CLIP batch QKV Q8",
+                                                          error,
+                                                          error_size));
+        metal_profile_add_event_now(ctx, "metal.vision.clip_attention_q8.qkv", qkv_q8_start_ns);
+    } else {
+        RUN_CLIP_BATCH_BLOCK_STEP("QKV",
+                                  metal_run_packed_qkv_mps_f16(ctx,
+                                                                (uocr_metal_buffer_slice){scratch->clip_block_norm1.buffer, scratch->clip_block_norm1.offset},
+                                                                block->qkv_weight.slice,
+                                                                block->qkv_bias.slice,
+                                                                (uocr_metal_buffer_slice){scratch->clip_block_q.buffer, scratch->clip_block_q.offset},
+                                                                (uocr_metal_buffer_slice){scratch->clip_block_k.buffer, scratch->clip_block_k.offset},
+                                                                (uocr_metal_buffer_slice){scratch->clip_block_v.buffer, scratch->clip_block_v.offset},
+                                                                rows,
+                                                                UOCR_CLIP_HIDDEN_SIZE,
+                                                                "Metal CLIP batch QKV MPS matmul",
+                                                                error,
+                                                                error_size));
+    }
     RUN_CLIP_BATCH_BLOCK_STEP("attention",
                               metal_context_clip_attention_batch_f16_to_slice(ctx,
                                                                              scratch->clip_block_q,
@@ -16676,25 +16772,43 @@ static int metal_context_clip_transformer_batch_block_workspace_f16_to_slice(uoc
                                                                              scratch->clip_block_attention,
                                                                              error,
                                                                              error_size));
-    RUN_CLIP_BATCH_BLOCK_STEP("output projection",
-                              metal_run_mps_matmul_nt_f16(ctx,
-                                                          (uocr_metal_buffer_slice){scratch->clip_block_attention.buffer, scratch->clip_block_attention.offset},
-                                                          block->out_proj_weight.slice,
-                                                          (uocr_metal_buffer_slice){scratch->clip_block_projected.buffer, scratch->clip_block_projected.offset},
-                                                          rows,
-                                                          UOCR_CLIP_HIDDEN_SIZE,
-                                                          UOCR_CLIP_HIDDEN_SIZE,
-                                                          "Metal CLIP batch output projection MPS matmul",
-                                                          error,
-                                                          error_size) &&
-                              metal_run_bias_add_f16_inplace(ctx,
-                                                             (uocr_metal_buffer_slice){scratch->clip_block_projected.buffer, scratch->clip_block_projected.offset},
-                                                             block->out_proj_bias.slice,
+    if (out_proj_is_q8) {
+        const uint64_t out_proj_q8_start_ns = uocr_profile_now_ns();
+        RUN_CLIP_BATCH_BLOCK_STEP("output projection",
+                                  metal_run_clip_linear_q8_0(ctx,
+                                                             (uocr_metal_buffer_slice){scratch->clip_block_attention.buffer, scratch->clip_block_attention.offset},
+                                                             block->out_proj_weight,
+                                                             block->out_proj_bias,
                                                              rows,
                                                              UOCR_CLIP_HIDDEN_SIZE,
-                                                             "Metal CLIP batch output projection bias",
+                                                             UOCR_CLIP_HIDDEN_SIZE,
+                                                             UOCR_METAL_CLIP_Q8_ACT_NONE,
+                                                             (uocr_metal_buffer_slice){scratch->clip_block_projected.buffer, scratch->clip_block_projected.offset},
+                                                             "Metal CLIP batch output projection Q8",
                                                              error,
                                                              error_size));
+        metal_profile_add_event_now(ctx, "metal.vision.clip_attention_q8.out_proj", out_proj_q8_start_ns);
+    } else {
+        RUN_CLIP_BATCH_BLOCK_STEP("output projection",
+                                  metal_run_mps_matmul_nt_f16(ctx,
+                                                              (uocr_metal_buffer_slice){scratch->clip_block_attention.buffer, scratch->clip_block_attention.offset},
+                                                              block->out_proj_weight.slice,
+                                                              (uocr_metal_buffer_slice){scratch->clip_block_projected.buffer, scratch->clip_block_projected.offset},
+                                                              rows,
+                                                              UOCR_CLIP_HIDDEN_SIZE,
+                                                              UOCR_CLIP_HIDDEN_SIZE,
+                                                              "Metal CLIP batch output projection MPS matmul",
+                                                              error,
+                                                              error_size) &&
+                                  metal_run_bias_add_f16_inplace(ctx,
+                                                                 (uocr_metal_buffer_slice){scratch->clip_block_projected.buffer, scratch->clip_block_projected.offset},
+                                                                 block->out_proj_bias.slice,
+                                                                 rows,
+                                                                 UOCR_CLIP_HIDDEN_SIZE,
+                                                                 "Metal CLIP batch output projection bias",
+                                                                 error,
+                                                                 error_size));
+    }
     RUN_CLIP_BATCH_BLOCK_STEP("attention residual",
                               metal_run_residual_add_f16(ctx,
                                                          (uocr_metal_buffer_slice){input_tokens.buffer, input_tokens.offset},

@@ -72,7 +72,7 @@ modules:
   - name: clip_attention
     family: VISION_CLIP
     projections: [VISION_ATTN_QKV, VISION_ATTN_O]
-    supported: false
+    supported: true
 
   - name: sam_mlp
     family: VISION_SAM

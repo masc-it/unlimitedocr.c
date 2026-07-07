@@ -412,14 +412,14 @@ attention math itself remains custom/fp16/fp32 as currently implemented.
 
 Checklist:
 
-* [ ] Add fused Q8 QKV projection kernel for CLIP: hidden `[tokens,1024]`,
-      Q8 qkv weight `[3072,1024]`, fp16 qkv bias `[3072]`, output existing Q/K/V
-      scratch layout.
-* [ ] Add Q8 output projection kernel: attention context `[tokens,1024]`, Q8
+* [x] Add fused Q8 QKV projection kernel for CLIP: hidden `[tokens,1024]`,
+      Q8 qkv weight `[3072,1024]`, fp16 qkv bias `[3072]`, direct writes into
+      the existing split Q/K/V scratch buffers (no temp + split pass).
+* [x] Add Q8 output projection kernel: attention context `[tokens,1024]`, Q8
       weight `[1024,1024]`, fp16 bias `[1024]`, residual output fp16.
-* [ ] Preserve attention softmax/scaling/head layout unchanged.
-* [ ] Dispatch Q8 only when the block's QKV and output weights are Q8_0.
-* [ ] Flip `clip_attention.supported: true` only after QA.
+* [x] Preserve attention softmax/scaling/head layout unchanged.
+* [x] Dispatch Q8 per projection when the weight is Q8_0.
+* [x] Enable `clip_attention.supported: true` for end-to-end QA.
 
 ### 4.5 SAM MLP Q8
 
@@ -526,12 +526,12 @@ Checklist:
    * wire dtype-aware dispatch;
    * enable `visual_projector` and QA.
 
-4. **CLIP MLP Q8** — implemented, awaiting QA
+4. **CLIP MLP Q8** — complete (QA'd)
    * implement fc1/fc2 Q8 kernels;
    * wire dispatch;
    * enable `clip_mlp` and QA.
 
-5. **CLIP attention Q8**
+5. **CLIP attention Q8** — implemented, awaiting QA
    * implement QKV/O Q8 kernels;
    * wire dispatch;
    * enable `clip_attention` and QA.
@@ -566,8 +566,8 @@ Already-QA'd Q8 modules:
 
 New vision-Q8 target modules, QA-gated in order:
   visual projector                      QA'd
-  CLIP MLP fc1/fc2                      enabled for user QA
-  CLIP attention QKV/O                  pending
+  CLIP MLP fc1/fc2                      QA'd
+  CLIP attention QKV/O                  enabled for user QA
   SAM MLP lin1/lin2                     pending
   SAM attention QKV/O                   pending
 
