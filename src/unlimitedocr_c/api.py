@@ -37,6 +37,7 @@ ProfileName = Literal["base", "gundam"]
 ImageSource = str | os.PathLike[str] | bytes | bytearray | memoryview | IO[bytes] | Image.Image
 
 DEFAULT_MODEL_FILENAME = "unlimitedocr-fp16.uocr"
+DEFAULT_Q8_MODEL_FILENAME = "unlimitedocr-q8.uocr"
 DEFAULT_SOURCE_MODEL_REPO_ID = "baidu/Unlimited-OCR"
 DEFAULT_MAX_LENGTH = 32768
 DEFAULT_NO_REPEAT_NGRAM_SIZE = 35
@@ -85,8 +86,36 @@ def _hf_local_files_only() -> bool:
     return _env_flag("UOCR_HF_LOCAL_FILES_ONLY", default=False)
 
 
-def _download_and_convert_source_model(cache_dir: Path, filename: str) -> Path:
+def _quant_profile_for(quant: str | None) -> str:
+    """Map a high-level ``quant`` option to a converter qprofile id."""
+    if quant is None or quant == "":
+        return "fp16"
+    normalized = quant.strip().lower()
+    if normalized in {"q8", "q8_0", "mixed-q8_0"}:
+        return "mixed-q8_0"
+    if normalized in {"fp16", "f16", "none"}:
+        return "fp16"
+    raise ValueError(
+        f"unsupported quant={quant!r}; expected one of 'q8', 'fp16', or None"
+    )
+
+
+def _model_filename_for(quant: str | None) -> str:
+    """Return the cache filename for a quant option."""
+    if _quant_profile_for(quant) == "mixed-q8_0":
+        return os.environ.get("UOCR_Q8_MODEL_FILENAME", DEFAULT_Q8_MODEL_FILENAME)
+    return os.environ.get("UOCR_MODEL_FILENAME", DEFAULT_MODEL_FILENAME)
+
+
+def _download_and_convert_source_model(
+    cache_dir: Path,
+    filename: str,
+    *,
+    qprofile: str = "fp16",
+    quant_cfg_path: str | Path | None = None,
+) -> Path:
     from huggingface_hub import snapshot_download
+    from .quant_cfg import load_default_quant_config, load_quant_config
 
     out_path = cache_dir / filename
     if out_path.exists():
@@ -117,7 +146,8 @@ def _download_and_convert_source_model(cache_dir: Path, filename: str) -> Path:
     stats_path = out_path.with_suffix(out_path.suffix + ".conversion-stats.json")
     if tmp_path.exists():
         tmp_path.unlink()
-    plan = build_dry_run_plan(snapshot, qprofile="fp16")
+    quant_cfg = load_quant_config(quant_cfg_path) if quant_cfg_path is not None else load_default_quant_config()
+    plan = build_dry_run_plan(snapshot, qprofile=qprofile, quant_cfg=quant_cfg)
     write_uocr_model(plan, tmp_path, overwrite=True, stats_path=stats_path)
     tmp_path.replace(out_path)
     return out_path.resolve()
@@ -128,14 +158,20 @@ def resolve_model_path(
     *,
     cache_dir: str | Path | None = None,
     download: bool = True,
+    quant: str | None = None,
+    quant_cfg_path: str | Path | None = None,
 ) -> Path:
     """Resolve a `.uocr` model path using env, local cache, and HF conversion.
 
     Resolution order:
     1. explicit ``model_path``
     2. ``UOCR_MODEL_PATH``
-    3. cache directory
+    3. cache directory (filename depends on ``quant``)
     4. Hugging Face download of the upstream checkpoint followed by conversion
+
+    ``quant`` selects the conversion profile when downloading/converting:
+    ``None``/``"fp16"`` keeps the fp16 baseline; ``"q8"`` produces a
+    runtime-safe mixed-Q8_0 model gated by ``configs/quant-cfg.yaml``.
     """
 
     if model_path is not None:
@@ -145,7 +181,10 @@ def resolve_model_path(
     if env_model_path:
         return _require_existing_model(env_model_path, source="UOCR_MODEL_PATH")
 
-    filename = os.environ.get("UOCR_MODEL_FILENAME", DEFAULT_MODEL_FILENAME)
+    qprofile = _quant_profile_for(quant)
+    filename = _model_filename_for(quant) if qprofile == "mixed-q8_0" else os.environ.get(
+        "UOCR_MODEL_FILENAME", DEFAULT_MODEL_FILENAME
+    )
     resolved_cache_dir = Path(cache_dir).expanduser() if cache_dir is not None else default_cache_dir()
 
     seen: set[Path] = set()
@@ -167,7 +206,12 @@ def resolve_model_path(
 
     resolved_cache_dir.mkdir(parents=True, exist_ok=True)
     try:
-        return _download_and_convert_source_model(resolved_cache_dir, filename)
+        return _download_and_convert_source_model(
+            resolved_cache_dir,
+            filename,
+            qprofile=qprofile,
+            quant_cfg_path=quant_cfg_path,
+        )
     except Exception as exc:  # pragma: no cover - network/large-conversion path
         raise ModelResolutionError(
             "could not prepare the UnlimitedOCR model automatically. "
@@ -278,8 +322,16 @@ class UnlimitedOCR:
         library_path: str | Path | None = None,
         resource_path: str | Path | None = None,
         request_timeout: float = 30.0,
+        quant: str | None = None,
+        quant_cfg_path: str | Path | None = None,
     ) -> None:
-        self._model_path = resolve_model_path(model_path, cache_dir=cache_dir, download=download)
+        self._model_path = resolve_model_path(
+            model_path,
+            cache_dir=cache_dir,
+            download=download,
+            quant=quant,
+            quant_cfg_path=quant_cfg_path,
+        )
         self._backend = backend.lower()
         self._memory_budget_bytes = int(memory_budget_bytes)
         self._library_path = str(library_path) if library_path is not None else None
@@ -394,6 +446,7 @@ class UnlimitedOCR:
 
 __all__ = [
     "DEFAULT_MODEL_FILENAME",
+    "DEFAULT_Q8_MODEL_FILENAME",
     "DEFAULT_SOURCE_MODEL_REPO_ID",
     "ImageSource",
     "ModelResolutionError",

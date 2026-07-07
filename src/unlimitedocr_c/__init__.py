@@ -2,6 +2,7 @@
 
 from .api import (
     DEFAULT_MODEL_FILENAME,
+    DEFAULT_Q8_MODEL_FILENAME,
     DEFAULT_SOURCE_MODEL_REPO_ID,
     ImageSource,
     ModelResolutionError,
@@ -142,6 +143,7 @@ from .parity_thresholds import (
 
 __all__ = [
     "DEFAULT_MODEL_FILENAME",
+    "DEFAULT_Q8_MODEL_FILENAME",
     "DEFAULT_SOURCE_MODEL_REPO_ID",
     "ImageSource",
     "ModelResolutionError",

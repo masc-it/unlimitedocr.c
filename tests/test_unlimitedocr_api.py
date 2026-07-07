@@ -66,7 +66,7 @@ def test_resolve_model_path_prefers_cache_without_download(monkeypatch: pytest.M
     def fail_download(*args, **kwargs):  # type: ignore[no-untyped-def]
         raise AssertionError("download should not be attempted")
 
-    monkeypatch.setattr(api, "_download_converted_model", fail_download)
+    monkeypatch.setattr(api, "_download_and_convert_source_model", fail_download)
     assert api.resolve_model_path(cache_dir=tmp_path, download=True) == cached.resolve()
 
 
@@ -76,13 +76,27 @@ def test_resolve_model_path_uses_download_when_cache_misses(monkeypatch: pytest.
     downloaded.parent.mkdir()
     downloaded.write_bytes(b"uocr")
 
-    def fake_download(cache_dir: Path, filename: str) -> Path:
+    def fake_download(cache_dir: Path, filename: str, **kwargs):  # type: ignore[no-untyped-def]
         assert cache_dir == tmp_path
         assert filename == "downloaded-test-model.uocr"
         return downloaded
 
-    monkeypatch.setattr(api, "_download_converted_model", fake_download)
+    monkeypatch.setattr(api, "_download_and_convert_source_model", fake_download)
     assert api.resolve_model_path(cache_dir=tmp_path, download=True) == downloaded
+
+
+def test_resolve_model_path_q8_uses_separate_cache_filename(tmp_path: Path) -> None:
+    q8_cached = tmp_path / api.DEFAULT_Q8_MODEL_FILENAME
+    q8_cached.write_bytes(b"uocr")
+    resolved = api.resolve_model_path(cache_dir=tmp_path, download=False, quant="q8")
+    assert resolved == q8_cached.resolve()
+
+
+def test_resolve_model_path_q8_does_not_match_fp16_cache(tmp_path: Path) -> None:
+    fp16_cached = tmp_path / api.DEFAULT_MODEL_FILENAME
+    fp16_cached.write_bytes(b"uocr")
+    with pytest.raises(api.ModelResolutionError, match="could not find"):
+        api.resolve_model_path(cache_dir=tmp_path, download=False, quant="q8")
 
 
 def test_unlimitedocr_generate_returns_decoded_string_and_uses_profile(tmp_path: Path) -> None:
