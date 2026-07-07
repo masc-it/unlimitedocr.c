@@ -557,7 +557,7 @@ Checklist:
    * wire dispatch;
    * enable `clip_attention` and QA.
 
-6. **SAM MLP Q8** — implemented, awaiting QA
+6. **SAM MLP Q8** — complete (QA'd, including tiled-GEMM perf fix)
    * implement lin1/lin2 Q8 kernels;
    * wire dispatch for global/window block usage;
    * enable `sam_mlp` and QA.
@@ -589,7 +589,7 @@ New vision-Q8 target modules, QA-gated in order:
   visual projector                      QA'd
   CLIP MLP fc1/fc2                      QA'd
   CLIP attention QKV/O                  QA'd
-  SAM MLP lin1/lin2                     enabled for user QA (perf-fixed GEMM)
+  SAM MLP lin1/lin2                     QA'd (perf-fixed GEMM)
   SAM attention QKV/O                   pending
 
 Still fp16 in first vision deliverable:
