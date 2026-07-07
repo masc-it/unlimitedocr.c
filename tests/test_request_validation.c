@@ -140,8 +140,6 @@ static int test_text_request_validation_contract(void) {
     owned_request owned;
     CHECK(make_text_request(3u, &owned));
     owned.request.max_new_tokens = 4u;
-    owned.request.no_repeat_ngram_size = 35u;
-    owned.request.no_repeat_window = 128u;
 
     CHECK(expect_validation_ok(&owned.request) == 0);
     CHECK(uocr_count_image_placeholders(&owned.request) == 0u);
@@ -314,7 +312,7 @@ static int test_crop_mode_visual_contracts(void) {
     return 0;
 }
 
-static int test_budget_and_no_repeat_validation(void) {
+static int test_budget_validation(void) {
     owned_request owned;
     CHECK(make_text_request(4u, &owned));
     owned.request.max_new_tokens = 4u;
@@ -331,19 +329,6 @@ static int test_budget_and_no_repeat_validation(void) {
     limits.max_position_tokens = 7u;
     CHECK(expect_validation_error(&owned.request, &limits, "position budget") == 0);
 
-    limits = default_limits();
-    owned.request.max_new_tokens = 0u;
-    owned.request.no_repeat_ngram_size = 0u;
-    owned.request.no_repeat_window = 128u;
-    CHECK(expect_validation_error(&owned.request, &limits, "no_repeat_window") == 0);
-
-    owned.request.no_repeat_ngram_size = UOCR_MAX_POSITIONS + 1u;
-    owned.request.no_repeat_window = 0u;
-    CHECK(expect_validation_error(&owned.request, &limits, "no_repeat_ngram_size") == 0);
-
-    owned.request.no_repeat_ngram_size = 1u;
-    owned.request.no_repeat_window = UOCR_MAX_POSITIONS + 1u;
-    CHECK(expect_validation_error(&owned.request, &limits, "no_repeat_window") == 0);
 
     free_owned_request(&owned);
     return 0;
@@ -356,6 +341,6 @@ int main(void) {
     if (test_rejects_discontiguous_image_span() != 0) return 1;
     if (test_global_and_multipage_visual_contracts() != 0) return 1;
     if (test_crop_mode_visual_contracts() != 0) return 1;
-    if (test_budget_and_no_repeat_validation() != 0) return 1;
+    if (test_budget_validation() != 0) return 1;
     return 0;
 }

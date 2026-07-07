@@ -9,24 +9,6 @@ struct UocrArgmaxParams {
     uint reserved1;
 };
 
-struct UocrNoRepeatNgramParams {
-    uint rows;
-    uint vocab_size;
-    uint max_candidates;
-    uint reserved0;
-};
-
-struct UocrNoRepeatCollectParams {
-    uint sequence_len;
-    uint ngram_size;
-    uint window;
-    uint candidate_count;
-    uint vocab_size;
-    uint reserved0;
-    uint reserved1;
-    uint reserved2;
-};
-
 struct UocrLmHeadArgmaxParams {
     uint vocab_size;
     uint hidden_size;
@@ -44,54 +26,6 @@ struct UocrArgmaxPairsParams {
     uint reserved1;
     uint reserved2;
 };
-
-kernel void uocr_no_repeat_ngram_f32(device float *logits [[buffer(0)]],
-                                     device const int *sequences [[buffer(1)]],
-                                     device const uint *row_offsets [[buffer(2)]],
-                                     device const uint *sequence_lengths [[buffer(3)]],
-                                     device const uint *ngram_sizes [[buffer(4)]],
-                                     device const uint *windows [[buffer(5)]],
-                                     constant UocrNoRepeatNgramParams &params [[buffer(6)]],
-                                     uint2 gid [[thread_position_in_grid]]) {
-    const uint candidate_offset = gid.x;
-    const uint row = gid.y;
-    if (row >= params.rows || candidate_offset >= params.max_candidates) {
-        return;
-    }
-
-    const uint ngram_size = ngram_sizes[row];
-    const uint sequence_len = sequence_lengths[row];
-    if (ngram_size == 0u || sequence_len < ngram_size) {
-        return;
-    }
-
-    const uint window = windows[row];
-    const uint effective_window = (window == 0u || window > sequence_len) ? sequence_len : window;
-    const uint search_start = sequence_len - effective_window;
-    const uint search_end = sequence_len - ngram_size + 1u;
-    if (search_end <= search_start) {
-        return;
-    }
-
-    const uint candidate_count = search_end - search_start;
-    if (candidate_offset >= candidate_count) {
-        return;
-    }
-
-    const uint idx = search_start + candidate_offset;
-    const uint current_prefix_start = ngram_size > 1u ? sequence_len - (ngram_size - 1u) : sequence_len;
-    const uint row_offset = row_offsets[row];
-    for (uint j = 0u; j + 1u < ngram_size; ++j) {
-        if (sequences[row_offset + idx + j] != sequences[row_offset + current_prefix_start + j]) {
-            return;
-        }
-    }
-
-    const int token_id = sequences[row_offset + idx + ngram_size - 1u];
-    if (token_id >= 0 && uint(token_id) < params.vocab_size) {
-        logits[ulong(row) * ulong(params.vocab_size) + ulong(uint(token_id))] = -INFINITY;
-    }
-}
 
 static inline bool uocr_argmax_better(float score, uint id, float best_score, uint best_id) {
     if (isnan(score)) {
@@ -159,45 +93,6 @@ static inline void uocr_threadgroup_argmax_pair(thread float &best_score,
 
     best_score = scores[0];
     best_id = ids[0];
-}
-
-kernel void uocr_no_repeat_collect_banned_i32(device const int *sequence [[buffer(0)]],
-                                             device uchar *ban_flags [[buffer(1)]],
-                                             constant UocrNoRepeatCollectParams &params [[buffer(2)]],
-                                             uint candidate_offset [[thread_position_in_grid]]) {
-    if (candidate_offset >= params.candidate_count || params.ngram_size == 0u ||
-        params.sequence_len < params.ngram_size) {
-        return;
-    }
-
-    const uint effective_window = (params.window == 0u || params.window > params.sequence_len) ?
-                                      params.sequence_len :
-                                      params.window;
-    const uint search_start = params.sequence_len - effective_window;
-    const uint search_end = params.sequence_len - params.ngram_size + 1u;
-    if (search_end <= search_start) {
-        return;
-    }
-
-    const uint candidate_count = search_end - search_start;
-    if (candidate_offset >= candidate_count) {
-        return;
-    }
-
-    const uint idx = search_start + candidate_offset;
-    const uint current_prefix_start = params.ngram_size > 1u ?
-                                          params.sequence_len - (params.ngram_size - 1u) :
-                                          params.sequence_len;
-    for (uint j = 0u; j + 1u < params.ngram_size; ++j) {
-        if (sequence[idx + j] != sequence[current_prefix_start + j]) {
-            return;
-        }
-    }
-
-    const int token_id = sequence[idx + params.ngram_size - 1u];
-    if (token_id >= 0 && uint(token_id) < params.vocab_size) {
-        ban_flags[uint(token_id)] = uchar(1u);
-    }
 }
 
 [[max_total_threads_per_threadgroup(256)]] kernel void uocr_lm_head_argmax_f16(device const half *hidden [[buffer(0)]],

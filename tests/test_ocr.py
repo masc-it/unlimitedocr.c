@@ -79,8 +79,6 @@ def test_ocr_image_uses_upstream_defaults_and_caps_generation() -> None:
     assert request.expected_visual_tokens == GLOBAL_VISUAL_TOKENS
     assert request.max_length == 32768
     assert request.max_new_tokens == 7
-    assert request.no_repeat_ngram_size == 35
-    assert request.no_repeat_window == 128
 
 
 def test_ocr_image_rejects_negative_generation_cap() -> None:
@@ -102,8 +100,6 @@ def test_ocr_pages_uses_upstream_defaults_and_caps_generation() -> None:
     assert request.expected_visual_tokens == 2 * GLOBAL_VISUAL_TOKENS
     assert request.max_length == 32768
     assert request.max_new_tokens == 9
-    assert request.no_repeat_ngram_size == 35
-    assert request.no_repeat_window == 1024
     assert request.crop_grid_w == 1
     assert request.crop_grid_h == 1
     assert [view.kind for view in request.views] == ["global", "global"]
@@ -197,8 +193,6 @@ def test_ocr_pdf_renders_then_uses_multi_page_defaults(monkeypatch: pytest.Monke
     assert request.mode == "multi-page-base"
     assert request.expected_visual_tokens == 2 * GLOBAL_VISUAL_TOKENS
     assert request.max_new_tokens == 11
-    assert request.no_repeat_ngram_size == 35
-    assert request.no_repeat_window == 1024
 
 
 @pytest.mark.skipif(not native_library_available(), reason="libunlimitedocr is not built")

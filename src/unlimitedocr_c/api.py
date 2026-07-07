@@ -40,10 +40,6 @@ DEFAULT_MODEL_FILENAME = "unlimitedocr-fp16.uocr"
 DEFAULT_Q8_MODEL_FILENAME = "unlimitedocr-q8.uocr"
 DEFAULT_SOURCE_MODEL_REPO_ID = "baidu/Unlimited-OCR"
 DEFAULT_MAX_LENGTH = 32768
-DEFAULT_NO_REPEAT_NGRAM_SIZE = 35
-DEFAULT_NO_REPEAT_WINDOW = 128
-
-
 class ModelResolutionError(FileNotFoundError):
     """Raised when a usable `.uocr` model cannot be found or downloaded."""
 
@@ -447,8 +443,6 @@ class UnlimitedOCR:
             tokenizer_path=self._tokenizer_path,
             max_length=DEFAULT_MAX_LENGTH,
             max_new_tokens=None,
-            no_repeat_ngram_size=DEFAULT_NO_REPEAT_NGRAM_SIZE,
-            no_repeat_window=DEFAULT_NO_REPEAT_WINDOW,
         )
         engine = self._ensure_engine(
             prompt_capacity=max(1, request.n_tokens),

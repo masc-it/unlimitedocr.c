@@ -81,8 +81,6 @@ def _tiny_text_request(input_ids: np.ndarray) -> PreparedRequest:
         rendered_prompt="fixture",
         max_new_tokens=0,
         max_length=0,
-        no_repeat_ngram_size=0,
-        no_repeat_window=0,
         tokenizer_path="synthetic-tokenizer.json",
         model_vocab_size=6,
     )
@@ -100,8 +98,6 @@ def _tiny_image_request(input_ids: np.ndarray, image_mask: np.ndarray) -> Prepar
         rendered_prompt="<image>fixture",
         max_new_tokens=0,
         max_length=0,
-        no_repeat_ngram_size=0,
-        no_repeat_window=0,
         tokenizer_path="synthetic-tokenizer.json",
         model_vocab_size=6,
     )

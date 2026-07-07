@@ -526,8 +526,6 @@ static int generate_metal_text_fp16(uocr_engine *engine,
     metal_request.slot = 0u;
     metal_request.image_span_start = UINT32_MAX;
     metal_request.image_span_length = 0u;
-    metal_request.no_repeat_ngram_size = request->no_repeat_ngram_size;
-    metal_request.no_repeat_window = request->no_repeat_window;
 
     uocr_metal_decoder_result_f16 metal_result;
     memset(&metal_result, 0, sizeof(metal_result));

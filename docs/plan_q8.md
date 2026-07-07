@@ -332,9 +332,9 @@ Current fast path is `uocr_lm_head_argmax_f16`; the env-selectable MPS path writ
 
 Checklist:
 
-* [ ] Add fused Q8 LM-head argmax kernel for qweight/qscale `[vocab, hidden]`; dequantization, dot product, no-repeat-ngram banning, and per-tile argmax stay in the kernel path without materializing full logits. The kernel writes only the existing partial score/id outputs.
+* [ ] Add fused Q8 LM-head argmax kernel for qweight/qscale `[vocab, hidden]`; dequantization, dot product, and per-tile argmax stay in the kernel path without materializing full logits. The kernel writes only the existing partial score/id outputs.
 * [ ] Force the custom Q8 LM-head argmax path when LM-head qtype is Q8_0; ignore `UOCR_METAL_LM_HEAD_SELECTION_BACKEND=mps` for Q8_0 and emit a profile/debug note.
-* [ ] Preserve no-repeat-ngram banning and partial argmax output flow.
+* [ ] Preserve the partial argmax output flow.
 
 ---
 

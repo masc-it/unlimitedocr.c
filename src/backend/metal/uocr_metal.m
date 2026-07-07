@@ -376,10 +376,6 @@ struct uocr_metal_context {
     uint64_t prompt_token_ids_capacity;
     uint32_t prompt_token_ids_batch_slots;
     uint32_t prompt_token_ids_prompt_capacity;
-    id<MTLBuffer> no_repeat_sequence_buffer;
-    uint64_t no_repeat_sequence_capacity;
-    uint32_t no_repeat_sequence_batch_slots;
-    uint32_t no_repeat_sequence_token_capacity;
     uocr_metal_decoder_binding_cache decoder_bindings;
     uocr_metal_decoder_layer_fast_bindings decoder_fast_bindings[UOCR_DECODER_LAYERS];
     int decoder_fast_bindings_valid;
@@ -407,11 +403,6 @@ struct uocr_metal_context {
 static int metal_fail(char *error, size_t error_size, const char *fmt, ...);
 static int metal_buffer_range_valid(id<MTLBuffer> buffer, NSUInteger offset, uint64_t bytes);
 static int metal_slice_valid(uocr_metal_buffer_slice slice, uint64_t bytes);
-static int metal_no_repeat_sequence_slice(const uocr_metal_context *ctx,
-                                          uint32_t slot,
-                                          uint32_t token_count,
-                                          uocr_metal_buffer_slice *out_slice,
-                                          uint64_t *out_bytes);
 static int metal_context_ensure_scratch_accounted(uocr_metal_context *ctx,
                                                   uocr_metal_scratch_slot slot,
                                                   uint64_t min_length,
@@ -1303,24 +1294,6 @@ typedef struct uocr_metal_argmax_params {
     uint32_t reserved1;
 } uocr_metal_argmax_params;
 
-typedef struct uocr_metal_no_repeat_ngram_params {
-    uint32_t rows;
-    uint32_t vocab_size;
-    uint32_t max_candidates;
-    uint32_t reserved0;
-} uocr_metal_no_repeat_ngram_params;
-
-typedef struct uocr_metal_no_repeat_collect_params {
-    uint32_t sequence_len;
-    uint32_t ngram_size;
-    uint32_t window;
-    uint32_t candidate_count;
-    uint32_t vocab_size;
-    uint32_t reserved0;
-    uint32_t reserved1;
-    uint32_t reserved2;
-} uocr_metal_no_repeat_collect_params;
-
 typedef struct uocr_metal_lm_head_argmax_params {
     uint32_t vocab_size;
     uint32_t hidden_size;
@@ -1339,19 +1312,6 @@ typedef struct uocr_metal_argmax_pairs_params {
     uint32_t reserved2;
 } uocr_metal_argmax_pairs_params;
 
-typedef struct uocr_metal_no_repeat_ngram_pack {
-    int32_t *sequences;
-    uint32_t *row_offsets;
-    uint32_t *sequence_lengths;
-    uint32_t *ngram_sizes;
-    uint32_t *windows;
-    uint32_t total_sequence_tokens;
-    uint32_t max_candidates;
-    int has_work;
-} uocr_metal_no_repeat_ngram_pack;
-
-_Static_assert(sizeof(uocr_metal_no_repeat_collect_params) == 32u,
-               "uocr_metal_no_repeat_collect_params ABI mismatch");
 _Static_assert(sizeof(uocr_metal_lm_head_argmax_params) == 32u,
                "uocr_metal_lm_head_argmax_params ABI mismatch");
 _Static_assert(sizeof(uocr_metal_argmax_pairs_params) == 16u,
@@ -7745,7 +7705,7 @@ void uocr_metal_context_release_runtime_arenas(uocr_metal_context *ctx) {
         return;
     }
     @autoreleasepool {
-        int changed = ctx->prompt_token_ids_buffer != nil || ctx->no_repeat_sequence_buffer != nil || ctx->has_kv_cache_layout != 0;
+        int changed = ctx->prompt_token_ids_buffer != nil || ctx->has_kv_cache_layout != 0;
         metal_clear_mps_workspace_ndarray_cache(ctx);
         for (uint32_t i = 0u; i < (uint32_t)UOCR_METAL_ARENA_COUNT; ++i) {
             uocr_metal_runtime_arena *arena = &ctx->runtime_arenas[i];
@@ -7762,11 +7722,6 @@ void uocr_metal_context_release_runtime_arenas(uocr_metal_context *ctx) {
         ctx->prompt_token_ids_capacity = 0u;
         ctx->prompt_token_ids_batch_slots = 0u;
         ctx->prompt_token_ids_prompt_capacity = 0u;
-        [ctx->no_repeat_sequence_buffer release];
-        ctx->no_repeat_sequence_buffer = nil;
-        ctx->no_repeat_sequence_capacity = 0u;
-        ctx->no_repeat_sequence_batch_slots = 0u;
-        ctx->no_repeat_sequence_token_capacity = 0u;
         memset(&ctx->kv_cache_layout, 0, sizeof(ctx->kv_cache_layout));
         ctx->has_kv_cache_layout = 0;
         ctx->has_integrated_prefill = 0;
@@ -7869,29 +7824,6 @@ int uocr_metal_context_allocate_runtime_arenas(uocr_metal_context *ctx,
         ctx->prompt_token_ids_capacity = prompt_token_id_bytes;
         ctx->prompt_token_ids_batch_slots = batch_slots;
         ctx->prompt_token_ids_prompt_capacity = prompt_token_capacity;
-
-        uint64_t no_repeat_sequence_bytes = 0u;
-        if (!checked_mul_u64((uint64_t)batch_slots, (uint64_t)UOCR_MAX_POSITIONS, &no_repeat_sequence_bytes) ||
-            !checked_mul_u64(no_repeat_sequence_bytes, (uint64_t)sizeof(int32_t), &no_repeat_sequence_bytes) ||
-            no_repeat_sequence_bytes > max_buffer_length || no_repeat_sequence_bytes > (uint64_t)SIZE_MAX) {
-            uocr_metal_context_release_runtime_arenas(ctx);
-            return metal_fail(error, error_size, "Metal no-repeat sequence arena byte-size overflow");
-        }
-        id<MTLBuffer> no_repeat_sequence = metal_new_buffer_with_length(ctx,
-                                                                        (NSUInteger)no_repeat_sequence_bytes,
-                                                                        MTLResourceStorageModePrivate);
-        if (no_repeat_sequence == nil) {
-            uocr_metal_context_release_runtime_arenas(ctx);
-            return metal_fail(error,
-                              error_size,
-                              "failed to allocate reusable Metal no-repeat sequence buffer with %llu bytes",
-                              (unsigned long long)no_repeat_sequence_bytes);
-        }
-        no_repeat_sequence.label = @"uocr_reusable_no_repeat_sequence";
-        ctx->no_repeat_sequence_buffer = no_repeat_sequence;
-        ctx->no_repeat_sequence_capacity = no_repeat_sequence_bytes;
-        ctx->no_repeat_sequence_batch_slots = batch_slots;
-        ctx->no_repeat_sequence_token_capacity = UOCR_MAX_POSITIONS;
 
         ctx->kv_cache_layout = kv_layout;
         ctx->has_kv_cache_layout = 1;
@@ -10581,73 +10513,6 @@ static int metal_run_token_embedding_from_token_slot_f16(uocr_metal_context *ctx
     }
 }
 
-static uint32_t metal_no_repeat_candidate_count(uint32_t sequence_len, uint32_t ngram_size, uint32_t window);
-
-static int metal_run_no_repeat_collect_ban_flags_to_slice(uocr_metal_context *ctx,
-                                                          uocr_metal_buffer_slice sequence,
-                                                          uocr_metal_buffer_slice ban_flags,
-                                                          uint32_t sequence_len,
-                                                          uint32_t ngram_size,
-                                                          uint32_t window,
-                                                          uint32_t candidate_count,
-                                                          char *error,
-                                                          size_t error_size) {
-    if (candidate_count == 0u) {
-        return 1;
-    }
-    uint64_t sequence_bytes = 0u;
-    if (ctx == NULL || sequence_len == 0u || ngram_size == 0u ||
-        !checked_mul_u64((uint64_t)sequence_len, (uint64_t)sizeof(int32_t), &sequence_bytes) ||
-        !metal_slice_valid(sequence, sequence_bytes) || !metal_slice_valid(ban_flags, (uint64_t)UOCR_VOCAB_SIZE)) {
-        return metal_fail(error, error_size, "invalid integrated no-repeat collection request");
-    }
-    @autoreleasepool {
-        id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, "uocr_no_repeat_collect_banned_i32", error, error_size);
-        if (pipeline == nil) {
-            return 0;
-        }
-        NSUInteger threads = metal_power2_threadgroup_width(128u, pipeline.maxTotalThreadsPerThreadgroup);
-        if (threads > (NSUInteger)candidate_count) {
-            threads = metal_power2_threadgroup_width((NSUInteger)candidate_count, threads);
-        }
-        if (threads == 0u) {
-            threads = 1u;
-        }
-        int owned_command_buffer = 0;
-        id<MTLCommandBuffer> cb = metal_command_buffer_for_op(ctx, &owned_command_buffer, "integrated no-repeat collection", error, error_size);
-        if (cb == nil) {
-            return 0;
-        }
-        id<MTLBlitCommandEncoder> blit = metal_blit_command_encoder(ctx, cb);
-        if (blit == nil) {
-            return metal_fail(error, error_size, "failed to create integrated no-repeat flag-clear encoder");
-        }
-        [blit fillBuffer:ban_flags.buffer range:NSMakeRange(ban_flags.offset, (NSUInteger)UOCR_VOCAB_SIZE) value:0u];
-        [blit endEncoding];
-        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
-        if (enc == nil) {
-            return metal_fail(error, error_size, "failed to create integrated no-repeat collection encoder");
-        }
-        uocr_metal_no_repeat_collect_params params;
-        params.sequence_len = sequence_len;
-        params.ngram_size = ngram_size;
-        params.window = window;
-        params.candidate_count = candidate_count;
-        params.vocab_size = UOCR_VOCAB_SIZE;
-        params.reserved0 = 0u;
-        params.reserved1 = 0u;
-        params.reserved2 = 0u;
-        [enc setComputePipelineState:pipeline];
-        [enc setBuffer:sequence.buffer offset:sequence.offset atIndex:0u];
-        [enc setBuffer:ban_flags.buffer offset:ban_flags.offset atIndex:1u];
-        [enc setBytes:&params length:sizeof(params) atIndex:2u];
-        [enc dispatchThreads:MTLSizeMake((NSUInteger)candidate_count, 1u, 1u)
-       threadsPerThreadgroup:MTLSizeMake(threads, 1u, 1u)];
-        [enc endEncoding];
-        return metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, "integrated no-repeat collection", error, error_size);
-    }
-}
-
 static int metal_run_lm_head_argmax_f16(uocr_metal_context *ctx,
                                         uocr_metal_buffer_slice input,
                                         uocr_metal_buffer_slice ban_flags,
@@ -10964,11 +10829,10 @@ static int metal_run_rmsnorm_buffer_f16(uocr_metal_context *ctx,
  * internally without CPU readback until the chunk boundary.
  *
  * Each step in the chunk:
- *   1. selection: final_norm → no_repeat_collect → lm_head → argmax
+ *   1. selection: final_norm → lm_head → argmax
  *      writes token to chunk_token_slots[step]
- *   2. append:    blit token to no_repeat_sequence
- *   3. embed:     get_rows(chunk_token_slots[step]) → decode_input
- *   4. decode:    one decoder forward pass → new hidden state
+ *   2. embed:     get_rows(chunk_token_slots[step]) → decode_input
+ *   3. decode:    one decoder forward pass → new hidden state
  *
  * All operations use the active command batch; no commit/wait between steps.
  * ────────────────────────────────────────────────────────────────────────── */
@@ -10998,10 +10862,6 @@ static int metal_encode_chunk_step_selection_f16(
     uocr_metal_buffer_slice selection_scratch,
     uocr_metal_buffer_slice chunk_token_out,   /* single int32 slot for this step */
     uocr_metal_buffer_slice chunk_score_out,   /* single float slot for this step */
-    uocr_metal_buffer_slice no_repeat_sequence,
-    uint32_t sequence_len,
-    uint32_t no_repeat_ngram_size,
-    uint32_t no_repeat_window,
     char *error,
     size_t error_size) {
     if (ctx == NULL ||
@@ -11018,11 +10878,8 @@ static int metal_encode_chunk_step_selection_f16(
                                             "final norm", error, error_size);
     if (final_norm == NULL) return 0;
 
-    const uint32_t banned_capacity = metal_no_repeat_candidate_count(
-        sequence_len, no_repeat_ngram_size, no_repeat_window);
-
     uocr_metal_decode_selection_slices selection_slices;
-    if (!metal_decode_selection_slices(selection_scratch, banned_capacity, &selection_slices)) {
+    if (!metal_decode_selection_slices(selection_scratch, 0u, &selection_slices)) {
         return metal_fail(error, error_size, "chunk step selection scratch layout is invalid");
     }
 
@@ -11032,46 +10889,20 @@ static int metal_encode_chunk_step_selection_f16(
     }
 
     if (metal_lm_head_backend_is_mps()) {
-        /* MPS path: ban_flags at end of selection_scratch */
-        uocr_metal_buffer_slice mps_ban_flags;
-        if (!metal_mps_lm_head_ban_flags_slice(selection_scratch, &mps_ban_flags)) {
-            return metal_fail(error, error_size, "MPS chunk LM head: failed to compute ban_flags slice");
-        }
-        if (banned_capacity != 0u) {
-            if (!metal_run_no_repeat_collect_ban_flags_to_slice(ctx, no_repeat_sequence,
-                                                                mps_ban_flags,
-                                                                sequence_len,
-                                                                no_repeat_ngram_size,
-                                                                no_repeat_window,
-                                                                banned_capacity,
-                                                                error, error_size)) {
-                return 0;
-            }
-        }
         uocr_metal_buffer_slice lm_head_logits;
         if (!metal_lm_head_logits_scratch_slice(ctx, 0u, &lm_head_logits)) {
             return metal_fail(error, error_size, "MPS chunk LM head: failed to get lm_head_logits slice");
         }
-        if (!metal_run_lm_head_mps_path(ctx, norm_scratch, lm_head_logits, mps_ban_flags,
+        uocr_metal_buffer_slice empty_ban_flags = { nil, 0u };
+        if (!metal_run_lm_head_mps_path(ctx, norm_scratch, lm_head_logits, empty_ban_flags,
                                         chunk_token_out, chunk_score_out, error, error_size)) {
             return 0;
         }
     } else {
         /* Custom fused path */
-        if (banned_capacity != 0u) {
-            if (!metal_run_no_repeat_collect_ban_flags_to_slice(ctx, no_repeat_sequence,
-                                                                selection_slices.ban_flags,
-                                                                sequence_len,
-                                                                no_repeat_ngram_size,
-                                                                no_repeat_window,
-                                                                banned_capacity,
-                                                                error, error_size)) {
-                return 0;
-            }
-        }
         if (!metal_run_lm_head_argmax_f16(ctx, norm_scratch,
                                           selection_slices.ban_flags,
-                                          banned_capacity,
+                                          0u,
                                           selection_slices.partial_scores,
                                           selection_slices.partial_ids,
                                           selection_slices.partial_count,
@@ -11110,10 +10941,6 @@ static int metal_encode_chunk_step_selection_f16(
  *   chunk_token_slots      – GPU buffer [chunk_size] int32, CPU-visible
  *   chunk_score_slots      – GPU buffer [chunk_size] float,  CPU-visible
  *   chunk_storage_bytes    – sizeof(chunk_token_slots + chunk_score_slots)
- *   no_repeat_sequence     – GPU no-repeat sequence buffer
- *   base_sequence_len      – sequence length before chunk started
- *   no_repeat_ngram_size   – ngram size for no-repeat
- *   no_repeat_window       – window for no-repeat
  *   error/error_size       – error output
  *
  * Returns 1 on success, 0 on error.
@@ -11129,10 +10956,6 @@ static int metal_run_decoder_decode_chunk_f16(
     uocr_metal_buffer_slice selection_scratch,
     uocr_metal_buffer_slice chunk_token_slots,
     uocr_metal_buffer_slice chunk_score_slots,
-    uocr_metal_buffer_slice no_repeat_sequence,
-    uint32_t base_sequence_len,
-    uint32_t no_repeat_ngram_size,
-    uint32_t no_repeat_window,
     char *error,
     size_t error_size) {
     if (ctx == NULL || chunk_size == 0u || chunk_size > 128u ||
@@ -11160,7 +10983,7 @@ static int metal_run_decoder_decode_chunk_f16(
     for (uint32_t step = 0u; step < chunk_size; ++step) {
         const uint64_t step_start_ns = uocr_profile_now_ns();
 
-        /* 1. Selection: final_norm → no_repeat → lm_head → argmax
+        /* 1. Selection: final_norm → lm_head → argmax
          *    Writes to chunk_token_slots[step], chunk_score_slots[step]. */
         {
             uocr_metal_buffer_slice token_out = chunk_token_slots;
@@ -11168,43 +10991,19 @@ static int metal_run_decoder_decode_chunk_f16(
             uocr_metal_buffer_slice score_out = chunk_score_slots;
             score_out.offset += (NSUInteger)((uint64_t)step * sizeof(float));
 
-            const uint32_t cur_sequence_len = base_sequence_len + step;
             if (!metal_encode_chunk_step_selection_f16(ctx,
                                                        current_hidden,
                                                        norm_scratch,
                                                        selection_scratch,
                                                        token_out,
                                                        score_out,
-                                                       no_repeat_sequence,
-                                                       cur_sequence_len,
-                                                       no_repeat_ngram_size,
-                                                       no_repeat_window,
                                                        error, error_size)) {
                 return 0;
             }
         }
         metal_profile_add_event_now(ctx, "metal.chunk.step.selection", step_start_ns);
 
-        /* 2. Append token to no_repeat_sequence at position = base_sequence_len + step */
-        {
-            const uint32_t append_pos = base_sequence_len + step;
-            uocr_metal_buffer_slice token_src = chunk_token_slots;
-            token_src.offset += (NSUInteger)((uint64_t)step * sizeof(int32_t));
-            uint64_t dst_offset = 0u;
-            if (!checked_mul_u64((uint64_t)append_pos, (uint64_t)sizeof(int32_t), &dst_offset) ||
-                dst_offset > (uint64_t)NSUIntegerMax) {
-                return metal_fail(error, error_size, "chunk no-repeat append offset overflow");
-            }
-            uocr_metal_buffer_slice dst_slice = no_repeat_sequence;
-            dst_slice.offset += (NSUInteger)dst_offset;
-            if (!metal_copy_slice(ctx, token_src, dst_slice, (uint64_t)sizeof(int32_t),
-                                  "chunk no-repeat sequence append", error, error_size)) {
-                return 0;
-            }
-        }
-        metal_profile_add_event_now(ctx, "metal.chunk.step.append", step_start_ns);
-
-        /* 3. Token embedding: get_rows from chunk_token_slots[step] → segment 0 */
+        /* 2. Token embedding: get_rows from chunk_token_slots[step] → segment 0 */
         {
             uocr_metal_buffer_slice token_src = chunk_token_slots;
             token_src.offset += (NSUInteger)((uint64_t)step * sizeof(int32_t));
@@ -11215,7 +11014,7 @@ static int metal_run_decoder_decode_chunk_f16(
         }
         metal_profile_add_event_now(ctx, "metal.chunk.step.embed", step_start_ns);
 
-        /* 4. Decoder decode_one step.
+        /* 3. Decoder decode_one step.
          *    Reads from segment 0 (just filled by embedding), writes final
          *    output back to segment 0 via decode_one's internal final copy. */
         {
@@ -13825,12 +13624,6 @@ static int metal_context_generate_f16_impl(uocr_metal_context *ctx,
     if (request->n_tokens > UOCR_MAX_POSITIONS || request->max_new_tokens > UOCR_MAX_POSITIONS - request->n_tokens) {
         return metal_fail(error, error_size, "Metal integrated decoder sequence length exceeds max positions");
     }
-    if (request->no_repeat_ngram_size == 0u && request->no_repeat_window != 0u) {
-        return metal_fail(error, error_size, "Metal integrated decoder no_repeat_window is set but no_repeat_ngram_size is zero");
-    }
-    if (request->no_repeat_ngram_size > UOCR_MAX_POSITIONS || request->no_repeat_window > UOCR_MAX_POSITIONS) {
-        return metal_fail(error, error_size, "Metal integrated decoder no-repeat configuration exceeds max positions");
-    }
     if (request->max_new_tokens > 0u &&
         (result->generated_ids == NULL || result->generated_capacity < request->max_new_tokens)) {
         return metal_fail(error,
@@ -13970,8 +13763,6 @@ static int metal_context_generate_f16_impl(uocr_metal_context *ctx,
     sequence_request.image_mask = request->image_mask;
     sequence_request.n_tokens = request->n_tokens;
     sequence_request.max_new_tokens = request->max_new_tokens;
-    sequence_request.no_repeat_ngram_size = request->no_repeat_ngram_size;
-    sequence_request.no_repeat_window = request->no_repeat_window;
 
     uocr_sequence_state sequence_state;
     char sequence_error[256];
@@ -14059,16 +13850,6 @@ static int metal_context_generate_f16_impl(uocr_metal_context *ctx,
         return metal_fail(error, error_size, "integrated Metal fp16 decode arena slices are invalid");
     }
 
-    uocr_metal_buffer_slice no_repeat_sequence;
-    uint64_t no_repeat_sequence_bytes = 0u;
-    if (!metal_no_repeat_sequence_slice(ctx,
-                                        request->slot,
-                                        (uint32_t)sequence_len_u64,
-                                        &no_repeat_sequence,
-                                        &no_repeat_sequence_bytes)) {
-        uocr_free(sequence);
-        return metal_fail(error, error_size, "integrated Metal fp16 no-repeat sequence buffer is invalid");
-    }
     uocr_metal_buffer_slice prompt_token_ids;
     uint64_t prompt_token_ids_bytes = 0u;
     if (!metal_prompt_token_ids_slice(ctx, request->slot, request->n_tokens, &prompt_token_ids, &prompt_token_ids_bytes) ||
@@ -14076,19 +13857,6 @@ static int metal_context_generate_f16_impl(uocr_metal_context *ctx,
         uocr_free(sequence);
         return metal_fail(error, error_size, "integrated Metal fp16 prompt token-id slice is invalid");
     }
-    const uint64_t no_repeat_init_start_ns = uocr_profile_now_ns();
-    if (!metal_copy_slice(ctx,
-                          prompt_token_ids,
-                          no_repeat_sequence,
-                          prompt_token_ids_bytes,
-                          "integrated no-repeat sequence init",
-                          error,
-                          error_size)) {
-        uocr_free(sequence);
-        return 0;
-    }
-    metal_profile_add_event_now(ctx, "metal.decode.no_repeat_sequence_init", no_repeat_init_start_ns);
-    (void)no_repeat_sequence_bytes;
 
     uocr_metal_buffer_slice hidden_for_selection;
     if (!metal_hidden_arena_token_slice(ctx,
@@ -14161,21 +13929,6 @@ static int metal_context_generate_f16_impl(uocr_metal_context *ctx,
             this_chunk_size = target_token_index - generated_before_chunk;
         }
 
-        /* Get no-repeat configuration for the first step of this chunk.
-         * Subsequent steps compute GPU-resident with updated sequence len. */
-        uocr_no_repeat_ngram_config no_repeat_config;
-        const int nr_status = uocr_sequence_no_repeat_config(&sequence_state, &no_repeat_config);
-        if (nr_status != UOCR_OK) {
-            [chunk_buffer release];
-            UOCR_METAL_DECODE_LOOP_FAIL("integrated Metal fp16 no-repeat state is invalid: %s",
-                                        uocr_status_string(nr_status));
-        }
-        const uint32_t base_sequence_len = no_repeat_config.sequence != NULL ?
-                                               no_repeat_config.sequence_len :
-                                               sequence_state.token_history_count;
-        const uint32_t nr_ngram_size = no_repeat_config.ngram_size;
-        const uint32_t nr_window = no_repeat_config.window;
-
         /* Open a single command batch for the whole chunk */
         if (!metal_command_batch_begin(ctx, error, error_size)) {
             [chunk_buffer release];
@@ -14195,10 +13948,6 @@ static int metal_context_generate_f16_impl(uocr_metal_context *ctx,
                                                 selection_scratch,
                                                 chunk_tokens,
                                                 chunk_scores,
-                                                no_repeat_sequence,
-                                                base_sequence_len,
-                                                nr_ngram_size,
-                                                nr_window,
                                                 error, error_size)) {
             [chunk_buffer release];
             char detail[512];
@@ -14433,8 +14182,6 @@ static int metal_context_generate_image_f16_impl(uocr_metal_context *ctx,
     decoder_request.slot = slot;
     decoder_request.image_span_start = sequence_state.image_span_start;
     decoder_request.image_span_length = sequence_state.image_span_length;
-    decoder_request.no_repeat_ngram_size = request->no_repeat_ngram_size;
-    decoder_request.no_repeat_window = request->no_repeat_window;
 
     const uint64_t generate_start_ns = uocr_profile_now_ns();
     const int ok = metal_context_generate_f16_impl(ctx,
@@ -15337,34 +15084,6 @@ static int metal_prompt_token_ids_slice(const uocr_metal_context *ctx,
     return 1;
 }
 
-static int metal_no_repeat_sequence_slice(const uocr_metal_context *ctx,
-                                          uint32_t slot,
-                                          uint32_t token_count,
-                                          uocr_metal_buffer_slice *out_slice,
-                                          uint64_t *out_bytes) {
-    if (ctx == NULL || out_slice == NULL || out_bytes == NULL || ctx->no_repeat_sequence_buffer == nil ||
-        token_count == 0u || slot >= ctx->no_repeat_sequence_batch_slots ||
-        token_count > ctx->no_repeat_sequence_token_capacity) {
-        return 0;
-    }
-    uint64_t offset_tokens = 0u;
-    uint64_t offset_bytes = 0u;
-    uint64_t token_bytes = 0u;
-    if (!checked_mul_u64((uint64_t)slot, (uint64_t)ctx->no_repeat_sequence_token_capacity, &offset_tokens) ||
-        !checked_mul_u64(offset_tokens, (uint64_t)sizeof(int32_t), &offset_bytes) ||
-        !checked_mul_u64((uint64_t)token_count, (uint64_t)sizeof(int32_t), &token_bytes)) {
-        return 0;
-    }
-    uint64_t end = 0u;
-    if (!checked_add_u64(offset_bytes, token_bytes, &end) || end > ctx->no_repeat_sequence_capacity ||
-        offset_bytes > (uint64_t)NSUIntegerMax || token_bytes > (uint64_t)NSUIntegerMax) {
-        return 0;
-    }
-    out_slice->buffer = ctx->no_repeat_sequence_buffer;
-    out_slice->offset = (NSUInteger)offset_bytes;
-    *out_bytes = token_bytes;
-    return 1;
-}
 
 static int metal_upload_prompt_token_ids(uocr_metal_context *ctx,
                                          const int32_t *input_ids,
@@ -17869,292 +17588,6 @@ int uocr_metal_context_lm_head_f16(uocr_metal_context *ctx,
     return 1;
 }
 
-static uint32_t metal_no_repeat_candidate_count(uint32_t sequence_len, uint32_t ngram_size, uint32_t window) {
-    if (ngram_size == 0u || sequence_len < ngram_size) {
-        return 0u;
-    }
-    const uint32_t effective_window = window == 0u || window > sequence_len ? sequence_len : window;
-    const uint32_t search_start = sequence_len - effective_window;
-    const uint32_t search_end = sequence_len - ngram_size + 1u;
-    return search_end > search_start ? search_end - search_start : 0u;
-}
-
-static void metal_no_repeat_pack_free(uocr_metal_no_repeat_ngram_pack *pack) {
-    if (pack == NULL) {
-        return;
-    }
-    free(pack->sequences);
-    free(pack->row_offsets);
-    free(pack->sequence_lengths);
-    free(pack->ngram_sizes);
-    free(pack->windows);
-    memset(pack, 0, sizeof(*pack));
-}
-
-static int metal_no_repeat_pack_configs(const uocr_no_repeat_ngram_config *configs,
-                                        uint32_t n_rows,
-                                        uint32_t vocab_size,
-                                        uocr_metal_no_repeat_ngram_pack *out_pack,
-                                        char *error,
-                                        size_t error_size) {
-    if (out_pack == NULL) {
-        return metal_fail(error, error_size, "invalid Metal no-repeat-ngram pack output");
-    }
-    memset(out_pack, 0, sizeof(*out_pack));
-    if (configs == NULL || n_rows == 0u) {
-        return 1;
-    }
-
-    uint64_t total_sequence_tokens = 0u;
-    uint32_t max_candidates = 0u;
-    for (uint32_t row = 0u; row < n_rows; ++row) {
-        const uocr_no_repeat_ngram_config *config = &configs[row];
-        if (config->ngram_size == 0u) {
-            continue;
-        }
-
-        uint32_t banned_count = 0u;
-        const int status = uocr_no_repeat_ngram_collect_banned(config->sequence,
-                                                               config->sequence_len,
-                                                               vocab_size,
-                                                               config->ngram_size,
-                                                               config->window,
-                                                               NULL,
-                                                               0u,
-                                                               NULL,
-                                                               0u,
-                                                               &banned_count);
-        if (status != UOCR_OK && status != UOCR_ERROR_OUT_OF_MEMORY) {
-            return metal_fail(error, error_size, "failed to validate no-repeat-ngram row %u: status %d", row, status);
-        }
-
-        const uint32_t candidates = metal_no_repeat_candidate_count(config->sequence_len, config->ngram_size, config->window);
-        if (candidates == 0u) {
-            continue;
-        }
-        if (!checked_add_u64(total_sequence_tokens, (uint64_t)config->sequence_len, &total_sequence_tokens)) {
-            return metal_fail(error, error_size, "Metal no-repeat-ngram sequence metadata overflow");
-        }
-        if (candidates > max_candidates) {
-            max_candidates = candidates;
-        }
-    }
-
-    if (max_candidates == 0u) {
-        return 1;
-    }
-    if (total_sequence_tokens > (uint64_t)UINT32_MAX) {
-        return metal_fail(error, error_size, "Metal no-repeat-ngram packed sequence is too large");
-    }
-
-    uint64_t row_bytes = 0u;
-    uint64_t sequence_bytes = 0u;
-    if (!checked_mul_u64((uint64_t)n_rows, (uint64_t)sizeof(uint32_t), &row_bytes) ||
-        !checked_mul_u64(total_sequence_tokens, (uint64_t)sizeof(int32_t), &sequence_bytes) ||
-        row_bytes > (uint64_t)SIZE_MAX || sequence_bytes > (uint64_t)SIZE_MAX) {
-        return metal_fail(error, error_size, "Metal no-repeat-ngram pack byte-size overflow");
-    }
-
-    out_pack->row_offsets = (uint32_t *)calloc((size_t)n_rows, sizeof(uint32_t));
-    out_pack->sequence_lengths = (uint32_t *)calloc((size_t)n_rows, sizeof(uint32_t));
-    out_pack->ngram_sizes = (uint32_t *)calloc((size_t)n_rows, sizeof(uint32_t));
-    out_pack->windows = (uint32_t *)calloc((size_t)n_rows, sizeof(uint32_t));
-    out_pack->sequences = (int32_t *)malloc((size_t)sequence_bytes);
-    if (out_pack->row_offsets == NULL || out_pack->sequence_lengths == NULL || out_pack->ngram_sizes == NULL ||
-        out_pack->windows == NULL || out_pack->sequences == NULL) {
-        metal_no_repeat_pack_free(out_pack);
-        return metal_fail(error, error_size, "failed to allocate Metal no-repeat-ngram pack");
-    }
-
-    uint32_t cursor = 0u;
-    for (uint32_t row = 0u; row < n_rows; ++row) {
-        const uocr_no_repeat_ngram_config *config = &configs[row];
-        const uint32_t candidates = metal_no_repeat_candidate_count(config->sequence_len, config->ngram_size, config->window);
-        if (config->ngram_size == 0u || candidates == 0u) {
-            continue;
-        }
-        out_pack->row_offsets[row] = cursor;
-        out_pack->sequence_lengths[row] = config->sequence_len;
-        out_pack->ngram_sizes[row] = config->ngram_size;
-        out_pack->windows[row] = config->window;
-        memcpy(out_pack->sequences + cursor, config->sequence, (size_t)config->sequence_len * sizeof(int32_t));
-        cursor += config->sequence_len;
-    }
-
-    out_pack->total_sequence_tokens = (uint32_t)total_sequence_tokens;
-    out_pack->max_candidates = max_candidates;
-    out_pack->has_work = 1;
-    return 1;
-}
-
-int uocr_metal_context_apply_no_repeat_ngram_f32(uocr_metal_context *ctx,
-                                                 float *logits_f32,
-                                                 uint32_t n_rows,
-                                                 uint32_t vocab_size,
-                                                 const uocr_no_repeat_ngram_config *configs_or_null,
-                                                 char *error,
-                                                 size_t error_size) {
-    metal_clear_error(error, error_size);
-    if (ctx == NULL || vocab_size == 0u) {
-        return metal_fail(error, error_size, "invalid Metal no-repeat-ngram request");
-    }
-    if (n_rows == 0u || configs_or_null == NULL) {
-        return 1;
-    }
-    if (logits_f32 == NULL) {
-        return metal_fail(error, error_size, "invalid Metal no-repeat-ngram logits buffer");
-    }
-
-    uocr_metal_no_repeat_ngram_pack pack;
-    if (!metal_no_repeat_pack_configs(configs_or_null, n_rows, vocab_size, &pack, error, error_size)) {
-        return 0;
-    }
-    if (!pack.has_work) {
-        metal_no_repeat_pack_free(&pack);
-        return 1;
-    }
-
-    uint64_t logits_values = 0u;
-    uint64_t logits_bytes = 0u;
-    uint64_t sequence_bytes = 0u;
-    uint64_t row_bytes = 0u;
-    if (!checked_mul_u64((uint64_t)n_rows, (uint64_t)vocab_size, &logits_values) ||
-        !checked_mul_u64(logits_values, (uint64_t)sizeof(float), &logits_bytes) ||
-        !checked_mul_u64((uint64_t)pack.total_sequence_tokens, (uint64_t)sizeof(int32_t), &sequence_bytes) ||
-        !checked_mul_u64((uint64_t)n_rows, (uint64_t)sizeof(uint32_t), &row_bytes) ||
-        logits_bytes > (uint64_t)SIZE_MAX || sequence_bytes > (uint64_t)SIZE_MAX || row_bytes > (uint64_t)SIZE_MAX) {
-        metal_no_repeat_pack_free(&pack);
-        return metal_fail(error, error_size, "Metal no-repeat-ngram byte-size overflow");
-    }
-    if (logits_bytes > (uint64_t)ctx->device.maxBufferLength || sequence_bytes > (uint64_t)ctx->device.maxBufferLength ||
-        row_bytes > (uint64_t)ctx->device.maxBufferLength) {
-        metal_no_repeat_pack_free(&pack);
-        return metal_fail(error,
-                          error_size,
-                          "Metal no-repeat-ngram buffers exceed maxBufferLength %llu",
-                          (unsigned long long)ctx->device.maxBufferLength);
-    }
-
-    @autoreleasepool {
-        id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, "uocr_no_repeat_ngram_f32", error, error_size);
-        if (pipeline == nil) {
-            metal_no_repeat_pack_free(&pack);
-            return 0;
-        }
-
-        id<MTLBuffer> logits = metal_new_buffer_with_bytes(ctx, logits_f32, (NSUInteger)logits_bytes, MTLResourceStorageModeShared);
-        id<MTLBuffer> sequences = metal_new_buffer_with_bytes(ctx, pack.sequences, (NSUInteger)sequence_bytes, MTLResourceStorageModeShared);
-        id<MTLBuffer> row_offsets = metal_new_buffer_with_bytes(ctx, pack.row_offsets, (NSUInteger)row_bytes, MTLResourceStorageModeShared);
-        id<MTLBuffer> sequence_lengths = metal_new_buffer_with_bytes(ctx, pack.sequence_lengths, (NSUInteger)row_bytes, MTLResourceStorageModeShared);
-        id<MTLBuffer> ngram_sizes = metal_new_buffer_with_bytes(ctx, pack.ngram_sizes, (NSUInteger)row_bytes, MTLResourceStorageModeShared);
-        id<MTLBuffer> windows = metal_new_buffer_with_bytes(ctx, pack.windows, (NSUInteger)row_bytes, MTLResourceStorageModeShared);
-        if (logits == nil || sequences == nil || row_offsets == nil || sequence_lengths == nil || ngram_sizes == nil || windows == nil) {
-            [windows release];
-            [ngram_sizes release];
-            [sequence_lengths release];
-            [row_offsets release];
-            [sequences release];
-            [logits release];
-            metal_no_repeat_pack_free(&pack);
-            return metal_fail(error, error_size, "failed to allocate Metal no-repeat-ngram buffers");
-        }
-        logits.label = @"uocr_no_repeat_logits_f32";
-        sequences.label = @"uocr_no_repeat_sequences";
-        row_offsets.label = @"uocr_no_repeat_row_offsets";
-        sequence_lengths.label = @"uocr_no_repeat_sequence_lengths";
-        ngram_sizes.label = @"uocr_no_repeat_ngram_sizes";
-        windows.label = @"uocr_no_repeat_windows";
-
-        id<MTLCommandBuffer> cb = metal_new_command_buffer(ctx);
-        if (cb == nil) {
-            [windows release];
-            [ngram_sizes release];
-            [sequence_lengths release];
-            [row_offsets release];
-            [sequences release];
-            [logits release];
-            metal_no_repeat_pack_free(&pack);
-            return metal_fail(error, error_size, "failed to create Metal no-repeat-ngram command buffer");
-        }
-        cb.label = @"uocr_no_repeat_ngram_command_buffer";
-
-        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
-        if (enc == nil) {
-            [windows release];
-            [ngram_sizes release];
-            [sequence_lengths release];
-            [row_offsets release];
-            [sequences release];
-            [logits release];
-            metal_no_repeat_pack_free(&pack);
-            return metal_fail(error, error_size, "failed to create Metal no-repeat-ngram command encoder");
-        }
-
-        uocr_metal_no_repeat_ngram_params params;
-        params.rows = n_rows;
-        params.vocab_size = vocab_size;
-        params.max_candidates = pack.max_candidates;
-        params.reserved0 = 0u;
-
-        NSUInteger threads_x = (NSUInteger)pack.max_candidates;
-        if (threads_x > 64u) {
-            threads_x = 64u;
-        }
-        if (threads_x > pipeline.maxTotalThreadsPerThreadgroup) {
-            threads_x = pipeline.maxTotalThreadsPerThreadgroup;
-        }
-        if (threads_x == 0u) {
-            [enc endEncoding];
-            [windows release];
-            [ngram_sizes release];
-            [sequence_lengths release];
-            [row_offsets release];
-            [sequences release];
-            [logits release];
-            metal_no_repeat_pack_free(&pack);
-            return metal_fail(error, error_size, "Metal no-repeat-ngram pipeline has no available threads");
-        }
-        const NSUInteger groups_x = ((NSUInteger)pack.max_candidates + threads_x - 1u) / threads_x;
-
-        [enc setComputePipelineState:pipeline];
-        [enc setBuffer:logits offset:0u atIndex:0u];
-        [enc setBuffer:sequences offset:0u atIndex:1u];
-        [enc setBuffer:row_offsets offset:0u atIndex:2u];
-        [enc setBuffer:sequence_lengths offset:0u atIndex:3u];
-        [enc setBuffer:ngram_sizes offset:0u atIndex:4u];
-        [enc setBuffer:windows offset:0u atIndex:5u];
-        [enc setBytes:&params length:sizeof(params) atIndex:6u];
-        [enc dispatchThreadgroups:MTLSizeMake(groups_x, (NSUInteger)n_rows, 1u)
-             threadsPerThreadgroup:MTLSizeMake(threads_x, 1u, 1u)];
-        [enc endEncoding];
-
-        UOCR_METAL_COMMIT_AND_WAIT_PROFILED(ctx, cb);
-        if (cb.status == MTLCommandBufferStatusError) {
-            NSString *description = cb.error != nil ? [cb.error localizedDescription] : @"unknown command-buffer error";
-            [windows release];
-            [ngram_sizes release];
-            [sequence_lengths release];
-            [row_offsets release];
-            [sequences release];
-            [logits release];
-            metal_no_repeat_pack_free(&pack);
-            return metal_fail(error, error_size, "Metal no-repeat-ngram command failed: %s", [description UTF8String]);
-        }
-
-        memcpy(logits_f32, [logits contents], (size_t)logits_bytes);
-        [windows release];
-        [ngram_sizes release];
-        [sequence_lengths release];
-        [row_offsets release];
-        [sequences release];
-        [logits release];
-    }
-
-    metal_no_repeat_pack_free(&pack);
-    metal_clear_error(error, error_size);
-    return 1;
-}
-
 int uocr_metal_context_argmax_f32(uocr_metal_context *ctx,
                                   const float *logits_f32,
                                   uint32_t n_rows,
@@ -18284,7 +17717,6 @@ int uocr_metal_context_select_greedy_f32(uocr_metal_context *ctx,
                                          float *logits_f32,
                                          uint32_t n_rows,
                                          uint32_t vocab_size,
-                                         const uocr_no_repeat_ngram_config *no_repeat_or_null,
                                          uint32_t *token_ids_out,
                                          float *scores_out_f32_or_null,
                                          char *error,
@@ -18292,19 +17724,6 @@ int uocr_metal_context_select_greedy_f32(uocr_metal_context *ctx,
     metal_clear_error(error, error_size);
     if (ctx == NULL || logits_f32 == NULL || token_ids_out == NULL || n_rows == 0u || vocab_size == 0u) {
         return metal_fail(error, error_size, "invalid Metal greedy selection request");
-    }
-
-    if (no_repeat_or_null != NULL &&
-        !uocr_metal_context_apply_no_repeat_ngram_f32(ctx,
-                                                      logits_f32,
-                                                      n_rows,
-                                                      vocab_size,
-                                                      no_repeat_or_null,
-                                                      error,
-                                                      error_size)) {
-        char detail[512];
-        (void)snprintf(detail, sizeof(detail), "%s", (error != NULL && error[0] != '\0') ? error : "unknown error");
-        return metal_fail(error, error_size, "failed to apply no-repeat-ngram bans before argmax: %s", detail);
     }
 
     return uocr_metal_context_argmax_f32(ctx,
@@ -18320,7 +17739,6 @@ int uocr_metal_context_select_greedy_f32(uocr_metal_context *ctx,
 int uocr_metal_context_select_next_token_f16(uocr_metal_context *ctx,
                                              const uint16_t *hidden_f16,
                                              uint32_t n_rows,
-                                             const uocr_no_repeat_ngram_config *no_repeat_or_null,
                                              uint16_t *normed_scratch_f16,
                                              float *logits_scratch_f32,
                                              uint32_t *token_ids_out,
@@ -18369,7 +17787,6 @@ int uocr_metal_context_select_next_token_f16(uocr_metal_context *ctx,
                                              logits_scratch_f32,
                                              n_rows,
                                              UOCR_VOCAB_SIZE,
-                                             no_repeat_or_null,
                                              token_ids_out,
                                              scores_out_f32_or_null,
                                              error,

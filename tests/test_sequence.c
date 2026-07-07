@@ -19,8 +19,6 @@ static int test_text_only_sequence_state(void) {
     request.image_mask = image_mask;
     request.n_tokens = 3u;
     request.max_new_tokens = 5u;
-    request.no_repeat_ngram_size = 2u;
-    request.no_repeat_window = 16u;
 
     char error[128];
     uocr_sequence_state state;
@@ -35,8 +33,6 @@ static int test_text_only_sequence_state(void) {
     CHECK(state.text_suffix_start == 3u);
     CHECK(state.text_suffix_length == 0u);
     CHECK(state.max_new_tokens == 5u);
-    CHECK(state.no_repeat_ngram_size == 2u);
-    CHECK(state.no_repeat_window == 16u);
     CHECK(state.generated_count == 0u);
     CHECK(state.position == 3u);
     CHECK(state.eos == 0);
@@ -146,7 +142,7 @@ static int test_generation_stops_on_max_new_tokens(void) {
     return 0;
 }
 
-static int test_attached_generation_buffers_track_no_repeat_history(void) {
+static int test_attached_generation_buffers_track_token_history(void) {
     const int32_t input_ids[] = {0, 5, 6, 5};
     const uint8_t image_mask[] = {0, 0, 0, 0};
     uocr_prepared_request request;
@@ -155,19 +151,10 @@ static int test_attached_generation_buffers_track_no_repeat_history(void) {
     request.image_mask = image_mask;
     request.n_tokens = 4u;
     request.max_new_tokens = 3u;
-    request.no_repeat_ngram_size = 2u;
-    request.no_repeat_window = 8u;
 
     uocr_sequence_state state;
     char error[128];
     CHECK(uocr_build_sequence_state(&request, &state, error, sizeof(error)) == UOCR_OK);
-
-    uocr_no_repeat_ngram_config config;
-    CHECK(uocr_sequence_no_repeat_config(&state, &config) == UOCR_OK);
-    CHECK(config.sequence == input_ids);
-    CHECK(config.sequence_len == 4u);
-    CHECK(config.ngram_size == 2u);
-    CHECK(config.window == 8u);
 
     int32_t generated[3] = {0};
     int32_t history[7] = {0};
@@ -183,9 +170,6 @@ static int test_attached_generation_buffers_track_no_repeat_history(void) {
     CHECK(history[4] == 9);
     CHECK(state.generated_count == 1u);
     CHECK(state.token_history_count == 5u);
-    CHECK(uocr_sequence_no_repeat_config(&state, &config) == UOCR_OK);
-    CHECK(config.sequence == history);
-    CHECK(config.sequence_len == 5u);
 
     CHECK(uocr_sequence_accept_generated_token(&state, 10, NULL, 0u) == UOCR_OK);
     CHECK(uocr_sequence_accept_generated_token(&state, 11, NULL, 0u) == UOCR_OK);
@@ -302,7 +286,7 @@ int main(void) {
     if ((status = test_rejects_discontiguous_image_placeholders()) != 0) return status;
     if ((status = test_generation_stops_on_eos()) != 0) return status;
     if ((status = test_generation_stops_on_max_new_tokens()) != 0) return status;
-    if ((status = test_attached_generation_buffers_track_no_repeat_history()) != 0) return status;
+    if ((status = test_attached_generation_buffers_track_token_history()) != 0) return status;
     if ((status = test_attach_generation_buffers_rejects_short_history()) != 0) return status;
     if ((status = test_generation_zero_budget_is_done()) != 0) return status;
     if ((status = test_generation_rejects_bad_token_and_short_buffer()) != 0) return status;

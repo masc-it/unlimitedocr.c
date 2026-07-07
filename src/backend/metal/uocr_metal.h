@@ -113,8 +113,6 @@ typedef struct uocr_metal_decoder_request_f16 {
     uint32_t slot;
     uint32_t image_span_start;
     uint32_t image_span_length;
-    uint32_t no_repeat_ngram_size;
-    uint32_t no_repeat_window;
     uint32_t reserved0;
 } uocr_metal_decoder_request_f16;
 
@@ -373,44 +371,27 @@ int uocr_metal_context_argmax_f32(uocr_metal_context *ctx,
                                   char *error,
                                   size_t error_size);
 
-/* Apply no-repeat-ngram bans on Metal to a row-major fp32 logits buffer and
- * copy the mutated logits back to the caller. configs_or_null==NULL disables
- * banning. This mirrors uocr_no_repeat_ngram_apply_batch() semantics for the
- * decode path (no whitelist), while moving the scan/mutation to the GPU.
- */
-int uocr_metal_context_apply_no_repeat_ngram_f32(uocr_metal_context *ctx,
-                                                 float *logits_f32,
-                                                 uint32_t n_rows,
-                                                 uint32_t vocab_size,
-                                                 const uocr_no_repeat_ngram_config *configs_or_null,
-                                                 char *error,
-                                                 size_t error_size);
 
-/* Decode-time greedy selection helper. It applies no-repeat-ngram bans on
- * Metal, preserving the caller-visible in-place logits mutation, then runs the
- * Metal argmax kernel. no_repeat_or_null==NULL disables banning.
+/* Decode-time greedy selection helper. Runs the Metal argmax kernel on a
+ * row-major fp32 logits buffer.
  */
 int uocr_metal_context_select_greedy_f32(uocr_metal_context *ctx,
                                          float *logits_f32,
                                          uint32_t n_rows,
                                          uint32_t vocab_size,
-                                         const uocr_no_repeat_ngram_config *no_repeat_or_null,
                                          uint32_t *token_ids_out,
                                          float *scores_out_f32_or_null,
                                          char *error,
                                          size_t error_size);
 
 /* Decode-time final-token selection helper. This wires the mapped final
- * RMSNorm, mapped LM head, optional no-repeat-ngram bans, and Metal greedy
- * argmax into one synchronous stage for bring-up/parity tests. The caller
- * provides fp16 normalized-hidden scratch sized [n_rows,1280] and fp32 logits
- * scratch sized [n_rows,129280]; a later production decode loop should bind
- * persistent Metal arenas directly for every intermediate.
+ * RMSNorm, mapped LM head, and Metal greedy argmax into one synchronous stage
+ * for bring-up/parity tests. The caller provides fp16 normalized-hidden
+ * scratch sized [n_rows,1280] and fp32 logits scratch sized [n_rows,129280].
  */
 int uocr_metal_context_select_next_token_f16(uocr_metal_context *ctx,
                                              const uint16_t *hidden_f16,
                                              uint32_t n_rows,
-                                             const uocr_no_repeat_ngram_config *no_repeat_or_null,
                                              uint16_t *normed_scratch_f16,
                                              float *logits_scratch_f32,
                                              uint32_t *token_ids_out,

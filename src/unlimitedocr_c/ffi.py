@@ -120,8 +120,6 @@ class CPreparedRequest(ct.Structure):
         ("crop_grid_w", ct.c_uint32),
         ("crop_grid_h", ct.c_uint32),
         ("max_new_tokens", ct.c_uint32),
-        ("no_repeat_ngram_size", ct.c_uint32),
-        ("no_repeat_window", ct.c_uint32),
     ]
 
 
@@ -496,8 +494,6 @@ def as_c_request(request: PreparedRequest) -> _PreparedKeepalive:
         crop_grid_w=ct.c_uint32(request.crop_grid_w),
         crop_grid_h=ct.c_uint32(request.crop_grid_h),
         max_new_tokens=ct.c_uint32(request.max_new_tokens),
-        no_repeat_ngram_size=ct.c_uint32(request.no_repeat_ngram_size),
-        no_repeat_window=ct.c_uint32(request.no_repeat_window),
     )
     return _PreparedKeepalive(input_ids, image_mask, tuple(view_pixels), c_views, c_request)
 

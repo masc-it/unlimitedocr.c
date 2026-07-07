@@ -58,8 +58,6 @@ int uocr_build_sequence_state(const uocr_prepared_request *request,
     state.prompt_tokens = request->input_ids;
     state.prompt_token_count = request->n_tokens;
     state.max_new_tokens = request->max_new_tokens;
-    state.no_repeat_ngram_size = request->no_repeat_ngram_size;
-    state.no_repeat_window = request->no_repeat_window;
     state.position = request->n_tokens;
     state.eos = 0;
 
@@ -116,32 +114,6 @@ int uocr_sequence_attach_generation_buffers(uocr_sequence_state *state,
     state->token_history = token_history;
     state->token_history_capacity = token_history_capacity;
     state->token_history_count = state->prompt_token_count;
-    return UOCR_OK;
-}
-
-int uocr_sequence_no_repeat_config(const uocr_sequence_state *state,
-                                   uocr_no_repeat_ngram_config *out_config) {
-    if (out_config == NULL) {
-        return UOCR_ERROR_INVALID_ARGUMENT;
-    }
-    memset(out_config, 0, sizeof(*out_config));
-    if (state == NULL) {
-        return UOCR_ERROR_INVALID_ARGUMENT;
-    }
-    if (state->no_repeat_ngram_size == 0u) {
-        return UOCR_OK;
-    }
-    if (state->token_history != NULL) {
-        out_config->sequence = state->token_history;
-        out_config->sequence_len = state->token_history_count;
-    } else if (state->generated_count == 0u && state->prompt_tokens != NULL) {
-        out_config->sequence = state->prompt_tokens;
-        out_config->sequence_len = state->prompt_token_count;
-    } else {
-        return UOCR_ERROR_INVALID_ARGUMENT;
-    }
-    out_config->ngram_size = state->no_repeat_ngram_size;
-    out_config->window = state->no_repeat_window;
     return UOCR_OK;
 }
 

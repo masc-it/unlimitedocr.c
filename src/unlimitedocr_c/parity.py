@@ -64,8 +64,6 @@ class CMetalDecoderRequestF16(ct.Structure):
         ("slot", ct.c_uint32),
         ("image_span_start", ct.c_uint32),
         ("image_span_length", ct.c_uint32),
-        ("no_repeat_ngram_size", ct.c_uint32),
-        ("no_repeat_window", ct.c_uint32),
         ("reserved0", ct.c_uint32),
     ]
 
@@ -256,8 +254,6 @@ def generate_from_dumped_image_embeddings(
             slot=ct.c_uint32(0),
             image_span_start=ct.c_uint32(dump.image_span_start),
             image_span_length=ct.c_uint32(dump.image_span_length),
-            no_repeat_ngram_size=ct.c_uint32(int(dump.manifest.get("no_repeat_ngram_size", 0))),
-            no_repeat_window=ct.c_uint32(int(dump.manifest.get("no_repeat_window", 0))),
             reserved0=ct.c_uint32(0),
         )
         result = CMetalDecoderResultF16(

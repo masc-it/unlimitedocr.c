@@ -38,16 +38,12 @@ class BaselineCaseConfig:
     preset: str
     max_length: int
     max_gen_tokens: int | None
-    no_repeat_ngram_size: int
-    ngram_window: int
 
     def as_dict(self) -> dict[str, object]:
         return {
             "preset": self.preset,
             "max_length": self.max_length,
             "max_gen_tokens": self.max_gen_tokens,
-            "no_repeat_ngram_size": self.no_repeat_ngram_size,
-            "ngram_window": self.ngram_window,
         }
 
 
@@ -211,8 +207,6 @@ def run_docs_test_profile_baselines(
     output_path: str | Path | None = DEFAULT_BASELINE_OUTPUT,
     max_length: int = DEFAULT_BASELINE_MAX_LENGTH,
     max_gen_tokens: int | None = DEFAULT_BASELINE_MAX_GEN_TOKENS,
-    no_repeat_ngram_size: int = 35,
-    ngram_window: int = 128,
     tokenizer_path: str | Path | None = None,
     resource_path: str | Path | None = None,
     library_path: str | Path | None = None,
@@ -223,7 +217,7 @@ def run_docs_test_profile_baselines(
 
     Defaults intentionally match the plan item: ``preset=base`` and
     ``preset=gundam`` on ``docs/test.png`` with ``max_length=4096`` and the
-    public OCR defaults for generation/no-repeat settings.  The resulting JSON
+    public OCR defaults for generation settings.  The resulting JSON
     is stable enough to diff across local optimization runs.
     """
 
@@ -231,11 +225,6 @@ def run_docs_test_profile_baselines(
         raise ValueError("max_length must be positive")
     if max_gen_tokens is not None and max_gen_tokens < 0:
         raise ValueError("max_gen_tokens must be non-negative when provided")
-    if no_repeat_ngram_size < 0:
-        raise ValueError("no_repeat_ngram_size must be non-negative")
-    if ngram_window < 0:
-        raise ValueError("ngram_window must be non-negative")
-
     resolved_model_path = _resolve_model_path(model_path)
     resolved_image_path = _resolve_image_path(image_path)
     normalized_presets = _validate_presets(presets)
@@ -247,8 +236,6 @@ def run_docs_test_profile_baselines(
             preset=preset,
             max_length=max_length,
             max_gen_tokens=max_gen_tokens,
-            no_repeat_ngram_size=no_repeat_ngram_size,
-            ngram_window=ngram_window,
         )
         case_start = perf_counter()
         prep_start = perf_counter()
@@ -258,8 +245,6 @@ def run_docs_test_profile_baselines(
             tokenizer_path=tokenizer_path,
             max_length=max_length,
             max_new_tokens=None,
-            no_repeat_ngram_size=no_repeat_ngram_size,
-            no_repeat_window=ngram_window,
             dtype=np.float16,
         )
         request = _cap_request_max_new_tokens(request, max_gen_tokens)
@@ -315,8 +300,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--preset", action="append", choices=sorted(PRESETS), dest="presets", help="preset to run; repeatable (default: base and gundam)")
     parser.add_argument("--max-length", type=int, default=DEFAULT_BASELINE_MAX_LENGTH, help="public OCR max_length")
     parser.add_argument("--max-gen-tokens", type=int, default=DEFAULT_BASELINE_MAX_GEN_TOKENS, help="public OCR max_gen_tokens cap (default matches OCR; 0 is useful only for smoke validation)")
-    parser.add_argument("--no-repeat-ngram-size", type=int, default=35, help="no-repeat ngram size")
-    parser.add_argument("--ngram-window", type=int, default=128, help="no-repeat search window")
     parser.add_argument("--tokenizer-path", type=Path, default=None, help="tokenizer directory/file override")
     parser.add_argument("--resource-path", type=Path, default=None, help="Metal resource path override")
     parser.add_argument("--library-path", type=Path, default=None, help="libunlimitedocr path override")
@@ -334,8 +317,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         output_path=args.output,
         max_length=args.max_length,
         max_gen_tokens=args.max_gen_tokens,
-        no_repeat_ngram_size=args.no_repeat_ngram_size,
-        ngram_window=args.ngram_window,
         tokenizer_path=args.tokenizer_path,
         resource_path=args.resource_path,
         library_path=args.library_path,

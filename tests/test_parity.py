@@ -39,8 +39,6 @@ def _write_minimal_image_embedding_dump(root: Path, *, hidden_size: int, generat
     generated_ids.tofile(root / GENERATED_IDS_BIN)
     manifest = {
         "mode": "image-embedding-parity",
-        "no_repeat_ngram_size": 0,
-        "no_repeat_window": 0,
         "image_embedding_fixture": {
             "bypasses_c_vision_encoder": True,
             "image_span_start": 1,

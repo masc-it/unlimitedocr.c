@@ -237,23 +237,6 @@ int uocr_validate_prepared_request(const uocr_prepared_request *request,
     if (request->input_ids[0] != UOCR_TOKEN_BOS) {
         return fail(error, error_size, "first token must be BOS id %d, got %d", UOCR_TOKEN_BOS, request->input_ids[0]);
     }
-    if (request->no_repeat_ngram_size == 0u && request->no_repeat_window != 0u) {
-        return fail(error, error_size, "no_repeat_window is set but no_repeat_ngram_size is zero");
-    }
-    if (request->no_repeat_ngram_size > UOCR_MAX_POSITIONS) {
-        return fail(error,
-                    error_size,
-                    "no_repeat_ngram_size %u exceeds max positions %u",
-                    request->no_repeat_ngram_size,
-                    UOCR_MAX_POSITIONS);
-    }
-    if (request->no_repeat_window > UOCR_MAX_POSITIONS) {
-        return fail(error,
-                    error_size,
-                    "no_repeat_window %u exceeds max positions %u",
-                    request->no_repeat_window,
-                    UOCR_MAX_POSITIONS);
-    }
 
     uint32_t image_placeholders = 0u;
     uint32_t first_image = request->n_tokens;

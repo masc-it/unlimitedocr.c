@@ -135,8 +135,6 @@ typedef struct uocr_prepared_request {
     uint32_t crop_grid_h;
 
     uint32_t max_new_tokens;
-    uint32_t no_repeat_ngram_size;
-    uint32_t no_repeat_window;
 } uocr_prepared_request;
 
 typedef struct uocr_engine_opts {

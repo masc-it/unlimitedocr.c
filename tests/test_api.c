@@ -593,7 +593,7 @@ static int test_request_validation_rejects_bad_visual_count(void) {
     return 0;
 }
 
-static int test_request_validation_accepts_upstream_no_repeat_defaults(void) {
+static int test_request_validation_accepts_upstream_defaults(void) {
     uocr_engine_opts opts;
     memset(&opts, 0, sizeof(opts));
     opts.backend = "cpu-ref";
@@ -614,47 +614,12 @@ static int test_request_validation_accepts_upstream_no_repeat_defaults(void) {
     req.crop_grid_w = 1;
     req.crop_grid_h = 1;
     req.max_new_tokens = 0;
-    req.no_repeat_ngram_size = 35;
-    req.no_repeat_window = 128;
 
     uocr_result *result = NULL;
     int status = uocr_generate_prepared(engine, &req, 1, &result);
     CHECK(status == UOCR_OK);
     CHECK(result != NULL);
     uocr_result_free(result);
-    uocr_engine_close(engine);
-    return 0;
-}
-
-static int test_request_validation_rejects_bad_no_repeat_config(void) {
-    uocr_engine_opts opts;
-    memset(&opts, 0, sizeof(opts));
-    opts.backend = "cpu-ref";
-    opts.max_batch = 1;
-    opts.max_prompt_tokens = 16;
-    opts.max_gen_tokens = 4;
-
-    uocr_engine *engine = uocr_engine_open(&opts);
-    CHECK(engine != NULL);
-
-    const int32_t input_ids[] = {0, 42};
-    const uint8_t image_mask[] = {0, 0};
-    uocr_prepared_request req;
-    memset(&req, 0, sizeof(req));
-    req.input_ids = input_ids;
-    req.image_mask = image_mask;
-    req.n_tokens = 2;
-    req.crop_grid_w = 1;
-    req.crop_grid_h = 1;
-    req.no_repeat_ngram_size = 0;
-    req.no_repeat_window = 128;
-
-    uocr_result *result = NULL;
-    int status = uocr_generate_prepared(engine, &req, 1, &result);
-    CHECK(status == UOCR_ERROR_INVALID_ARGUMENT);
-    CHECK(result == NULL);
-    CHECK(strstr(uocr_last_error(engine), "no_repeat_window") != NULL);
-
     uocr_engine_close(engine);
     return 0;
 }
@@ -742,8 +707,7 @@ int main(void) {
     if (test_global_image_request_validation() != 0) return 1;
     if (test_crop_image_request_validation() != 0) return 1;
     if (test_request_validation_rejects_bad_visual_count() != 0) return 1;
-    if (test_request_validation_accepts_upstream_no_repeat_defaults() != 0) return 1;
-    if (test_request_validation_rejects_bad_no_repeat_config() != 0) return 1;
+    if (test_request_validation_accepts_upstream_defaults() != 0) return 1;
     if (test_request_validation_rejects_sequence_position_overflow() != 0) return 1;
     if (test_request_validation_rejects_bad_bos() != 0) return 1;
     return 0;

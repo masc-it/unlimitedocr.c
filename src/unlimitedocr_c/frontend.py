@@ -109,8 +109,6 @@ class PreparedRequest:
     rendered_prompt: str
     max_new_tokens: int
     max_length: int | None
-    no_repeat_ngram_size: int
-    no_repeat_window: int
     tokenizer_path: str
     source_images: tuple[dict[str, Any], ...] = ()
     model_vocab_size: int = MODEL_VOCAB_SIZE
@@ -139,8 +137,6 @@ class PreparedRequest:
             "crop_grid_h": self.crop_grid_h,
             "max_new_tokens": self.max_new_tokens,
             "max_length": self.max_length,
-            "no_repeat_ngram_size": self.no_repeat_ngram_size,
-            "no_repeat_window": self.no_repeat_window,
             "source_images": list(self.source_images),
             "views": [
                 {
@@ -512,8 +508,6 @@ def prepare_image(image: ImageInput,
                   tokenizer_path: str | Path | None = None,
                   max_length: int = 32768,
                   max_new_tokens: int | None = None,
-                  no_repeat_ngram_size: int = 35,
-                  no_repeat_window: int = 128,
                   dtype: np.dtype[Any] | type[np.float16] | type[np.float32] = np.float16) -> PreparedRequest:
     cfg = _resolve_preset(preset)
     tokenizer_path_resolved = _resolve_tokenizer_path(tokenizer_path)
@@ -552,8 +546,6 @@ def prepare_image(image: ImageInput,
         rendered_prompt=rendered,
         max_new_tokens=request_max_new,
         max_length=max_length,
-        no_repeat_ngram_size=no_repeat_ngram_size,
-        no_repeat_window=no_repeat_window,
         tokenizer_path=str(tokenizer_path_resolved),
         source_images=(source_metadata,),
     )
@@ -566,8 +558,6 @@ def prepare_pages(images: Sequence[ImageInput],
                   image_size: int = GLOBAL_VIEW_SIZE,
                   max_length: int = 32768,
                   max_new_tokens: int | None = None,
-                  no_repeat_ngram_size: int = 35,
-                  no_repeat_window: int = 1024,
                   dtype: np.dtype[Any] | type[np.float16] | type[np.float32] = np.float16) -> PreparedRequest:
     if not images:
         raise ValueError("prepare_pages requires at least one image")
@@ -599,8 +589,6 @@ def prepare_pages(images: Sequence[ImageInput],
         rendered_prompt=rendered,
         max_new_tokens=request_max_new,
         max_length=max_length,
-        no_repeat_ngram_size=no_repeat_ngram_size,
-        no_repeat_window=no_repeat_window,
         tokenizer_path=str(tokenizer_path_resolved),
         source_images=tuple(source_images),
     )
@@ -610,9 +598,7 @@ def prepare_text(prompt: str,
                  *,
                  tokenizer_path: str | Path | None = None,
                  max_length: int = 32768,
-                 max_new_tokens: int | None = None,
-                 no_repeat_ngram_size: int = 0,
-                 no_repeat_window: int = 0) -> PreparedRequest:
+                 max_new_tokens: int | None = None) -> PreparedRequest:
     tokenizer_path_resolved = _resolve_tokenizer_path(tokenizer_path)
     tokenizer = load_tokenizer(tokenizer_path_resolved)
     rendered = render_prompt(prompt)
@@ -629,8 +615,6 @@ def prepare_text(prompt: str,
         rendered_prompt=rendered,
         max_new_tokens=request_max_new,
         max_length=max_length,
-        no_repeat_ngram_size=no_repeat_ngram_size,
-        no_repeat_window=no_repeat_window,
         tokenizer_path=str(tokenizer_path_resolved),
     )
 

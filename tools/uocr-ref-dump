@@ -45,8 +45,6 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--tokenizer", type=Path, default=None, help="path to tokenizer.json")
     parser.add_argument("--max-length", type=int, default=32768, help="upstream-style total max length")
     parser.add_argument("--max-new-tokens", type=int, default=None, help="override generated-token budget")
-    parser.add_argument("--no-repeat-ngram-size", type=int, default=35)
-    parser.add_argument("--ngram-window", type=int, default=None, help="default: 128 single image, 1024 multi-page, 0 text-only")
     parser.add_argument("--dtype", choices=("float16", "float32"), default="float16")
     parser.add_argument("--hf-dir", type=Path, default=None, help="HF model directory for golden tensor dumps")
     parser.add_argument(
@@ -119,8 +117,6 @@ def main(argv: list[str] | None = None) -> int:
             tokenizer_path=args.tokenizer,
             max_length=args.max_length,
             max_new_tokens=args.max_new_tokens,
-            no_repeat_ngram_size=args.no_repeat_ngram_size if args.ngram_window else 0,
-            no_repeat_window=args.ngram_window or 0,
         )
     elif args.pages:
         request = prepare_pages(
@@ -129,8 +125,6 @@ def main(argv: list[str] | None = None) -> int:
             tokenizer_path=args.tokenizer,
             max_length=args.max_length,
             max_new_tokens=args.max_new_tokens,
-            no_repeat_ngram_size=args.no_repeat_ngram_size,
-            no_repeat_window=args.ngram_window or 1024,
             dtype=dtype,
         )
     else:
@@ -141,8 +135,6 @@ def main(argv: list[str] | None = None) -> int:
             tokenizer_path=args.tokenizer,
             max_length=args.max_length,
             max_new_tokens=args.max_new_tokens,
-            no_repeat_ngram_size=args.no_repeat_ngram_size,
-            no_repeat_window=args.ngram_window or 128,
             dtype=dtype,
         )
 
