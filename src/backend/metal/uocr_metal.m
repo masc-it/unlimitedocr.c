@@ -1216,9 +1216,10 @@ enum {
     UOCR_METAL_VISION_Q8_ACT_GELU_ERF = 2u
 };
 
-#define UOCR_METAL_VISION_GEMM_Q8_BM 64u
-#define UOCR_METAL_VISION_GEMM_Q8_BN 32u
-#define UOCR_METAL_VISION_GEMM_Q8_THREADS 128u
+/* Tile geometry shared by all tiled Q8 GEMM kernels (gemm_q8.metal). */
+#define UOCR_METAL_GEMM_Q8_BM 64u
+#define UOCR_METAL_GEMM_Q8_BN 32u
+#define UOCR_METAL_GEMM_Q8_THREADS 128u
 
 typedef struct uocr_metal_vision_gemm_q8_params {
     uint32_t m;
@@ -1230,6 +1231,17 @@ typedef struct uocr_metal_vision_gemm_q8_params {
     uint32_t reserved0;
     uint32_t reserved1;
 } uocr_metal_vision_gemm_q8_params;
+
+typedef struct uocr_metal_decoder_gemm_q8_params {
+    uint32_t m;
+    uint32_t k;
+    uint32_t n;
+    uint32_t groups_per_row;
+    uint32_t has_residual;
+    uint32_t reserved0;
+    uint32_t reserved1;
+    uint32_t reserved2;
+} uocr_metal_decoder_gemm_q8_params;
 
 typedef struct uocr_metal_sam_layernorm2d_params {
     uint32_t grid_width;
@@ -1302,6 +1314,8 @@ _Static_assert(sizeof(uocr_metal_clip_sam_concat_params) == 16u,
                "uocr_metal_clip_sam_concat_params ABI mismatch");
 _Static_assert(sizeof(uocr_metal_vision_gemm_q8_params) == 32u,
                "uocr_metal_vision_gemm_q8_params ABI mismatch");
+_Static_assert(sizeof(uocr_metal_decoder_gemm_q8_params) == 32u,
+               "uocr_metal_decoder_gemm_q8_params ABI mismatch");
 _Static_assert(sizeof(uocr_metal_get_rows_q8_params) == 32u,
                "uocr_metal_get_rows_q8_params ABI mismatch");
 _Static_assert(sizeof(uocr_metal_sam_layernorm2d_params) == 20u,
@@ -6404,7 +6418,7 @@ static int metal_run_vision_gemm_q8_0(uocr_metal_context *ctx,
         if (pipeline == nil) {
             return 0;
         }
-        if (pipeline.maxTotalThreadsPerThreadgroup < UOCR_METAL_VISION_GEMM_Q8_THREADS) {
+        if (pipeline.maxTotalThreadsPerThreadgroup < UOCR_METAL_GEMM_Q8_THREADS) {
             return metal_fail(error, error_size, "%s pipeline does not support 128-thread groups", op_name);
         }
         int owned_command_buffer = 0;
@@ -6437,10 +6451,10 @@ static int metal_run_vision_gemm_q8_0(uocr_metal_context *ctx,
         [enc setBuffer:dst1.buffer offset:dst1.offset atIndex:5u];
         [enc setBuffer:dst2.buffer offset:dst2.offset atIndex:6u];
         [enc setBytes:&params length:sizeof(params) atIndex:7u];
-        const NSUInteger col_tiles = ((NSUInteger)output_size + UOCR_METAL_VISION_GEMM_Q8_BN - 1u) / UOCR_METAL_VISION_GEMM_Q8_BN;
-        const NSUInteger row_tiles = ((NSUInteger)n_rows + UOCR_METAL_VISION_GEMM_Q8_BM - 1u) / UOCR_METAL_VISION_GEMM_Q8_BM;
+        const NSUInteger col_tiles = ((NSUInteger)output_size + UOCR_METAL_GEMM_Q8_BN - 1u) / UOCR_METAL_GEMM_Q8_BN;
+        const NSUInteger row_tiles = ((NSUInteger)n_rows + UOCR_METAL_GEMM_Q8_BM - 1u) / UOCR_METAL_GEMM_Q8_BM;
         [enc dispatchThreadgroups:MTLSizeMake(col_tiles, row_tiles, 1u)
-            threadsPerThreadgroup:MTLSizeMake(UOCR_METAL_VISION_GEMM_Q8_THREADS, 1u, 1u)];
+            threadsPerThreadgroup:MTLSizeMake(UOCR_METAL_GEMM_Q8_THREADS, 1u, 1u)];
         [enc endEncoding];
         return metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, op_name, error, error_size);
     }
@@ -11727,6 +11741,45 @@ static int metal_run_attention_output_residual_q8_0(uocr_metal_context *ctx,
         output_values > (uint64_t)UINT32_MAX) {
         return metal_fail(error, error_size, "invalid %s request", op);
     }
+    if (n_tokens > 1u) {
+        /* Prefill: tiled GEMM with residual epilogue; the GEMV kernel below is
+         * decode-only. */
+        @autoreleasepool {
+            id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, "uocr_decoder_gemm_residual_q8_0_to_f16", error, error_size);
+            if (pipeline == nil) {
+                return 0;
+            }
+            int owned_command_buffer = 0;
+            id<MTLCommandBuffer> cb = metal_command_buffer_for_op(ctx, &owned_command_buffer, op, error, error_size);
+            if (cb == nil) {
+                return 0;
+            }
+            id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
+            if (enc == nil) {
+                return metal_fail(error, error_size, "failed to create %s GEMM encoder", op);
+            }
+            uocr_metal_decoder_gemm_q8_params params;
+            memset(&params, 0, sizeof(params));
+            params.m = n_tokens;
+            params.k = UOCR_HIDDEN_SIZE;
+            params.n = UOCR_HIDDEN_SIZE;
+            params.groups_per_row = UOCR_HIDDEN_SIZE / UOCR_Q8_GROUP_SIZE_DEFAULT;
+            params.has_residual = 1u;
+            [enc setComputePipelineState:pipeline];
+            [enc setBuffer:context.buffer offset:context.offset atIndex:0u];
+            [enc setBuffer:o_weight->buffer offset:o_weight->offset atIndex:1u];
+            [enc setBuffer:o_weight->scale_buffer offset:o_weight->scale_offset atIndex:2u];
+            [enc setBuffer:residual.buffer offset:residual.offset atIndex:3u];
+            [enc setBuffer:dst.buffer offset:dst.offset atIndex:4u];
+            [enc setBytes:&params length:sizeof(params) atIndex:5u];
+            [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(UOCR_HIDDEN_SIZE / UOCR_METAL_GEMM_Q8_BN),
+                                                  ((NSUInteger)n_tokens + UOCR_METAL_GEMM_Q8_BM - 1u) / UOCR_METAL_GEMM_Q8_BM,
+                                                  1u)
+                threadsPerThreadgroup:MTLSizeMake(UOCR_METAL_GEMM_Q8_THREADS, 1u, 1u)];
+            [enc endEncoding];
+            return metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, op, error, error_size);
+        }
+    }
     @autoreleasepool {
         id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, "uocr_attention_output_residual_q8_0_to_f16_h1280_g64", error, error_size);
         if (pipeline == nil) {
@@ -12181,6 +12234,49 @@ static int metal_run_attention_qkv_buffer_q8_0(uocr_metal_context *ctx,
     if (!checked_mul_u64((uint64_t)n_tokens, (uint64_t)UOCR_HIDDEN_SIZE * 3u, &output_values) ||
         output_values > (uint64_t)UINT32_MAX) {
         return metal_fail(error, error_size, "integrated Q8 attention QKV dispatch size overflow");
+    }
+    if (n_tokens > 1u) {
+        /* Prefill: tiled GEMM with per-64-row weight-tile reuse; the GEMV
+         * kernel below is decode-only. */
+        @autoreleasepool {
+            id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, "uocr_decoder_qkv_gemm_q8_0_to_f16", error, error_size);
+            if (pipeline == nil) {
+                return 0;
+            }
+            int owned_command_buffer = 0;
+            id<MTLCommandBuffer> cb = metal_command_buffer_for_op(ctx, &owned_command_buffer, "prefill Q8 attention QKV GEMM", error, error_size);
+            if (cb == nil) {
+                return 0;
+            }
+            id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
+            if (enc == nil) {
+                return metal_fail(error, error_size, "failed to create prefill Q8 attention QKV GEMM encoder");
+            }
+            uocr_metal_decoder_gemm_q8_params params;
+            memset(&params, 0, sizeof(params));
+            params.m = n_tokens;
+            params.k = UOCR_HIDDEN_SIZE;
+            params.n = UOCR_HIDDEN_SIZE;
+            params.groups_per_row = UOCR_HIDDEN_SIZE / UOCR_Q8_GROUP_SIZE_DEFAULT;
+            [enc setComputePipelineState:pipeline];
+            [enc setBuffer:src.buffer offset:src.offset atIndex:0u];
+            [enc setBuffer:q_weight->buffer offset:q_weight->offset atIndex:1u];
+            [enc setBuffer:k_weight->buffer offset:k_weight->offset atIndex:2u];
+            [enc setBuffer:v_weight->buffer offset:v_weight->offset atIndex:3u];
+            [enc setBuffer:q_weight->scale_buffer offset:q_weight->scale_offset atIndex:4u];
+            [enc setBuffer:k_weight->scale_buffer offset:k_weight->scale_offset atIndex:5u];
+            [enc setBuffer:v_weight->scale_buffer offset:v_weight->scale_offset atIndex:6u];
+            [enc setBuffer:q_dst.buffer offset:q_dst.offset atIndex:7u];
+            [enc setBuffer:k_dst.buffer offset:k_dst.offset atIndex:8u];
+            [enc setBuffer:v_dst.buffer offset:v_dst.offset atIndex:9u];
+            [enc setBytes:&params length:sizeof(params) atIndex:10u];
+            [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(UOCR_HIDDEN_SIZE / UOCR_METAL_GEMM_Q8_BN),
+                                                  ((NSUInteger)n_tokens + UOCR_METAL_GEMM_Q8_BM - 1u) / UOCR_METAL_GEMM_Q8_BM,
+                                                  3u)
+                threadsPerThreadgroup:MTLSizeMake(UOCR_METAL_GEMM_Q8_THREADS, 1u, 1u)];
+            [enc endEncoding];
+            return metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, "prefill Q8 attention QKV GEMM", error, error_size);
+        }
     }
     @autoreleasepool {
         id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, "uocr_attention_qkv_q8_0_to_f16_h1280_g64", error, error_size);
@@ -12680,9 +12776,75 @@ static int metal_run_dense_swiglu_buffer_q8_0(uocr_metal_context *ctx,
     const uint32_t groups_per_row_hidden = UOCR_HIDDEN_SIZE / UOCR_Q8_GROUP_SIZE_DEFAULT;
     const uint32_t groups_per_row_inter = intermediate_size / UOCR_Q8_GROUP_SIZE_DEFAULT;
 
+    if (n_tokens > 1u && (intermediate_size % UOCR_METAL_GEMM_Q8_BN) == 0u) {
+        /* Prefill: fused gate/up tiled GEMM + down tiled GEMM with residual;
+         * the per-output GEMV kernels below are decode-only. */
+        @autoreleasepool {
+            id<MTLComputePipelineState> gate_pipeline = metal_get_pipeline(ctx, "uocr_decoder_swiglu_gate_up_gemm_q8_0_to_f16", error, error_size);
+            id<MTLComputePipelineState> down_pipeline = metal_get_pipeline(ctx, "uocr_decoder_gemm_residual_q8_0_to_f16", error, error_size);
+            if (gate_pipeline == nil || down_pipeline == nil) {
+                return 0;
+            }
+            int owned_command_buffer = 0;
+            id<MTLCommandBuffer> cb = metal_command_buffer_for_op(ctx, &owned_command_buffer, op, error, error_size);
+            if (cb == nil) {
+                return 0;
+            }
+            const NSUInteger row_tiles = ((NSUInteger)n_tokens + UOCR_METAL_GEMM_Q8_BM - 1u) / UOCR_METAL_GEMM_Q8_BM;
+
+            uocr_metal_decoder_gemm_q8_params gate_params;
+            memset(&gate_params, 0, sizeof(gate_params));
+            gate_params.m = n_tokens;
+            gate_params.k = UOCR_HIDDEN_SIZE;
+            gate_params.n = intermediate_size;
+            gate_params.groups_per_row = groups_per_row_hidden;
+
+            id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
+            if (enc == nil) {
+                return metal_fail(error, error_size, "failed to create %s gate/up GEMM encoder", op);
+            }
+            [enc setComputePipelineState:gate_pipeline];
+            [enc setBuffer:input.buffer offset:input.offset atIndex:0u];
+            [enc setBuffer:gate_weight->buffer offset:gate_weight->offset atIndex:1u];
+            [enc setBuffer:up_weight->buffer offset:up_weight->offset atIndex:2u];
+            [enc setBuffer:gate_weight->scale_buffer offset:gate_weight->scale_offset atIndex:3u];
+            [enc setBuffer:up_weight->scale_buffer offset:up_weight->scale_offset atIndex:4u];
+            [enc setBuffer:mid.buffer offset:mid.offset atIndex:5u];
+            [enc setBytes:&gate_params length:sizeof(gate_params) atIndex:6u];
+            [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(intermediate_size / UOCR_METAL_GEMM_Q8_BN), row_tiles, 1u)
+                threadsPerThreadgroup:MTLSizeMake(UOCR_METAL_GEMM_Q8_THREADS, 1u, 1u)];
+            [enc endEncoding];
+
+            uocr_metal_decoder_gemm_q8_params down_params;
+            memset(&down_params, 0, sizeof(down_params));
+            down_params.m = n_tokens;
+            down_params.k = intermediate_size;
+            down_params.n = UOCR_HIDDEN_SIZE;
+            down_params.groups_per_row = groups_per_row_inter;
+            down_params.has_residual = has_residual ? 1u : 0u;
+
+            enc = metal_compute_command_encoder(ctx, cb);
+            if (enc == nil) {
+                return metal_fail(error, error_size, "failed to create %s down GEMM encoder", op);
+            }
+            [enc setComputePipelineState:down_pipeline];
+            [enc setBuffer:mid.buffer offset:mid.offset atIndex:0u];
+            [enc setBuffer:down_weight->buffer offset:down_weight->offset atIndex:1u];
+            [enc setBuffer:down_weight->scale_buffer offset:down_weight->scale_offset atIndex:2u];
+            [enc setBuffer:(has_residual ? residual.buffer : input.buffer)
+                    offset:(has_residual ? residual.offset : input.offset)
+                   atIndex:3u];
+            [enc setBuffer:dst.buffer offset:dst.offset atIndex:4u];
+            [enc setBytes:&down_params length:sizeof(down_params) atIndex:5u];
+            [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(UOCR_HIDDEN_SIZE / UOCR_METAL_GEMM_Q8_BN), row_tiles, 1u)
+                threadsPerThreadgroup:MTLSizeMake(UOCR_METAL_GEMM_Q8_THREADS, 1u, 1u)];
+            [enc endEncoding];
+            return metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, op, error, error_size);
+        }
+    }
+
     @autoreleasepool {
-        /* Prefill uses the non-tiled gate+up kernel; the tiled variant is
-         * decode-only (n_tokens == 1). */
+        /* Decode path: per-output GEMV kernels (n_tokens == 1). */
         id<MTLComputePipelineState> gate_pipeline = metal_get_decoder_shape_pipeline(ctx,
                                                                                      "uocr_dense_swiglu_gate_up_q8_0_to_f16",
                                                                                      error,

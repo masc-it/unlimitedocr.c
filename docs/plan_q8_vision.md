@@ -368,7 +368,7 @@ CPU or GPU and must not run MPS matmul on dequantized global-memory weights.
 
 Checklist:
 
-* [x] Vision Q8 GEMM lives in one shared fragment, `vision_gemm_q8.metal`.
+* [x] Tiled Q8 GEMM lives in one shared fragment, `gemm_q8.metal`.
       The first-pass per-module GEMV-style fragments (`projector_q8.metal`,
       `clip_q8.metal`, `sam_q8.metal`) were replaced after profiling: vision
       call sites are multi-row GEMMs (up to 4096 token rows), and per-output
@@ -379,6 +379,20 @@ Checklist:
       bias + activation (+ optional QKV split) epilogue.  Measured on SAM lin1
       `[4096,768]->[3072]`: ~2.2 TFLOP/s vs ~3.0 TFLOP/s MPS fp16, while
       reading half the weight bytes.  Optional later: `sam_conv_q8.metal`.
+* [x] Decoder Q8 prefill audit: the prefill path (n_tokens = prompt length)
+      dispatched the decode GEMV kernels for attention QKV/O and dense/shared
+      SwiGLU — same weight-re-read bottleneck (the fp16 prefill path used MPS
+      for QKV/O/down).  Fixed with tiled-GEMM variants in `gemm_q8.metal`
+      (`uocr_decoder_qkv_gemm_q8_0_to_f16` with grid.z projection select,
+      `uocr_decoder_gemm_residual_q8_0_to_f16` for O/down,
+      `uocr_decoder_swiglu_gate_up_gemm_q8_0_to_f16` fused gate/up), dispatched
+      only when `n_tokens > 1`; decode keeps the GEMV kernels.
+* [ ] Known remaining prefill hotspot: routed-MoE prefill still uses the
+      per-(token, expert) GEMV kernels.  This matches the pre-existing fp16
+      custom MoE prefill path (Q8 reads half the bytes, so it is not a
+      regression), but a proper fix needs an expert-bucketed tiled GEMM
+      (mul_mm_id style: bucket token rows by expert, then run the tiled GEMM
+      per bucket) plus extra gate/up/down scratch.  Follow-up.
 * [x] Add fragments to `tools/gen_metal.py` near the matching fp16 files.
 * [x] Regenerate `src/backend/metal/kernels/uocr_smoke.metal`.
 * [x] Verify both source-compiled and precompiled Metal builds.

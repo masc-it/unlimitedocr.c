@@ -18,7 +18,7 @@ ORDER = [
     "dense_q8.metal",
     "norm.metal",
     "sam.metal",
-    "vision_gemm_q8.metal",
+    "gemm_q8.metal",
     "sam_attention.metal",
     "sam_position.metal",
     "attention_decode.metal",
