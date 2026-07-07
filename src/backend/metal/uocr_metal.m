@@ -3629,7 +3629,18 @@ static int metal_validate_vision_tensor_metadata(const uocr_tensor_entry *tensor
                           tensor_id,
                           uocr_tensor_qtype_name(tensor->qtype));
     }
-    if (tensor->family != family || tensor->layer != layer || tensor->expert != expert || tensor->projection != projection) {
+    int projection_matches = tensor->projection == projection;
+    if (!projection_matches &&
+        tensor->qtype == UOCR_TENSOR_F16 &&
+        tensor->projection == UOCR_TENSOR_PROJ_NONE &&
+        (family == UOCR_TENSOR_FAMILY_VISION_SAM || family == UOCR_TENSOR_FAMILY_VISION_CLIP) &&
+        (projection == UOCR_TENSOR_PROJ_VISION_ATTN_QKV ||
+         projection == UOCR_TENSOR_PROJ_VISION_ATTN_O ||
+         projection == UOCR_TENSOR_PROJ_VISION_MLP_FC1 ||
+         projection == UOCR_TENSOR_PROJ_VISION_MLP_FC2)) {
+        projection_matches = 1;
+    }
+    if (tensor->family != family || tensor->layer != layer || tensor->expert != expert || !projection_matches) {
         return metal_fail(error,
                           error_size,
                           "%s %u registry metadata mismatch: family=%s layer=%d expert=%d projection=%u",
@@ -3901,15 +3912,15 @@ static int metal_refresh_vision_binding_cache(uocr_metal_context *ctx,
         const uint32_t base = UOCR_TENSOR_ID_VISION_SAM_BASE + sorted_block * 14u;
         const uint32_t rel_pos_length = uocr_sam_block_uses_global_attention(source_block) ? UOCR_SAM_MAX_REL_POS_SIZE : UOCR_SAM_WINDOW_REL_POS_SIZE;
         VAPPEND1(base + 0u, "SAM attention projection bias", UOCR_TENSOR_FAMILY_VISION_SAM, -1, -1, UOCR_TENSOR_PROJ_NONE, UOCR_SAM_HIDDEN_SIZE);
-        VAPPEND2(base + 1u, "SAM attention projection weight", UOCR_TENSOR_FAMILY_VISION_SAM, -1, -1, UOCR_TENSOR_PROJ_NONE, UOCR_SAM_HIDDEN_SIZE, UOCR_SAM_HIDDEN_SIZE);
+        VAPPEND2(base + 1u, "SAM attention projection weight", UOCR_TENSOR_FAMILY_VISION_SAM, -1, -1, UOCR_TENSOR_PROJ_VISION_ATTN_O, UOCR_SAM_HIDDEN_SIZE, UOCR_SAM_HIDDEN_SIZE);
         VAPPEND1(base + 2u, "SAM attention qkv bias", UOCR_TENSOR_FAMILY_VISION_SAM, -1, -1, UOCR_TENSOR_PROJ_NONE, UOCR_SAM_QKV_SIZE);
-        VAPPEND2(base + 3u, "SAM attention qkv weight", UOCR_TENSOR_FAMILY_VISION_SAM, -1, -1, UOCR_TENSOR_PROJ_NONE, UOCR_SAM_QKV_SIZE, UOCR_SAM_HIDDEN_SIZE);
+        VAPPEND2(base + 3u, "SAM attention qkv weight", UOCR_TENSOR_FAMILY_VISION_SAM, -1, -1, UOCR_TENSOR_PROJ_VISION_ATTN_QKV, UOCR_SAM_QKV_SIZE, UOCR_SAM_HIDDEN_SIZE);
         VAPPEND2(base + 4u, "SAM relative position H", UOCR_TENSOR_FAMILY_VISION_SAM, -1, -1, UOCR_TENSOR_PROJ_NONE, rel_pos_length, UOCR_SAM_HEAD_DIM);
         VAPPEND2(base + 5u, "SAM relative position W", UOCR_TENSOR_FAMILY_VISION_SAM, -1, -1, UOCR_TENSOR_PROJ_NONE, rel_pos_length, UOCR_SAM_HEAD_DIM);
         VAPPEND1(base + 6u, "SAM MLP lin1 bias", UOCR_TENSOR_FAMILY_VISION_SAM, -1, -1, UOCR_TENSOR_PROJ_NONE, UOCR_SAM_MLP_INTERMEDIATE);
-        VAPPEND2(base + 7u, "SAM MLP lin1 weight", UOCR_TENSOR_FAMILY_VISION_SAM, -1, -1, UOCR_TENSOR_PROJ_NONE, UOCR_SAM_MLP_INTERMEDIATE, UOCR_SAM_HIDDEN_SIZE);
+        VAPPEND2(base + 7u, "SAM MLP lin1 weight", UOCR_TENSOR_FAMILY_VISION_SAM, -1, -1, UOCR_TENSOR_PROJ_VISION_MLP_FC1, UOCR_SAM_MLP_INTERMEDIATE, UOCR_SAM_HIDDEN_SIZE);
         VAPPEND1(base + 8u, "SAM MLP lin2 bias", UOCR_TENSOR_FAMILY_VISION_SAM, -1, -1, UOCR_TENSOR_PROJ_NONE, UOCR_SAM_HIDDEN_SIZE);
-        VAPPEND2(base + 9u, "SAM MLP lin2 weight", UOCR_TENSOR_FAMILY_VISION_SAM, -1, -1, UOCR_TENSOR_PROJ_NONE, UOCR_SAM_HIDDEN_SIZE, UOCR_SAM_MLP_INTERMEDIATE);
+        VAPPEND2(base + 9u, "SAM MLP lin2 weight", UOCR_TENSOR_FAMILY_VISION_SAM, -1, -1, UOCR_TENSOR_PROJ_VISION_MLP_FC2, UOCR_SAM_HIDDEN_SIZE, UOCR_SAM_MLP_INTERMEDIATE);
         VAPPEND1(base + 10u, "SAM norm1 bias", UOCR_TENSOR_FAMILY_VISION_SAM, -1, -1, UOCR_TENSOR_PROJ_NONE, UOCR_SAM_HIDDEN_SIZE);
         VAPPEND1(base + 11u, "SAM norm1 weight", UOCR_TENSOR_FAMILY_VISION_SAM, -1, -1, UOCR_TENSOR_PROJ_NONE, UOCR_SAM_HIDDEN_SIZE);
         VAPPEND1(base + 12u, "SAM norm2 bias", UOCR_TENSOR_FAMILY_VISION_SAM, -1, -1, UOCR_TENSOR_PROJ_NONE, UOCR_SAM_HIDDEN_SIZE);
@@ -3957,13 +3968,13 @@ static int metal_refresh_vision_binding_cache(uocr_metal_context *ctx,
         VAPPEND1(base + 2u, "CLIP layer_norm2 bias", UOCR_TENSOR_FAMILY_VISION_CLIP, -1, -1, UOCR_TENSOR_PROJ_NONE, UOCR_CLIP_HIDDEN_SIZE);
         VAPPEND1(base + 3u, "CLIP layer_norm2 weight", UOCR_TENSOR_FAMILY_VISION_CLIP, -1, -1, UOCR_TENSOR_PROJ_NONE, UOCR_CLIP_HIDDEN_SIZE);
         VAPPEND1(base + 4u, "CLIP MLP fc1 bias", UOCR_TENSOR_FAMILY_VISION_CLIP, -1, -1, UOCR_TENSOR_PROJ_NONE, UOCR_CLIP_MLP_INTERMEDIATE);
-        VAPPEND2(base + 5u, "CLIP MLP fc1 weight", UOCR_TENSOR_FAMILY_VISION_CLIP, -1, -1, UOCR_TENSOR_PROJ_NONE, UOCR_CLIP_MLP_INTERMEDIATE, UOCR_CLIP_HIDDEN_SIZE);
+        VAPPEND2(base + 5u, "CLIP MLP fc1 weight", UOCR_TENSOR_FAMILY_VISION_CLIP, -1, -1, UOCR_TENSOR_PROJ_VISION_MLP_FC1, UOCR_CLIP_MLP_INTERMEDIATE, UOCR_CLIP_HIDDEN_SIZE);
         VAPPEND1(base + 6u, "CLIP MLP fc2 bias", UOCR_TENSOR_FAMILY_VISION_CLIP, -1, -1, UOCR_TENSOR_PROJ_NONE, UOCR_CLIP_HIDDEN_SIZE);
-        VAPPEND2(base + 7u, "CLIP MLP fc2 weight", UOCR_TENSOR_FAMILY_VISION_CLIP, -1, -1, UOCR_TENSOR_PROJ_NONE, UOCR_CLIP_HIDDEN_SIZE, UOCR_CLIP_MLP_INTERMEDIATE);
+        VAPPEND2(base + 7u, "CLIP MLP fc2 weight", UOCR_TENSOR_FAMILY_VISION_CLIP, -1, -1, UOCR_TENSOR_PROJ_VISION_MLP_FC2, UOCR_CLIP_HIDDEN_SIZE, UOCR_CLIP_MLP_INTERMEDIATE);
         VAPPEND1(base + 8u, "CLIP attention output bias", UOCR_TENSOR_FAMILY_VISION_CLIP, -1, -1, UOCR_TENSOR_PROJ_NONE, UOCR_CLIP_HIDDEN_SIZE);
-        VAPPEND2(base + 9u, "CLIP attention output weight", UOCR_TENSOR_FAMILY_VISION_CLIP, -1, -1, UOCR_TENSOR_PROJ_NONE, UOCR_CLIP_HIDDEN_SIZE, UOCR_CLIP_HIDDEN_SIZE);
+        VAPPEND2(base + 9u, "CLIP attention output weight", UOCR_TENSOR_FAMILY_VISION_CLIP, -1, -1, UOCR_TENSOR_PROJ_VISION_ATTN_O, UOCR_CLIP_HIDDEN_SIZE, UOCR_CLIP_HIDDEN_SIZE);
         VAPPEND1(base + 10u, "CLIP attention qkv bias", UOCR_TENSOR_FAMILY_VISION_CLIP, -1, -1, UOCR_TENSOR_PROJ_NONE, UOCR_CLIP_QKV_SIZE);
-        VAPPEND2(base + 11u, "CLIP attention qkv weight", UOCR_TENSOR_FAMILY_VISION_CLIP, -1, -1, UOCR_TENSOR_PROJ_NONE, UOCR_CLIP_QKV_SIZE, UOCR_CLIP_HIDDEN_SIZE);
+        VAPPEND2(base + 11u, "CLIP attention qkv weight", UOCR_TENSOR_FAMILY_VISION_CLIP, -1, -1, UOCR_TENSOR_PROJ_VISION_ATTN_QKV, UOCR_CLIP_QKV_SIZE, UOCR_CLIP_HIDDEN_SIZE);
     }
 
 #undef VAPPEND1

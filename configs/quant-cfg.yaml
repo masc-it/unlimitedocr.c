@@ -55,3 +55,41 @@ modules:
     family: MOE_EXPERT
     projections: [GATE, UP, DOWN]
     supported: true
+
+  # Vision modules are intentionally disabled until each fused Q8 Metal path is
+  # implemented and QA'd end-to-end.  These entries make converter planning
+  # explicit while preserving the current fp16 vision runtime.
+  - name: visual_projector
+    family: PROJECTOR
+    projections: [WEIGHT]
+    supported: false
+
+  - name: clip_mlp
+    family: VISION_CLIP
+    projections: [VISION_MLP_FC1, VISION_MLP_FC2]
+    supported: false
+
+  - name: clip_attention
+    family: VISION_CLIP
+    projections: [VISION_ATTN_QKV, VISION_ATTN_O]
+    supported: false
+
+  - name: sam_mlp
+    family: VISION_SAM
+    projections: [VISION_MLP_FC1, VISION_MLP_FC2]
+    supported: false
+
+  - name: sam_attention
+    family: VISION_SAM
+    projections: [VISION_ATTN_QKV, VISION_ATTN_O]
+    supported: false
+
+  - name: sam_patch_embed
+    family: VISION_SAM
+    projections: [VISION_PATCH_EMBED]
+    supported: false
+
+  - name: sam_neck_convs
+    family: VISION_SAM
+    projections: [VISION_CONV_1X1, VISION_CONV_3X3]
+    supported: false

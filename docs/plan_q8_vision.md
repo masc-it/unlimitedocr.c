@@ -144,15 +144,15 @@ VISION_SAM  / VISION_MLP_FC2
 
 Checklist:
 
-* [ ] Extend `TensorProjection` in Python and C mirrors with vision-specific
+* [x] Extend `TensorProjection` in Python and C mirrors with vision-specific
       projections, or an equivalent stable role field.
-* [ ] Map SAM block tensors:
+* [x] Map SAM block tensors:
       attention qkv weight, attention projection weight, MLP lin1/lin2 weights.
-* [ ] Map CLIP block tensors:
+* [x] Map CLIP block tensors:
       attention qkv weight, attention output weight, MLP fc1/fc2 weights.
-* [ ] Keep SAM/CLIP norms, biases, position embeddings, relative position
+* [x] Keep SAM/CLIP norms, biases, position embeddings, relative position
       tables, class embedding, and conv/patch weights out of first-pass Q8.
-* [ ] Add tests that registry roles match the expected tensor names and shapes.
+* [x] Add tests that registry roles match the expected tensor names and shapes.
 
 ### 1.3 Validator policy
 
@@ -250,10 +250,10 @@ Later optional modules, also disabled by default:
 
 Checklist:
 
-* [ ] Add disabled vision module entries only after registry roles exist.
-* [ ] Ensure default config stays monotonic: a module only flips to `true` after
+* [x] Add disabled vision module entries only after registry roles exist.
+* [x] Ensure default config stays monotonic: a module only flips to `true` after
       fused kernels and QA.
-* [ ] Add converter dry-run tests showing vision modules remain fp16 while
+* [x] Add converter dry-run tests showing vision modules remain fp16 while
       disabled and become Q8 only when their module is enabled.
 
 ### 2.3 Tensor selection
@@ -510,7 +510,7 @@ Checklist:
 
 ## 7. Implementation order
 
-1. **Registry/config groundwork**
+1. **Registry/config groundwork** — complete
    * add stable vision projections/roles;
    * add disabled vision modules to `configs/quant-cfg.yaml`;
    * add converter dry-run tests.

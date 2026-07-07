@@ -154,10 +154,11 @@ def _embeddings_only_config() -> QuantConfig:
 
 
 def all_supported_quant_config() -> QuantConfig:
-    """Return a config with every known candidate module supported.
+    """Return a config with every decoder/text candidate module supported.
 
-    Used by tests that exercise the full planner independent of the
-    runtime-safe subset.
+    Used by tests that exercise the completed decoder planner independent of
+    the runtime-safe subset.  Vision modules are tested with explicit configs so
+    disabled rollout entries do not imply fused-kernel support.
     """
     candidates: list[tuple[str, TensorFamily, tuple[TensorProjection, ...]]] = [
         ("token_embedding", TensorFamily.TOK_EMBED, (TensorProjection.WEIGHT,)),

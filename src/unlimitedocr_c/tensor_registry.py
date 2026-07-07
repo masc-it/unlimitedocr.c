@@ -42,6 +42,13 @@ class TensorProjection(IntEnum):
     GATE = 20
     UP = 21
     DOWN = 22
+    VISION_ATTN_QKV = 30
+    VISION_ATTN_O = 31
+    VISION_MLP_FC1 = 32
+    VISION_MLP_FC2 = 33
+    VISION_PATCH_EMBED = 34
+    VISION_CONV_1X1 = 35
+    VISION_CONV_3X3 = 36
 
 
 INVALID_TENSOR_ID = 0
@@ -83,6 +90,10 @@ _DENSE_MLP_RE = re.compile(r"^model\.layers\.0\.mlp\.(gate_proj|up_proj|down_pro
 _MOE_ROUTER_RE = re.compile(r"^model\.layers\.(\d+)\.mlp\.gate\.weight$")
 _MOE_SHARED_RE = re.compile(r"^model\.layers\.(\d+)\.mlp\.shared_experts\.(gate_proj|up_proj|down_proj)\.weight$")
 _MOE_EXPERT_RE = re.compile(r"^model\.layers\.(\d+)\.mlp\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight$")
+_SAM_ATTN_WEIGHT_RE = re.compile(r"^model\.sam_model\.blocks\.(\d+)\.attn\.(qkv|proj)\.weight$")
+_SAM_MLP_WEIGHT_RE = re.compile(r"^model\.sam_model\.blocks\.(\d+)\.mlp\.(lin1|lin2)\.weight$")
+_CLIP_ATTN_WEIGHT_RE = re.compile(r"^model\.vision_model\.transformer\.layers\.(\d+)\.self_attn\.(qkv_proj|out_proj)\.weight$")
+_CLIP_MLP_WEIGHT_RE = re.compile(r"^model\.vision_model\.transformer\.layers\.(\d+)\.mlp\.(fc1|fc2)\.weight$")
 
 
 @dataclass(frozen=True)
@@ -225,6 +236,34 @@ def _entry_without_vision(name: str) -> TensorRegistryEntry | None:
     return None
 
 
+def _vision_entry(name: str, tensor_id: int, family: TensorFamily) -> TensorRegistryEntry:
+    projection = TensorProjection.NONE
+    expected_shape: tuple[int, ...] | None = None
+
+    if family == TensorFamily.VISION_SAM:
+        match = _SAM_ATTN_WEIGHT_RE.match(name)
+        if match:
+            projection = TensorProjection.VISION_ATTN_QKV if match.group(2) == "qkv" else TensorProjection.VISION_ATTN_O
+            expected_shape = (2304, 768) if projection == TensorProjection.VISION_ATTN_QKV else (768, 768)
+        else:
+            match = _SAM_MLP_WEIGHT_RE.match(name)
+            if match:
+                projection = TensorProjection.VISION_MLP_FC1 if match.group(2) == "lin1" else TensorProjection.VISION_MLP_FC2
+                expected_shape = (3072, 768) if projection == TensorProjection.VISION_MLP_FC1 else (768, 3072)
+    elif family == TensorFamily.VISION_CLIP:
+        match = _CLIP_ATTN_WEIGHT_RE.match(name)
+        if match:
+            projection = TensorProjection.VISION_ATTN_QKV if match.group(2) == "qkv_proj" else TensorProjection.VISION_ATTN_O
+            expected_shape = (3072, 1024) if projection == TensorProjection.VISION_ATTN_QKV else (1024, 1024)
+        else:
+            match = _CLIP_MLP_WEIGHT_RE.match(name)
+            if match:
+                projection = TensorProjection.VISION_MLP_FC1 if match.group(2) == "fc1" else TensorProjection.VISION_MLP_FC2
+                expected_shape = (4096, 1024) if projection == TensorProjection.VISION_MLP_FC1 else (1024, 4096)
+
+    return TensorRegistryEntry(name, tensor_id, family, -1, -1, projection, expected_shape)
+
+
 def build_tensor_registry(names: Iterable[str]) -> dict[str, TensorRegistryEntry]:
     names_tuple = tuple(names)
     sam_names = sorted(name for name in names_tuple if name.startswith("model.sam_model."))
@@ -237,9 +276,9 @@ def build_tensor_registry(names: Iterable[str]) -> dict[str, TensorRegistryEntry
     for name in names_tuple:
         entry = _entry_without_vision(name)
         if entry is None and name in sam_ids:
-            entry = TensorRegistryEntry(name, sam_ids[name], TensorFamily.VISION_SAM, -1, -1, TensorProjection.NONE)
+            entry = _vision_entry(name, sam_ids[name], TensorFamily.VISION_SAM)
         if entry is None and name in clip_ids:
-            entry = TensorRegistryEntry(name, clip_ids[name], TensorFamily.VISION_CLIP, -1, -1, TensorProjection.NONE)
+            entry = _vision_entry(name, clip_ids[name], TensorFamily.VISION_CLIP)
         if entry is None:
             raise ValueError(f"unrecognized tensor name for registry: {name}")
         if not (1 <= entry.tensor_id < 1_000_000):

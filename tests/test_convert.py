@@ -41,8 +41,11 @@ from unlimitedocr_c.convert import (
     write_uocr_model,
 )
 from unlimitedocr_c.frontend import project_root
-from unlimitedocr_c.quant_cfg import all_supported_quant_config
+from unlimitedocr_c.quant_cfg import QuantConfig, QuantModuleSpec, all_supported_quant_config, load_default_quant_config
 from unlimitedocr_c.tensor_registry import TENSOR_ID_LM_HEAD, TENSOR_ID_TOK_EMBED, TensorFamily, TensorProjection, tensor_id_layer_attn
+
+
+UOCR_TENSOR_F16_NAME = "UOCR_TENSOR_F16"
 
 
 def _bf16_payload(values: np.ndarray) -> bytes:
@@ -238,7 +241,42 @@ def test_mixed_q8_converter_dry_run_plans_decoder_quantization() -> None:
     assert all(a.scale_offset + a.scale_size == b.scale_offset for a, b in zip(layer1_experts, layer1_experts[1:]))
 
 
+def test_vision_registry_roles_are_stable_for_rank2_linears() -> None:
+    plan = build_dry_run_plan(project_root() / "data/context", qprofile="fp16")
+
+    clip_qkv = plan.tensor_by_name("model.vision_model.transformer.layers.0.self_attn.qkv_proj.weight")
+    clip_o = plan.tensor_by_name("model.vision_model.transformer.layers.0.self_attn.out_proj.weight")
+    clip_fc1 = plan.tensor_by_name("model.vision_model.transformer.layers.0.mlp.fc1.weight")
+    clip_fc2 = plan.tensor_by_name("model.vision_model.transformer.layers.0.mlp.fc2.weight")
+    sam_qkv = plan.tensor_by_name("model.sam_model.blocks.0.attn.qkv.weight")
+    sam_o = plan.tensor_by_name("model.sam_model.blocks.0.attn.proj.weight")
+    sam_fc1 = plan.tensor_by_name("model.sam_model.blocks.0.mlp.lin1.weight")
+    sam_fc2 = plan.tensor_by_name("model.sam_model.blocks.0.mlp.lin2.weight")
+
+    assert clip_qkv.family_id == TensorFamily.VISION_CLIP and clip_qkv.projection_id == TensorProjection.VISION_ATTN_QKV
+    assert clip_o.family_id == TensorFamily.VISION_CLIP and clip_o.projection_id == TensorProjection.VISION_ATTN_O
+    assert clip_fc1.family_id == TensorFamily.VISION_CLIP and clip_fc1.projection_id == TensorProjection.VISION_MLP_FC1
+    assert clip_fc2.family_id == TensorFamily.VISION_CLIP and clip_fc2.projection_id == TensorProjection.VISION_MLP_FC2
+    assert sam_qkv.family_id == TensorFamily.VISION_SAM and sam_qkv.projection_id == TensorProjection.VISION_ATTN_QKV
+    assert sam_o.family_id == TensorFamily.VISION_SAM and sam_o.projection_id == TensorProjection.VISION_ATTN_O
+    assert sam_fc1.family_id == TensorFamily.VISION_SAM and sam_fc1.projection_id == TensorProjection.VISION_MLP_FC1
+    assert sam_fc2.family_id == TensorFamily.VISION_SAM and sam_fc2.projection_id == TensorProjection.VISION_MLP_FC2
+    assert clip_qkv.shape == (3072, 1024)
+    assert sam_qkv.shape == (2304, 768)
+
+    clip_position = plan.tensor_by_name("model.vision_model.embeddings.position_embedding.weight")
+    sam_rel_pos = plan.tensor_by_name("model.sam_model.blocks.0.attn.rel_pos_h")
+    assert clip_position.projection_id == TensorProjection.NONE
+    assert sam_rel_pos.projection_id == TensorProjection.NONE
+
+
 def test_mixed_q8_default_cfg_only_quantizes_runtime_supported_modules() -> None:
+    cfg = load_default_quant_config()
+    for name in ("visual_projector", "clip_mlp", "clip_attention", "sam_mlp", "sam_attention"):
+        module = cfg.module_by_name(name)
+        assert module is not None
+        assert module.supported is False
+
     plan = build_dry_run_plan(project_root() / "data/context", qprofile="mixed-q8_0")
     tok_embed = plan.tensor_by_name("model.embed_tokens.weight")
     lm_head = plan.tensor_by_name("lm_head.weight")
@@ -247,6 +285,11 @@ def test_mixed_q8_default_cfg_only_quantizes_runtime_supported_modules() -> None
     expert_gate = plan.tensor_by_name("model.layers.1.mlp.experts.0.gate_proj.weight")
     shared_gate = plan.tensor_by_name("model.layers.1.mlp.shared_experts.gate_proj.weight")
     dense_gate = plan.tensor_by_name("model.layers.0.mlp.gate_proj.weight")
+    projector = plan.tensor_by_name("model.projector.layers.weight")
+    clip_fc1 = plan.tensor_by_name("model.vision_model.transformer.layers.0.mlp.fc1.weight")
+    clip_qkv = plan.tensor_by_name("model.vision_model.transformer.layers.0.self_attn.qkv_proj.weight")
+    sam_fc1 = plan.tensor_by_name("model.sam_model.blocks.0.mlp.lin1.weight")
+    sam_qkv = plan.tensor_by_name("model.sam_model.blocks.0.attn.qkv.weight")
     assert tok_embed.qtype_id == UOCR_TENSOR_Q8_0
     assert attn_q.qtype_id == UOCR_TENSOR_Q8_0
     assert attn_o.qtype_id == UOCR_TENSOR_Q8_0
@@ -254,6 +297,49 @@ def test_mixed_q8_default_cfg_only_quantizes_runtime_supported_modules() -> None
     assert shared_gate.qtype_id == UOCR_TENSOR_Q8_0
     assert expert_gate.qtype_id == UOCR_TENSOR_Q8_0
     assert lm_head.qtype_id == UOCR_TENSOR_Q8_0
+    assert projector.qtype == UOCR_TENSOR_F16_NAME
+    assert clip_fc1.qtype == UOCR_TENSOR_F16_NAME
+    assert clip_qkv.qtype == UOCR_TENSOR_F16_NAME
+    assert sam_fc1.qtype == UOCR_TENSOR_F16_NAME
+    assert sam_qkv.qtype == UOCR_TENSOR_F16_NAME
+
+
+def test_mixed_q8_vision_modules_quantize_only_when_enabled() -> None:
+    supported_pairs = frozenset({
+        (TensorFamily.PROJECTOR, TensorProjection.WEIGHT),
+        (TensorFamily.VISION_CLIP, TensorProjection.VISION_MLP_FC1),
+        (TensorFamily.VISION_CLIP, TensorProjection.VISION_MLP_FC2),
+    })
+    cfg = QuantConfig(
+        version=1,
+        group_size=UOCR_Q8_GROUP_SIZE_DEFAULT,
+        modules=(
+            QuantModuleSpec("visual_projector", TensorFamily.PROJECTOR, frozenset({TensorProjection.WEIGHT}), True),
+            QuantModuleSpec(
+                "clip_mlp",
+                TensorFamily.VISION_CLIP,
+                frozenset({TensorProjection.VISION_MLP_FC1, TensorProjection.VISION_MLP_FC2}),
+                True,
+            ),
+        ),
+        supported_pairs=supported_pairs,
+    )
+
+    plan = build_dry_run_plan(project_root() / "data/context", qprofile="mixed-q8_0", quant_cfg=cfg)
+    projector = plan.tensor_by_name("model.projector.layers.weight")
+    clip_fc1 = plan.tensor_by_name("model.vision_model.transformer.layers.0.mlp.fc1.weight")
+    clip_fc2 = plan.tensor_by_name("model.vision_model.transformer.layers.0.mlp.fc2.weight")
+    clip_qkv = plan.tensor_by_name("model.vision_model.transformer.layers.0.self_attn.qkv_proj.weight")
+    sam_fc1 = plan.tensor_by_name("model.sam_model.blocks.0.mlp.lin1.weight")
+
+    assert projector.qtype_id == UOCR_TENSOR_Q8_0
+    assert clip_fc1.qtype_id == UOCR_TENSOR_Q8_0
+    assert clip_fc2.qtype_id == UOCR_TENSOR_Q8_0
+    assert clip_qkv.qtype == UOCR_TENSOR_F16_NAME
+    assert sam_fc1.qtype == UOCR_TENSOR_F16_NAME
+    assert projector.block_size == UOCR_Q8_GROUP_SIZE_DEFAULT
+    assert clip_fc1.row_size == 1024
+    assert clip_fc2.row_size == 4096
 
 
 def test_tensor_directory_bytes_records_fp16_metadata() -> None:

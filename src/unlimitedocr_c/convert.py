@@ -109,10 +109,10 @@ UOCR_Q8_MAX = 127
 CONVERTER_VERSION = (0, 2, 0)
 
 QUANT_POLICY_EMBEDDINGS_DECODER = "embeddings+decoder"
-#: Candidate (family, projection) universe for the ``embeddings+decoder`` policy.
+#: Candidate (family, projection) universe for cfg-gated mixed Q8 planning.
 #: The runtime-safe subset actually quantized is governed by ``configs/quant-cfg.yaml``
 #: (see :mod:`unlimitedocr_c.quant_cfg``); this constant only documents which
-#: families/projections the policy considers at all.
+#: families/projections the current rollout considers at all.
 Q8_POLICY_CANDIDATE_FAMILIES = frozenset({
     TensorFamily.TOK_EMBED,
     TensorFamily.LM_HEAD,
@@ -120,6 +120,9 @@ Q8_POLICY_CANDIDATE_FAMILIES = frozenset({
     TensorFamily.LAYER_DENSE_MLP,
     TensorFamily.MOE_EXPERT,
     TensorFamily.MOE_SHARED,
+    TensorFamily.PROJECTOR,
+    TensorFamily.VISION_CLIP,
+    TensorFamily.VISION_SAM,
 })
 Q8_POLICY_CANDIDATE_PROJECTIONS = frozenset({
     TensorProjection.WEIGHT,
@@ -130,6 +133,10 @@ Q8_POLICY_CANDIDATE_PROJECTIONS = frozenset({
     TensorProjection.GATE,
     TensorProjection.UP,
     TensorProjection.DOWN,
+    TensorProjection.VISION_ATTN_QKV,
+    TensorProjection.VISION_ATTN_O,
+    TensorProjection.VISION_MLP_FC1,
+    TensorProjection.VISION_MLP_FC2,
 })
 
 CLIP_PIXEL_PATCH_EMBEDDING_PREFIX = "model.vision_model.embeddings.patch_embedding."
@@ -1413,7 +1420,7 @@ def _make_tensor_plan(
         qtype = "UOCR_TENSOR_Q8_0"
         output_dtype = "Q8_0"
         qtype_reason_id = UOCR_QTYPE_REASON_UNKNOWN
-        reason = f"mixed-q8_0 {quant_policy} rank-2 decoder/embedding weight"
+        reason = f"mixed-q8_0 {quant_policy} cfg-gated rank-2 weight"
 
     (
         source_layout,
