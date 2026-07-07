@@ -54,4 +54,4 @@ modules:
   - name: moe_routed_experts
     family: MOE_EXPERT
     projections: [GATE, UP, DOWN]
-    supported: false
+    supported: true

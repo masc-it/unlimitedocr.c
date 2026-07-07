@@ -252,9 +252,9 @@ def test_mixed_q8_default_cfg_only_quantizes_runtime_supported_modules() -> None
     assert attn_o.qtype_id == UOCR_TENSOR_Q8_0
     assert dense_gate.qtype_id == UOCR_TENSOR_Q8_0
     assert shared_gate.qtype_id == UOCR_TENSOR_Q8_0
+    assert expert_gate.qtype_id == UOCR_TENSOR_Q8_0
     # Modules without fused Q8 runtime kernels stay fp16 under the default cfg.
     assert lm_head.qtype == "UOCR_TENSOR_F16"
-    assert expert_gate.qtype == "UOCR_TENSOR_F16"
 
 
 def test_tensor_directory_bytes_records_fp16_metadata() -> None:

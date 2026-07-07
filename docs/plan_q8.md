@@ -321,10 +321,10 @@ Current routed expert path depends on an interleaved fp16 expert-major slab.
 
 Checklist:
 
-* [ ] Define a Q8 expert slab contract: qweights are still `[expert][gate,up,down][row][k]`; scales are `[expert][gate,up,down][row][k_group]`.
-* [ ] Extend `metal_expert_interleaved_slab_for_layer()` to return both qweight and qscale slabs/strides.
-* [ ] Add fused Q8 selected-expert gate/up and down/combine kernels; dequantization, expert weighting, and combine happen inside the selected-expert kernels.
-* [ ] Preserve router/top-k buffers and weighting semantics.
+* [x] Define a Q8 expert slab contract: qweights are still `[expert][gate,up,down][row][k]`; scales are `[expert][gate,up,down][row][k_group]`.
+* [x] Extend `metal_expert_interleaved_slab_for_layer()` to return both qweight and qscale slabs/strides.
+* [x] Add fused Q8 selected-expert gate/up and down/combine kernels; dequantization, expert weighting, and combine happen inside the selected-expert kernels.
+* [x] Preserve router/top-k buffers and weighting semantics.
 
 ### 4.6 LM head
 

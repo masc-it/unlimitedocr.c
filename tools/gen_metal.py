@@ -31,6 +31,7 @@ ORDER = [
     "kv_cache.metal",
     "layout.metal",
     "moe.metal",
+    "moe_q8.metal",
     "prompt_assembly.metal",
     "rope.metal",
     "sampling.metal",

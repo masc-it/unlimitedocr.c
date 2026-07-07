@@ -384,6 +384,8 @@ struct uocr_metal_context {
     uocr_metal_decoder_layer_fast_bindings decoder_fast_bindings[UOCR_DECODER_LAYERS];
     int decoder_fast_bindings_valid;
     uocr_metal_buffer_slice decoder_fast_expert_slabs[UOCR_DECODER_LAYERS];
+    uocr_metal_buffer_slice decoder_fast_expert_scale_slabs[UOCR_DECODER_LAYERS];
+    uint32_t decoder_fast_expert_qtype;
     int decoder_fast_expert_slabs_valid;
     char decoder_binding_error[256];
     uocr_metal_vision_binding_cache vision_bindings;
@@ -1393,6 +1395,36 @@ typedef struct uocr_metal_dense_swiglu_q8_params {
     uint32_t reserved0;
     uint32_t reserved1;
 } uocr_metal_dense_swiglu_q8_params;
+
+typedef struct uocr_metal_moe_prefill_interleaved_q8_params {
+    uint32_t n_tokens;
+    uint32_t hidden_size;
+    uint32_t intermediate_size;
+    uint32_t expert_count;
+    uint32_t top_k;
+    uint32_t expert_stride_values;
+    uint32_t up_offset_values;
+    uint32_t down_offset_values;
+    uint32_t expert_scale_stride_values;
+    uint32_t up_scale_offset_values;
+    uint32_t down_scale_offset_values;
+    uint32_t group_size;
+} uocr_metal_moe_prefill_interleaved_q8_params;
+
+typedef struct uocr_metal_moe_decode_interleaved_q8_params {
+    uint32_t hidden_size;
+    uint32_t intermediate_size;
+    uint32_t expert_count;
+    uint32_t top_k;
+    uint32_t expert_stride_values;
+    uint32_t up_offset_values;
+    uint32_t down_offset_values;
+    uint32_t expert_scale_stride_values;
+    uint32_t up_scale_offset_values;
+    uint32_t down_scale_offset_values;
+    uint32_t group_size;
+    uint32_t reserved;
+} uocr_metal_moe_decode_interleaved_q8_params;
 
 typedef struct uocr_metal_dense_swiglu_params {
     uint32_t n_tokens;
@@ -2750,9 +2782,13 @@ static void metal_decoder_binding_cache_init(uocr_metal_decoder_binding_cache *c
         layer_cache->moe_shared_up = UOCR_METAL_DECODER_BINDING_INDEX_INVALID;
         layer_cache->moe_shared_down = UOCR_METAL_DECODER_BINDING_INDEX_INVALID;
         layer_cache->expert_slab.valid = 0;
+        layer_cache->expert_slab.qtype = UOCR_TENSOR_F16;
         layer_cache->expert_slab.buffer = nil;
         layer_cache->expert_slab.offset = 0u;
         layer_cache->expert_slab.byte_length = 0u;
+        layer_cache->expert_slab.scale_buffer = nil;
+        layer_cache->expert_slab.scale_offset = 0u;
+        layer_cache->expert_slab.scale_byte_length = 0u;
     }
 }
 
@@ -3534,7 +3570,14 @@ static int metal_refresh_decoder_binding_cache(uocr_metal_context *ctx,
             &ctx->decoder_fast_expert_slabs[layer];
         fast->buffer = slab->buffer;
         fast->offset = slab->offset;
+        uocr_metal_buffer_slice *fast_scale =
+            &ctx->decoder_fast_expert_scale_slabs[layer];
+        fast_scale->buffer = slab->scale_buffer;
+        fast_scale->offset = slab->scale_offset;
     }
+    ctx->decoder_fast_expert_qtype = (UOCR_DECODER_LAYERS > 1u)
+        ? ctx->decoder_bindings.layers[1u].expert_slab.qtype
+        : UOCR_TENSOR_F16;
     ctx->decoder_fast_expert_slabs_valid = 1;
 
     return 1;
@@ -12679,11 +12722,197 @@ static int metal_expert_interleaved_slab_for_layer(const uocr_metal_context *ctx
 
 
 
+static int metal_run_moe_interleaved_decode_fused_combine_buffer_q8_0(
+    uocr_metal_context *ctx,
+    uocr_metal_buffer_slice input,
+    uocr_metal_buffer_slice top_ids,
+    uocr_metal_buffer_slice top_weights,
+    uocr_metal_buffer_slice expert_qweight_slab,
+    uocr_metal_buffer_slice expert_qscale_slab,
+    uint32_t n_tokens,
+    uocr_metal_buffer_slice mid,
+    uocr_metal_buffer_slice shared,
+    uocr_metal_buffer_slice residual,
+    uocr_metal_buffer_slice dst,
+    char *error,
+    size_t error_size);
+
+static int metal_run_moe_interleaved_decode_fused_combine_buffer_q8_0(
+    uocr_metal_context *ctx,
+    uocr_metal_buffer_slice input,
+    uocr_metal_buffer_slice top_ids,
+    uocr_metal_buffer_slice top_weights,
+    uocr_metal_buffer_slice expert_qweight_slab,
+    uocr_metal_buffer_slice expert_qscale_slab,
+    uint32_t n_tokens,
+    uocr_metal_buffer_slice mid,
+    uocr_metal_buffer_slice shared,
+    uocr_metal_buffer_slice residual,
+    uocr_metal_buffer_slice dst,
+    char *error,
+    size_t error_size) {
+    const uint64_t hidden_bytes = (uint64_t)n_tokens * (uint64_t)UOCR_HIDDEN_SIZE * 2u;
+    const uint64_t top_ids_bytes = (uint64_t)n_tokens * (uint64_t)UOCR_MOE_TOP_K * sizeof(uint32_t);
+    const uint64_t top_weights_bytes = (uint64_t)n_tokens * (uint64_t)UOCR_MOE_TOP_K * sizeof(float);
+    const uint64_t mid_bytes = (uint64_t)n_tokens * (uint64_t)UOCR_MOE_TOP_K * (uint64_t)UOCR_MOE_EXPERT_INTERMEDIATE * 2u;
+    const uint64_t projection_values = (uint64_t)UOCR_MOE_EXPERT_INTERMEDIATE * (uint64_t)UOCR_HIDDEN_SIZE;
+    const uint64_t projection_scale_values =
+        (uint64_t)UOCR_MOE_EXPERT_INTERMEDIATE * ((uint64_t)UOCR_HIDDEN_SIZE / UOCR_Q8_GROUP_SIZE_DEFAULT);
+    const uint64_t slab_qweight_bytes = projection_values * 3u * (uint64_t)UOCR_ROUTED_EXPERTS;
+    const uint64_t slab_qscale_bytes = projection_scale_values * 3u * (uint64_t)UOCR_ROUTED_EXPERTS;
+    uint64_t gate_values = (uint64_t)n_tokens * (uint64_t)UOCR_MOE_TOP_K * (uint64_t)UOCR_MOE_EXPERT_INTERMEDIATE;
+    uint64_t down_values = (uint64_t)n_tokens * (uint64_t)UOCR_HIDDEN_SIZE;
+    if (ctx == NULL || n_tokens == 0u || gate_values > UINT32_MAX || down_values > UINT32_MAX ||
+        !metal_slice_valid(input, hidden_bytes) || !metal_slice_valid(top_ids, top_ids_bytes) ||
+        !metal_slice_valid(top_weights, top_weights_bytes) ||
+        !metal_slice_valid(expert_qweight_slab, slab_qweight_bytes) ||
+        !metal_slice_valid(expert_qscale_slab, slab_qscale_bytes) ||
+        !metal_slice_valid(mid, mid_bytes) || !metal_slice_valid(shared, hidden_bytes) ||
+        !metal_slice_valid(residual, hidden_bytes) || !metal_slice_valid(dst, hidden_bytes)) {
+        return metal_fail(error, error_size, "invalid integrated routed MoE Q8 fused-combine request");
+    }
+    @autoreleasepool {
+        const int use_decode_kernels = (n_tokens == 1u);
+        const int use_tiled_routed_gate_up = use_decode_kernels;
+        const uint32_t routed_top_k =
+            use_decode_kernels ? (uint32_t)UOCR_METAL_DECODE_MOE_TOP_K : (uint32_t)UOCR_MOE_TOP_K;
+
+        id<MTLComputePipelineState> gate_pipeline = nil;
+        id<MTLComputePipelineState> down_combine_pipeline = nil;
+        if (use_decode_kernels) {
+            gate_pipeline = metal_get_pipeline(ctx,
+                                                use_tiled_routed_gate_up ?
+                                                    "uocr_moe_decode_interleaved_gate_up_tile4_q8_0_to_f16" :
+                                                    "uocr_moe_decode_interleaved_gate_up_one_q8_0_to_f16",
+                                                error, error_size);
+            down_combine_pipeline = metal_get_pipeline(ctx,
+                                                        use_tiled_routed_gate_up ?
+                                                            "uocr_moe_decode_interleaved_down_sum_combine_tile4_q8_0_to_f16" :
+                                                            "uocr_moe_decode_interleaved_down_sum_combine_one_q8_0_to_f16",
+                                                        error, error_size);
+        } else {
+            /* Prefill uses the non-tiled decode gate/up kernel with n_tokens > 1,
+             * and the non-tiled decode down/combine kernel.  The decode kernel
+             * params struct is used for both since it has the same layout. */
+            gate_pipeline = metal_get_pipeline(ctx,
+                                                "uocr_moe_decode_interleaved_gate_up_one_q8_0_to_f16",
+                                                error, error_size);
+            down_combine_pipeline = metal_get_pipeline(ctx,
+                                                        "uocr_moe_decode_interleaved_down_sum_combine_one_q8_0_to_f16",
+                                                        error, error_size);
+        }
+        if (gate_pipeline == nil || down_combine_pipeline == nil) {
+            return 0;
+        }
+        if (use_tiled_routed_gate_up &&
+            gate_pipeline.maxTotalThreadsPerThreadgroup < (NSUInteger)UOCR_METAL_MOE_ROUTED_GATE_UP_TILED_THREADS) {
+            return metal_fail(error, error_size,
+                              "integrated routed MoE Q8 tiled gate/up pipeline supports only %llu threads; need %u",
+                              (unsigned long long)gate_pipeline.maxTotalThreadsPerThreadgroup,
+                              UOCR_METAL_MOE_ROUTED_GATE_UP_TILED_THREADS);
+        }
+        int owned_command_buffer = 0;
+        id<MTLCommandBuffer> cb = metal_command_buffer_for_op(ctx, &owned_command_buffer, "integrated routed MoE Q8 fused combine", error, error_size);
+        if (cb == nil) {
+            return 0;
+        }
+        uocr_metal_moe_decode_interleaved_q8_params params;
+        params.hidden_size = UOCR_HIDDEN_SIZE;
+        params.intermediate_size = UOCR_MOE_EXPERT_INTERMEDIATE;
+        params.expert_count = UOCR_ROUTED_EXPERTS;
+        params.top_k = routed_top_k;
+        params.expert_stride_values = (uint32_t)(projection_values * 3u);
+        params.up_offset_values = (uint32_t)projection_values;
+        params.down_offset_values = (uint32_t)(projection_values * 2u);
+        params.expert_scale_stride_values = (uint32_t)(projection_scale_values * 3u);
+        params.up_scale_offset_values = (uint32_t)projection_scale_values;
+        params.down_scale_offset_values = (uint32_t)(projection_scale_values * 2u);
+        params.group_size = UOCR_Q8_GROUP_SIZE_DEFAULT;
+        params.reserved = 0u;
+
+        /* The decode Q8 kernel uses n_tokens from the params struct for the
+         * prefill path, but the decode struct doesn't have n_tokens.  For
+         * prefill, we use the prefill Q8 params.  For decode, the decode
+         * struct.  Both share the same kernel which reads n_tokens from the
+         * constant buffer.  The decode kernel struct has no n_tokens field,
+         * so for prefill we need the prefill struct.  To keep it simple, we
+         * always use the prefill struct (which has n_tokens) for the gate/up
+         * kernel, and the appropriate struct for down/combine. */
+        uocr_metal_moe_prefill_interleaved_q8_params prefill_params;
+        prefill_params.n_tokens = n_tokens;
+        prefill_params.hidden_size = UOCR_HIDDEN_SIZE;
+        prefill_params.intermediate_size = UOCR_MOE_EXPERT_INTERMEDIATE;
+        prefill_params.expert_count = UOCR_ROUTED_EXPERTS;
+        prefill_params.top_k = routed_top_k;
+        prefill_params.expert_stride_values = (uint32_t)(projection_values * 3u);
+        prefill_params.up_offset_values = (uint32_t)projection_values;
+        prefill_params.down_offset_values = (uint32_t)(projection_values * 2u);
+        prefill_params.expert_scale_stride_values = (uint32_t)(projection_scale_values * 3u);
+        prefill_params.up_scale_offset_values = (uint32_t)projection_scale_values;
+        prefill_params.down_scale_offset_values = (uint32_t)(projection_scale_values * 2u);
+        prefill_params.group_size = UOCR_Q8_GROUP_SIZE_DEFAULT;
+
+        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
+        if (enc == nil) {
+            return metal_fail(error, error_size, "failed to create integrated routed MoE Q8 gate/up encoder");
+        }
+        const NSUInteger gate_threads = use_tiled_routed_gate_up ?
+            metal_power2_threadgroup_width((NSUInteger)UOCR_METAL_MOE_ROUTED_GATE_UP_TILED_THREADS,
+                                           gate_pipeline.maxTotalThreadsPerThreadgroup) :
+            metal_power2_threadgroup_width(n_tokens == 1u ? 256u : 64u, gate_pipeline.maxTotalThreadsPerThreadgroup);
+        const NSUInteger gate_threadgroups = use_tiled_routed_gate_up ?
+            (NSUInteger)n_tokens * (NSUInteger)routed_top_k *
+                (((NSUInteger)UOCR_MOE_EXPERT_INTERMEDIATE + (NSUInteger)UOCR_METAL_MOE_ROUTED_GATE_UP_TILE_COLUMNS - 1u) /
+                 (NSUInteger)UOCR_METAL_MOE_ROUTED_GATE_UP_TILE_COLUMNS) :
+            (NSUInteger)n_tokens * (NSUInteger)routed_top_k * (NSUInteger)UOCR_MOE_EXPERT_INTERMEDIATE;
+        [enc setComputePipelineState:gate_pipeline];
+        [enc setBuffer:input.buffer offset:input.offset atIndex:0u];
+        [enc setBuffer:top_ids.buffer offset:top_ids.offset atIndex:1u];
+        [enc setBuffer:expert_qweight_slab.buffer offset:expert_qweight_slab.offset atIndex:2u];
+        [enc setBuffer:expert_qscale_slab.buffer offset:expert_qscale_slab.offset atIndex:3u];
+        [enc setBuffer:mid.buffer offset:mid.offset atIndex:4u];
+        [enc setBytes:&prefill_params length:sizeof(prefill_params) atIndex:5u];
+        [enc setThreadgroupMemoryLength:gate_threads * 2u * sizeof(float) atIndex:0u];
+        [enc dispatchThreadgroups:MTLSizeMake(gate_threadgroups, 1u, 1u)
+             threadsPerThreadgroup:MTLSizeMake(gate_threads, 1u, 1u)];
+        [enc endEncoding];
+
+        enc = metal_compute_command_encoder(ctx, cb);
+        if (enc == nil) {
+            return metal_fail(error, error_size, "failed to create integrated routed MoE Q8 down/combine encoder");
+        }
+        const NSUInteger down_threads = metal_power2_threadgroup_width(n_tokens == 1u ? 256u : 64u,
+                                                                       down_combine_pipeline.maxTotalThreadsPerThreadgroup);
+        [enc setComputePipelineState:down_combine_pipeline];
+        [enc setBuffer:mid.buffer offset:mid.offset atIndex:0u];
+        [enc setBuffer:top_ids.buffer offset:top_ids.offset atIndex:1u];
+        [enc setBuffer:top_weights.buffer offset:top_weights.offset atIndex:2u];
+        [enc setBuffer:expert_qweight_slab.buffer offset:expert_qweight_slab.offset atIndex:3u];
+        [enc setBuffer:expert_qscale_slab.buffer offset:expert_qscale_slab.offset atIndex:4u];
+        [enc setBuffer:shared.buffer offset:shared.offset atIndex:5u];
+        [enc setBuffer:residual.buffer offset:residual.offset atIndex:6u];
+        [enc setBuffer:dst.buffer offset:dst.offset atIndex:7u];
+        [enc setBytes:&params length:sizeof(params) atIndex:8u];
+        [enc setThreadgroupMemoryLength:down_threads * sizeof(float) atIndex:0u];
+        {
+            const NSUInteger down_threadgroups = use_tiled_routed_gate_up ?
+                ((NSUInteger)UOCR_HIDDEN_SIZE + 4u - 1u) / 4u :
+                (NSUInteger)down_values;
+            [enc dispatchThreadgroups:MTLSizeMake(down_threadgroups, 1u, 1u)
+                 threadsPerThreadgroup:MTLSizeMake(down_threads, 1u, 1u)];
+        }
+        [enc endEncoding];
+        return metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, "integrated routed MoE Q8 fused combine", error, error_size);
+    }
+}
+
 static int metal_run_moe_interleaved_decode_fused_combine_buffer_f16(uocr_metal_context *ctx,
                                                                      uocr_metal_buffer_slice input,
                                                                      uocr_metal_buffer_slice top_ids,
                                                                      uocr_metal_buffer_slice top_weights,
                                                                      uocr_metal_buffer_slice expert_slab,
+                                                                     uocr_metal_buffer_slice expert_scale_slab,
+                                                                     uint32_t expert_qtype,
                                                                      uint32_t n_tokens,
                                                                      uocr_metal_buffer_slice mid,
                                                                      uocr_metal_buffer_slice shared,
@@ -12691,6 +12920,21 @@ static int metal_run_moe_interleaved_decode_fused_combine_buffer_f16(uocr_metal_
                                                                      uocr_metal_buffer_slice dst,
                                                                      char *error,
                                                                      size_t error_size) {
+    if (expert_qtype == UOCR_TENSOR_Q8_0) {
+        return metal_run_moe_interleaved_decode_fused_combine_buffer_q8_0(ctx,
+                                                                          input,
+                                                                          top_ids,
+                                                                          top_weights,
+                                                                          expert_slab,
+                                                                          expert_scale_slab,
+                                                                          n_tokens,
+                                                                          mid,
+                                                                          shared,
+                                                                          residual,
+                                                                          dst,
+                                                                          error,
+                                                                          error_size);
+    }
     const uint64_t hidden_bytes = (uint64_t)n_tokens * (uint64_t)UOCR_HIDDEN_SIZE * 2u;
     const uint64_t top_ids_bytes = (uint64_t)n_tokens * (uint64_t)UOCR_MOE_TOP_K * sizeof(uint32_t);
     const uint64_t top_weights_bytes = (uint64_t)n_tokens * (uint64_t)UOCR_MOE_TOP_K * sizeof(float);
@@ -13098,6 +13342,8 @@ static int metal_run_decoder_decode_one_f16(uocr_metal_context *ctx,
                                                                    error_size));
             DECODE_OP_CHECKPOINT("moe_shared");
             expert_slab = ctx->decoder_fast_expert_slabs[layer];
+            const uocr_metal_buffer_slice expert_scale_slab = ctx->decoder_fast_expert_scale_slabs[layer];
+            const uint32_t expert_qtype = ctx->decoder_fast_expert_qtype;
             if (!metal_moe_intermediate_slice(ctx, slot, routed_mid_bytes, &mid)) {
                 return metal_fail(error, error_size, "integrated decode MoE routed intermediate slice is invalid");
             }
@@ -13107,6 +13353,8 @@ static int metal_run_decoder_decode_one_f16(uocr_metal_context *ctx,
                                                                                        top_ids,
                                                                                        top_weights,
                                                                                        expert_slab,
+                                                                                       expert_scale_slab,
+                                                                                       expert_qtype,
                                                                                        1u,
                                                                                        mid,
                                                                                        v,
@@ -13453,6 +13701,8 @@ static int metal_run_decoder_prefill_text_f16(uocr_metal_context *ctx,
                                                               error,
                                                               error_size));
             expert_slab = ctx->decoder_fast_expert_slabs[layer];
+            const uocr_metal_buffer_slice expert_scale_slab = ctx->decoder_fast_expert_scale_slabs[layer];
+            const uint32_t expert_qtype = ctx->decoder_fast_expert_qtype;
             if (!metal_moe_intermediate_slice(ctx, slot, routed_mid_bytes, &mid)) {
                 return 0;
             }
@@ -13463,6 +13713,8 @@ static int metal_run_decoder_prefill_text_f16(uocr_metal_context *ctx,
                                                                                      top_ids,
                                                                                      top_weights,
                                                                                      expert_slab,
+                                                                                     expert_scale_slab,
+                                                                                     expert_qtype,
                                                                                      n_tokens,
                                                                                      mid,
                                                                                      v,
