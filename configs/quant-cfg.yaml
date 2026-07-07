@@ -14,9 +14,8 @@
 #     projections  list of TensorProjection enum names this module covers
 #     supported    whether the runtime can consume Q8_0 weights for this module
 #
-# Note: attention_qkv covers Q/K/V.  Prefill and decode both have fused Q8 QKV
-# kernels.  The O projection (attention_output) is still fp16-only, so it stays
-# unsupported until the Q8 O-projection kernel lands.
+# Note: attention_qkv covers Q/K/V and attention_output covers O.  Both prefill
+# and decode have fused Q8 kernels for Q/K/V and O projections.
 
 version: 1
 group_size: 64
@@ -40,7 +39,7 @@ modules:
   - name: attention_output
     family: LAYER_ATTN
     projections: [O]
-    supported: false
+    supported: true
 
   - name: dense_mlp
     family: LAYER_DENSE_MLP
