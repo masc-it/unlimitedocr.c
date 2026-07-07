@@ -2,6 +2,28 @@
 
 This plan is corrected against the current tree.  It assumes **pre-quantized `.uocr` model files**, **fp16 activations/KV/runtime arenas**, and **Metal-only Q8 execution** for the decoder/text path while vision/projector/norm/router weights initially remain fp16.
 
+## QA / rollout discipline
+
+Q8 support is rolled out **module by module**, not as a single big-bang
+switch.  Each fused Q8 kernel lands behind a `configs/quant-cfg.yaml` flag,
+and the model is **end-to-end QA tested** with that module enabled before the
+next module is flipped on.
+
+The workflow for every new Q8 module is:
+
+1. Implement the fused Q8 kernel(s) for the module.
+2. Flip `supported: true` for that module in `configs/quant-cfg.yaml`.
+3. Re-convert the model (`uv run tools/uocr-convert --qprofile mixed-q8_0`
+   or `UnlimitedOCR(quant="q8")` to trigger conversion).
+4. **QA test** the converted model end-to-end on representative OCR inputs and
+   confirm parity with the fp16 baseline.
+5. Only once QA passes, move on to the next module.
+
+This means `configs/quant-cfg.yaml` is the single source of truth for "what is
+runtime-safe to quantize right now", and it grows strictly monotonically as
+kernels are validated.  A module never goes `supported: true` without a passing
+QA run on a real `.uocr` file.
+
 ## Current code facts this plan must preserve
 
 * `.uocr` format is defined in `src/model/uocr_format.h` and mirrored in `src/unlimitedocr_c/convert.py`.
@@ -69,7 +91,7 @@ Checklist:
 * [x] Add `uocr_tensor_qtype_name()` support for `q8_0`.
 * [x] Add converter/runtime helpers for Q8 qweight bytes, qscale bytes, and total bytes.
 * [x] Require `cols % group_size == 0` for first-pass Q8 tensors.
-* [ ] Keep rank-1 tensors, biases, norms, router weights, projector, and vision tensors fp16.
+* [x] Keep rank-1 tensors, biases, norms, router weights, projector, and vision tensors fp16.
 
 ### 1.2 Qprofile/version policy
 
@@ -82,7 +104,7 @@ Checklist:
 * [x] Keep `UOCR_FORMAT_VERSION = 1`; the existing tensor-entry fields already encode Q8 qweights and qscales, so Q8 is a new qprofile within the current file structure.
 * [x] Extend `uocr_model_file_validate_memory()` so it accepts `UOCR_QPROFILE_MIXED_Q8_0` and dispatches per-tensor validation by qtype.
 * [x] Preserve the current fp16 validation path unchanged for `UOCR_QPROFILE_FP16`.
-* [ ] Use the existing provenance JSON payload for quantization metadata instead of adding binary provenance fields.
+* [x] Use the existing provenance JSON payload for quantization metadata instead of adding binary provenance fields.
 
 Add this provenance JSON payload:
 
@@ -322,9 +344,18 @@ Runtime quantization is inferred from the model file; no runtime quantization is
 
 Checklist:
 
-* [ ] Do **not** add `quantization` and `quantization_policy` fields to `uocr_engine_opts`.
-* [ ] Do not change `include/unlimitedocr.h`, `src/unlimitedocr_c/ffi.py::CEngineOpts`, and `EngineOptions` for Q8 loading.
-* [ ] Python high-level loading is:
+* [x] Do **not** add `quantization` and `quantization_policy` fields to `uocr_engine_opts`.
+* [x] Do not change `include/unlimitedocr.h`, `src/unlimitedocr_c/ffi.py::CEngineOpts`, and `EngineOptions` for Q8 loading.
+* [x] Python high-level loading supports an optional `quant="q8"` convenience on `UnlimitedOCR(...)` and `resolve_model_path(...)`.  When set, it resolves/produces a `unlimitedocr-q8.uocr` file in the cache dir and converts it on miss using `configs/quant-cfg.yaml`.
+* [x] The C generation entry points accept both `UOCR_QPROFILE_FP16` and `UOCR_QPROFILE_MIXED_Q8_0` `.uocr` models.
+
+```python
+from unlimitedocr_c import UnlimitedOCR
+ocr = UnlimitedOCR(quant="q8")           # cache + convert if needed, then load
+text = ocr.generate("page.png")
+```
+
+or, equivalently, point at a pre-converted file directly:
 
 ```python
 ocr = UnlimitedOCR(model_path="unlimitedocr-mixed-q8_0.uocr", backend="metal")
@@ -346,36 +377,45 @@ Checklist:
 
 ## 7. Implementation order
 
-1. **Format/validator groundwork**
+Each step is QA-gated per the rollout discipline above: a module is only moved
+to `supported: true` in `configs/quant-cfg.yaml` after its fused Q8 kernel
+passes an end-to-end OCR run against the fp16 baseline.
+
+1. **Format/validator groundwork** ✅
    * add qtype/qprofile constants;
    * add Q8 tensor-entry validation;
    * update name helpers and converter mirrors.
 
-2. **Converter planning/writing**
+2. **Converter planning/writing** ✅
    * extend `TensorPlan` for scale ranges;
-   * implement tensor selection from registry metadata;
+   * implement tensor selection from registry metadata gated by `quant-cfg.yaml`;
    * implement BF16→Q8_0 writer;
    * emit quant summary JSON.
 
-3. **Metal loader**
+3. **Metal loader** ✅
    * map qweight and qscale ranges;
    * add dtype-aware weight views/bindings;
    * keep fp16 decoder and vision paths passing unchanged.
 
-4. **Embedding + LM-head Q8**
-   * implement the isolated Q8 embedding and Q8 LM-head kernels;
-   * verify prompt text-only generation with Q8 embeddings and Q8 LM-head.
+4. **Q8 embedding (runtime-safe, QA'd)** ✅
+   * fused Q8 embedding kernel for prompt assembly + generated-token embedding;
+   * `configs/quant-cfg.yaml` ships `token_embedding` as the only `supported: true` module;
+   * end-to-end QA on a real `unlimitedocr-q8.uocr` file passes.
 
-5. **Attention Q8**
-   * Q/K/V and O for decode and prefill.
+5. **Attention Q8** (in progress)
+   * prefill Q/K/V fused Q8 kernel landed and dispatch wired;
+   * decode Q/K/V and O projection still fp16 — `attention_qkv`/`attention_output` stay `supported: false` until decode paths land and pass QA.
 
 6. **Dense/shared MLP Q8**
-   * fused gate+up Q8 kernels and fused down Q8 kernels.
+   * fused gate+up Q8 kernels and fused down Q8 kernels; QA before enabling.
 
 7. **Routed MoE Q8**
-   * Q8 expert slabs and selected-expert kernels.
+   * Q8 expert slabs and selected-expert kernels; QA before enabling.
 
-8. **Docs/tests/profiling**
+8. **LM head Q8**
+   * fused Q8 LM-head argmax; QA before enabling.
+
+9. **Docs/tests/profiling**
    * converter docs;
    * Python loading example;
    * loader rejection tests for malformed Q8 metadata;
@@ -391,25 +431,28 @@ A grounded first deliverable is:
 Model:
   mixed fp16/Q8_0 .uocr with qprofile UOCR_QPROFILE_MIXED_Q8_0
 
-Quantized families:
-  token embedding
-  decoder attention projections
-  decoder dense MLP
-  decoder MoE routed experts
-  decoder MoE shared experts
-  LM head Q8; router fp16
+Quantized families (runtime-supported subset, gated by configs/quant-cfg.yaml):
+  token embedding                      ✅ QA'd
+  decoder attention Q/K/V (prefill)     kernel landed, decode path pending QA gate
+  decoder attention O projection        pending
+  decoder dense MLP                     pending
+  decoder MoE routed experts            pending
+  decoder MoE shared experts            pending
+  LM head                               pending
+  router                                always fp16
 
 Runtime:
-  Metal fused Q8 embedding
+  Metal fused Q8 embedding              ✅
   fused Q8 attention/dense/MoE/LM-head paths integrated at current call sites
-  no standalone dequantization kernels and no dequantized Q8 weight buffers
-  fp16 activations, KV cache, image features, runtime arenas
-  fp16 vision/projector/norm/router paths unchanged
+  as their modules pass QA; no standalone dequantization kernels and no
+  dequantized Q8 weight buffers; fp16 activations, KV cache, image features,
+  runtime arenas; fp16 vision/projector/norm/router paths unchanged.
 
 User API:
-  load by model_path; quantization inferred from .uocr qprofile/tensor qtypes
+  UnlimitedOCR(quant="q8") resolves/produces a cache-cached mixed-q8_0 model
+  and loads it; quantization is inferred from .uocr qprofile/tensor qtypes.
 
 Reporting:
   q8 tensor count, qweight bytes, qscale bytes, fp16-equivalent bytes,
-  estimated savings, and Q8 kernel timings
+  estimated savings, and Q8 kernel timings.
 ```
