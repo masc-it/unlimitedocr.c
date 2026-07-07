@@ -11248,6 +11248,18 @@ static int metal_run_decode_rope_kv_write_one_f16(uocr_metal_context *ctx,
     }
 }
 
+static int metal_run_attention_qkv_buffer_q8_0(uocr_metal_context *ctx,
+                                              uocr_metal_buffer_slice src,
+                                              const uocr_metal_decoder_binding *q_weight,
+                                              const uocr_metal_decoder_binding *k_weight,
+                                              const uocr_metal_decoder_binding *v_weight,
+                                              uint32_t n_tokens,
+                                              uocr_metal_buffer_slice q_dst,
+                                              uocr_metal_buffer_slice k_dst,
+                                              uocr_metal_buffer_slice v_dst,
+                                              char *error,
+                                              size_t error_size);
+
 static int metal_run_decode_attention_qkv_one_f16(uocr_metal_context *ctx,
                                                    uocr_metal_buffer_slice src,
                                                    const uocr_metal_decoder_binding *q_weight,
@@ -11258,10 +11270,26 @@ static int metal_run_decode_attention_qkv_one_f16(uocr_metal_context *ctx,
                                                    uocr_metal_buffer_slice v_dst,
                                                    char *error,
                                                    size_t error_size) {
+    if (ctx == NULL || q_weight == NULL || k_weight == NULL || v_weight == NULL) {
+        return metal_fail(error, error_size, "invalid decode attention QKV request");
+    }
+    if (q_weight->qtype == UOCR_TENSOR_Q8_0 && k_weight->qtype == UOCR_TENSOR_Q8_0 &&
+        v_weight->qtype == UOCR_TENSOR_Q8_0) {
+        return metal_run_attention_qkv_buffer_q8_0(ctx,
+                                                  src,
+                                                  q_weight,
+                                                  k_weight,
+                                                  v_weight,
+                                                  1u,
+                                                  q_dst,
+                                                  k_dst,
+                                                  v_dst,
+                                                  error,
+                                                  error_size);
+    }
     const uint64_t hidden_bytes = (uint64_t)UOCR_HIDDEN_SIZE * 2u;
     const uint64_t weight_bytes = (uint64_t)UOCR_HIDDEN_SIZE * (uint64_t)UOCR_HIDDEN_SIZE * 2u;
-    if (ctx == NULL || q_weight == NULL || k_weight == NULL || v_weight == NULL ||
-        !metal_slice_valid(src, hidden_bytes) || !metal_slice_valid(q_dst, hidden_bytes) ||
+    if (!metal_slice_valid(src, hidden_bytes) || !metal_slice_valid(q_dst, hidden_bytes) ||
         !metal_slice_valid(k_dst, hidden_bytes) || !metal_slice_valid(v_dst, hidden_bytes) ||
         !metal_buffer_range_valid(q_weight->buffer, q_weight->offset, weight_bytes) ||
         !metal_buffer_range_valid(k_weight->buffer, k_weight->offset, weight_bytes) ||
