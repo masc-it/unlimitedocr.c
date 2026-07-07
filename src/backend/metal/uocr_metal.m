@@ -1232,6 +1232,13 @@ typedef struct uocr_metal_vision_gemm_q8_params {
     uint32_t reserved1;
 } uocr_metal_vision_gemm_q8_params;
 
+typedef struct uocr_metal_decode_gemv_q8_params {
+    uint32_t k;
+    uint32_t n;
+    uint32_t groups_per_row;
+    uint32_t has_residual;
+} uocr_metal_decode_gemv_q8_params;
+
 typedef struct uocr_metal_decoder_gemm_q8_params {
     uint32_t m;
     uint32_t k;
@@ -1316,6 +1323,8 @@ _Static_assert(sizeof(uocr_metal_vision_gemm_q8_params) == 32u,
                "uocr_metal_vision_gemm_q8_params ABI mismatch");
 _Static_assert(sizeof(uocr_metal_decoder_gemm_q8_params) == 32u,
                "uocr_metal_decoder_gemm_q8_params ABI mismatch");
+_Static_assert(sizeof(uocr_metal_decode_gemv_q8_params) == 16u,
+               "uocr_metal_decode_gemv_q8_params ABI mismatch");
 _Static_assert(sizeof(uocr_metal_get_rows_q8_params) == 32u,
                "uocr_metal_get_rows_q8_params ABI mismatch");
 _Static_assert(sizeof(uocr_metal_sam_layernorm2d_params) == 20u,
@@ -2827,6 +2836,17 @@ static void metal_invalidate_decoder_binding_cache(uocr_metal_context *ctx, cons
         reason = "decoder tensor bindings are not validated";
     }
     (void)snprintf(ctx->decoder_binding_error, sizeof(ctx->decoder_binding_error), "%s", reason);
+}
+
+/* Output rows per 128-thread threadgroup for the simdgroup-per-row decode
+ * GEMV kernels. */
+static NSUInteger metal_decode_gemv_rows_per_threadgroup(id<MTLComputePipelineState> pipeline) {
+    NSUInteger width = pipeline.threadExecutionWidth;
+    if (width == 0u) {
+        width = 32u;
+    }
+    const NSUInteger rows = 128u / width;
+    return rows == 0u ? 1u : rows;
 }
 
 static int metal_tensor_expected_payload_bytes(uint32_t rank,
@@ -11781,11 +11801,11 @@ static int metal_run_attention_output_residual_q8_0(uocr_metal_context *ctx,
         }
     }
     @autoreleasepool {
-        id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, "uocr_attention_output_residual_q8_0_to_f16_h1280_g64", error, error_size);
+        /* Decode: simdgroup-per-row GEMV with residual epilogue. */
+        id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, "uocr_decode_linear_residual_gemv_q8_0_to_f16", error, error_size);
         if (pipeline == nil) {
             return 0;
         }
-        const NSUInteger threads = metal_power2_threadgroup_width(256u, pipeline.maxTotalThreadsPerThreadgroup);
         int owned_command_buffer = 0;
         id<MTLCommandBuffer> cb = metal_command_buffer_for_op(ctx, &owned_command_buffer, op, error, error_size);
         if (cb == nil) {
@@ -11795,11 +11815,11 @@ static int metal_run_attention_output_residual_q8_0(uocr_metal_context *ctx,
         if (enc == nil) {
             return metal_fail(error, error_size, "failed to create %s command encoder", op);
         }
-        uocr_metal_attention_output_q8_params params;
-        params.n_tokens = n_tokens;
-        params.hidden_size = UOCR_HIDDEN_SIZE;
-        params.group_size = UOCR_Q8_GROUP_SIZE_DEFAULT;
+        uocr_metal_decode_gemv_q8_params params;
+        params.k = UOCR_HIDDEN_SIZE;
+        params.n = UOCR_HIDDEN_SIZE;
         params.groups_per_row = UOCR_HIDDEN_SIZE / UOCR_Q8_GROUP_SIZE_DEFAULT;
+        params.has_residual = 1u;
         [enc setComputePipelineState:pipeline];
         [enc setBuffer:context.buffer offset:context.offset atIndex:0u];
         [enc setBuffer:o_weight->buffer offset:o_weight->offset atIndex:1u];
@@ -11807,9 +11827,9 @@ static int metal_run_attention_output_residual_q8_0(uocr_metal_context *ctx,
         [enc setBuffer:residual.buffer offset:residual.offset atIndex:3u];
         [enc setBuffer:dst.buffer offset:dst.offset atIndex:4u];
         [enc setBytes:&params length:sizeof(params) atIndex:5u];
-        [enc setThreadgroupMemoryLength:threads * sizeof(float) atIndex:0u];
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)output_values, 1u, 1u)
-             threadsPerThreadgroup:MTLSizeMake(threads, 1u, 1u)];
+        const NSUInteger rows_per_tg = metal_decode_gemv_rows_per_threadgroup(pipeline);
+        [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)UOCR_HIDDEN_SIZE + rows_per_tg - 1u) / rows_per_tg, 1u, 1u)
+             threadsPerThreadgroup:MTLSizeMake(128u, 1u, 1u)];
         [enc endEncoding];
         return metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, op, error, error_size);
     }
@@ -11937,20 +11957,10 @@ static int metal_run_decode_dense_swiglu_one_q8_0(uocr_metal_context *ctx,
     const uint32_t groups_per_row_inter = intermediate_size / UOCR_Q8_GROUP_SIZE_DEFAULT;
 
     @autoreleasepool {
-        const int use_tiled_shared_gate_up = intermediate_size == UOCR_MOE_SHARED_INTERMEDIATE;
-        const char *gate_kernel = use_tiled_shared_gate_up
-            ? "uocr_dense_swiglu_shared_gate_up_tile4_q8_0_to_f16"
-            : "uocr_dense_swiglu_gate_up_q8_0_to_f16";
-        id<MTLComputePipelineState> gate_pipeline = metal_get_decoder_shape_pipeline(ctx, gate_kernel, error, error_size);
-        if (gate_pipeline == nil) {
-            return 0;
-        }
-        if (use_tiled_shared_gate_up &&
-            gate_pipeline.maxTotalThreadsPerThreadgroup < (NSUInteger)UOCR_METAL_MOE_SHARED_GATE_UP_TILED_THREADS) {
-            return metal_fail(error, error_size, "%s tiled shared gate/up pipeline does not support 1024 threads", op);
-        }
-        id<MTLComputePipelineState> down_pipeline = metal_get_decoder_shape_pipeline(ctx, "uocr_dense_swiglu_down_q8_0_to_f16", error, error_size);
-        if (down_pipeline == nil) {
+        /* Decode: simdgroup-per-row GEMV for gate/up and down. */
+        id<MTLComputePipelineState> gate_pipeline = metal_get_pipeline(ctx, "uocr_decode_swiglu_gate_up_gemv_q8_0_to_f16", error, error_size);
+        id<MTLComputePipelineState> down_pipeline = metal_get_pipeline(ctx, "uocr_decode_linear_residual_gemv_q8_0_to_f16", error, error_size);
+        if (gate_pipeline == nil || down_pipeline == nil) {
             return 0;
         }
         int owned_command_buffer = 0;
@@ -11959,32 +11969,24 @@ static int metal_run_decode_dense_swiglu_one_q8_0(uocr_metal_context *ctx,
             return 0;
         }
 
-        uocr_metal_dense_swiglu_q8_params gate_params;
-        gate_params.n_tokens = 1u;
-        gate_params.hidden_size = UOCR_HIDDEN_SIZE;
-        gate_params.intermediate_size = intermediate_size;
-        gate_params.has_residual = has_residual ? 1u : 0u;
-        gate_params.group_size = UOCR_Q8_GROUP_SIZE_DEFAULT;
+        uocr_metal_decode_gemv_q8_params gate_params;
+        gate_params.k = UOCR_HIDDEN_SIZE;
+        gate_params.n = intermediate_size;
         gate_params.groups_per_row = groups_per_row_hidden;
-        gate_params.reserved0 = 0u;
-        gate_params.reserved1 = 0u;
+        gate_params.has_residual = 0u;
 
-        uocr_metal_dense_swiglu_q8_params down_params = gate_params;
+        uocr_metal_decode_gemv_q8_params down_params;
+        down_params.k = intermediate_size;
+        down_params.n = UOCR_HIDDEN_SIZE;
         down_params.groups_per_row = groups_per_row_inter;
+        down_params.has_residual = has_residual ? 1u : 0u;
 
         /* gate + up → mid */
         id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
         if (enc == nil) {
             return metal_fail(error, error_size, "failed to create %s gate/up command encoder", op);
         }
-        const NSUInteger gate_threads = use_tiled_shared_gate_up
-            ? metal_power2_threadgroup_width((NSUInteger)UOCR_METAL_MOE_SHARED_GATE_UP_TILED_THREADS,
-                                             gate_pipeline.maxTotalThreadsPerThreadgroup)
-            : metal_power2_threadgroup_width(64u, gate_pipeline.maxTotalThreadsPerThreadgroup);
-        const NSUInteger gate_threadgroups = use_tiled_shared_gate_up
-            ? ((NSUInteger)intermediate_size + (NSUInteger)UOCR_METAL_MOE_SHARED_GATE_UP_TILE_COLUMNS - 1u) /
-                (NSUInteger)UOCR_METAL_MOE_SHARED_GATE_UP_TILE_COLUMNS
-            : (NSUInteger)gate_values;
+        const NSUInteger gate_rows_per_tg = metal_decode_gemv_rows_per_threadgroup(gate_pipeline);
         [enc setComputePipelineState:gate_pipeline];
         [enc setBuffer:input.buffer offset:input.offset atIndex:0u];
         [enc setBuffer:gate_weight->buffer offset:gate_weight->offset atIndex:1u];
@@ -11993,9 +11995,8 @@ static int metal_run_decode_dense_swiglu_one_q8_0(uocr_metal_context *ctx,
         [enc setBuffer:up_weight->scale_buffer offset:up_weight->scale_offset atIndex:4u];
         [enc setBuffer:mid.buffer offset:mid.offset atIndex:5u];
         [enc setBytes:&gate_params length:sizeof(gate_params) atIndex:6u];
-        [enc setThreadgroupMemoryLength:gate_threads * 2u * sizeof(float) atIndex:0u];
-        [enc dispatchThreadgroups:MTLSizeMake(gate_threadgroups, 1u, 1u)
-             threadsPerThreadgroup:MTLSizeMake(gate_threads, 1u, 1u)];
+        [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)intermediate_size + gate_rows_per_tg - 1u) / gate_rows_per_tg, 1u, 1u)
+             threadsPerThreadgroup:MTLSizeMake(128u, 1u, 1u)];
         [enc endEncoding];
 
         /* down → dst (+ residual) */
@@ -12003,7 +12004,7 @@ static int metal_run_decode_dense_swiglu_one_q8_0(uocr_metal_context *ctx,
         if (enc == nil) {
             return metal_fail(error, error_size, "failed to create %s down command encoder", op);
         }
-        const NSUInteger down_threads = metal_power2_threadgroup_width(256u, down_pipeline.maxTotalThreadsPerThreadgroup);
+        const NSUInteger down_rows_per_tg = metal_decode_gemv_rows_per_threadgroup(down_pipeline);
         [enc setComputePipelineState:down_pipeline];
         [enc setBuffer:mid.buffer offset:mid.offset atIndex:0u];
         [enc setBuffer:down_weight->buffer offset:down_weight->offset atIndex:1u];
@@ -12011,9 +12012,8 @@ static int metal_run_decode_dense_swiglu_one_q8_0(uocr_metal_context *ctx,
         [enc setBuffer:(has_residual ? residual.buffer : input.buffer) offset:(has_residual ? residual.offset : input.offset) atIndex:3u];
         [enc setBuffer:dst.buffer offset:dst.offset atIndex:4u];
         [enc setBytes:&down_params length:sizeof(down_params) atIndex:5u];
-        [enc setThreadgroupMemoryLength:down_threads * sizeof(float) atIndex:0u];
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)down_values, 1u, 1u)
-             threadsPerThreadgroup:MTLSizeMake(down_threads, 1u, 1u)];
+        [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)UOCR_HIDDEN_SIZE + down_rows_per_tg - 1u) / down_rows_per_tg, 1u, 1u)
+             threadsPerThreadgroup:MTLSizeMake(128u, 1u, 1u)];
         [enc endEncoding];
         return metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, op, error, error_size);
     }
@@ -12279,11 +12279,11 @@ static int metal_run_attention_qkv_buffer_q8_0(uocr_metal_context *ctx,
         }
     }
     @autoreleasepool {
-        id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, "uocr_attention_qkv_q8_0_to_f16_h1280_g64", error, error_size);
+        /* Decode: simdgroup-per-row GEMV. */
+        id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, "uocr_decode_qkv_gemv_q8_0_to_f16", error, error_size);
         if (pipeline == nil) {
             return 0;
         }
-        const NSUInteger threads = metal_power2_threadgroup_width(256u, pipeline.maxTotalThreadsPerThreadgroup);
         int owned_command_buffer = 0;
         id<MTLCommandBuffer> cb = metal_command_buffer_for_op(ctx, &owned_command_buffer, "integrated Q8 attention QKV", error, error_size);
         if (cb == nil) {
@@ -12293,11 +12293,11 @@ static int metal_run_attention_qkv_buffer_q8_0(uocr_metal_context *ctx,
         if (enc == nil) {
             return metal_fail(error, error_size, "failed to create integrated Q8 attention QKV command encoder");
         }
-        uocr_metal_attention_qkv_q8_params params;
-        params.n_tokens = n_tokens;
-        params.hidden_size = UOCR_HIDDEN_SIZE;
-        params.group_size = UOCR_Q8_GROUP_SIZE_DEFAULT;
+        uocr_metal_decode_gemv_q8_params params;
+        params.k = UOCR_HIDDEN_SIZE;
+        params.n = UOCR_HIDDEN_SIZE;
         params.groups_per_row = UOCR_HIDDEN_SIZE / UOCR_Q8_GROUP_SIZE_DEFAULT;
+        params.has_residual = 0u;
         [enc setComputePipelineState:pipeline];
         [enc setBuffer:src.buffer offset:src.offset atIndex:0u];
         [enc setBuffer:q_weight->buffer offset:q_weight->offset atIndex:1u];
@@ -12310,9 +12310,9 @@ static int metal_run_attention_qkv_buffer_q8_0(uocr_metal_context *ctx,
         [enc setBuffer:k_dst.buffer offset:k_dst.offset atIndex:8u];
         [enc setBuffer:v_dst.buffer offset:v_dst.offset atIndex:9u];
         [enc setBytes:&params length:sizeof(params) atIndex:10u];
-        [enc setThreadgroupMemoryLength:threads * sizeof(float) atIndex:0u];
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)output_values, 1u, 1u)
-             threadsPerThreadgroup:MTLSizeMake(threads, 1u, 1u)];
+        const NSUInteger rows_per_tg = metal_decode_gemv_rows_per_threadgroup(pipeline);
+        [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)UOCR_HIDDEN_SIZE * 3u + rows_per_tg - 1u) / rows_per_tg, 1u, 1u)
+             threadsPerThreadgroup:MTLSizeMake(128u, 1u, 1u)];
         [enc endEncoding];
         return metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, "integrated Q8 attention QKV", error, error_size);
     }
@@ -12843,76 +12843,24 @@ static int metal_run_dense_swiglu_buffer_q8_0(uocr_metal_context *ctx,
         }
     }
 
-    @autoreleasepool {
-        /* Decode path: per-output GEMV kernels (n_tokens == 1). */
-        id<MTLComputePipelineState> gate_pipeline = metal_get_decoder_shape_pipeline(ctx,
-                                                                                     "uocr_dense_swiglu_gate_up_q8_0_to_f16",
-                                                                                     error,
-                                                                                     error_size);
-        if (gate_pipeline == nil) {
-            return 0;
-        }
-        id<MTLComputePipelineState> down_pipeline = metal_get_decoder_shape_pipeline(ctx, "uocr_dense_swiglu_down_q8_0_to_f16", error, error_size);
-        if (down_pipeline == nil) {
-            return 0;
-        }
-        int owned_command_buffer = 0;
-        id<MTLCommandBuffer> cb = metal_command_buffer_for_op(ctx, &owned_command_buffer, op, error, error_size);
-        if (cb == nil) {
-            return 0;
-        }
-
-        uocr_metal_dense_swiglu_q8_params gate_params;
-        gate_params.n_tokens = n_tokens;
-        gate_params.hidden_size = UOCR_HIDDEN_SIZE;
-        gate_params.intermediate_size = intermediate_size;
-        gate_params.has_residual = has_residual ? 1u : 0u;
-        gate_params.group_size = UOCR_Q8_GROUP_SIZE_DEFAULT;
-        gate_params.groups_per_row = groups_per_row_hidden;
-        gate_params.reserved0 = 0u;
-        gate_params.reserved1 = 0u;
-
-        uocr_metal_dense_swiglu_q8_params down_params = gate_params;
-        down_params.groups_per_row = groups_per_row_inter;
-
-        /* gate + up → mid */
-        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
-        if (enc == nil) {
-            return metal_fail(error, error_size, "failed to create %s gate/up command encoder", op);
-        }
-        const NSUInteger gate_threads = metal_power2_threadgroup_width(64u, gate_pipeline.maxTotalThreadsPerThreadgroup);
-        [enc setComputePipelineState:gate_pipeline];
-        [enc setBuffer:input.buffer offset:input.offset atIndex:0u];
-        [enc setBuffer:gate_weight->buffer offset:gate_weight->offset atIndex:1u];
-        [enc setBuffer:up_weight->buffer offset:up_weight->offset atIndex:2u];
-        [enc setBuffer:gate_weight->scale_buffer offset:gate_weight->scale_offset atIndex:3u];
-        [enc setBuffer:up_weight->scale_buffer offset:up_weight->scale_offset atIndex:4u];
-        [enc setBuffer:mid.buffer offset:mid.offset atIndex:5u];
-        [enc setBytes:&gate_params length:sizeof(gate_params) atIndex:6u];
-        [enc setThreadgroupMemoryLength:gate_threads * 2u * sizeof(float) atIndex:0u];
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)gate_values, 1u, 1u)
-             threadsPerThreadgroup:MTLSizeMake(gate_threads, 1u, 1u)];
-        [enc endEncoding];
-
-        /* down → dst (+ residual) */
-        enc = metal_compute_command_encoder(ctx, cb);
-        if (enc == nil) {
-            return metal_fail(error, error_size, "failed to create %s down command encoder", op);
-        }
-        const NSUInteger down_threads = metal_power2_threadgroup_width(256u, down_pipeline.maxTotalThreadsPerThreadgroup);
-        [enc setComputePipelineState:down_pipeline];
-        [enc setBuffer:mid.buffer offset:mid.offset atIndex:0u];
-        [enc setBuffer:down_weight->buffer offset:down_weight->offset atIndex:1u];
-        [enc setBuffer:down_weight->scale_buffer offset:down_weight->scale_offset atIndex:2u];
-        [enc setBuffer:(has_residual ? residual.buffer : input.buffer) offset:(has_residual ? residual.offset : input.offset) atIndex:3u];
-        [enc setBuffer:dst.buffer offset:dst.offset atIndex:4u];
-        [enc setBytes:&down_params length:sizeof(down_params) atIndex:5u];
-        [enc setThreadgroupMemoryLength:down_threads * sizeof(float) atIndex:0u];
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)down_values, 1u, 1u)
-             threadsPerThreadgroup:MTLSizeMake(down_threads, 1u, 1u)];
-        [enc endEncoding];
-        return metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, op, error, error_size);
-    }
+    /* Decode path (n_tokens == 1): simdgroup-per-row GEMV kernels. */
+    (void)gate_values;
+    (void)down_values;
+    (void)groups_per_row_hidden;
+    (void)groups_per_row_inter;
+    return metal_run_decode_dense_swiglu_one_q8_0(ctx,
+                                                  input,
+                                                  gate_weight,
+                                                  up_weight,
+                                                  down_weight,
+                                                  residual,
+                                                  has_residual,
+                                                  intermediate_size,
+                                                  mid,
+                                                  dst,
+                                                  op,
+                                                  error,
+                                                  error_size);
 }
 
 static int metal_run_dense_swiglu_buffer_f16(uocr_metal_context *ctx,
@@ -13398,117 +13346,54 @@ static int metal_run_moe_interleaved_decode_fused_combine_buffer_q8_0(
                                                    error_size);
     }
     @autoreleasepool {
-        const int use_decode_kernels = (n_tokens == 1u);
-        const int use_tiled_routed_gate_up = use_decode_kernels;
-        const uint32_t routed_top_k =
-            use_decode_kernels ? (uint32_t)UOCR_METAL_DECODE_MOE_TOP_K : (uint32_t)UOCR_MOE_TOP_K;
-
-        id<MTLComputePipelineState> gate_pipeline = nil;
-        id<MTLComputePipelineState> down_combine_pipeline = nil;
-        if (use_decode_kernels) {
-            gate_pipeline = metal_get_pipeline(ctx,
-                                                use_tiled_routed_gate_up ?
-                                                    "uocr_moe_decode_interleaved_gate_up_tile4_q8_0_to_f16" :
-                                                    "uocr_moe_decode_interleaved_gate_up_one_q8_0_to_f16",
-                                                error, error_size);
-            down_combine_pipeline = metal_get_pipeline(ctx,
-                                                        use_tiled_routed_gate_up ?
-                                                            "uocr_moe_decode_interleaved_down_sum_combine_tile4_q8_0_to_f16" :
-                                                            "uocr_moe_decode_interleaved_down_sum_combine_one_q8_0_to_f16",
-                                                        error, error_size);
-        } else {
-            /* Prefill uses the non-tiled decode gate/up kernel with n_tokens > 1,
-             * and the non-tiled decode down/combine kernel.  The decode kernel
-             * params struct is used for both since it has the same layout. */
-            gate_pipeline = metal_get_pipeline(ctx,
-                                                "uocr_moe_decode_interleaved_gate_up_one_q8_0_to_f16",
-                                                error, error_size);
-            down_combine_pipeline = metal_get_pipeline(ctx,
-                                                        "uocr_moe_decode_interleaved_down_sum_combine_one_q8_0_to_f16",
-                                                        error, error_size);
-        }
+        /* Decode (n_tokens == 1): simdgroup-per-row GEMV kernels. */
+        const uint32_t routed_top_k = (uint32_t)UOCR_METAL_DECODE_MOE_TOP_K;
+        id<MTLComputePipelineState> gate_pipeline = metal_get_pipeline(ctx, "uocr_moe_decode_gate_up_gemv_q8_0_to_f16", error, error_size);
+        id<MTLComputePipelineState> down_combine_pipeline = metal_get_pipeline(ctx, "uocr_moe_decode_down_combine_gemv_q8_0_to_f16", error, error_size);
         if (gate_pipeline == nil || down_combine_pipeline == nil) {
             return 0;
-        }
-        if (use_tiled_routed_gate_up &&
-            gate_pipeline.maxTotalThreadsPerThreadgroup < (NSUInteger)UOCR_METAL_MOE_ROUTED_GATE_UP_TILED_THREADS) {
-            return metal_fail(error, error_size,
-                              "integrated routed MoE Q8 tiled gate/up pipeline supports only %llu threads; need %u",
-                              (unsigned long long)gate_pipeline.maxTotalThreadsPerThreadgroup,
-                              UOCR_METAL_MOE_ROUTED_GATE_UP_TILED_THREADS);
         }
         int owned_command_buffer = 0;
         id<MTLCommandBuffer> cb = metal_command_buffer_for_op(ctx, &owned_command_buffer, "integrated routed MoE Q8 fused combine", error, error_size);
         if (cb == nil) {
             return 0;
         }
-        uocr_metal_moe_decode_interleaved_q8_params params;
-        params.hidden_size = UOCR_HIDDEN_SIZE;
-        params.intermediate_size = UOCR_MOE_EXPERT_INTERMEDIATE;
-        params.expert_count = UOCR_ROUTED_EXPERTS;
-        params.top_k = routed_top_k;
-        params.expert_stride_values = (uint32_t)(projection_values * 3u);
-        params.up_offset_values = (uint32_t)projection_values;
-        params.down_offset_values = (uint32_t)(projection_values * 2u);
-        params.expert_scale_stride_values = (uint32_t)(projection_scale_values * 3u);
-        params.up_scale_offset_values = (uint32_t)projection_scale_values;
-        params.down_scale_offset_values = (uint32_t)(projection_scale_values * 2u);
-        params.group_size = UOCR_Q8_GROUP_SIZE_DEFAULT;
-        params.reserved = 0u;
-
-        /* The decode Q8 kernel uses n_tokens from the params struct for the
-         * prefill path, but the decode struct doesn't have n_tokens.  For
-         * prefill, we use the prefill Q8 params.  For decode, the decode
-         * struct.  Both share the same kernel which reads n_tokens from the
-         * constant buffer.  The decode kernel struct has no n_tokens field,
-         * so for prefill we need the prefill struct.  To keep it simple, we
-         * always use the prefill struct (which has n_tokens) for the gate/up
-         * kernel, and the appropriate struct for down/combine. */
-        uocr_metal_moe_prefill_interleaved_q8_params prefill_params;
-        prefill_params.n_tokens = n_tokens;
-        prefill_params.hidden_size = UOCR_HIDDEN_SIZE;
-        prefill_params.intermediate_size = UOCR_MOE_EXPERT_INTERMEDIATE;
-        prefill_params.expert_count = UOCR_ROUTED_EXPERTS;
-        prefill_params.top_k = routed_top_k;
-        prefill_params.expert_stride_values = (uint32_t)(projection_values * 3u);
-        prefill_params.up_offset_values = (uint32_t)projection_values;
-        prefill_params.down_offset_values = (uint32_t)(projection_values * 2u);
-        prefill_params.expert_scale_stride_values = (uint32_t)(projection_scale_values * 3u);
-        prefill_params.up_scale_offset_values = (uint32_t)projection_scale_values;
-        prefill_params.down_scale_offset_values = (uint32_t)(projection_scale_values * 2u);
-        prefill_params.group_size = UOCR_Q8_GROUP_SIZE_DEFAULT;
+        uocr_metal_moe_prefill_interleaved_q8_params gemv_params;
+        gemv_params.n_tokens = 1u;
+        gemv_params.hidden_size = UOCR_HIDDEN_SIZE;
+        gemv_params.intermediate_size = UOCR_MOE_EXPERT_INTERMEDIATE;
+        gemv_params.expert_count = UOCR_ROUTED_EXPERTS;
+        gemv_params.top_k = routed_top_k;
+        gemv_params.expert_stride_values = (uint32_t)(projection_values * 3u);
+        gemv_params.up_offset_values = (uint32_t)projection_values;
+        gemv_params.down_offset_values = (uint32_t)(projection_values * 2u);
+        gemv_params.expert_scale_stride_values = (uint32_t)(projection_scale_values * 3u);
+        gemv_params.up_scale_offset_values = (uint32_t)projection_scale_values;
+        gemv_params.down_scale_offset_values = (uint32_t)(projection_scale_values * 2u);
+        gemv_params.group_size = UOCR_Q8_GROUP_SIZE_DEFAULT;
 
         id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
         if (enc == nil) {
             return metal_fail(error, error_size, "failed to create integrated routed MoE Q8 gate/up encoder");
         }
-        const NSUInteger gate_threads = use_tiled_routed_gate_up ?
-            metal_power2_threadgroup_width((NSUInteger)UOCR_METAL_MOE_ROUTED_GATE_UP_TILED_THREADS,
-                                           gate_pipeline.maxTotalThreadsPerThreadgroup) :
-            metal_power2_threadgroup_width(n_tokens == 1u ? 256u : 64u, gate_pipeline.maxTotalThreadsPerThreadgroup);
-        const NSUInteger gate_threadgroups = use_tiled_routed_gate_up ?
-            (NSUInteger)n_tokens * (NSUInteger)routed_top_k *
-                (((NSUInteger)UOCR_MOE_EXPERT_INTERMEDIATE + (NSUInteger)UOCR_METAL_MOE_ROUTED_GATE_UP_TILE_COLUMNS - 1u) /
-                 (NSUInteger)UOCR_METAL_MOE_ROUTED_GATE_UP_TILE_COLUMNS) :
-            (NSUInteger)n_tokens * (NSUInteger)routed_top_k * (NSUInteger)UOCR_MOE_EXPERT_INTERMEDIATE;
+        const NSUInteger gate_rows = (NSUInteger)routed_top_k * (NSUInteger)UOCR_MOE_EXPERT_INTERMEDIATE;
+        const NSUInteger gate_rows_per_tg = metal_decode_gemv_rows_per_threadgroup(gate_pipeline);
         [enc setComputePipelineState:gate_pipeline];
         [enc setBuffer:input.buffer offset:input.offset atIndex:0u];
         [enc setBuffer:top_ids.buffer offset:top_ids.offset atIndex:1u];
         [enc setBuffer:expert_qweight_slab.buffer offset:expert_qweight_slab.offset atIndex:2u];
         [enc setBuffer:expert_qscale_slab.buffer offset:expert_qscale_slab.offset atIndex:3u];
         [enc setBuffer:mid.buffer offset:mid.offset atIndex:4u];
-        [enc setBytes:&prefill_params length:sizeof(prefill_params) atIndex:5u];
-        [enc setThreadgroupMemoryLength:gate_threads * 2u * sizeof(float) atIndex:0u];
-        [enc dispatchThreadgroups:MTLSizeMake(gate_threadgroups, 1u, 1u)
-             threadsPerThreadgroup:MTLSizeMake(gate_threads, 1u, 1u)];
+        [enc setBytes:&gemv_params length:sizeof(gemv_params) atIndex:5u];
+        [enc dispatchThreadgroups:MTLSizeMake((gate_rows + gate_rows_per_tg - 1u) / gate_rows_per_tg, 1u, 1u)
+             threadsPerThreadgroup:MTLSizeMake(128u, 1u, 1u)];
         [enc endEncoding];
 
         enc = metal_compute_command_encoder(ctx, cb);
         if (enc == nil) {
             return metal_fail(error, error_size, "failed to create integrated routed MoE Q8 down/combine encoder");
         }
-        const NSUInteger down_threads = metal_power2_threadgroup_width(n_tokens == 1u ? 256u : 64u,
-                                                                       down_combine_pipeline.maxTotalThreadsPerThreadgroup);
+        const NSUInteger down_rows_per_tg = metal_decode_gemv_rows_per_threadgroup(down_combine_pipeline);
         [enc setComputePipelineState:down_combine_pipeline];
         [enc setBuffer:mid.buffer offset:mid.offset atIndex:0u];
         [enc setBuffer:top_ids.buffer offset:top_ids.offset atIndex:1u];
@@ -13518,15 +13403,9 @@ static int metal_run_moe_interleaved_decode_fused_combine_buffer_q8_0(
         [enc setBuffer:shared.buffer offset:shared.offset atIndex:5u];
         [enc setBuffer:residual.buffer offset:residual.offset atIndex:6u];
         [enc setBuffer:dst.buffer offset:dst.offset atIndex:7u];
-        [enc setBytes:&prefill_params length:sizeof(prefill_params) atIndex:8u];
-        [enc setThreadgroupMemoryLength:down_threads * sizeof(float) atIndex:0u];
-        {
-            const NSUInteger down_threadgroups = use_tiled_routed_gate_up ?
-                (NSUInteger)n_tokens * (((NSUInteger)UOCR_HIDDEN_SIZE + 4u - 1u) / 4u) :
-                (NSUInteger)down_values;
-            [enc dispatchThreadgroups:MTLSizeMake(down_threadgroups, 1u, 1u)
-                 threadsPerThreadgroup:MTLSizeMake(down_threads, 1u, 1u)];
-        }
+        [enc setBytes:&gemv_params length:sizeof(gemv_params) atIndex:8u];
+        [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)UOCR_HIDDEN_SIZE + down_rows_per_tg - 1u) / down_rows_per_tg, 1u, 1u)
+             threadsPerThreadgroup:MTLSizeMake(128u, 1u, 1u)];
         [enc endEncoding];
         return metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, "integrated routed MoE Q8 fused combine", error, error_size);
     }

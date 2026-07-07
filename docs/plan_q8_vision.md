@@ -396,7 +396,18 @@ Checklist:
       transient scratch (pairs x hidden fp16).  Overdispatched tile slots
       resolve their bucket via a tile-prefix binary search.  Measured at 1024
       prompt tokens: ~528 ms -> ~29 ms per MoE layer (~18x).  Decode
-      (n_tokens == 1) keeps the GEMV kernels.
+      (n_tokens == 1) keeps GEMV kernels.
+* [x] Decode-phase GEMV rework (`decode_gemv_q8.metal`): single-token decode
+      is weight-bandwidth-bound (~573 MB of Q8 weights per token), but the
+      original decode kernels (one threadgroup + tree reduction per output
+      element, scalar int8 loads) reached only 11-44% of streaming bandwidth.
+      Replaced with simdgroup-per-row GEMV kernels (char4 weight / half4
+      activation loads, simd_sum only, no threadgroup barriers) for decode
+      QKV, O+residual, dense/shared SwiGLU gate/up + down, and routed-MoE
+      gate/up + down/combine; the LM-head argmax lanes switched to char4
+      loads.  Measured per-kernel: QKV 3.2x, O 2.0x, shared MLP 2.1x, MoE
+      routed 2.5x, LM head 2.3x (now at full streaming bandwidth); estimated
+      ~2.4x end-to-end decode throughput.
 * [x] Add fragments to `tools/gen_metal.py` near the matching fp16 files.
 * [x] Regenerate `src/backend/metal/kernels/uocr_smoke.metal`.
 * [x] Verify both source-compiled and precompiled Metal builds.

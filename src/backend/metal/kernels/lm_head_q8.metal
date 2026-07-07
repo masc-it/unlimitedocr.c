@@ -125,10 +125,13 @@ static inline void uocr_lm_head_q8_threadgroup_argmax_pair(thread float &best_sc
             const uint group_start = group * group_size;
             const uint group_end = min(group_start + group_size, hidden_size);
             const float scale = float(qscale[scale_base + ulong(group)]);
-            for (uint k = group_start + lane; k < group_end; k += lanes) {
-                const float x = float(hidden_tg[k]);
-                const float q = float(int(qweight[weight_base + ulong(k)]));
-                sum += x * (q * scale);
+            /* group_size and lane strides are multiples of 4: char4/half4 runs
+             * stay aligned and inside the group. */
+            for (uint k = group_start + lane * 4u; k + 3u < group_end; k += lanes * 4u) {
+                const char4 w = *(device const char4 *)(qweight + weight_base + ulong(k));
+                const half4 x = *(threadgroup const half4 *)(hidden_tg + k);
+                sum += (float(x.x) * float(w.x) + float(x.y) * float(w.y) +
+                        float(x.z) * float(w.z) + float(x.w) * float(w.w)) * scale;
             }
         }
     }

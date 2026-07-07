@@ -16,6 +16,7 @@ ORDER = [
     "common.metal",
     "dense.metal",
     "dense_q8.metal",
+    "decode_gemv_q8.metal",
     "norm.metal",
     "sam.metal",
     "gemm_q8.metal",
