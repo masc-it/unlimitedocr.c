@@ -29,7 +29,7 @@ modules:
   - name: lm_head
     family: LM_HEAD
     projections: [WEIGHT]
-    supported: false
+    supported: true
 
   - name: attention_qkv
     family: LAYER_ATTN

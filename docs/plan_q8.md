@@ -172,7 +172,7 @@ Checklist:
 * [x] Add `--quant-group-size`, default `64`.
 * [x] Add `--quant-policy embeddings+decoder` as the only accepted Q8 policy for this deliverable; reject other policy strings with a clear error.
 * [x] Add `--quant-cfg` (default `configs/quant-cfg.yaml`) gating which modules are actually quantized to the runtime-supported subset.
-* [x] Quantize LM head unconditionally under `mixed-q8_0` *when the cfg marks it supported* (currently `supported: false` until the Q8 LM-head kernel lands).
+* [x] Quantize LM head unconditionally under `mixed-q8_0` *when the cfg marks it supported*; `configs/quant-cfg.yaml` now enables LM head after the fused Q8 argmax path landed.
 * [x] Keep router weights fp16 unconditionally under `mixed-q8_0`.
 * [x] Add `--dump-quant-summary` and `--dry-run` behavior consistent with existing planning.
 * [x] Bump `CONVERTER_VERSION` to `(0, 2, 0)`.
@@ -332,9 +332,9 @@ Current fast path is `uocr_lm_head_argmax_f16`; the env-selectable MPS path writ
 
 Checklist:
 
-* [ ] Add fused Q8 LM-head argmax kernel for qweight/qscale `[vocab, hidden]`; dequantization, dot product, and per-tile argmax stay in the kernel path without materializing full logits. The kernel writes only the existing partial score/id outputs.
-* [ ] Force the custom Q8 LM-head argmax path when LM-head qtype is Q8_0; ignore `UOCR_METAL_LM_HEAD_SELECTION_BACKEND=mps` for Q8_0 and emit a profile/debug note.
-* [ ] Preserve the partial argmax output flow.
+* [x] Add fused Q8 LM-head argmax kernel for qweight/qscale `[vocab, hidden]`; dequantization, dot product, and per-tile argmax stay in the kernel path without materializing full logits. The kernel writes only the existing partial score/id outputs.
+* [x] Force the custom Q8 LM-head argmax path when LM-head qtype is Q8_0; ignore `UOCR_METAL_LM_HEAD_SELECTION_BACKEND=mps` for Q8_0 and emit a profile/debug note.
+* [x] Preserve the partial argmax output flow.
 
 ---
 
@@ -399,21 +399,20 @@ passes an end-to-end OCR run against the fp16 baseline.
 
 4. **Q8 embedding (runtime-safe, QA'd)** ✅
    * fused Q8 embedding kernel for prompt assembly + generated-token embedding;
-   * `configs/quant-cfg.yaml` ships `token_embedding` as the only `supported: true` module;
+   * `configs/quant-cfg.yaml` initially shipped `token_embedding` as the first `supported: true` module;
    * end-to-end QA on a real `unlimitedocr-q8.uocr` file passes.
 
-5. **Attention Q8** (in progress)
-   * prefill Q/K/V fused Q8 kernel landed and dispatch wired;
-   * decode Q/K/V and O projection still fp16 — `attention_qkv`/`attention_output` stay `supported: false` until decode paths land and pass QA.
+5. **Attention Q8** ✅
+   * prefill/decode Q/K/V and O projection fused Q8 kernels are wired and enabled.
 
-6. **Dense/shared MLP Q8**
-   * fused gate+up Q8 kernels and fused down Q8 kernels; QA before enabling.
+6. **Dense/shared MLP Q8** ✅
+   * fused gate+up/down Q8 kernels are wired and enabled.
 
-7. **Routed MoE Q8**
-   * Q8 expert slabs and selected-expert kernels; QA before enabling.
+7. **Routed MoE Q8** ✅
+   * Q8 expert slabs and selected-expert kernels are wired and enabled.
 
 8. **LM head Q8**
-   * fused Q8 LM-head argmax; QA before enabling.
+   * fused Q8 LM-head argmax is wired and enabled for QA.
 
 9. **Docs/tests/profiling**
    * converter docs;
@@ -433,12 +432,12 @@ Model:
 
 Quantized families (runtime-supported subset, gated by configs/quant-cfg.yaml):
   token embedding                      ✅ QA'd
-  decoder attention Q/K/V (prefill)     kernel landed, decode path pending QA gate
-  decoder attention O projection        pending
-  decoder dense MLP                     pending
-  decoder MoE routed experts            pending
-  decoder MoE shared experts            pending
-  LM head                               pending
+  decoder attention Q/K/V               ✅ QA'd
+  decoder attention O projection        ✅ QA'd
+  decoder dense MLP                     ✅ QA'd
+  decoder MoE routed experts            ✅ QA'd
+  decoder MoE shared experts            ✅ QA'd
+  LM head                               enabled for QA
   router                                always fp16
 
 Runtime:

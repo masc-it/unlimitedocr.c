@@ -1305,6 +1305,17 @@ typedef struct uocr_metal_lm_head_argmax_params {
     uint32_t reserved1;
 } uocr_metal_lm_head_argmax_params;
 
+typedef struct uocr_metal_lm_head_argmax_q8_params {
+    uint32_t vocab_size;
+    uint32_t hidden_size;
+    uint32_t tile_tokens;
+    uint32_t lanes_per_token;
+    uint32_t group_size;
+    uint32_t groups_per_row;
+    uint32_t partial_count;
+    uint32_t reserved0;
+} uocr_metal_lm_head_argmax_q8_params;
+
 typedef struct uocr_metal_argmax_pairs_params {
     uint32_t count;
     uint32_t reserved0;
@@ -1314,6 +1325,8 @@ typedef struct uocr_metal_argmax_pairs_params {
 
 _Static_assert(sizeof(uocr_metal_lm_head_argmax_params) == 32u,
                "uocr_metal_lm_head_argmax_params ABI mismatch");
+_Static_assert(sizeof(uocr_metal_lm_head_argmax_q8_params) == 32u,
+               "uocr_metal_lm_head_argmax_q8_params ABI mismatch");
 _Static_assert(sizeof(uocr_metal_argmax_pairs_params) == 16u,
                "uocr_metal_argmax_pairs_params ABI mismatch");
 
@@ -10599,6 +10612,100 @@ static int metal_run_lm_head_argmax_f16(uocr_metal_context *ctx,
     }
 }
 
+static int metal_run_lm_head_argmax_q8_0(uocr_metal_context *ctx,
+                                         uocr_metal_buffer_slice input,
+                                         uocr_metal_buffer_slice partial_scores,
+                                         uocr_metal_buffer_slice partial_ids,
+                                         uint32_t partial_count,
+                                         char *error,
+                                         size_t error_size) {
+    const uint64_t input_bytes = (uint64_t)UOCR_HIDDEN_SIZE * 2u;
+    const uint64_t qweight_bytes = (uint64_t)UOCR_VOCAB_SIZE * (uint64_t)UOCR_HIDDEN_SIZE;
+    const uint64_t qscale_bytes = uocr_q8_0_qscale_bytes(UOCR_VOCAB_SIZE,
+                                                         UOCR_HIDDEN_SIZE,
+                                                         UOCR_Q8_GROUP_SIZE_DEFAULT);
+    uint64_t partial_bytes = 0u;
+    const uint32_t expected_partials = (UOCR_VOCAB_SIZE + UOCR_METAL_LM_HEAD_ARGMAX_TILE_TOKENS - 1u) /
+                                       UOCR_METAL_LM_HEAD_ARGMAX_TILE_TOKENS;
+    if (ctx == NULL || partial_count != expected_partials || qscale_bytes == 0u ||
+        !checked_mul_u64((uint64_t)partial_count, (uint64_t)sizeof(float), &partial_bytes) ||
+        !metal_slice_valid(input, input_bytes) ||
+        !metal_slice_valid(partial_scores, partial_bytes) || !metal_slice_valid(partial_ids, partial_bytes)) {
+        return metal_fail(error, error_size, "invalid integrated Q8 LM-head argmax request");
+    }
+    const uocr_metal_decoder_binding *lm_head = metal_require_decoder_binding_index(ctx,
+                                                                                    ctx->decoder_bindings.lm_head,
+                                                                                    "LM head",
+                                                                                    error,
+                                                                                    error_size);
+    if (lm_head == NULL) {
+        return 0;
+    }
+    if (lm_head->qtype != UOCR_TENSOR_Q8_0 || lm_head->rows != UOCR_VOCAB_SIZE ||
+        lm_head->cols != UOCR_HIDDEN_SIZE || lm_head->group_size != UOCR_Q8_GROUP_SIZE_DEFAULT ||
+        lm_head->groups_per_row != UOCR_HIDDEN_SIZE / UOCR_Q8_GROUP_SIZE_DEFAULT ||
+        lm_head->payload_size != qweight_bytes || lm_head->scale_size != qscale_bytes ||
+        !metal_buffer_range_valid(lm_head->buffer, lm_head->offset, qweight_bytes) ||
+        !metal_buffer_range_valid(lm_head->scale_buffer, lm_head->scale_offset, qscale_bytes)) {
+        return metal_fail(error, error_size, "invalid integrated Q8 LM-head binding");
+    }
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline = metal_get_decoder_shape_pipeline(ctx, "uocr_lm_head_argmax_q8_0_to_f16", error, error_size);
+        if (pipeline == nil) {
+            return 0;
+        }
+        const NSUInteger threads = (NSUInteger)UOCR_METAL_LM_HEAD_ARGMAX_THREADS;
+        if (pipeline.maxTotalThreadsPerThreadgroup < threads) {
+            return metal_fail(error,
+                              error_size,
+                              "integrated Q8 LM-head argmax requires %u threads per threadgroup, device supports %llu",
+                              UOCR_METAL_LM_HEAD_ARGMAX_THREADS,
+                              (unsigned long long)pipeline.maxTotalThreadsPerThreadgroup);
+        }
+        const uint64_t sum_bytes = (uint64_t)threads * (uint64_t)sizeof(float);
+        const uint64_t id_bytes = (uint64_t)threads * (uint64_t)sizeof(uint32_t);
+        const uint64_t hidden_bytes = (uint64_t)UOCR_HIDDEN_SIZE * 2u;
+        uint64_t tg_bytes = 0u;
+        if (!checked_add_u64(sum_bytes, id_bytes, &tg_bytes) ||
+            !checked_add_u64(tg_bytes, hidden_bytes, &tg_bytes) ||
+            tg_bytes > (uint64_t)ctx->device.maxThreadgroupMemoryLength) {
+            return metal_fail(error, error_size, "integrated Q8 LM-head argmax threadgroup memory exceeds device limit");
+        }
+        int owned_command_buffer = 0;
+        id<MTLCommandBuffer> cb = metal_command_buffer_for_op(ctx, &owned_command_buffer, "integrated Q8 LM-head argmax", error, error_size);
+        if (cb == nil) {
+            return 0;
+        }
+        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
+        if (enc == nil) {
+            return metal_fail(error, error_size, "failed to create integrated Q8 LM-head argmax encoder");
+        }
+        uocr_metal_lm_head_argmax_q8_params params;
+        params.vocab_size = UOCR_VOCAB_SIZE;
+        params.hidden_size = UOCR_HIDDEN_SIZE;
+        params.tile_tokens = UOCR_METAL_LM_HEAD_ARGMAX_TILE_TOKENS;
+        params.lanes_per_token = UOCR_METAL_LM_HEAD_ARGMAX_LANES_PER_TOKEN;
+        params.group_size = UOCR_Q8_GROUP_SIZE_DEFAULT;
+        params.groups_per_row = UOCR_HIDDEN_SIZE / UOCR_Q8_GROUP_SIZE_DEFAULT;
+        params.partial_count = partial_count;
+        params.reserved0 = 0u;
+        [enc setComputePipelineState:pipeline];
+        [enc setBuffer:input.buffer offset:input.offset atIndex:0u];
+        [enc setBuffer:lm_head->buffer offset:lm_head->offset atIndex:1u];
+        [enc setBuffer:lm_head->scale_buffer offset:lm_head->scale_offset atIndex:2u];
+        [enc setBuffer:partial_scores.buffer offset:partial_scores.offset atIndex:3u];
+        [enc setBuffer:partial_ids.buffer offset:partial_ids.offset atIndex:4u];
+        [enc setBytes:&params length:sizeof(params) atIndex:5u];
+        [enc setThreadgroupMemoryLength:(NSUInteger)sum_bytes atIndex:0u];
+        [enc setThreadgroupMemoryLength:(NSUInteger)id_bytes atIndex:1u];
+        [enc setThreadgroupMemoryLength:(NSUInteger)hidden_bytes atIndex:2u];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)partial_count, 1u, 1u)
+             threadsPerThreadgroup:MTLSizeMake(threads, 1u, 1u)];
+        [enc endEncoding];
+        return metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, "integrated Q8 LM-head argmax", error, error_size);
+    }
+}
+
 static int metal_run_argmax_pairs_to_token(uocr_metal_context *ctx,
                                            uocr_metal_buffer_slice partial_scores,
                                            uocr_metal_buffer_slice partial_ids,
@@ -10692,7 +10799,7 @@ static int metal_run_lm_head_mps_path(uocr_metal_context *ctx,
     const uint64_t logits_bytes = (uint64_t)UOCR_VOCAB_SIZE * (uint64_t)sizeof(float);
     if (!metal_slice_valid(norm, (uint64_t)UOCR_HIDDEN_SIZE * 2u) ||
         !metal_slice_valid(logits_slice, logits_bytes) ||
-        !metal_slice_valid(ban_flags, (uint64_t)UOCR_VOCAB_SIZE) ||
+        (ban_flags.buffer != nil && !metal_slice_valid(ban_flags, (uint64_t)UOCR_VOCAB_SIZE)) ||
         !metal_slice_valid(token_slot, sizeof(int32_t)) ||
         !metal_slice_valid(score_slot, sizeof(float))) {
         return metal_fail(error, error_size, "invalid MPS LM head request");
@@ -10888,7 +10995,32 @@ static int metal_encode_chunk_step_selection_f16(
         return 0;
     }
 
-    if (metal_lm_head_backend_is_mps()) {
+    const uocr_metal_decoder_binding *lm_head =
+        metal_require_decoder_binding_index(ctx, ctx->decoder_bindings.lm_head,
+                                            "LM head", error, error_size);
+    if (lm_head == NULL) return 0;
+
+    if (lm_head->qtype == UOCR_TENSOR_Q8_0) {
+        if (metal_lm_head_backend_is_mps()) {
+            metal_profile_add_event_now(ctx, "metal.lm_head.q8_forced_custom", uocr_profile_now_ns());
+        }
+        if (!metal_run_lm_head_argmax_q8_0(ctx, norm_scratch,
+                                           selection_slices.partial_scores,
+                                           selection_slices.partial_ids,
+                                           selection_slices.partial_count,
+                                           error, error_size)) {
+            return 0;
+        }
+        if (!metal_run_argmax_pairs_to_token(ctx,
+                                             selection_slices.partial_scores,
+                                             selection_slices.partial_ids,
+                                             selection_slices.partial_count,
+                                             chunk_token_out,
+                                             chunk_score_out,
+                                             error, error_size)) {
+            return 0;
+        }
+    } else if (metal_lm_head_backend_is_mps()) {
         uocr_metal_buffer_slice lm_head_logits;
         if (!metal_lm_head_logits_scratch_slice(ctx, 0u, &lm_head_logits)) {
             return metal_fail(error, error_size, "MPS chunk LM head: failed to get lm_head_logits slice");
