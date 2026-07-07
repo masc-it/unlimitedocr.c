@@ -1369,6 +1369,13 @@ typedef struct uocr_metal_attention_output_params {
     uint32_t reserved1;
 } uocr_metal_attention_output_params;
 
+typedef struct uocr_metal_attention_qkv_q8_params {
+    uint32_t n_tokens;
+    uint32_t hidden_size;
+    uint32_t group_size;
+    uint32_t groups_per_row;
+} uocr_metal_attention_qkv_q8_params;
+
 typedef struct uocr_metal_dense_swiglu_params {
     uint32_t n_tokens;
     uint32_t hidden_size;
@@ -11526,6 +11533,81 @@ static int metal_run_decode_moe_router_one_f16(uocr_metal_context *ctx,
 }
 
 
+static int metal_run_attention_qkv_buffer_q8_0(uocr_metal_context *ctx,
+                                              uocr_metal_buffer_slice src,
+                                              const uocr_metal_decoder_binding *q_weight,
+                                              const uocr_metal_decoder_binding *k_weight,
+                                              const uocr_metal_decoder_binding *v_weight,
+                                              uint32_t n_tokens,
+                                              uocr_metal_buffer_slice q_dst,
+                                              uocr_metal_buffer_slice k_dst,
+                                              uocr_metal_buffer_slice v_dst,
+                                              char *error,
+                                              size_t error_size) {
+    const uint64_t hidden_bytes = (uint64_t)n_tokens * (uint64_t)UOCR_HIDDEN_SIZE * 2u;
+    const uint64_t weight_bytes = uocr_q8_0_qweight_bytes(UOCR_HIDDEN_SIZE, UOCR_HIDDEN_SIZE);
+    const uint64_t scale_bytes = uocr_q8_0_qscale_bytes(UOCR_HIDDEN_SIZE, UOCR_HIDDEN_SIZE, UOCR_Q8_GROUP_SIZE_DEFAULT);
+    if (ctx == NULL || q_weight == NULL || k_weight == NULL || v_weight == NULL || n_tokens == 0u ||
+        !metal_slice_valid(src, hidden_bytes) || !metal_slice_valid(q_dst, hidden_bytes) ||
+        !metal_slice_valid(k_dst, hidden_bytes) || !metal_slice_valid(v_dst, hidden_bytes)) {
+        return metal_fail(error, error_size, "invalid integrated Q8 attention QKV request");
+    }
+    const uocr_metal_decoder_binding *weights[3] = { q_weight, k_weight, v_weight };
+    for (uint32_t i = 0u; i < 3u; ++i) {
+        const uocr_metal_decoder_binding *w = weights[i];
+        if (w->qtype != UOCR_TENSOR_Q8_0 || w->rows != UOCR_HIDDEN_SIZE || w->cols != UOCR_HIDDEN_SIZE ||
+            w->group_size != UOCR_Q8_GROUP_SIZE_DEFAULT || w->payload_size != weight_bytes ||
+            w->scale_size != scale_bytes ||
+            !metal_buffer_range_valid(w->buffer, w->offset, weight_bytes) ||
+            !metal_buffer_range_valid(w->scale_buffer, w->scale_offset, scale_bytes)) {
+            return metal_fail(error, error_size, "invalid integrated Q8 attention QKV weight binding");
+        }
+    }
+    uint64_t output_values = 0u;
+    if (!checked_mul_u64((uint64_t)n_tokens, (uint64_t)UOCR_HIDDEN_SIZE * 3u, &output_values) ||
+        output_values > (uint64_t)UINT32_MAX) {
+        return metal_fail(error, error_size, "integrated Q8 attention QKV dispatch size overflow");
+    }
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, "uocr_attention_qkv_q8_0_to_f16_h1280_g64", error, error_size);
+        if (pipeline == nil) {
+            return 0;
+        }
+        const NSUInteger threads = metal_power2_threadgroup_width(256u, pipeline.maxTotalThreadsPerThreadgroup);
+        int owned_command_buffer = 0;
+        id<MTLCommandBuffer> cb = metal_command_buffer_for_op(ctx, &owned_command_buffer, "integrated Q8 attention QKV", error, error_size);
+        if (cb == nil) {
+            return 0;
+        }
+        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
+        if (enc == nil) {
+            return metal_fail(error, error_size, "failed to create integrated Q8 attention QKV command encoder");
+        }
+        uocr_metal_attention_qkv_q8_params params;
+        params.n_tokens = n_tokens;
+        params.hidden_size = UOCR_HIDDEN_SIZE;
+        params.group_size = UOCR_Q8_GROUP_SIZE_DEFAULT;
+        params.groups_per_row = UOCR_HIDDEN_SIZE / UOCR_Q8_GROUP_SIZE_DEFAULT;
+        [enc setComputePipelineState:pipeline];
+        [enc setBuffer:src.buffer offset:src.offset atIndex:0u];
+        [enc setBuffer:q_weight->buffer offset:q_weight->offset atIndex:1u];
+        [enc setBuffer:k_weight->buffer offset:k_weight->offset atIndex:2u];
+        [enc setBuffer:v_weight->buffer offset:v_weight->offset atIndex:3u];
+        [enc setBuffer:q_weight->scale_buffer offset:q_weight->scale_offset atIndex:4u];
+        [enc setBuffer:k_weight->scale_buffer offset:k_weight->scale_offset atIndex:5u];
+        [enc setBuffer:v_weight->scale_buffer offset:v_weight->scale_offset atIndex:6u];
+        [enc setBuffer:q_dst.buffer offset:q_dst.offset atIndex:7u];
+        [enc setBuffer:k_dst.buffer offset:k_dst.offset atIndex:8u];
+        [enc setBuffer:v_dst.buffer offset:v_dst.offset atIndex:9u];
+        [enc setBytes:&params length:sizeof(params) atIndex:10u];
+        [enc setThreadgroupMemoryLength:threads * sizeof(float) atIndex:0u];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)output_values, 1u, 1u)
+             threadsPerThreadgroup:MTLSizeMake(threads, 1u, 1u)];
+        [enc endEncoding];
+        return metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, "integrated Q8 attention QKV", error, error_size);
+    }
+}
+
 static int metal_run_attention_qkv_buffer_f16(uocr_metal_context *ctx,
                                               uocr_metal_buffer_slice src,
                                               const uocr_metal_decoder_binding *q_weight,
@@ -11538,9 +11620,25 @@ static int metal_run_attention_qkv_buffer_f16(uocr_metal_context *ctx,
                                               char *error,
                                               size_t error_size) {
     const uint64_t hidden_bytes = (uint64_t)n_tokens * (uint64_t)UOCR_HIDDEN_SIZE * 2u;
+    if (ctx == NULL || q_weight == NULL || k_weight == NULL || v_weight == NULL || n_tokens == 0u) {
+        return metal_fail(error, error_size, "invalid integrated attention QKV request");
+    }
+    if (q_weight->qtype == UOCR_TENSOR_Q8_0 && k_weight->qtype == UOCR_TENSOR_Q8_0 &&
+        v_weight->qtype == UOCR_TENSOR_Q8_0) {
+        return metal_run_attention_qkv_buffer_q8_0(ctx,
+                                                  src,
+                                                  q_weight,
+                                                  k_weight,
+                                                  v_weight,
+                                                  n_tokens,
+                                                  q_dst,
+                                                  k_dst,
+                                                  v_dst,
+                                                  error,
+                                                  error_size);
+    }
     const uint64_t weight_bytes = (uint64_t)UOCR_HIDDEN_SIZE * (uint64_t)UOCR_HIDDEN_SIZE * 2u;
-    if (ctx == NULL || q_weight == NULL || k_weight == NULL || v_weight == NULL || n_tokens == 0u ||
-        !metal_slice_valid(src, hidden_bytes) || !metal_slice_valid(q_dst, hidden_bytes) ||
+    if (!metal_slice_valid(src, hidden_bytes) || !metal_slice_valid(q_dst, hidden_bytes) ||
         !metal_slice_valid(k_dst, hidden_bytes) || !metal_slice_valid(v_dst, hidden_bytes) ||
         !metal_buffer_range_valid(q_weight->buffer, q_weight->offset, weight_bytes) ||
         !metal_buffer_range_valid(k_weight->buffer, k_weight->offset, weight_bytes) ||

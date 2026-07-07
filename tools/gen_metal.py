@@ -22,6 +22,7 @@ ORDER = [
     "attention_decode.metal",
     "attention_prefill.metal",
     "attention.metal",
+    "attention_q8.metal",
     "clip.metal",
     "clip_sam.metal",
     "embedding.metal",

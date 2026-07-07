@@ -268,7 +268,7 @@ Checklist:
 
 Checklist:
 
-* [ ] For prefill Q/K/V, add a fused Q8 QKV kernel and dispatch it from `metal_run_attention_qkv_buffer_*` when all three projection weights are Q8_0.
+* [x] For prefill Q/K/V, add a fused Q8 QKV kernel and dispatch it from `metal_run_attention_qkv_buffer_*` when all three projection weights are Q8_0.
 * [ ] For decode Q/K/V, add fused Q8 variants of the custom decode QKV path.
 * [ ] For O projection, add fused Q8 dequant-dot kernels before residual add for both decode and prefill.
 * [ ] Preserve RoPE, KV-cache write, flash attention, and residual add unchanged.
