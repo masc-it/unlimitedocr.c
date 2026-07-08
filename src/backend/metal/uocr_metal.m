@@ -2907,7 +2907,8 @@ static int metal_decoder_tensor_allows_q4(uint32_t family, uint32_t projection, 
     if (family == UOCR_TENSOR_FAMILY_LM_HEAD) {
         return projection == UOCR_TENSOR_PROJ_WEIGHT;
     }
-    return family == UOCR_TENSOR_FAMILY_MOE_EXPERT &&
+    return (family == UOCR_TENSOR_FAMILY_MOE_EXPERT || family == UOCR_TENSOR_FAMILY_MOE_SHARED ||
+            family == UOCR_TENSOR_FAMILY_LAYER_DENSE_MLP) &&
            (projection == UOCR_TENSOR_PROJ_GATE || projection == UOCR_TENSOR_PROJ_UP ||
             projection == UOCR_TENSOR_PROJ_DOWN);
 }
@@ -12129,6 +12130,21 @@ static int metal_run_decode_dense_swiglu_one_q8_0(uocr_metal_context *ctx,
                                                  char *error,
                                                  size_t error_size);
 
+static int metal_run_dense_swiglu_buffer_q4_0(uocr_metal_context *ctx,
+                                             uocr_metal_buffer_slice input,
+                                             const uocr_metal_decoder_binding *gate_weight,
+                                             const uocr_metal_decoder_binding *up_weight,
+                                             const uocr_metal_decoder_binding *down_weight,
+                                             uocr_metal_buffer_slice residual,
+                                             int has_residual,
+                                             uint32_t n_tokens,
+                                             uint32_t intermediate_size,
+                                             uocr_metal_buffer_slice mid,
+                                             uocr_metal_buffer_slice dst,
+                                             const char *op_name,
+                                             char *error,
+                                             size_t error_size);
+
 static int metal_run_decode_dense_swiglu_one_q8_0(uocr_metal_context *ctx,
                                                  uocr_metal_buffer_slice input,
                                                  const uocr_metal_decoder_binding *gate_weight,
@@ -12251,6 +12267,12 @@ static int metal_run_decode_dense_swiglu_one_f16(uocr_metal_context *ctx,
                                                  size_t error_size) {
     if (ctx == NULL || gate_weight == NULL || up_weight == NULL || down_weight == NULL) {
         return metal_fail(error, error_size, "invalid %s decode SwiGLU request", op_name);
+    }
+    if (gate_weight->qtype == UOCR_TENSOR_Q4_0 || up_weight->qtype == UOCR_TENSOR_Q4_0 ||
+        down_weight->qtype == UOCR_TENSOR_Q4_0) {
+        return metal_run_dense_swiglu_buffer_q4_0(ctx, input, gate_weight, up_weight, down_weight,
+                                                 residual, has_residual, 1u, intermediate_size,
+                                                 mid, dst, op_name, error, error_size);
     }
     if (gate_weight->qtype == UOCR_TENSOR_Q8_0 && up_weight->qtype == UOCR_TENSOR_Q8_0 &&
         down_weight->qtype == UOCR_TENSOR_Q8_0) {
@@ -13062,6 +13084,190 @@ static int metal_run_dense_swiglu_buffer_q8_0(uocr_metal_context *ctx,
                                                   error_size);
 }
 
+/*
+ * Q4_0 dense/shared SwiGLU: prefill uses the tiled Q4 GEMM twins, decode the
+ * simdgroup-per-row Q4 GEMV kernels.  Same structure as the Q8 path.
+ */
+static int metal_run_dense_swiglu_buffer_q4_0(uocr_metal_context *ctx,
+                                             uocr_metal_buffer_slice input,
+                                             const uocr_metal_decoder_binding *gate_weight,
+                                             const uocr_metal_decoder_binding *up_weight,
+                                             const uocr_metal_decoder_binding *down_weight,
+                                             uocr_metal_buffer_slice residual,
+                                             int has_residual,
+                                             uint32_t n_tokens,
+                                             uint32_t intermediate_size,
+                                             uocr_metal_buffer_slice mid,
+                                             uocr_metal_buffer_slice dst,
+                                             const char *op_name,
+                                             char *error,
+                                             size_t error_size) {
+    const char *op = op_name != NULL ? op_name : "Metal Q4 SwiGLU";
+    const uint64_t hidden_bytes = (uint64_t)n_tokens * (uint64_t)UOCR_HIDDEN_SIZE * 2u;
+    const uint64_t gate_qweight_bytes = uocr_q4_0_qweight_bytes(intermediate_size, UOCR_HIDDEN_SIZE);
+    const uint64_t gate_qscale_bytes = uocr_q4_0_qscale_bytes(intermediate_size, UOCR_HIDDEN_SIZE, UOCR_Q4_GROUP_SIZE_DEFAULT);
+    const uint64_t down_qweight_bytes = uocr_q4_0_qweight_bytes(UOCR_HIDDEN_SIZE, intermediate_size);
+    const uint64_t down_qscale_bytes = uocr_q4_0_qscale_bytes(UOCR_HIDDEN_SIZE, intermediate_size, UOCR_Q4_GROUP_SIZE_DEFAULT);
+    const uint64_t mid_bytes = (uint64_t)n_tokens * (uint64_t)intermediate_size * 2u;
+    uint64_t gate_values = (uint64_t)n_tokens * (uint64_t)intermediate_size;
+    uint64_t down_values = (uint64_t)n_tokens * (uint64_t)UOCR_HIDDEN_SIZE;
+
+    if (ctx == NULL || gate_weight == NULL || up_weight == NULL || down_weight == NULL || n_tokens == 0u ||
+        intermediate_size == 0u || gate_values > UINT32_MAX || down_values > UINT32_MAX ||
+        gate_qweight_bytes == 0u || gate_qscale_bytes == 0u || down_qweight_bytes == 0u || down_qscale_bytes == 0u ||
+        (intermediate_size % UOCR_Q4_GROUP_SIZE_DEFAULT) != 0u ||
+        gate_weight->qtype != UOCR_TENSOR_Q4_0 || up_weight->qtype != UOCR_TENSOR_Q4_0 ||
+        down_weight->qtype != UOCR_TENSOR_Q4_0 ||
+        gate_weight->group_size != UOCR_Q4_GROUP_SIZE_DEFAULT ||
+        up_weight->group_size != UOCR_Q4_GROUP_SIZE_DEFAULT ||
+        down_weight->group_size != UOCR_Q4_GROUP_SIZE_DEFAULT ||
+        gate_weight->payload_size != gate_qweight_bytes || gate_weight->scale_size != gate_qscale_bytes ||
+        up_weight->payload_size != gate_qweight_bytes || up_weight->scale_size != gate_qscale_bytes ||
+        down_weight->payload_size != down_qweight_bytes || down_weight->scale_size != down_qscale_bytes ||
+        !metal_slice_valid(input, hidden_bytes) || !metal_slice_valid(mid, mid_bytes) ||
+        !metal_slice_valid(dst, hidden_bytes) || (has_residual && !metal_slice_valid(residual, hidden_bytes)) ||
+        !metal_buffer_range_valid(gate_weight->buffer, gate_weight->offset, gate_qweight_bytes) ||
+        !metal_buffer_range_valid(gate_weight->scale_buffer, gate_weight->scale_offset, gate_qscale_bytes) ||
+        !metal_buffer_range_valid(up_weight->buffer, up_weight->offset, gate_qweight_bytes) ||
+        !metal_buffer_range_valid(up_weight->scale_buffer, up_weight->scale_offset, gate_qscale_bytes) ||
+        !metal_buffer_range_valid(down_weight->buffer, down_weight->offset, down_qweight_bytes) ||
+        !metal_buffer_range_valid(down_weight->scale_buffer, down_weight->scale_offset, down_qscale_bytes)) {
+        return metal_fail(error, error_size, "invalid %s request", op);
+    }
+
+    const uint32_t groups_per_row_hidden = UOCR_HIDDEN_SIZE / UOCR_Q4_GROUP_SIZE_DEFAULT;
+    const uint32_t groups_per_row_inter = intermediate_size / UOCR_Q4_GROUP_SIZE_DEFAULT;
+
+    if (n_tokens > 1u && (intermediate_size % UOCR_METAL_GEMM_Q8_BN) == 0u) {
+        /* Prefill: fused gate/up tiled Q4 GEMM + down tiled Q4 GEMM with residual. */
+        @autoreleasepool {
+            id<MTLComputePipelineState> gate_pipeline = metal_get_pipeline(ctx, "uocr_decoder_swiglu_gate_up_gemm_q4_0_to_f16", error, error_size);
+            id<MTLComputePipelineState> down_pipeline = metal_get_pipeline(ctx, "uocr_decoder_gemm_residual_q4_0_to_f16", error, error_size);
+            if (gate_pipeline == nil || down_pipeline == nil) {
+                return 0;
+            }
+            int owned_command_buffer = 0;
+            id<MTLCommandBuffer> cb = metal_command_buffer_for_op(ctx, &owned_command_buffer, op, error, error_size);
+            if (cb == nil) {
+                return 0;
+            }
+            const NSUInteger row_tiles = ((NSUInteger)n_tokens + UOCR_METAL_GEMM_Q8_BM - 1u) / UOCR_METAL_GEMM_Q8_BM;
+
+            uocr_metal_decoder_gemm_q8_params gate_params;
+            memset(&gate_params, 0, sizeof(gate_params));
+            gate_params.m = n_tokens;
+            gate_params.k = UOCR_HIDDEN_SIZE;
+            gate_params.n = intermediate_size;
+            gate_params.groups_per_row = groups_per_row_hidden;
+
+            id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
+            if (enc == nil) {
+                return metal_fail(error, error_size, "failed to create %s gate/up GEMM encoder", op);
+            }
+            [enc setComputePipelineState:gate_pipeline];
+            [enc setBuffer:input.buffer offset:input.offset atIndex:0u];
+            [enc setBuffer:gate_weight->buffer offset:gate_weight->offset atIndex:1u];
+            [enc setBuffer:up_weight->buffer offset:up_weight->offset atIndex:2u];
+            [enc setBuffer:gate_weight->scale_buffer offset:gate_weight->scale_offset atIndex:3u];
+            [enc setBuffer:up_weight->scale_buffer offset:up_weight->scale_offset atIndex:4u];
+            [enc setBuffer:mid.buffer offset:mid.offset atIndex:5u];
+            [enc setBytes:&gate_params length:sizeof(gate_params) atIndex:6u];
+            [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(intermediate_size / UOCR_METAL_GEMM_Q8_BN), row_tiles, 1u)
+                threadsPerThreadgroup:MTLSizeMake(UOCR_METAL_GEMM_Q8_THREADS, 1u, 1u)];
+            [enc endEncoding];
+
+            uocr_metal_decoder_gemm_q8_params down_params;
+            memset(&down_params, 0, sizeof(down_params));
+            down_params.m = n_tokens;
+            down_params.k = intermediate_size;
+            down_params.n = UOCR_HIDDEN_SIZE;
+            down_params.groups_per_row = groups_per_row_inter;
+            down_params.has_residual = has_residual ? 1u : 0u;
+
+            enc = metal_compute_command_encoder(ctx, cb);
+            if (enc == nil) {
+                return metal_fail(error, error_size, "failed to create %s down GEMM encoder", op);
+            }
+            [enc setComputePipelineState:down_pipeline];
+            [enc setBuffer:mid.buffer offset:mid.offset atIndex:0u];
+            [enc setBuffer:down_weight->buffer offset:down_weight->offset atIndex:1u];
+            [enc setBuffer:down_weight->scale_buffer offset:down_weight->scale_offset atIndex:2u];
+            [enc setBuffer:(has_residual ? residual.buffer : input.buffer)
+                    offset:(has_residual ? residual.offset : input.offset)
+                   atIndex:3u];
+            [enc setBuffer:dst.buffer offset:dst.offset atIndex:4u];
+            [enc setBytes:&down_params length:sizeof(down_params) atIndex:5u];
+            [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(UOCR_HIDDEN_SIZE / UOCR_METAL_GEMM_Q8_BN), row_tiles, 1u)
+                threadsPerThreadgroup:MTLSizeMake(UOCR_METAL_GEMM_Q8_THREADS, 1u, 1u)];
+            [enc endEncoding];
+            return metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, op, error, error_size);
+        }
+    }
+    if (n_tokens > 1u) {
+        return metal_fail(error, error_size, "%s: unaligned intermediate size %u for Q4 prefill", op, intermediate_size);
+    }
+
+    @autoreleasepool {
+        /* Decode: simdgroup-per-row Q4 GEMV for gate/up and down. */
+        id<MTLComputePipelineState> gate_pipeline = metal_get_pipeline(ctx, "uocr_decode_swiglu_gate_up_gemv_q4_0_to_f16", error, error_size);
+        id<MTLComputePipelineState> down_pipeline = metal_get_pipeline(ctx, "uocr_decode_linear_residual_gemv_q4_0_to_f16", error, error_size);
+        if (gate_pipeline == nil || down_pipeline == nil) {
+            return 0;
+        }
+        int owned_command_buffer = 0;
+        id<MTLCommandBuffer> cb = metal_command_buffer_for_op(ctx, &owned_command_buffer, op, error, error_size);
+        if (cb == nil) {
+            return 0;
+        }
+
+        uocr_metal_decode_gemv_q8_params gate_params;
+        gate_params.k = UOCR_HIDDEN_SIZE;
+        gate_params.n = intermediate_size;
+        gate_params.groups_per_row = groups_per_row_hidden;
+        gate_params.has_residual = 0u;
+
+        uocr_metal_decode_gemv_q8_params down_params;
+        down_params.k = intermediate_size;
+        down_params.n = UOCR_HIDDEN_SIZE;
+        down_params.groups_per_row = groups_per_row_inter;
+        down_params.has_residual = has_residual ? 1u : 0u;
+
+        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
+        if (enc == nil) {
+            return metal_fail(error, error_size, "failed to create %s gate/up command encoder", op);
+        }
+        const NSUInteger gate_rows_per_tg = metal_decode_gemv_rows_per_threadgroup(gate_pipeline);
+        [enc setComputePipelineState:gate_pipeline];
+        [enc setBuffer:input.buffer offset:input.offset atIndex:0u];
+        [enc setBuffer:gate_weight->buffer offset:gate_weight->offset atIndex:1u];
+        [enc setBuffer:up_weight->buffer offset:up_weight->offset atIndex:2u];
+        [enc setBuffer:gate_weight->scale_buffer offset:gate_weight->scale_offset atIndex:3u];
+        [enc setBuffer:up_weight->scale_buffer offset:up_weight->scale_offset atIndex:4u];
+        [enc setBuffer:mid.buffer offset:mid.offset atIndex:5u];
+        [enc setBytes:&gate_params length:sizeof(gate_params) atIndex:6u];
+        [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)intermediate_size + gate_rows_per_tg - 1u) / gate_rows_per_tg, 1u, 1u)
+             threadsPerThreadgroup:MTLSizeMake(128u, 1u, 1u)];
+        [enc endEncoding];
+
+        enc = metal_compute_command_encoder(ctx, cb);
+        if (enc == nil) {
+            return metal_fail(error, error_size, "failed to create %s down command encoder", op);
+        }
+        const NSUInteger down_rows_per_tg = metal_decode_gemv_rows_per_threadgroup(down_pipeline);
+        [enc setComputePipelineState:down_pipeline];
+        [enc setBuffer:mid.buffer offset:mid.offset atIndex:0u];
+        [enc setBuffer:down_weight->buffer offset:down_weight->offset atIndex:1u];
+        [enc setBuffer:down_weight->scale_buffer offset:down_weight->scale_offset atIndex:2u];
+        [enc setBuffer:(has_residual ? residual.buffer : input.buffer) offset:(has_residual ? residual.offset : input.offset) atIndex:3u];
+        [enc setBuffer:dst.buffer offset:dst.offset atIndex:4u];
+        [enc setBytes:&down_params length:sizeof(down_params) atIndex:5u];
+        [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)UOCR_HIDDEN_SIZE + down_rows_per_tg - 1u) / down_rows_per_tg, 1u, 1u)
+             threadsPerThreadgroup:MTLSizeMake(128u, 1u, 1u)];
+        [enc endEncoding];
+        return metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, op, error, error_size);
+    }
+}
+
 static int metal_run_dense_swiglu_buffer_f16(uocr_metal_context *ctx,
                                              uocr_metal_buffer_slice input,
                                              const uocr_metal_decoder_binding *gate_weight,
@@ -13078,6 +13284,12 @@ static int metal_run_dense_swiglu_buffer_f16(uocr_metal_context *ctx,
                                              size_t error_size) {
     if (ctx == NULL || gate_weight == NULL || up_weight == NULL || down_weight == NULL || n_tokens == 0u) {
         return metal_fail(error, error_size, "invalid %s SwiGLU request", op_name);
+    }
+    if (gate_weight->qtype == UOCR_TENSOR_Q4_0 || up_weight->qtype == UOCR_TENSOR_Q4_0 ||
+        down_weight->qtype == UOCR_TENSOR_Q4_0) {
+        return metal_run_dense_swiglu_buffer_q4_0(ctx, input, gate_weight, up_weight, down_weight,
+                                                 residual, has_residual, n_tokens, intermediate_size,
+                                                 mid, dst, op_name, error, error_size);
     }
     if (gate_weight->qtype == UOCR_TENSOR_Q8_0 && up_weight->qtype == UOCR_TENSOR_Q8_0 &&
         down_weight->qtype == UOCR_TENSOR_Q8_0) {

@@ -56,6 +56,132 @@ static inline void uocr_gemm_q4_stage_b(device const uchar *qweight,
     }
 }
 
+// Decoder prefill GEMM with optional residual add (dense/shared MLP down
+// projection).  Q4_0 twin of uocr_decoder_gemm_residual_q8_0_to_f16; reuses
+// UocrDecoderGemmQ8Params (gemm_q8.metal is an earlier fragment).
+[[max_total_threads_per_threadgroup(UOCR_GEMM_Q8_THREADS)]] kernel void uocr_decoder_gemm_residual_q4_0_to_f16(
+    device const half *src [[buffer(0)]],
+    device const uchar *qweight [[buffer(1)]],
+    device const half *qscale [[buffer(2)]],
+    device const half *residual [[buffer(3)]],
+    device half *dst [[buffer(4)]],
+    constant UocrDecoderGemmQ8Params &params [[buffer(5)]],
+    uint2 tgpig [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float smem[UOCR_GEMM_Q8_BM * UOCR_GEMM_Q8_BN];
+    threadgroup half *sa = (threadgroup half *)smem;
+    threadgroup half *sb = sa + UOCR_GEMM_Q8_BM * UOCR_GEMM_Q8_BK;
+    threadgroup float *sc = smem;
+
+    const uint K = params.k;
+    const uint row_base = tgpig.y * UOCR_GEMM_Q8_BM;
+    const uint col_base = tgpig.x * UOCR_GEMM_Q8_BN;
+
+    simdgroup_float8x8 mc[4][2];
+    for (uint i = 0u; i < 4u; ++i) {
+        for (uint j = 0u; j < 2u; ++j) {
+            mc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        }
+    }
+    const uint sg_row = (sgitg / 2u) * 32u;
+    const uint sg_col = (sgitg % 2u) * 16u;
+
+    for (uint k_base = 0u; k_base < K; k_base += UOCR_GEMM_Q8_BK) {
+        uocr_gemm_q8_stage_a(src, params.m, K, row_base, k_base, tid, sa);
+        uocr_gemm_q4_stage_b(qweight, qscale, K, params.groups_per_row, col_base, k_base, tid, sb);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uocr_gemm_q8_mma_tile(sa, sb, sg_row, sg_col, mc);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    for (uint i = 0u; i < 4u; ++i) {
+        for (uint j = 0u; j < 2u; ++j) {
+            simdgroup_store(mc[i][j], sc + (sg_row + i * 8u) * UOCR_GEMM_Q8_BN + sg_col + j * 8u, UOCR_GEMM_Q8_BN);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint i = tid; i < UOCR_GEMM_Q8_BM * UOCR_GEMM_Q8_BN; i += UOCR_GEMM_Q8_THREADS) {
+        const uint mrow = i / UOCR_GEMM_Q8_BN;
+        const uint col = col_base + (i - mrow * UOCR_GEMM_Q8_BN);
+        const uint row = row_base + mrow;
+        if (row < params.m && col < params.n) {
+            const ulong dst_index = (ulong)row * params.n + col;
+            float value = sc[i];
+            if (params.has_residual != 0u) {
+                value += float(residual[dst_index]);
+            }
+            dst[dst_index] = half(value);
+        }
+    }
+}
+
+// Decoder prefill fused SwiGLU gate/up (dense/shared MLP): Q4_0 twin of
+// uocr_decoder_swiglu_gate_up_gemm_q8_0_to_f16.
+[[max_total_threads_per_threadgroup(UOCR_GEMM_Q8_THREADS)]] kernel void uocr_decoder_swiglu_gate_up_gemm_q4_0_to_f16(
+    device const half *src [[buffer(0)]],
+    device const uchar *gate_qweight [[buffer(1)]],
+    device const uchar *up_qweight [[buffer(2)]],
+    device const half *gate_qscale [[buffer(3)]],
+    device const half *up_qscale [[buffer(4)]],
+    device half *mid [[buffer(5)]],
+    constant UocrDecoderGemmQ8Params &params [[buffer(6)]],
+    uint2 tgpig [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float smem[2u * UOCR_GEMM_Q8_BM * UOCR_GEMM_Q8_BN];
+    threadgroup half *sa = (threadgroup half *)smem;
+    threadgroup half *sb_gate = sa + UOCR_GEMM_Q8_BM * UOCR_GEMM_Q8_BK;
+    threadgroup half *sb_up = sb_gate + UOCR_GEMM_Q8_BK * UOCR_GEMM_Q8_BN;
+    threadgroup float *sc_gate = smem;
+    threadgroup float *sc_up = smem + UOCR_GEMM_Q8_BM * UOCR_GEMM_Q8_BN;
+
+    const uint K = params.k;
+    const uint row_base = tgpig.y * UOCR_GEMM_Q8_BM;
+    const uint col_base = tgpig.x * UOCR_GEMM_Q8_BN;
+
+    simdgroup_float8x8 mc_gate[4][2];
+    simdgroup_float8x8 mc_up[4][2];
+    for (uint i = 0u; i < 4u; ++i) {
+        for (uint j = 0u; j < 2u; ++j) {
+            mc_gate[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+            mc_up[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        }
+    }
+    const uint sg_row = (sgitg / 2u) * 32u;
+    const uint sg_col = (sgitg % 2u) * 16u;
+
+    for (uint k_base = 0u; k_base < K; k_base += UOCR_GEMM_Q8_BK) {
+        uocr_gemm_q8_stage_a(src, params.m, K, row_base, k_base, tid, sa);
+        uocr_gemm_q4_stage_b(gate_qweight, gate_qscale, K, params.groups_per_row, col_base, k_base, tid, sb_gate);
+        uocr_gemm_q4_stage_b(up_qweight, up_qscale, K, params.groups_per_row, col_base, k_base, tid, sb_up);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uocr_gemm_q8_mma_tile(sa, sb_gate, sg_row, sg_col, mc_gate);
+        uocr_gemm_q8_mma_tile(sa, sb_up, sg_row, sg_col, mc_up);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    for (uint i = 0u; i < 4u; ++i) {
+        for (uint j = 0u; j < 2u; ++j) {
+            simdgroup_store(mc_gate[i][j], sc_gate + (sg_row + i * 8u) * UOCR_GEMM_Q8_BN + sg_col + j * 8u, UOCR_GEMM_Q8_BN);
+            simdgroup_store(mc_up[i][j], sc_up + (sg_row + i * 8u) * UOCR_GEMM_Q8_BN + sg_col + j * 8u, UOCR_GEMM_Q8_BN);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint i = tid; i < UOCR_GEMM_Q8_BM * UOCR_GEMM_Q8_BN; i += UOCR_GEMM_Q8_THREADS) {
+        const uint mrow = i / UOCR_GEMM_Q8_BN;
+        const uint col = col_base + (i - mrow * UOCR_GEMM_Q8_BN);
+        const uint row = row_base + mrow;
+        if (row < params.m && col < params.n) {
+            const float gate = sc_gate[i];
+            const float silu = gate / (1.0f + exp(-gate));
+            mid[(ulong)row * params.n + col] = half(silu * sc_up[i]);
+        }
+    }
+}
+
 // Bucketed gate/up GEMM: mid[pair, col] = silu(src_t @ Wg_e^T) * (src_t @ Wu_e^T)
 // for every pair (t, e) in the tile's bucket.
 [[max_total_threads_per_threadgroup(UOCR_GEMM_Q8_THREADS)]] kernel void uocr_moe_prefill_bucketed_swiglu_gate_up_gemm_q4_0_to_f16(

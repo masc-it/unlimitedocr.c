@@ -713,10 +713,11 @@ static int validate_q4_tensor_entry(const uocr_tensor_entry *tensor,
     if (tensor->qtype != UOCR_TENSOR_Q4_0) {
         return fail(error, error_size, "tensor entry %u has non-q4_0 qtype %u", index, tensor->qtype);
     }
-    if (tensor->family != UOCR_TENSOR_FAMILY_MOE_EXPERT && tensor->family != UOCR_TENSOR_FAMILY_LM_HEAD) {
+    if (tensor->family != UOCR_TENSOR_FAMILY_MOE_EXPERT && tensor->family != UOCR_TENSOR_FAMILY_LM_HEAD &&
+        tensor->family != UOCR_TENSOR_FAMILY_MOE_SHARED && tensor->family != UOCR_TENSOR_FAMILY_LAYER_DENSE_MLP) {
         return fail(error,
                     error_size,
-                    "tensor entry %u q4_0 is only supported for routed MoE experts and the LM head, got family %u",
+                    "tensor entry %u q4_0 is only supported for MoE experts, MLPs and the LM head, got family %u",
                     index,
                     tensor->family);
     }

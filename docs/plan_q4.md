@@ -516,25 +516,28 @@ kernel is simultaneously near the ALU limit, but real and exact.
       file: 2.16 GB).
 * [x] End-to-end QA vs q8/fp16 baselines — passed.
 
-### E2. Shared experts + dense L0 MLP Q4 (102 MB/token → 51 MB/token)
+### E2. Shared experts + dense L0 MLP Q4 (102 MB/token → 51 MB/token) — ✅ shipped, pending QA
 
 Structural mirrors of existing kernels; note the shared experts run for
 *every* token (no routing redundancy), so quality risk is higher than the
-routed experts were — QA separately from E1.
+routed experts were.
 
-* [ ] Allow `q4_0` for `MOE_SHARED` and `LAYER_DENSE_MLP` gate/up/down in
+* [x] Allow `q4_0` for `MOE_SHARED` and `LAYER_DENSE_MLP` gate/up/down in
       schema/validators/bindings.
-* [ ] Decode GEMV kernels in `decode_gemv_q4.metal`:
+* [x] Decode GEMV kernels in `decode_gemv_q4.metal`:
       `uocr_decode_swiglu_gate_up_gemv_q4_0_to_f16`,
       `uocr_decode_linear_residual_gemv_q4_0_to_f16` (reuse
       `uocr_decode_gemv_q4_lane_dot`).
-* [ ] Prefill tiled GEMM kernels in `gemm_q4.metal`:
+* [x] Prefill tiled GEMM kernels in `gemm_q4.metal`:
       `uocr_decoder_swiglu_gate_up_gemm_q4_0_to_f16`,
       `uocr_decoder_gemm_residual_q4_0_to_f16` (reuse
       `uocr_gemm_q4_stage_b`).
-* [ ] Route `metal_run_dense_swiglu_buffer_*` / decode SwiGLU dispatch by
-      qtype.
-* [ ] Flip `moe_shared` first, QA, then `dense_mlp`, QA.
+* [x] Route `metal_run_dense_swiglu_buffer_*` / decode SwiGLU dispatch by
+      qtype (`metal_run_dense_swiglu_buffer_q4_0` handles both regimes).
+* [x] Flip `moe_shared` + `dense_mlp` in the shipped cfg (both share the same
+      kernels; a QA regression bisects by flipping one back).  Planned
+      mixed-q4 file: 2.11 GB.
+* [ ] End-to-end QA vs q8/fp16 baselines.
 
 ### E4. Embeddings + vision Q4 (file size only)
 

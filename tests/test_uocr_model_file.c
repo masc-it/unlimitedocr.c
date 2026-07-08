@@ -837,7 +837,7 @@ static int test_rejects_q4_outside_moe_experts(void) {
     char error[512];
     uocr_model_file model;
     CHECK(uocr_model_file_open(path, &model, error, sizeof(error)) != 0);
-    CHECK(strstr(error, "routed MoE experts") != NULL);
+    CHECK(strstr(error, "q4_0 is only supported") != NULL);
     unlink(path);
     return 0;
 }

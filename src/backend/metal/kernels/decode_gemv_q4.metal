@@ -56,6 +56,84 @@ static inline float uocr_decode_gemv_q4_lane_dot(device const half *x,
     return sum;
 }
 
+// Mirrors UocrDecodeGemvQ8Params (decode_gemv_q8.metal is an earlier
+// fragment).
+struct UocrDecodeGemvQ4Params {
+    uint k;              // input features (multiple of 8; groups of 64)
+    uint n;              // output rows
+    uint groups_per_row; // k / 64
+    uint has_residual;
+};
+
+// Decode linear with optional residual (dense/shared down).
+[[max_total_threads_per_threadgroup(128)]] kernel void uocr_decode_linear_residual_gemv_q4_0_to_f16(
+    device const half *src [[buffer(0)]],
+    device const uchar *qweight [[buffer(1)]],
+    device const half *qscale [[buffer(2)]],
+    device const half *residual [[buffer(3)]],
+    device half *dst [[buffer(4)]],
+    constant UocrDecodeGemvQ4Params &params [[buffer(5)]],
+    uint tgpig [[threadgroup_position_in_grid]],
+    uint ntg [[threads_per_threadgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simd_width [[threads_per_simdgroup]]) {
+    const uint rows_per_tg = ntg / simd_width;
+    const uint row = tgpig * rows_per_tg + sgitg;
+    if (row >= params.n) {
+        return;
+    }
+    float sum = simd_sum(uocr_decode_gemv_q4_lane_dot(src,
+                                                      qweight + (ulong)row * (params.k / 2u),
+                                                      qscale + (ulong)row * params.groups_per_row,
+                                                      params.k,
+                                                      lane,
+                                                      simd_width));
+    if (lane == 0u) {
+        if (params.has_residual != 0u) {
+            sum += float(residual[row]);
+        }
+        dst[row] = half(sum);
+    }
+}
+
+// Decode SwiGLU gate/up: one simdgroup computes both dots for its column.
+[[max_total_threads_per_threadgroup(128)]] kernel void uocr_decode_swiglu_gate_up_gemv_q4_0_to_f16(
+    device const half *src [[buffer(0)]],
+    device const uchar *gate_qweight [[buffer(1)]],
+    device const uchar *up_qweight [[buffer(2)]],
+    device const half *gate_qscale [[buffer(3)]],
+    device const half *up_qscale [[buffer(4)]],
+    device half *mid [[buffer(5)]],
+    constant UocrDecodeGemvQ4Params &params [[buffer(6)]],
+    uint tgpig [[threadgroup_position_in_grid]],
+    uint ntg [[threads_per_threadgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simd_width [[threads_per_simdgroup]]) {
+    const uint rows_per_tg = ntg / simd_width;
+    const uint row = tgpig * rows_per_tg + sgitg;
+    if (row >= params.n) {
+        return;
+    }
+    const float gate = simd_sum(uocr_decode_gemv_q4_lane_dot(src,
+                                                             gate_qweight + (ulong)row * (params.k / 2u),
+                                                             gate_qscale + (ulong)row * params.groups_per_row,
+                                                             params.k,
+                                                             lane,
+                                                             simd_width));
+    const float up = simd_sum(uocr_decode_gemv_q4_lane_dot(src,
+                                                           up_qweight + (ulong)row * (params.k / 2u),
+                                                           up_qscale + (ulong)row * params.groups_per_row,
+                                                           params.k,
+                                                           lane,
+                                                           simd_width));
+    if (lane == 0u) {
+        const float silu = gate / (1.0f + exp(-gate));
+        mid[row] = half(silu * up);
+    }
+}
+
 // Decode routed-MoE gate/up: one simdgroup per (rank, column).
 [[max_total_threads_per_threadgroup(128)]] kernel void uocr_moe_decode_gate_up_gemv_q4_0_to_f16(
     device const half *src [[buffer(0)]],

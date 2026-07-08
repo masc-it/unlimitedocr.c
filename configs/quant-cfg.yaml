@@ -47,15 +47,19 @@ modules:
     projections: [O]
     supported: true
 
+  # Dense layer-0 MLP and shared experts store Q4_0 under --qprofile mixed-q4
+  # (fused Q4 decode GEMV + tiled prefill GEMM kernels); mixed-q8_0 keeps Q8_0.
   - name: dense_mlp
     family: LAYER_DENSE_MLP
     projections: [GATE, UP, DOWN]
     supported: true
+    qtype: q4_0
 
   - name: moe_shared
     family: MOE_SHARED
     projections: [GATE, UP, DOWN]
     supported: true
+    qtype: q4_0
 
   # Routed experts store Q4_0 under --qprofile mixed-q4 (fused Q4 decode GEMV
   # + bucketed prefill GEMM kernels); mixed-q8_0 conversions ignore the qtype
