@@ -79,10 +79,16 @@ documents — the sensitive cases from the sim QA).
   `metal_validate_decoder_tensor_metadata()`; that stays.
 * Adding a `.metal` fragment requires updating `tools/gen_metal.py` `ORDER` and
   regenerating `src/backend/metal/kernels/uocr_smoke.metal`.
-* Performance rule carried over from Q8: **every Q4 compute path is fused**.
-  Nibble unpack, dequant, dot/MMA, SwiGLU, expert weighting, and combine happen
-  inside one kernel; no dequantized weight buffers on CPU or GPU, no standalone
-  dequant pass, no fp16/Q8 shadow copies.
+* Kernel design follows **`docs/howto_quant.md`** (the distilled Q8 lessons):
+  quantized inference is a memory problem (§1.1), there are exactly two
+  workload regimes — simdgroup-per-row GEMV for decode and 64×32×32 tiled MMA
+  GEMM for prefill (§1.2, §3, §4) — and dequantization is always fused (§1.3).
+  Its §7 (“Applying this to dynamic Q4”) covers the Q4-specific decisions and
+  is the reference for every kernel in section 4 of this plan.
+* Performance rule carried over from Q8 (`docs/howto_quant.md` §1.3):
+  **every Q4 compute path is fused**.  Nibble unpack, dequant, dot/MMA, SwiGLU,
+  expert weighting, and combine happen inside one kernel; no dequantized weight
+  buffers on CPU or GPU, no standalone dequant pass, no fp16/Q8 shadow copies.
 
 ---
 
@@ -304,6 +310,13 @@ Checklist:
 
 ## 4. Metal kernels
 
+> **Reference:** `docs/howto_quant.md` is normative for everything in this
+> section — §3 for the decode GEMV shape, §4 for the prefill GEMM shape and
+> the gathered-rows bucketed variant (§4.3), §5 for host-side integration
+> rules, and §6 for the validation methodology (probe in `/tmp` first, compare
+> bit-level vs a reference, then wire the dispatch).  §7 lists the Q4-specific
+> design decisions (nibble packing, unpack cost, load widths).
+
 New fragments, mirroring the Q8 structure:
 
 ```text
@@ -350,8 +363,9 @@ Checklist:
       1280 rows, fused expert weighting + combine + optional residual.
 * [ ] Route the decode expert dispatch (`metal_run_decode_moe_*`) by expert
       slab qtype: F16 → f16 GEMV, Q8_0 → q8 GEMV, Q4_0 → q4 GEMV.
-* [ ] `/tmp` probe comparing q8 vs q4 decode GEMV before wiring (expect
-      ~1.6–2.0×; if unpack costs eat the win, widen loads before landing).
+* [ ] `/tmp` probe comparing q8 vs q4 decode GEMV before wiring, per the
+      methodology in `docs/howto_quant.md` §6 (expect ~1.6–2.0×; if unpack
+      costs eat the win, widen loads before landing).
 
 ### 4.2 Prefill (expert-bucketed tiled GEMM)
 
@@ -431,7 +445,7 @@ Each step gates the next; the cfg flip is last.
    * Q4 spans, bindings, slab strides;
    * fp16 and Q8 paths still pass unchanged (full `ctest`).
 
-4. **Decode GEMV Q4** (probe first, then land)
+4. **Decode GEMV Q4** (probe first, then land — `docs/howto_quant.md` §6)
    * `/tmp` probe vs Q8 GEMV;
    * `decode_gemv_q4.metal` kernels + dispatch routing;
    * warmup + `ctest`.
