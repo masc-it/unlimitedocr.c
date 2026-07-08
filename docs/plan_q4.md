@@ -1,5 +1,12 @@
 # Grounded Q4 implementation plan for `unlimitedocr.c`
 
+> **Status: shipped.**  All seven steps landed on `feat/more-quant` and the
+> mixed-q4 model passed end-to-end notebook QA.  Actuals: model file
+> **2.24 GB** (from 3.45 GB mixed-q8_0), routed-expert decode GEMV measured
+> **~2.7× vs Q8** on M1 Pro (group-half-split packing; the originally planned
+> interleaved nibble packing measured 0.9× and was replaced — see §1.1).
+> The q4_sim quality-gate tool served its purpose and was deleted in step 7.
+
 This plan adds **int4 (Q4_0) storage for the routed MoE expert weights** on top
 of the shipped mixed-Q8 pipeline.  Scope is the **decoder only**, and inside the
 decoder only `TensorFamily.MOE_EXPERT` gate/up/down: the experts hold ~2.42 B of
@@ -27,8 +34,8 @@ keeps the kernel inner loop cheapest.  Q4_1 (scale+min) is the documented
 fallback if full-corpus QA on the real Q4 path regresses; the format reserves
 its qtype id and the tensor entry already has `min_offset/min_size` fields.
 
-The simulation tool is deleted at the end of this plan — Q4 lands properly or
-not at all.
+The simulation tool was deleted at the end of this plan (step 7) — the gate
+passed and Q4 landed properly.
 
 ## Expected wins
 
@@ -146,12 +153,12 @@ flags                         = UOCR_TENSOR_FLAG_ROW_MAJOR
 
 Checklist:
 
-* [ ] Add `UOCR_TENSOR_Q4_0 = 4` to `uocr_tensor_qtype` and converter constants;
+* [x] Add `UOCR_TENSOR_Q4_0 = 4` to `uocr_tensor_qtype` and converter constants;
       reserve `UOCR_TENSOR_Q4_1 = 5` (do not implement).
-* [ ] Add `UOCR_Q4_GROUP_SIZE_DEFAULT = 64`, `UOCR_Q4_MIN = -8`, `UOCR_Q4_MAX = 7`.
-* [ ] Add `uocr_tensor_qtype_name()` support for `q4_0`.
-* [ ] Add converter/runtime helpers for Q4 qweight bytes, qscale bytes, totals.
-* [ ] Require `cols % 64 == 0` (both expert shapes qualify: gate/up
+* [x] Add `UOCR_Q4_GROUP_SIZE_DEFAULT = 64`, `UOCR_Q4_MIN = -8`, `UOCR_Q4_MAX = 7`.
+* [x] Add `uocr_tensor_qtype_name()` support for `q4_0`.
+* [x] Add converter/runtime helpers for Q4 qweight bytes, qscale bytes, totals.
+* [x] Require `cols % 64 == 0` (both expert shapes qualify: gate/up
       `[896, 1280]`, down `[1280, 896]`).
 
 ### 1.2 Qprofile policy
@@ -161,14 +168,14 @@ rest of the Q8-supported decoder modules stay Q8_0, everything else fp16.
 
 Checklist:
 
-* [ ] Add `UOCR_QPROFILE_MIXED_Q4 = 3` in `src/model/uocr_format.h` and
+* [x] Add `UOCR_QPROFILE_MIXED_Q4 = 3` in `src/model/uocr_format.h` and
       `convert.py`; name `mixed-q4`.
-* [ ] Keep `UOCR_FORMAT_VERSION = 1` — the tensor entry already encodes
+* [x] Keep `UOCR_FORMAT_VERSION = 1` — the tensor entry already encodes
       everything Q4_0 needs.
-* [ ] Extend `uocr_model_file_validate_memory()` to accept
+* [x] Extend `uocr_model_file_validate_memory()` to accept
       `UOCR_QPROFILE_MIXED_Q4` and dispatch per-tensor validation by qtype
       (fp16 | q8_0 | q4_0).
-* [ ] Extend the provenance JSON `quantization` payload:
+* [x] Extend the provenance JSON `quantization` payload:
 
 ```json
 {
@@ -190,14 +197,14 @@ Add a Q4_0 validator next to the fp16/Q8 ones in `src/model/uocr_model_file.c`.
 
 Checklist:
 
-* [ ] Rank 2; logical == physical shape; row-major, not transposed.
-* [ ] `block_size == 64`; `cols % 64 == 0`; `cols % 2 == 0`.
-* [ ] `row_size == cols / 2`.
-* [ ] `payload_size == rows * cols / 2`.
-* [ ] `scale_size == rows * (cols / 64) * sizeof(uint16_t)`.
-* [ ] `payload_offset`/`scale_offset` 16-byte aligned, inside tensor-data section.
-* [ ] `min_offset == 0 && min_size == 0`.
-* [ ] Restrict Q4_0 to `TensorFamily.MOE_EXPERT` in decoder-binding validation;
+* [x] Rank 2; logical == physical shape; row-major, not transposed.
+* [x] `block_size == 64`; `cols % 64 == 0`; `cols % 2 == 0`.
+* [x] `row_size == cols / 2`.
+* [x] `payload_size == rows * cols / 2`.
+* [x] `scale_size == rows * (cols / 64) * sizeof(uint16_t)`.
+* [x] `payload_offset`/`scale_offset` 16-byte aligned, inside tensor-data section.
+* [x] `min_offset == 0 && min_size == 0`.
+* [x] Restrict Q4_0 to `TensorFamily.MOE_EXPERT` in decoder-binding validation;
       any other family with qtype Q4_0 is a validation error for this
       deliverable.
 
@@ -224,15 +231,15 @@ modules:
 
 Checklist:
 
-* [ ] Bump quant-cfg `version` to 2 in `configs/quant-cfg.yaml` and
+* [x] Bump quant-cfg `version` to 2 in `configs/quant-cfg.yaml` and
       `src/unlimitedocr_c/quant_cfg.py`; keep accepting version 1 (implicit
       `qtype: q8_0`).
-* [ ] `QuantModuleSpec` gains `qtype`; `QuantConfig.supported_pairs` becomes a
+* [x] `QuantModuleSpec` gains `qtype`; `QuantConfig.supported_pairs` becomes a
       mapping `(family, projection) → qtype`.
-* [ ] Reject `qtype: q4_0` on any family other than `MOE_EXPERT` (schema-level
+* [x] Reject `qtype: q4_0` on any family other than `MOE_EXPERT` (schema-level
       guard mirroring the runtime validator).
-* [ ] `moe_routed_experts` stays `qtype: q8_0` in the shipped cfg until the
-      full Q4 path passes QA (rollout discipline), then flips to `q4_0`.
+* [x] `moe_routed_experts` stayed `qtype: q8_0` in the shipped cfg until the
+      full Q4 path passed QA (rollout discipline), then flipped to `q4_0`.
 
 ### 2.2 Converter CLI
 
@@ -247,39 +254,39 @@ uv run tools/uocr-convert \
 
 Checklist:
 
-* [ ] Extend `--qprofile` choices to `fp16,mixed-q8_0,mixed-q4`.
-* [ ] `mixed-q4` plans exactly like `mixed-q8_0`, except modules whose cfg
+* [x] Extend `--qprofile` choices to `fp16,mixed-q8_0,mixed-q4`.
+* [x] `mixed-q4` plans exactly like `mixed-q8_0`, except modules whose cfg
       qtype is `q4_0` get Q4 planning; the policy stays
       `embeddings+decoder`.
-* [ ] Bump `CONVERTER_VERSION` to `(0, 3, 0)`.
+* [x] Bump `CONVERTER_VERSION` to `(0, 3, 0)`.
 
 ### 2.3 Planning and layout
 
 Checklist:
 
-* [ ] Extend `TensorPlan` byte-count helpers with `q4_qweight_bytes`
+* [x] Extend `TensorPlan` byte-count helpers with `q4_qweight_bytes`
       (`rows * cols / 2`), `q4_qscale_bytes`, `q4_total_bytes`.
-* [ ] `_layout_dry_run_file()` allocates qweight + qscale ranges for Q4 tensors
+* [x] `_layout_dry_run_file()` allocates qweight + qscale ranges for Q4 tensors
       in the tensor-data section, 16-byte aligned, same as Q8.
-* [ ] Preserve the interleaved expert-major ordering: per layer, the routed
+* [x] Preserve the interleaved expert-major ordering: per layer, the routed
       expert Q4 qweight slab is `[expert][gate,up,down]` contiguous, followed by
       the matching contiguous qscale slab — same contract as Q8, halved
       qweight strides.
-* [ ] Update qtype histograms, `q8_summary` → generalized quant summary with
+* [x] Update qtype histograms, `q8_summary` → generalized quant summary with
       per-qtype byte totals.
 
 ### 2.4 Quantization writer
 
 Checklist:
 
-* [ ] Add `_stream_bf16_to_q4_0()` next to `_stream_bf16_to_q8_0()`: chunked
+* [x] Add `_stream_bf16_to_q4_0()` next to `_stream_bf16_to_q8_0()`: chunked
       row-major BF16→fp32, per-group signed-max scale, nibble packing
       (`q + 8`, low nibble = even k), qweight and qscale streamed to their
       offsets without materializing full tensors.
-* [ ] Reject non-finite values, mirror the Q8 error handling.
-* [ ] Extend `compare_single_tensor_conversion()` with Q4 dequant comparison
+* [x] Reject non-finite values, mirror the Q8 error handling.
+* [x] Extend `compare_single_tensor_conversion()` with Q4 dequant comparison
       (max_abs_error/rmse against source BF16); record tolerances in tests.
-* [ ] Unit tests in `tests/test_convert.py`: pack/unpack round-trip, scale
+* [x] Unit tests in `tests/test_convert.py`: pack/unpack round-trip, scale
       edge cases (all-zero group, negative max), layout offsets, planned vs
       written byte counts.
 
@@ -291,25 +298,25 @@ Checklist:
 
 Checklist:
 
-* [ ] `payload_tensor_count()`/`build_payload_spans()` already emit spans for
+* [x] `payload_tensor_count()`/`build_payload_spans()` already emit spans for
       qweight + qscale ranges by qtype; extend the qtype switch to Q4_0.
-* [ ] Binding construction resolves both ranges to Metal buffers/offsets for
+* [x] Binding construction resolves both ranges to Metal buffers/offsets for
       Q4_0 (same two-buffer shape as Q8; `min` ranges stay unmapped).
 
 ### 3.2 Decoder bindings and expert slabs
 
 Checklist:
 
-* [ ] `metal_validate_decoder_tensor_metadata()` accepts qtype Q4_0 **only**
+* [x] `metal_validate_decoder_tensor_metadata()` accepts qtype Q4_0 **only**
       for `MOE_EXPERT` gate/up/down; all other families keep their current
       fp16/Q8 rules.
-* [ ] Extend the decoder-binding cache with Q4 shape/group metadata
+* [x] Extend the decoder-binding cache with Q4 shape/group metadata
       (`group_size`, `groups_per_row`, packed `row_bytes`).
-* [ ] Extend `metal_expert_interleaved_slab_for_layer()` and the fast expert
+* [x] Extend `metal_expert_interleaved_slab_for_layer()` and the fast expert
       slab cache for Q4: qweight slab stride is
       `expert_stride_bytes = 3 * projection_rows * cols / 2`, qscale slab
       stride unchanged from Q8 (`3 * projection_rows * cols / 64 * 2`).
-* [ ] Mixed-layer guard: within one layer all routed experts must share one
+* [x] Mixed-layer guard: within one layer all routed experts must share one
       qtype (Q4_0 or Q8_0); reject mixed slabs at binding time.
 
 ---
@@ -362,14 +369,14 @@ Design notes grounded in measurements:
 
 Checklist:
 
-* [ ] `uocr_moe_decode_gate_up_gemv_q4_0_to_f16` — mirrors the Q8 kernel:
+* [x] `uocr_moe_decode_gate_up_gemv_q4_0_to_f16` — mirrors the Q8 kernel:
       grid `top_k * 896` rows, 128 threads, fused SwiGLU, fp32 accumulate,
       fp16 `mid` out.
-* [ ] `uocr_moe_decode_down_combine_gemv_q4_0_to_f16` — mirrors the Q8 kernel:
+* [x] `uocr_moe_decode_down_combine_gemv_q4_0_to_f16` — mirrors the Q8 kernel:
       1280 rows, fused expert weighting + combine + optional residual.
-* [ ] Route the decode expert dispatch (`metal_run_decode_moe_*`) by expert
+* [x] Route the decode expert dispatch (`metal_run_decode_moe_*`) by expert
       slab qtype: F16 → f16 GEMV, Q8_0 → q8 GEMV, Q4_0 → q4 GEMV.
-* [ ] `/tmp` probe comparing q8 vs q4 decode GEMV before wiring, per the
+* [x] `/tmp` probe comparing q8 vs q4 decode GEMV before wiring, per the
       methodology in `docs/howto_quant.md` §6 (expect ~1.6–2.0×; if unpack
       costs eat the win, widen loads before landing).
 
@@ -377,27 +384,27 @@ Checklist:
 
 Checklist:
 
-* [ ] `uocr_gemm_q4_stage_b()` in `gemm_q4.metal`: stage a dequantized fp16
+* [x] `uocr_gemm_q4_stage_b()` in `gemm_q4.metal`: stage a dequantized fp16
       B tile `[BK][BN]` from packed nibbles + scales into threadgroup memory —
       dequant-on-stage exactly like `uocr_gemm_q8_stage_b()`; the MMA loop
       (`uocr_gemm_q8_mma_tile`) is reused unchanged.
-* [ ] `uocr_moe_prefill_bucketed_swiglu_gate_up_gemm_q4_0_to_f16` — same
+* [x] `uocr_moe_prefill_bucketed_swiglu_gate_up_gemm_q4_0_to_f16` — same
       64×32×32 tile geometry, gathered A rows, fused SwiGLU epilogue.
-* [ ] `uocr_moe_prefill_bucketed_down_gemm_q4_0_to_f16` — same shape, fused
+* [x] `uocr_moe_prefill_bucketed_down_gemm_q4_0_to_f16` — same shape, fused
       down projection into per-pair rows.
-* [ ] Bucketing pass and combine kernels are reused as-is (qtype-agnostic).
-* [ ] Route the prefill bucketed dispatch by expert slab qtype.
-* [ ] Transient scratch preallocation (`metal_preallocate_moe_bucketed_prefill_
+* [x] Bucketing pass and combine kernels are reused as-is (qtype-agnostic).
+* [x] Route the prefill bucketed dispatch by expert slab qtype.
+* [x] Transient scratch preallocation (`metal_preallocate_moe_bucketed_prefill_
       transient_scratch`) is qtype-independent and unchanged.
 
 ### 4.3 Build integration
 
 Checklist:
 
-* [ ] Add `decode_gemv_q4.metal` after `decode_gemv_q8.metal` and
+* [x] Add `decode_gemv_q4.metal` after `decode_gemv_q8.metal` and
       `gemm_q4.metal` after `gemm_q8.metal` in `tools/gen_metal.py` `ORDER`.
-* [ ] Regenerate `src/backend/metal/kernels/uocr_smoke.metal`.
-* [ ] Full pipeline warmup (`uocr_metal_context_compile_all_pipelines`) picks
+* [x] Regenerate `src/backend/metal/kernels/uocr_smoke.metal`.
+* [x] Full pipeline warmup (`uocr_metal_context_compile_all_pipelines`) picks
       the new kernels up automatically.
 
 ---
@@ -406,12 +413,12 @@ Checklist:
 
 Checklist:
 
-* [ ] No C API changes: qprofile/qtype are inferred from the `.uocr` file, same
+* [x] No C API changes: qprofile/qtype are inferred from the `.uocr` file, same
       as Q8.
-* [ ] Python convenience: `UnlimitedOCR(quant="q4")` resolves/produces
+* [x] Python convenience: `UnlimitedOCR(quant="q4")` resolves/produces
       `unlimitedocr-q4.uocr` in the cache dir (converting with
       `--qprofile mixed-q4` on miss), mirroring `quant="q8"`.
-* [ ] `resolve_model_path(...)` learns the `q4` filename.
+* [x] `resolve_model_path(...)` learns the `q4` filename.
 
 ```python
 from unlimitedocr_c import UnlimitedOCR
@@ -425,11 +432,11 @@ text = ocr.generate("page.png")
 
 Checklist:
 
-* [ ] Model-view admission uses the actual mixed-q4 tensor-data size (nothing
+* [x] Model-view admission uses the actual mixed-q4 tensor-data size (nothing
       to change structurally; verify the reported bytes drop by ~1.2 GB).
-* [ ] Quant summary reports per-qtype tensor counts and byte totals
+* [x] Quant summary reports per-qtype tensor counts and byte totals
       (fp16 / q8_0 / q4_0).
-* [ ] Profile event names: `metal.decode.moe_routed_experts_q4`,
+* [x] Profile event names: `metal.decode.moe_routed_experts_q4`,
       `metal.prefill.moe_bucketed_q4`.
 
 ---
@@ -438,39 +445,39 @@ Checklist:
 
 Each step gates the next; the cfg flip is last.
 
-1. **Format/validator groundwork**
+1. **Format/validator groundwork** ✅
    * qtype/qprofile constants, name helpers, byte-count helpers;
    * Q4_0 tensor-entry validator + loader rejection tests.
 
-2. **quant-cfg v2 + converter**
+2. **quant-cfg v2 + converter** ✅
    * per-module qtype schema;
    * `_stream_bf16_to_q4_0()` writer + expert slab layout;
    * pack/round-trip/layout unit tests; `--qprofile mixed-q4` dry-run summary.
 
-3. **Loader / weight views / expert slabs**
-   * Q4 spans, bindings, slab strides;
+3. **Loader / weight views / expert slabs** ✅
+   * Q4 spans, bindings, slab strides + mixed-slab guards;
    * fp16 and Q8 paths still pass unchanged (full `ctest`).
 
-4. **Decode GEMV Q4** (probe first, then land — `docs/howto_quant.md` §6)
-   * `/tmp` probe vs Q8 GEMV;
-   * `decode_gemv_q4.metal` kernels + dispatch routing;
-   * warmup + `ctest`.
+4. **Decode GEMV Q4** ✅ (probe-first per `docs/howto_quant.md` §6)
+   * `/tmp` probe vs Q8 GEMV caught the packing problem: interleaved nibbles
+     0.9×, group-half split 2.7× — packing was revised before landing;
+   * `decode_gemv_q4.metal` kernels + dispatch routing, bit-exact vs Q8 on
+     identical dequant values.
 
-5. **Prefill bucketed GEMM Q4**
-   * `gemm_q4.metal` stage-B + kernels + dispatch routing;
-   * warmup + `ctest`.
+5. **Prefill bucketed GEMM Q4** ✅
+   * `gemm_q4.metal` dequant-on-stage stage-B + kernels + dispatch routing;
+   * bucketing/combine passes reused unchanged.
 
-6. **End-to-end QA, then flip the cfg**
-   * convert a real `mixed-q4` model, QA against fp16 and mixed-q8_0 baselines
-     on the sensitive corpus (digits, det boxes, long documents);
-   * only then set `moe_routed_experts: qtype: q4_0` in the shipped
-     `configs/quant-cfg.yaml` and wire `quant="q4"`.
+6. **End-to-end QA, then flip the cfg** ✅
+   * real `mixed-q4` model converted (2.24 GB) and QA'd in the notebook
+     against the q8/fp16 baselines;
+   * `moe_routed_experts: qtype: q4_0` flipped in the shipped
+     `configs/quant-cfg.yaml`; `quant="q4"` wired.
 
-7. **Cleanup**
-   * **delete `src/unlimitedocr_c/q4_sim.py`** and the `*-q4sim-*.uocr` cache
-     artifacts — the simulation was the gate, not the product;
-   * converter docs (`docs/howto_quant.md` section), README quant table,
-     profiling notes.
+7. **Cleanup** ✅
+   * `src/unlimitedocr_c/q4_sim.py` and the `*-q4sim-*.uocr` cache artifacts
+     deleted — the simulation was the gate, not the product;
+   * README quant table + `docs/howto_quant.md` §7 outcome notes updated.
 
 ---
 

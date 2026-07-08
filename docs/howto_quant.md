@@ -325,6 +325,20 @@ Performance targets to hold a new kernel to:
 
 ## 7. Applying this to dynamic Q4
 
+> **Outcome (shipped as `mixed-q4`, see `docs/plan_q4.md`):** Q4_0 landed for
+> the routed MoE experts.  The predictions below held with one hard-won
+> exception — **nibble packing layout decides everything**.  The first probe
+> used interleaved even/odd nibbles (`byte = w[k] | w[k+1]<<4`) and measured
+> **0.9× vs Q8**: the scalar unpack (8 nibble extracts + int→float converts
+> per uchar4) ate the entire bandwidth win.  Switching to the llama.cpp-style
+> **group-half split** (`byte j of a 64-group = w[j] | w[j+32]<<4`) made the
+> unpack two vectorized ops (`int4(w)&0xF`, `int4(w)>>4`) feeding two `dot()`s
+> against *aligned* `half4` activation loads — **2.7× vs Q8**, bit-exact.
+> A second bonus of that layout: a BK=32 GEMM K-tile is exactly one nibble
+> half of one scale group, so the bucketed-prefill stage-B reads contiguous
+> bytes with a single scale lookup and no cross-group handling.
+> Always probe the packing before freezing the format.
+
 What "Q4" changes and what it doesn't:
 
 ### 7.1 Unchanged (reuse as-is)
@@ -347,7 +361,8 @@ What "Q4" changes and what it doesn't:
   Choose so that one vector load (`uchar4` = 8 weights) still maps to **one
   scale lookup**: an aligned 8-weight run must stay inside one group — with
   group 64 and nibble packing, 4-byte runs cover 8 K elements, so the Q8
-  alignment argument carries over unchanged.
+  alignment argument carries over unchanged.  *Measured verdict: the low/high
+  half split is the right answer — see the outcome note above.*
 * **Dequant cost doubles per byte.**  Q4 GEMV loads half the bytes but does the
   same MACs plus nibble extraction (`(b & 0xF) - 8`, `(b >> 4) - 8`).  Decode
   becomes even more bandwidth-bound → expect up to ~2× decode gain *if* the
