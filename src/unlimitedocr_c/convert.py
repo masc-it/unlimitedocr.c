@@ -72,6 +72,10 @@ UOCR_FORMAT_VERSION = 1
 UOCR_ENDIAN_MARKER = 0x01020304
 UOCR_QPROFILE_FP16 = 1
 UOCR_QPROFILE_MIXED_Q8_0 = 2
+#: mixed-q4: routed MoE experts Q4_0, remaining quantized decoder modules Q8_0,
+#: everything else fp16 (see docs/plan_q4.md).  Not yet in QPROFILE_IDS: the
+#: converter CLI gains "mixed-q4" with the Q4 planner/writer (plan step 2).
+UOCR_QPROFILE_MIXED_Q4 = 3
 UOCR_TOKENIZER_FLAG_C_V1_NOT_REQUIRED = 1 << 0
 UOCR_PROVENANCE_FLAG_JSON_PAYLOAD = 1 << 0
 UOCR_TOKENIZER_METADATA_MAGIC = 0x4B4F5455
@@ -101,10 +105,17 @@ UOCR_PROMOTION_NONE = 0
 UOCR_TENSOR_F16 = 1
 UOCR_TENSOR_F32 = 2
 UOCR_TENSOR_Q8_0 = 3
+UOCR_TENSOR_Q4_0 = 4
+#: Reserved for the asymmetric scale+min fallback scheme; not implemented.
+UOCR_TENSOR_Q4_1 = 5
 
 UOCR_Q8_GROUP_SIZE_DEFAULT = 64
 UOCR_Q8_MIN = -127
 UOCR_Q8_MAX = 127
+
+UOCR_Q4_GROUP_SIZE_DEFAULT = 64
+UOCR_Q4_MIN = -8
+UOCR_Q4_MAX = 7
 
 CONVERTER_VERSION = (0, 2, 0)
 
@@ -706,6 +717,31 @@ def q8_qscale_bytes(shape: tuple[int, ...], group_size: int = UOCR_Q8_GROUP_SIZE
 
 def q8_total_bytes(shape: tuple[int, ...], group_size: int = UOCR_Q8_GROUP_SIZE_DEFAULT) -> int:
     return q8_qweight_bytes(shape, group_size) + q8_qscale_bytes(shape, group_size)
+
+
+def q4_qweight_bytes(shape: tuple[int, ...], group_size: int = UOCR_Q4_GROUP_SIZE_DEFAULT) -> int:
+    if len(shape) != 2:
+        raise ValueError(f"Q4_0 tensors must be rank-2, got shape {shape!r}")
+    rows, cols = (int(shape[0]), int(shape[1]))
+    if rows <= 0 or cols <= 0:
+        raise ValueError(f"Q4_0 tensors require positive dimensions, got shape {shape!r}")
+    if group_size <= 0:
+        raise ValueError(f"Q4_0 group size must be positive, got {group_size}")
+    if cols % group_size != 0:
+        raise ValueError(f"Q4_0 columns ({cols}) must be divisible by group size {group_size}")
+    if cols % 2 != 0:
+        raise ValueError(f"Q4_0 columns ({cols}) must be even for nibble packing")
+    return rows * (cols // 2)
+
+
+def q4_qscale_bytes(shape: tuple[int, ...], group_size: int = UOCR_Q4_GROUP_SIZE_DEFAULT) -> int:
+    _ = q4_qweight_bytes(shape, group_size)
+    rows, cols = (int(shape[0]), int(shape[1]))
+    return rows * (cols // group_size) * np.dtype("<f2").itemsize
+
+
+def q4_total_bytes(shape: tuple[int, ...], group_size: int = UOCR_Q4_GROUP_SIZE_DEFAULT) -> int:
+    return q4_qweight_bytes(shape, group_size) + q4_qscale_bytes(shape, group_size)
 
 
 def _align_up(value: int, alignment: int) -> int:
