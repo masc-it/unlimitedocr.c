@@ -490,7 +490,7 @@ cfg flip → end-to-end QA.  Attention Q/K/V/O is deliberately **excluded** for
 now (highest quality risk: Q/K errors amplify through RoPE and attention
 logits).
 
-### E1. LM head Q4 (165 MB/token → 83 MB/token) — ✅ shipped, pending QA
+### E1. LM head Q4 (165 MB/token → 83 MB/token) — ✅ shipped and QA'd
 
 Now the single biggest per-token reader: the fused argmax streams the whole
 `[129280, 1280]` matrix every decode token.
@@ -514,7 +514,7 @@ kernel is simultaneously near the ALU limit, but real and exact.
       decode step; custom path forced (MPS env selector ignored).
 * [x] Flip `lm_head: qtype: q4_0` in the shipped cfg → QA (planned mixed-q4
       file: 2.16 GB).
-* [ ] End-to-end QA vs q8/fp16 baselines.
+* [x] End-to-end QA vs q8/fp16 baselines — passed.
 
 ### E2. Shared experts + dense L0 MLP Q4 (102 MB/token → 51 MB/token)
 
