@@ -10729,18 +10729,21 @@ static int metal_run_packed_qkv_mps_f16(uocr_metal_context *ctx,
     }
 
     /*
-     * Fused QKV: one MPS matmul  src @ Wqkv^T  →  temp [rows, 3*hidden],
-     * then split into separate Q/K/V buffers.  This replaces 3 separate
-     * MPS matmul calls (Q, K, V) with 1, cutting 2 dispatches per block.
+     * Fused QKV: one MPS matmul  src @ Wqkv^T  →  transient scratch
+     * [rows, 3*hidden], then a single fused bias-add + split pass into the
+     * separate Q/K/V buffers.  This replaces 3 separate MPS matmul calls
+     * (Q, K, V) with 1 and folds the bias pass into the split, and reuses the
+     * grow-on-demand transient scratch instead of allocating a fresh private
+     * buffer per call.
      */
+    if ((hidden_size % 4u) != 0u) {
+        return metal_fail(error, error_size, "%s fused QKV requires hidden size divisible by 4", op_name != NULL ? op_name : "Metal");
+    }
+    if (!uocr_metal_context_ensure_scratch(ctx, UOCR_METAL_SCRATCH_TRANSIENT, qkv_bytes, 0, error, error_size)) {
+        return 0;
+    }
     @autoreleasepool {
-        id<MTLBuffer> temp = metal_new_buffer_with_length(ctx, (NSUInteger)qkv_bytes, MTLResourceStorageModePrivate);
-        if (temp == nil) {
-            return metal_fail(error, error_size, "failed to allocate %s fused QKV temp buffer", op_name != NULL ? op_name : "Metal");
-        }
-        temp.label = @"uocr_qkv_fused_temp";
-
-        uocr_metal_buffer_slice temp_slice = { temp, 0u };
+        uocr_metal_buffer_slice temp_slice = { ctx->scratch[UOCR_METAL_SCRATCH_TRANSIENT].buffer, 0u };
 
         /* One fused MPS matmul:  src @ Wqkv^T  →  temp [rows, 3*hidden] */
         if (!metal_run_mps_matmul_nt_f16(ctx,
@@ -10753,62 +10756,103 @@ static int metal_run_packed_qkv_mps_f16(uocr_metal_context *ctx,
                                          op_name,
                                          error,
                                          error_size)) {
-            [temp release];
             return 0;
         }
 
-        /* Bias add on the fused output */
-        if (!metal_run_bias_add_f16_inplace(ctx,
-                                            temp_slice,
-                                            packed_bias,
-                                            rows,
-                                            qkv_size,
-                                            op_name,
-                                            error,
-                                            error_size)) {
-            [temp release];
-            return 0;
-        }
-
-        /* Split kernel: temp → q_dst, k_dst, v_dst */
+        /* Fused bias + split kernel: temp + bias → q_dst, k_dst, v_dst */
         {
-            id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, "uocr_split_qkv_f16", error, error_size);
+            id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, "uocr_split_qkv_bias_f16", error, error_size);
             if (pipeline == nil) {
-                [temp release];
                 return 0;
             }
             int owned = 0;
-            id<MTLCommandBuffer> cb = metal_command_buffer_for_op(ctx, &owned, "Metal QKV split", error, error_size);
+            id<MTLCommandBuffer> cb = metal_command_buffer_for_op(ctx, &owned, "Metal QKV bias split", error, error_size);
             if (cb == nil) {
-                [temp release];
                 return 0;
             }
             id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
             if (enc == nil) {
-                [temp release];
-                return metal_fail(error, error_size, "failed to create %s QKV split encoder", op_name != NULL ? op_name : "Metal");
+                return metal_fail(error, error_size, "failed to create %s QKV bias split encoder", op_name != NULL ? op_name : "Metal");
             }
             struct { uint32_t rows; uint32_t hidden_size; } split_params;
             split_params.rows = rows;
             split_params.hidden_size = hidden_size;
             [enc setComputePipelineState:pipeline];
-            [enc setBuffer:temp offset:0u atIndex:0u];
-            [enc setBuffer:q_dst.buffer offset:q_dst.offset atIndex:1u];
-            [enc setBuffer:k_dst.buffer offset:k_dst.offset atIndex:2u];
-            [enc setBuffer:v_dst.buffer offset:v_dst.offset atIndex:3u];
-            [enc setBytes:&split_params length:sizeof(split_params) atIndex:4u];
-            [enc dispatchThreads:MTLSizeMake((NSUInteger)hidden_size, (NSUInteger)rows, 1u)
+            [enc setBuffer:temp_slice.buffer offset:temp_slice.offset atIndex:0u];
+            [enc setBuffer:packed_bias.buffer offset:packed_bias.offset atIndex:1u];
+            [enc setBuffer:q_dst.buffer offset:q_dst.offset atIndex:2u];
+            [enc setBuffer:k_dst.buffer offset:k_dst.offset atIndex:3u];
+            [enc setBuffer:v_dst.buffer offset:v_dst.offset atIndex:4u];
+            [enc setBytes:&split_params length:sizeof(split_params) atIndex:5u];
+            [enc dispatchThreads:MTLSizeMake((NSUInteger)(hidden_size / 4u), (NSUInteger)rows, 1u)
            threadsPerThreadgroup:MTLSizeMake(32u, 1u, 1u)];
             [enc endEncoding];
-            if (!metal_finish_command_buffer_for_op(ctx, cb, owned, "Metal QKV split", error, error_size)) {
-                [temp release];
+            if (!metal_finish_command_buffer_for_op(ctx, cb, owned, "Metal QKV bias split", error, error_size)) {
                 return 0;
             }
         }
 
-        [temp release];
     }
     return 1;
+}
+
+/* Fused bias + residual add: dst = src + bias (per column) + residual. */
+static int metal_run_bias_residual_add_f16(uocr_metal_context *ctx,
+                                           uocr_metal_buffer_slice src,
+                                           uocr_metal_buffer_slice bias,
+                                           uocr_metal_buffer_slice residual,
+                                           uocr_metal_buffer_slice dst,
+                                           uint32_t rows,
+                                           uint32_t cols,
+                                           const char *op_name,
+                                           char *error,
+                                           size_t error_size) {
+    uint64_t value_count = 0u;
+    uint64_t data_bytes = 0u;
+    uint64_t bias_bytes = 0u;
+    if (ctx == NULL || rows == 0u || cols == 0u || (cols % UOCR_METAL_HALF4_WIDTH) != 0u ||
+        !checked_mul_u64((uint64_t)rows, (uint64_t)cols, &value_count) ||
+        !checked_mul_u64(value_count, 2u, &data_bytes) ||
+        !checked_mul_u64((uint64_t)cols, 2u, &bias_bytes) ||
+        value_count > (uint64_t)UINT32_MAX ||
+        !metal_slice_valid(src, data_bytes) || !metal_slice_valid(bias, bias_bytes) ||
+        !metal_slice_valid(residual, data_bytes) || !metal_slice_valid(dst, data_bytes)) {
+        return metal_fail(error, error_size, "invalid %s bias-residual-add request", op_name != NULL ? op_name : "Metal");
+    }
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, "uocr_bias_residual_add_f16", error, error_size);
+        if (pipeline == nil) {
+            return 0;
+        }
+        int owned_command_buffer = 0;
+        id<MTLCommandBuffer> cb = metal_command_buffer_for_op(ctx, &owned_command_buffer, op_name != NULL ? op_name : "bias residual add", error, error_size);
+        if (cb == nil) {
+            return 0;
+        }
+        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
+        if (enc == nil) {
+            return metal_fail(error, error_size, "failed to create %s bias-residual-add command encoder", op_name != NULL ? op_name : "Metal");
+        }
+        uocr_metal_bias_add_params params;
+        params.rows = rows;
+        params.cols = cols;
+        params.reserved0 = 0u;
+        params.reserved1 = 0u;
+        NSUInteger threads = pipeline.threadExecutionWidth;
+        if (threads == 0u) threads = 1u;
+        if (threads > 256u) threads = 256u;
+        const uint64_t vector_count = value_count / UOCR_METAL_HALF4_WIDTH;
+        [enc setComputePipelineState:pipeline];
+        [enc setBuffer:src.buffer offset:src.offset atIndex:0u];
+        [enc setBuffer:bias.buffer offset:bias.offset atIndex:1u];
+        [enc setBuffer:residual.buffer offset:residual.offset atIndex:2u];
+        [enc setBuffer:dst.buffer offset:dst.offset atIndex:3u];
+        [enc setBytes:&params length:sizeof(params) atIndex:4u];
+        [enc dispatchThreads:MTLSizeMake((NSUInteger)vector_count, 1u, 1u)
+       threadsPerThreadgroup:MTLSizeMake(threads, 1u, 1u)];
+        [enc endEncoding];
+        return metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, op_name != NULL ? op_name : "bias residual add", error, error_size);
+    }
 }
 
 static const uocr_metal_decoder_binding *metal_require_decoder_binding_index(const uocr_metal_context *ctx,
@@ -17216,25 +17260,33 @@ static int metal_context_clip_transformer_batch_block_workspace_f16_to_slice(uoc
                                                               UOCR_CLIP_HIDDEN_SIZE,
                                                               "Metal CLIP batch output projection MPS matmul",
                                                               error,
-                                                              error_size) &&
-                                  metal_run_bias_add_f16_inplace(ctx,
-                                                                 (uocr_metal_buffer_slice){scratch->clip_block_projected.buffer, scratch->clip_block_projected.offset},
-                                                                 block->out_proj_bias.slice,
-                                                                 rows,
-                                                                 UOCR_CLIP_HIDDEN_SIZE,
-                                                                 "Metal CLIP batch output projection bias",
-                                                                 error,
-                                                                 error_size));
+                                                              error_size));
     }
-    RUN_CLIP_BATCH_BLOCK_STEP("attention residual",
-                              metal_run_residual_add_f16(ctx,
-                                                         (uocr_metal_buffer_slice){input_tokens.buffer, input_tokens.offset},
-                                                         (uocr_metal_buffer_slice){scratch->clip_block_projected.buffer, scratch->clip_block_projected.offset},
-                                                         (uocr_metal_buffer_slice){scratch->clip_block_residual1.buffer, scratch->clip_block_residual1.offset},
-                                                         (uint32_t)hidden_values,
-                                                         "Metal CLIP batch attention residual",
-                                                         error,
-                                                         error_size));
+    /* fp16 path defers the projection bias into the fused bias+residual pass;
+     * the Q8 GEMM already applied bias in its epilogue. */
+    if (out_proj_is_q8) {
+        RUN_CLIP_BATCH_BLOCK_STEP("attention residual",
+                                  metal_run_residual_add_f16(ctx,
+                                                             (uocr_metal_buffer_slice){input_tokens.buffer, input_tokens.offset},
+                                                             (uocr_metal_buffer_slice){scratch->clip_block_projected.buffer, scratch->clip_block_projected.offset},
+                                                             (uocr_metal_buffer_slice){scratch->clip_block_residual1.buffer, scratch->clip_block_residual1.offset},
+                                                             (uint32_t)hidden_values,
+                                                             "Metal CLIP batch attention residual",
+                                                             error,
+                                                             error_size));
+    } else {
+        RUN_CLIP_BATCH_BLOCK_STEP("attention bias residual",
+                                  metal_run_bias_residual_add_f16(ctx,
+                                                                  (uocr_metal_buffer_slice){scratch->clip_block_projected.buffer, scratch->clip_block_projected.offset},
+                                                                  block->out_proj_bias.slice,
+                                                                  (uocr_metal_buffer_slice){input_tokens.buffer, input_tokens.offset},
+                                                                  (uocr_metal_buffer_slice){scratch->clip_block_residual1.buffer, scratch->clip_block_residual1.offset},
+                                                                  rows,
+                                                                  UOCR_CLIP_HIDDEN_SIZE,
+                                                                  "Metal CLIP batch attention bias residual",
+                                                                  error,
+                                                                  error_size));
+    }
     RUN_CLIP_BATCH_BLOCK_STEP("LayerNorm2",
                               metal_context_layernorm_f16_slices_with_parameter_buffers(ctx,
                                                                                          (uocr_metal_buffer_slice){scratch->clip_block_residual1.buffer, scratch->clip_block_residual1.offset},
@@ -18392,25 +18444,33 @@ static int metal_context_sam_transformer_batch_block_workspace_f16_to_slice(uocr
                                                                  UOCR_SAM_HIDDEN_SIZE,
                                                                  "Metal SAM batch global output projection MPS matmul",
                                                                  error,
-                                                                 error_size) &&
-                                     metal_run_bias_add_f16_inplace(ctx,
-                                                                    (uocr_metal_buffer_slice){scratch->sam_block_attention_bhwc.buffer, scratch->sam_block_attention_bhwc.offset},
-                                                                    block->proj_bias.slice,
-                                                                    rows,
-                                                                    UOCR_SAM_HIDDEN_SIZE,
-                                                                    "Metal SAM batch global output projection bias",
-                                                                    error,
-                                                                    error_size));
+                                                                 error_size));
         }
-        RUN_SAM_BATCH_BLOCK_STEP("attention residual",
-                                 metal_run_residual_add_f16(ctx,
-                                                            (uocr_metal_buffer_slice){input_bhwc.buffer, input_bhwc.offset},
-                                                            (uocr_metal_buffer_slice){scratch->sam_block_attention_bhwc.buffer, scratch->sam_block_attention_bhwc.offset},
-                                                            (uocr_metal_buffer_slice){scratch->sam_block_residual1_bhwc.buffer, scratch->sam_block_residual1_bhwc.offset},
-                                                            (uint32_t)hidden_values,
-                                                            "Metal SAM batch global attention residual",
-                                                            error,
-                                                            error_size));
+        /* fp16 path defers the projection bias into the fused bias+residual
+         * pass; the Q8 GEMM already applied bias in its epilogue. */
+        if (proj_is_q8) {
+            RUN_SAM_BATCH_BLOCK_STEP("attention residual",
+                                     metal_run_residual_add_f16(ctx,
+                                                                (uocr_metal_buffer_slice){input_bhwc.buffer, input_bhwc.offset},
+                                                                (uocr_metal_buffer_slice){scratch->sam_block_attention_bhwc.buffer, scratch->sam_block_attention_bhwc.offset},
+                                                                (uocr_metal_buffer_slice){scratch->sam_block_residual1_bhwc.buffer, scratch->sam_block_residual1_bhwc.offset},
+                                                                (uint32_t)hidden_values,
+                                                                "Metal SAM batch global attention residual",
+                                                                error,
+                                                                error_size));
+        } else {
+            RUN_SAM_BATCH_BLOCK_STEP("attention bias residual",
+                                     metal_run_bias_residual_add_f16(ctx,
+                                                                     (uocr_metal_buffer_slice){scratch->sam_block_attention_bhwc.buffer, scratch->sam_block_attention_bhwc.offset},
+                                                                     block->proj_bias.slice,
+                                                                     (uocr_metal_buffer_slice){input_bhwc.buffer, input_bhwc.offset},
+                                                                     (uocr_metal_buffer_slice){scratch->sam_block_residual1_bhwc.buffer, scratch->sam_block_residual1_bhwc.offset},
+                                                                     rows,
+                                                                     UOCR_SAM_HIDDEN_SIZE,
+                                                                     "Metal SAM batch global attention bias residual",
+                                                                     error,
+                                                                     error_size));
+        }
     } else {
         uint32_t actual_windows = 0u;
         uint32_t actual_padded_w = 0u;

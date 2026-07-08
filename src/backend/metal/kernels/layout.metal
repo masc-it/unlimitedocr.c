@@ -171,6 +171,43 @@ kernel void uocr_split_qkv_f16(device const half *qkv [[buffer(0)]],
     v[dst] = qkv[qkv_base + ulong(params.hidden_size * 2u) + ulong(col)];
 }
 
+/*
+ * Fused packed-QKV bias add + split: q/k/v[row, col] = qkv[row, ...] + bias.
+ *
+ * qkv:  [rows, 3 * hidden_size]  raw matmul output (no bias)
+ * bias: [3 * hidden_size]        packed q | k | v bias
+ *
+ * Dispatch: (hidden_size / 4, rows) as thread_position_in_grid; hidden_size
+ * must be a multiple of 4 (CLIP 1024, SAM 768).
+ */
+kernel void uocr_split_qkv_bias_f16(device const half *qkv [[buffer(0)]],
+                                    device const half *bias [[buffer(1)]],
+                                    device half *q [[buffer(2)]],
+                                    device half *k [[buffer(3)]],
+                                    device half *v [[buffer(4)]],
+                                    constant UocrSplitQkvParams &params [[buffer(5)]],
+                                    uint2 gid [[thread_position_in_grid]]) {
+    const uint col = gid.x * UOCR_HALF4_WIDTH;
+    const uint row = gid.y;
+    if (row >= params.rows || col >= params.hidden_size) {
+        return;
+    }
+
+    const uint hidden = params.hidden_size;
+    const ulong qkv_base = ulong(row) * ulong(hidden * 3u) + ulong(col);
+    const ulong dst = ulong(row) * ulong(hidden) + ulong(col);
+
+    const half4 qv = half4(float4(uocr_load_half4(qkv, qkv_base)) +
+                           float4(uocr_load_half4(bias, ulong(col))));
+    const half4 kv = half4(float4(uocr_load_half4(qkv, qkv_base + ulong(hidden))) +
+                           float4(uocr_load_half4(bias, ulong(hidden + col))));
+    const half4 vv = half4(float4(uocr_load_half4(qkv, qkv_base + ulong(hidden * 2u))) +
+                           float4(uocr_load_half4(bias, ulong(hidden * 2u + col))));
+    uocr_store_half4(q, dst, qv);
+    uocr_store_half4(k, dst, kv);
+    uocr_store_half4(v, dst, vv);
+}
+
 struct UocrConv3x3BhwcIm2ColParams {
     uint input_width;
     uint input_height;

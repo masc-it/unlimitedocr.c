@@ -1,47 +1,7 @@
-// clip.metal - CLIP QKV projection
+// clip.metal - CLIP residual/embedding kernels
 // Extracted from uocr_smoke.metal
 //
 #include "common.metal"
-kernel void uocr_clip_qkv_f16_to_f16(device const half *src [[buffer(0)]],
-                                     device const half *weight [[buffer(1)]],
-                                     device const half *bias [[buffer(2)]],
-                                     device half *q_dst [[buffer(3)]],
-                                     device half *k_dst [[buffer(4)]],
-                                     device half *v_dst [[buffer(5)]],
-                                     constant UocrDenseParams &params [[buffer(6)]],
-                                     threadgroup float *partials [[threadgroup(0)]],
-                                     uint output_index [[threadgroup_position_in_grid]],
-                                     uint tid [[thread_index_in_threadgroup]],
-                                     uint ntg [[threads_per_threadgroup]],
-                                     uint simd_width [[threads_per_simdgroup]]) {
-    const uint values_per_projection = params.input_rows * params.out_features;
-    const uint projection = output_index / values_per_projection;
-    const uint element = output_index - projection * values_per_projection;
-    const uint row = element / params.out_features;
-    const uint out_col = element - row * params.out_features;
-    if (projection >= 3u || row >= params.input_rows || out_col >= params.out_features) {
-        return;
-    }
-
-    const uint packed_col = projection * params.out_features + out_col;
-    float value = uocr_dense_dot_f16(src, weight, params, row, packed_col, tid, ntg, simd_width, partials);
-    if (tid == 0) {
-        value += float(bias[packed_col]);
-        device half *dst = projection == 0u ? q_dst : (projection == 1u ? k_dst : v_dst);
-        dst[row * params.out_features + out_col] = half(value);
-    }
-}
-
-// CLIP activation and residual
-kernel void uocr_clip_quickgelu_f16_to_f16(device const half *src [[buffer(0)]],
-                                           device half *dst [[buffer(1)]],
-                                           constant uint &value_count [[buffer(2)]],
-                                           uint gid [[thread_position_in_grid]]) {
-    if (gid >= value_count) {
-        return;
-    }
-    dst[gid] = half(uocr_quickgelu(float(src[gid])));
-}
 kernel void uocr_clip_residual_add_f16_to_f16(device const half *base [[buffer(0)]],
                                               device const half *update [[buffer(1)]],
                                               device half *dst [[buffer(2)]],

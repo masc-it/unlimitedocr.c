@@ -1,58 +1,7 @@
-// dense.metal - Dense projection params, bias add
+// dense.metal - Bias add / dense decode kernels
 // Extracted from uocr_smoke.metal
 //
 #include "common.metal"
-struct UocrDenseParams {
-    uint input_rows;
-    uint in_features;
-    uint out_features;
-    uint has_bias;
-};
-
-
-
-static inline float uocr_dense_dot_f16(device const half *src,
-                                       device const half *weight,
-                                       constant UocrDenseParams &params,
-                                       uint row,
-                                       uint out_col,
-                                       uint tid,
-                                       uint ntg,
-                                       uint simd_width,
-                                       threadgroup float *partials) {
-    float sum = 0.0f;
-    const uint src_base = row * params.in_features;
-    const uint weight_base = out_col * params.in_features;
-    for (uint k = tid; k < params.in_features; k += ntg) {
-        sum += float(src[src_base + k]) * float(weight[weight_base + k]);
-    }
-    return uocr_threadgroup_sum(sum, partials, tid, ntg, simd_width);
-}
-
-kernel void uocr_dense_f16_to_f16(device const half *src [[buffer(0)]],
-                                  device const half *weight [[buffer(1)]],
-                                  device const half *bias [[buffer(2)]],
-                                  device half *dst [[buffer(3)]],
-                                  constant UocrDenseParams &params [[buffer(4)]],
-                                  threadgroup float *partials [[threadgroup(0)]],
-                                  uint output_index [[threadgroup_position_in_grid]],
-                                  uint tid [[thread_index_in_threadgroup]],
-                                  uint ntg [[threads_per_threadgroup]],
-                                  uint simd_width [[threads_per_simdgroup]]) {
-    const uint row = output_index / params.out_features;
-    const uint out_col = output_index - row * params.out_features;
-    if (row >= params.input_rows || out_col >= params.out_features) {
-        return;
-    }
-
-    float value = uocr_dense_dot_f16(src, weight, params, row, out_col, tid, ntg, simd_width, partials);
-    if (tid == 0) {
-        if (params.has_bias != 0u) {
-            value += float(bias[out_col]);
-        }
-        dst[row * params.out_features + out_col] = half(value);
-    }
-}
 struct UocrBiasAddParams {
     uint rows;
     uint cols;
@@ -82,6 +31,33 @@ kernel void uocr_bias_add_f16_inplace(device half *dst [[buffer(0)]],
             dst[idx] = half(float(dst[idx]) + float(bias[col + i]));
         }
     }
+}
+
+/*
+ * Fused bias + residual add: dst[row, col] = src[row, col] + bias[col] +
+ * residual[row, col].  Replaces the separate bias-add and residual-add passes
+ * after the vision fp16 attention output projection.
+ *
+ * Dispatch: rows * (cols / 4) half4 vectors; cols must be a multiple of 4.
+ */
+kernel void uocr_bias_residual_add_f16(device const half *src [[buffer(0)]],
+                                       device const half *bias [[buffer(1)]],
+                                       device const half *residual [[buffer(2)]],
+                                       device half *dst [[buffer(3)]],
+                                       constant UocrBiasAddParams &params [[buffer(4)]],
+                                       uint gid [[thread_position_in_grid]]) {
+    const uint vec_cols = params.cols / UOCR_HALF4_WIDTH;
+    const uint vector_count = params.rows * vec_cols;
+    if (gid >= vector_count || vec_cols == 0u) {
+        return;
+    }
+    const uint row = gid / vec_cols;
+    const uint col = (gid - row * vec_cols) * UOCR_HALF4_WIDTH;
+    const ulong base = (ulong(row) * ulong(params.cols)) + ulong(col);
+    const half4 values = uocr_load_half4(src, base);
+    const half4 bias_values = uocr_load_half4(bias, ulong(col));
+    const half4 residual_values = uocr_load_half4(residual, base);
+    uocr_store_half4(dst, base, half4(float4(values) + float4(bias_values) + float4(residual_values)));
 }
 
 // Shared activation: uocr_quickgelu

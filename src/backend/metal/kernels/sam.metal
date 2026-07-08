@@ -178,43 +178,7 @@ kernel void uocr_sam_layernorm2d_bhwc_f16_to_f16(device const half *src_bhwc [[b
     }
 }
 
-struct UocrSamResidualParams {
-    uint n_rows;
-    uint hidden_size;
-    uint reserved0;
-    uint reserved1;
-};
-
-kernel void uocr_sam_residual_add_f16_to_f16(device const half *base [[buffer(0)]],
-                                             device const half *update [[buffer(1)]],
-                                             device half *dst [[buffer(2)]],
-                                             constant UocrSamResidualParams &params [[buffer(3)]],
-                                             uint gid [[thread_position_in_grid]]) {
-    const uint values = params.n_rows * params.hidden_size;
-    const uint value_base = gid * UOCR_HALF4_WIDTH;
-    if (value_base >= values) {
-        return;
-    }
-    if (value_base + (UOCR_HALF4_WIDTH - 1u) < values) {
-        const half4 base_values = uocr_load_half4(base, ulong(value_base));
-        const half4 update_values = uocr_load_half4(update, ulong(value_base));
-        uocr_store_half4(dst, ulong(value_base), half4(float4(base_values) + float4(update_values)));
-    } else {
-        for (uint i = 0u; i < UOCR_HALF4_WIDTH && value_base + i < values; ++i) {
-            const uint idx = value_base + i;
-            dst[idx] = half(float(base[idx]) + float(update[idx]));
-        }
-    }
-}
-
-// SAM MLP kernels
-struct UocrSamMlpParams {
-    uint n_rows;
-    uint hidden_size;
-    uint intermediate_size;
-    uint reserved;
-};
-
+// SAM MLP activation helpers
 static inline float uocr_erf_approx(float x) {
     const float sign = x < 0.0f ? -1.0f : 1.0f;
     const float ax = fabs(x);
@@ -240,74 +204,4 @@ kernel void uocr_bias_gelu_f16_inplace(device half *dst [[buffer(0)]],
     const uint col = gid - (gid / params.cols) * params.cols;
     const float value = float(dst[gid]) + float(bias[col]);
     dst[gid] = half(uocr_gelu_erf(value));
-}
-
-kernel void uocr_sam_mlp_lin1_gelu_f16(device const half *src [[buffer(0)]],
-                                       device const half *weight [[buffer(1)]],
-                                       device const half *bias [[buffer(2)]],
-                                       device half *mid [[buffer(3)]],
-                                       constant UocrSamMlpParams &params [[buffer(4)]],
-                                       threadgroup float *partials [[threadgroup(0)]],
-                                       uint output_index [[threadgroup_position_in_grid]],
-                                       uint tid [[thread_index_in_threadgroup]],
-                                       uint ntg [[threads_per_threadgroup]],
-                                       uint simd_width [[threads_per_simdgroup]]) {
-    const uint row = output_index / params.intermediate_size;
-    const uint out_col = output_index - row * params.intermediate_size;
-    if (row >= params.n_rows || out_col >= params.intermediate_size) {
-        return;
-    }
-
-    float sum = 0.0f;
-    const uint src_base = row * params.hidden_size;
-    const uint weight_base = out_col * params.hidden_size;
-    for (uint k = tid; k < params.hidden_size; k += ntg) {
-        sum += float(src[src_base + k]) * float(weight[weight_base + k]);
-    }
-    const float total = uocr_threadgroup_sum(sum, partials, tid, ntg, simd_width);
-
-    if (tid == 0u) {
-        const float projected = total + float(bias[out_col]);
-        mid[row * params.intermediate_size + out_col] = half(uocr_gelu_erf(projected));
-    }
-}
-
-static inline float uocr_sam_mlp_lin2_dot_f16(device const half *mid,
-                                              device const half *weight,
-                                              constant UocrSamMlpParams &params,
-                                              uint row,
-                                              uint out_col,
-                                              uint tid,
-                                              uint ntg,
-                                              uint simd_width,
-                                              threadgroup float *partials) {
-    float sum = 0.0f;
-    const uint mid_base = row * params.intermediate_size;
-    const uint weight_base = out_col * params.intermediate_size;
-    for (uint k = tid; k < params.intermediate_size; k += ntg) {
-        sum += float(mid[mid_base + k]) * float(weight[weight_base + k]);
-    }
-    return uocr_threadgroup_sum(sum, partials, tid, ntg, simd_width);
-}
-
-kernel void uocr_sam_mlp_lin2_f16_to_f16(device const half *mid [[buffer(0)]],
-                                         device const half *weight [[buffer(1)]],
-                                         device const half *bias [[buffer(2)]],
-                                         device half *dst [[buffer(3)]],
-                                         constant UocrSamMlpParams &params [[buffer(4)]],
-                                         threadgroup float *partials [[threadgroup(0)]],
-                                         uint output_index [[threadgroup_position_in_grid]],
-                                         uint tid [[thread_index_in_threadgroup]],
-                                         uint ntg [[threads_per_threadgroup]],
-                                         uint simd_width [[threads_per_simdgroup]]) {
-    const uint row = output_index / params.hidden_size;
-    const uint out_col = output_index - row * params.hidden_size;
-    if (row >= params.n_rows || out_col >= params.hidden_size) {
-        return;
-    }
-
-    float value = uocr_sam_mlp_lin2_dot_f16(mid, weight, params, row, out_col, tid, ntg, simd_width, partials);
-    if (tid == 0u) {
-        dst[row * params.hidden_size + out_col] = half(value + float(bias[out_col]));
-    }
 }

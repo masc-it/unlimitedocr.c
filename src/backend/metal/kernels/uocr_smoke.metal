@@ -258,60 +258,9 @@ static inline void uocr_threadgroup_sum2(float value0,
 //  dense.metal
 // ═══════════════════════════════════════════
 
-// dense.metal - Dense projection params, bias add
+// dense.metal - Bias add / dense decode kernels
 // Extracted from uocr_smoke.metal
 //
-struct UocrDenseParams {
-    uint input_rows;
-    uint in_features;
-    uint out_features;
-    uint has_bias;
-};
-
-
-
-static inline float uocr_dense_dot_f16(device const half *src,
-                                       device const half *weight,
-                                       constant UocrDenseParams &params,
-                                       uint row,
-                                       uint out_col,
-                                       uint tid,
-                                       uint ntg,
-                                       uint simd_width,
-                                       threadgroup float *partials) {
-    float sum = 0.0f;
-    const uint src_base = row * params.in_features;
-    const uint weight_base = out_col * params.in_features;
-    for (uint k = tid; k < params.in_features; k += ntg) {
-        sum += float(src[src_base + k]) * float(weight[weight_base + k]);
-    }
-    return uocr_threadgroup_sum(sum, partials, tid, ntg, simd_width);
-}
-
-kernel void uocr_dense_f16_to_f16(device const half *src [[buffer(0)]],
-                                  device const half *weight [[buffer(1)]],
-                                  device const half *bias [[buffer(2)]],
-                                  device half *dst [[buffer(3)]],
-                                  constant UocrDenseParams &params [[buffer(4)]],
-                                  threadgroup float *partials [[threadgroup(0)]],
-                                  uint output_index [[threadgroup_position_in_grid]],
-                                  uint tid [[thread_index_in_threadgroup]],
-                                  uint ntg [[threads_per_threadgroup]],
-                                  uint simd_width [[threads_per_simdgroup]]) {
-    const uint row = output_index / params.out_features;
-    const uint out_col = output_index - row * params.out_features;
-    if (row >= params.input_rows || out_col >= params.out_features) {
-        return;
-    }
-
-    float value = uocr_dense_dot_f16(src, weight, params, row, out_col, tid, ntg, simd_width, partials);
-    if (tid == 0) {
-        if (params.has_bias != 0u) {
-            value += float(bias[out_col]);
-        }
-        dst[row * params.out_features + out_col] = half(value);
-    }
-}
 struct UocrBiasAddParams {
     uint rows;
     uint cols;
@@ -341,6 +290,33 @@ kernel void uocr_bias_add_f16_inplace(device half *dst [[buffer(0)]],
             dst[idx] = half(float(dst[idx]) + float(bias[col + i]));
         }
     }
+}
+
+/*
+ * Fused bias + residual add: dst[row, col] = src[row, col] + bias[col] +
+ * residual[row, col].  Replaces the separate bias-add and residual-add passes
+ * after the vision fp16 attention output projection.
+ *
+ * Dispatch: rows * (cols / 4) half4 vectors; cols must be a multiple of 4.
+ */
+kernel void uocr_bias_residual_add_f16(device const half *src [[buffer(0)]],
+                                       device const half *bias [[buffer(1)]],
+                                       device const half *residual [[buffer(2)]],
+                                       device half *dst [[buffer(3)]],
+                                       constant UocrBiasAddParams &params [[buffer(4)]],
+                                       uint gid [[thread_position_in_grid]]) {
+    const uint vec_cols = params.cols / UOCR_HALF4_WIDTH;
+    const uint vector_count = params.rows * vec_cols;
+    if (gid >= vector_count || vec_cols == 0u) {
+        return;
+    }
+    const uint row = gid / vec_cols;
+    const uint col = (gid - row * vec_cols) * UOCR_HALF4_WIDTH;
+    const ulong base = (ulong(row) * ulong(params.cols)) + ulong(col);
+    const half4 values = uocr_load_half4(src, base);
+    const half4 bias_values = uocr_load_half4(bias, ulong(col));
+    const half4 residual_values = uocr_load_half4(residual, base);
+    uocr_store_half4(dst, base, half4(float4(values) + float4(bias_values) + float4(residual_values)));
 }
 
 // Shared activation: uocr_quickgelu
@@ -1456,43 +1432,7 @@ kernel void uocr_sam_layernorm2d_bhwc_f16_to_f16(device const half *src_bhwc [[b
     }
 }
 
-struct UocrSamResidualParams {
-    uint n_rows;
-    uint hidden_size;
-    uint reserved0;
-    uint reserved1;
-};
-
-kernel void uocr_sam_residual_add_f16_to_f16(device const half *base [[buffer(0)]],
-                                             device const half *update [[buffer(1)]],
-                                             device half *dst [[buffer(2)]],
-                                             constant UocrSamResidualParams &params [[buffer(3)]],
-                                             uint gid [[thread_position_in_grid]]) {
-    const uint values = params.n_rows * params.hidden_size;
-    const uint value_base = gid * UOCR_HALF4_WIDTH;
-    if (value_base >= values) {
-        return;
-    }
-    if (value_base + (UOCR_HALF4_WIDTH - 1u) < values) {
-        const half4 base_values = uocr_load_half4(base, ulong(value_base));
-        const half4 update_values = uocr_load_half4(update, ulong(value_base));
-        uocr_store_half4(dst, ulong(value_base), half4(float4(base_values) + float4(update_values)));
-    } else {
-        for (uint i = 0u; i < UOCR_HALF4_WIDTH && value_base + i < values; ++i) {
-            const uint idx = value_base + i;
-            dst[idx] = half(float(base[idx]) + float(update[idx]));
-        }
-    }
-}
-
-// SAM MLP kernels
-struct UocrSamMlpParams {
-    uint n_rows;
-    uint hidden_size;
-    uint intermediate_size;
-    uint reserved;
-};
-
+// SAM MLP activation helpers
 static inline float uocr_erf_approx(float x) {
     const float sign = x < 0.0f ? -1.0f : 1.0f;
     const float ax = fabs(x);
@@ -1518,76 +1458,6 @@ kernel void uocr_bias_gelu_f16_inplace(device half *dst [[buffer(0)]],
     const uint col = gid - (gid / params.cols) * params.cols;
     const float value = float(dst[gid]) + float(bias[col]);
     dst[gid] = half(uocr_gelu_erf(value));
-}
-
-kernel void uocr_sam_mlp_lin1_gelu_f16(device const half *src [[buffer(0)]],
-                                       device const half *weight [[buffer(1)]],
-                                       device const half *bias [[buffer(2)]],
-                                       device half *mid [[buffer(3)]],
-                                       constant UocrSamMlpParams &params [[buffer(4)]],
-                                       threadgroup float *partials [[threadgroup(0)]],
-                                       uint output_index [[threadgroup_position_in_grid]],
-                                       uint tid [[thread_index_in_threadgroup]],
-                                       uint ntg [[threads_per_threadgroup]],
-                                       uint simd_width [[threads_per_simdgroup]]) {
-    const uint row = output_index / params.intermediate_size;
-    const uint out_col = output_index - row * params.intermediate_size;
-    if (row >= params.n_rows || out_col >= params.intermediate_size) {
-        return;
-    }
-
-    float sum = 0.0f;
-    const uint src_base = row * params.hidden_size;
-    const uint weight_base = out_col * params.hidden_size;
-    for (uint k = tid; k < params.hidden_size; k += ntg) {
-        sum += float(src[src_base + k]) * float(weight[weight_base + k]);
-    }
-    const float total = uocr_threadgroup_sum(sum, partials, tid, ntg, simd_width);
-
-    if (tid == 0u) {
-        const float projected = total + float(bias[out_col]);
-        mid[row * params.intermediate_size + out_col] = half(uocr_gelu_erf(projected));
-    }
-}
-
-static inline float uocr_sam_mlp_lin2_dot_f16(device const half *mid,
-                                              device const half *weight,
-                                              constant UocrSamMlpParams &params,
-                                              uint row,
-                                              uint out_col,
-                                              uint tid,
-                                              uint ntg,
-                                              uint simd_width,
-                                              threadgroup float *partials) {
-    float sum = 0.0f;
-    const uint mid_base = row * params.intermediate_size;
-    const uint weight_base = out_col * params.intermediate_size;
-    for (uint k = tid; k < params.intermediate_size; k += ntg) {
-        sum += float(mid[mid_base + k]) * float(weight[weight_base + k]);
-    }
-    return uocr_threadgroup_sum(sum, partials, tid, ntg, simd_width);
-}
-
-kernel void uocr_sam_mlp_lin2_f16_to_f16(device const half *mid [[buffer(0)]],
-                                         device const half *weight [[buffer(1)]],
-                                         device const half *bias [[buffer(2)]],
-                                         device half *dst [[buffer(3)]],
-                                         constant UocrSamMlpParams &params [[buffer(4)]],
-                                         threadgroup float *partials [[threadgroup(0)]],
-                                         uint output_index [[threadgroup_position_in_grid]],
-                                         uint tid [[thread_index_in_threadgroup]],
-                                         uint ntg [[threads_per_threadgroup]],
-                                         uint simd_width [[threads_per_simdgroup]]) {
-    const uint row = output_index / params.hidden_size;
-    const uint out_col = output_index - row * params.hidden_size;
-    if (row >= params.n_rows || out_col >= params.hidden_size) {
-        return;
-    }
-
-    float value = uocr_sam_mlp_lin2_dot_f16(mid, weight, params, row, out_col, tid, ntg, simd_width, partials);
-    if (tid == 0u) {
-        dst[row * params.hidden_size + out_col] = half(value + float(bias[out_col]));
-    }
 }
 
 // ═══════════════════════════════════════════
@@ -2517,39 +2387,9 @@ kernel void uocr_moe_prefill_bucketed_combine_round_routed_f16(
 //  sam_attention.metal
 // ═══════════════════════════════════════════
 
-// sam_attention.metal - SAM QKV projection
+// sam_attention.metal - SAM window/rel-pos attention kernels
 // Extracted from uocr_smoke.metal
 //
-kernel void uocr_sam_qkv_f16_to_f16(device const half *src [[buffer(0)]],
-                                    device const half *weight [[buffer(1)]],
-                                    device const half *bias [[buffer(2)]],
-                                    device half *q_dst [[buffer(3)]],
-                                    device half *k_dst [[buffer(4)]],
-                                    device half *v_dst [[buffer(5)]],
-                                    constant UocrDenseParams &params [[buffer(6)]],
-                                    threadgroup float *partials [[threadgroup(0)]],
-                                    uint output_index [[threadgroup_position_in_grid]],
-                                    uint tid [[thread_index_in_threadgroup]],
-                                    uint ntg [[threads_per_threadgroup]],
-                                    uint simd_width [[threads_per_simdgroup]]) {
-    const uint values_per_projection = params.input_rows * params.out_features;
-    const uint projection = output_index / values_per_projection;
-    const uint element = output_index - projection * values_per_projection;
-    const uint row = element / params.out_features;
-    const uint out_col = element - row * params.out_features;
-    if (projection >= 3u || row >= params.input_rows || out_col >= params.out_features) {
-        return;
-    }
-
-    const uint packed_col = projection * params.out_features + out_col;
-    float value = uocr_dense_dot_f16(src, weight, params, row, packed_col, tid, ntg, simd_width, partials);
-    if (tid == 0) {
-        value += float(bias[packed_col]);
-        device half *dst = projection == 0u ? q_dst : (projection == 1u ? k_dst : v_dst);
-        dst[row * params.out_features + out_col] = half(value);
-    }
-}
-
 // SAM window/rel pos attention params and helpers
 struct UocrSamWindowAttentionParams {
     uint windows;
@@ -2630,49 +2470,6 @@ static inline float uocr_sam_rel_pos_table_value(device const half *rel_pos,
     const float v0 = float(rel_pos[ulong(uint(index0)) * ulong(head_dim) + ulong(dim)]);
     const float v1 = float(rel_pos[ulong(uint(index1)) * ulong(head_dim) + ulong(dim)]);
     return v0 * (1.0f - t) + v1 * t;
-}
-
-// SAM attention project/residual
-static inline float uocr_sam_attention_project_dot_f16(device const half *src,
-                                                       device const half *weight,
-                                                       constant UocrSamResidualParams &params,
-                                                       uint row,
-                                                       uint out_col,
-                                                       uint tid,
-                                                       uint ntg,
-                                              uint simd_width,
-                                                       threadgroup float *partials) {
-    float sum = 0.0f;
-    const uint src_base = row * params.hidden_size;
-    const uint weight_base = out_col * params.hidden_size;
-    for (uint k = tid; k < params.hidden_size; k += ntg) {
-        sum += float(src[src_base + k]) * float(weight[weight_base + k]);
-    }
-    return uocr_threadgroup_sum(sum, partials, tid, ntg, simd_width);
-}
-
-kernel void uocr_sam_attention_project_residual_f16_to_f16(device const half *src [[buffer(0)]],
-                                                           device const half *weight [[buffer(1)]],
-                                                           device const half *bias [[buffer(2)]],
-                                                           device const half *residual [[buffer(3)]],
-                                                           device half *dst [[buffer(4)]],
-                                                           constant UocrSamResidualParams &params [[buffer(5)]],
-                                                           threadgroup float *partials [[threadgroup(0)]],
-                                                           uint output_index [[threadgroup_position_in_grid]],
-                                                           uint tid [[thread_index_in_threadgroup]],
-                                                           uint ntg [[threads_per_threadgroup]],
-                                                           uint simd_width [[threads_per_simdgroup]]) {
-    const uint row = output_index / params.hidden_size;
-    const uint out_col = output_index - row * params.hidden_size;
-    if (row >= params.n_rows || out_col >= params.hidden_size) {
-        return;
-    }
-
-    float value = uocr_sam_attention_project_dot_f16(src, weight, params, row, out_col, tid, ntg, simd_width, partials);
-    if (tid == 0u) {
-        const uint dst_index = row * params.hidden_size + out_col;
-        dst[dst_index] = half(value + float(bias[out_col]) + float(residual[dst_index]));
-    }
 }
 
 // SAM flash attention: window, rel_pos, global attention, tiled variants
@@ -4262,49 +4059,9 @@ static inline float uocr_attention_output_q8_dot(device const half *src,
 //  clip.metal
 // ═══════════════════════════════════════════
 
-// clip.metal - CLIP QKV projection
+// clip.metal - CLIP residual/embedding kernels
 // Extracted from uocr_smoke.metal
 //
-kernel void uocr_clip_qkv_f16_to_f16(device const half *src [[buffer(0)]],
-                                     device const half *weight [[buffer(1)]],
-                                     device const half *bias [[buffer(2)]],
-                                     device half *q_dst [[buffer(3)]],
-                                     device half *k_dst [[buffer(4)]],
-                                     device half *v_dst [[buffer(5)]],
-                                     constant UocrDenseParams &params [[buffer(6)]],
-                                     threadgroup float *partials [[threadgroup(0)]],
-                                     uint output_index [[threadgroup_position_in_grid]],
-                                     uint tid [[thread_index_in_threadgroup]],
-                                     uint ntg [[threads_per_threadgroup]],
-                                     uint simd_width [[threads_per_simdgroup]]) {
-    const uint values_per_projection = params.input_rows * params.out_features;
-    const uint projection = output_index / values_per_projection;
-    const uint element = output_index - projection * values_per_projection;
-    const uint row = element / params.out_features;
-    const uint out_col = element - row * params.out_features;
-    if (projection >= 3u || row >= params.input_rows || out_col >= params.out_features) {
-        return;
-    }
-
-    const uint packed_col = projection * params.out_features + out_col;
-    float value = uocr_dense_dot_f16(src, weight, params, row, packed_col, tid, ntg, simd_width, partials);
-    if (tid == 0) {
-        value += float(bias[packed_col]);
-        device half *dst = projection == 0u ? q_dst : (projection == 1u ? k_dst : v_dst);
-        dst[row * params.out_features + out_col] = half(value);
-    }
-}
-
-// CLIP activation and residual
-kernel void uocr_clip_quickgelu_f16_to_f16(device const half *src [[buffer(0)]],
-                                           device half *dst [[buffer(1)]],
-                                           constant uint &value_count [[buffer(2)]],
-                                           uint gid [[thread_position_in_grid]]) {
-    if (gid >= value_count) {
-        return;
-    }
-    dst[gid] = half(uocr_quickgelu(float(src[gid])));
-}
 kernel void uocr_clip_residual_add_f16_to_f16(device const half *base [[buffer(0)]],
                                               device const half *update [[buffer(1)]],
                                               device half *dst [[buffer(2)]],
@@ -4821,6 +4578,43 @@ kernel void uocr_split_qkv_f16(device const half *qkv [[buffer(0)]],
     q[dst] = qkv[qkv_base + ulong(col)];
     k[dst] = qkv[qkv_base + ulong(params.hidden_size) + ulong(col)];
     v[dst] = qkv[qkv_base + ulong(params.hidden_size * 2u) + ulong(col)];
+}
+
+/*
+ * Fused packed-QKV bias add + split: q/k/v[row, col] = qkv[row, ...] + bias.
+ *
+ * qkv:  [rows, 3 * hidden_size]  raw matmul output (no bias)
+ * bias: [3 * hidden_size]        packed q | k | v bias
+ *
+ * Dispatch: (hidden_size / 4, rows) as thread_position_in_grid; hidden_size
+ * must be a multiple of 4 (CLIP 1024, SAM 768).
+ */
+kernel void uocr_split_qkv_bias_f16(device const half *qkv [[buffer(0)]],
+                                    device const half *bias [[buffer(1)]],
+                                    device half *q [[buffer(2)]],
+                                    device half *k [[buffer(3)]],
+                                    device half *v [[buffer(4)]],
+                                    constant UocrSplitQkvParams &params [[buffer(5)]],
+                                    uint2 gid [[thread_position_in_grid]]) {
+    const uint col = gid.x * UOCR_HALF4_WIDTH;
+    const uint row = gid.y;
+    if (row >= params.rows || col >= params.hidden_size) {
+        return;
+    }
+
+    const uint hidden = params.hidden_size;
+    const ulong qkv_base = ulong(row) * ulong(hidden * 3u) + ulong(col);
+    const ulong dst = ulong(row) * ulong(hidden) + ulong(col);
+
+    const half4 qv = half4(float4(uocr_load_half4(qkv, qkv_base)) +
+                           float4(uocr_load_half4(bias, ulong(col))));
+    const half4 kv = half4(float4(uocr_load_half4(qkv, qkv_base + ulong(hidden))) +
+                           float4(uocr_load_half4(bias, ulong(hidden + col))));
+    const half4 vv = half4(float4(uocr_load_half4(qkv, qkv_base + ulong(hidden * 2u))) +
+                           float4(uocr_load_half4(bias, ulong(hidden * 2u + col))));
+    uocr_store_half4(q, dst, qv);
+    uocr_store_half4(k, dst, kv);
+    uocr_store_half4(v, dst, vv);
 }
 
 struct UocrConv3x3BhwcIm2ColParams {

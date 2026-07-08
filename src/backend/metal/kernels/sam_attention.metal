@@ -1,37 +1,7 @@
-// sam_attention.metal - SAM QKV projection
+// sam_attention.metal - SAM window/rel-pos attention kernels
 // Extracted from uocr_smoke.metal
 //
 #include "common.metal"
-kernel void uocr_sam_qkv_f16_to_f16(device const half *src [[buffer(0)]],
-                                    device const half *weight [[buffer(1)]],
-                                    device const half *bias [[buffer(2)]],
-                                    device half *q_dst [[buffer(3)]],
-                                    device half *k_dst [[buffer(4)]],
-                                    device half *v_dst [[buffer(5)]],
-                                    constant UocrDenseParams &params [[buffer(6)]],
-                                    threadgroup float *partials [[threadgroup(0)]],
-                                    uint output_index [[threadgroup_position_in_grid]],
-                                    uint tid [[thread_index_in_threadgroup]],
-                                    uint ntg [[threads_per_threadgroup]],
-                                    uint simd_width [[threads_per_simdgroup]]) {
-    const uint values_per_projection = params.input_rows * params.out_features;
-    const uint projection = output_index / values_per_projection;
-    const uint element = output_index - projection * values_per_projection;
-    const uint row = element / params.out_features;
-    const uint out_col = element - row * params.out_features;
-    if (projection >= 3u || row >= params.input_rows || out_col >= params.out_features) {
-        return;
-    }
-
-    const uint packed_col = projection * params.out_features + out_col;
-    float value = uocr_dense_dot_f16(src, weight, params, row, packed_col, tid, ntg, simd_width, partials);
-    if (tid == 0) {
-        value += float(bias[packed_col]);
-        device half *dst = projection == 0u ? q_dst : (projection == 1u ? k_dst : v_dst);
-        dst[row * params.out_features + out_col] = half(value);
-    }
-}
-
 // SAM window/rel pos attention params and helpers
 struct UocrSamWindowAttentionParams {
     uint windows;
@@ -112,49 +82,6 @@ static inline float uocr_sam_rel_pos_table_value(device const half *rel_pos,
     const float v0 = float(rel_pos[ulong(uint(index0)) * ulong(head_dim) + ulong(dim)]);
     const float v1 = float(rel_pos[ulong(uint(index1)) * ulong(head_dim) + ulong(dim)]);
     return v0 * (1.0f - t) + v1 * t;
-}
-
-// SAM attention project/residual
-static inline float uocr_sam_attention_project_dot_f16(device const half *src,
-                                                       device const half *weight,
-                                                       constant UocrSamResidualParams &params,
-                                                       uint row,
-                                                       uint out_col,
-                                                       uint tid,
-                                                       uint ntg,
-                                              uint simd_width,
-                                                       threadgroup float *partials) {
-    float sum = 0.0f;
-    const uint src_base = row * params.hidden_size;
-    const uint weight_base = out_col * params.hidden_size;
-    for (uint k = tid; k < params.hidden_size; k += ntg) {
-        sum += float(src[src_base + k]) * float(weight[weight_base + k]);
-    }
-    return uocr_threadgroup_sum(sum, partials, tid, ntg, simd_width);
-}
-
-kernel void uocr_sam_attention_project_residual_f16_to_f16(device const half *src [[buffer(0)]],
-                                                           device const half *weight [[buffer(1)]],
-                                                           device const half *bias [[buffer(2)]],
-                                                           device const half *residual [[buffer(3)]],
-                                                           device half *dst [[buffer(4)]],
-                                                           constant UocrSamResidualParams &params [[buffer(5)]],
-                                                           threadgroup float *partials [[threadgroup(0)]],
-                                                           uint output_index [[threadgroup_position_in_grid]],
-                                                           uint tid [[thread_index_in_threadgroup]],
-                                                           uint ntg [[threads_per_threadgroup]],
-                                                           uint simd_width [[threads_per_simdgroup]]) {
-    const uint row = output_index / params.hidden_size;
-    const uint out_col = output_index - row * params.hidden_size;
-    if (row >= params.n_rows || out_col >= params.hidden_size) {
-        return;
-    }
-
-    float value = uocr_sam_attention_project_dot_f16(src, weight, params, row, out_col, tid, ntg, simd_width, partials);
-    if (tid == 0u) {
-        const uint dst_index = row * params.hidden_size + out_col;
-        dst[dst_index] = half(value + float(bias[out_col]) + float(residual[dst_index]));
-    }
 }
 
 // SAM flash attention: window, rel_pos, global attention, tiled variants
