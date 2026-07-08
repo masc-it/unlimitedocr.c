@@ -117,7 +117,7 @@ UOCR_Q4_GROUP_SIZE_DEFAULT = 64
 UOCR_Q4_MIN = -8
 UOCR_Q4_MAX = 7
 
-CONVERTER_VERSION = (0, 2, 0)
+CONVERTER_VERSION = (0, 3, 0)
 
 QUANT_POLICY_EMBEDDINGS_DECODER = "embeddings+decoder"
 #: Candidate (family, projection) universe for cfg-gated mixed Q8 planning.
@@ -156,7 +156,11 @@ PRESERVED_UNUSED_NORMAL_OCR_PREFIXES: tuple[str, ...] = (CLIP_PIXEL_PATCH_EMBEDD
 QPROFILE_IDS: Mapping[str, int] = {
     "fp16": UOCR_QPROFILE_FP16,
     "mixed-q8_0": UOCR_QPROFILE_MIXED_Q8_0,
+    "mixed-q4": UOCR_QPROFILE_MIXED_Q4,
 }
+
+#: qprofiles whose planning is cfg-gated mixed quantization.
+MIXED_QPROFILES = frozenset({"mixed-q8_0", "mixed-q4"})
 
 QTYPE_REASON_NAMES: Mapping[int, str] = {
     UOCR_QTYPE_REASON_UNKNOWN: "unknown",
@@ -772,12 +776,31 @@ def _family_histogram(tensors: Iterable[TensorPlan]) -> dict[str, int]:
 
 
 def q8_summary(tensors: Iterable[TensorPlan]) -> dict[str, Any]:
+    """Quantization summary; keeps its historical name and Q8 top-level keys and
+    adds a ``by_qtype`` breakdown covering every quantized qtype (q8_0, q4_0)."""
     tensors_tuple = tuple(tensors)
     q8_tensors = tuple(t for t in tensors_tuple if t.qtype_id == UOCR_TENSOR_Q8_0)
     qweight_bytes = sum(t.output_bytes for t in q8_tensors)
     qscale_bytes = sum(t.scale_size for t in q8_tensors)
     fp16_equivalent_bytes = sum(t.fp16_equivalent_bytes for t in q8_tensors)
     q8_total = qweight_bytes + qscale_bytes
+    by_qtype: dict[str, dict[str, Any]] = {}
+    for qtype_id, qtype_name in ((UOCR_TENSOR_Q8_0, "q8_0"), (UOCR_TENSOR_Q4_0, "q4_0")):
+        subset = tuple(t for t in tensors_tuple if t.qtype_id == qtype_id)
+        if not subset:
+            continue
+        subset_qweight = sum(t.output_bytes for t in subset)
+        subset_qscale = sum(t.scale_size for t in subset)
+        subset_fp16 = sum(t.fp16_equivalent_bytes for t in subset)
+        by_qtype[qtype_name] = {
+            "tensor_count": len(subset),
+            "qweight_bytes": subset_qweight,
+            "qscale_bytes": subset_qscale,
+            "total_bytes": subset_qweight + subset_qscale,
+            "fp16_equivalent_bytes": subset_fp16,
+            "estimated_savings_bytes": subset_fp16 - subset_qweight - subset_qscale,
+            "by_family": dict(Counter(t.family for t in subset)),
+        }
     return {
         "tensor_count": len(q8_tensors),
         "qweight_bytes": qweight_bytes,
@@ -786,11 +809,12 @@ def q8_summary(tensors: Iterable[TensorPlan]) -> dict[str, Any]:
         "fp16_equivalent_bytes": fp16_equivalent_bytes,
         "estimated_savings_bytes": fp16_equivalent_bytes - q8_total,
         "by_family": dict(Counter(t.family for t in q8_tensors)),
+        "by_qtype": by_qtype,
     }
 
 
 def _layout_metadata_for_tensor(shape: tuple[int, ...], qtype_id: int) -> tuple[str, str, int, int, bool, str]:
-    if qtype_id not in {UOCR_TENSOR_F16, UOCR_TENSOR_Q8_0}:
+    if qtype_id not in {UOCR_TENSOR_F16, UOCR_TENSOR_Q8_0, UOCR_TENSOR_Q4_0}:
         raise ValueError(f"unsupported tensor qtype id {qtype_id}")
     _ = shape
     return (
@@ -890,9 +914,9 @@ def _validate_moe_expert_interleaved_layout(tensors: Iterable[TensorPlan], *, re
                         f"expected payload offset {previous_end}, got {tensor.payload_offset}"
                     )
                 previous_end = tensor.payload_offset + tensor.output_bytes
-                if tensor.qtype_id == UOCR_TENSOR_Q8_0:
+                if tensor.qtype_id in (UOCR_TENSOR_Q8_0, UOCR_TENSOR_Q4_0):
                     if tensor.scale_size <= 0 or tensor.scale_offset <= 0:
-                        raise ValueError(f"MoE expert-major Q8 tensor {tensor.name} is missing scale payload")
+                        raise ValueError(f"MoE expert-major quantized tensor {tensor.name} is missing scale payload")
                     if previous_scale_end is not None and tensor.scale_offset != previous_scale_end:
                         raise ValueError(
                             f"MoE expert-major layer {layer} scale slab is not contiguous before {tensor.name}: "
@@ -939,12 +963,13 @@ def _layout_dry_run_file(
             continue
 
         group = [tensor]
-        if tensor.qtype_id == UOCR_TENSOR_Q8_0 and tensor.family == TensorFamily.MOE_EXPERT.name:
+        quantized_expert_qtypes = {UOCR_TENSOR_Q8_0, UOCR_TENSOR_Q4_0}
+        if tensor.qtype_id in quantized_expert_qtypes and tensor.family == TensorFamily.MOE_EXPERT.name:
             layer = tensor.layer
             lookahead = index + 1
             while (
                 lookahead < len(tensors)
-                and tensors[lookahead].qtype_id == UOCR_TENSOR_Q8_0
+                and tensors[lookahead].qtype_id == tensor.qtype_id
                 and tensors[lookahead].family == TensorFamily.MOE_EXPERT.name
                 and tensors[lookahead].layer == layer
             ):
@@ -1443,20 +1468,33 @@ def _make_tensor_plan(
     qtype_reason_id = UOCR_QTYPE_REASON_FP16_BASELINE
     promotion_reason_id = UOCR_PROMOTION_NONE
 
-    if qprofile == "mixed-q8_0" and _is_mixed_q8_candidate(registry_entry, shape, usage_id, cfg):
-        qweight_bytes = q8_qweight_bytes(shape, quant_group_size)
-        qscale_bytes = q8_qscale_bytes(shape, quant_group_size)
+    if qprofile in MIXED_QPROFILES and _is_mixed_q8_candidate(registry_entry, shape, usage_id, cfg):
+        module_qtype = cfg.qtype_for(registry_entry.family, registry_entry.projection) or "q8_0"
+        if module_qtype == "q4_0" and qprofile != "mixed-q4":
+            # A v2 cfg with q4 modules can still drive a mixed-q8_0 conversion;
+            # those modules simply fall back to Q8_0 planning.
+            module_qtype = "q8_0"
         logical_shape = shape
         physical_shape = shape
+        block_size = quant_group_size
+        qtype_reason_id = UOCR_QTYPE_REASON_UNKNOWN
+        if module_qtype == "q4_0":
+            qweight_bytes = q4_qweight_bytes(shape, quant_group_size)
+            qscale_bytes = q4_qscale_bytes(shape, quant_group_size)
+            row_size = int(shape[1]) // 2
+            qtype_id = UOCR_TENSOR_Q4_0
+            qtype = "UOCR_TENSOR_Q4_0"
+            output_dtype = "Q4_0"
+        else:
+            qweight_bytes = q8_qweight_bytes(shape, quant_group_size)
+            qscale_bytes = q8_qscale_bytes(shape, quant_group_size)
+            row_size = int(shape[1])
+            qtype_id = UOCR_TENSOR_Q8_0
+            qtype = "UOCR_TENSOR_Q8_0"
+            output_dtype = "Q8_0"
         output_bytes = qweight_bytes
         scale_size = qscale_bytes
-        block_size = quant_group_size
-        row_size = int(shape[1])
-        qtype_id = UOCR_TENSOR_Q8_0
-        qtype = "UOCR_TENSOR_Q8_0"
-        output_dtype = "Q8_0"
-        qtype_reason_id = UOCR_QTYPE_REASON_UNKNOWN
-        reason = f"mixed-q8_0 {quant_policy} cfg-gated rank-2 weight"
+        reason = f"{qprofile} {quant_policy} cfg-gated rank-2 weight ({module_qtype})"
 
     (
         source_layout,
@@ -1716,23 +1754,23 @@ def _converter_version_string() -> str:
 
 
 def _provenance_json_payload(qprofile: str, source_metadata: SourceMetadata | None) -> bytes:
-    if qprofile != "mixed-q8_0":
+    if qprofile not in MIXED_QPROFILES:
         return b""
     source_hash = ""
     if source_metadata is not None:
         source_hash = str(source_metadata.hashes.get("safetensors_index_sha256", ""))
-    payload = {
-        "quantization": {
-            "mode": "mixed-q8_0",
-            "group_size": UOCR_Q8_GROUP_SIZE_DEFAULT,
-            "policy": QUANT_POLICY_EMBEDDINGS_DECODER,
-            "lm_head_qtype": "q8_0",
-            "router_qtype": "fp16",
-            "converter_version": _converter_version_string(),
-            "source_model_hash": source_hash,
-        }
+    quantization: dict[str, Any] = {
+        "mode": qprofile,
+        "group_size": UOCR_Q8_GROUP_SIZE_DEFAULT,
+        "policy": QUANT_POLICY_EMBEDDINGS_DECODER,
+        "lm_head_qtype": "q8_0",
+        "router_qtype": "fp16",
+        "converter_version": _converter_version_string(),
+        "source_model_hash": source_hash,
     }
-    return json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    if qprofile == "mixed-q4":
+        quantization["expert_qtype"] = "q4_0"
+    return json.dumps({"quantization": quantization}, separators=(",", ":"), sort_keys=True).encode("utf-8")
 
 
 def _tokenizer_metadata_bytes(tokenizer_hash: bytes) -> bytes:
@@ -2045,6 +2083,66 @@ def _stream_bf16_to_q8_0(
     return bytes_written
 
 
+def _stream_bf16_to_q4_0(
+    src: BinaryIO,
+    dst: BinaryIO,
+    tensor: TensorPlan,
+    *,
+    stats: _StreamingValueStats | None = None,
+    chunk_source_bytes: int = 8 * 1024 * 1024,
+) -> int:
+    if tensor.qtype_id != UOCR_TENSOR_Q4_0:
+        raise ValueError(f"tensor {tensor.name} is not Q4_0")
+    if len(tensor.shape) != 2:
+        raise ValueError(f"Q4_0 tensor {tensor.name} must be rank-2")
+    rows, cols = tensor.shape
+    group_size = tensor.block_size
+    if group_size != UOCR_Q4_GROUP_SIZE_DEFAULT or cols % group_size != 0 or cols % 2 != 0:
+        raise ValueError(f"Q4_0 tensor {tensor.name} has unsupported group metadata")
+    row_source_bytes = cols * np.dtype("<u2").itemsize
+    if tensor.source_bytes != rows * row_source_bytes:
+        raise ValueError(f"Q4_0 tensor {tensor.name} source byte count does not match shape")
+
+    rows_per_chunk = max(1, chunk_source_bytes // row_source_bytes)
+    rows_done = 0
+    qweight_pos = tensor.payload_offset
+    qscale_pos = tensor.scale_offset
+    bytes_written = 0
+
+    while rows_done < rows:
+        batch_rows = min(rows - rows_done, rows_per_chunk)
+        raw_size = batch_rows * row_source_bytes
+        raw = src.read(raw_size)
+        if len(raw) != raw_size:
+            raise EOFError(f"unexpected end of safetensors payload while quantizing {tensor.name}")
+        values = _bf16_bytes_to_f32(raw).reshape(batch_rows, cols)
+        if stats is not None:
+            stats.update(values)
+        if not np.all(np.isfinite(values)):
+            raise ValueError(f"Q4_0 tensor {tensor.name} contains non-finite values")
+
+        packed, scales_f16, _dequant = _quantize_q4_0_rows(values, group_size)
+        qweight_payload = packed.tobytes()
+        qscale_payload = scales_f16.tobytes()
+
+        dst.seek(qweight_pos)
+        dst.write(qweight_payload)
+        qweight_pos += len(qweight_payload)
+        bytes_written += len(qweight_payload)
+
+        dst.seek(qscale_pos)
+        dst.write(qscale_payload)
+        qscale_pos += len(qscale_payload)
+        bytes_written += len(qscale_payload)
+        rows_done += batch_rows
+
+    if qweight_pos != tensor.payload_offset + tensor.output_bytes:
+        raise IOError(f"Q4_0 tensor {tensor.name} wrote an unexpected qweight byte count")
+    if qscale_pos != tensor.scale_offset + tensor.scale_size:
+        raise IOError(f"Q4_0 tensor {tensor.name} wrote an unexpected qscale byte count")
+    return bytes_written
+
+
 def _read_uocr_tensor_payload_view(model_path: str | Path, tensor_id: int) -> _UocrTensorPayloadView:
     path = Path(model_path)
     with path.open("rb") as f:
@@ -2146,6 +2244,73 @@ def _iter_expected_converted_tensor_chunks(
             raise EOFError(f"unexpected end of safetensors payload while reading {tensor.name}")
         yield _bf16_bytes_to_f32(raw).astype(np.dtype("<f2"), copy=False).tobytes()
         remaining -= wanted
+
+
+def _quantize_q4_0_rows(values: np.ndarray, group_size: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Quantize row-major fp32 ``[rows, cols]`` to Q4_0.
+
+    Returns ``(packed_u8[rows, cols//2], scales_f16[rows, groups], dequant_f32)``.
+    Scheme (docs/plan_q4.md §1.1): per 64-wide group, ``scale = signed_max / -8``
+    rounded to fp16, levels clamped to ``[-8, 7]``, nibbles stored as ``q + 8``
+    with the low nibble holding the even k element.
+    """
+    rows, cols = values.shape
+    groups_per_row = cols // group_size
+    grouped = values.reshape(rows, groups_per_row, group_size)
+    abs_idx = np.argmax(np.abs(grouped), axis=2)
+    signed_max = np.take_along_axis(grouped, abs_idx[:, :, None], axis=2)[:, :, 0]
+    scales_f16 = (signed_max / np.float32(UOCR_Q4_MIN)).astype(np.dtype("<f2"))
+    scales_f32 = scales_f16.astype(np.float32)
+    scales_safe = np.where(scales_f32 == 0.0, np.float32(1.0), scales_f32)
+    quantized = np.clip(np.rint(grouped / scales_safe[:, :, None]), UOCR_Q4_MIN, UOCR_Q4_MAX)
+    quantized = quantized.astype(np.int8, copy=False)
+    dequant = (quantized.astype(np.float32) * scales_f32[:, :, None]).reshape(rows, cols)
+    biased = (quantized.reshape(rows, cols).astype(np.int16) + 8).astype(np.uint8)
+    packed = (biased[:, 0::2] | (biased[:, 1::2] << 4)).astype(np.uint8, copy=False)
+    return packed, scales_f16, dequant
+
+
+def _expected_q4_0_chunk(values: np.ndarray, tensor: TensorPlan) -> tuple[bytes, bytes, float, float, int]:
+    packed, scales_f16, dequant = _quantize_q4_0_rows(values, tensor.block_size)
+    diff = dequant - values
+    sq_error = float(np.sum(diff * diff, dtype=np.float64))
+    max_abs_error = float(np.max(np.abs(diff))) if diff.size else 0.0
+    return (
+        packed.tobytes(),
+        scales_f16.tobytes(),
+        max_abs_error,
+        sq_error,
+        int(diff.size),
+    )
+
+
+def _iter_expected_q4_0_tensor_chunks(
+    src: BinaryIO,
+    tensor: TensorPlan,
+    *,
+    chunk_source_bytes: int = 8 * 1024 * 1024,
+) -> Iterable[tuple[bytes, bytes, float, float, int]]:
+    if tensor.qtype_id != UOCR_TENSOR_Q4_0:
+        raise ValueError(f"tensor {tensor.name} is not Q4_0")
+    if len(tensor.shape) != 2:
+        raise ValueError(f"Q4_0 tensor {tensor.name} must be rank-2")
+    rows, cols = tensor.shape
+    if tensor.block_size != UOCR_Q4_GROUP_SIZE_DEFAULT or cols % tensor.block_size != 0 or cols % 2 != 0:
+        raise ValueError(f"Q4_0 tensor {tensor.name} has unsupported group metadata")
+    row_source_bytes = cols * np.dtype("<u2").itemsize
+    rows_per_chunk = max(1, chunk_source_bytes // row_source_bytes)
+    rows_done = 0
+    while rows_done < rows:
+        batch_rows = min(rows - rows_done, rows_per_chunk)
+        wanted = batch_rows * row_source_bytes
+        raw = src.read(wanted)
+        if len(raw) != wanted:
+            raise EOFError(f"unexpected end of safetensors payload while reading {tensor.name}")
+        values = _bf16_bytes_to_f32(raw).reshape(batch_rows, cols)
+        if not np.all(np.isfinite(values)):
+            raise ValueError(f"Q4_0 tensor {tensor.name} contains non-finite values")
+        yield _expected_q4_0_chunk(values, tensor)
+        rows_done += batch_rows
 
 
 def _expected_q8_0_chunk(values: np.ndarray, tensor: TensorPlan) -> tuple[bytes, bytes, float, float, int]:
@@ -2254,7 +2419,7 @@ def compare_single_tensor_conversion(
     tensor = plan.tensors[0]
     if tensor.usage_id == UOCR_TENSOR_USAGE_OMITTED_WITH_REASON:
         raise ValueError(f"tensor {tensor.name} has no payload to compare")
-    if tensor.qtype_id not in {UOCR_TENSOR_F16, UOCR_TENSOR_Q8_0}:
+    if tensor.qtype_id not in {UOCR_TENSOR_F16, UOCR_TENSOR_Q8_0, UOCR_TENSOR_Q4_0}:
         raise NotImplementedError(f"single-tensor compare for qtype {tensor.qtype} is not implemented")
 
     model = Path(model_path)
@@ -2303,9 +2468,12 @@ def compare_single_tensor_conversion(
             qweight_pos = view.payload_offset
             qscale_pos = view.scale_offset
             scale_compared = 0
-            for expected_qweight, expected_qscale, max_abs_error, sq_error, value_count in _iter_expected_q8_0_tensor_chunks(
-                src, tensor, chunk_source_bytes=chunk_source_bytes
-            ):
+            expected_chunks = (
+                _iter_expected_q4_0_tensor_chunks(src, tensor, chunk_source_bytes=chunk_source_bytes)
+                if tensor.qtype_id == UOCR_TENSOR_Q4_0
+                else _iter_expected_q8_0_tensor_chunks(src, tensor, chunk_source_bytes=chunk_source_bytes)
+            )
+            for expected_qweight, expected_qscale, max_abs_error, sq_error, value_count in expected_chunks:
                 dequant_max_abs_error = max(max_abs_error, dequant_max_abs_error or 0.0)
                 dequant_sq_error += sq_error
                 dequant_value_count += value_count
@@ -2442,6 +2610,9 @@ def write_uocr_model(
                 elif tensor.qtype_id == UOCR_TENSOR_Q8_0:
                     output_bytes_written = _stream_bf16_to_q8_0(src, dst, tensor, stats=value_stats)
                     expected_written = tensor.output_bytes + tensor.scale_size
+                elif tensor.qtype_id == UOCR_TENSOR_Q4_0:
+                    output_bytes_written = _stream_bf16_to_q4_0(src, dst, tensor, stats=value_stats)
+                    expected_written = tensor.output_bytes + tensor.scale_size
                 else:
                     raise NotImplementedError(f"writing qtype {tensor.qtype} is not implemented")
                 if output_bytes_written != expected_written:
@@ -2526,7 +2697,7 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="explicit source .safetensors payload for --out or --compare-uocr",
     )
-    parser.add_argument("--qprofile", choices=["fp16", "mixed-q8_0"], default="fp16")
+    parser.add_argument("--qprofile", choices=["fp16", "mixed-q8_0", "mixed-q4"], default="fp16")
     parser.add_argument("--quant-group-size", type=int, default=UOCR_Q8_GROUP_SIZE_DEFAULT)
     parser.add_argument("--quant-policy", choices=[QUANT_POLICY_EMBEDDINGS_DECODER], default=QUANT_POLICY_EMBEDDINGS_DECODER)
     parser.add_argument(

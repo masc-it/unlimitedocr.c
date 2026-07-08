@@ -215,7 +215,7 @@ def test_metal_generation_unsupported_paths_are_clear() -> None:
             engine.generate_prepared(text_request)
     message = str(exc_info.value)
     assert f"failed ({UOCR_ERROR_NOT_IMPLEMENTED})" in message
-    assert "Metal fp16 text generation requires a mapped fp16 .uocr model" in message
+    assert "Metal text generation requires a mapped .uocr model" in message
 
     image_request = prepare_image(Image.new("RGB", (64, 64), (1, 2, 3)), preset="base", max_new_tokens=1)
     with _metal_engine_or_skip(
@@ -231,7 +231,7 @@ def test_metal_generation_unsupported_paths_are_clear() -> None:
             engine.generate_prepared(image_request)
     message = str(exc_info.value)
     assert f"failed ({UOCR_ERROR_NOT_IMPLEMENTED})" in message
-    assert "Metal fp16 image generation requires a mapped fp16 .uocr model" in message
+    assert "Metal image generation requires a mapped .uocr model" in message
 
 
 @pytest.mark.skipif(

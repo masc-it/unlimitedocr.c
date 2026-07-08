@@ -1,23 +1,26 @@
-# quant-cfg.yaml — runtime-supported Q8_0 modules for the Metal backend.
+# quant-cfg.yaml — runtime-supported quantized modules for the Metal backend.
 #
 # The converter quantizes only the (family, projection) pairs listed here with
-# `supported: true`.  Grow this list as fused Q8 Metal kernels land; a module
-# stays `supported: false` until every decode and prefill path that consumes it
-# has a fused Q8 kernel.
+# `supported: true`.  Grow this list as fused quantized Metal kernels land; a
+# module stays `supported: false` until every decode and prefill path that
+# consumes it has a fused kernel.
 #
 # Keys:
-#   version     config schema version (currently 1)
-#   group_size  Q8_0 block/group size; must match UOCR_Q8_GROUP_SIZE_DEFAULT
+#   version     config schema version (currently 2)
+#   group_size  quant block/group size; must match UOCR_Q8/Q4_GROUP_SIZE_DEFAULT
 #   modules     ordered list of module specs
 #     name         human-readable module id (stable, used in summaries)
 #     family       TensorFamily enum name
 #     projections  list of TensorProjection enum names this module covers
-#     supported    whether the runtime can consume Q8_0 weights for this module
+#     supported    whether the runtime can consume quantized weights for this module
+#     qtype        optional storage qtype: q8_0 (default) or q4_0; q4_0 is only
+#                  valid for MOE_EXPERT (docs/plan_q4.md) and stays q8_0 here
+#                  until the fused Q4 kernels pass end-to-end QA
 #
 # Note: attention_qkv covers Q/K/V and attention_output covers O.  Both prefill
 # and decode have fused Q8 kernels for Q/K/V and O projections.
 
-version: 1
+version: 2
 group_size: 64
 
 modules:

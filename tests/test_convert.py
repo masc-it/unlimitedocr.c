@@ -19,15 +19,21 @@ from unlimitedocr_c.convert import (
     UOCR_Q8_GROUP_SIZE_DEFAULT,
     UOCR_Q8_MAX,
     UOCR_Q8_MIN,
+    UOCR_QPROFILE_MIXED_Q4,
     UOCR_QPROFILE_MIXED_Q8_0,
     UOCR_QTYPE_REASON_FP16_BASELINE,
+    UOCR_Q4_GROUP_SIZE_DEFAULT,
+    UOCR_Q4_MAX,
+    UOCR_Q4_MIN,
     UOCR_SECTION_TENSOR_DATA,
     UOCR_TENSOR_DATA_ALIGNMENT,
     UOCR_TENSOR_FLAG_ROW_MAJOR,
     UOCR_TENSOR_PAYLOAD_ALIGNMENT,
+    UOCR_TENSOR_Q4_0,
     UOCR_TENSOR_Q8_0,
     _TENSOR_DIRECTORY_HEADER_STRUCT,
     _TENSOR_ENTRY_STRUCT,
+    _quantize_q4_0_rows,
     _tensor_directory_bytes,
     q8_summary,
     build_dry_run_plan,
@@ -35,13 +41,22 @@ from unlimitedocr_c.convert import (
     filter_plan_tensors,
     is_preserved_unused_in_normal_ocr,
     main as convert_main,
+    q4_qscale_bytes,
+    q4_qweight_bytes,
+    q4_total_bytes,
     q8_qscale_bytes,
     q8_qweight_bytes,
     q8_total_bytes,
     write_uocr_model,
 )
 from unlimitedocr_c.frontend import project_root
-from unlimitedocr_c.quant_cfg import QuantConfig, QuantModuleSpec, all_supported_quant_config, load_default_quant_config
+from unlimitedocr_c.quant_cfg import (
+    QuantConfig,
+    QuantModuleSpec,
+    _parse_config,
+    all_supported_quant_config,
+    load_default_quant_config,
+)
 from unlimitedocr_c.tensor_registry import TENSOR_ID_LM_HEAD, TENSOR_ID_TOK_EMBED, TensorFamily, TensorProjection, tensor_id_layer_attn
 
 
@@ -159,6 +174,95 @@ def test_q8_format_constants_and_byte_helpers() -> None:
         q8_qweight_bytes((2, 63))
 
 
+def test_q4_format_constants_and_byte_helpers() -> None:
+    assert UOCR_QPROFILE_MIXED_Q4 == 3
+    assert UOCR_TENSOR_Q4_0 == 4
+    assert UOCR_Q4_GROUP_SIZE_DEFAULT == 64
+    assert (UOCR_Q4_MIN, UOCR_Q4_MAX) == (-8, 7)
+    assert q4_qweight_bytes((2, 64)) == 64
+    assert q4_qscale_bytes((2, 64)) == 4
+    assert q4_total_bytes((2, 64)) == 68
+    assert q4_qweight_bytes((896, 1280)) == 896 * 640
+    with pytest.raises(ValueError, match="rank-2"):
+        q4_qweight_bytes((64,))
+    with pytest.raises(ValueError, match="divisible"):
+        q4_qweight_bytes((2, 63))
+
+
+def test_q4_pack_roundtrip() -> None:
+    rng = np.random.default_rng(7)
+    values = rng.standard_normal((4, 128), dtype=np.float32) * 0.05
+    values[0, :64] = 0.0            # all-zero group -> scale 1.0, q 0
+    values[1, 64] = -0.5            # negative signed max
+    packed, scales_f16, dequant = _quantize_q4_0_rows(values, UOCR_Q4_GROUP_SIZE_DEFAULT)
+    assert packed.shape == (4, 64)
+    assert scales_f16.shape == (4, 2)
+
+    # Unpack nibbles (stored as q + 8, low nibble = even k) and re-dequantize.
+    low = (packed & 0x0F).astype(np.int16) - 8
+    high = (packed >> 4).astype(np.int16) - 8
+    q = np.empty((4, 128), dtype=np.int16)
+    q[:, 0::2] = low
+    q[:, 1::2] = high
+    assert q.min() >= UOCR_Q4_MIN and q.max() <= UOCR_Q4_MAX
+    scales = scales_f16.astype(np.float32)
+    redequant = (q.reshape(4, 2, 64).astype(np.float32) * scales[:, :, None]).reshape(4, 128)
+    np.testing.assert_array_equal(redequant, dequant)
+
+    # All-zero group encodes exactly zero.
+    np.testing.assert_array_equal(dequant[0, :64], np.zeros(64, dtype=np.float32))
+    # Signed-max element reconstructs exactly (q = -8 by construction).
+    assert abs(dequant[1, 64] - np.float32(np.float16(-0.5 / -8.0)) * -8.0) < 1e-6
+    # Overall error bounded by half a step per group.
+    err = np.abs(dequant - values)
+    assert float(err.max()) <= float(np.abs(scales).max()) * 0.5 + 1e-6
+
+
+def test_quant_cfg_v2_qtype_rules() -> None:
+    base = {
+        "version": 2,
+        "group_size": 64,
+        "modules": [
+            {
+                "name": "moe_routed_experts",
+                "family": "MOE_EXPERT",
+                "projections": ["GATE", "UP", "DOWN"],
+                "supported": True,
+                "qtype": "q4_0",
+            },
+        ],
+    }
+    cfg = _parse_config(base)
+    assert cfg.qtype_for(TensorFamily.MOE_EXPERT, TensorProjection.GATE) == "q4_0"
+    assert cfg.modules[0].qtype == "q4_0"
+
+    with pytest.raises(ValueError, match="only supported for MOE_EXPERT"):
+        _parse_config(
+            {
+                "version": 2,
+                "group_size": 64,
+                "modules": [
+                    {
+                        "name": "lm_head",
+                        "family": "LM_HEAD",
+                        "projections": ["WEIGHT"],
+                        "supported": True,
+                        "qtype": "q4_0",
+                    },
+                ],
+            }
+        )
+
+    with pytest.raises(ValueError, match="schema version is 1"):
+        _parse_config({**base, "version": 1})
+
+
+def test_shipped_quant_cfg_is_v2_with_q8_experts() -> None:
+    cfg = load_default_quant_config()
+    assert cfg.version == 2
+    assert cfg.qtype_for(TensorFamily.MOE_EXPERT, TensorProjection.GATE) == "q8_0"
+
+
 def test_fp16_converter_dry_run_against_cached_header() -> None:
     plan = build_dry_run_plan(project_root() / "data/context", qprofile="fp16")
     assert plan.tensor_count == EXPECTED_TENSOR_COUNT
@@ -241,6 +345,95 @@ def test_mixed_q8_converter_dry_run_plans_decoder_quantization() -> None:
     assert all(a.scale_offset + a.scale_size == b.scale_offset for a, b in zip(layer1_experts, layer1_experts[1:]))
 
 
+def test_mixed_q4_converter_dry_run_plans_expert_q4() -> None:
+    plan = build_dry_run_plan(
+        project_root() / "data/context",
+        qprofile="mixed-q4",
+        quant_cfg=all_supported_quant_config(expert_qtype="q4_0"),
+    )
+    assert plan.qprofile == "mixed-q4"
+
+    expert_gate = plan.tensor_by_name("model.layers.1.mlp.experts.0.gate_proj.weight")
+    expert_down = plan.tensor_by_name("model.layers.1.mlp.experts.0.down_proj.weight")
+    lm_head = plan.tensor_by_name("lm_head.weight")
+    attn_q = plan.tensor_by_name("model.layers.3.self_attn.q_proj.weight")
+    router = plan.tensor_by_name("model.layers.1.mlp.gate.weight")
+
+    assert expert_gate.qtype_id == UOCR_TENSOR_Q4_0
+    assert expert_gate.output_dtype == "Q4_0"
+    assert expert_gate.row_size == expert_gate.shape[1] // 2
+    assert expert_gate.output_bytes == expert_gate.shape[0] * expert_gate.shape[1] // 2
+    assert expert_gate.scale_size == expert_gate.shape[0] * (expert_gate.shape[1] // 64) * 2
+    assert expert_down.qtype_id == UOCR_TENSOR_Q4_0
+    assert lm_head.qtype_id == UOCR_TENSOR_Q8_0
+    assert attn_q.qtype_id == UOCR_TENSOR_Q8_0
+    assert router.qtype == UOCR_TENSOR_F16_NAME
+
+    # Interleaved expert-major slab stays contiguous with Q4 payloads/scales.
+    layer1_experts = [
+        tensor
+        for tensor in plan.tensors
+        if tensor.family == TensorFamily.MOE_EXPERT.name and tensor.layer == 1 and tensor.qtype_id == UOCR_TENSOR_Q4_0
+    ]
+    assert len(layer1_experts) == 64 * 3
+    assert all(
+        a.payload_offset + a.output_bytes == b.payload_offset for a, b in zip(layer1_experts, layer1_experts[1:])
+    )
+    assert all(a.scale_offset + a.scale_size == b.scale_offset for a, b in zip(layer1_experts, layer1_experts[1:]))
+
+    summary = q8_summary(plan.tensors)
+    assert summary["by_qtype"]["q4_0"]["tensor_count"] == 11 * 64 * 3
+    assert summary["by_qtype"]["q4_0"]["estimated_savings_bytes"] > 0
+    assert summary["by_qtype"]["q8_0"]["tensor_count"] > 0
+
+
+def test_write_and_compare_tiny_q4_expert_payload(tmp_path: Path) -> None:
+    values = np.linspace(-1.0, 1.0, 128, dtype=np.float32).reshape(2, 64)
+    payload = _bf16_payload(values)
+    name = "model.layers.1.mlp.experts.0.gate_proj.weight"
+    header = {
+        "__metadata__": {"format": "pt"},
+        name: {"dtype": "BF16", "shape": [2, 64], "data_offsets": [0, len(payload)]},
+    }
+    header_bytes = json.dumps(header, separators=(",", ":")).encode("utf-8")
+    with (tmp_path / "model.safetensors").open("wb") as f:
+        f.write(struct.pack("<Q", len(header_bytes)))
+        f.write(header_bytes)
+        f.write(payload)
+    index = {"metadata": {"total_size": len(payload)}, "weight_map": {name: "model.safetensors"}}
+    (tmp_path / "model.safetensors.index.json").write_text(json.dumps(index), encoding="utf-8")
+    (tmp_path / "tokenizer.json").write_text("{}\n", encoding="utf-8")
+
+    plan = build_dry_run_plan(
+        tmp_path,
+        qprofile="mixed-q4",
+        strict=False,
+        quant_cfg=all_supported_quant_config(expert_qtype="q4_0"),
+    )
+    tensor = plan.tensor_by_name(name)
+    assert tensor.qtype_id == UOCR_TENSOR_Q4_0
+    out = tmp_path / "tiny-q4.uocr"
+    write_uocr_model(plan, out, overwrite=True)
+
+    raw = out.read_bytes()
+    assert raw[:4] == b"UOCR"
+    assert struct.unpack_from("<I", raw, 20)[0] == UOCR_QPROFILE_MIXED_Q4
+    expected_packed, expected_scales, _ = _quantize_q4_0_rows(
+        _f32_from_bf16_payload(payload).reshape(2, 64), UOCR_Q4_GROUP_SIZE_DEFAULT
+    )
+    assert raw[tensor.payload_offset : tensor.payload_offset + tensor.output_bytes] == expected_packed.tobytes()
+    assert raw[tensor.scale_offset : tensor.scale_offset + tensor.scale_size] == expected_scales.tobytes()
+
+    filtered = filter_plan_tensors(plan, name)
+    result = compare_single_tensor_conversion(filtered, out)
+    assert result.matches
+    assert result.qtype == "UOCR_TENSOR_Q4_0"
+    assert result.dequant_max_abs_error is not None
+    assert result.dequant_max_abs_error < 0.1
+    assert result.dequant_rmse is not None
+    assert result.dequant_rmse < 0.05
+
+
 def test_vision_registry_roles_are_stable_for_rank2_linears() -> None:
     plan = build_dry_run_plan(project_root() / "data/context", qprofile="fp16")
 
@@ -314,11 +507,11 @@ def test_mixed_q8_default_cfg_only_quantizes_runtime_supported_modules() -> None
 
 
 def test_mixed_q8_vision_modules_quantize_only_when_enabled() -> None:
-    supported_pairs = frozenset({
-        (TensorFamily.PROJECTOR, TensorProjection.WEIGHT),
-        (TensorFamily.VISION_CLIP, TensorProjection.VISION_MLP_FC1),
-        (TensorFamily.VISION_CLIP, TensorProjection.VISION_MLP_FC2),
-    })
+    supported_pairs = {
+        (TensorFamily.PROJECTOR, TensorProjection.WEIGHT): "q8_0",
+        (TensorFamily.VISION_CLIP, TensorProjection.VISION_MLP_FC1): "q8_0",
+        (TensorFamily.VISION_CLIP, TensorProjection.VISION_MLP_FC2): "q8_0",
+    }
     cfg = QuantConfig(
         version=1,
         group_size=UOCR_Q8_GROUP_SIZE_DEFAULT,
