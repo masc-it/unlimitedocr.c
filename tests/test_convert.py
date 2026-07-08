@@ -257,10 +257,13 @@ def test_quant_cfg_v2_qtype_rules() -> None:
         _parse_config({**base, "version": 1})
 
 
-def test_shipped_quant_cfg_is_v2_with_q8_experts() -> None:
+def test_shipped_quant_cfg_is_v2_with_q4_experts() -> None:
     cfg = load_default_quant_config()
     assert cfg.version == 2
-    assert cfg.qtype_for(TensorFamily.MOE_EXPERT, TensorProjection.GATE) == "q8_0"
+    # Routed experts carry the q4_0 override (fused Q4 kernels landed); it only
+    # takes effect under --qprofile mixed-q4, so mixed-q8_0 stays Q8 everywhere.
+    assert cfg.qtype_for(TensorFamily.MOE_EXPERT, TensorProjection.GATE) == "q4_0"
+    assert cfg.qtype_for(TensorFamily.LM_HEAD, TensorProjection.WEIGHT) == "q8_0"
 
 
 def test_fp16_converter_dry_run_against_cached_header() -> None:

@@ -14,8 +14,8 @@
 #     projections  list of TensorProjection enum names this module covers
 #     supported    whether the runtime can consume quantized weights for this module
 #     qtype        optional storage qtype: q8_0 (default) or q4_0; q4_0 is only
-#                  valid for MOE_EXPERT (docs/plan_q4.md) and stays q8_0 here
-#                  until the fused Q4 kernels pass end-to-end QA
+#                  valid for MOE_EXPERT (docs/plan_q4.md) and only takes effect
+#                  under --qprofile mixed-q4
 #
 # Note: attention_qkv covers Q/K/V and attention_output covers O.  Both prefill
 # and decode have fused Q8 kernels for Q/K/V and O projections.
@@ -54,10 +54,14 @@ modules:
     projections: [GATE, UP, DOWN]
     supported: true
 
+  # Routed experts store Q4_0 under --qprofile mixed-q4 (fused Q4 decode GEMV
+  # + bucketed prefill GEMM kernels); mixed-q8_0 conversions ignore the qtype
+  # override and keep Q8_0.
   - name: moe_routed_experts
     family: MOE_EXPERT
     projections: [GATE, UP, DOWN]
     supported: true
+    qtype: q4_0
 
   # Vision modules are intentionally disabled until each fused Q8 Metal path is
   # implemented and QA'd end-to-end.  These entries make converter planning

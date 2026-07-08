@@ -38,6 +38,7 @@ ImageSource = str | os.PathLike[str] | bytes | bytearray | memoryview | IO[bytes
 
 DEFAULT_MODEL_FILENAME = "unlimitedocr-fp16.uocr"
 DEFAULT_Q8_MODEL_FILENAME = "unlimitedocr-q8.uocr"
+DEFAULT_Q4_MODEL_FILENAME = "unlimitedocr-q4.uocr"
 DEFAULT_SOURCE_MODEL_REPO_ID = "baidu/Unlimited-OCR"
 DEFAULT_MAX_LENGTH = 32768
 class ModelResolutionError(FileNotFoundError):
@@ -89,17 +90,22 @@ def _quant_profile_for(quant: str | None) -> str:
     normalized = quant.strip().lower()
     if normalized in {"q8", "q8_0", "mixed-q8_0"}:
         return "mixed-q8_0"
+    if normalized in {"q4", "q4_0", "mixed-q4"}:
+        return "mixed-q4"
     if normalized in {"fp16", "f16", "none"}:
         return "fp16"
     raise ValueError(
-        f"unsupported quant={quant!r}; expected one of 'q8', 'fp16', or None"
+        f"unsupported quant={quant!r}; expected one of 'q4', 'q8', 'fp16', or None"
     )
 
 
 def _model_filename_for(quant: str | None) -> str:
     """Return the cache filename for a quant option."""
-    if _quant_profile_for(quant) == "mixed-q8_0":
+    qprofile = _quant_profile_for(quant)
+    if qprofile == "mixed-q8_0":
         return os.environ.get("UOCR_Q8_MODEL_FILENAME", DEFAULT_Q8_MODEL_FILENAME)
+    if qprofile == "mixed-q4":
+        return os.environ.get("UOCR_Q4_MODEL_FILENAME", DEFAULT_Q4_MODEL_FILENAME)
     return os.environ.get("UOCR_MODEL_FILENAME", DEFAULT_MODEL_FILENAME)
 
 
@@ -169,7 +175,9 @@ def resolve_model_path(
 
     ``quant`` selects the conversion profile when downloading/converting:
     ``None``/``"fp16"`` keeps the fp16 baseline; ``"q8"`` produces a
-    runtime-safe mixed-Q8_0 model gated by ``configs/quant-cfg.yaml``.
+    runtime-safe mixed-Q8_0 model and ``"q4"`` a mixed-q4 model (routed MoE
+    experts Q4_0, remaining decoder modules Q8_0), both gated by
+    ``configs/quant-cfg.yaml``.
 
     ``force_reconvert`` deletes any cached model for the selected ``quant`` and
     re-runs conversion.  This is useful when ``configs/quant-cfg.yaml`` has
@@ -185,7 +193,7 @@ def resolve_model_path(
         return _require_existing_model(env_model_path, source="UOCR_MODEL_PATH")
 
     qprofile = _quant_profile_for(quant)
-    filename = _model_filename_for(quant) if qprofile == "mixed-q8_0" else os.environ.get(
+    filename = _model_filename_for(quant) if qprofile in {"mixed-q8_0", "mixed-q4"} else os.environ.get(
         "UOCR_MODEL_FILENAME", DEFAULT_MODEL_FILENAME
     )
     resolved_cache_dir = Path(cache_dir).expanduser() if cache_dir is not None else default_cache_dir()

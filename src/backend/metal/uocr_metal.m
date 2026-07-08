@@ -13750,10 +13750,147 @@ static int metal_run_moe_interleaved_decode_fused_combine_buffer_q8_0(
 }
 
 /*
+ * Q4_0 expert-bucketed prefill: same four passes as the Q8 path (bucket,
+ * gate/up GEMM, down GEMM, combine); only the GEMM kernels differ (Q4
+ * dequant-on-stage from the group-half-split packing).  The bucketing and
+ * combine kernels are qtype-agnostic and reused as-is.
+ */
+static int metal_run_moe_prefill_bucketed_q4_0(uocr_metal_context *ctx,
+                                               uocr_metal_buffer_slice input,
+                                               uocr_metal_buffer_slice top_ids,
+                                               uocr_metal_buffer_slice top_weights,
+                                               uocr_metal_buffer_slice expert_qweight_slab,
+                                               uocr_metal_buffer_slice expert_qscale_slab,
+                                               uint32_t n_tokens,
+                                               uocr_metal_buffer_slice mid,
+                                               uocr_metal_buffer_slice shared,
+                                               uocr_metal_buffer_slice residual,
+                                               uocr_metal_buffer_slice dst,
+                                               const uocr_metal_moe_prefill_interleaved_q8_params *prefill_params,
+                                               char *error,
+                                               size_t error_size) {
+    const char *op = "prefill routed MoE Q4 bucketed GEMM";
+    uocr_metal_moe_bucketed_prefill_scratch_layout layout;
+    if (ctx == NULL || prefill_params == NULL || n_tokens <= 1u ||
+        !metal_moe_bucketed_prefill_scratch_layout(n_tokens, &layout) ||
+        !uocr_metal_context_ensure_scratch(ctx, UOCR_METAL_SCRATCH_TRANSIENT, layout.total_bytes, 0, error, error_size)) {
+        return metal_fail(error, error_size, "invalid %s request", op);
+    }
+    const uint64_t pair_count = layout.pair_count;
+    const uint64_t pair_rows_offset = layout.pair_rows_offset;
+    const uint64_t expert_offsets_offset = layout.expert_offsets_offset;
+    const uint64_t tile_prefix_offset = layout.tile_prefix_offset;
+    const uint64_t down_out_offset = layout.down_out_offset;
+    id<MTLBuffer> transient = ctx->scratch[UOCR_METAL_SCRATCH_TRANSIENT].buffer;
+    if (transient == nil) {
+        return metal_fail(error, error_size, "%s transient scratch is unavailable", op);
+    }
+    @autoreleasepool {
+        id<MTLComputePipelineState> bucket_pipeline = metal_get_pipeline(ctx, "uocr_moe_prefill_bucket_pairs", error, error_size);
+        id<MTLComputePipelineState> gate_pipeline = metal_get_pipeline(ctx, "uocr_moe_prefill_bucketed_swiglu_gate_up_gemm_q4_0_to_f16", error, error_size);
+        id<MTLComputePipelineState> down_pipeline = metal_get_pipeline(ctx, "uocr_moe_prefill_bucketed_down_gemm_q4_0_to_f16", error, error_size);
+        id<MTLComputePipelineState> combine_pipeline = metal_get_pipeline(ctx, "uocr_moe_prefill_bucketed_combine_f16", error, error_size);
+        if (bucket_pipeline == nil || gate_pipeline == nil || down_pipeline == nil || combine_pipeline == nil) {
+            return 0;
+        }
+        int owned_command_buffer = 0;
+        id<MTLCommandBuffer> cb = metal_command_buffer_for_op(ctx, &owned_command_buffer, op, error, error_size);
+        if (cb == nil) {
+            return 0;
+        }
+        const uint64_t bucketed_start_ns = uocr_profile_now_ns();
+
+        /* Pass 1: bucket (token, expert) pairs by expert. */
+        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
+        if (enc == nil) {
+            return metal_fail(error, error_size, "failed to create %s bucket encoder", op);
+        }
+        struct {
+            uint32_t n_tokens;
+            uint32_t top_k;
+            uint32_t expert_count;
+            uint32_t rows_per_tile;
+        } bucket_params = { n_tokens, UOCR_MOE_TOP_K, UOCR_ROUTED_EXPERTS, UOCR_METAL_GEMM_Q8_BM };
+        [enc setComputePipelineState:bucket_pipeline];
+        [enc setBuffer:top_ids.buffer offset:top_ids.offset atIndex:0u];
+        [enc setBuffer:transient offset:(NSUInteger)pair_rows_offset atIndex:1u];
+        [enc setBuffer:transient offset:(NSUInteger)expert_offsets_offset atIndex:2u];
+        [enc setBuffer:transient offset:(NSUInteger)tile_prefix_offset atIndex:3u];
+        [enc setBytes:&bucket_params length:sizeof(bucket_params) atIndex:4u];
+        [enc dispatchThreadgroups:MTLSizeMake(1u, 1u, 1u) threadsPerThreadgroup:MTLSizeMake(256u, 1u, 1u)];
+        [enc endEncoding];
+
+        const NSUInteger tile_slots = (NSUInteger)((pair_count + UOCR_METAL_GEMM_Q8_BM - 1u) / UOCR_METAL_GEMM_Q8_BM) +
+                                      (NSUInteger)UOCR_ROUTED_EXPERTS;
+
+        /* Pass 2: bucketed gate/up SwiGLU GEMM -> mid. */
+        enc = metal_compute_command_encoder(ctx, cb);
+        if (enc == nil) {
+            return metal_fail(error, error_size, "failed to create %s gate/up encoder", op);
+        }
+        [enc setComputePipelineState:gate_pipeline];
+        [enc setBuffer:input.buffer offset:input.offset atIndex:0u];
+        [enc setBuffer:transient offset:(NSUInteger)pair_rows_offset atIndex:1u];
+        [enc setBuffer:transient offset:(NSUInteger)expert_offsets_offset atIndex:2u];
+        [enc setBuffer:transient offset:(NSUInteger)tile_prefix_offset atIndex:3u];
+        [enc setBuffer:expert_qweight_slab.buffer offset:expert_qweight_slab.offset atIndex:4u];
+        [enc setBuffer:expert_qscale_slab.buffer offset:expert_qscale_slab.offset atIndex:5u];
+        [enc setBuffer:mid.buffer offset:mid.offset atIndex:6u];
+        [enc setBytes:prefill_params length:sizeof(*prefill_params) atIndex:7u];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(UOCR_MOE_EXPERT_INTERMEDIATE / UOCR_METAL_GEMM_Q8_BN), tile_slots, 1u)
+            threadsPerThreadgroup:MTLSizeMake(UOCR_METAL_GEMM_Q8_THREADS, 1u, 1u)];
+        [enc endEncoding];
+
+        /* Pass 3: bucketed down GEMM -> down_out. */
+        enc = metal_compute_command_encoder(ctx, cb);
+        if (enc == nil) {
+            return metal_fail(error, error_size, "failed to create %s down encoder", op);
+        }
+        [enc setComputePipelineState:down_pipeline];
+        [enc setBuffer:mid.buffer offset:mid.offset atIndex:0u];
+        [enc setBuffer:transient offset:(NSUInteger)pair_rows_offset atIndex:1u];
+        [enc setBuffer:transient offset:(NSUInteger)expert_offsets_offset atIndex:2u];
+        [enc setBuffer:transient offset:(NSUInteger)tile_prefix_offset atIndex:3u];
+        [enc setBuffer:expert_qweight_slab.buffer offset:expert_qweight_slab.offset atIndex:4u];
+        [enc setBuffer:expert_qscale_slab.buffer offset:expert_qscale_slab.offset atIndex:5u];
+        [enc setBuffer:transient offset:(NSUInteger)down_out_offset atIndex:6u];
+        [enc setBytes:prefill_params length:sizeof(*prefill_params) atIndex:7u];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(UOCR_HIDDEN_SIZE / UOCR_METAL_GEMM_Q8_BN), tile_slots, 1u)
+            threadsPerThreadgroup:MTLSizeMake(UOCR_METAL_GEMM_Q8_THREADS, 1u, 1u)];
+        [enc endEncoding];
+
+        /* Pass 4: weighted combine with shared experts and residual. */
+        enc = metal_compute_command_encoder(ctx, cb);
+        if (enc == nil) {
+            return metal_fail(error, error_size, "failed to create %s combine encoder", op);
+        }
+        NSUInteger combine_threads = combine_pipeline.threadExecutionWidth;
+        if (combine_threads == 0u) combine_threads = 32u;
+        if (combine_threads > 256u) combine_threads = 256u;
+        [enc setComputePipelineState:combine_pipeline];
+        [enc setBuffer:transient offset:(NSUInteger)down_out_offset atIndex:0u];
+        [enc setBuffer:top_ids.buffer offset:top_ids.offset atIndex:1u];
+        [enc setBuffer:top_weights.buffer offset:top_weights.offset atIndex:2u];
+        [enc setBuffer:shared.buffer offset:shared.offset atIndex:3u];
+        [enc setBuffer:residual.buffer offset:residual.offset atIndex:4u];
+        [enc setBuffer:dst.buffer offset:dst.offset atIndex:5u];
+        [enc setBytes:prefill_params length:sizeof(*prefill_params) atIndex:6u];
+        [enc dispatchThreads:MTLSizeMake((NSUInteger)n_tokens * (NSUInteger)UOCR_HIDDEN_SIZE, 1u, 1u)
+       threadsPerThreadgroup:MTLSizeMake(combine_threads, 1u, 1u)];
+        [enc endEncoding];
+
+        const int ok = metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, op, error, error_size);
+        if (ok) {
+            metal_profile_add_event_now(ctx, "metal.prefill.moe_routed_bucketed_q4", bucketed_start_ns);
+        }
+        return ok;
+    }
+}
+
+/*
  * Q4_0 routed-MoE fused combine.  Decode (n_tokens == 1) uses the
  * simdgroup-per-row Q4 GEMV kernels (group-half-split nibble unpack, one
- * fp16 scale per 64-group); prefill lands with the bucketed Q4 GEMM
- * (docs/plan_q4.md step 5).
+ * fp16 scale per 64-group); prefill uses the expert-bucketed Q4 GEMM.
  */
 static int metal_run_moe_interleaved_decode_fused_combine_buffer_q4_0(
     uocr_metal_context *ctx,
@@ -13791,9 +13928,36 @@ static int metal_run_moe_interleaved_decode_fused_combine_buffer_q4_0(
         return metal_fail(error, error_size, "invalid integrated routed MoE Q4 fused-combine request");
     }
     if (n_tokens > 1u) {
-        return metal_fail(error,
-                          error_size,
-                          "integrated routed MoE Q4 prefill kernels are not implemented yet");
+        /* Prefill: expert-bucketed tiled Q4 GEMM path.  Same 12-uint ABI as
+         * the Q8 params; qweight strides/offsets are PACKED BYTE counts
+         * (UocrMoeBucketedGemmQ4Params). */
+        uocr_metal_moe_prefill_interleaved_q8_params bucketed_params;
+        bucketed_params.n_tokens = n_tokens;
+        bucketed_params.hidden_size = UOCR_HIDDEN_SIZE;
+        bucketed_params.intermediate_size = UOCR_MOE_EXPERT_INTERMEDIATE;
+        bucketed_params.expert_count = UOCR_ROUTED_EXPERTS;
+        bucketed_params.top_k = UOCR_MOE_TOP_K;
+        bucketed_params.expert_stride_values = (uint32_t)(projection_qweight_bytes * 3u);
+        bucketed_params.up_offset_values = (uint32_t)projection_qweight_bytes;
+        bucketed_params.down_offset_values = (uint32_t)(projection_qweight_bytes * 2u);
+        bucketed_params.expert_scale_stride_values = (uint32_t)(projection_scale_values * 3u);
+        bucketed_params.up_scale_offset_values = (uint32_t)projection_scale_values;
+        bucketed_params.down_scale_offset_values = (uint32_t)(projection_scale_values * 2u);
+        bucketed_params.group_size = UOCR_Q4_GROUP_SIZE_DEFAULT;
+        return metal_run_moe_prefill_bucketed_q4_0(ctx,
+                                                   input,
+                                                   top_ids,
+                                                   top_weights,
+                                                   expert_qweight_slab,
+                                                   expert_qscale_slab,
+                                                   n_tokens,
+                                                   mid,
+                                                   shared,
+                                                   residual,
+                                                   dst,
+                                                   &bucketed_params,
+                                                   error,
+                                                   error_size);
     }
     @autoreleasepool {
         /* Decode (n_tokens == 1): simdgroup-per-row Q4 GEMV kernels. */
