@@ -2897,6 +2897,17 @@ static int metal_decoder_tensor_allows_q8(uint32_t family, uint32_t projection, 
     }
 }
 
+/* Q4_0 decoder weights are restricted to the routed MoE experts
+ * (docs/plan_q4.md §1.3); everything else keeps its fp16/Q8 rules. */
+static int metal_decoder_tensor_allows_q4(uint32_t family, uint32_t projection, uint32_t rank) {
+    if (rank != 2u) {
+        return 0;
+    }
+    return family == UOCR_TENSOR_FAMILY_MOE_EXPERT &&
+           (projection == UOCR_TENSOR_PROJ_GATE || projection == UOCR_TENSOR_PROJ_UP ||
+            projection == UOCR_TENSOR_PROJ_DOWN);
+}
+
 static int metal_validate_decoder_tensor_metadata(const uocr_tensor_entry *tensor,
                                                   uint32_t tensor_id,
                                                   uint32_t family,
@@ -2921,14 +2932,16 @@ static int metal_validate_decoder_tensor_metadata(const uocr_tensor_entry *tenso
                           tensor_id,
                           uocr_tensor_usage_name(tensor->usage));
     }
-    if (tensor->qtype != UOCR_TENSOR_F16 && tensor->qtype != UOCR_TENSOR_Q8_0) {
+    if (tensor->qtype != UOCR_TENSOR_F16 && tensor->qtype != UOCR_TENSOR_Q8_0 &&
+        tensor->qtype != UOCR_TENSOR_Q4_0) {
         return metal_fail(error,
                           error_size,
                           "decoder tensor %u has unsupported qtype %s",
                           tensor_id,
                           uocr_tensor_qtype_name(tensor->qtype));
     }
-    if (tensor->qtype == UOCR_TENSOR_Q8_0 && !metal_decoder_tensor_allows_q8(family, projection, rank)) {
+    if ((tensor->qtype == UOCR_TENSOR_Q8_0 && !metal_decoder_tensor_allows_q8(family, projection, rank)) ||
+        (tensor->qtype == UOCR_TENSOR_Q4_0 && !metal_decoder_tensor_allows_q4(family, projection, rank))) {
         return metal_fail(error,
                           error_size,
                           "decoder tensor %u cannot use qtype %s for this family/projection",
@@ -2988,13 +3001,23 @@ static int metal_validate_decoder_tensor_metadata(const uocr_tensor_entry *tenso
         if (tensor->scale_offset != 0u || tensor->scale_size != 0u || tensor->block_size != 0u || tensor->row_size != 0u) {
             return metal_fail(error, error_size, "decoder f16 tensor %u has quantization metadata", tensor_id);
         }
-    } else {
+    } else if (tensor->qtype == UOCR_TENSOR_Q8_0) {
         const uint32_t cols = dims[1];
         const uint64_t expected_scale_size = uocr_q8_0_qscale_bytes(dims[0], cols, UOCR_Q8_GROUP_SIZE_DEFAULT);
         if (tensor->block_size != UOCR_Q8_GROUP_SIZE_DEFAULT || tensor->row_size != cols || tensor->scale_size != expected_scale_size) {
             return metal_fail(error,
                               error_size,
                               "decoder q8_0 tensor %u packing metadata mismatch",
+                              tensor_id);
+        }
+    } else {
+        const uint32_t cols = dims[1];
+        const uint64_t expected_scale_size = uocr_q4_0_qscale_bytes(dims[0], cols, UOCR_Q4_GROUP_SIZE_DEFAULT);
+        if (tensor->block_size != UOCR_Q4_GROUP_SIZE_DEFAULT || (cols % 2u) != 0u || tensor->row_size != cols / 2u ||
+            expected_scale_size == 0u || tensor->scale_size != expected_scale_size) {
+            return metal_fail(error,
+                              error_size,
+                              "decoder q4_0 tensor %u packing metadata mismatch",
                               tensor_id);
         }
     }
@@ -3035,6 +3058,11 @@ static int metal_append_decoder_binding(uocr_metal_context *ctx,
         if (rank != 2u || !checked_mul_u64((uint64_t)dims[0], (uint64_t)dims[1], &expected_payload_size)) {
             return metal_fail(error, error_size, "decoder tensor %u expected q8 byte-size overflow", tensor_id);
         }
+    } else if (tensor->qtype == UOCR_TENSOR_Q4_0) {
+        expected_payload_size = rank == 2u ? uocr_q4_0_qweight_bytes(dims[0], dims[1]) : 0u;
+        if (expected_payload_size == 0u) {
+            return metal_fail(error, error_size, "decoder tensor %u expected q4 byte-size is invalid", tensor_id);
+        }
     } else if (!metal_tensor_expected_payload_bytes(rank, dims, &expected_payload_size)) {
         return metal_fail(error, error_size, "decoder tensor %u expected byte-size overflow", tensor_id);
     }
@@ -3069,7 +3097,10 @@ static int metal_append_decoder_binding(uocr_metal_context *ctx,
     binding->rows = rank >= 1u ? dims[0] : 0u;
     binding->cols = rank >= 2u ? dims[1] : 0u;
     binding->group_size = tensor->block_size;
-    binding->groups_per_row = (tensor->qtype == UOCR_TENSOR_Q8_0 && tensor->block_size != 0u) ? dims[1] / tensor->block_size : 0u;
+    binding->groups_per_row =
+        ((tensor->qtype == UOCR_TENSOR_Q8_0 || tensor->qtype == UOCR_TENSOR_Q4_0) && tensor->block_size != 0u)
+            ? dims[1] / tensor->block_size
+            : 0u;
     binding->buffer = buffer;
     binding->offset = offset;
     binding->payload_size = expected_payload_size;
@@ -3172,14 +3203,22 @@ static int metal_decoder_binding_cache_validate_expert_slab(const uocr_metal_dec
     }
     const uocr_metal_decoder_binding *gate0 = &cache->tensors[gate0_index];
     const uint32_t slab_qtype = gate0->qtype;
-    const uint64_t projection_data_bytes = slab_qtype == UOCR_TENSOR_Q8_0 ? projection_values : projection_bytes;
+    const int slab_is_quantized = slab_qtype == UOCR_TENSOR_Q8_0 || slab_qtype == UOCR_TENSOR_Q4_0;
+    uint64_t projection_data_bytes = projection_bytes;
+    uint64_t projection_scale_bytes = 0u;
+    if (slab_qtype == UOCR_TENSOR_Q8_0) {
+        projection_data_bytes = projection_values;
+        projection_scale_bytes = uocr_q8_0_qscale_bytes(UOCR_MOE_EXPERT_INTERMEDIATE,
+                                                        UOCR_HIDDEN_SIZE,
+                                                        UOCR_Q8_GROUP_SIZE_DEFAULT);
+    } else if (slab_qtype == UOCR_TENSOR_Q4_0) {
+        projection_data_bytes = projection_values / 2u;
+        projection_scale_bytes = uocr_q4_0_qscale_bytes(UOCR_MOE_EXPERT_INTERMEDIATE,
+                                                        UOCR_HIDDEN_SIZE,
+                                                        UOCR_Q4_GROUP_SIZE_DEFAULT);
+    }
     const uint64_t expert_data_stride_bytes = projection_data_bytes * 3u;
     const uint64_t total_data_bytes = expert_data_stride_bytes * (uint64_t)UOCR_ROUTED_EXPERTS;
-    const uint64_t projection_scale_bytes = slab_qtype == UOCR_TENSOR_Q8_0
-                                                ? uocr_q8_0_qscale_bytes(UOCR_MOE_EXPERT_INTERMEDIATE,
-                                                                         UOCR_HIDDEN_SIZE,
-                                                                         UOCR_Q8_GROUP_SIZE_DEFAULT)
-                                                : 0u;
     const uint64_t expert_scale_stride_bytes = projection_scale_bytes * 3u;
     const uint64_t total_scale_bytes = expert_scale_stride_bytes * (uint64_t)UOCR_ROUTED_EXPERTS;
     if (gate0->offset > NSUIntegerMax || !metal_buffer_range_valid(gate0->buffer, gate0->offset, total_data_bytes)) {
@@ -3188,7 +3227,7 @@ static int metal_decoder_binding_cache_validate_expert_slab(const uocr_metal_dec
                           "integrated MoE expert slab for layer %u is not contiguous in one Metal view",
                           layer);
     }
-    if (slab_qtype == UOCR_TENSOR_Q8_0 &&
+    if (slab_is_quantized &&
         (gate0->scale_buffer == nil || gate0->scale_offset > NSUIntegerMax ||
          !metal_buffer_range_valid(gate0->scale_buffer, gate0->scale_offset, total_scale_bytes))) {
         return metal_fail(error,
@@ -3236,7 +3275,7 @@ static int metal_decoder_binding_cache_validate_expert_slab(const uocr_metal_dec
                               layer,
                               expert);
         }
-        if (slab_qtype == UOCR_TENSOR_Q8_0 &&
+        if (slab_is_quantized &&
             (gate->scale_buffer != gate0->scale_buffer || up->scale_buffer != gate0->scale_buffer ||
              down->scale_buffer != gate0->scale_buffer || (uint64_t)gate->scale_offset != scale_base ||
              (uint64_t)up->scale_offset != scale_base + projection_scale_bytes ||
@@ -3634,6 +3673,19 @@ static int metal_refresh_decoder_binding_cache(uocr_metal_context *ctx,
     ctx->decoder_fast_expert_qtype = (UOCR_DECODER_LAYERS > 1u)
         ? ctx->decoder_bindings.layers[1u].expert_slab.qtype
         : UOCR_TENSOR_F16;
+    /* The decode loop keys expert dispatch on one qtype for all MoE layers;
+     * reject models whose expert slabs mix qtypes across layers. */
+    for (uint32_t layer = 2u; layer < UOCR_DECODER_LAYERS; ++layer) {
+        if (ctx->decoder_bindings.layers[layer].expert_slab.qtype != ctx->decoder_fast_expert_qtype) {
+            ctx->decoder_fast_expert_slabs_valid = 0;
+            return metal_fail(error,
+                              error_size,
+                              "integrated MoE expert slabs mix qtypes: layer 1 is %s, layer %u is %s",
+                              uocr_tensor_qtype_name(ctx->decoder_fast_expert_qtype),
+                              layer,
+                              uocr_tensor_qtype_name(ctx->decoder_bindings.layers[layer].expert_slab.qtype));
+        }
+    }
     ctx->decoder_fast_expert_slabs_valid = 1;
 
     return 1;
@@ -13725,6 +13777,13 @@ static int metal_run_moe_interleaved_decode_fused_combine_buffer_f16(uocr_metal_
                                                                           dst,
                                                                           error,
                                                                           error_size);
+    }
+    if (expert_qtype == UOCR_TENSOR_Q4_0) {
+        /* Loader/bindings accept Q4 expert slabs ahead of the fused Q4
+         * kernels (docs/plan_q4.md step 4); fail loudly until they land. */
+        return metal_fail(error,
+                          error_size,
+                          "integrated routed MoE Q4 kernels are not implemented yet");
     }
     const uint64_t hidden_bytes = (uint64_t)n_tokens * (uint64_t)UOCR_HIDDEN_SIZE * 2u;
     const uint64_t top_ids_bytes = (uint64_t)n_tokens * (uint64_t)UOCR_MOE_TOP_K * sizeof(uint32_t);
