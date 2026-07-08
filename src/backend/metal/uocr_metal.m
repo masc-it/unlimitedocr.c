@@ -60,6 +60,9 @@
 #error "UOCR_METAL_DECODE_MOE_TOP_K must be in [1, UOCR_MOE_TOP_K]"
 #endif
 #define UOCR_METAL_FLASH_Q_PER_TG 4u
+/* Staged-K/V prefill flash attention (uocr_prefill_attention_flash_staged_*). */
+#define UOCR_METAL_FLASH_STAGED_Q_PER_TG 8u
+#define UOCR_METAL_FLASH_STAGED_THREADS 256u
 #define UOCR_METAL_FLASH_MAX_LANE_VALUES 4u
 #define UOCR_METAL_HALF4_WIDTH 4u
 #define UOCR_METAL_FC_HIDDEN_SIZE 0u
@@ -12614,20 +12617,17 @@ static int metal_run_prefill_attention_buffer_f16(uocr_metal_context *ctx,
         return metal_fail(error, error_size, "invalid integrated prefill attention request");
     }
     @autoreleasepool {
-        id<MTLComputePipelineState> pipeline = metal_get_decoder_shape_pipeline(ctx, "uocr_prefill_attention_flash_f16_to_f16", error, error_size);
+        /* Staged-K/V flash kernel: 8 query rows per 256-thread threadgroup
+         * share 32-key K/V tiles staged in threadgroup memory. */
+        id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, "uocr_prefill_attention_flash_staged_f16_to_f16", error, error_size);
         if (pipeline == nil) {
             return 0;
         }
-        NSUInteger threads = 0u;
-        if (!metal_flash_attention_threads_per_threadgroup(pipeline,
-                                                           UOCR_METAL_FLASH_Q_PER_TG,
-                                                           UOCR_HEAD_DIM,
-                                                           "integrated prefill",
-                                                           &threads,
-                                                           error,
-                                                           error_size)) {
-            return 0;
+        if (pipeline.maxTotalThreadsPerThreadgroup < (NSUInteger)UOCR_METAL_FLASH_STAGED_THREADS) {
+            return metal_fail(error, error_size, "integrated prefill attention pipeline does not support 256 threads");
         }
+        const uint64_t staged_query_blocks =
+            ((uint64_t)n_tokens + (uint64_t)UOCR_METAL_FLASH_STAGED_Q_PER_TG - 1u) / (uint64_t)UOCR_METAL_FLASH_STAGED_Q_PER_TG;
         int owned_command_buffer = 0;
         id<MTLCommandBuffer> cb = metal_command_buffer_for_op(ctx, &owned_command_buffer, "integrated prefill attention", error, error_size);
         if (cb == nil) {
@@ -12648,8 +12648,8 @@ static int metal_run_prefill_attention_buffer_f16(uocr_metal_context *ctx,
         [enc setBuffer:v.buffer offset:v.offset atIndex:2u];
         [enc setBuffer:dst.buffer offset:dst.offset atIndex:3u];
         [enc setBytes:&params length:sizeof(params) atIndex:4u];
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)UOCR_ATTENTION_HEADS, (NSUInteger)query_blocks, 1u)
-             threadsPerThreadgroup:MTLSizeMake(threads, 1u, 1u)];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)UOCR_ATTENTION_HEADS, (NSUInteger)staged_query_blocks, 1u)
+             threadsPerThreadgroup:MTLSizeMake((NSUInteger)UOCR_METAL_FLASH_STAGED_THREADS, 1u, 1u)];
         [enc endEncoding];
         return metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, "integrated prefill attention", error, error_size);
     }
