@@ -12894,7 +12894,7 @@ static int metal_run_dense_swiglu_buffer_f16(uocr_metal_context *ctx,
         !metal_buffer_range_valid(down_weight->buffer, down_weight->offset, down_weight_bytes)) {
         return metal_fail(error, error_size, "invalid %s SwiGLU request", op_name);
     }
-    if (n_tokens > 1u && (intermediate_size % UOCR_METAL_GEMM_Q8_BN) == 0u) {
+    if (n_tokens > 1u) {
         @autoreleasepool {
             id<MTLComputePipelineState> gate_pipeline = metal_get_pipeline(ctx, "uocr_decoder_swiglu_gate_up_gemm_f16_to_f16", error, error_size);
             if (gate_pipeline == nil) {
@@ -12922,7 +12922,10 @@ static int metal_run_dense_swiglu_buffer_f16(uocr_metal_context *ctx,
             [enc setBuffer:up_weight->buffer offset:up_weight->offset atIndex:2u];
             [enc setBuffer:mid.buffer offset:mid.offset atIndex:3u];
             [enc setBytes:&gate_params length:sizeof(gate_params) atIndex:4u];
-            [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(intermediate_size / UOCR_METAL_GEMM_Q8_BN), row_tiles, 1u)
+            [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)intermediate_size + UOCR_METAL_GEMM_Q8_BN - 1u) /
+                                                  UOCR_METAL_GEMM_Q8_BN,
+                                                  row_tiles,
+                                                  1u)
                 threadsPerThreadgroup:MTLSizeMake(UOCR_METAL_GEMM_Q8_THREADS, 1u, 1u)];
             [enc endEncoding];
 

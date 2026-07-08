@@ -62,6 +62,7 @@ static inline void uocr_gemm_q8_stage_b(device const char *qweight,
 // Stage an fp16 W tile transposed to [BK][BN] (k-major for B-side MMA loads).
 static inline void uocr_gemm_f16_stage_b(device const half *weight,
                                          uint K,
+                                         uint N,
                                          uint col_base,
                                          uint k_base,
                                          uint tid,
@@ -72,7 +73,7 @@ static inline void uocr_gemm_f16_stage_b(device const half *weight,
         const uint wk = (i - wn * chunks_per_col) * UOCR_HALF4_WIDTH;
         const uint wcol = col_base + wn;
         const uint k0 = k_base + wk;
-        const half4 value = uocr_load_half4(weight, (ulong)wcol * K + k0);
+        const half4 value = wcol < N ? uocr_load_half4(weight, (ulong)wcol * K + k0) : uocr_zero_half4();
         sb[(wk + 0u) * UOCR_GEMM_Q8_BN + wn] = value.x;
         sb[(wk + 1u) * UOCR_GEMM_Q8_BN + wn] = value.y;
         sb[(wk + 2u) * UOCR_GEMM_Q8_BN + wn] = value.z;
@@ -396,8 +397,8 @@ struct UocrDecoderGemmQ8Params {
 
     for (uint k_base = 0u; k_base < K; k_base += UOCR_GEMM_Q8_BK) {
         uocr_gemm_q8_stage_a(src, params.m, K, row_base, k_base, tid, sa);
-        uocr_gemm_f16_stage_b(gate_weight, K, col_base, k_base, tid, sb_gate);
-        uocr_gemm_f16_stage_b(up_weight, K, col_base, k_base, tid, sb_up);
+        uocr_gemm_f16_stage_b(gate_weight, K, params.n, col_base, k_base, tid, sb_gate);
+        uocr_gemm_f16_stage_b(up_weight, K, params.n, col_base, k_base, tid, sb_up);
         threadgroup_barrier(mem_flags::mem_threadgroup);
         uocr_gemm_q8_mma_tile(sa, sb_gate, sg_row, sg_col, mc_gate);
         uocr_gemm_q8_mma_tile(sa, sb_up, sg_row, sg_col, mc_up);
@@ -769,8 +770,8 @@ static inline void uocr_gemm_q8_stage_a_gathered(device const half *src,
 
     for (uint k_base = 0u; k_base < K; k_base += UOCR_GEMM_Q8_BK) {
         uocr_gemm_q8_stage_a_gathered(src, K, k_base, params.top_k, tile_pairs, tid, sa);
-        uocr_gemm_f16_stage_b(gate_weight, K, col_base, k_base, tid, sb_gate);
-        uocr_gemm_f16_stage_b(up_weight, K, col_base, k_base, tid, sb_up);
+        uocr_gemm_f16_stage_b(gate_weight, K, params.intermediate_size, col_base, k_base, tid, sb_gate);
+        uocr_gemm_f16_stage_b(up_weight, K, params.intermediate_size, col_base, k_base, tid, sb_up);
         threadgroup_barrier(mem_flags::mem_threadgroup);
         uocr_gemm_q8_mma_tile(sa, sb_gate, sg_row, sg_col, mc_gate);
         uocr_gemm_q8_mma_tile(sa, sb_up, sg_row, sg_col, mc_up);
@@ -839,7 +840,7 @@ static inline void uocr_gemm_q8_stage_a_gathered(device const half *src,
 
     for (uint k_base = 0u; k_base < K; k_base += UOCR_GEMM_Q8_BK) {
         uocr_gemm_q8_stage_a_gathered(mid, K, k_base, 1u, tile_pairs, tid, sa);
-        uocr_gemm_f16_stage_b(down_weight, K, col_base, k_base, tid, sb);
+        uocr_gemm_f16_stage_b(down_weight, K, params.hidden_size, col_base, k_base, tid, sb);
         threadgroup_barrier(mem_flags::mem_threadgroup);
         uocr_gemm_q8_mma_tile(sa, sb, sg_row, sg_col, mc);
         threadgroup_barrier(mem_flags::mem_threadgroup);
