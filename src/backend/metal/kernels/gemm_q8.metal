@@ -59,6 +59,27 @@ static inline void uocr_gemm_q8_stage_b(device const char *qweight,
     }
 }
 
+// Stage an fp16 W tile transposed to [BK][BN] (k-major for B-side MMA loads).
+static inline void uocr_gemm_f16_stage_b(device const half *weight,
+                                         uint K,
+                                         uint col_base,
+                                         uint k_base,
+                                         uint tid,
+                                         threadgroup half *sb) {
+    const uint chunks_per_col = UOCR_GEMM_Q8_BK / UOCR_HALF4_WIDTH;
+    for (uint i = tid; i < UOCR_GEMM_Q8_BN * chunks_per_col; i += UOCR_GEMM_Q8_THREADS) {
+        const uint wn = i / chunks_per_col;
+        const uint wk = (i - wn * chunks_per_col) * UOCR_HALF4_WIDTH;
+        const uint wcol = col_base + wn;
+        const uint k0 = k_base + wk;
+        const half4 value = uocr_load_half4(weight, (ulong)wcol * K + k0);
+        sb[(wk + 0u) * UOCR_GEMM_Q8_BN + wn] = value.x;
+        sb[(wk + 1u) * UOCR_GEMM_Q8_BN + wn] = value.y;
+        sb[(wk + 2u) * UOCR_GEMM_Q8_BN + wn] = value.z;
+        sb[(wk + 3u) * UOCR_GEMM_Q8_BN + wn] = value.w;
+    }
+}
+
 // MMA over one staged K tile into the per-simdgroup accumulators.
 static inline void uocr_gemm_q8_mma_tile(threadgroup const half *sa,
                                          threadgroup const half *sb,
@@ -340,6 +361,69 @@ struct UocrDecoderGemmQ8Params {
     }
 }
 
+// Decoder prefill fp16 fused SwiGLU gate/up: same 64x32x32 MMA tile shape as
+// the Q8 prefill kernel, but stages fp16 gate/up weight tiles directly.
+[[max_total_threads_per_threadgroup(UOCR_GEMM_Q8_THREADS)]] kernel void uocr_decoder_swiglu_gate_up_gemm_f16_to_f16(
+    device const half *src [[buffer(0)]],
+    device const half *gate_weight [[buffer(1)]],
+    device const half *up_weight [[buffer(2)]],
+    device half *mid [[buffer(3)]],
+    constant UocrDecoderGemmQ8Params &params [[buffer(4)]],
+    uint2 tgpig [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float smem[2u * UOCR_GEMM_Q8_BM * UOCR_GEMM_Q8_BN];
+    threadgroup half *sa = (threadgroup half *)smem;
+    threadgroup half *sb_gate = sa + UOCR_GEMM_Q8_BM * UOCR_GEMM_Q8_BK;
+    threadgroup half *sb_up = sb_gate + UOCR_GEMM_Q8_BK * UOCR_GEMM_Q8_BN;
+    threadgroup float *sc_gate = smem;
+    threadgroup float *sc_up = smem + UOCR_GEMM_Q8_BM * UOCR_GEMM_Q8_BN;
+
+    const uint K = params.k;
+    const uint row_base = tgpig.y * UOCR_GEMM_Q8_BM;
+    const uint col_base = tgpig.x * UOCR_GEMM_Q8_BN;
+
+    simdgroup_float8x8 mc_gate[4][2];
+    simdgroup_float8x8 mc_up[4][2];
+    for (uint i = 0u; i < 4u; ++i) {
+        for (uint j = 0u; j < 2u; ++j) {
+            mc_gate[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+            mc_up[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        }
+    }
+    const uint sg_row = (sgitg / 2u) * 32u;
+    const uint sg_col = (sgitg % 2u) * 16u;
+
+    for (uint k_base = 0u; k_base < K; k_base += UOCR_GEMM_Q8_BK) {
+        uocr_gemm_q8_stage_a(src, params.m, K, row_base, k_base, tid, sa);
+        uocr_gemm_f16_stage_b(gate_weight, K, col_base, k_base, tid, sb_gate);
+        uocr_gemm_f16_stage_b(up_weight, K, col_base, k_base, tid, sb_up);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uocr_gemm_q8_mma_tile(sa, sb_gate, sg_row, sg_col, mc_gate);
+        uocr_gemm_q8_mma_tile(sa, sb_up, sg_row, sg_col, mc_up);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    for (uint i = 0u; i < 4u; ++i) {
+        for (uint j = 0u; j < 2u; ++j) {
+            simdgroup_store(mc_gate[i][j], sc_gate + (sg_row + i * 8u) * UOCR_GEMM_Q8_BN + sg_col + j * 8u, UOCR_GEMM_Q8_BN);
+            simdgroup_store(mc_up[i][j], sc_up + (sg_row + i * 8u) * UOCR_GEMM_Q8_BN + sg_col + j * 8u, UOCR_GEMM_Q8_BN);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint i = tid; i < UOCR_GEMM_Q8_BM * UOCR_GEMM_Q8_BN; i += UOCR_GEMM_Q8_THREADS) {
+        const uint mrow = i / UOCR_GEMM_Q8_BN;
+        const uint col = col_base + (i - mrow * UOCR_GEMM_Q8_BN);
+        const uint row = row_base + mrow;
+        if (row < params.m && col < params.n) {
+            const float gate = sc_gate[i];
+            const float silu = gate / (1.0f + exp(-gate));
+            mid[(ulong)row * params.n + col] = half(silu * sc_up[i]);
+        }
+    }
+}
+
 // ── Expert-bucketed routed-MoE prefill ─────────────────────────────────────
 //
 // Prefill routes n_tokens*top_k (token, expert) pairs.  To reuse dequantized
@@ -486,27 +570,6 @@ static inline void uocr_gemm_q8_stage_a_gathered(device const half *src,
                                 ? uocr_load_half4(src, (ulong)(pair / row_divisor) * K + k_base + kk)
                                 : uocr_zero_half4();
         *reinterpret_cast<threadgroup half4 *>(sa + mrow * UOCR_GEMM_Q8_BK + kk) = value;
-    }
-}
-
-// Stage an fp16 W tile transposed to [BK][BN] (k-major for B-side MMA loads).
-static inline void uocr_gemm_f16_stage_b(device const half *weight,
-                                         uint K,
-                                         uint col_base,
-                                         uint k_base,
-                                         uint tid,
-                                         threadgroup half *sb) {
-    const uint chunks_per_col = UOCR_GEMM_Q8_BK / UOCR_HALF4_WIDTH;
-    for (uint i = tid; i < UOCR_GEMM_Q8_BN * chunks_per_col; i += UOCR_GEMM_Q8_THREADS) {
-        const uint wn = i / chunks_per_col;
-        const uint wk = (i - wn * chunks_per_col) * UOCR_HALF4_WIDTH;
-        const uint wcol = col_base + wn;
-        const uint k0 = k_base + wk;
-        const half4 value = uocr_load_half4(weight, (ulong)wcol * K + k0);
-        sb[(wk + 0u) * UOCR_GEMM_Q8_BN + wn] = value.x;
-        sb[(wk + 1u) * UOCR_GEMM_Q8_BN + wn] = value.y;
-        sb[(wk + 2u) * UOCR_GEMM_Q8_BN + wn] = value.z;
-        sb[(wk + 3u) * UOCR_GEMM_Q8_BN + wn] = value.w;
     }
 }
 

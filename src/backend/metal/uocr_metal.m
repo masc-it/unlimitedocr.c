@@ -12894,6 +12894,65 @@ static int metal_run_dense_swiglu_buffer_f16(uocr_metal_context *ctx,
         !metal_buffer_range_valid(down_weight->buffer, down_weight->offset, down_weight_bytes)) {
         return metal_fail(error, error_size, "invalid %s SwiGLU request", op_name);
     }
+    if (n_tokens > 1u && (intermediate_size % UOCR_METAL_GEMM_Q8_BN) == 0u) {
+        @autoreleasepool {
+            id<MTLComputePipelineState> gate_pipeline = metal_get_pipeline(ctx, "uocr_decoder_swiglu_gate_up_gemm_f16_to_f16", error, error_size);
+            if (gate_pipeline == nil) {
+                return 0;
+            }
+            int owned_command_buffer = 0;
+            id<MTLCommandBuffer> cb = metal_command_buffer_for_op(ctx, &owned_command_buffer, op_name, error, error_size);
+            if (cb == nil) {
+                return 0;
+            }
+            uocr_metal_decoder_gemm_q8_params gate_params;
+            memset(&gate_params, 0, sizeof(gate_params));
+            gate_params.m = n_tokens;
+            gate_params.k = UOCR_HIDDEN_SIZE;
+            gate_params.n = intermediate_size;
+
+            id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
+            if (enc == nil) {
+                return metal_fail(error, error_size, "failed to create %s gate/up GEMM encoder", op_name);
+            }
+            const NSUInteger row_tiles = ((NSUInteger)n_tokens + UOCR_METAL_GEMM_Q8_BM - 1u) / UOCR_METAL_GEMM_Q8_BM;
+            [enc setComputePipelineState:gate_pipeline];
+            [enc setBuffer:input.buffer offset:input.offset atIndex:0u];
+            [enc setBuffer:gate_weight->buffer offset:gate_weight->offset atIndex:1u];
+            [enc setBuffer:up_weight->buffer offset:up_weight->offset atIndex:2u];
+            [enc setBuffer:mid.buffer offset:mid.offset atIndex:3u];
+            [enc setBytes:&gate_params length:sizeof(gate_params) atIndex:4u];
+            [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(intermediate_size / UOCR_METAL_GEMM_Q8_BN), row_tiles, 1u)
+                threadsPerThreadgroup:MTLSizeMake(UOCR_METAL_GEMM_Q8_THREADS, 1u, 1u)];
+            [enc endEncoding];
+
+            uocr_metal_buffer_slice down_weight_slice = { down_weight->buffer, down_weight->offset };
+            if (!metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, op_name, error, error_size) ||
+                !metal_run_mps_matmul_nt_f16(ctx,
+                                             mid,
+                                             down_weight_slice,
+                                             dst,
+                                             n_tokens,
+                                             intermediate_size,
+                                             UOCR_HIDDEN_SIZE,
+                                             op_name,
+                                             error,
+                                             error_size)) {
+                return 0;
+            }
+            if (has_residual) {
+                return metal_run_residual_add_f16(ctx,
+                                                  dst,
+                                                  residual,
+                                                  dst,
+                                                  (uint32_t)down_values,
+                                                  op_name,
+                                                  error,
+                                                  error_size);
+            }
+            return 1;
+        }
+    }
     @autoreleasepool {
         const int use_tiled_shared_gate_up = n_tokens == 1u && intermediate_size == UOCR_MOE_SHARED_INTERMEDIATE;
         id<MTLComputePipelineState> gate_pipeline = metal_get_decoder_shape_pipeline(ctx,

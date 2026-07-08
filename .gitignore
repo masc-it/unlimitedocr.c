@@ -16,3 +16,4 @@ Testing/
 
 # pi agent workspace
 .pi/
+.DS_Store
