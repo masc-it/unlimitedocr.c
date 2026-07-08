@@ -539,7 +539,7 @@ routed experts were.
       mixed-q4 file: 2.11 GB.
 * [x] End-to-end QA vs q8/fp16 baselines — passed.
 
-### E4. Embeddings + vision Q4 (file size only) — ✅ shipped, pending QA
+### E4. Embeddings + vision Q4 (file size only) — ✅ shipped and QA'd
 
 No decode-speed win (embedding is a row lookup; vision is compute-bound
 prefill).  Measured saving: ~277 MB (planned mixed-q4 file 2.11 → 1.83 GB;
@@ -554,8 +554,8 @@ CLIP 151, embedding 83, SAM 42, projector 1).
       stage-B dequant reuses `uocr_gemm_q4_stage_b`); host GEMM routes by
       weight qtype (guarding n % 32 / k % 64), vision loader + weight-ready
       checks accept Q4_0.  SAM patch-embed / neck convs stay fp16.
-* [ ] End-to-end QA vs q8/fp16 baselines (image-heavy: vision encoder is now
-      Q4 — watch OCR quality on fine glyphs).
+* [x] End-to-end QA vs q8/fp16 baselines — passed (vision encoder Q4
+      included).
 
 ## Fallback ladder (if full-corpus QA regresses at step 6)
 
