@@ -516,7 +516,7 @@ kernel is simultaneously near the ALU limit, but real and exact.
       file: 2.16 GB).
 * [x] End-to-end QA vs q8/fp16 baselines — passed.
 
-### E2. Shared experts + dense L0 MLP Q4 (102 MB/token → 51 MB/token) — ✅ shipped, pending QA
+### E2. Shared experts + dense L0 MLP Q4 (102 MB/token → 51 MB/token) — ✅ shipped and QA'd
 
 Structural mirrors of existing kernels; note the shared experts run for
 *every* token (no routing redundancy), so quality risk is higher than the
@@ -537,7 +537,7 @@ routed experts were.
 * [x] Flip `moe_shared` + `dense_mlp` in the shipped cfg (both share the same
       kernels; a QA regression bisects by flipping one back).  Planned
       mixed-q4 file: 2.11 GB.
-* [ ] End-to-end QA vs q8/fp16 baselines.
+* [x] End-to-end QA vs q8/fp16 baselines — passed.
 
 ### E4. Embeddings + vision Q4 (file size only)
 
