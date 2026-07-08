@@ -40,6 +40,33 @@ for image_path in ["page-1.png", "page-2.png", "page-3.png"]:
 ocr.close()
 ```
 
+## Quantization (Q8)
+
+The engine supports two model profiles:
+
+| Profile | Weights | Model file | Usage |
+| --- | --- | --- | --- |
+| fp16 (default) | fp16 | ~6.7 GB | `UnlimitedOCR()` |
+| mixed Q8_0 | int8 weights + fp16 scales | ~3.5 GB | `UnlimitedOCR(quant="q8")` |
+
+```python
+from unlimitedocr_c import UnlimitedOCR
+
+ocr = UnlimitedOCR(quant="q8")
+text = ocr.generate("page.png")
+ocr.close()
+```
+
+The first use converts the Hugging Face checkpoint into a cached
+`unlimitedocr-q8.uocr` model file; pass `force_reconvert=True` to rebuild it.
+
+Q8 quantizes all decoder and vision-encoder weight matrices (attention, MLPs,
+MoE experts, LM head, embeddings, projector) with group-64 Q8_0.  Norms,
+biases, position embeddings, convolutions, and all runtime activations stay
+fp16.  Dequantization is fused inside the Metal kernels — quantization roughly
+halves model memory and speeds up token generation, which is
+memory-bandwidth-bound.
+
 ## Input types
 
 `generate()` accepts the common image forms directly:

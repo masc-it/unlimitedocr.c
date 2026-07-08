@@ -14,6 +14,7 @@ API for OCR workflows.
 | **On-device, private** | No network calls; model and inference run entirely on the local machine. |
 | **Low latency** | Native C code, GPU execution via Apple Metal, no-copy model tensor views, and a bounded-memory vision pipeline. |
 | **Memory aware** | Every allocation is tracked by category.  Requests are admitted or rejected based on a fixed memory budget, preventing OOM at runtime. |
+| **Quantized** | An optional mixed-Q8_0 profile stores weight matrices as int8 + fp16 group scales (~½ model size).  Dequantization is fused inside the GPU kernels; activations, KV cache, and numerics-sensitive tensors stay fp16. |
 | **Multi-backend** | A clean C ABI lets the same engine dispatch to different backends.  Today only **Metal** (Apple GPU) is production-ready; a **CPU ref** backend exists for validation and parity testing.  Future backends (CUDA, ANE, etc.) slot in behind the same interface. |
 | **Portable Python API** | The user-facing `UnlimitedOCR` class accepts images as paths, URLs, bytes, PIL images, or base64 strings. |
 
@@ -60,7 +61,7 @@ communicate through a stable C ABI defined in `unlimitedocr.h`.
 | **Engine core** | `src/core/uocr_api.c` | Request validation, memory estimation, admission control, vision scheduling, backend dispatch. |
 | **Memory management** | `src/runtime/uocr_memory.c` | Per-category tracking, peak recording, budget enforcement, component-wise memory estimation. |
 | **Vision runtime** | `src/runtime/uocr_vision.c` | View schedule planning, chunked execution, final feature assembly. |
-| **Sequence runtime** | `src/runtime/uocr_sequence.c` | Prompt+generated token state, no-repeat-ngram configuration. |
+| **Sequence runtime** | `src/runtime/uocr_sequence.c` | Prompt+generated token state. |
 | **Model file** | `src/model/uocr_model_file.c` | Memory-mapped `.uocr` model parsing: header, sections, tensor directory. |
 | **Metal backend** | `src/backend/metal/` | GPU context, buffer management, kernel pipelines, integrated fp16 decode and image generation. |
 | **CPU ref backend** | `src/backend/cpu_ref/` | Pure C reference implementation for validation and correctness parity. |
@@ -128,9 +129,7 @@ C: uocr_generate_prepared()
                       │     │     ├── KV append → flash attention → output proj
                       │     │     ├── RMS norm → MoE (router + shared + routed)
                       │     │     └── Residual add
-                      │     ├── RMS norm → LM head → logits
-                      │     ├── No-repeat-ngram (CPU readback, mutates logits)
-                      │     ├── Greedy argmax → next token
+                      │     ├── RMS norm → LM head → greedy argmax (fused on GPU)
                       │     └── Stop if EOS or max_new_tokens reached
                       └── Return generated tokens
     │
@@ -158,7 +157,7 @@ to one of **ten categories**, each tracked with live/peak bytes:
 | 5 | Vision Host Staging | CPU-side staging for visual features (if needed) |
 | 6 | Decoder Scratch | Layer intermediate buffers (hidden states, attention) |
 | 7 | MoE Scratch | Router logits, expert output combiners |
-| 8 | Logits Readback | CPU-visible logits buffer for no-repeat-ngram processing |
+| 8 | Logits Readback | CPU-visible logits/token readback buffer |
 | 9 | Transient Buffers | Short-lived allocations (generated token buffers, etc.) |
 
 Before executing a request, the engine computes a **memory estimate** for every
@@ -215,8 +214,7 @@ The decoder is a **DeepSeek V2**-style transformer with:
 
 The decode loop runs entirely on GPU: prompt tokens are prefilled in one pass,
 then each generated token runs a full forward pass through all layers, followed
-by LM head projection and logits processing.  No-repeat-ngram filtering is
-applied on the CPU logits readback buffer before greedy argmax sampling.
+by a fused LM-head projection + greedy argmax.
 
 ---
 
@@ -312,9 +310,18 @@ designed for **zero-copy memory mapping**:
 ├──────────────────────┤
 │ Provenance Record    │  source safetensors info, config hashes
 ├──────────────────────┤
-│ Tensor Payloads      │  aligned fp16 tensor data
+│ Tensor Payloads      │  aligned fp16 / Q8_0 tensor data
 └──────────────────────┘
 ```
+
+The file carries a **quantization profile** (`qprofile`): `fp16` (all tensors
+fp16) or `mixed-q8_0`.  In the mixed profile, selected rank-2 weight matrices
+are stored as **Q8_0**: row-major int8 qweights plus one fp16 scale per
+64-element group along the input dimension (`payload_offset/size` for
+qweights, `scale_offset/size` for scales in the same tensor entry).  Which
+modules the converter may quantize is gated by `configs/quant-cfg.yaml` — a
+module is enabled only after fused runtime kernels exist and it passed
+end-to-end QA.
 
 **Key design decisions:**
 
@@ -350,7 +357,7 @@ The Metal backend divides GPU memory into three tiers:
 | 0 = VISION | SAM/CLIP/projector per-chunk temporaries |
 | 1 = DECODER | Decoder layer intermediate hidden states |
 | 2 = MOE | MoE expert intermediate activations |
-| 3 = LOGITS | CPU-visible logits buffer for no-repeat-ngram |
+| 3 = LOGITS | CPU-visible logits buffer |
 | 4 = TRANSIENT | Short-lived kernel temporaries |
 | 5 = VISION_FINAL | Concatenated visual features for decoder |
 | 6 = LM_HEAD_LOGITS | LM head projection output |
@@ -423,10 +430,8 @@ For each generated token:
      c. Flash attention over all cache positions (or ring window)
      d. Output projection + residual
      e. MoE (same as prefill)
-  3. RMS norm → LM head (hidden → vocab logits)
-  4. No-repeat-ngram (CPU: collect banning set → apply -inf to logits)
-  5. Greedy argmax → next token
-  6. If EOS or max_new_tokens → stop
+  3. RMS norm → LM head → greedy argmax (fused on GPU) → next token
+  4. If EOS or max_new_tokens → stop
 ```
 
 ### 4.4 Metal Kernels
@@ -445,6 +450,11 @@ contains one or more related GPU functions:
 | `moe.metal` | Router, gated MLP (shared + routed experts) |
 | `rope.metal` | Rotary position embedding |
 | `embedding.metal` | Token embedding lookup |
+| `embedding_q8.metal` | Fused Q8 token-embedding gather |
+| `attention_q8.metal`, `dense_q8.metal`, `moe_q8.metal` | Fused Q8 decode projection/MLP/MoE variants |
+| `decode_gemv_q8.metal` | Simdgroup-per-row Q8 GEMV family for single-token decode |
+| `gemm_q8.metal` | Tiled simdgroup-MMA Q8 GEMM (prefill + vision) and expert-bucketed MoE prefill |
+| `lm_head_q8.metal` | Fused Q8 LM-head projection + argmax |
 | `sam.metal` | SAM patch embedding |
 | `sam_attention.metal` | SAM window attention with relative position bias |
 | `sam_conv.metal` | SAM conv layers |
@@ -463,7 +473,41 @@ compile specialized pipeline variants at runtime for the exact model
 architecture (hidden size, head count, ring window, etc.), avoiding runtime
 branches inside hot kernels.
 
-### 4.5 Orchestration
+### 4.5 Q8 Quantization Support
+
+The Metal backend executes the **mixed-Q8_0** model profile with fused
+quantized kernels.  All rank-2 weight matrices are quantized — the full
+decoder path (token embedding, attention Q/K/V/O, dense MLP, shared and
+routed MoE experts, LM head) and the full vision path (visual projector, CLIP
+attention QKV/O and MLP fc1/fc2, SAM attention QKV/O and MLP lin1/lin2).
+Norms, biases, position/relative-position embeddings, the MoE router, the
+rank-4 SAM conv/patch tensors, and all activations and the KV cache stay fp16.
+
+Design rules (see `docs/howto_quant.md` for the full guide):
+
+- **Fused dequantization.**  No kernel materializes a dequantized weight
+  buffer; int8 qweights and fp16 group scales are read and dequantized inside
+  the same kernel that performs the dot product (registers for GEMV,
+  threadgroup tiles for GEMM).  MPS matmul is never fed dequantized copies.
+- **Two kernel regimes, selected per dispatch.**  Single-token decode uses
+  simdgroup-per-row GEMV kernels (`decode_gemv_q8.metal`: char4 weight /
+  half4 activation loads, `simd_sum` only — 45–156 GB/s effective weight
+  bandwidth, the LM head at full streaming bandwidth).  Multi-row prefill and
+  vision batches use a tiled simdgroup-MMA GEMM (`gemm_q8.metal`: 64×32×32
+  tiles, fp16 MMA with fp32 accumulators, each weight tile dequantized once
+  per 64-row block — ~2.2 TFLOP/s, ≈ 75% of MPS fp16 on the same shapes
+  while reading half the bytes).
+- **Expert-bucketed MoE prefill.**  Routed-expert prefill buckets
+  (token, expert) pairs by expert on GPU, then runs the tiled GEMM per bucket
+  with gathered rows (~18× faster than per-pair GEMV at 1024 prompt tokens).
+- **Cfg-gated rollout.**  `configs/quant-cfg.yaml` lists the runtime-safe
+  (family, projection) modules; the converter quantizes only those, the
+  loader validates Q8 metadata per role, and a quantized tensor reaching a
+  call site without a fused kernel fails at bind time rather than falling
+  back silently.
+
+### 4.6 Orchestration
+
 
 The top-level Metal generation paths are:
 
@@ -478,7 +522,7 @@ The top-level Metal generation paths are:
   the engine core to coordinate memory tracking across the vision→decoder
   boundary.
 
-### 4.6 Profiling & Diagnostics
+### 4.7 Profiling & Diagnostics
 
 The backend supports runtime profiling via `uocr_profile_state`.  Every
 significant operation records a named event with duration, call count, min/max.
