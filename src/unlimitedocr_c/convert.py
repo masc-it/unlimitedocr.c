@@ -2252,10 +2252,16 @@ def _quantize_q4_0_rows(values: np.ndarray, group_size: int) -> tuple[np.ndarray
     Returns ``(packed_u8[rows, cols//2], scales_f16[rows, groups], dequant_f32)``.
     Scheme (docs/plan_q4.md §1.1): per 64-wide group, ``scale = signed_max / -8``
     rounded to fp16, levels clamped to ``[-8, 7]``, nibbles stored as ``q + 8``
-    with the low nibble holding the even k element.
+    with the **group-half split** layout: byte ``j`` of a group (j in 0..31)
+    packs ``w[g*64 + j]`` in the low nibble and ``w[g*64 + 32 + j]`` in the
+    high nibble.  This lets the Metal GEMV unpack a 4-byte load into two
+    vectorized ``float4`` halves that each pair with an aligned ``half4``
+    activation load (measured 2.7x vs Q8 decode vs 0.9x for interleaved
+    even/odd nibbles).
     """
     rows, cols = values.shape
     groups_per_row = cols // group_size
+    half = group_size // 2
     grouped = values.reshape(rows, groups_per_row, group_size)
     abs_idx = np.argmax(np.abs(grouped), axis=2)
     signed_max = np.take_along_axis(grouped, abs_idx[:, :, None], axis=2)[:, :, 0]
@@ -2265,9 +2271,9 @@ def _quantize_q4_0_rows(values: np.ndarray, group_size: int) -> tuple[np.ndarray
     quantized = np.clip(np.rint(grouped / scales_safe[:, :, None]), UOCR_Q4_MIN, UOCR_Q4_MAX)
     quantized = quantized.astype(np.int8, copy=False)
     dequant = (quantized.astype(np.float32) * scales_f32[:, :, None]).reshape(rows, cols)
-    biased = (quantized.reshape(rows, cols).astype(np.int16) + 8).astype(np.uint8)
-    packed = (biased[:, 0::2] | (biased[:, 1::2] << 4)).astype(np.uint8, copy=False)
-    return packed, scales_f16, dequant
+    biased = (quantized.astype(np.int16) + 8).astype(np.uint8)  # [rows, groups, 64]
+    packed = (biased[:, :, :half] | (biased[:, :, half:] << 4)).astype(np.uint8, copy=False)
+    return packed.reshape(rows, cols // 2), scales_f16, dequant
 
 
 def _expected_q4_0_chunk(values: np.ndarray, tensor: TensorPlan) -> tuple[bytes, bytes, float, float, int]:

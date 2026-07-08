@@ -68,8 +68,11 @@ static inline uint64_t uocr_q8_0_total_bytes(uint32_t rows, uint32_t cols, uint3
     return uocr_q8_0_qweight_bytes(rows, cols) + uocr_q8_0_qscale_bytes(rows, cols, group_size);
 }
 
-/* Q4_0: symmetric grouped int4, two weights per byte packed along K
- * (low nibble = even k, stored as q + 8), one fp16 scale per group. */
+/* Q4_0: symmetric grouped int4, two weights per byte, one fp16 scale per
+ * group.  Nibbles are stored as q + 8 with the group-half split layout:
+ * byte j of a 64-wide group (j in 0..31) packs w[g*64+j] in the low nibble
+ * and w[g*64+32+j] in the high nibble, so kernels unpack 4-byte loads into
+ * two vectorized float4 halves (see docs/plan_q4.md). */
 #define UOCR_Q4_GROUP_SIZE_DEFAULT 64u
 #define UOCR_Q4_MIN (-8)
 #define UOCR_Q4_MAX 7

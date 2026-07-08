@@ -118,13 +118,19 @@ scale = m / -8              (fp16; 1.0 for all-zero groups)
 q     = round(w / scale), clamped to [-8, 7]
 ```
 
-Packing: byte `k/2` of a row holds weights `k` (low nibble) and `k+1`
-(high nibble), stored as unsigned `q + 8` so unpack is
-`int(nibble) - 8` without sign-extension tricks:
+Packing (**group-half split**, llama.cpp-style): byte `j` of a 64-wide group
+(j in 0..31) holds weight `g*64 + j` in the low nibble and `g*64 + 32 + j` in
+the high nibble, stored as unsigned `q + 8`:
 
 ```text
-byte = (uint8)(q[k] + 8) | ((uint8)(q[k+1] + 8) << 4)
+byte[g*32 + j] = (uint8)(q[g*64 + j] + 8) | ((uint8)(q[g*64 + 32 + j] + 8) << 4)
 ```
+
+This was probe-validated against the interleaved even/odd alternative: the
+group-half split lets the GEMV unpack one `uchar4` load into two vectorized
+`float4` halves that each pair with an *aligned* `half4` activation load
+(`lo → x[k..k+3]`, `hi → x[k+32..k+35]`), measured **2.7× vs Q8 decode**,
+while interleaved nibbles measured 0.9× (scalar unpack dominated).
 
 Tensor-entry representation (existing fields only):
 

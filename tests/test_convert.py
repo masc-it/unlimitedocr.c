@@ -198,12 +198,12 @@ def test_q4_pack_roundtrip() -> None:
     assert packed.shape == (4, 64)
     assert scales_f16.shape == (4, 2)
 
-    # Unpack nibbles (stored as q + 8, low nibble = even k) and re-dequantize.
-    low = (packed & 0x0F).astype(np.int16) - 8
-    high = (packed >> 4).astype(np.int16) - 8
-    q = np.empty((4, 128), dtype=np.int16)
-    q[:, 0::2] = low
-    q[:, 1::2] = high
+    # Unpack nibbles (stored as q + 8, group-half split: byte j of a group
+    # holds w[j] low / w[j+32] high) and re-dequantize.
+    packed_groups = packed.reshape(4, 2, 32)
+    low = (packed_groups & 0x0F).astype(np.int16) - 8
+    high = (packed_groups >> 4).astype(np.int16) - 8
+    q = np.concatenate([low, high], axis=2).reshape(4, 128)
     assert q.min() >= UOCR_Q4_MIN and q.max() <= UOCR_Q4_MAX
     scales = scales_f16.astype(np.float32)
     redequant = (q.reshape(4, 2, 64).astype(np.float32) * scales[:, :, None]).reshape(4, 128)

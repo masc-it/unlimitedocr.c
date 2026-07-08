@@ -13749,6 +13749,120 @@ static int metal_run_moe_interleaved_decode_fused_combine_buffer_q8_0(
     }
 }
 
+/*
+ * Q4_0 routed-MoE fused combine.  Decode (n_tokens == 1) uses the
+ * simdgroup-per-row Q4 GEMV kernels (group-half-split nibble unpack, one
+ * fp16 scale per 64-group); prefill lands with the bucketed Q4 GEMM
+ * (docs/plan_q4.md step 5).
+ */
+static int metal_run_moe_interleaved_decode_fused_combine_buffer_q4_0(
+    uocr_metal_context *ctx,
+    uocr_metal_buffer_slice input,
+    uocr_metal_buffer_slice top_ids,
+    uocr_metal_buffer_slice top_weights,
+    uocr_metal_buffer_slice expert_qweight_slab,
+    uocr_metal_buffer_slice expert_qscale_slab,
+    uint32_t n_tokens,
+    uocr_metal_buffer_slice mid,
+    uocr_metal_buffer_slice shared,
+    uocr_metal_buffer_slice residual,
+    uocr_metal_buffer_slice dst,
+    char *error,
+    size_t error_size) {
+    const uint64_t hidden_bytes = (uint64_t)n_tokens * (uint64_t)UOCR_HIDDEN_SIZE * 2u;
+    const uint64_t top_ids_bytes = (uint64_t)n_tokens * (uint64_t)UOCR_MOE_TOP_K * sizeof(uint32_t);
+    const uint64_t top_weights_bytes = (uint64_t)n_tokens * (uint64_t)UOCR_MOE_TOP_K * sizeof(float);
+    const uint64_t mid_bytes = (uint64_t)n_tokens * (uint64_t)UOCR_MOE_TOP_K * (uint64_t)UOCR_MOE_EXPERT_INTERMEDIATE * 2u;
+    const uint64_t projection_values = (uint64_t)UOCR_MOE_EXPERT_INTERMEDIATE * (uint64_t)UOCR_HIDDEN_SIZE;
+    const uint64_t projection_qweight_bytes = projection_values / 2u;
+    const uint64_t projection_scale_values =
+        (uint64_t)UOCR_MOE_EXPERT_INTERMEDIATE * ((uint64_t)UOCR_HIDDEN_SIZE / UOCR_Q4_GROUP_SIZE_DEFAULT);
+    const uint64_t slab_qweight_bytes = projection_qweight_bytes * 3u * (uint64_t)UOCR_ROUTED_EXPERTS;
+    const uint64_t slab_qscale_bytes = projection_scale_values * 3u * (uint64_t)UOCR_ROUTED_EXPERTS * 2u;
+    uint64_t gate_values = (uint64_t)n_tokens * (uint64_t)UOCR_MOE_TOP_K * (uint64_t)UOCR_MOE_EXPERT_INTERMEDIATE;
+    uint64_t down_values = (uint64_t)n_tokens * (uint64_t)UOCR_HIDDEN_SIZE;
+    if (ctx == NULL || n_tokens == 0u || gate_values > UINT32_MAX || down_values > UINT32_MAX ||
+        !metal_slice_valid(input, hidden_bytes) || !metal_slice_valid(top_ids, top_ids_bytes) ||
+        !metal_slice_valid(top_weights, top_weights_bytes) ||
+        !metal_slice_valid(expert_qweight_slab, slab_qweight_bytes) ||
+        !metal_slice_valid(expert_qscale_slab, slab_qscale_bytes) ||
+        !metal_slice_valid(mid, mid_bytes) || !metal_slice_valid(shared, hidden_bytes) ||
+        !metal_slice_valid(residual, hidden_bytes) || !metal_slice_valid(dst, hidden_bytes)) {
+        return metal_fail(error, error_size, "invalid integrated routed MoE Q4 fused-combine request");
+    }
+    if (n_tokens > 1u) {
+        return metal_fail(error,
+                          error_size,
+                          "integrated routed MoE Q4 prefill kernels are not implemented yet");
+    }
+    @autoreleasepool {
+        /* Decode (n_tokens == 1): simdgroup-per-row Q4 GEMV kernels. */
+        const uint32_t routed_top_k = (uint32_t)UOCR_METAL_DECODE_MOE_TOP_K;
+        id<MTLComputePipelineState> gate_pipeline = metal_get_pipeline(ctx, "uocr_moe_decode_gate_up_gemv_q4_0_to_f16", error, error_size);
+        id<MTLComputePipelineState> down_combine_pipeline = metal_get_pipeline(ctx, "uocr_moe_decode_down_combine_gemv_q4_0_to_f16", error, error_size);
+        if (gate_pipeline == nil || down_combine_pipeline == nil) {
+            return 0;
+        }
+        int owned_command_buffer = 0;
+        id<MTLCommandBuffer> cb = metal_command_buffer_for_op(ctx, &owned_command_buffer, "integrated routed MoE Q4 fused combine", error, error_size);
+        if (cb == nil) {
+            return 0;
+        }
+        /* Same 12-uint ABI as the Q8 params; qweight strides/offsets are
+         * PACKED BYTE counts for Q4 (UocrMoeDecodeGemvQ4Params). */
+        uocr_metal_moe_prefill_interleaved_q8_params gemv_params;
+        gemv_params.n_tokens = 1u;
+        gemv_params.hidden_size = UOCR_HIDDEN_SIZE;
+        gemv_params.intermediate_size = UOCR_MOE_EXPERT_INTERMEDIATE;
+        gemv_params.expert_count = UOCR_ROUTED_EXPERTS;
+        gemv_params.top_k = routed_top_k;
+        gemv_params.expert_stride_values = (uint32_t)(projection_qweight_bytes * 3u);
+        gemv_params.up_offset_values = (uint32_t)projection_qweight_bytes;
+        gemv_params.down_offset_values = (uint32_t)(projection_qweight_bytes * 2u);
+        gemv_params.expert_scale_stride_values = (uint32_t)(projection_scale_values * 3u);
+        gemv_params.up_scale_offset_values = (uint32_t)projection_scale_values;
+        gemv_params.down_scale_offset_values = (uint32_t)(projection_scale_values * 2u);
+        gemv_params.group_size = UOCR_Q4_GROUP_SIZE_DEFAULT;
+
+        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
+        if (enc == nil) {
+            return metal_fail(error, error_size, "failed to create integrated routed MoE Q4 gate/up encoder");
+        }
+        const NSUInteger gate_rows = (NSUInteger)routed_top_k * (NSUInteger)UOCR_MOE_EXPERT_INTERMEDIATE;
+        const NSUInteger gate_rows_per_tg = metal_decode_gemv_rows_per_threadgroup(gate_pipeline);
+        [enc setComputePipelineState:gate_pipeline];
+        [enc setBuffer:input.buffer offset:input.offset atIndex:0u];
+        [enc setBuffer:top_ids.buffer offset:top_ids.offset atIndex:1u];
+        [enc setBuffer:expert_qweight_slab.buffer offset:expert_qweight_slab.offset atIndex:2u];
+        [enc setBuffer:expert_qscale_slab.buffer offset:expert_qscale_slab.offset atIndex:3u];
+        [enc setBuffer:mid.buffer offset:mid.offset atIndex:4u];
+        [enc setBytes:&gemv_params length:sizeof(gemv_params) atIndex:5u];
+        [enc dispatchThreadgroups:MTLSizeMake((gate_rows + gate_rows_per_tg - 1u) / gate_rows_per_tg, 1u, 1u)
+             threadsPerThreadgroup:MTLSizeMake(128u, 1u, 1u)];
+        [enc endEncoding];
+
+        enc = metal_compute_command_encoder(ctx, cb);
+        if (enc == nil) {
+            return metal_fail(error, error_size, "failed to create integrated routed MoE Q4 down/combine encoder");
+        }
+        const NSUInteger down_rows_per_tg = metal_decode_gemv_rows_per_threadgroup(down_combine_pipeline);
+        [enc setComputePipelineState:down_combine_pipeline];
+        [enc setBuffer:mid.buffer offset:mid.offset atIndex:0u];
+        [enc setBuffer:top_ids.buffer offset:top_ids.offset atIndex:1u];
+        [enc setBuffer:top_weights.buffer offset:top_weights.offset atIndex:2u];
+        [enc setBuffer:expert_qweight_slab.buffer offset:expert_qweight_slab.offset atIndex:3u];
+        [enc setBuffer:expert_qscale_slab.buffer offset:expert_qscale_slab.offset atIndex:4u];
+        [enc setBuffer:shared.buffer offset:shared.offset atIndex:5u];
+        [enc setBuffer:residual.buffer offset:residual.offset atIndex:6u];
+        [enc setBuffer:dst.buffer offset:dst.offset atIndex:7u];
+        [enc setBytes:&gemv_params length:sizeof(gemv_params) atIndex:8u];
+        [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)UOCR_HIDDEN_SIZE + down_rows_per_tg - 1u) / down_rows_per_tg, 1u, 1u)
+             threadsPerThreadgroup:MTLSizeMake(128u, 1u, 1u)];
+        [enc endEncoding];
+        return metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, "integrated routed MoE Q4 fused combine", error, error_size);
+    }
+}
+
 static int metal_run_moe_interleaved_decode_fused_combine_buffer_f16(uocr_metal_context *ctx,
                                                                      uocr_metal_buffer_slice input,
                                                                      uocr_metal_buffer_slice top_ids,
@@ -13779,11 +13893,19 @@ static int metal_run_moe_interleaved_decode_fused_combine_buffer_f16(uocr_metal_
                                                                           error_size);
     }
     if (expert_qtype == UOCR_TENSOR_Q4_0) {
-        /* Loader/bindings accept Q4 expert slabs ahead of the fused Q4
-         * kernels (docs/plan_q4.md step 4); fail loudly until they land. */
-        return metal_fail(error,
-                          error_size,
-                          "integrated routed MoE Q4 kernels are not implemented yet");
+        return metal_run_moe_interleaved_decode_fused_combine_buffer_q4_0(ctx,
+                                                                          input,
+                                                                          top_ids,
+                                                                          top_weights,
+                                                                          expert_slab,
+                                                                          expert_scale_slab,
+                                                                          n_tokens,
+                                                                          mid,
+                                                                          shared,
+                                                                          residual,
+                                                                          dst,
+                                                                          error,
+                                                                          error_size);
     }
     const uint64_t hidden_bytes = (uint64_t)n_tokens * (uint64_t)UOCR_HIDDEN_SIZE * 2u;
     const uint64_t top_ids_bytes = (uint64_t)n_tokens * (uint64_t)UOCR_MOE_TOP_K * sizeof(uint32_t);
