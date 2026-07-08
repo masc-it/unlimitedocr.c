@@ -14,7 +14,10 @@
 
 typedef enum uocr_qprofile_id {
     UOCR_QPROFILE_FP16 = 1,
-    UOCR_QPROFILE_MIXED_Q8_0 = 2
+    UOCR_QPROFILE_MIXED_Q8_0 = 2,
+    /* mixed-q4: routed MoE experts Q4_0, remaining quantized decoder modules
+     * Q8_0, everything else fp16 (see docs/plan_q4.md). */
+    UOCR_QPROFILE_MIXED_Q4 = 3
 } uocr_qprofile_id;
 
 typedef enum uocr_section_type {
@@ -37,7 +40,10 @@ typedef enum uocr_provenance_flags {
 typedef enum uocr_tensor_qtype {
     UOCR_TENSOR_F16 = 1,
     UOCR_TENSOR_F32 = 2,
-    UOCR_TENSOR_Q8_0 = 3
+    UOCR_TENSOR_Q8_0 = 3,
+    UOCR_TENSOR_Q4_0 = 4,
+    /* Reserved for the asymmetric scale+min fallback scheme; not implemented. */
+    UOCR_TENSOR_Q4_1 = 5
 } uocr_tensor_qtype;
 
 #define UOCR_Q8_GROUP_SIZE_DEFAULT 64u
@@ -60,6 +66,36 @@ static inline uint64_t uocr_q8_0_total_bytes(uint32_t rows, uint32_t cols, uint3
         return 0u;
     }
     return uocr_q8_0_qweight_bytes(rows, cols) + uocr_q8_0_qscale_bytes(rows, cols, group_size);
+}
+
+/* Q4_0: symmetric grouped int4, two weights per byte, one fp16 scale per
+ * group.  Nibbles are stored as q + 8 with the group-half split layout:
+ * byte j of a 64-wide group (j in 0..31) packs w[g*64+j] in the low nibble
+ * and w[g*64+32+j] in the high nibble, so kernels unpack 4-byte loads into
+ * two vectorized float4 halves (see docs/plan_q4.md). */
+#define UOCR_Q4_GROUP_SIZE_DEFAULT 64u
+#define UOCR_Q4_MIN (-8)
+#define UOCR_Q4_MAX 7
+
+static inline uint64_t uocr_q4_0_qweight_bytes(uint32_t rows, uint32_t cols) {
+    if ((cols % 2u) != 0u) {
+        return 0u;
+    }
+    return (uint64_t)rows * (uint64_t)(cols / 2u);
+}
+
+static inline uint64_t uocr_q4_0_qscale_bytes(uint32_t rows, uint32_t cols, uint32_t group_size) {
+    if (group_size == 0u || (cols % group_size) != 0u) {
+        return 0u;
+    }
+    return (uint64_t)rows * (uint64_t)(cols / group_size) * (uint64_t)sizeof(uint16_t);
+}
+
+static inline uint64_t uocr_q4_0_total_bytes(uint32_t rows, uint32_t cols, uint32_t group_size) {
+    if (group_size == 0u || (cols % group_size) != 0u || (cols % 2u) != 0u) {
+        return 0u;
+    }
+    return uocr_q4_0_qweight_bytes(rows, cols) + uocr_q4_0_qscale_bytes(rows, cols, group_size);
 }
 
 typedef enum uocr_tensor_usage {

@@ -1,35 +1,44 @@
-# quant-cfg.yaml — runtime-supported Q8_0 modules for the Metal backend.
+# quant-cfg.yaml — runtime-supported quantized modules for the Metal backend.
 #
 # The converter quantizes only the (family, projection) pairs listed here with
-# `supported: true`.  Grow this list as fused Q8 Metal kernels land; a module
-# stays `supported: false` until every decode and prefill path that consumes it
-# has a fused Q8 kernel.
+# `supported: true`.  Grow this list as fused quantized Metal kernels land; a
+# module stays `supported: false` until every decode and prefill path that
+# consumes it has a fused kernel.
 #
 # Keys:
-#   version     config schema version (currently 1)
-#   group_size  Q8_0 block/group size; must match UOCR_Q8_GROUP_SIZE_DEFAULT
+#   version     config schema version (currently 2)
+#   group_size  quant block/group size; must match UOCR_Q8/Q4_GROUP_SIZE_DEFAULT
 #   modules     ordered list of module specs
 #     name         human-readable module id (stable, used in summaries)
 #     family       TensorFamily enum name
 #     projections  list of TensorProjection enum names this module covers
-#     supported    whether the runtime can consume Q8_0 weights for this module
+#     supported    whether the runtime can consume quantized weights for this module
+#     qtype        optional storage qtype: q8_0 (default) or q4_0; q4_0 is only
+#                  valid for MOE_EXPERT (docs/plan_q4.md) and only takes effect
+#                  under --qprofile mixed-q4
 #
 # Note: attention_qkv covers Q/K/V and attention_output covers O.  Both prefill
 # and decode have fused Q8 kernels for Q/K/V and O projections.
 
-version: 1
+version: 2
 group_size: 64
 
 modules:
+  # Token embedding stores Q4_0 under --qprofile mixed-q4 (fused Q4 row-gather
+  # kernel); mixed-q8_0 keeps Q8_0.
   - name: token_embedding
     family: TOK_EMBED
     projections: [WEIGHT]
     supported: true
+    qtype: q4_0
 
+  # LM head stores Q4_0 under --qprofile mixed-q4 (fused Q4 simdgroup-per-row
+  # argmax kernel); mixed-q8_0 conversions keep Q8_0.
   - name: lm_head
     family: LM_HEAD
     projections: [WEIGHT]
     supported: true
+    qtype: q4_0
 
   - name: attention_qkv
     family: LAYER_ATTN
@@ -41,48 +50,60 @@ modules:
     projections: [O]
     supported: true
 
+  # Dense layer-0 MLP and shared experts store Q4_0 under --qprofile mixed-q4
+  # (fused Q4 decode GEMV + tiled prefill GEMM kernels); mixed-q8_0 keeps Q8_0.
   - name: dense_mlp
     family: LAYER_DENSE_MLP
     projections: [GATE, UP, DOWN]
     supported: true
+    qtype: q4_0
 
   - name: moe_shared
     family: MOE_SHARED
     projections: [GATE, UP, DOWN]
     supported: true
+    qtype: q4_0
 
+  # Routed experts store Q4_0 under --qprofile mixed-q4 (fused Q4 decode GEMV
+  # + bucketed prefill GEMM kernels); mixed-q8_0 conversions ignore the qtype
+  # override and keep Q8_0.
   - name: moe_routed_experts
     family: MOE_EXPERT
     projections: [GATE, UP, DOWN]
     supported: true
+    qtype: q4_0
 
-  # Vision modules are intentionally disabled until each fused Q8 Metal path is
-  # implemented and QA'd end-to-end.  These entries make converter planning
-  # explicit while preserving the current fp16 vision runtime.
+  # Vision GEMM modules store Q4_0 under --qprofile mixed-q4 (fused Q4 vision
+  # GEMM kernel); mixed-q8_0 keeps Q8_0.  Patch-embed / neck convs stay fp16.
   - name: visual_projector
     family: PROJECTOR
     projections: [WEIGHT]
     supported: true
+    qtype: q4_0
 
   - name: clip_mlp
     family: VISION_CLIP
     projections: [VISION_MLP_FC1, VISION_MLP_FC2]
     supported: true
+    qtype: q4_0
 
   - name: clip_attention
     family: VISION_CLIP
     projections: [VISION_ATTN_QKV, VISION_ATTN_O]
     supported: true
+    qtype: q4_0
 
   - name: sam_mlp
     family: VISION_SAM
     projections: [VISION_MLP_FC1, VISION_MLP_FC2]
     supported: true
+    qtype: q4_0
 
   - name: sam_attention
     family: VISION_SAM
     projections: [VISION_ATTN_QKV, VISION_ATTN_O]
     supported: true
+    qtype: q4_0
 
   - name: sam_patch_embed
     family: VISION_SAM

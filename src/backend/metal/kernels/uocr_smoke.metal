@@ -1,6 +1,6 @@
 // Auto-generated UnlimitedOCR Metal translation unit.
 // Edit src/backend/metal/kernels/*.metal and rerun tools/gen_metal.py.
-// Generated from: common.metal, dense.metal, dense_q8.metal, decode_gemv_q8.metal, norm.metal, sam.metal, gemm_q8.metal, sam_attention.metal, sam_position.metal, attention_decode.metal, attention_prefill.metal, attention.metal, attention_q8.metal, clip.metal, clip_sam.metal, embedding.metal, embedding_q8.metal, kv_cache.metal, layout.metal, moe.metal, moe_q8.metal, prompt_assembly.metal, rope.metal, sampling.metal, sam_conv.metal, sam_window.metal, smoke.metal, lm_head_q8.metal, mpp_prototypes.metal
+// Generated from: common.metal, dense.metal, dense_q8.metal, decode_gemv_q8.metal, decode_gemv_q4.metal, norm.metal, sam.metal, gemm_q8.metal, gemm_q4.metal, lm_head_q4.metal, embedding_q4.metal, sam_attention.metal, sam_position.metal, attention_decode.metal, attention_prefill.metal, attention.metal, attention_q8.metal, clip.metal, clip_sam.metal, embedding.metal, embedding_q8.metal, kv_cache.metal, layout.metal, moe.metal, moe_q8.metal, prompt_assembly.metal, rope.metal, sampling.metal, sam_conv.metal, sam_window.metal, smoke.metal, lm_head_q8.metal, mpp_prototypes.metal
 
 // ═══════════════════════════════════════════
 //  common.metal
@@ -1090,6 +1090,234 @@ static inline float uocr_decode_gemv_q8_lane_dot(device const half *x,
                                          params.down_scale_offset_values + (ulong)col * groups_per_row;
         lane_sum += top_weights[rank] *
                     uocr_decode_gemv_q8_lane_dot(mid + (ulong)rank * K, down_qweight, down_qscale, K, lane, simd_width);
+    }
+    const float routed = simd_sum(lane_sum);
+    if (lane == 0u) {
+        dst[col] = half(routed + float(shared[col]) + float(residual[col]));
+    }
+}
+
+// ═══════════════════════════════════════════
+//  decode_gemv_q4.metal
+// ═══════════════════════════════════════════
+
+// decode_gemv_q4.metal - Simdgroup-per-row Q4_0 GEMV kernels for decode.
+//
+// Same regime as decode_gemv_q8.metal: single-token decode is
+// weight-bandwidth-bound, one simdgroup owns one output row, lanes reduce
+// with a single simd_sum and no threadgroup barriers.  Q4_0 halves the weight
+// bytes; the group-half-split nibble packing (see docs/plan_q4.md §1.1) keeps
+// the unpack vectorized: a 4-byte load yields two float4 halves that each
+// pair with an aligned half4 activation load.  Measured ~2x vs the Q8 decode
+// GEMV on M1 Pro.
+
+// Mirrors UocrMoeDecodeGemvQ8Params (decode_gemv_q8.metal is an earlier
+// fragment); stride/offset fields are PACKED BYTE counts for Q4 qweights and
+// value counts for scales.
+struct UocrMoeDecodeGemvQ4Params {
+    uint n_tokens;
+    uint hidden_size;
+    uint intermediate_size;
+    uint expert_count;
+    uint top_k;
+    uint expert_stride_bytes;
+    uint up_offset_bytes;
+    uint down_offset_bytes;
+    uint expert_scale_stride_values;
+    uint up_scale_offset_values;
+    uint down_scale_offset_values;
+    uint group_size;
+};
+
+// Lane-partial dot product over one Q4_0 row (no reduction; caller
+// simd_sums).  Group-half split: uchar4 chunk c covers weights
+// k = g*64 + j..j+3 (low nibbles) and k+32..k+35 (high nibbles) with
+// g = c/8, j = (c%8)*4 — both halves stay inside one 64-wide scale group.
+static inline float uocr_decode_gemv_q4_lane_dot(device const half *x,
+                                                 device const uchar *w_row,
+                                                 device const half *s_row,
+                                                 uint k,
+                                                 uint lane,
+                                                 uint simd_width) {
+    device const uchar4 *w4 = (device const uchar4 *)w_row;
+    device const half4 *x4 = (device const half4 *)x;
+    float sum = 0.0f;
+    const uint chunks = k / 8u; // 4 packed bytes -> 8 weights
+    for (uint c = lane; c < chunks; c += simd_width) {
+        const uchar4 w = w4[c];
+        const uint group = c / 8u;       // 8 uchar4 chunks per 64-wide group
+        const uint j4 = c - group * 8u;  // half4 index inside the low half
+        const float scale = float(s_row[group]);
+        const float4 lo = float4(int4(w) & 0xF) - 8.0f;
+        const float4 hi = float4(int4(w) >> 4) - 8.0f;
+        const uint xbase = group * 16u + j4; // 16 half4 per 64-wide group
+        float d = dot(float4(x4[xbase]), lo);
+        d += dot(float4(x4[xbase + 8u]), hi);
+        sum += d * scale;
+    }
+    return sum;
+}
+
+// Mirrors UocrDecodeGemvQ8Params (decode_gemv_q8.metal is an earlier
+// fragment).
+struct UocrDecodeGemvQ4Params {
+    uint k;              // input features (multiple of 8; groups of 64)
+    uint n;              // output rows
+    uint groups_per_row; // k / 64
+    uint has_residual;
+};
+
+// Decode linear with optional residual (dense/shared down).
+[[max_total_threads_per_threadgroup(128)]] kernel void uocr_decode_linear_residual_gemv_q4_0_to_f16(
+    device const half *src [[buffer(0)]],
+    device const uchar *qweight [[buffer(1)]],
+    device const half *qscale [[buffer(2)]],
+    device const half *residual [[buffer(3)]],
+    device half *dst [[buffer(4)]],
+    constant UocrDecodeGemvQ4Params &params [[buffer(5)]],
+    uint tgpig [[threadgroup_position_in_grid]],
+    uint ntg [[threads_per_threadgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simd_width [[threads_per_simdgroup]]) {
+    const uint rows_per_tg = ntg / simd_width;
+    const uint row = tgpig * rows_per_tg + sgitg;
+    if (row >= params.n) {
+        return;
+    }
+    float sum = simd_sum(uocr_decode_gemv_q4_lane_dot(src,
+                                                      qweight + (ulong)row * (params.k / 2u),
+                                                      qscale + (ulong)row * params.groups_per_row,
+                                                      params.k,
+                                                      lane,
+                                                      simd_width));
+    if (lane == 0u) {
+        if (params.has_residual != 0u) {
+            sum += float(residual[row]);
+        }
+        dst[row] = half(sum);
+    }
+}
+
+// Decode SwiGLU gate/up: one simdgroup computes both dots for its column.
+[[max_total_threads_per_threadgroup(128)]] kernel void uocr_decode_swiglu_gate_up_gemv_q4_0_to_f16(
+    device const half *src [[buffer(0)]],
+    device const uchar *gate_qweight [[buffer(1)]],
+    device const uchar *up_qweight [[buffer(2)]],
+    device const half *gate_qscale [[buffer(3)]],
+    device const half *up_qscale [[buffer(4)]],
+    device half *mid [[buffer(5)]],
+    constant UocrDecodeGemvQ4Params &params [[buffer(6)]],
+    uint tgpig [[threadgroup_position_in_grid]],
+    uint ntg [[threads_per_threadgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simd_width [[threads_per_simdgroup]]) {
+    const uint rows_per_tg = ntg / simd_width;
+    const uint row = tgpig * rows_per_tg + sgitg;
+    if (row >= params.n) {
+        return;
+    }
+    const float gate = simd_sum(uocr_decode_gemv_q4_lane_dot(src,
+                                                             gate_qweight + (ulong)row * (params.k / 2u),
+                                                             gate_qscale + (ulong)row * params.groups_per_row,
+                                                             params.k,
+                                                             lane,
+                                                             simd_width));
+    const float up = simd_sum(uocr_decode_gemv_q4_lane_dot(src,
+                                                           up_qweight + (ulong)row * (params.k / 2u),
+                                                           up_qscale + (ulong)row * params.groups_per_row,
+                                                           params.k,
+                                                           lane,
+                                                           simd_width));
+    if (lane == 0u) {
+        const float silu = gate / (1.0f + exp(-gate));
+        mid[row] = half(silu * up);
+    }
+}
+
+// Decode routed-MoE gate/up: one simdgroup per (rank, column).
+[[max_total_threads_per_threadgroup(128)]] kernel void uocr_moe_decode_gate_up_gemv_q4_0_to_f16(
+    device const half *src [[buffer(0)]],
+    device const uint *top_expert_ids [[buffer(1)]],
+    device const uchar *expert_qweight [[buffer(2)]],
+    device const half *expert_qscale [[buffer(3)]],
+    device half *mid [[buffer(4)]],
+    constant UocrMoeDecodeGemvQ4Params &params [[buffer(5)]],
+    uint tgpig [[threadgroup_position_in_grid]],
+    uint ntg [[threads_per_threadgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simd_width [[threads_per_simdgroup]]) {
+    const uint rows_per_tg = ntg / simd_width;
+    const uint row = tgpig * rows_per_tg + sgitg;
+    const uint intermediate_size = params.intermediate_size;
+    if (row >= params.top_k * intermediate_size) {
+        return;
+    }
+    const uint rank = row / intermediate_size;
+    const uint col = row - rank * intermediate_size;
+    const uint expert = top_expert_ids[rank];
+    if (expert >= params.expert_count) {
+        if (lane == 0u) {
+            mid[row] = half(0.0f);
+        }
+        return;
+    }
+    const uint K = params.hidden_size;
+    const uint groups_per_row = K / params.group_size;
+    device const uchar *gate_qweight = expert_qweight + (ulong)expert * params.expert_stride_bytes +
+                                       (ulong)col * (K / 2u);
+    device const uchar *up_qweight = gate_qweight + params.up_offset_bytes;
+    device const half *gate_qscale = expert_qscale + (ulong)expert * params.expert_scale_stride_values +
+                                     (ulong)col * groups_per_row;
+    device const half *up_qscale = gate_qscale + params.up_scale_offset_values;
+
+    const float gate = simd_sum(uocr_decode_gemv_q4_lane_dot(src, gate_qweight, gate_qscale, K, lane, simd_width));
+    const float up = simd_sum(uocr_decode_gemv_q4_lane_dot(src, up_qweight, up_qscale, K, lane, simd_width));
+    if (lane == 0u) {
+        const float silu = gate / (1.0f + exp(-gate));
+        mid[row] = half(silu * up);
+    }
+}
+
+// Decode routed-MoE down + weighted combine: one simdgroup per output column;
+// each simdgroup accumulates the weighted lane-partials over all top-k
+// experts and reduces once.
+[[max_total_threads_per_threadgroup(128)]] kernel void uocr_moe_decode_down_combine_gemv_q4_0_to_f16(
+    device const half *mid [[buffer(0)]],
+    device const uint *top_expert_ids [[buffer(1)]],
+    device const float *top_weights [[buffer(2)]],
+    device const uchar *expert_qweight [[buffer(3)]],
+    device const half *expert_qscale [[buffer(4)]],
+    device const half *shared [[buffer(5)]],
+    device const half *residual [[buffer(6)]],
+    device half *dst [[buffer(7)]],
+    constant UocrMoeDecodeGemvQ4Params &params [[buffer(8)]],
+    uint tgpig [[threadgroup_position_in_grid]],
+    uint ntg [[threads_per_threadgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simd_width [[threads_per_simdgroup]]) {
+    const uint rows_per_tg = ntg / simd_width;
+    const uint col = tgpig * rows_per_tg + sgitg;
+    if (col >= params.hidden_size) {
+        return;
+    }
+    const uint K = params.intermediate_size;
+    const uint groups_per_row = K / params.group_size;
+    float lane_sum = 0.0f;
+    for (uint rank = 0u; rank < params.top_k; ++rank) {
+        const uint expert = top_expert_ids[rank];
+        if (expert >= params.expert_count) {
+            continue;
+        }
+        device const uchar *down_qweight = expert_qweight + (ulong)expert * params.expert_stride_bytes +
+                                           params.down_offset_bytes + (ulong)col * (K / 2u);
+        device const half *down_qscale = expert_qscale + (ulong)expert * params.expert_scale_stride_values +
+                                         params.down_scale_offset_values + (ulong)col * groups_per_row;
+        lane_sum += top_weights[rank] *
+                    uocr_decode_gemv_q4_lane_dot(mid + (ulong)rank * K, down_qweight, down_qscale, K, lane, simd_width);
     }
     const float routed = simd_sum(lane_sum);
     if (lane == 0u) {
@@ -2381,6 +2609,576 @@ kernel void uocr_moe_prefill_bucketed_combine_round_routed_f16(
     }
     const float routed = float(half(sum));
     dst[gid] = half(routed + float(shared[gid]) + float(residual[gid]));
+}
+
+// ═══════════════════════════════════════════
+//  gemm_q4.metal
+// ═══════════════════════════════════════════
+
+// gemm_q4.metal - Expert-bucketed tiled Q4_0 GEMM kernels for routed-MoE
+// prefill.
+//
+// Same 64x32x32 simdgroup-MMA regime as gemm_q8.metal; only the B-side
+// staging differs: Q4_0 weights are dequantized on stage from the
+// group-half-split nibble packing (docs/plan_q4.md §1.1).  A BK=32 K-tile is
+// exactly one nibble half of a 64-wide scale group, so each staged run reads
+// contiguous bytes and extracts a single nibble side with one scale lookup.
+//
+// Reuses uocr_gemm_q8_stage_a_gathered / uocr_gemm_q8_mma_tile and the
+// bucket lookup helpers from gemm_q8.metal (earlier fragment).
+
+// Mirrors UocrMoeBucketedGemmQ8Params; qweight stride/offset fields are
+// PACKED BYTE counts for Q4, scale fields stay value counts.
+struct UocrMoeBucketedGemmQ4Params {
+    uint n_tokens;
+    uint hidden_size;
+    uint intermediate_size;
+    uint expert_count;
+    uint top_k;
+    uint expert_stride_bytes;
+    uint up_offset_bytes;
+    uint down_offset_bytes;
+    uint expert_scale_stride_values;
+    uint up_scale_offset_values;
+    uint down_scale_offset_values;
+    uint group_size;
+};
+
+// Dequantize a Q4_0 W tile transposed to [BK][BN] (k-major for B-side MMA
+// loads).  Each thread handles one (column, 8-wide k run); with BK == 32 and
+// k_base a multiple of 32, the run stays inside one nibble half of one
+// 64-wide scale group.
+static inline void uocr_gemm_q4_stage_b(device const uchar *qweight,
+                                        device const half *qscale,
+                                        uint K,
+                                        uint groups_per_row,
+                                        uint col_base,
+                                        uint k_base,
+                                        uint tid,
+                                        threadgroup half *sb) {
+    const uint wn = tid / 4u;
+    const uint wk0 = (tid % 4u) * 8u;
+    const uint wcol = col_base + wn;
+    const uint k0 = k_base + wk0;
+    const uint group = k0 / 64u;
+    const float scale = float(qscale[wcol * groups_per_row + group]);
+    const uint j = k0 - group * 64u; // 0..63; BK tiles keep the 8-run in one half
+    const bool high = j >= 32u;
+    device const uchar *w = qweight + (ulong)wcol * (K / 2u) + group * 32u + (high ? j - 32u : j);
+    for (uint kk = 0u; kk < 8u; ++kk) {
+        const uint b = uint(w[kk]);
+        const int q = int(high ? (b >> 4u) : (b & 0xFu)) - 8;
+        sb[(wk0 + kk) * UOCR_GEMM_Q8_BN + wn] = half(float(q) * scale);
+    }
+}
+
+// Vision GEMM: Q4_0 twin of uocr_vision_gemm_q8_0_to_f16 (bias + activation
+// + optional QKV-split epilogue).  Requires n % 32 == 0 and k % 64 == 0 (the
+// Q4 B-side staging has no column guard); the host validates both.
+[[max_total_threads_per_threadgroup(UOCR_GEMM_Q8_THREADS)]] kernel void uocr_vision_gemm_q4_0_to_f16(
+    device const half *src [[buffer(0)]],
+    device const uchar *qweight [[buffer(1)]],
+    device const half *qscale [[buffer(2)]],
+    device const half *bias [[buffer(3)]],
+    device half *dst0 [[buffer(4)]],
+    device half *dst1 [[buffer(5)]],
+    device half *dst2 [[buffer(6)]],
+    constant UocrVisionGemmQ8Params &params [[buffer(7)]],
+    uint2 tgpig [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float smem[UOCR_GEMM_Q8_BM * UOCR_GEMM_Q8_BN];
+    threadgroup half *sa = (threadgroup half *)smem;
+    threadgroup half *sb = sa + UOCR_GEMM_Q8_BM * UOCR_GEMM_Q8_BK;
+    threadgroup float *sc = smem;
+
+    const uint K = params.k;
+    const uint row_base = tgpig.y * UOCR_GEMM_Q8_BM;
+    const uint col_base = tgpig.x * UOCR_GEMM_Q8_BN;
+
+    simdgroup_float8x8 mc[4][2];
+    for (uint i = 0u; i < 4u; ++i) {
+        for (uint j = 0u; j < 2u; ++j) {
+            mc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        }
+    }
+    const uint sg_row = (sgitg / 2u) * 32u;
+    const uint sg_col = (sgitg % 2u) * 16u;
+
+    for (uint k_base = 0u; k_base < K; k_base += UOCR_GEMM_Q8_BK) {
+        uocr_gemm_q8_stage_a(src, params.m, K, row_base, k_base, tid, sa);
+        uocr_gemm_q4_stage_b(qweight, qscale, K, params.groups_per_row, col_base, k_base, tid, sb);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uocr_gemm_q8_mma_tile(sa, sb, sg_row, sg_col, mc);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    for (uint i = 0u; i < 4u; ++i) {
+        for (uint j = 0u; j < 2u; ++j) {
+            simdgroup_store(mc[i][j], sc + (sg_row + i * 8u) * UOCR_GEMM_Q8_BN + sg_col + j * 8u, UOCR_GEMM_Q8_BN);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint i = tid; i < UOCR_GEMM_Q8_BM * UOCR_GEMM_Q8_BN; i += UOCR_GEMM_Q8_THREADS) {
+        const uint mrow = i / UOCR_GEMM_Q8_BN;
+        const uint n = i - mrow * UOCR_GEMM_Q8_BN;
+        const uint row = row_base + mrow;
+        const uint col = col_base + n;
+        if (row >= params.m || col >= params.n) {
+            continue;
+        }
+        float value = sc[i] + float(bias[col]);
+        if (params.activation == UOCR_VISION_Q8_ACT_QUICKGELU) {
+            value = uocr_quickgelu(value);
+        } else if (params.activation == UOCR_VISION_Q8_ACT_GELU_ERF) {
+            value = uocr_gelu_erf(value);
+        }
+        if (params.split_size == 0u) {
+            dst0[(ulong)row * params.n + col] = half(value);
+        } else {
+            const uint projection = col / params.split_size;
+            const uint local_col = col - projection * params.split_size;
+            device half *dst = projection == 0u ? dst0 : (projection == 1u ? dst1 : dst2);
+            dst[(ulong)row * params.split_size + local_col] = half(value);
+        }
+    }
+}
+
+// Decoder prefill GEMM with optional residual add (dense/shared MLP down
+// projection).  Q4_0 twin of uocr_decoder_gemm_residual_q8_0_to_f16; reuses
+// UocrDecoderGemmQ8Params (gemm_q8.metal is an earlier fragment).
+[[max_total_threads_per_threadgroup(UOCR_GEMM_Q8_THREADS)]] kernel void uocr_decoder_gemm_residual_q4_0_to_f16(
+    device const half *src [[buffer(0)]],
+    device const uchar *qweight [[buffer(1)]],
+    device const half *qscale [[buffer(2)]],
+    device const half *residual [[buffer(3)]],
+    device half *dst [[buffer(4)]],
+    constant UocrDecoderGemmQ8Params &params [[buffer(5)]],
+    uint2 tgpig [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float smem[UOCR_GEMM_Q8_BM * UOCR_GEMM_Q8_BN];
+    threadgroup half *sa = (threadgroup half *)smem;
+    threadgroup half *sb = sa + UOCR_GEMM_Q8_BM * UOCR_GEMM_Q8_BK;
+    threadgroup float *sc = smem;
+
+    const uint K = params.k;
+    const uint row_base = tgpig.y * UOCR_GEMM_Q8_BM;
+    const uint col_base = tgpig.x * UOCR_GEMM_Q8_BN;
+
+    simdgroup_float8x8 mc[4][2];
+    for (uint i = 0u; i < 4u; ++i) {
+        for (uint j = 0u; j < 2u; ++j) {
+            mc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        }
+    }
+    const uint sg_row = (sgitg / 2u) * 32u;
+    const uint sg_col = (sgitg % 2u) * 16u;
+
+    for (uint k_base = 0u; k_base < K; k_base += UOCR_GEMM_Q8_BK) {
+        uocr_gemm_q8_stage_a(src, params.m, K, row_base, k_base, tid, sa);
+        uocr_gemm_q4_stage_b(qweight, qscale, K, params.groups_per_row, col_base, k_base, tid, sb);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uocr_gemm_q8_mma_tile(sa, sb, sg_row, sg_col, mc);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    for (uint i = 0u; i < 4u; ++i) {
+        for (uint j = 0u; j < 2u; ++j) {
+            simdgroup_store(mc[i][j], sc + (sg_row + i * 8u) * UOCR_GEMM_Q8_BN + sg_col + j * 8u, UOCR_GEMM_Q8_BN);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint i = tid; i < UOCR_GEMM_Q8_BM * UOCR_GEMM_Q8_BN; i += UOCR_GEMM_Q8_THREADS) {
+        const uint mrow = i / UOCR_GEMM_Q8_BN;
+        const uint col = col_base + (i - mrow * UOCR_GEMM_Q8_BN);
+        const uint row = row_base + mrow;
+        if (row < params.m && col < params.n) {
+            const ulong dst_index = (ulong)row * params.n + col;
+            float value = sc[i];
+            if (params.has_residual != 0u) {
+                value += float(residual[dst_index]);
+            }
+            dst[dst_index] = half(value);
+        }
+    }
+}
+
+// Decoder prefill fused SwiGLU gate/up (dense/shared MLP): Q4_0 twin of
+// uocr_decoder_swiglu_gate_up_gemm_q8_0_to_f16.
+[[max_total_threads_per_threadgroup(UOCR_GEMM_Q8_THREADS)]] kernel void uocr_decoder_swiglu_gate_up_gemm_q4_0_to_f16(
+    device const half *src [[buffer(0)]],
+    device const uchar *gate_qweight [[buffer(1)]],
+    device const uchar *up_qweight [[buffer(2)]],
+    device const half *gate_qscale [[buffer(3)]],
+    device const half *up_qscale [[buffer(4)]],
+    device half *mid [[buffer(5)]],
+    constant UocrDecoderGemmQ8Params &params [[buffer(6)]],
+    uint2 tgpig [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float smem[2u * UOCR_GEMM_Q8_BM * UOCR_GEMM_Q8_BN];
+    threadgroup half *sa = (threadgroup half *)smem;
+    threadgroup half *sb_gate = sa + UOCR_GEMM_Q8_BM * UOCR_GEMM_Q8_BK;
+    threadgroup half *sb_up = sb_gate + UOCR_GEMM_Q8_BK * UOCR_GEMM_Q8_BN;
+    threadgroup float *sc_gate = smem;
+    threadgroup float *sc_up = smem + UOCR_GEMM_Q8_BM * UOCR_GEMM_Q8_BN;
+
+    const uint K = params.k;
+    const uint row_base = tgpig.y * UOCR_GEMM_Q8_BM;
+    const uint col_base = tgpig.x * UOCR_GEMM_Q8_BN;
+
+    simdgroup_float8x8 mc_gate[4][2];
+    simdgroup_float8x8 mc_up[4][2];
+    for (uint i = 0u; i < 4u; ++i) {
+        for (uint j = 0u; j < 2u; ++j) {
+            mc_gate[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+            mc_up[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        }
+    }
+    const uint sg_row = (sgitg / 2u) * 32u;
+    const uint sg_col = (sgitg % 2u) * 16u;
+
+    for (uint k_base = 0u; k_base < K; k_base += UOCR_GEMM_Q8_BK) {
+        uocr_gemm_q8_stage_a(src, params.m, K, row_base, k_base, tid, sa);
+        uocr_gemm_q4_stage_b(gate_qweight, gate_qscale, K, params.groups_per_row, col_base, k_base, tid, sb_gate);
+        uocr_gemm_q4_stage_b(up_qweight, up_qscale, K, params.groups_per_row, col_base, k_base, tid, sb_up);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uocr_gemm_q8_mma_tile(sa, sb_gate, sg_row, sg_col, mc_gate);
+        uocr_gemm_q8_mma_tile(sa, sb_up, sg_row, sg_col, mc_up);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    for (uint i = 0u; i < 4u; ++i) {
+        for (uint j = 0u; j < 2u; ++j) {
+            simdgroup_store(mc_gate[i][j], sc_gate + (sg_row + i * 8u) * UOCR_GEMM_Q8_BN + sg_col + j * 8u, UOCR_GEMM_Q8_BN);
+            simdgroup_store(mc_up[i][j], sc_up + (sg_row + i * 8u) * UOCR_GEMM_Q8_BN + sg_col + j * 8u, UOCR_GEMM_Q8_BN);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint i = tid; i < UOCR_GEMM_Q8_BM * UOCR_GEMM_Q8_BN; i += UOCR_GEMM_Q8_THREADS) {
+        const uint mrow = i / UOCR_GEMM_Q8_BN;
+        const uint col = col_base + (i - mrow * UOCR_GEMM_Q8_BN);
+        const uint row = row_base + mrow;
+        if (row < params.m && col < params.n) {
+            const float gate = sc_gate[i];
+            const float silu = gate / (1.0f + exp(-gate));
+            mid[(ulong)row * params.n + col] = half(silu * sc_up[i]);
+        }
+    }
+}
+
+// Bucketed gate/up GEMM: mid[pair, col] = silu(src_t @ Wg_e^T) * (src_t @ Wu_e^T)
+// for every pair (t, e) in the tile's bucket.
+[[max_total_threads_per_threadgroup(UOCR_GEMM_Q8_THREADS)]] kernel void uocr_moe_prefill_bucketed_swiglu_gate_up_gemm_q4_0_to_f16(
+    device const half *src [[buffer(0)]],
+    device const uint *pair_rows [[buffer(1)]],
+    device const uint *expert_offsets [[buffer(2)]],
+    device const uint *tile_prefix [[buffer(3)]],
+    device const uchar *expert_qweight [[buffer(4)]],
+    device const half *expert_qscale [[buffer(5)]],
+    device half *mid [[buffer(6)]],
+    constant UocrMoeBucketedGemmQ4Params &params [[buffer(7)]],
+    uint2 tgpig [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float smem[2u * UOCR_GEMM_Q8_BM * UOCR_GEMM_Q8_BN];
+    threadgroup uint tile_pairs[UOCR_GEMM_Q8_BM];
+    threadgroup half *sa = (threadgroup half *)smem;
+    threadgroup half *sb_gate = sa + UOCR_GEMM_Q8_BM * UOCR_GEMM_Q8_BK;
+    threadgroup half *sb_up = sb_gate + UOCR_GEMM_Q8_BK * UOCR_GEMM_Q8_BN;
+    threadgroup float *sc_gate = smem;
+    threadgroup float *sc_up = smem + UOCR_GEMM_Q8_BM * UOCR_GEMM_Q8_BN;
+
+    uint expert = 0u;
+    uint bucket_start = 0u;
+    uint bucket_rows = 0u;
+    if (!uocr_moe_bucket_tile_lookup(tile_prefix, expert_offsets, params.expert_count,
+                                     tgpig.y, UOCR_GEMM_Q8_BM, expert, bucket_start, bucket_rows)) {
+        return;
+    }
+    uocr_moe_bucket_stage_rows(pair_rows, bucket_start, bucket_rows, tid, tile_pairs);
+
+    const uint K = params.hidden_size;
+    const uint col_base = tgpig.x * UOCR_GEMM_Q8_BN;
+    device const uchar *gate_qweight = expert_qweight + (ulong)expert * params.expert_stride_bytes;
+    device const uchar *up_qweight = gate_qweight + params.up_offset_bytes;
+    device const half *gate_qscale = expert_qscale + (ulong)expert * params.expert_scale_stride_values;
+    device const half *up_qscale = gate_qscale + params.up_scale_offset_values;
+    const uint groups_per_row = K / params.group_size;
+
+    simdgroup_float8x8 mc_gate[4][2];
+    simdgroup_float8x8 mc_up[4][2];
+    for (uint i = 0u; i < 4u; ++i) {
+        for (uint j = 0u; j < 2u; ++j) {
+            mc_gate[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+            mc_up[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        }
+    }
+    const uint sg_row = (sgitg / 2u) * 32u;
+    const uint sg_col = (sgitg % 2u) * 16u;
+
+    for (uint k_base = 0u; k_base < K; k_base += UOCR_GEMM_Q8_BK) {
+        uocr_gemm_q8_stage_a_gathered(src, K, k_base, params.top_k, tile_pairs, tid, sa);
+        uocr_gemm_q4_stage_b(gate_qweight, gate_qscale, K, groups_per_row, col_base, k_base, tid, sb_gate);
+        uocr_gemm_q4_stage_b(up_qweight, up_qscale, K, groups_per_row, col_base, k_base, tid, sb_up);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uocr_gemm_q8_mma_tile(sa, sb_gate, sg_row, sg_col, mc_gate);
+        uocr_gemm_q8_mma_tile(sa, sb_up, sg_row, sg_col, mc_up);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    for (uint i = 0u; i < 4u; ++i) {
+        for (uint j = 0u; j < 2u; ++j) {
+            simdgroup_store(mc_gate[i][j], sc_gate + (sg_row + i * 8u) * UOCR_GEMM_Q8_BN + sg_col + j * 8u, UOCR_GEMM_Q8_BN);
+            simdgroup_store(mc_up[i][j], sc_up + (sg_row + i * 8u) * UOCR_GEMM_Q8_BN + sg_col + j * 8u, UOCR_GEMM_Q8_BN);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint i = tid; i < UOCR_GEMM_Q8_BM * UOCR_GEMM_Q8_BN; i += UOCR_GEMM_Q8_THREADS) {
+        const uint mrow = i / UOCR_GEMM_Q8_BN;
+        const uint col = col_base + (i - mrow * UOCR_GEMM_Q8_BN);
+        const uint pair = tile_pairs[mrow];
+        if (pair != 0xFFFFFFFFu && col < params.intermediate_size) {
+            const float gate = sc_gate[i];
+            const float silu = gate / (1.0f + exp(-gate));
+            mid[(ulong)pair * params.intermediate_size + col] = half(silu * sc_up[i]);
+        }
+    }
+}
+
+// Bucketed down GEMM: down_out[pair, col] = mid[pair, :] @ Wd_e^T.
+[[max_total_threads_per_threadgroup(UOCR_GEMM_Q8_THREADS)]] kernel void uocr_moe_prefill_bucketed_down_gemm_q4_0_to_f16(
+    device const half *mid [[buffer(0)]],
+    device const uint *pair_rows [[buffer(1)]],
+    device const uint *expert_offsets [[buffer(2)]],
+    device const uint *tile_prefix [[buffer(3)]],
+    device const uchar *expert_qweight [[buffer(4)]],
+    device const half *expert_qscale [[buffer(5)]],
+    device half *down_out [[buffer(6)]],
+    constant UocrMoeBucketedGemmQ4Params &params [[buffer(7)]],
+    uint2 tgpig [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float smem[UOCR_GEMM_Q8_BM * UOCR_GEMM_Q8_BN];
+    threadgroup uint tile_pairs[UOCR_GEMM_Q8_BM];
+    threadgroup half *sa = (threadgroup half *)smem;
+    threadgroup half *sb = sa + UOCR_GEMM_Q8_BM * UOCR_GEMM_Q8_BK;
+    threadgroup float *sc = smem;
+
+    uint expert = 0u;
+    uint bucket_start = 0u;
+    uint bucket_rows = 0u;
+    if (!uocr_moe_bucket_tile_lookup(tile_prefix, expert_offsets, params.expert_count,
+                                     tgpig.y, UOCR_GEMM_Q8_BM, expert, bucket_start, bucket_rows)) {
+        return;
+    }
+    uocr_moe_bucket_stage_rows(pair_rows, bucket_start, bucket_rows, tid, tile_pairs);
+
+    const uint K = params.intermediate_size;
+    const uint col_base = tgpig.x * UOCR_GEMM_Q8_BN;
+    device const uchar *down_qweight = expert_qweight + (ulong)expert * params.expert_stride_bytes + params.down_offset_bytes;
+    device const half *down_qscale = expert_qscale + (ulong)expert * params.expert_scale_stride_values + params.down_scale_offset_values;
+    const uint groups_per_row = K / params.group_size;
+
+    simdgroup_float8x8 mc[4][2];
+    for (uint i = 0u; i < 4u; ++i) {
+        for (uint j = 0u; j < 2u; ++j) {
+            mc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        }
+    }
+    const uint sg_row = (sgitg / 2u) * 32u;
+    const uint sg_col = (sgitg % 2u) * 16u;
+
+    for (uint k_base = 0u; k_base < K; k_base += UOCR_GEMM_Q8_BK) {
+        uocr_gemm_q8_stage_a_gathered(mid, K, k_base, 1u, tile_pairs, tid, sa);
+        uocr_gemm_q4_stage_b(down_qweight, down_qscale, K, groups_per_row, col_base, k_base, tid, sb);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uocr_gemm_q8_mma_tile(sa, sb, sg_row, sg_col, mc);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    for (uint i = 0u; i < 4u; ++i) {
+        for (uint j = 0u; j < 2u; ++j) {
+            simdgroup_store(mc[i][j], sc + (sg_row + i * 8u) * UOCR_GEMM_Q8_BN + sg_col + j * 8u, UOCR_GEMM_Q8_BN);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint i = tid; i < UOCR_GEMM_Q8_BM * UOCR_GEMM_Q8_BN; i += UOCR_GEMM_Q8_THREADS) {
+        const uint mrow = i / UOCR_GEMM_Q8_BN;
+        const uint col = col_base + (i - mrow * UOCR_GEMM_Q8_BN);
+        const uint pair = tile_pairs[mrow];
+        if (pair != 0xFFFFFFFFu && col < params.hidden_size) {
+            down_out[(ulong)pair * params.hidden_size + col] = half(sc[i]);
+        }
+    }
+}
+
+// ═══════════════════════════════════════════
+//  lm_head_q4.metal
+// ═══════════════════════════════════════════
+
+// lm_head_q4.metal - Fused Q4_0 LM-head argmax kernel.
+//
+// Structure differs from the Q8 kernel: instead of 8 lanes per token with the
+// hidden vector staged in threadgroup memory (which caps Q4 at ~1.1x because
+// the TG-load instruction rate does not halve with the weight bytes), one
+// simdgroup owns one vocab row and streams the packed Q4 weights with the
+// group-half-split unpack, reading the 2.5 KB hidden vector through the
+// device cache.  32 simdgroups per 1024-thread threadgroup produce one
+// argmax partial per 32 rows - the same partial layout as the Q8 kernel
+// (vocab / 32), so the selection scratch and finalize pass are unchanged.
+// Measured ~1.2x vs the Q8 argmax on M1 Pro (~0.15 ms/token).
+
+struct UocrLmHeadArgmaxQ4Params {
+    uint vocab_size;
+    uint hidden_size;
+    uint tile_tokens;      // rows per threadgroup (32)
+    uint lanes_per_token;  // unused; kept for ABI symmetry with Q8
+    uint group_size;
+    uint groups_per_row;
+    uint partial_count;
+    uint reserved0;
+};
+
+[[max_total_threads_per_threadgroup(1024)]] kernel void uocr_lm_head_argmax_q4_0_to_f16(
+    device const half *hidden [[buffer(0)]],
+    device const uchar *qweight [[buffer(1)]],
+    device const half *qscale [[buffer(2)]],
+    device float *partial_scores_out [[buffer(3)]],
+    device uint *partial_ids_out [[buffer(4)]],
+    constant UocrLmHeadArgmaxQ4Params &params [[buffer(5)]],
+    threadgroup float *partials [[threadgroup(0)]],
+    threadgroup uint *partial_ids [[threadgroup(1)]],
+    uint tile [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint ntg [[threads_per_threadgroup]],
+    ushort lane_u16 [[thread_index_in_simdgroup]],
+    ushort simdgroup_u16 [[simdgroup_index_in_threadgroup]],
+    ushort simd_width_u16 [[threads_per_simdgroup]]) {
+    const uint lane = uint(lane_u16);
+    const uint simdgroup = uint(simdgroup_u16);
+    const uint simd_width = uint(simd_width_u16);
+    const uint rows_per_tg = ntg / simd_width;
+    const uint row = tile * rows_per_tg + simdgroup;
+    const uint hidden_size = params.hidden_size;
+    const uint vocab_size = params.vocab_size;
+
+    float score = -INFINITY;
+    uint id = 0xffffffffu;
+    if (row < vocab_size && params.group_size == 64u) {
+        device const uchar *w_row = qweight + (ulong)row * (ulong)(hidden_size / 2u);
+        device const half *s_row = qscale + (ulong)row * (ulong)params.groups_per_row;
+        device const uchar4 *w4 = (device const uchar4 *)w_row;
+        device const half4 *x4 = (device const half4 *)hidden;
+        float sum = 0.0f;
+        const uint chunks = hidden_size / 8u; // 4 packed bytes -> 8 weights
+        for (uint c = lane; c < chunks; c += simd_width) {
+            const uchar4 w = w4[c];
+            const uint group = c / 8u;       // 8 uchar4 chunks per 64-wide group
+            const uint j4 = c - group * 8u;  // half4 index inside the low half
+            const float scale = float(s_row[group]);
+            const uint xbase = group * 16u + j4; // 16 half4 per 64-wide group
+            float d = dot(float4(x4[xbase]), float4(int4(w) & 0xF) - 8.0f);
+            d += dot(float4(x4[xbase + 8u]), float4(int4(w) >> 4) - 8.0f);
+            sum += d * scale;
+        }
+        const float total = simd_sum(sum);
+        if (!isnan(total)) {
+            score = total;
+            id = row;
+        }
+    }
+
+    if (lane == 0u) {
+        partials[simdgroup] = score;
+        partial_ids[simdgroup] = id;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    /* Rows ascend with simdgroup index, so a strict > keeps the lowest id on
+     * ties - matching the Q8 argmax tie-break. */
+    if (tid == 0u && tile < params.partial_count) {
+        float best = -INFINITY;
+        uint best_id = 0xffffffffu;
+        for (uint i = 0u; i < rows_per_tg; ++i) {
+            if (partial_ids[i] == 0xffffffffu) {
+                continue;
+            }
+            if (best_id == 0xffffffffu || partials[i] > best ||
+                (partials[i] == best && partial_ids[i] < best_id)) {
+                best = partials[i];
+                best_id = partial_ids[i];
+            }
+        }
+        partial_scores_out[tile] = best_id == 0xffffffffu ? -INFINITY : best;
+        partial_ids_out[tile] = best_id;
+    }
+}
+
+// ═══════════════════════════════════════════
+//  embedding_q4.metal
+// ═══════════════════════════════════════════
+
+// embedding_q4.metal - Q4_0 embedding lookup kernels
+//
+// Same shape contract as uocr_get_rows_q8_0_to_f16_h1280_g64; rows use the
+// group-half-split nibble packing (docs/plan_q4.md §1.1): byte g*32 + j of a
+// row holds weights k = g*64 + j (low nibble) and k + 32 (high nibble).  A
+// half4-aligned column run stays inside one nibble half of one scale group.
+
+// Mirrors UocrGetRowsQ8Params (embedding_q8.metal is an earlier fragment).
+struct UocrGetRowsQ4Params {
+    uint table_rows;
+    uint logical_width;
+    uint physical_width;
+    uint n_row_ids;
+    uint row_size; // packed row bytes (width / 2)
+    uint reserved0;
+    uint reserved1;
+    uint reserved2;
+};
+
+kernel void uocr_get_rows_q4_0_to_f16_h1280_g64(device const uchar *qweight [[buffer(0)]],
+                                                device const half *qscale [[buffer(1)]],
+                                                device const int *row_ids [[buffer(2)]],
+                                                device half *dst [[buffer(3)]],
+                                                constant UocrGetRowsQ4Params &params [[buffer(4)]],
+                                                uint2 gid [[thread_position_in_grid]]) {
+    constexpr uint kWidth = 1280u;
+    constexpr uint kGroup = 64u;
+    constexpr uint kGroupsPerRow = kWidth / kGroup;
+    constexpr uint kRowBytes = kWidth / 2u;
+
+    const uint col = gid.x * UOCR_HALF4_WIDTH;
+    const uint out_row = gid.y;
+    if (col >= kWidth || out_row >= params.n_row_ids) {
+        return;
+    }
+
+    const ulong dst_base = (ulong(out_row) * ulong(kWidth)) + ulong(col);
+    const int row = row_ids[out_row];
+    if (row < 0 || uint(row) >= params.table_rows || params.logical_width != kWidth ||
+        params.physical_width != kWidth || params.row_size != kRowBytes) {
+        uocr_store_half4(dst, dst_base, uocr_zero_half4());
+        return;
+    }
+
+    const uint src_row = uint(row);
+    const uint group = col / kGroup;
+    const uint j = col - group * kGroup; // half4-aligned; run stays in one half
+    const bool high = j >= 32u;
+    const ulong q_base = (ulong(src_row) * ulong(kRowBytes)) + ulong(group * 32u + (high ? j - 32u : j));
+    const float scale = float(qscale[ulong(src_row) * ulong(kGroupsPerRow) + ulong(group)]);
+    const uchar4 w = *(device const uchar4 *)(qweight + q_base);
+    const int4 q = high ? (int4(w) >> 4) : (int4(w) & 0xF);
+    const float4 values = (float4(q) - 8.0f) * scale;
+    uocr_store_half4(dst, dst_base, half4(values));
 }
 
 // ═══════════════════════════════════════════

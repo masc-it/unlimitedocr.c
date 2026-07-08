@@ -486,10 +486,11 @@ static int generate_metal_text_fp16(uocr_engine *engine,
                                  "Metal text generation requires a mapped .uocr model");
     }
     if (engine->model_file.header->qprofile != UOCR_QPROFILE_FP16 &&
-        engine->model_file.header->qprofile != UOCR_QPROFILE_MIXED_Q8_0) {
+        engine->model_file.header->qprofile != UOCR_QPROFILE_MIXED_Q8_0 &&
+        engine->model_file.header->qprofile != UOCR_QPROFILE_MIXED_Q4) {
         return set_engine_errorf(engine,
                                  UOCR_ERROR_NOT_IMPLEMENTED,
-                                 "Metal text generation currently supports fp16 and mixed-q8_0 .uocr models, got %s",
+                                 "Metal text generation currently supports fp16, mixed-q8_0, and mixed-q4 .uocr models, got %s",
                                  uocr_qprofile_name(engine->model_file.header->qprofile));
     }
     if (!uocr_metal_context_decoder_bindings_ready(engine->metal)) {
@@ -594,10 +595,11 @@ static int generate_metal_image_fp16(uocr_engine *engine,
                                  "Metal image generation requires a mapped .uocr model");
     }
     if (engine->model_file.header->qprofile != UOCR_QPROFILE_FP16 &&
-        engine->model_file.header->qprofile != UOCR_QPROFILE_MIXED_Q8_0) {
+        engine->model_file.header->qprofile != UOCR_QPROFILE_MIXED_Q8_0 &&
+        engine->model_file.header->qprofile != UOCR_QPROFILE_MIXED_Q4) {
         return set_engine_errorf(engine,
                                  UOCR_ERROR_NOT_IMPLEMENTED,
-                                 "Metal image generation currently supports fp16 and mixed-q8_0 .uocr models, got %s",
+                                 "Metal image generation currently supports fp16, mixed-q8_0, and mixed-q4 .uocr models, got %s",
                                  uocr_qprofile_name(engine->model_file.header->qprofile));
     }
     if (!uocr_metal_context_decoder_bindings_ready(engine->metal)) {
@@ -954,7 +956,8 @@ uocr_engine *uocr_engine_open(const uocr_engine_opts *opts) {
         }
         if (engine->has_model_file &&
             (engine->model_file.header->qprofile == UOCR_QPROFILE_FP16 ||
-             engine->model_file.header->qprofile == UOCR_QPROFILE_MIXED_Q8_0) &&
+             engine->model_file.header->qprofile == UOCR_QPROFILE_MIXED_Q8_0 ||
+             engine->model_file.header->qprofile == UOCR_QPROFILE_MIXED_Q4) &&
             !uocr_metal_context_vision_bindings_ready(engine->metal)) {
             set_engine_errorf(engine,
                               UOCR_ERROR_NOT_IMPLEMENTED,

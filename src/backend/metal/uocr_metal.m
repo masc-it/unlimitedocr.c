@@ -2897,6 +2897,22 @@ static int metal_decoder_tensor_allows_q8(uint32_t family, uint32_t projection, 
     }
 }
 
+/* Q4_0 decoder weights are restricted to the routed MoE experts and the LM
+ * head (docs/plan_q4.md §1.3 + extension E1); everything else keeps its
+ * fp16/Q8 rules. */
+static int metal_decoder_tensor_allows_q4(uint32_t family, uint32_t projection, uint32_t rank) {
+    if (rank != 2u) {
+        return 0;
+    }
+    if (family == UOCR_TENSOR_FAMILY_LM_HEAD || family == UOCR_TENSOR_FAMILY_TOK_EMBED) {
+        return projection == UOCR_TENSOR_PROJ_WEIGHT;
+    }
+    return (family == UOCR_TENSOR_FAMILY_MOE_EXPERT || family == UOCR_TENSOR_FAMILY_MOE_SHARED ||
+            family == UOCR_TENSOR_FAMILY_LAYER_DENSE_MLP) &&
+           (projection == UOCR_TENSOR_PROJ_GATE || projection == UOCR_TENSOR_PROJ_UP ||
+            projection == UOCR_TENSOR_PROJ_DOWN);
+}
+
 static int metal_validate_decoder_tensor_metadata(const uocr_tensor_entry *tensor,
                                                   uint32_t tensor_id,
                                                   uint32_t family,
@@ -2921,14 +2937,16 @@ static int metal_validate_decoder_tensor_metadata(const uocr_tensor_entry *tenso
                           tensor_id,
                           uocr_tensor_usage_name(tensor->usage));
     }
-    if (tensor->qtype != UOCR_TENSOR_F16 && tensor->qtype != UOCR_TENSOR_Q8_0) {
+    if (tensor->qtype != UOCR_TENSOR_F16 && tensor->qtype != UOCR_TENSOR_Q8_0 &&
+        tensor->qtype != UOCR_TENSOR_Q4_0) {
         return metal_fail(error,
                           error_size,
                           "decoder tensor %u has unsupported qtype %s",
                           tensor_id,
                           uocr_tensor_qtype_name(tensor->qtype));
     }
-    if (tensor->qtype == UOCR_TENSOR_Q8_0 && !metal_decoder_tensor_allows_q8(family, projection, rank)) {
+    if ((tensor->qtype == UOCR_TENSOR_Q8_0 && !metal_decoder_tensor_allows_q8(family, projection, rank)) ||
+        (tensor->qtype == UOCR_TENSOR_Q4_0 && !metal_decoder_tensor_allows_q4(family, projection, rank))) {
         return metal_fail(error,
                           error_size,
                           "decoder tensor %u cannot use qtype %s for this family/projection",
@@ -2988,13 +3006,23 @@ static int metal_validate_decoder_tensor_metadata(const uocr_tensor_entry *tenso
         if (tensor->scale_offset != 0u || tensor->scale_size != 0u || tensor->block_size != 0u || tensor->row_size != 0u) {
             return metal_fail(error, error_size, "decoder f16 tensor %u has quantization metadata", tensor_id);
         }
-    } else {
+    } else if (tensor->qtype == UOCR_TENSOR_Q8_0) {
         const uint32_t cols = dims[1];
         const uint64_t expected_scale_size = uocr_q8_0_qscale_bytes(dims[0], cols, UOCR_Q8_GROUP_SIZE_DEFAULT);
         if (tensor->block_size != UOCR_Q8_GROUP_SIZE_DEFAULT || tensor->row_size != cols || tensor->scale_size != expected_scale_size) {
             return metal_fail(error,
                               error_size,
                               "decoder q8_0 tensor %u packing metadata mismatch",
+                              tensor_id);
+        }
+    } else {
+        const uint32_t cols = dims[1];
+        const uint64_t expected_scale_size = uocr_q4_0_qscale_bytes(dims[0], cols, UOCR_Q4_GROUP_SIZE_DEFAULT);
+        if (tensor->block_size != UOCR_Q4_GROUP_SIZE_DEFAULT || (cols % 2u) != 0u || tensor->row_size != cols / 2u ||
+            expected_scale_size == 0u || tensor->scale_size != expected_scale_size) {
+            return metal_fail(error,
+                              error_size,
+                              "decoder q4_0 tensor %u packing metadata mismatch",
                               tensor_id);
         }
     }
@@ -3035,6 +3063,11 @@ static int metal_append_decoder_binding(uocr_metal_context *ctx,
         if (rank != 2u || !checked_mul_u64((uint64_t)dims[0], (uint64_t)dims[1], &expected_payload_size)) {
             return metal_fail(error, error_size, "decoder tensor %u expected q8 byte-size overflow", tensor_id);
         }
+    } else if (tensor->qtype == UOCR_TENSOR_Q4_0) {
+        expected_payload_size = rank == 2u ? uocr_q4_0_qweight_bytes(dims[0], dims[1]) : 0u;
+        if (expected_payload_size == 0u) {
+            return metal_fail(error, error_size, "decoder tensor %u expected q4 byte-size is invalid", tensor_id);
+        }
     } else if (!metal_tensor_expected_payload_bytes(rank, dims, &expected_payload_size)) {
         return metal_fail(error, error_size, "decoder tensor %u expected byte-size overflow", tensor_id);
     }
@@ -3069,7 +3102,10 @@ static int metal_append_decoder_binding(uocr_metal_context *ctx,
     binding->rows = rank >= 1u ? dims[0] : 0u;
     binding->cols = rank >= 2u ? dims[1] : 0u;
     binding->group_size = tensor->block_size;
-    binding->groups_per_row = (tensor->qtype == UOCR_TENSOR_Q8_0 && tensor->block_size != 0u) ? dims[1] / tensor->block_size : 0u;
+    binding->groups_per_row =
+        ((tensor->qtype == UOCR_TENSOR_Q8_0 || tensor->qtype == UOCR_TENSOR_Q4_0) && tensor->block_size != 0u)
+            ? dims[1] / tensor->block_size
+            : 0u;
     binding->buffer = buffer;
     binding->offset = offset;
     binding->payload_size = expected_payload_size;
@@ -3172,14 +3208,22 @@ static int metal_decoder_binding_cache_validate_expert_slab(const uocr_metal_dec
     }
     const uocr_metal_decoder_binding *gate0 = &cache->tensors[gate0_index];
     const uint32_t slab_qtype = gate0->qtype;
-    const uint64_t projection_data_bytes = slab_qtype == UOCR_TENSOR_Q8_0 ? projection_values : projection_bytes;
+    const int slab_is_quantized = slab_qtype == UOCR_TENSOR_Q8_0 || slab_qtype == UOCR_TENSOR_Q4_0;
+    uint64_t projection_data_bytes = projection_bytes;
+    uint64_t projection_scale_bytes = 0u;
+    if (slab_qtype == UOCR_TENSOR_Q8_0) {
+        projection_data_bytes = projection_values;
+        projection_scale_bytes = uocr_q8_0_qscale_bytes(UOCR_MOE_EXPERT_INTERMEDIATE,
+                                                        UOCR_HIDDEN_SIZE,
+                                                        UOCR_Q8_GROUP_SIZE_DEFAULT);
+    } else if (slab_qtype == UOCR_TENSOR_Q4_0) {
+        projection_data_bytes = projection_values / 2u;
+        projection_scale_bytes = uocr_q4_0_qscale_bytes(UOCR_MOE_EXPERT_INTERMEDIATE,
+                                                        UOCR_HIDDEN_SIZE,
+                                                        UOCR_Q4_GROUP_SIZE_DEFAULT);
+    }
     const uint64_t expert_data_stride_bytes = projection_data_bytes * 3u;
     const uint64_t total_data_bytes = expert_data_stride_bytes * (uint64_t)UOCR_ROUTED_EXPERTS;
-    const uint64_t projection_scale_bytes = slab_qtype == UOCR_TENSOR_Q8_0
-                                                ? uocr_q8_0_qscale_bytes(UOCR_MOE_EXPERT_INTERMEDIATE,
-                                                                         UOCR_HIDDEN_SIZE,
-                                                                         UOCR_Q8_GROUP_SIZE_DEFAULT)
-                                                : 0u;
     const uint64_t expert_scale_stride_bytes = projection_scale_bytes * 3u;
     const uint64_t total_scale_bytes = expert_scale_stride_bytes * (uint64_t)UOCR_ROUTED_EXPERTS;
     if (gate0->offset > NSUIntegerMax || !metal_buffer_range_valid(gate0->buffer, gate0->offset, total_data_bytes)) {
@@ -3188,7 +3232,7 @@ static int metal_decoder_binding_cache_validate_expert_slab(const uocr_metal_dec
                           "integrated MoE expert slab for layer %u is not contiguous in one Metal view",
                           layer);
     }
-    if (slab_qtype == UOCR_TENSOR_Q8_0 &&
+    if (slab_is_quantized &&
         (gate0->scale_buffer == nil || gate0->scale_offset > NSUIntegerMax ||
          !metal_buffer_range_valid(gate0->scale_buffer, gate0->scale_offset, total_scale_bytes))) {
         return metal_fail(error,
@@ -3236,7 +3280,7 @@ static int metal_decoder_binding_cache_validate_expert_slab(const uocr_metal_dec
                               layer,
                               expert);
         }
-        if (slab_qtype == UOCR_TENSOR_Q8_0 &&
+        if (slab_is_quantized &&
             (gate->scale_buffer != gate0->scale_buffer || up->scale_buffer != gate0->scale_buffer ||
              down->scale_buffer != gate0->scale_buffer || (uint64_t)gate->scale_offset != scale_base ||
              (uint64_t)up->scale_offset != scale_base + projection_scale_bytes ||
@@ -3634,6 +3678,19 @@ static int metal_refresh_decoder_binding_cache(uocr_metal_context *ctx,
     ctx->decoder_fast_expert_qtype = (UOCR_DECODER_LAYERS > 1u)
         ? ctx->decoder_bindings.layers[1u].expert_slab.qtype
         : UOCR_TENSOR_F16;
+    /* The decode loop keys expert dispatch on one qtype for all MoE layers;
+     * reject models whose expert slabs mix qtypes across layers. */
+    for (uint32_t layer = 2u; layer < UOCR_DECODER_LAYERS; ++layer) {
+        if (ctx->decoder_bindings.layers[layer].expert_slab.qtype != ctx->decoder_fast_expert_qtype) {
+            ctx->decoder_fast_expert_slabs_valid = 0;
+            return metal_fail(error,
+                              error_size,
+                              "integrated MoE expert slabs mix qtypes: layer 1 is %s, layer %u is %s",
+                              uocr_tensor_qtype_name(ctx->decoder_fast_expert_qtype),
+                              layer,
+                              uocr_tensor_qtype_name(ctx->decoder_bindings.layers[layer].expert_slab.qtype));
+        }
+    }
     ctx->decoder_fast_expert_slabs_valid = 1;
 
     return 1;
@@ -3723,7 +3780,8 @@ static int metal_validate_vision_tensor_metadata(const uocr_tensor_entry *tensor
                           tensor_id,
                           uocr_tensor_usage_name(tensor->usage));
     }
-    if (tensor->qtype != UOCR_TENSOR_F16 && tensor->qtype != UOCR_TENSOR_Q8_0) {
+    if (tensor->qtype != UOCR_TENSOR_F16 && tensor->qtype != UOCR_TENSOR_Q8_0 &&
+        tensor->qtype != UOCR_TENSOR_Q4_0) {
         return metal_fail(error,
                           error_size,
                           "%s %u has unsupported qtype %s",
@@ -3731,7 +3789,9 @@ static int metal_validate_vision_tensor_metadata(const uocr_tensor_entry *tensor
                           tensor_id,
                           uocr_tensor_qtype_name(tensor->qtype));
     }
-    if (tensor->qtype == UOCR_TENSOR_Q8_0 && !metal_vision_tensor_allows_q8(family, projection, rank, dims)) {
+    /* Q4 group 64 shares the Q8 family/projection/alignment rules. */
+    if ((tensor->qtype == UOCR_TENSOR_Q8_0 || tensor->qtype == UOCR_TENSOR_Q4_0) &&
+        !metal_vision_tensor_allows_q8(family, projection, rank, dims)) {
         return metal_fail(error,
                           error_size,
                           "%s %u cannot use qtype %s for this family/projection",
@@ -3810,12 +3870,13 @@ static int metal_validate_vision_tensor_metadata(const uocr_tensor_entry *tensor
         }
     } else {
         const uint32_t cols = dims[1];
+        const uint32_t expected_row_size = tensor->qtype == UOCR_TENSOR_Q4_0 ? cols / 2u : cols;
         const uint64_t expected_scale_size = uocr_q8_0_qscale_bytes(dims[0], cols, UOCR_Q8_GROUP_SIZE_DEFAULT);
         if (expected_scale_size == 0u || tensor->block_size != UOCR_Q8_GROUP_SIZE_DEFAULT ||
-            tensor->row_size != cols || tensor->scale_size != expected_scale_size) {
+            tensor->row_size != expected_row_size || tensor->scale_size != expected_scale_size) {
             return metal_fail(error,
                               error_size,
-                              "%s %u q8_0 packing metadata mismatch",
+                              "%s %u quantized packing metadata mismatch",
                               role,
                               tensor_id);
         }
@@ -3907,6 +3968,11 @@ static int metal_append_vision_binding(uocr_metal_context *ctx,
         if (rank != 2u || !checked_mul_u64((uint64_t)dims[0], (uint64_t)dims[1], &expected_payload_size)) {
             return metal_fail(error, error_size, "vision tensor %u expected q8 byte-size overflow", tensor_id);
         }
+    } else if (tensor->qtype == UOCR_TENSOR_Q4_0) {
+        expected_payload_size = rank == 2u ? uocr_q4_0_qweight_bytes(dims[0], dims[1]) : 0u;
+        if (expected_payload_size == 0u) {
+            return metal_fail(error, error_size, "vision tensor %u expected q4 byte-size is invalid", tensor_id);
+        }
     } else if (!metal_tensor_expected_payload_bytes(rank, dims, &expected_payload_size)) {
         return metal_fail(error, error_size, "vision tensor %u expected byte-size overflow", tensor_id);
     }
@@ -3943,7 +4009,10 @@ static int metal_append_vision_binding(uocr_metal_context *ctx,
     binding->rows = rank >= 1u ? dims[0] : 0u;
     binding->cols = rank >= 2u ? dims[1] : 0u;
     binding->group_size = tensor->block_size;
-    binding->groups_per_row = (tensor->qtype == UOCR_TENSOR_Q8_0 && tensor->block_size != 0u) ? dims[1] / tensor->block_size : 0u;
+    binding->groups_per_row =
+        ((tensor->qtype == UOCR_TENSOR_Q8_0 || tensor->qtype == UOCR_TENSOR_Q4_0) && tensor->block_size != 0u)
+            ? dims[1] / tensor->block_size
+            : 0u;
     binding->buffer = buffer;
     binding->offset = offset;
     binding->payload_size = expected_payload_size;
@@ -4260,10 +4329,10 @@ static int metal_vision_tensor_from_binding_cache(const uocr_metal_vision_bindin
                           role,
                           tensor_id);
     }
-    if (binding->qtype == UOCR_TENSOR_Q8_0) {
+    if (binding->qtype == UOCR_TENSOR_Q8_0 || binding->qtype == UOCR_TENSOR_Q4_0) {
         if (binding->scale_buffer == nil || binding->scale_size == 0u ||
             !metal_buffer_range_valid(binding->scale_buffer, binding->scale_offset, binding->scale_size)) {
-            return metal_fail(error, error_size, "%s tensor %u has an invalid q8 scale binding", role, tensor_id);
+            return metal_fail(error, error_size, "%s tensor %u has an invalid quantized scale binding", role, tensor_id);
         }
     } else if (binding->qtype != UOCR_TENSOR_F16) {
         return metal_fail(error,
@@ -5125,6 +5194,28 @@ static int metal_vision_require_weight_q8(uocr_metal_vision_tensor_f16 tensor,
         tensor.scale_slice.buffer == nil || tensor.scale_byte_length != qscale_bytes ||
         !metal_slice_valid(tensor.scale_slice, qscale_bytes)) {
         return metal_fail(error, error_size, "invalid Metal vision %s q8_0 tensor slice", label != NULL ? label : "weight");
+    }
+    return 1;
+}
+
+static int metal_vision_require_weight_q4(uocr_metal_vision_tensor_f16 tensor,
+                                          uint32_t rows,
+                                          uint32_t cols,
+                                          const char *label,
+                                          char *error,
+                                          size_t error_size) {
+    const uint64_t qweight_bytes = uocr_q4_0_qweight_bytes(rows, cols);
+    const uint64_t qscale_bytes = uocr_q4_0_qscale_bytes(rows, cols, UOCR_Q4_GROUP_SIZE_DEFAULT);
+    if (tensor.qtype != UOCR_TENSOR_Q4_0 || rows == 0u || cols == 0u || qweight_bytes == 0u || qscale_bytes == 0u ||
+        (cols % UOCR_Q4_GROUP_SIZE_DEFAULT) != 0u ||
+        tensor.rows != rows || tensor.cols != cols ||
+        tensor.group_size != UOCR_Q4_GROUP_SIZE_DEFAULT ||
+        tensor.groups_per_row != cols / UOCR_Q4_GROUP_SIZE_DEFAULT ||
+        tensor.slice.buffer == nil || tensor.byte_length != qweight_bytes ||
+        !metal_slice_valid(tensor.slice, qweight_bytes) ||
+        tensor.scale_slice.buffer == nil || tensor.scale_byte_length != qscale_bytes ||
+        !metal_slice_valid(tensor.scale_slice, qscale_bytes)) {
+        return metal_fail(error, error_size, "invalid Metal vision %s q4_0 tensor slice", label != NULL ? label : "weight");
     }
     return 1;
 }
@@ -6439,14 +6530,22 @@ static int metal_run_vision_gemm_q8_0(uocr_metal_context *ctx,
                                       char *error,
                                       size_t error_size) {
     const uint64_t bias_bytes = (uint64_t)output_size * 2u;
+    const int use_q4 = weight.qtype == UOCR_TENSOR_Q4_0;
     if (ctx == NULL || n_rows == 0u || (input_size % 32u) != 0u ||
         (split_size != 0u && (output_size != split_size * 3u)) ||
-        !metal_vision_require_weight_q8(weight, output_size, input_size, op_name, error, error_size) ||
+        /* Q4 B-side staging has no column guard and needs whole 64-groups. */
+        (use_q4 && ((output_size % 32u) != 0u || (input_size % UOCR_Q4_GROUP_SIZE_DEFAULT) != 0u)) ||
+        !(use_q4 ? metal_vision_require_weight_q4(weight, output_size, input_size, op_name, error, error_size)
+                 : metal_vision_require_weight_q8(weight, output_size, input_size, op_name, error, error_size)) ||
         !metal_vision_require_tensor_slice_f16(bias, bias_bytes, op_name, error, error_size)) {
         return 0;
     }
     @autoreleasepool {
-        id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, "uocr_vision_gemm_q8_0_to_f16", error, error_size);
+        id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx,
+                                                                  use_q4 ? "uocr_vision_gemm_q4_0_to_f16"
+                                                                         : "uocr_vision_gemm_q8_0_to_f16",
+                                                                  error,
+                                                                  error_size);
         if (pipeline == nil) {
             return 0;
         }
@@ -6544,7 +6643,7 @@ static int metal_context_visual_projector_f16_to_slice(uocr_metal_context *ctx,
                                                        uocr_metal_vision_workspace_slice out_rows,
                                                        char *error,
                                                        size_t error_size) {
-    if (weight.qtype == UOCR_TENSOR_Q8_0) {
+    if (weight.qtype == UOCR_TENSOR_Q8_0 || weight.qtype == UOCR_TENSOR_Q4_0) {
         return metal_run_visual_projector_q8_0_to_slice(ctx,
                                                         input,
                                                         weight,
@@ -10899,7 +10998,9 @@ static int metal_run_token_embedding_from_token_slot_f16(uocr_metal_context *ctx
         return 0;
     }
     const uint64_t table_f16_bytes = (uint64_t)UOCR_VOCAB_SIZE * (uint64_t)UOCR_HIDDEN_SIZE * 2u;
-    const uint64_t table_qweight_bytes = uocr_q8_0_qweight_bytes(UOCR_VOCAB_SIZE, UOCR_HIDDEN_SIZE);
+    const uint64_t table_qweight_bytes = embedding->qtype == UOCR_TENSOR_Q4_0
+                                             ? uocr_q4_0_qweight_bytes(UOCR_VOCAB_SIZE, UOCR_HIDDEN_SIZE)
+                                             : uocr_q8_0_qweight_bytes(UOCR_VOCAB_SIZE, UOCR_HIDDEN_SIZE);
     const uint64_t table_qscale_bytes = uocr_q8_0_qscale_bytes(UOCR_VOCAB_SIZE,
                                                                UOCR_HIDDEN_SIZE,
                                                                UOCR_Q8_GROUP_SIZE_DEFAULT);
@@ -10907,13 +11008,14 @@ static int metal_run_token_embedding_from_token_slot_f16(uocr_metal_context *ctx
         if (!metal_buffer_range_valid(embedding->buffer, embedding->offset, table_f16_bytes)) {
             return 0;
         }
-    } else if (embedding->qtype == UOCR_TENSOR_Q8_0) {
+    } else if (embedding->qtype == UOCR_TENSOR_Q8_0 || embedding->qtype == UOCR_TENSOR_Q4_0) {
+        /* Q4 group 64 has the same scale layout as Q8 group 64. */
         if (embedding->group_size != UOCR_Q8_GROUP_SIZE_DEFAULT || embedding->rows != UOCR_VOCAB_SIZE ||
             embedding->cols != UOCR_HIDDEN_SIZE || embedding->payload_size != table_qweight_bytes ||
             embedding->scale_size != table_qscale_bytes ||
             !metal_buffer_range_valid(embedding->buffer, embedding->offset, table_qweight_bytes) ||
             !metal_buffer_range_valid(embedding->scale_buffer, embedding->scale_offset, table_qscale_bytes)) {
-            return metal_fail(error, error_size, "invalid integrated Q8 token-embedding binding");
+            return metal_fail(error, error_size, "invalid integrated quantized token-embedding binding");
         }
     } else {
         return metal_fail(error,
@@ -10922,10 +11024,12 @@ static int metal_run_token_embedding_from_token_slot_f16(uocr_metal_context *ctx
                           uocr_tensor_qtype_name(embedding->qtype));
     }
     @autoreleasepool {
-        const int use_q8 = embedding->qtype == UOCR_TENSOR_Q8_0;
+        const int use_q8 = embedding->qtype == UOCR_TENSOR_Q8_0 || embedding->qtype == UOCR_TENSOR_Q4_0;
         id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx,
-                                                                  use_q8 ? "uocr_get_rows_q8_0_to_f16_h1280_g64"
-                                                                         : "uocr_get_rows_f16_to_f16",
+                                                                  embedding->qtype == UOCR_TENSOR_Q4_0
+                                                                      ? "uocr_get_rows_q4_0_to_f16_h1280_g64"
+                                                                      : (use_q8 ? "uocr_get_rows_q8_0_to_f16_h1280_g64"
+                                                                                : "uocr_get_rows_f16_to_f16"),
                                                                   error,
                                                                   error_size);
         if (pipeline == nil) {
@@ -10953,7 +11057,7 @@ static int metal_run_token_embedding_from_token_slot_f16(uocr_metal_context *ctx
             params.logical_width = UOCR_HIDDEN_SIZE;
             params.physical_width = UOCR_HIDDEN_SIZE;
             params.n_row_ids = 1u;
-            params.row_size = UOCR_HIDDEN_SIZE;
+            params.row_size = embedding->qtype == UOCR_TENSOR_Q4_0 ? UOCR_HIDDEN_SIZE / 2u : UOCR_HIDDEN_SIZE;
             [enc setBuffer:embedding->buffer offset:embedding->offset atIndex:0u];
             [enc setBuffer:embedding->scale_buffer offset:embedding->scale_offset atIndex:1u];
             [enc setBuffer:token_id.buffer offset:token_id.offset atIndex:2u];
@@ -11154,6 +11258,103 @@ static int metal_run_lm_head_argmax_q8_0(uocr_metal_context *ctx,
              threadsPerThreadgroup:MTLSizeMake(threads, 1u, 1u)];
         [enc endEncoding];
         return metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, "integrated Q8 LM-head argmax", error, error_size);
+    }
+}
+
+/*
+ * Fused Q4_0 LM-head argmax: one simdgroup per vocab row (32 rows per
+ * 1024-thread threadgroup), so the partial layout stays vocab/32 and the
+ * selection scratch + finalize pass are shared with the Q8 kernel.
+ */
+static int metal_run_lm_head_argmax_q4_0(uocr_metal_context *ctx,
+                                         uocr_metal_buffer_slice input,
+                                         uocr_metal_buffer_slice partial_scores,
+                                         uocr_metal_buffer_slice partial_ids,
+                                         uint32_t partial_count,
+                                         char *error,
+                                         size_t error_size) {
+    const uint64_t input_bytes = (uint64_t)UOCR_HIDDEN_SIZE * 2u;
+    const uint64_t qweight_bytes = uocr_q4_0_qweight_bytes(UOCR_VOCAB_SIZE, UOCR_HIDDEN_SIZE);
+    const uint64_t qscale_bytes = uocr_q4_0_qscale_bytes(UOCR_VOCAB_SIZE,
+                                                         UOCR_HIDDEN_SIZE,
+                                                         UOCR_Q4_GROUP_SIZE_DEFAULT);
+    uint64_t partial_bytes = 0u;
+    const uint32_t expected_partials = (UOCR_VOCAB_SIZE + UOCR_METAL_LM_HEAD_ARGMAX_TILE_TOKENS - 1u) /
+                                       UOCR_METAL_LM_HEAD_ARGMAX_TILE_TOKENS;
+    if (ctx == NULL || partial_count != expected_partials || qweight_bytes == 0u || qscale_bytes == 0u ||
+        !checked_mul_u64((uint64_t)partial_count, (uint64_t)sizeof(float), &partial_bytes) ||
+        !metal_slice_valid(input, input_bytes) ||
+        !metal_slice_valid(partial_scores, partial_bytes) || !metal_slice_valid(partial_ids, partial_bytes)) {
+        return metal_fail(error, error_size, "invalid integrated Q4 LM-head argmax request");
+    }
+    const uocr_metal_decoder_binding *lm_head = metal_require_decoder_binding_index(ctx,
+                                                                                    ctx->decoder_bindings.lm_head,
+                                                                                    "LM head",
+                                                                                    error,
+                                                                                    error_size);
+    if (lm_head == NULL) {
+        return 0;
+    }
+    if (lm_head->qtype != UOCR_TENSOR_Q4_0 || lm_head->rows != UOCR_VOCAB_SIZE ||
+        lm_head->cols != UOCR_HIDDEN_SIZE || lm_head->group_size != UOCR_Q4_GROUP_SIZE_DEFAULT ||
+        lm_head->groups_per_row != UOCR_HIDDEN_SIZE / UOCR_Q4_GROUP_SIZE_DEFAULT ||
+        lm_head->payload_size != qweight_bytes || lm_head->scale_size != qscale_bytes ||
+        !metal_buffer_range_valid(lm_head->buffer, lm_head->offset, qweight_bytes) ||
+        !metal_buffer_range_valid(lm_head->scale_buffer, lm_head->scale_offset, qscale_bytes)) {
+        return metal_fail(error, error_size, "invalid integrated Q4 LM-head binding");
+    }
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, "uocr_lm_head_argmax_q4_0_to_f16", error, error_size);
+        if (pipeline == nil) {
+            return 0;
+        }
+        NSUInteger simd_width = pipeline.threadExecutionWidth;
+        if (simd_width == 0u) {
+            simd_width = 32u;
+        }
+        /* One simdgroup per row, TILE_TOKENS rows per threadgroup so the
+         * partial layout matches the Q8 kernel. */
+        const NSUInteger threads = simd_width * (NSUInteger)UOCR_METAL_LM_HEAD_ARGMAX_TILE_TOKENS;
+        if (pipeline.maxTotalThreadsPerThreadgroup < threads) {
+            return metal_fail(error,
+                              error_size,
+                              "integrated Q4 LM-head argmax requires %llu threads per threadgroup, device supports %llu",
+                              (unsigned long long)threads,
+                              (unsigned long long)pipeline.maxTotalThreadsPerThreadgroup);
+        }
+        const uint64_t sum_bytes = (uint64_t)UOCR_METAL_LM_HEAD_ARGMAX_TILE_TOKENS * (uint64_t)sizeof(float);
+        const uint64_t id_bytes = (uint64_t)UOCR_METAL_LM_HEAD_ARGMAX_TILE_TOKENS * (uint64_t)sizeof(uint32_t);
+        int owned_command_buffer = 0;
+        id<MTLCommandBuffer> cb = metal_command_buffer_for_op(ctx, &owned_command_buffer, "integrated Q4 LM-head argmax", error, error_size);
+        if (cb == nil) {
+            return 0;
+        }
+        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
+        if (enc == nil) {
+            return metal_fail(error, error_size, "failed to create integrated Q4 LM-head argmax encoder");
+        }
+        uocr_metal_lm_head_argmax_q8_params params;
+        params.vocab_size = UOCR_VOCAB_SIZE;
+        params.hidden_size = UOCR_HIDDEN_SIZE;
+        params.tile_tokens = UOCR_METAL_LM_HEAD_ARGMAX_TILE_TOKENS;
+        params.lanes_per_token = 0u;
+        params.group_size = UOCR_Q4_GROUP_SIZE_DEFAULT;
+        params.groups_per_row = UOCR_HIDDEN_SIZE / UOCR_Q4_GROUP_SIZE_DEFAULT;
+        params.partial_count = partial_count;
+        params.reserved0 = 0u;
+        [enc setComputePipelineState:pipeline];
+        [enc setBuffer:input.buffer offset:input.offset atIndex:0u];
+        [enc setBuffer:lm_head->buffer offset:lm_head->offset atIndex:1u];
+        [enc setBuffer:lm_head->scale_buffer offset:lm_head->scale_offset atIndex:2u];
+        [enc setBuffer:partial_scores.buffer offset:partial_scores.offset atIndex:3u];
+        [enc setBuffer:partial_ids.buffer offset:partial_ids.offset atIndex:4u];
+        [enc setBytes:&params length:sizeof(params) atIndex:5u];
+        [enc setThreadgroupMemoryLength:(NSUInteger)sum_bytes atIndex:0u];
+        [enc setThreadgroupMemoryLength:(NSUInteger)id_bytes atIndex:1u];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)partial_count, 1u, 1u)
+             threadsPerThreadgroup:MTLSizeMake(threads, 1u, 1u)];
+        [enc endEncoding];
+        return metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, "integrated Q4 LM-head argmax", error, error_size);
     }
 }
 
@@ -11451,15 +11652,27 @@ static int metal_encode_chunk_step_selection_f16(
                                             "LM head", error, error_size);
     if (lm_head == NULL) return 0;
 
-    if (lm_head->qtype == UOCR_TENSOR_Q8_0) {
+    if (lm_head->qtype == UOCR_TENSOR_Q8_0 || lm_head->qtype == UOCR_TENSOR_Q4_0) {
+        /* Quantized LM head always uses the fused custom argmax path; the
+         * MPS selector env var is ignored (no dequantized logits allowed). */
         if (metal_lm_head_backend_is_mps()) {
-            metal_profile_add_event_now(ctx, "metal.lm_head.q8_forced_custom", uocr_profile_now_ns());
+            metal_profile_add_event_now(ctx,
+                                        lm_head->qtype == UOCR_TENSOR_Q4_0 ? "metal.lm_head.q4_forced_custom"
+                                                                           : "metal.lm_head.q8_forced_custom",
+                                        uocr_profile_now_ns());
         }
-        if (!metal_run_lm_head_argmax_q8_0(ctx, norm_scratch,
-                                           selection_slices.partial_scores,
-                                           selection_slices.partial_ids,
-                                           selection_slices.partial_count,
-                                           error, error_size)) {
+        const int argmax_ok = lm_head->qtype == UOCR_TENSOR_Q4_0
+                                  ? metal_run_lm_head_argmax_q4_0(ctx, norm_scratch,
+                                                                  selection_slices.partial_scores,
+                                                                  selection_slices.partial_ids,
+                                                                  selection_slices.partial_count,
+                                                                  error, error_size)
+                                  : metal_run_lm_head_argmax_q8_0(ctx, norm_scratch,
+                                                                  selection_slices.partial_scores,
+                                                                  selection_slices.partial_ids,
+                                                                  selection_slices.partial_count,
+                                                                  error, error_size);
+        if (!argmax_ok) {
             return 0;
         }
         if (!metal_run_argmax_pairs_to_token(ctx,
@@ -11964,6 +12177,21 @@ static int metal_run_decode_dense_swiglu_one_q8_0(uocr_metal_context *ctx,
                                                  char *error,
                                                  size_t error_size);
 
+static int metal_run_dense_swiglu_buffer_q4_0(uocr_metal_context *ctx,
+                                             uocr_metal_buffer_slice input,
+                                             const uocr_metal_decoder_binding *gate_weight,
+                                             const uocr_metal_decoder_binding *up_weight,
+                                             const uocr_metal_decoder_binding *down_weight,
+                                             uocr_metal_buffer_slice residual,
+                                             int has_residual,
+                                             uint32_t n_tokens,
+                                             uint32_t intermediate_size,
+                                             uocr_metal_buffer_slice mid,
+                                             uocr_metal_buffer_slice dst,
+                                             const char *op_name,
+                                             char *error,
+                                             size_t error_size);
+
 static int metal_run_decode_dense_swiglu_one_q8_0(uocr_metal_context *ctx,
                                                  uocr_metal_buffer_slice input,
                                                  const uocr_metal_decoder_binding *gate_weight,
@@ -12086,6 +12314,12 @@ static int metal_run_decode_dense_swiglu_one_f16(uocr_metal_context *ctx,
                                                  size_t error_size) {
     if (ctx == NULL || gate_weight == NULL || up_weight == NULL || down_weight == NULL) {
         return metal_fail(error, error_size, "invalid %s decode SwiGLU request", op_name);
+    }
+    if (gate_weight->qtype == UOCR_TENSOR_Q4_0 || up_weight->qtype == UOCR_TENSOR_Q4_0 ||
+        down_weight->qtype == UOCR_TENSOR_Q4_0) {
+        return metal_run_dense_swiglu_buffer_q4_0(ctx, input, gate_weight, up_weight, down_weight,
+                                                 residual, has_residual, 1u, intermediate_size,
+                                                 mid, dst, op_name, error, error_size);
     }
     if (gate_weight->qtype == UOCR_TENSOR_Q8_0 && up_weight->qtype == UOCR_TENSOR_Q8_0 &&
         down_weight->qtype == UOCR_TENSOR_Q8_0) {
@@ -12897,6 +13131,190 @@ static int metal_run_dense_swiglu_buffer_q8_0(uocr_metal_context *ctx,
                                                   error_size);
 }
 
+/*
+ * Q4_0 dense/shared SwiGLU: prefill uses the tiled Q4 GEMM twins, decode the
+ * simdgroup-per-row Q4 GEMV kernels.  Same structure as the Q8 path.
+ */
+static int metal_run_dense_swiglu_buffer_q4_0(uocr_metal_context *ctx,
+                                             uocr_metal_buffer_slice input,
+                                             const uocr_metal_decoder_binding *gate_weight,
+                                             const uocr_metal_decoder_binding *up_weight,
+                                             const uocr_metal_decoder_binding *down_weight,
+                                             uocr_metal_buffer_slice residual,
+                                             int has_residual,
+                                             uint32_t n_tokens,
+                                             uint32_t intermediate_size,
+                                             uocr_metal_buffer_slice mid,
+                                             uocr_metal_buffer_slice dst,
+                                             const char *op_name,
+                                             char *error,
+                                             size_t error_size) {
+    const char *op = op_name != NULL ? op_name : "Metal Q4 SwiGLU";
+    const uint64_t hidden_bytes = (uint64_t)n_tokens * (uint64_t)UOCR_HIDDEN_SIZE * 2u;
+    const uint64_t gate_qweight_bytes = uocr_q4_0_qweight_bytes(intermediate_size, UOCR_HIDDEN_SIZE);
+    const uint64_t gate_qscale_bytes = uocr_q4_0_qscale_bytes(intermediate_size, UOCR_HIDDEN_SIZE, UOCR_Q4_GROUP_SIZE_DEFAULT);
+    const uint64_t down_qweight_bytes = uocr_q4_0_qweight_bytes(UOCR_HIDDEN_SIZE, intermediate_size);
+    const uint64_t down_qscale_bytes = uocr_q4_0_qscale_bytes(UOCR_HIDDEN_SIZE, intermediate_size, UOCR_Q4_GROUP_SIZE_DEFAULT);
+    const uint64_t mid_bytes = (uint64_t)n_tokens * (uint64_t)intermediate_size * 2u;
+    uint64_t gate_values = (uint64_t)n_tokens * (uint64_t)intermediate_size;
+    uint64_t down_values = (uint64_t)n_tokens * (uint64_t)UOCR_HIDDEN_SIZE;
+
+    if (ctx == NULL || gate_weight == NULL || up_weight == NULL || down_weight == NULL || n_tokens == 0u ||
+        intermediate_size == 0u || gate_values > UINT32_MAX || down_values > UINT32_MAX ||
+        gate_qweight_bytes == 0u || gate_qscale_bytes == 0u || down_qweight_bytes == 0u || down_qscale_bytes == 0u ||
+        (intermediate_size % UOCR_Q4_GROUP_SIZE_DEFAULT) != 0u ||
+        gate_weight->qtype != UOCR_TENSOR_Q4_0 || up_weight->qtype != UOCR_TENSOR_Q4_0 ||
+        down_weight->qtype != UOCR_TENSOR_Q4_0 ||
+        gate_weight->group_size != UOCR_Q4_GROUP_SIZE_DEFAULT ||
+        up_weight->group_size != UOCR_Q4_GROUP_SIZE_DEFAULT ||
+        down_weight->group_size != UOCR_Q4_GROUP_SIZE_DEFAULT ||
+        gate_weight->payload_size != gate_qweight_bytes || gate_weight->scale_size != gate_qscale_bytes ||
+        up_weight->payload_size != gate_qweight_bytes || up_weight->scale_size != gate_qscale_bytes ||
+        down_weight->payload_size != down_qweight_bytes || down_weight->scale_size != down_qscale_bytes ||
+        !metal_slice_valid(input, hidden_bytes) || !metal_slice_valid(mid, mid_bytes) ||
+        !metal_slice_valid(dst, hidden_bytes) || (has_residual && !metal_slice_valid(residual, hidden_bytes)) ||
+        !metal_buffer_range_valid(gate_weight->buffer, gate_weight->offset, gate_qweight_bytes) ||
+        !metal_buffer_range_valid(gate_weight->scale_buffer, gate_weight->scale_offset, gate_qscale_bytes) ||
+        !metal_buffer_range_valid(up_weight->buffer, up_weight->offset, gate_qweight_bytes) ||
+        !metal_buffer_range_valid(up_weight->scale_buffer, up_weight->scale_offset, gate_qscale_bytes) ||
+        !metal_buffer_range_valid(down_weight->buffer, down_weight->offset, down_qweight_bytes) ||
+        !metal_buffer_range_valid(down_weight->scale_buffer, down_weight->scale_offset, down_qscale_bytes)) {
+        return metal_fail(error, error_size, "invalid %s request", op);
+    }
+
+    const uint32_t groups_per_row_hidden = UOCR_HIDDEN_SIZE / UOCR_Q4_GROUP_SIZE_DEFAULT;
+    const uint32_t groups_per_row_inter = intermediate_size / UOCR_Q4_GROUP_SIZE_DEFAULT;
+
+    if (n_tokens > 1u && (intermediate_size % UOCR_METAL_GEMM_Q8_BN) == 0u) {
+        /* Prefill: fused gate/up tiled Q4 GEMM + down tiled Q4 GEMM with residual. */
+        @autoreleasepool {
+            id<MTLComputePipelineState> gate_pipeline = metal_get_pipeline(ctx, "uocr_decoder_swiglu_gate_up_gemm_q4_0_to_f16", error, error_size);
+            id<MTLComputePipelineState> down_pipeline = metal_get_pipeline(ctx, "uocr_decoder_gemm_residual_q4_0_to_f16", error, error_size);
+            if (gate_pipeline == nil || down_pipeline == nil) {
+                return 0;
+            }
+            int owned_command_buffer = 0;
+            id<MTLCommandBuffer> cb = metal_command_buffer_for_op(ctx, &owned_command_buffer, op, error, error_size);
+            if (cb == nil) {
+                return 0;
+            }
+            const NSUInteger row_tiles = ((NSUInteger)n_tokens + UOCR_METAL_GEMM_Q8_BM - 1u) / UOCR_METAL_GEMM_Q8_BM;
+
+            uocr_metal_decoder_gemm_q8_params gate_params;
+            memset(&gate_params, 0, sizeof(gate_params));
+            gate_params.m = n_tokens;
+            gate_params.k = UOCR_HIDDEN_SIZE;
+            gate_params.n = intermediate_size;
+            gate_params.groups_per_row = groups_per_row_hidden;
+
+            id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
+            if (enc == nil) {
+                return metal_fail(error, error_size, "failed to create %s gate/up GEMM encoder", op);
+            }
+            [enc setComputePipelineState:gate_pipeline];
+            [enc setBuffer:input.buffer offset:input.offset atIndex:0u];
+            [enc setBuffer:gate_weight->buffer offset:gate_weight->offset atIndex:1u];
+            [enc setBuffer:up_weight->buffer offset:up_weight->offset atIndex:2u];
+            [enc setBuffer:gate_weight->scale_buffer offset:gate_weight->scale_offset atIndex:3u];
+            [enc setBuffer:up_weight->scale_buffer offset:up_weight->scale_offset atIndex:4u];
+            [enc setBuffer:mid.buffer offset:mid.offset atIndex:5u];
+            [enc setBytes:&gate_params length:sizeof(gate_params) atIndex:6u];
+            [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(intermediate_size / UOCR_METAL_GEMM_Q8_BN), row_tiles, 1u)
+                threadsPerThreadgroup:MTLSizeMake(UOCR_METAL_GEMM_Q8_THREADS, 1u, 1u)];
+            [enc endEncoding];
+
+            uocr_metal_decoder_gemm_q8_params down_params;
+            memset(&down_params, 0, sizeof(down_params));
+            down_params.m = n_tokens;
+            down_params.k = intermediate_size;
+            down_params.n = UOCR_HIDDEN_SIZE;
+            down_params.groups_per_row = groups_per_row_inter;
+            down_params.has_residual = has_residual ? 1u : 0u;
+
+            enc = metal_compute_command_encoder(ctx, cb);
+            if (enc == nil) {
+                return metal_fail(error, error_size, "failed to create %s down GEMM encoder", op);
+            }
+            [enc setComputePipelineState:down_pipeline];
+            [enc setBuffer:mid.buffer offset:mid.offset atIndex:0u];
+            [enc setBuffer:down_weight->buffer offset:down_weight->offset atIndex:1u];
+            [enc setBuffer:down_weight->scale_buffer offset:down_weight->scale_offset atIndex:2u];
+            [enc setBuffer:(has_residual ? residual.buffer : input.buffer)
+                    offset:(has_residual ? residual.offset : input.offset)
+                   atIndex:3u];
+            [enc setBuffer:dst.buffer offset:dst.offset atIndex:4u];
+            [enc setBytes:&down_params length:sizeof(down_params) atIndex:5u];
+            [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(UOCR_HIDDEN_SIZE / UOCR_METAL_GEMM_Q8_BN), row_tiles, 1u)
+                threadsPerThreadgroup:MTLSizeMake(UOCR_METAL_GEMM_Q8_THREADS, 1u, 1u)];
+            [enc endEncoding];
+            return metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, op, error, error_size);
+        }
+    }
+    if (n_tokens > 1u) {
+        return metal_fail(error, error_size, "%s: unaligned intermediate size %u for Q4 prefill", op, intermediate_size);
+    }
+
+    @autoreleasepool {
+        /* Decode: simdgroup-per-row Q4 GEMV for gate/up and down. */
+        id<MTLComputePipelineState> gate_pipeline = metal_get_pipeline(ctx, "uocr_decode_swiglu_gate_up_gemv_q4_0_to_f16", error, error_size);
+        id<MTLComputePipelineState> down_pipeline = metal_get_pipeline(ctx, "uocr_decode_linear_residual_gemv_q4_0_to_f16", error, error_size);
+        if (gate_pipeline == nil || down_pipeline == nil) {
+            return 0;
+        }
+        int owned_command_buffer = 0;
+        id<MTLCommandBuffer> cb = metal_command_buffer_for_op(ctx, &owned_command_buffer, op, error, error_size);
+        if (cb == nil) {
+            return 0;
+        }
+
+        uocr_metal_decode_gemv_q8_params gate_params;
+        gate_params.k = UOCR_HIDDEN_SIZE;
+        gate_params.n = intermediate_size;
+        gate_params.groups_per_row = groups_per_row_hidden;
+        gate_params.has_residual = 0u;
+
+        uocr_metal_decode_gemv_q8_params down_params;
+        down_params.k = intermediate_size;
+        down_params.n = UOCR_HIDDEN_SIZE;
+        down_params.groups_per_row = groups_per_row_inter;
+        down_params.has_residual = has_residual ? 1u : 0u;
+
+        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
+        if (enc == nil) {
+            return metal_fail(error, error_size, "failed to create %s gate/up command encoder", op);
+        }
+        const NSUInteger gate_rows_per_tg = metal_decode_gemv_rows_per_threadgroup(gate_pipeline);
+        [enc setComputePipelineState:gate_pipeline];
+        [enc setBuffer:input.buffer offset:input.offset atIndex:0u];
+        [enc setBuffer:gate_weight->buffer offset:gate_weight->offset atIndex:1u];
+        [enc setBuffer:up_weight->buffer offset:up_weight->offset atIndex:2u];
+        [enc setBuffer:gate_weight->scale_buffer offset:gate_weight->scale_offset atIndex:3u];
+        [enc setBuffer:up_weight->scale_buffer offset:up_weight->scale_offset atIndex:4u];
+        [enc setBuffer:mid.buffer offset:mid.offset atIndex:5u];
+        [enc setBytes:&gate_params length:sizeof(gate_params) atIndex:6u];
+        [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)intermediate_size + gate_rows_per_tg - 1u) / gate_rows_per_tg, 1u, 1u)
+             threadsPerThreadgroup:MTLSizeMake(128u, 1u, 1u)];
+        [enc endEncoding];
+
+        enc = metal_compute_command_encoder(ctx, cb);
+        if (enc == nil) {
+            return metal_fail(error, error_size, "failed to create %s down command encoder", op);
+        }
+        const NSUInteger down_rows_per_tg = metal_decode_gemv_rows_per_threadgroup(down_pipeline);
+        [enc setComputePipelineState:down_pipeline];
+        [enc setBuffer:mid.buffer offset:mid.offset atIndex:0u];
+        [enc setBuffer:down_weight->buffer offset:down_weight->offset atIndex:1u];
+        [enc setBuffer:down_weight->scale_buffer offset:down_weight->scale_offset atIndex:2u];
+        [enc setBuffer:(has_residual ? residual.buffer : input.buffer) offset:(has_residual ? residual.offset : input.offset) atIndex:3u];
+        [enc setBuffer:dst.buffer offset:dst.offset atIndex:4u];
+        [enc setBytes:&down_params length:sizeof(down_params) atIndex:5u];
+        [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)UOCR_HIDDEN_SIZE + down_rows_per_tg - 1u) / down_rows_per_tg, 1u, 1u)
+             threadsPerThreadgroup:MTLSizeMake(128u, 1u, 1u)];
+        [enc endEncoding];
+        return metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, op, error, error_size);
+    }
+}
+
 static int metal_run_dense_swiglu_buffer_f16(uocr_metal_context *ctx,
                                              uocr_metal_buffer_slice input,
                                              const uocr_metal_decoder_binding *gate_weight,
@@ -12913,6 +13331,12 @@ static int metal_run_dense_swiglu_buffer_f16(uocr_metal_context *ctx,
                                              size_t error_size) {
     if (ctx == NULL || gate_weight == NULL || up_weight == NULL || down_weight == NULL || n_tokens == 0u) {
         return metal_fail(error, error_size, "invalid %s SwiGLU request", op_name);
+    }
+    if (gate_weight->qtype == UOCR_TENSOR_Q4_0 || up_weight->qtype == UOCR_TENSOR_Q4_0 ||
+        down_weight->qtype == UOCR_TENSOR_Q4_0) {
+        return metal_run_dense_swiglu_buffer_q4_0(ctx, input, gate_weight, up_weight, down_weight,
+                                                 residual, has_residual, n_tokens, intermediate_size,
+                                                 mid, dst, op_name, error, error_size);
     }
     if (gate_weight->qtype == UOCR_TENSOR_Q8_0 && up_weight->qtype == UOCR_TENSOR_Q8_0 &&
         down_weight->qtype == UOCR_TENSOR_Q8_0) {
@@ -13697,6 +14121,284 @@ static int metal_run_moe_interleaved_decode_fused_combine_buffer_q8_0(
     }
 }
 
+/*
+ * Q4_0 expert-bucketed prefill: same four passes as the Q8 path (bucket,
+ * gate/up GEMM, down GEMM, combine); only the GEMM kernels differ (Q4
+ * dequant-on-stage from the group-half-split packing).  The bucketing and
+ * combine kernels are qtype-agnostic and reused as-is.
+ */
+static int metal_run_moe_prefill_bucketed_q4_0(uocr_metal_context *ctx,
+                                               uocr_metal_buffer_slice input,
+                                               uocr_metal_buffer_slice top_ids,
+                                               uocr_metal_buffer_slice top_weights,
+                                               uocr_metal_buffer_slice expert_qweight_slab,
+                                               uocr_metal_buffer_slice expert_qscale_slab,
+                                               uint32_t n_tokens,
+                                               uocr_metal_buffer_slice mid,
+                                               uocr_metal_buffer_slice shared,
+                                               uocr_metal_buffer_slice residual,
+                                               uocr_metal_buffer_slice dst,
+                                               const uocr_metal_moe_prefill_interleaved_q8_params *prefill_params,
+                                               char *error,
+                                               size_t error_size) {
+    const char *op = "prefill routed MoE Q4 bucketed GEMM";
+    uocr_metal_moe_bucketed_prefill_scratch_layout layout;
+    if (ctx == NULL || prefill_params == NULL || n_tokens <= 1u ||
+        !metal_moe_bucketed_prefill_scratch_layout(n_tokens, &layout) ||
+        !uocr_metal_context_ensure_scratch(ctx, UOCR_METAL_SCRATCH_TRANSIENT, layout.total_bytes, 0, error, error_size)) {
+        return metal_fail(error, error_size, "invalid %s request", op);
+    }
+    const uint64_t pair_count = layout.pair_count;
+    const uint64_t pair_rows_offset = layout.pair_rows_offset;
+    const uint64_t expert_offsets_offset = layout.expert_offsets_offset;
+    const uint64_t tile_prefix_offset = layout.tile_prefix_offset;
+    const uint64_t down_out_offset = layout.down_out_offset;
+    id<MTLBuffer> transient = ctx->scratch[UOCR_METAL_SCRATCH_TRANSIENT].buffer;
+    if (transient == nil) {
+        return metal_fail(error, error_size, "%s transient scratch is unavailable", op);
+    }
+    @autoreleasepool {
+        id<MTLComputePipelineState> bucket_pipeline = metal_get_pipeline(ctx, "uocr_moe_prefill_bucket_pairs", error, error_size);
+        id<MTLComputePipelineState> gate_pipeline = metal_get_pipeline(ctx, "uocr_moe_prefill_bucketed_swiglu_gate_up_gemm_q4_0_to_f16", error, error_size);
+        id<MTLComputePipelineState> down_pipeline = metal_get_pipeline(ctx, "uocr_moe_prefill_bucketed_down_gemm_q4_0_to_f16", error, error_size);
+        id<MTLComputePipelineState> combine_pipeline = metal_get_pipeline(ctx, "uocr_moe_prefill_bucketed_combine_f16", error, error_size);
+        if (bucket_pipeline == nil || gate_pipeline == nil || down_pipeline == nil || combine_pipeline == nil) {
+            return 0;
+        }
+        int owned_command_buffer = 0;
+        id<MTLCommandBuffer> cb = metal_command_buffer_for_op(ctx, &owned_command_buffer, op, error, error_size);
+        if (cb == nil) {
+            return 0;
+        }
+        const uint64_t bucketed_start_ns = uocr_profile_now_ns();
+
+        /* Pass 1: bucket (token, expert) pairs by expert. */
+        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
+        if (enc == nil) {
+            return metal_fail(error, error_size, "failed to create %s bucket encoder", op);
+        }
+        struct {
+            uint32_t n_tokens;
+            uint32_t top_k;
+            uint32_t expert_count;
+            uint32_t rows_per_tile;
+        } bucket_params = { n_tokens, UOCR_MOE_TOP_K, UOCR_ROUTED_EXPERTS, UOCR_METAL_GEMM_Q8_BM };
+        [enc setComputePipelineState:bucket_pipeline];
+        [enc setBuffer:top_ids.buffer offset:top_ids.offset atIndex:0u];
+        [enc setBuffer:transient offset:(NSUInteger)pair_rows_offset atIndex:1u];
+        [enc setBuffer:transient offset:(NSUInteger)expert_offsets_offset atIndex:2u];
+        [enc setBuffer:transient offset:(NSUInteger)tile_prefix_offset atIndex:3u];
+        [enc setBytes:&bucket_params length:sizeof(bucket_params) atIndex:4u];
+        [enc dispatchThreadgroups:MTLSizeMake(1u, 1u, 1u) threadsPerThreadgroup:MTLSizeMake(256u, 1u, 1u)];
+        [enc endEncoding];
+
+        const NSUInteger tile_slots = (NSUInteger)((pair_count + UOCR_METAL_GEMM_Q8_BM - 1u) / UOCR_METAL_GEMM_Q8_BM) +
+                                      (NSUInteger)UOCR_ROUTED_EXPERTS;
+
+        /* Pass 2: bucketed gate/up SwiGLU GEMM -> mid. */
+        enc = metal_compute_command_encoder(ctx, cb);
+        if (enc == nil) {
+            return metal_fail(error, error_size, "failed to create %s gate/up encoder", op);
+        }
+        [enc setComputePipelineState:gate_pipeline];
+        [enc setBuffer:input.buffer offset:input.offset atIndex:0u];
+        [enc setBuffer:transient offset:(NSUInteger)pair_rows_offset atIndex:1u];
+        [enc setBuffer:transient offset:(NSUInteger)expert_offsets_offset atIndex:2u];
+        [enc setBuffer:transient offset:(NSUInteger)tile_prefix_offset atIndex:3u];
+        [enc setBuffer:expert_qweight_slab.buffer offset:expert_qweight_slab.offset atIndex:4u];
+        [enc setBuffer:expert_qscale_slab.buffer offset:expert_qscale_slab.offset atIndex:5u];
+        [enc setBuffer:mid.buffer offset:mid.offset atIndex:6u];
+        [enc setBytes:prefill_params length:sizeof(*prefill_params) atIndex:7u];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(UOCR_MOE_EXPERT_INTERMEDIATE / UOCR_METAL_GEMM_Q8_BN), tile_slots, 1u)
+            threadsPerThreadgroup:MTLSizeMake(UOCR_METAL_GEMM_Q8_THREADS, 1u, 1u)];
+        [enc endEncoding];
+
+        /* Pass 3: bucketed down GEMM -> down_out. */
+        enc = metal_compute_command_encoder(ctx, cb);
+        if (enc == nil) {
+            return metal_fail(error, error_size, "failed to create %s down encoder", op);
+        }
+        [enc setComputePipelineState:down_pipeline];
+        [enc setBuffer:mid.buffer offset:mid.offset atIndex:0u];
+        [enc setBuffer:transient offset:(NSUInteger)pair_rows_offset atIndex:1u];
+        [enc setBuffer:transient offset:(NSUInteger)expert_offsets_offset atIndex:2u];
+        [enc setBuffer:transient offset:(NSUInteger)tile_prefix_offset atIndex:3u];
+        [enc setBuffer:expert_qweight_slab.buffer offset:expert_qweight_slab.offset atIndex:4u];
+        [enc setBuffer:expert_qscale_slab.buffer offset:expert_qscale_slab.offset atIndex:5u];
+        [enc setBuffer:transient offset:(NSUInteger)down_out_offset atIndex:6u];
+        [enc setBytes:prefill_params length:sizeof(*prefill_params) atIndex:7u];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(UOCR_HIDDEN_SIZE / UOCR_METAL_GEMM_Q8_BN), tile_slots, 1u)
+            threadsPerThreadgroup:MTLSizeMake(UOCR_METAL_GEMM_Q8_THREADS, 1u, 1u)];
+        [enc endEncoding];
+
+        /* Pass 4: weighted combine with shared experts and residual. */
+        enc = metal_compute_command_encoder(ctx, cb);
+        if (enc == nil) {
+            return metal_fail(error, error_size, "failed to create %s combine encoder", op);
+        }
+        NSUInteger combine_threads = combine_pipeline.threadExecutionWidth;
+        if (combine_threads == 0u) combine_threads = 32u;
+        if (combine_threads > 256u) combine_threads = 256u;
+        [enc setComputePipelineState:combine_pipeline];
+        [enc setBuffer:transient offset:(NSUInteger)down_out_offset atIndex:0u];
+        [enc setBuffer:top_ids.buffer offset:top_ids.offset atIndex:1u];
+        [enc setBuffer:top_weights.buffer offset:top_weights.offset atIndex:2u];
+        [enc setBuffer:shared.buffer offset:shared.offset atIndex:3u];
+        [enc setBuffer:residual.buffer offset:residual.offset atIndex:4u];
+        [enc setBuffer:dst.buffer offset:dst.offset atIndex:5u];
+        [enc setBytes:prefill_params length:sizeof(*prefill_params) atIndex:6u];
+        [enc dispatchThreads:MTLSizeMake((NSUInteger)n_tokens * (NSUInteger)UOCR_HIDDEN_SIZE, 1u, 1u)
+       threadsPerThreadgroup:MTLSizeMake(combine_threads, 1u, 1u)];
+        [enc endEncoding];
+
+        const int ok = metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, op, error, error_size);
+        if (ok) {
+            metal_profile_add_event_now(ctx, "metal.prefill.moe_routed_bucketed_q4", bucketed_start_ns);
+        }
+        return ok;
+    }
+}
+
+/*
+ * Q4_0 routed-MoE fused combine.  Decode (n_tokens == 1) uses the
+ * simdgroup-per-row Q4 GEMV kernels (group-half-split nibble unpack, one
+ * fp16 scale per 64-group); prefill uses the expert-bucketed Q4 GEMM.
+ */
+static int metal_run_moe_interleaved_decode_fused_combine_buffer_q4_0(
+    uocr_metal_context *ctx,
+    uocr_metal_buffer_slice input,
+    uocr_metal_buffer_slice top_ids,
+    uocr_metal_buffer_slice top_weights,
+    uocr_metal_buffer_slice expert_qweight_slab,
+    uocr_metal_buffer_slice expert_qscale_slab,
+    uint32_t n_tokens,
+    uocr_metal_buffer_slice mid,
+    uocr_metal_buffer_slice shared,
+    uocr_metal_buffer_slice residual,
+    uocr_metal_buffer_slice dst,
+    char *error,
+    size_t error_size) {
+    const uint64_t hidden_bytes = (uint64_t)n_tokens * (uint64_t)UOCR_HIDDEN_SIZE * 2u;
+    const uint64_t top_ids_bytes = (uint64_t)n_tokens * (uint64_t)UOCR_MOE_TOP_K * sizeof(uint32_t);
+    const uint64_t top_weights_bytes = (uint64_t)n_tokens * (uint64_t)UOCR_MOE_TOP_K * sizeof(float);
+    const uint64_t mid_bytes = (uint64_t)n_tokens * (uint64_t)UOCR_MOE_TOP_K * (uint64_t)UOCR_MOE_EXPERT_INTERMEDIATE * 2u;
+    const uint64_t projection_values = (uint64_t)UOCR_MOE_EXPERT_INTERMEDIATE * (uint64_t)UOCR_HIDDEN_SIZE;
+    const uint64_t projection_qweight_bytes = projection_values / 2u;
+    const uint64_t projection_scale_values =
+        (uint64_t)UOCR_MOE_EXPERT_INTERMEDIATE * ((uint64_t)UOCR_HIDDEN_SIZE / UOCR_Q4_GROUP_SIZE_DEFAULT);
+    const uint64_t slab_qweight_bytes = projection_qweight_bytes * 3u * (uint64_t)UOCR_ROUTED_EXPERTS;
+    const uint64_t slab_qscale_bytes = projection_scale_values * 3u * (uint64_t)UOCR_ROUTED_EXPERTS * 2u;
+    uint64_t gate_values = (uint64_t)n_tokens * (uint64_t)UOCR_MOE_TOP_K * (uint64_t)UOCR_MOE_EXPERT_INTERMEDIATE;
+    uint64_t down_values = (uint64_t)n_tokens * (uint64_t)UOCR_HIDDEN_SIZE;
+    if (ctx == NULL || n_tokens == 0u || gate_values > UINT32_MAX || down_values > UINT32_MAX ||
+        !metal_slice_valid(input, hidden_bytes) || !metal_slice_valid(top_ids, top_ids_bytes) ||
+        !metal_slice_valid(top_weights, top_weights_bytes) ||
+        !metal_slice_valid(expert_qweight_slab, slab_qweight_bytes) ||
+        !metal_slice_valid(expert_qscale_slab, slab_qscale_bytes) ||
+        !metal_slice_valid(mid, mid_bytes) || !metal_slice_valid(shared, hidden_bytes) ||
+        !metal_slice_valid(residual, hidden_bytes) || !metal_slice_valid(dst, hidden_bytes)) {
+        return metal_fail(error, error_size, "invalid integrated routed MoE Q4 fused-combine request");
+    }
+    if (n_tokens > 1u) {
+        /* Prefill: expert-bucketed tiled Q4 GEMM path.  Same 12-uint ABI as
+         * the Q8 params; qweight strides/offsets are PACKED BYTE counts
+         * (UocrMoeBucketedGemmQ4Params). */
+        uocr_metal_moe_prefill_interleaved_q8_params bucketed_params;
+        bucketed_params.n_tokens = n_tokens;
+        bucketed_params.hidden_size = UOCR_HIDDEN_SIZE;
+        bucketed_params.intermediate_size = UOCR_MOE_EXPERT_INTERMEDIATE;
+        bucketed_params.expert_count = UOCR_ROUTED_EXPERTS;
+        bucketed_params.top_k = UOCR_MOE_TOP_K;
+        bucketed_params.expert_stride_values = (uint32_t)(projection_qweight_bytes * 3u);
+        bucketed_params.up_offset_values = (uint32_t)projection_qweight_bytes;
+        bucketed_params.down_offset_values = (uint32_t)(projection_qweight_bytes * 2u);
+        bucketed_params.expert_scale_stride_values = (uint32_t)(projection_scale_values * 3u);
+        bucketed_params.up_scale_offset_values = (uint32_t)projection_scale_values;
+        bucketed_params.down_scale_offset_values = (uint32_t)(projection_scale_values * 2u);
+        bucketed_params.group_size = UOCR_Q4_GROUP_SIZE_DEFAULT;
+        return metal_run_moe_prefill_bucketed_q4_0(ctx,
+                                                   input,
+                                                   top_ids,
+                                                   top_weights,
+                                                   expert_qweight_slab,
+                                                   expert_qscale_slab,
+                                                   n_tokens,
+                                                   mid,
+                                                   shared,
+                                                   residual,
+                                                   dst,
+                                                   &bucketed_params,
+                                                   error,
+                                                   error_size);
+    }
+    @autoreleasepool {
+        /* Decode (n_tokens == 1): simdgroup-per-row Q4 GEMV kernels. */
+        const uint32_t routed_top_k = (uint32_t)UOCR_METAL_DECODE_MOE_TOP_K;
+        id<MTLComputePipelineState> gate_pipeline = metal_get_pipeline(ctx, "uocr_moe_decode_gate_up_gemv_q4_0_to_f16", error, error_size);
+        id<MTLComputePipelineState> down_combine_pipeline = metal_get_pipeline(ctx, "uocr_moe_decode_down_combine_gemv_q4_0_to_f16", error, error_size);
+        if (gate_pipeline == nil || down_combine_pipeline == nil) {
+            return 0;
+        }
+        int owned_command_buffer = 0;
+        id<MTLCommandBuffer> cb = metal_command_buffer_for_op(ctx, &owned_command_buffer, "integrated routed MoE Q4 fused combine", error, error_size);
+        if (cb == nil) {
+            return 0;
+        }
+        /* Same 12-uint ABI as the Q8 params; qweight strides/offsets are
+         * PACKED BYTE counts for Q4 (UocrMoeDecodeGemvQ4Params). */
+        uocr_metal_moe_prefill_interleaved_q8_params gemv_params;
+        gemv_params.n_tokens = 1u;
+        gemv_params.hidden_size = UOCR_HIDDEN_SIZE;
+        gemv_params.intermediate_size = UOCR_MOE_EXPERT_INTERMEDIATE;
+        gemv_params.expert_count = UOCR_ROUTED_EXPERTS;
+        gemv_params.top_k = routed_top_k;
+        gemv_params.expert_stride_values = (uint32_t)(projection_qweight_bytes * 3u);
+        gemv_params.up_offset_values = (uint32_t)projection_qweight_bytes;
+        gemv_params.down_offset_values = (uint32_t)(projection_qweight_bytes * 2u);
+        gemv_params.expert_scale_stride_values = (uint32_t)(projection_scale_values * 3u);
+        gemv_params.up_scale_offset_values = (uint32_t)projection_scale_values;
+        gemv_params.down_scale_offset_values = (uint32_t)(projection_scale_values * 2u);
+        gemv_params.group_size = UOCR_Q4_GROUP_SIZE_DEFAULT;
+
+        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
+        if (enc == nil) {
+            return metal_fail(error, error_size, "failed to create integrated routed MoE Q4 gate/up encoder");
+        }
+        const NSUInteger gate_rows = (NSUInteger)routed_top_k * (NSUInteger)UOCR_MOE_EXPERT_INTERMEDIATE;
+        const NSUInteger gate_rows_per_tg = metal_decode_gemv_rows_per_threadgroup(gate_pipeline);
+        [enc setComputePipelineState:gate_pipeline];
+        [enc setBuffer:input.buffer offset:input.offset atIndex:0u];
+        [enc setBuffer:top_ids.buffer offset:top_ids.offset atIndex:1u];
+        [enc setBuffer:expert_qweight_slab.buffer offset:expert_qweight_slab.offset atIndex:2u];
+        [enc setBuffer:expert_qscale_slab.buffer offset:expert_qscale_slab.offset atIndex:3u];
+        [enc setBuffer:mid.buffer offset:mid.offset atIndex:4u];
+        [enc setBytes:&gemv_params length:sizeof(gemv_params) atIndex:5u];
+        [enc dispatchThreadgroups:MTLSizeMake((gate_rows + gate_rows_per_tg - 1u) / gate_rows_per_tg, 1u, 1u)
+             threadsPerThreadgroup:MTLSizeMake(128u, 1u, 1u)];
+        [enc endEncoding];
+
+        enc = metal_compute_command_encoder(ctx, cb);
+        if (enc == nil) {
+            return metal_fail(error, error_size, "failed to create integrated routed MoE Q4 down/combine encoder");
+        }
+        const NSUInteger down_rows_per_tg = metal_decode_gemv_rows_per_threadgroup(down_combine_pipeline);
+        [enc setComputePipelineState:down_combine_pipeline];
+        [enc setBuffer:mid.buffer offset:mid.offset atIndex:0u];
+        [enc setBuffer:top_ids.buffer offset:top_ids.offset atIndex:1u];
+        [enc setBuffer:top_weights.buffer offset:top_weights.offset atIndex:2u];
+        [enc setBuffer:expert_qweight_slab.buffer offset:expert_qweight_slab.offset atIndex:3u];
+        [enc setBuffer:expert_qscale_slab.buffer offset:expert_qscale_slab.offset atIndex:4u];
+        [enc setBuffer:shared.buffer offset:shared.offset atIndex:5u];
+        [enc setBuffer:residual.buffer offset:residual.offset atIndex:6u];
+        [enc setBuffer:dst.buffer offset:dst.offset atIndex:7u];
+        [enc setBytes:&gemv_params length:sizeof(gemv_params) atIndex:8u];
+        [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)UOCR_HIDDEN_SIZE + down_rows_per_tg - 1u) / down_rows_per_tg, 1u, 1u)
+             threadsPerThreadgroup:MTLSizeMake(128u, 1u, 1u)];
+        [enc endEncoding];
+        return metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, "integrated routed MoE Q4 fused combine", error, error_size);
+    }
+}
+
 static int metal_run_moe_interleaved_decode_fused_combine_buffer_f16(uocr_metal_context *ctx,
                                                                      uocr_metal_buffer_slice input,
                                                                      uocr_metal_buffer_slice top_ids,
@@ -13713,6 +14415,21 @@ static int metal_run_moe_interleaved_decode_fused_combine_buffer_f16(uocr_metal_
                                                                      size_t error_size) {
     if (expert_qtype == UOCR_TENSOR_Q8_0) {
         return metal_run_moe_interleaved_decode_fused_combine_buffer_q8_0(ctx,
+                                                                          input,
+                                                                          top_ids,
+                                                                          top_weights,
+                                                                          expert_slab,
+                                                                          expert_scale_slab,
+                                                                          n_tokens,
+                                                                          mid,
+                                                                          shared,
+                                                                          residual,
+                                                                          dst,
+                                                                          error,
+                                                                          error_size);
+    }
+    if (expert_qtype == UOCR_TENSOR_Q4_0) {
+        return metal_run_moe_interleaved_decode_fused_combine_buffer_q4_0(ctx,
                                                                           input,
                                                                           top_ids,
                                                                           top_weights,
@@ -15548,6 +16265,7 @@ static int metal_context_assemble_prompt_q8_0_with_table_buffer_to_buffer(uocr_m
                                                                             NSUInteger qweight_offset,
                                                                             id<MTLBuffer> qscale_buffer,
                                                                             NSUInteger qscale_offset,
+                                                                            uint32_t table_qtype,
                                                                             uint32_t table_rows,
                                                                             uint32_t hidden_size,
                                                                             const int32_t *input_ids,
@@ -15564,9 +16282,11 @@ static int metal_context_assemble_prompt_q8_0_with_table_buffer_to_buffer(uocr_m
                                                                             const char *op_name,
                                                                             char *error,
                                                                             size_t error_size) {
-    const char *op = op_name != NULL ? op_name : "Metal Q8 prompt assembly";
+    const char *op = op_name != NULL ? op_name : "Metal quantized prompt assembly";
+    const int use_q4 = table_qtype == UOCR_TENSOR_Q4_0;
     if (ctx == NULL || qweight_buffer == nil || qscale_buffer == nil || input_ids == NULL || dst_buffer == nil ||
-        table_rows == 0u || hidden_size != UOCR_HIDDEN_SIZE || n_tokens == 0u) {
+        table_rows == 0u || hidden_size != UOCR_HIDDEN_SIZE || n_tokens == 0u ||
+        (table_qtype != UOCR_TENSOR_Q8_0 && table_qtype != UOCR_TENSOR_Q4_0)) {
         return metal_fail(error, error_size, "invalid %s request", op);
     }
 
@@ -15601,14 +16321,17 @@ static int metal_context_assemble_prompt_q8_0_with_table_buffer_to_buffer(uocr_m
         return 0;
     }
 
-    const uint64_t qweight_bytes = uocr_q8_0_qweight_bytes(table_rows, hidden_size);
-    const uint64_t qscale_bytes = uocr_q8_0_qscale_bytes(table_rows, hidden_size, UOCR_Q8_GROUP_SIZE_DEFAULT);
+    const uint64_t qweight_bytes = use_q4 ? uocr_q4_0_qweight_bytes(table_rows, hidden_size)
+                                          : uocr_q8_0_qweight_bytes(table_rows, hidden_size);
+    const uint64_t qscale_bytes = use_q4
+                                      ? uocr_q4_0_qscale_bytes(table_rows, hidden_size, UOCR_Q4_GROUP_SIZE_DEFAULT)
+                                      : uocr_q8_0_qscale_bytes(table_rows, hidden_size, UOCR_Q8_GROUP_SIZE_DEFAULT);
     uint64_t token_bytes = 0u;
     uint64_t output_values = 0u;
     uint64_t output_bytes = 0u;
     uint64_t image_values = 0u;
     uint64_t image_bytes = 0u;
-    if (qscale_bytes == 0u ||
+    if (qscale_bytes == 0u || qweight_bytes == 0u ||
         !checked_mul_u64((uint64_t)n_tokens, (uint64_t)sizeof(int32_t), &token_bytes) ||
         !checked_mul_u64((uint64_t)n_tokens, (uint64_t)hidden_size, &output_values) ||
         !checked_mul_u64(output_values, 2u, &output_bytes) ||
@@ -15650,7 +16373,8 @@ static int metal_context_assemble_prompt_q8_0_with_table_buffer_to_buffer(uocr_m
 
     @autoreleasepool {
         id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx,
-                                                                  "uocr_get_rows_q8_0_to_f16_h1280_g64",
+                                                                  use_q4 ? "uocr_get_rows_q4_0_to_f16_h1280_g64"
+                                                                         : "uocr_get_rows_q8_0_to_f16_h1280_g64",
                                                                   error,
                                                                   error_size);
         if (pipeline == nil) {
@@ -15716,7 +16440,7 @@ static int metal_context_assemble_prompt_q8_0_with_table_buffer_to_buffer(uocr_m
         params.logical_width = hidden_size;
         params.physical_width = hidden_size;
         params.n_row_ids = n_tokens;
-        params.row_size = hidden_size;
+        params.row_size = use_q4 ? hidden_size / 2u : hidden_size;
 
         const uint64_t token_gather_start_ns = uocr_profile_now_ns();
         [enc setComputePipelineState:pipeline];
@@ -15785,6 +16509,7 @@ static int metal_context_assemble_prompt_q8_0_with_table_buffer(uocr_metal_conte
                                                                  NSUInteger qweight_offset,
                                                                  id<MTLBuffer> qscale_buffer,
                                                                  NSUInteger qscale_offset,
+                                                                 uint32_t table_qtype,
                                                                  uint32_t table_rows,
                                                                  uint32_t hidden_size,
                                                                  const int32_t *input_ids,
@@ -15822,6 +16547,7 @@ static int metal_context_assemble_prompt_q8_0_with_table_buffer(uocr_metal_conte
                                                                                            qweight_offset,
                                                                                            qscale_buffer,
                                                                                            qscale_offset,
+                                                                                           table_qtype,
                                                                                            table_rows,
                                                                                            hidden_size,
                                                                                            input_ids,
@@ -15922,14 +16648,19 @@ int uocr_metal_context_assemble_prompt_from_model_f16(uocr_metal_context *ctx,
     }
 
     const uocr_metal_tensor_binding_internal *embedding_binding = metal_find_tensor_binding(ctx, UOCR_TENSOR_ID_TOK_EMBED);
-    const int use_q8 = embedding_binding != NULL && embedding_binding->scale_size != 0u;
+    const int use_quant = embedding_binding != NULL && embedding_binding->scale_size != 0u;
+    uint32_t table_qtype = UOCR_TENSOR_F16;
     uint64_t table_bytes = 0u;
     uint64_t scale_bytes = 0u;
-    if (use_q8) {
-        table_bytes = uocr_q8_0_qweight_bytes(UOCR_VOCAB_SIZE, UOCR_HIDDEN_SIZE);
+    if (use_quant) {
+        const uint64_t q4_table_bytes = uocr_q4_0_qweight_bytes(UOCR_VOCAB_SIZE, UOCR_HIDDEN_SIZE);
+        table_qtype = embedding_binding->payload_size == q4_table_bytes ? UOCR_TENSOR_Q4_0 : UOCR_TENSOR_Q8_0;
+        table_bytes = table_qtype == UOCR_TENSOR_Q4_0 ? q4_table_bytes
+                                                      : uocr_q8_0_qweight_bytes(UOCR_VOCAB_SIZE, UOCR_HIDDEN_SIZE);
         scale_bytes = uocr_q8_0_qscale_bytes(UOCR_VOCAB_SIZE, UOCR_HIDDEN_SIZE, UOCR_Q8_GROUP_SIZE_DEFAULT);
-        if (scale_bytes == 0u || embedding_binding->scale_size != scale_bytes) {
-            return metal_fail(error, error_size, "Metal mapped Q8 prompt assembly table metadata mismatch");
+        if (table_bytes == 0u || scale_bytes == 0u || embedding_binding->scale_size != scale_bytes ||
+            embedding_binding->payload_size != table_bytes) {
+            return metal_fail(error, error_size, "Metal mapped quantized prompt assembly table metadata mismatch");
         }
     } else {
         uint64_t table_values = 0u;
@@ -15951,7 +16682,7 @@ int uocr_metal_context_assemble_prompt_from_model_f16(uocr_metal_context *ctx,
         return 0;
     }
 
-    if (use_q8) {
+    if (use_quant) {
         id<MTLBuffer> scale = nil;
         NSUInteger scale_offset = 0u;
         if (!metal_get_mapped_tensor_scale_buffer(ctx,
@@ -15968,6 +16699,7 @@ int uocr_metal_context_assemble_prompt_from_model_f16(uocr_metal_context *ctx,
                                                                      table_offset,
                                                                      scale,
                                                                      scale_offset,
+                                                                     table_qtype,
                                                                      UOCR_VOCAB_SIZE,
                                                                      UOCR_HIDDEN_SIZE,
                                                                      input_ids,
@@ -16113,14 +16845,19 @@ static int metal_context_assemble_prompt_from_model_to_arena_f16(uocr_metal_cont
     (void)output_bytes;
 
     const uocr_metal_tensor_binding_internal *embedding_binding = metal_find_tensor_binding(ctx, UOCR_TENSOR_ID_TOK_EMBED);
-    const int use_q8 = embedding_binding != NULL && embedding_binding->scale_size != 0u;
+    const int use_quant = embedding_binding != NULL && embedding_binding->scale_size != 0u;
+    uint32_t table_qtype = UOCR_TENSOR_F16;
     uint64_t table_bytes = 0u;
     uint64_t scale_bytes = 0u;
-    if (use_q8) {
-        table_bytes = uocr_q8_0_qweight_bytes(UOCR_VOCAB_SIZE, UOCR_HIDDEN_SIZE);
+    if (use_quant) {
+        const uint64_t q4_table_bytes = uocr_q4_0_qweight_bytes(UOCR_VOCAB_SIZE, UOCR_HIDDEN_SIZE);
+        table_qtype = embedding_binding->payload_size == q4_table_bytes ? UOCR_TENSOR_Q4_0 : UOCR_TENSOR_Q8_0;
+        table_bytes = table_qtype == UOCR_TENSOR_Q4_0 ? q4_table_bytes
+                                                      : uocr_q8_0_qweight_bytes(UOCR_VOCAB_SIZE, UOCR_HIDDEN_SIZE);
         scale_bytes = uocr_q8_0_qscale_bytes(UOCR_VOCAB_SIZE, UOCR_HIDDEN_SIZE, UOCR_Q8_GROUP_SIZE_DEFAULT);
-        if (scale_bytes == 0u || embedding_binding->scale_size != scale_bytes) {
-            return metal_fail(error, error_size, "Metal prompt arena Q8 embedding metadata mismatch");
+        if (table_bytes == 0u || scale_bytes == 0u || embedding_binding->scale_size != scale_bytes ||
+            embedding_binding->payload_size != table_bytes) {
+            return metal_fail(error, error_size, "Metal prompt arena quantized embedding metadata mismatch");
         }
     } else {
         uint64_t table_values = 0u;
@@ -16147,7 +16884,7 @@ static int metal_context_assemble_prompt_from_model_to_arena_f16(uocr_metal_cont
         return 0;
     }
 
-    if (use_q8) {
+    if (use_quant) {
         id<MTLBuffer> scale = nil;
         NSUInteger scale_offset = 0u;
         if (!metal_get_mapped_tensor_scale_buffer(ctx,
@@ -16164,6 +16901,7 @@ static int metal_context_assemble_prompt_from_model_to_arena_f16(uocr_metal_cont
                                                                                table_offset,
                                                                                scale,
                                                                                scale_offset,
+                                                                               table_qtype,
                                                                                UOCR_VOCAB_SIZE,
                                                                                UOCR_HIDDEN_SIZE,
                                                                                input_ids,
@@ -16775,11 +17513,15 @@ static int sam_window_partition_geometry(uint32_t grid_w,
     *out_n_windows = (uint32_t)n_windows;
     return 1;
 }
+static int metal_vision_weight_is_quant(const uocr_metal_vision_tensor_f16 *weight) {
+    return weight != NULL && (weight->qtype == UOCR_TENSOR_Q8_0 || weight->qtype == UOCR_TENSOR_Q4_0);
+}
+
 static int metal_vision_weight_slice_ready(const uocr_metal_vision_tensor_f16 *weight) {
     if (weight == NULL) {
         return 0;
     }
-    if (weight->qtype == UOCR_TENSOR_Q8_0) {
+    if (weight->qtype == UOCR_TENSOR_Q8_0 || weight->qtype == UOCR_TENSOR_Q4_0) {
         return weight->slice.buffer != nil && weight->scale_slice.buffer != nil;
     }
     return weight->host_f16 != NULL;
@@ -16991,8 +17733,8 @@ static int metal_context_clip_mlp_batch_workspace_f16_to_slice(uocr_metal_contex
     const uint64_t fc1_bias_bytes = (uint64_t)UOCR_CLIP_MLP_INTERMEDIATE * 2u;
     const uint64_t fc2_weight_bytes = (uint64_t)UOCR_CLIP_HIDDEN_SIZE * (uint64_t)UOCR_CLIP_MLP_INTERMEDIATE * 2u;
     const uint64_t fc2_bias_bytes = (uint64_t)UOCR_CLIP_HIDDEN_SIZE * 2u;
-    const int fc1_is_q8 = block != NULL && block->mlp_fc1_weight.qtype == UOCR_TENSOR_Q8_0;
-    const int fc2_is_q8 = block != NULL && block->mlp_fc2_weight.qtype == UOCR_TENSOR_Q8_0;
+    const int fc1_is_q8 = metal_vision_weight_is_quant(block != NULL ? &block->mlp_fc1_weight : NULL);
+    const int fc2_is_q8 = metal_vision_weight_is_quant(block != NULL ? &block->mlp_fc2_weight : NULL);
     if (ctx == NULL || block == NULL || rows == 0u || scratch == NULL ||
         !checked_mul_u64((uint64_t)rows, (uint64_t)UOCR_CLIP_HIDDEN_SIZE, &hidden_values) ||
         !metal_vision_f16_bytes(hidden_values, &hidden_bytes) ||
@@ -17145,8 +17887,8 @@ static int metal_context_clip_transformer_batch_block_workspace_f16_to_slice(uoc
     const uint64_t qkv_weight_bytes = (uint64_t)UOCR_CLIP_QKV_SIZE * (uint64_t)UOCR_CLIP_HIDDEN_SIZE * 2u;
     const uint64_t qkv_bias_bytes = (uint64_t)UOCR_CLIP_QKV_SIZE * 2u;
     const uint64_t projection_weight_bytes = (uint64_t)UOCR_CLIP_HIDDEN_SIZE * (uint64_t)UOCR_CLIP_HIDDEN_SIZE * 2u;
-    const int qkv_is_q8 = block->qkv_weight.qtype == UOCR_TENSOR_Q8_0;
-    const int out_proj_is_q8 = block->out_proj_weight.qtype == UOCR_TENSOR_Q8_0;
+    const int qkv_is_q8 = metal_vision_weight_is_quant(block != NULL ? &block->qkv_weight : NULL);
+    const int out_proj_is_q8 = metal_vision_weight_is_quant(block != NULL ? &block->out_proj_weight : NULL);
     if (!metal_vision_require_tensor_slice_f16(block->ln1_weight, hidden_parameter_bytes, "CLIP block ln1 weight", error, error_size) ||
         !metal_vision_require_tensor_slice_f16(block->ln1_bias, hidden_parameter_bytes, "CLIP block ln1 bias", error, error_size) ||
         (!qkv_is_q8 &&
@@ -18120,8 +18862,8 @@ static int metal_context_sam_mlp_batch_workspace_f16_to_slice(uocr_metal_context
     const uint64_t lin1_bias_bytes = (uint64_t)UOCR_SAM_MLP_INTERMEDIATE * 2u;
     const uint64_t lin2_weight_bytes = (uint64_t)UOCR_SAM_HIDDEN_SIZE * (uint64_t)UOCR_SAM_MLP_INTERMEDIATE * 2u;
     const uint64_t lin2_bias_bytes = (uint64_t)UOCR_SAM_HIDDEN_SIZE * 2u;
-    const int lin1_is_q8 = block != NULL && block->mlp_lin1_weight.qtype == UOCR_TENSOR_Q8_0;
-    const int lin2_is_q8 = block != NULL && block->mlp_lin2_weight.qtype == UOCR_TENSOR_Q8_0;
+    const int lin1_is_q8 = metal_vision_weight_is_quant(block != NULL ? &block->mlp_lin1_weight : NULL);
+    const int lin2_is_q8 = metal_vision_weight_is_quant(block != NULL ? &block->mlp_lin2_weight : NULL);
     if (ctx == NULL || !metal_sam_transformer_block_slices_have_weights(block) || rows == 0u ||
         !checked_mul_u64((uint64_t)rows, (uint64_t)UOCR_SAM_HIDDEN_SIZE, &hidden_values) ||
         !metal_vision_f16_bytes(hidden_values, &hidden_bytes) ||
@@ -18297,8 +19039,8 @@ static int metal_context_sam_transformer_batch_block_workspace_f16_to_slice(uocr
     const uint64_t projection_weight_bytes = (uint64_t)UOCR_SAM_HIDDEN_SIZE * (uint64_t)UOCR_SAM_HIDDEN_SIZE * 2u;
     const uint64_t rel_h_bytes = (uint64_t)block->rel_pos_h_length * (uint64_t)UOCR_SAM_HEAD_DIM * 2u;
     const uint64_t rel_w_bytes = (uint64_t)block->rel_pos_w_length * (uint64_t)UOCR_SAM_HEAD_DIM * 2u;
-    const int qkv_is_q8 = block->qkv_weight.qtype == UOCR_TENSOR_Q8_0;
-    const int proj_is_q8 = block->proj_weight.qtype == UOCR_TENSOR_Q8_0;
+    const int qkv_is_q8 = metal_vision_weight_is_quant(block != NULL ? &block->qkv_weight : NULL);
+    const int proj_is_q8 = metal_vision_weight_is_quant(block != NULL ? &block->proj_weight : NULL);
     if (!checked_mul_u64((uint64_t)rows, (uint64_t)UOCR_SAM_HIDDEN_SIZE, &hidden_values) ||
         hidden_values > (uint64_t)UINT32_MAX || !metal_vision_f16_bytes(hidden_values, &hidden_bytes) ||
         !checked_mul_u64((uint64_t)attention_rows, (uint64_t)UOCR_SAM_HIDDEN_SIZE, &attention_values) ||
