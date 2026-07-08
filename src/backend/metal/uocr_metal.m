@@ -11707,11 +11707,10 @@ static int metal_run_decode_attention_qkv_one_f16(uocr_metal_context *ctx,
         return metal_fail(error, error_size, "decode attention QKV dispatch size overflow");
     }
     @autoreleasepool {
-        id<MTLComputePipelineState> pipeline = metal_get_decoder_shape_pipeline(ctx, "uocr_attention_qkvo_f16_to_f16", error, error_size);
+        id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, "uocr_attention_qkv_decode_gemv_f16_to_f16", error, error_size);
         if (pipeline == nil) {
             return 0;
         }
-        const NSUInteger threads = metal_power2_threadgroup_width(256u, pipeline.maxTotalThreadsPerThreadgroup);
         int owned_command_buffer = 0;
         id<MTLCommandBuffer> cb = metal_command_buffer_for_op(ctx, &owned_command_buffer, "decode attention QKV", error, error_size);
         if (cb == nil) {
@@ -11726,20 +11725,18 @@ static int metal_run_decode_attention_qkv_one_f16(uocr_metal_context *ctx,
         params.hidden_size = UOCR_HIDDEN_SIZE;
         params.projection_count = 3u;
         params.reserved = 0u;
+        const NSUInteger rows_per_tg = metal_decode_gemv_rows_per_threadgroup(pipeline);
         [enc setComputePipelineState:pipeline];
         [enc setBuffer:src.buffer offset:src.offset atIndex:0u];
         [enc setBuffer:q_weight->buffer offset:q_weight->offset atIndex:1u];
         [enc setBuffer:k_weight->buffer offset:k_weight->offset atIndex:2u];
         [enc setBuffer:v_weight->buffer offset:v_weight->offset atIndex:3u];
-        [enc setBuffer:q_weight->buffer offset:q_weight->offset atIndex:4u];
-        [enc setBuffer:q_dst.buffer offset:q_dst.offset atIndex:5u];
-        [enc setBuffer:k_dst.buffer offset:k_dst.offset atIndex:6u];
-        [enc setBuffer:v_dst.buffer offset:v_dst.offset atIndex:7u];
-        [enc setBuffer:q_dst.buffer offset:q_dst.offset atIndex:8u];
-        [enc setBytes:&params length:sizeof(params) atIndex:9u];
-        [enc setThreadgroupMemoryLength:threads * sizeof(float) atIndex:0u];
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)output_values, 1u, 1u)
-             threadsPerThreadgroup:MTLSizeMake(threads, 1u, 1u)];
+        [enc setBuffer:q_dst.buffer offset:q_dst.offset atIndex:4u];
+        [enc setBuffer:k_dst.buffer offset:k_dst.offset atIndex:5u];
+        [enc setBuffer:v_dst.buffer offset:v_dst.offset atIndex:6u];
+        [enc setBytes:&params length:sizeof(params) atIndex:7u];
+        [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)output_values + rows_per_tg - 1u) / rows_per_tg, 1u, 1u)
+             threadsPerThreadgroup:MTLSizeMake(128u, 1u, 1u)];
         [enc endEncoding];
         return metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, "decode attention QKV", error, error_size);
     }
@@ -11874,11 +11871,10 @@ static int metal_run_decode_attention_output_one_f16(uocr_metal_context *ctx,
         return metal_fail(error, error_size, "invalid decode attention output request");
     }
     @autoreleasepool {
-        id<MTLComputePipelineState> pipeline = metal_get_decoder_shape_pipeline(ctx, "uocr_attention_output_residual_f16_to_f16", error, error_size);
+        id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, "uocr_attention_output_residual_decode_gemv_f16_to_f16", error, error_size);
         if (pipeline == nil) {
             return 0;
         }
-        const NSUInteger threads = metal_power2_threadgroup_width(256u, pipeline.maxTotalThreadsPerThreadgroup);
         int owned_command_buffer = 0;
         id<MTLCommandBuffer> cb = metal_command_buffer_for_op(ctx, &owned_command_buffer, "decode attention output", error, error_size);
         if (cb == nil) {
@@ -11893,15 +11889,15 @@ static int metal_run_decode_attention_output_one_f16(uocr_metal_context *ctx,
         params.hidden_size = UOCR_HIDDEN_SIZE;
         params.reserved0 = 0u;
         params.reserved1 = 0u;
+        const NSUInteger rows_per_tg = metal_decode_gemv_rows_per_threadgroup(pipeline);
         [enc setComputePipelineState:pipeline];
         [enc setBuffer:context.buffer offset:context.offset atIndex:0u];
         [enc setBuffer:o_weight->buffer offset:o_weight->offset atIndex:1u];
         [enc setBuffer:residual.buffer offset:residual.offset atIndex:2u];
         [enc setBuffer:dst.buffer offset:dst.offset atIndex:3u];
         [enc setBytes:&params length:sizeof(params) atIndex:4u];
-        [enc setThreadgroupMemoryLength:threads * sizeof(float) atIndex:0u];
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)output_values, 1u, 1u)
-             threadsPerThreadgroup:MTLSizeMake(threads, 1u, 1u)];
+        [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)output_values + rows_per_tg - 1u) / rows_per_tg, 1u, 1u)
+             threadsPerThreadgroup:MTLSizeMake(128u, 1u, 1u)];
         [enc endEncoding];
         return metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, "decode attention output", error, error_size);
     }
