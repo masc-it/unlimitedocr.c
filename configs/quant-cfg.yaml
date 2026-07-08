@@ -29,10 +29,13 @@ modules:
     projections: [WEIGHT]
     supported: true
 
+  # LM head stores Q4_0 under --qprofile mixed-q4 (fused Q4 simdgroup-per-row
+  # argmax kernel); mixed-q8_0 conversions keep Q8_0.
   - name: lm_head
     family: LM_HEAD
     projections: [WEIGHT]
     supported: true
+    qtype: q4_0
 
   - name: attention_qkv
     family: LAYER_ATTN

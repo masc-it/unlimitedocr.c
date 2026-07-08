@@ -481,6 +481,73 @@ Each step gates the next; the cfg flip is last.
 
 ---
 
+## Extensions: next Q4 modules
+
+With the routed experts shipped, the per-token decode weight traffic is
+~460 MB and re-ranks the remaining Q8 modules.  Extensions follow the same
+per-module discipline: validator + cfg allowance → kernels (probe-first) →
+cfg flip → end-to-end QA.  Attention Q/K/V/O is deliberately **excluded** for
+now (highest quality risk: Q/K errors amplify through RoPE and attention
+logits).
+
+### E1. LM head Q4 (165 MB/token → 83 MB/token) — ✅ shipped, pending QA
+
+Now the single biggest per-token reader: the fused argmax streams the whole
+`[129280, 1280]` matrix every decode token.
+
+**Probe outcome revised the design.**  The Q8 kernel structure (8 lanes/token,
+hidden staged in TG memory) caps Q4 at ~1.1× regardless of load width — the
+TG-load instruction rate does not halve with the weight bytes.  Restructuring
+to one **simdgroup per vocab row** (expert-GEMV style, hidden read through the
+device cache, 32 rows per 1024-thread TG so the `vocab/32` partial layout and
+selection scratch stay shared with Q8) measured **1.18–1.25× vs Q8**
+(~0.15 ms/token) — less than the naive bytes-ratio hope because the argmax
+kernel is simultaneously near the ALU limit, but real and exact.
+
+* [x] Allow `q4_0` for `LM_HEAD/WEIGHT` in quant-cfg schema, model-file
+      validator, and Metal decoder-binding validation.
+* [x] `/tmp` probe: three structures compared (TG-staged 4B/8B/16B loads all
+      ~1.1×; simdgroup-per-row 1.18–1.25× → chosen).
+* [x] `lm_head_q4.metal`: `uocr_lm_head_argmax_q4_0_to_f16` — simdgroup per
+      row, group-half-split unpack, partial score/id outputs unchanged.
+* [x] Host `metal_run_lm_head_argmax_q4_0` + qtype dispatch in the chunk
+      decode step; custom path forced (MPS env selector ignored).
+* [x] Flip `lm_head: qtype: q4_0` in the shipped cfg → QA (planned mixed-q4
+      file: 2.16 GB).
+* [ ] End-to-end QA vs q8/fp16 baselines.
+
+### E2. Shared experts + dense L0 MLP Q4 (102 MB/token → 51 MB/token)
+
+Structural mirrors of existing kernels; note the shared experts run for
+*every* token (no routing redundancy), so quality risk is higher than the
+routed experts were — QA separately from E1.
+
+* [ ] Allow `q4_0` for `MOE_SHARED` and `LAYER_DENSE_MLP` gate/up/down in
+      schema/validators/bindings.
+* [ ] Decode GEMV kernels in `decode_gemv_q4.metal`:
+      `uocr_decode_swiglu_gate_up_gemv_q4_0_to_f16`,
+      `uocr_decode_linear_residual_gemv_q4_0_to_f16` (reuse
+      `uocr_decode_gemv_q4_lane_dot`).
+* [ ] Prefill tiled GEMM kernels in `gemm_q4.metal`:
+      `uocr_decoder_swiglu_gate_up_gemm_q4_0_to_f16`,
+      `uocr_decoder_gemm_residual_q4_0_to_f16` (reuse
+      `uocr_gemm_q4_stage_b`).
+* [ ] Route `metal_run_dense_swiglu_buffer_*` / decode SwiGLU dispatch by
+      qtype.
+* [ ] Flip `moe_shared` first, QA, then `dense_mlp`, QA.
+
+### E4. Embeddings + vision Q4 (file size only)
+
+No decode-speed win (embedding is a row lookup; vision is compute-bound
+prefill), ~250 MB file-size saving combined.  Lowest priority; do only if
+footprint matters.
+
+* [ ] Token embedding: `q4_0` allowance + fused Q4 row-gather kernel
+      (`uocr_get_rows_q4_0_to_f16`).
+* [ ] Vision/projector: Q4 variant of `uocr_vision_gemm_q8_0_to_f16`
+      (stage-B dequant reuses `uocr_gemm_q4_stage_b`); size win only —
+      measure before bothering.
+
 ## Fallback ladder (if full-corpus QA regresses at step 6)
 
 In order, cheapest first — all validated paths exist in the sim data:

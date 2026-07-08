@@ -236,16 +236,34 @@ def test_quant_cfg_v2_qtype_rules() -> None:
     assert cfg.qtype_for(TensorFamily.MOE_EXPERT, TensorProjection.GATE) == "q4_0"
     assert cfg.modules[0].qtype == "q4_0"
 
-    with pytest.raises(ValueError, match="only supported for MOE_EXPERT"):
+    # LM head q4 is allowed (extension E1).
+    lm_cfg = _parse_config(
+        {
+            "version": 2,
+            "group_size": 64,
+            "modules": [
+                {
+                    "name": "lm_head",
+                    "family": "LM_HEAD",
+                    "projections": ["WEIGHT"],
+                    "supported": True,
+                    "qtype": "q4_0",
+                },
+            ],
+        }
+    )
+    assert lm_cfg.qtype_for(TensorFamily.LM_HEAD, TensorProjection.WEIGHT) == "q4_0"
+
+    with pytest.raises(ValueError, match="only supported for"):
         _parse_config(
             {
                 "version": 2,
                 "group_size": 64,
                 "modules": [
                     {
-                        "name": "lm_head",
-                        "family": "LM_HEAD",
-                        "projections": ["WEIGHT"],
+                        "name": "attention_qkv",
+                        "family": "LAYER_ATTN",
+                        "projections": ["Q", "K", "V"],
                         "supported": True,
                         "qtype": "q4_0",
                     },
@@ -257,13 +275,15 @@ def test_quant_cfg_v2_qtype_rules() -> None:
         _parse_config({**base, "version": 1})
 
 
-def test_shipped_quant_cfg_is_v2_with_q4_experts() -> None:
+def test_shipped_quant_cfg_is_v2_with_q4_experts_and_lm_head() -> None:
     cfg = load_default_quant_config()
     assert cfg.version == 2
-    # Routed experts carry the q4_0 override (fused Q4 kernels landed); it only
-    # takes effect under --qprofile mixed-q4, so mixed-q8_0 stays Q8 everywhere.
+    # Routed experts + LM head carry the q4_0 override (fused Q4 kernels
+    # landed); it only takes effect under --qprofile mixed-q4, so mixed-q8_0
+    # stays Q8 everywhere.
     assert cfg.qtype_for(TensorFamily.MOE_EXPERT, TensorProjection.GATE) == "q4_0"
-    assert cfg.qtype_for(TensorFamily.LM_HEAD, TensorProjection.WEIGHT) == "q8_0"
+    assert cfg.qtype_for(TensorFamily.LM_HEAD, TensorProjection.WEIGHT) == "q4_0"
+    assert cfg.qtype_for(TensorFamily.LAYER_ATTN, TensorProjection.Q) == "q8_0"
 
 
 def test_fp16_converter_dry_run_against_cached_header() -> None:

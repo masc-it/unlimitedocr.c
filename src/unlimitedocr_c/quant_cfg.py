@@ -25,8 +25,9 @@ DEFAULT_QUANT_CFG_NAME = "quant-cfg.yaml"
 
 #: qtype names accepted by quant-cfg v2 and the families each is allowed on.
 QUANT_CFG_QTYPES = ("q8_0", "q4_0")
-#: q4_0 is restricted to the routed MoE experts (docs/plan_q4.md §1.3).
-Q4_ALLOWED_FAMILIES = frozenset({TensorFamily.MOE_EXPERT})
+#: q4_0 is restricted to the routed MoE experts and the LM head
+#: (docs/plan_q4.md §1.3 + extension E1).
+Q4_ALLOWED_FAMILIES = frozenset({TensorFamily.MOE_EXPERT, TensorFamily.LM_HEAD})
 
 
 @dataclass(frozen=True)
@@ -117,7 +118,7 @@ def _parse_config(raw: object) -> QuantConfig:
         if qtype == "q4_0" and family not in Q4_ALLOWED_FAMILIES:
             raise ValueError(
                 f"quant-cfg module {name!r} requests q4_0 for family {family.name}; "
-                "q4_0 is only supported for MOE_EXPERT (docs/plan_q4.md)"
+                f"q4_0 is only supported for {sorted(f.name for f in Q4_ALLOWED_FAMILIES)} (docs/plan_q4.md)"
             )
         parsed.append(
             QuantModuleSpec(

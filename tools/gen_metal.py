@@ -22,6 +22,7 @@ ORDER = [
     "sam.metal",
     "gemm_q8.metal",
     "gemm_q4.metal",
+    "lm_head_q4.metal",
     "sam_attention.metal",
     "sam_position.metal",
     "attention_decode.metal",
