@@ -121,17 +121,36 @@ static inline void uocr_lm_head_q8_threadgroup_argmax_pair(thread float &best_sc
     if (local_token < tile_tokens && token_id < vocab_size && group_size != 0u && groups_per_row != 0u) {
         const ulong weight_base = ulong(token_id) * ulong(hidden_size);
         const ulong scale_base = ulong(token_id) * ulong(groups_per_row);
-        for (uint group = 0u; group < groups_per_row; ++group) {
-            const uint group_start = group * group_size;
-            const uint group_end = min(group_start + group_size, hidden_size);
-            const float scale = float(qscale[scale_base + ulong(group)]);
-            /* group_size and lane strides are multiples of 4: char4/half4 runs
-             * stay aligned and inside the group. */
-            for (uint k = group_start + lane * 4u; k + 3u < group_end; k += lanes * 4u) {
-                const char4 w = *(device const char4 *)(qweight + weight_base + ulong(k));
-                const half4 x = *(threadgroup const half4 *)(hidden_tg + k);
-                sum += (float(x.x) * float(w.x) + float(x.y) * float(w.y) +
-                        float(x.z) * float(w.z) + float(x.w) * float(w.w)) * scale;
+        if (lanes * 8u == group_size) {
+            /* Fast path (default shape: 8 lanes x 64-wide groups): each lane
+             * covers one aligned 8-byte run per group, so the weight row is
+             * streamed with 8-byte loads instead of 4-byte loads. */
+            for (uint group = 0u; group < groups_per_row; ++group) {
+                const uint k = group * group_size + lane * 8u;
+                const float scale = float(qscale[scale_base + ulong(group)]);
+                const char4 w0 = *(device const char4 *)(qweight + weight_base + ulong(k));
+                const char4 w1 = *(device const char4 *)(qweight + weight_base + ulong(k) + 4u);
+                const half4 x0 = *(threadgroup const half4 *)(hidden_tg + k);
+                const half4 x1 = *(threadgroup const half4 *)(hidden_tg + k + 4u);
+                float d = float(x0.x) * float(w0.x) + float(x0.y) * float(w0.y) +
+                          float(x0.z) * float(w0.z) + float(x0.w) * float(w0.w);
+                d += float(x1.x) * float(w1.x) + float(x1.y) * float(w1.y) +
+                     float(x1.z) * float(w1.z) + float(x1.w) * float(w1.w);
+                sum += d * scale;
+            }
+        } else {
+            for (uint group = 0u; group < groups_per_row; ++group) {
+                const uint group_start = group * group_size;
+                const uint group_end = min(group_start + group_size, hidden_size);
+                const float scale = float(qscale[scale_base + ulong(group)]);
+                /* group_size and lane strides are multiples of 4: char4/half4 runs
+                 * stay aligned and inside the group. */
+                for (uint k = group_start + lane * 4u; k + 3u < group_end; k += lanes * 4u) {
+                    const char4 w = *(device const char4 *)(qweight + weight_base + ulong(k));
+                    const half4 x = *(threadgroup const half4 *)(hidden_tg + k);
+                    sum += (float(x.x) * float(w.x) + float(x.y) * float(w.y) +
+                            float(x.z) * float(w.z) + float(x.w) * float(w.w)) * scale;
+                }
             }
         }
     }
