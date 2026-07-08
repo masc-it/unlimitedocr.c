@@ -489,6 +489,27 @@ static inline void uocr_gemm_q8_stage_a_gathered(device const half *src,
     }
 }
 
+// Stage an fp16 W tile transposed to [BK][BN] (k-major for B-side MMA loads).
+static inline void uocr_gemm_f16_stage_b(device const half *weight,
+                                         uint K,
+                                         uint col_base,
+                                         uint k_base,
+                                         uint tid,
+                                         threadgroup half *sb) {
+    const uint chunks_per_col = UOCR_GEMM_Q8_BK / UOCR_HALF4_WIDTH;
+    for (uint i = tid; i < UOCR_GEMM_Q8_BN * chunks_per_col; i += UOCR_GEMM_Q8_THREADS) {
+        const uint wn = i / chunks_per_col;
+        const uint wk = (i - wn * chunks_per_col) * UOCR_HALF4_WIDTH;
+        const uint wcol = col_base + wn;
+        const uint k0 = k_base + wk;
+        const half4 value = uocr_load_half4(weight, (ulong)wcol * K + k0);
+        sb[(wk + 0u) * UOCR_GEMM_Q8_BN + wn] = value.x;
+        sb[(wk + 1u) * UOCR_GEMM_Q8_BN + wn] = value.y;
+        sb[(wk + 2u) * UOCR_GEMM_Q8_BN + wn] = value.z;
+        sb[(wk + 3u) * UOCR_GEMM_Q8_BN + wn] = value.w;
+    }
+}
+
 // Bucketed gate/up GEMM: mid[pair, col] = silu(src_t @ Wg_e^T) * (src_t @ Wu_e^T)
 // for every pair (t, e) in the tile's bucket.
 [[max_total_threads_per_threadgroup(UOCR_GEMM_Q8_THREADS)]] kernel void uocr_moe_prefill_bucketed_swiglu_gate_up_gemm_q8_0_to_f16(
@@ -637,6 +658,147 @@ static inline void uocr_gemm_q8_stage_a_gathered(device const half *src,
     }
 }
 
+// fp16 bucketed gate/up GEMM.  Same tiling as the Q8 path, but stages fp16
+// expert weight tiles directly instead of dequantizing into B-side smem.
+[[max_total_threads_per_threadgroup(UOCR_GEMM_Q8_THREADS)]] kernel void uocr_moe_prefill_bucketed_swiglu_gate_up_gemm_f16_to_f16(
+    device const half *src [[buffer(0)]],
+    device const uint *pair_rows [[buffer(1)]],
+    device const uint *expert_offsets [[buffer(2)]],
+    device const uint *tile_prefix [[buffer(3)]],
+    device const half *expert_slab [[buffer(4)]],
+    device half *mid [[buffer(5)]],
+    constant UocrMoeBucketedGemmQ8Params &params [[buffer(6)]],
+    uint2 tgpig [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float smem[2u * UOCR_GEMM_Q8_BM * UOCR_GEMM_Q8_BN];
+    threadgroup uint tile_pairs[UOCR_GEMM_Q8_BM];
+    threadgroup half *sa = (threadgroup half *)smem;
+    threadgroup half *sb_gate = sa + UOCR_GEMM_Q8_BM * UOCR_GEMM_Q8_BK;
+    threadgroup half *sb_up = sb_gate + UOCR_GEMM_Q8_BK * UOCR_GEMM_Q8_BN;
+    threadgroup float *sc_gate = smem;
+    threadgroup float *sc_up = smem + UOCR_GEMM_Q8_BM * UOCR_GEMM_Q8_BN;
+
+    uint expert = 0u;
+    uint bucket_start = 0u;
+    uint bucket_rows = 0u;
+    if (!uocr_moe_bucket_tile_lookup(tile_prefix, expert_offsets, params.expert_count,
+                                     tgpig.y, UOCR_GEMM_Q8_BM, expert, bucket_start, bucket_rows)) {
+        return;
+    }
+    uocr_moe_bucket_stage_rows(pair_rows, bucket_start, bucket_rows, tid, tile_pairs);
+
+    const uint K = params.hidden_size;
+    const uint col_base = tgpig.x * UOCR_GEMM_Q8_BN;
+    device const half *gate_weight = expert_slab + (ulong)expert * params.expert_stride_values;
+    device const half *up_weight = gate_weight + params.up_offset_values;
+
+    simdgroup_float8x8 mc_gate[4][2];
+    simdgroup_float8x8 mc_up[4][2];
+    for (uint i = 0u; i < 4u; ++i) {
+        for (uint j = 0u; j < 2u; ++j) {
+            mc_gate[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+            mc_up[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        }
+    }
+    const uint sg_row = (sgitg / 2u) * 32u;
+    const uint sg_col = (sgitg % 2u) * 16u;
+
+    for (uint k_base = 0u; k_base < K; k_base += UOCR_GEMM_Q8_BK) {
+        uocr_gemm_q8_stage_a_gathered(src, K, k_base, params.top_k, tile_pairs, tid, sa);
+        uocr_gemm_f16_stage_b(gate_weight, K, col_base, k_base, tid, sb_gate);
+        uocr_gemm_f16_stage_b(up_weight, K, col_base, k_base, tid, sb_up);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uocr_gemm_q8_mma_tile(sa, sb_gate, sg_row, sg_col, mc_gate);
+        uocr_gemm_q8_mma_tile(sa, sb_up, sg_row, sg_col, mc_up);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    for (uint i = 0u; i < 4u; ++i) {
+        for (uint j = 0u; j < 2u; ++j) {
+            simdgroup_store(mc_gate[i][j], sc_gate + (sg_row + i * 8u) * UOCR_GEMM_Q8_BN + sg_col + j * 8u, UOCR_GEMM_Q8_BN);
+            simdgroup_store(mc_up[i][j], sc_up + (sg_row + i * 8u) * UOCR_GEMM_Q8_BN + sg_col + j * 8u, UOCR_GEMM_Q8_BN);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint i = tid; i < UOCR_GEMM_Q8_BM * UOCR_GEMM_Q8_BN; i += UOCR_GEMM_Q8_THREADS) {
+        const uint mrow = i / UOCR_GEMM_Q8_BN;
+        const uint col = col_base + (i - mrow * UOCR_GEMM_Q8_BN);
+        const uint pair = tile_pairs[mrow];
+        if (pair != 0xFFFFFFFFu && col < params.intermediate_size) {
+            const float gate = sc_gate[i];
+            const float silu = gate / (1.0f + exp(-gate));
+            mid[(ulong)pair * params.intermediate_size + col] = half(silu * sc_up[i]);
+        }
+    }
+}
+
+// fp16 bucketed down GEMM: down_out[pair, col] = mid[pair, :] @ Wd_e^T.
+[[max_total_threads_per_threadgroup(UOCR_GEMM_Q8_THREADS)]] kernel void uocr_moe_prefill_bucketed_down_gemm_f16_to_f16(
+    device const half *mid [[buffer(0)]],
+    device const uint *pair_rows [[buffer(1)]],
+    device const uint *expert_offsets [[buffer(2)]],
+    device const uint *tile_prefix [[buffer(3)]],
+    device const half *expert_slab [[buffer(4)]],
+    device half *down_out [[buffer(5)]],
+    constant UocrMoeBucketedGemmQ8Params &params [[buffer(6)]],
+    uint2 tgpig [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float smem[UOCR_GEMM_Q8_BM * UOCR_GEMM_Q8_BN];
+    threadgroup uint tile_pairs[UOCR_GEMM_Q8_BM];
+    threadgroup half *sa = (threadgroup half *)smem;
+    threadgroup half *sb = sa + UOCR_GEMM_Q8_BM * UOCR_GEMM_Q8_BK;
+    threadgroup float *sc = smem;
+
+    uint expert = 0u;
+    uint bucket_start = 0u;
+    uint bucket_rows = 0u;
+    if (!uocr_moe_bucket_tile_lookup(tile_prefix, expert_offsets, params.expert_count,
+                                     tgpig.y, UOCR_GEMM_Q8_BM, expert, bucket_start, bucket_rows)) {
+        return;
+    }
+    uocr_moe_bucket_stage_rows(pair_rows, bucket_start, bucket_rows, tid, tile_pairs);
+
+    const uint K = params.intermediate_size;
+    const uint col_base = tgpig.x * UOCR_GEMM_Q8_BN;
+    device const half *down_weight = expert_slab + (ulong)expert * params.expert_stride_values + params.down_offset_values;
+
+    simdgroup_float8x8 mc[4][2];
+    for (uint i = 0u; i < 4u; ++i) {
+        for (uint j = 0u; j < 2u; ++j) {
+            mc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        }
+    }
+    const uint sg_row = (sgitg / 2u) * 32u;
+    const uint sg_col = (sgitg % 2u) * 16u;
+
+    for (uint k_base = 0u; k_base < K; k_base += UOCR_GEMM_Q8_BK) {
+        uocr_gemm_q8_stage_a_gathered(mid, K, k_base, 1u, tile_pairs, tid, sa);
+        uocr_gemm_f16_stage_b(down_weight, K, col_base, k_base, tid, sb);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uocr_gemm_q8_mma_tile(sa, sb, sg_row, sg_col, mc);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    for (uint i = 0u; i < 4u; ++i) {
+        for (uint j = 0u; j < 2u; ++j) {
+            simdgroup_store(mc[i][j], sc + (sg_row + i * 8u) * UOCR_GEMM_Q8_BN + sg_col + j * 8u, UOCR_GEMM_Q8_BN);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint i = tid; i < UOCR_GEMM_Q8_BM * UOCR_GEMM_Q8_BN; i += UOCR_GEMM_Q8_THREADS) {
+        const uint mrow = i / UOCR_GEMM_Q8_BN;
+        const uint col = col_base + (i - mrow * UOCR_GEMM_Q8_BN);
+        const uint pair = tile_pairs[mrow];
+        if (pair != 0xFFFFFFFFu && col < params.hidden_size) {
+            down_out[(ulong)pair * params.hidden_size + col] = half(sc[i]);
+        }
+    }
+}
+
 // Weighted combine: dst[t, c] = shared + residual + sum_rank w[t,rank] * down_out[pair, c].
 kernel void uocr_moe_prefill_bucketed_combine_f16(
     device const half *down_out [[buffer(0)]],
@@ -661,4 +823,33 @@ kernel void uocr_moe_prefill_bucketed_combine_f16(
         }
     }
     dst[gid] = half(sum + float(shared[gid]) + float(residual[gid]));
+}
+
+// fp16 prefill compatibility combine: preserve the previous fp16 fused-combine
+// contract by rounding the routed contribution to half before adding shared and
+// residual.  The bucketed GEMM already materializes per-pair down_out as fp16.
+kernel void uocr_moe_prefill_bucketed_combine_round_routed_f16(
+    device const half *down_out [[buffer(0)]],
+    device const uint *top_expert_ids [[buffer(1)]],
+    device const float *top_weights [[buffer(2)]],
+    device const half *shared [[buffer(3)]],
+    device const half *residual [[buffer(4)]],
+    device half *dst [[buffer(5)]],
+    constant UocrMoeBucketedGemmQ8Params &params [[buffer(6)]],
+    uint gid [[thread_position_in_grid]]) {
+    const uint hidden_size = params.hidden_size;
+    const uint token = gid / hidden_size;
+    const uint col = gid - token * hidden_size;
+    if (token >= params.n_tokens) {
+        return;
+    }
+    float sum = 0.0f;
+    for (uint rank = 0u; rank < params.top_k; ++rank) {
+        const uint pair = token * params.top_k + rank;
+        if (top_expert_ids[pair] < params.expert_count) {
+            sum += top_weights[pair] * float(down_out[(ulong)pair * hidden_size + col]);
+        }
+    }
+    const float routed = float(half(sum));
+    dst[gid] = half(routed + float(shared[gid]) + float(residual[gid]));
 }

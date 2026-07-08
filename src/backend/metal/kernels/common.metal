@@ -124,6 +124,26 @@ static inline half4 uocr_zero_half4() {
     return half4(half(0.0h), half(0.0h), half(0.0h), half(0.0h));
 }
 
+/* Lane-local fp16 GEMV dot for decode kernels.  One simdgroup owns one
+ * output row; each lane processes half4 chunks and the caller reduces with
+ * simd_sum.  All decode K dimensions in Unlimited-OCR are multiples of 4. */
+static inline float uocr_decode_gemv_f16_lane_dot(device const half *x,
+                                                  device const half *w_row,
+                                                  uint k,
+                                                  uint lane,
+                                                  uint simd_width) {
+    float sum = 0.0f;
+    const uint chunks = k / UOCR_HALF4_WIDTH;
+    for (uint c = lane; c < chunks; c += simd_width) {
+        const uint kk = c * UOCR_HALF4_WIDTH;
+        const half4 xv = uocr_load_half4(x, ulong(kk));
+        const half4 wv = uocr_load_half4(w_row, ulong(kk));
+        sum += float(xv.x) * float(wv.x) + float(xv.y) * float(wv.y) +
+               float(xv.z) * float(wv.z) + float(xv.w) * float(wv.w);
+    }
+    return sum;
+}
+
 static inline uint uocr_flash_lane_dim(uint lane, uint component, uint simd_width) {
     return lane + component * simd_width;
 }

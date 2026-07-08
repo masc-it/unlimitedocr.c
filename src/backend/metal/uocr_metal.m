@@ -1239,6 +1239,13 @@ typedef struct uocr_metal_decode_gemv_q8_params {
     uint32_t has_residual;
 } uocr_metal_decode_gemv_q8_params;
 
+typedef struct uocr_metal_decode_gemv_f16_params {
+    uint32_t k;
+    uint32_t n;
+    uint32_t has_residual;
+    uint32_t reserved;
+} uocr_metal_decode_gemv_f16_params;
+
 typedef struct uocr_metal_decoder_gemm_q8_params {
     uint32_t m;
     uint32_t k;
@@ -1325,6 +1332,8 @@ _Static_assert(sizeof(uocr_metal_decoder_gemm_q8_params) == 32u,
                "uocr_metal_decoder_gemm_q8_params ABI mismatch");
 _Static_assert(sizeof(uocr_metal_decode_gemv_q8_params) == 16u,
                "uocr_metal_decode_gemv_q8_params ABI mismatch");
+_Static_assert(sizeof(uocr_metal_decode_gemv_f16_params) == 16u,
+               "uocr_metal_decode_gemv_f16_params ABI mismatch");
 _Static_assert(sizeof(uocr_metal_get_rows_q8_params) == 32u,
                "uocr_metal_get_rows_q8_params ABI mismatch");
 _Static_assert(sizeof(uocr_metal_sam_layernorm2d_params) == 20u,
@@ -12056,22 +12065,9 @@ static int metal_run_decode_dense_swiglu_one_f16(uocr_metal_context *ctx,
         return metal_fail(error, error_size, "invalid %s decode SwiGLU request", op_name);
     }
     @autoreleasepool {
-        const int use_tiled_shared_gate_up = intermediate_size == UOCR_MOE_SHARED_INTERMEDIATE;
-        id<MTLComputePipelineState> gate_pipeline = metal_get_decoder_shape_pipeline(ctx,
-                                                                                     use_tiled_shared_gate_up ?
-                                                                                         "uocr_dense_swiglu_shared_gate_up_tile4_f16" :
-                                                                                         "uocr_dense_swiglu_gate_up_f16",
-                                                                                     error,
-                                                                                     error_size);
-        if (gate_pipeline == nil) {
-            return 0;
-        }
-        if (use_tiled_shared_gate_up &&
-            gate_pipeline.maxTotalThreadsPerThreadgroup < (NSUInteger)UOCR_METAL_MOE_SHARED_GATE_UP_TILED_THREADS) {
-            return metal_fail(error, error_size, "%s decode tiled shared gate/up pipeline does not support 1024 threads", op_name);
-        }
-        id<MTLComputePipelineState> down_pipeline = metal_get_decoder_shape_pipeline(ctx, "uocr_dense_swiglu_down_f16_to_f16", error, error_size);
-        if (down_pipeline == nil) {
+        id<MTLComputePipelineState> gate_pipeline = metal_get_pipeline(ctx, "uocr_decode_swiglu_gate_up_gemv_f16_to_f16", error, error_size);
+        id<MTLComputePipelineState> down_pipeline = metal_get_pipeline(ctx, "uocr_decode_linear_residual_gemv_f16_to_f16", error, error_size);
+        if (gate_pipeline == nil || down_pipeline == nil) {
             return 0;
         }
         int owned_command_buffer = 0;
@@ -12079,48 +12075,46 @@ static int metal_run_decode_dense_swiglu_one_f16(uocr_metal_context *ctx,
         if (cb == nil) {
             return 0;
         }
-        uocr_metal_dense_swiglu_params params;
-        params.n_tokens = 1u;
-        params.hidden_size = UOCR_HIDDEN_SIZE;
-        params.intermediate_size = intermediate_size;
-        params.has_residual = has_residual ? 1u : 0u;
+
+        uocr_metal_decode_gemv_f16_params gate_params;
+        memset(&gate_params, 0, sizeof(gate_params));
+        gate_params.k = UOCR_HIDDEN_SIZE;
+        gate_params.n = intermediate_size;
+
+        uocr_metal_decode_gemv_f16_params down_params;
+        memset(&down_params, 0, sizeof(down_params));
+        down_params.k = intermediate_size;
+        down_params.n = UOCR_HIDDEN_SIZE;
+        down_params.has_residual = has_residual ? 1u : 0u;
+
         id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
         if (enc == nil) {
             return metal_fail(error, error_size, "failed to create %s decode gate/up command encoder", op_name);
         }
-        const NSUInteger gate_threads = use_tiled_shared_gate_up ?
-            metal_power2_threadgroup_width((NSUInteger)UOCR_METAL_MOE_SHARED_GATE_UP_TILED_THREADS,
-                                           gate_pipeline.maxTotalThreadsPerThreadgroup) :
-            metal_power2_threadgroup_width(64u, gate_pipeline.maxTotalThreadsPerThreadgroup);
-        const NSUInteger gate_threadgroups = use_tiled_shared_gate_up ?
-            ((NSUInteger)intermediate_size + (NSUInteger)UOCR_METAL_MOE_SHARED_GATE_UP_TILE_COLUMNS - 1u) /
-                (NSUInteger)UOCR_METAL_MOE_SHARED_GATE_UP_TILE_COLUMNS :
-            (NSUInteger)gate_values;
+        const NSUInteger gate_rows_per_tg = metal_decode_gemv_rows_per_threadgroup(gate_pipeline);
         [enc setComputePipelineState:gate_pipeline];
         [enc setBuffer:input.buffer offset:input.offset atIndex:0u];
         [enc setBuffer:gate_weight->buffer offset:gate_weight->offset atIndex:1u];
         [enc setBuffer:up_weight->buffer offset:up_weight->offset atIndex:2u];
         [enc setBuffer:mid.buffer offset:mid.offset atIndex:3u];
-        [enc setBytes:&params length:sizeof(params) atIndex:4u];
-        [enc setThreadgroupMemoryLength:gate_threads * 2u * sizeof(float) atIndex:0u];
-        [enc dispatchThreadgroups:MTLSizeMake(gate_threadgroups, 1u, 1u)
-             threadsPerThreadgroup:MTLSizeMake(gate_threads, 1u, 1u)];
+        [enc setBytes:&gate_params length:sizeof(gate_params) atIndex:4u];
+        [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)intermediate_size + gate_rows_per_tg - 1u) / gate_rows_per_tg, 1u, 1u)
+             threadsPerThreadgroup:MTLSizeMake(128u, 1u, 1u)];
         [enc endEncoding];
 
         enc = metal_compute_command_encoder(ctx, cb);
         if (enc == nil) {
             return metal_fail(error, error_size, "failed to create %s decode down command encoder", op_name);
         }
-        const NSUInteger down_threads = metal_power2_threadgroup_width(256u, down_pipeline.maxTotalThreadsPerThreadgroup);
+        const NSUInteger down_rows_per_tg = metal_decode_gemv_rows_per_threadgroup(down_pipeline);
         [enc setComputePipelineState:down_pipeline];
         [enc setBuffer:mid.buffer offset:mid.offset atIndex:0u];
         [enc setBuffer:down_weight->buffer offset:down_weight->offset atIndex:1u];
         [enc setBuffer:(has_residual ? residual.buffer : input.buffer) offset:(has_residual ? residual.offset : input.offset) atIndex:2u];
         [enc setBuffer:dst.buffer offset:dst.offset atIndex:3u];
-        [enc setBytes:&params length:sizeof(params) atIndex:4u];
-        [enc setThreadgroupMemoryLength:down_threads * sizeof(float) atIndex:0u];
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)down_values, 1u, 1u)
-             threadsPerThreadgroup:MTLSizeMake(down_threads, 1u, 1u)];
+        [enc setBytes:&down_params length:sizeof(down_params) atIndex:4u];
+        [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)UOCR_HIDDEN_SIZE + down_rows_per_tg - 1u) / down_rows_per_tg, 1u, 1u)
+             threadsPerThreadgroup:MTLSizeMake(128u, 1u, 1u)];
         [enc endEncoding];
         return metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, op_name, error, error_size);
     }
@@ -13139,11 +13133,79 @@ static int metal_run_moe_interleaved_decode_fused_combine_buffer_q8_0(
     char *error,
     size_t error_size);
 
+typedef struct uocr_metal_moe_bucketed_prefill_scratch_layout {
+    uint64_t pair_count;
+    uint64_t pair_rows_offset;
+    uint64_t expert_offsets_offset;
+    uint64_t tile_prefix_offset;
+    uint64_t down_out_offset;
+    uint64_t total_bytes;
+} uocr_metal_moe_bucketed_prefill_scratch_layout;
+
+static int metal_moe_bucketed_prefill_scratch_layout(uint32_t n_tokens,
+                                                     uocr_metal_moe_bucketed_prefill_scratch_layout *layout) {
+    if (layout == NULL || n_tokens == 0u) {
+        return 0;
+    }
+    memset(layout, 0, sizeof(*layout));
+    uint64_t pair_count = 0u;
+    uint64_t pair_rows_bytes = 0u;
+    uint64_t prefix_bytes = 0u;
+    uint64_t down_out_values = 0u;
+    uint64_t down_out_bytes = 0u;
+    uint64_t expert_offsets_offset = 0u;
+    uint64_t tile_prefix_offset = 0u;
+    uint64_t down_out_offset = 0u;
+    uint64_t total_bytes = 0u;
+    if (!checked_mul_u64((uint64_t)n_tokens, (uint64_t)UOCR_MOE_TOP_K, &pair_count) ||
+        pair_count > (uint64_t)UINT32_MAX ||
+        !checked_mul_u64(pair_count, (uint64_t)sizeof(uint32_t), &pair_rows_bytes) ||
+        !align_up_u64_checked(pair_rows_bytes, 16u, &pair_rows_bytes) ||
+        !checked_mul_u64((uint64_t)UOCR_ROUTED_EXPERTS + 1u, (uint64_t)sizeof(uint32_t), &prefix_bytes) ||
+        !align_up_u64_checked(prefix_bytes, 16u, &prefix_bytes) ||
+        !checked_mul_u64(pair_count, (uint64_t)UOCR_HIDDEN_SIZE, &down_out_values) ||
+        !checked_mul_u64(down_out_values, 2u, &down_out_bytes) ||
+        !checked_add_u64(pair_rows_bytes, prefix_bytes, &tile_prefix_offset) ||
+        !checked_add_u64(tile_prefix_offset, prefix_bytes, &down_out_offset) ||
+        !checked_add_u64(down_out_offset, down_out_bytes, &total_bytes) ||
+        total_bytes > (uint64_t)NSUIntegerMax) {
+        return 0;
+    }
+    expert_offsets_offset = pair_rows_bytes;
+    layout->pair_count = pair_count;
+    layout->pair_rows_offset = 0u;
+    layout->expert_offsets_offset = expert_offsets_offset;
+    layout->tile_prefix_offset = tile_prefix_offset;
+    layout->down_out_offset = down_out_offset;
+    layout->total_bytes = total_bytes;
+    return 1;
+}
+
+static int metal_preallocate_moe_bucketed_prefill_transient_scratch(uocr_metal_context *ctx,
+                                                                    uint32_t n_tokens,
+                                                                    char *error,
+                                                                    size_t error_size) {
+    if (n_tokens <= 1u) {
+        return 1;
+    }
+    uocr_metal_moe_bucketed_prefill_scratch_layout layout;
+    if (!metal_moe_bucketed_prefill_scratch_layout(n_tokens, &layout) ||
+        !uocr_metal_context_ensure_scratch(ctx,
+                                           UOCR_METAL_SCRATCH_TRANSIENT,
+                                           layout.total_bytes,
+                                           0,
+                                           error,
+                                           error_size)) {
+        return metal_fail(error, error_size, "Metal bucketed MoE prefill transient scratch allocation failed");
+    }
+    return 1;
+}
+
 /*
  * Expert-bucketed routed-MoE prefill (mul_mm_id style): bucket the
- * n_tokens*top_k (token, expert) pairs by expert on-GPU, then run tiled Q8
- * GEMMs per bucket so each dequantized expert weight tile is reused across a
- * 64-row block instead of being re-read per (token, expert) pair.
+ * n_tokens*top_k (token, expert) pairs by expert on-GPU, then run tiled GEMMs
+ * per bucket so each expert weight tile is reused across a 64-row block
+ * instead of being re-read per (token, expert) pair.
  */
 static int metal_run_moe_prefill_bucketed_q8_0(uocr_metal_context *ctx,
                                                uocr_metal_buffer_slice input,
@@ -13160,20 +13222,17 @@ static int metal_run_moe_prefill_bucketed_q8_0(uocr_metal_context *ctx,
                                                char *error,
                                                size_t error_size) {
     const char *op = "prefill routed MoE Q8 bucketed GEMM";
-    const uint64_t pair_count = (uint64_t)n_tokens * (uint64_t)UOCR_MOE_TOP_K;
-    const uint64_t pair_rows_bytes = (pair_count * 4u + 15u) & ~15ull;
-    const uint64_t prefix_bytes = (((uint64_t)UOCR_ROUTED_EXPERTS + 1u) * 4u + 15u) & ~15ull;
-    const uint64_t down_out_bytes = pair_count * (uint64_t)UOCR_HIDDEN_SIZE * 2u;
-    const uint64_t pair_rows_offset = 0u;
-    const uint64_t expert_offsets_offset = pair_rows_bytes;
-    const uint64_t tile_prefix_offset = expert_offsets_offset + prefix_bytes;
-    const uint64_t down_out_offset = tile_prefix_offset + prefix_bytes;
-    const uint64_t transient_bytes = down_out_offset + down_out_bytes;
-    if (ctx == NULL || prefill_params == NULL || n_tokens <= 1u || pair_count > (uint64_t)UINT32_MAX ||
-        transient_bytes > (uint64_t)NSUIntegerMax ||
-        !uocr_metal_context_ensure_scratch(ctx, UOCR_METAL_SCRATCH_TRANSIENT, transient_bytes, 0, error, error_size)) {
+    uocr_metal_moe_bucketed_prefill_scratch_layout layout;
+    if (ctx == NULL || prefill_params == NULL || n_tokens <= 1u ||
+        !metal_moe_bucketed_prefill_scratch_layout(n_tokens, &layout) ||
+        !uocr_metal_context_ensure_scratch(ctx, UOCR_METAL_SCRATCH_TRANSIENT, layout.total_bytes, 0, error, error_size)) {
         return metal_fail(error, error_size, "invalid %s request", op);
     }
+    const uint64_t pair_count = layout.pair_count;
+    const uint64_t pair_rows_offset = layout.pair_rows_offset;
+    const uint64_t expert_offsets_offset = layout.expert_offsets_offset;
+    const uint64_t tile_prefix_offset = layout.tile_prefix_offset;
+    const uint64_t down_out_offset = layout.down_out_offset;
     id<MTLBuffer> transient = ctx->scratch[UOCR_METAL_SCRATCH_TRANSIENT].buffer;
     if (transient == nil) {
         return metal_fail(error, error_size, "%s transient scratch is unavailable", op);
@@ -13276,6 +13335,131 @@ static int metal_run_moe_prefill_bucketed_q8_0(uocr_metal_context *ctx,
         const int ok = metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, op, error, error_size);
         if (ok) {
             metal_profile_add_event_now(ctx, "metal.prefill.moe_routed_bucketed_q8", bucketed_start_ns);
+        }
+        return ok;
+    }
+}
+
+static int metal_run_moe_prefill_bucketed_f16(uocr_metal_context *ctx,
+                                               uocr_metal_buffer_slice input,
+                                               uocr_metal_buffer_slice top_ids,
+                                               uocr_metal_buffer_slice top_weights,
+                                               uocr_metal_buffer_slice expert_slab,
+                                               uint32_t n_tokens,
+                                               uocr_metal_buffer_slice mid,
+                                               uocr_metal_buffer_slice shared,
+                                               uocr_metal_buffer_slice residual,
+                                               uocr_metal_buffer_slice dst,
+                                               const uocr_metal_moe_prefill_interleaved_q8_params *prefill_params,
+                                               char *error,
+                                               size_t error_size) {
+    const char *op = "prefill routed MoE fp16 bucketed GEMM";
+    uocr_metal_moe_bucketed_prefill_scratch_layout layout;
+    if (ctx == NULL || prefill_params == NULL || n_tokens <= 1u ||
+        !metal_moe_bucketed_prefill_scratch_layout(n_tokens, &layout) ||
+        !uocr_metal_context_ensure_scratch(ctx, UOCR_METAL_SCRATCH_TRANSIENT, layout.total_bytes, 0, error, error_size)) {
+        return metal_fail(error, error_size, "invalid %s request", op);
+    }
+    const uint64_t pair_count = layout.pair_count;
+    const uint64_t pair_rows_offset = layout.pair_rows_offset;
+    const uint64_t expert_offsets_offset = layout.expert_offsets_offset;
+    const uint64_t tile_prefix_offset = layout.tile_prefix_offset;
+    const uint64_t down_out_offset = layout.down_out_offset;
+    id<MTLBuffer> transient = ctx->scratch[UOCR_METAL_SCRATCH_TRANSIENT].buffer;
+    if (transient == nil) {
+        return metal_fail(error, error_size, "%s transient scratch is unavailable", op);
+    }
+    @autoreleasepool {
+        id<MTLComputePipelineState> bucket_pipeline = metal_get_pipeline(ctx, "uocr_moe_prefill_bucket_pairs", error, error_size);
+        id<MTLComputePipelineState> gate_pipeline = metal_get_pipeline(ctx, "uocr_moe_prefill_bucketed_swiglu_gate_up_gemm_f16_to_f16", error, error_size);
+        id<MTLComputePipelineState> down_pipeline = metal_get_pipeline(ctx, "uocr_moe_prefill_bucketed_down_gemm_f16_to_f16", error, error_size);
+        id<MTLComputePipelineState> combine_pipeline = metal_get_pipeline(ctx, "uocr_moe_prefill_bucketed_combine_round_routed_f16", error, error_size);
+        if (bucket_pipeline == nil || gate_pipeline == nil || down_pipeline == nil || combine_pipeline == nil) {
+            return 0;
+        }
+        int owned_command_buffer = 0;
+        id<MTLCommandBuffer> cb = metal_command_buffer_for_op(ctx, &owned_command_buffer, op, error, error_size);
+        if (cb == nil) {
+            return 0;
+        }
+        const uint64_t bucketed_start_ns = uocr_profile_now_ns();
+
+        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
+        if (enc == nil) {
+            return metal_fail(error, error_size, "failed to create %s bucket encoder", op);
+        }
+        struct {
+            uint32_t n_tokens;
+            uint32_t top_k;
+            uint32_t expert_count;
+            uint32_t rows_per_tile;
+        } bucket_params = { n_tokens, UOCR_MOE_TOP_K, UOCR_ROUTED_EXPERTS, UOCR_METAL_GEMM_Q8_BM };
+        [enc setComputePipelineState:bucket_pipeline];
+        [enc setBuffer:top_ids.buffer offset:top_ids.offset atIndex:0u];
+        [enc setBuffer:transient offset:(NSUInteger)pair_rows_offset atIndex:1u];
+        [enc setBuffer:transient offset:(NSUInteger)expert_offsets_offset atIndex:2u];
+        [enc setBuffer:transient offset:(NSUInteger)tile_prefix_offset atIndex:3u];
+        [enc setBytes:&bucket_params length:sizeof(bucket_params) atIndex:4u];
+        [enc dispatchThreadgroups:MTLSizeMake(1u, 1u, 1u) threadsPerThreadgroup:MTLSizeMake(256u, 1u, 1u)];
+        [enc endEncoding];
+
+        const NSUInteger tile_slots = (NSUInteger)((pair_count + UOCR_METAL_GEMM_Q8_BM - 1u) / UOCR_METAL_GEMM_Q8_BM) +
+                                      (NSUInteger)UOCR_ROUTED_EXPERTS;
+
+        enc = metal_compute_command_encoder(ctx, cb);
+        if (enc == nil) {
+            return metal_fail(error, error_size, "failed to create %s gate/up encoder", op);
+        }
+        [enc setComputePipelineState:gate_pipeline];
+        [enc setBuffer:input.buffer offset:input.offset atIndex:0u];
+        [enc setBuffer:transient offset:(NSUInteger)pair_rows_offset atIndex:1u];
+        [enc setBuffer:transient offset:(NSUInteger)expert_offsets_offset atIndex:2u];
+        [enc setBuffer:transient offset:(NSUInteger)tile_prefix_offset atIndex:3u];
+        [enc setBuffer:expert_slab.buffer offset:expert_slab.offset atIndex:4u];
+        [enc setBuffer:mid.buffer offset:mid.offset atIndex:5u];
+        [enc setBytes:prefill_params length:sizeof(*prefill_params) atIndex:6u];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(UOCR_MOE_EXPERT_INTERMEDIATE / UOCR_METAL_GEMM_Q8_BN), tile_slots, 1u)
+            threadsPerThreadgroup:MTLSizeMake(UOCR_METAL_GEMM_Q8_THREADS, 1u, 1u)];
+        [enc endEncoding];
+
+        enc = metal_compute_command_encoder(ctx, cb);
+        if (enc == nil) {
+            return metal_fail(error, error_size, "failed to create %s down encoder", op);
+        }
+        [enc setComputePipelineState:down_pipeline];
+        [enc setBuffer:mid.buffer offset:mid.offset atIndex:0u];
+        [enc setBuffer:transient offset:(NSUInteger)pair_rows_offset atIndex:1u];
+        [enc setBuffer:transient offset:(NSUInteger)expert_offsets_offset atIndex:2u];
+        [enc setBuffer:transient offset:(NSUInteger)tile_prefix_offset atIndex:3u];
+        [enc setBuffer:expert_slab.buffer offset:expert_slab.offset atIndex:4u];
+        [enc setBuffer:transient offset:(NSUInteger)down_out_offset atIndex:5u];
+        [enc setBytes:prefill_params length:sizeof(*prefill_params) atIndex:6u];
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(UOCR_HIDDEN_SIZE / UOCR_METAL_GEMM_Q8_BN), tile_slots, 1u)
+            threadsPerThreadgroup:MTLSizeMake(UOCR_METAL_GEMM_Q8_THREADS, 1u, 1u)];
+        [enc endEncoding];
+
+        enc = metal_compute_command_encoder(ctx, cb);
+        if (enc == nil) {
+            return metal_fail(error, error_size, "failed to create %s combine encoder", op);
+        }
+        NSUInteger combine_threads = combine_pipeline.threadExecutionWidth;
+        if (combine_threads == 0u) combine_threads = 32u;
+        if (combine_threads > 256u) combine_threads = 256u;
+        [enc setComputePipelineState:combine_pipeline];
+        [enc setBuffer:transient offset:(NSUInteger)down_out_offset atIndex:0u];
+        [enc setBuffer:top_ids.buffer offset:top_ids.offset atIndex:1u];
+        [enc setBuffer:top_weights.buffer offset:top_weights.offset atIndex:2u];
+        [enc setBuffer:shared.buffer offset:shared.offset atIndex:3u];
+        [enc setBuffer:residual.buffer offset:residual.offset atIndex:4u];
+        [enc setBuffer:dst.buffer offset:dst.offset atIndex:5u];
+        [enc setBytes:prefill_params length:sizeof(*prefill_params) atIndex:6u];
+        [enc dispatchThreads:MTLSizeMake((NSUInteger)n_tokens * (NSUInteger)UOCR_HIDDEN_SIZE, 1u, 1u)
+       threadsPerThreadgroup:MTLSizeMake(combine_threads, 1u, 1u)];
+        [enc endEncoding];
+
+        const int ok = metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, op, error, error_size);
+        if (ok) {
+            metal_profile_add_event_now(ctx, "metal.prefill.moe_routed_bucketed_f16", bucketed_start_ns);
         }
         return ok;
     }
@@ -13455,68 +13639,45 @@ static int metal_run_moe_interleaved_decode_fused_combine_buffer_f16(uocr_metal_
         !metal_slice_valid(residual, hidden_bytes) || !metal_slice_valid(dst, hidden_bytes)) {
         return metal_fail(error, error_size, "invalid integrated routed MoE fused-combine request");
     }
+    if (n_tokens > 1u) {
+        uocr_metal_moe_prefill_interleaved_q8_params bucketed_params;
+        memset(&bucketed_params, 0, sizeof(bucketed_params));
+        bucketed_params.n_tokens = n_tokens;
+        bucketed_params.hidden_size = UOCR_HIDDEN_SIZE;
+        bucketed_params.intermediate_size = UOCR_MOE_EXPERT_INTERMEDIATE;
+        bucketed_params.expert_count = UOCR_ROUTED_EXPERTS;
+        bucketed_params.top_k = UOCR_MOE_TOP_K;
+        bucketed_params.expert_stride_values = (uint32_t)(projection_values * 3u);
+        bucketed_params.up_offset_values = (uint32_t)projection_values;
+        bucketed_params.down_offset_values = (uint32_t)(projection_values * 2u);
+        return metal_run_moe_prefill_bucketed_f16(ctx,
+                                                  input,
+                                                  top_ids,
+                                                  top_weights,
+                                                  expert_slab,
+                                                  n_tokens,
+                                                  mid,
+                                                  shared,
+                                                  residual,
+                                                  dst,
+                                                  &bucketed_params,
+                                                  error,
+                                                  error_size);
+    }
     @autoreleasepool {
         const int use_decode_kernels = (n_tokens == 1u);
-        const int use_tiled_routed_gate_up = use_decode_kernels;
-        /* Decode uses fewer routed experts (UOCR_METAL_DECODE_MOE_TOP_K) than
-         * prefill (UOCR_MOE_TOP_K).  Buffers remain sized for the max top_k. */
+        /* Decode may be configured to use fewer routed experts than prefill.
+         * Buffers remain sized for the max top_k. */
         const uint32_t routed_top_k =
             use_decode_kernels ? (uint32_t)UOCR_METAL_DECODE_MOE_TOP_K : (uint32_t)UOCR_MOE_TOP_K;
-        id<MTLComputePipelineState> gate_pipeline = nil;
-        id<MTLComputePipelineState> down_combine_pipeline = nil;
-        if (use_decode_kernels) {
-            MTLFunctionConstantValues *constants = [MTLFunctionConstantValues new];
-            if (constants == nil) {
-                return metal_fail(error, error_size, "failed to allocate integrated routed MoE decode constants");
-            }
-            const uint32_t hidden_size = UOCR_HIDDEN_SIZE;
-            const uint32_t intermediate_size = UOCR_MOE_EXPERT_INTERMEDIATE;
-            const uint32_t expert_count = UOCR_ROUTED_EXPERTS;
-            const uint32_t top_k = routed_top_k;
-            [constants setConstantValue:&hidden_size type:MTLDataTypeUInt atIndex:UOCR_METAL_FC_HIDDEN_SIZE];
-            [constants setConstantValue:&expert_count type:MTLDataTypeUInt atIndex:UOCR_METAL_FC_MOE_EXPERTS];
-            [constants setConstantValue:&top_k type:MTLDataTypeUInt atIndex:UOCR_METAL_FC_MOE_TOP_K];
-            [constants setConstantValue:&intermediate_size type:MTLDataTypeUInt atIndex:UOCR_METAL_FC_MOE_EXPERT_INTERMEDIATE];
-            NSString *constant_key = [NSString stringWithFormat:@"#integrated-moe-decode:h%u:i%u:e%u:k%u",
-                                      hidden_size,
-                                      intermediate_size,
-                                      expert_count,
-                                      top_k];
-            gate_pipeline = metal_get_pipeline(ctx,
-                                               use_tiled_routed_gate_up ?
-                                                   "uocr_moe_decode_interleaved_gate_up_tile4_f16" :
-                                                   "uocr_moe_decode_interleaved_gate_up_one_f16",
-                                               error,
-                                               error_size);
-            down_combine_pipeline = metal_get_pipeline_with_constants(ctx,
-                                                                      use_tiled_routed_gate_up ?
-                                                                          UOCR_METAL_MOE_ROUTED_DOWN_COMBINE_KERNEL :
-                                                                          "uocr_moe_decode_interleaved_down_sum_combine_one_f16_to_f16",
-                                                                      constant_key,
-                                                                      constants,
-                                                                      error,
-                                                                      error_size);
-            [constants release];
-        } else {
-            gate_pipeline = metal_get_pipeline(ctx,
-                                               "uocr_moe_prefill_interleaved_gate_up_f16",
-                                               error,
-                                               error_size);
-            down_combine_pipeline = metal_get_pipeline(ctx,
-                                                       "uocr_moe_decode_interleaved_down_sum_combine_f16_to_f16",
-                                                       error,
-                                                       error_size);
-        }
+        id<MTLComputePipelineState> gate_pipeline = use_decode_kernels ?
+            metal_get_pipeline(ctx, "uocr_moe_decode_gate_up_gemv_f16_to_f16", error, error_size) :
+            metal_get_pipeline(ctx, "uocr_moe_prefill_interleaved_gate_up_f16", error, error_size);
+        id<MTLComputePipelineState> down_combine_pipeline = use_decode_kernels ?
+            metal_get_pipeline(ctx, "uocr_moe_decode_down_combine_gemv_f16_to_f16", error, error_size) :
+            metal_get_pipeline(ctx, "uocr_moe_decode_interleaved_down_sum_combine_f16_to_f16", error, error_size);
         if (gate_pipeline == nil || down_combine_pipeline == nil) {
             return 0;
-        }
-        if (use_tiled_routed_gate_up &&
-            gate_pipeline.maxTotalThreadsPerThreadgroup < (NSUInteger)UOCR_METAL_MOE_ROUTED_GATE_UP_TILED_THREADS) {
-            return metal_fail(error,
-                              error_size,
-                              "integrated routed MoE tiled gate/up pipeline supports only %llu threads; need %u",
-                              (unsigned long long)gate_pipeline.maxTotalThreadsPerThreadgroup,
-                              UOCR_METAL_MOE_ROUTED_GATE_UP_TILED_THREADS);
         }
         int owned_command_buffer = 0;
         id<MTLCommandBuffer> cb = metal_command_buffer_for_op(ctx, &owned_command_buffer, "integrated routed MoE fused combine", error, error_size);
@@ -13541,38 +13702,36 @@ static int metal_run_moe_interleaved_decode_fused_combine_buffer_f16(uocr_metal_
         decode_params.up_offset_values = (uint32_t)projection_values;
         decode_params.down_offset_values = (uint32_t)(projection_values * 2u);
         decode_params.reserved = 0u;
-        const void *down_params_ptr = use_decode_kernels ? (const void *)&decode_params : (const void *)&prefill_params;
-        const NSUInteger down_params_size = use_decode_kernels ? sizeof(decode_params) : sizeof(prefill_params);
+
         id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
         if (enc == nil) {
             return metal_fail(error, error_size, "failed to create integrated routed MoE fused gate/up encoder");
         }
-        const NSUInteger gate_threads = use_tiled_routed_gate_up ?
-            metal_power2_threadgroup_width((NSUInteger)UOCR_METAL_MOE_ROUTED_GATE_UP_TILED_THREADS,
-                                           gate_pipeline.maxTotalThreadsPerThreadgroup) :
-            metal_power2_threadgroup_width(n_tokens == 1u ? 256u : 64u, gate_pipeline.maxTotalThreadsPerThreadgroup);
-        const NSUInteger gate_threadgroups = use_tiled_routed_gate_up ?
-            (NSUInteger)n_tokens * (NSUInteger)routed_top_k *
-                (((NSUInteger)UOCR_MOE_EXPERT_INTERMEDIATE + (NSUInteger)UOCR_METAL_MOE_ROUTED_GATE_UP_TILE_COLUMNS - 1u) /
-                 (NSUInteger)UOCR_METAL_MOE_ROUTED_GATE_UP_TILE_COLUMNS) :
-            (NSUInteger)n_tokens * (NSUInteger)routed_top_k * (NSUInteger)UOCR_MOE_EXPERT_INTERMEDIATE;
         [enc setComputePipelineState:gate_pipeline];
         [enc setBuffer:input.buffer offset:input.offset atIndex:0u];
         [enc setBuffer:top_ids.buffer offset:top_ids.offset atIndex:1u];
         [enc setBuffer:expert_slab.buffer offset:expert_slab.offset atIndex:2u];
         [enc setBuffer:mid.buffer offset:mid.offset atIndex:3u];
-        [enc setBytes:&prefill_params length:sizeof(prefill_params) atIndex:4u];
-        [enc setThreadgroupMemoryLength:gate_threads * 2u * sizeof(float) atIndex:0u];
-        [enc dispatchThreadgroups:MTLSizeMake(gate_threadgroups, 1u, 1u)
-             threadsPerThreadgroup:MTLSizeMake(gate_threads, 1u, 1u)];
+        if (use_decode_kernels) {
+            const NSUInteger gate_rows = (NSUInteger)routed_top_k * (NSUInteger)UOCR_MOE_EXPERT_INTERMEDIATE;
+            const NSUInteger gate_rows_per_tg = metal_decode_gemv_rows_per_threadgroup(gate_pipeline);
+            [enc setBytes:&decode_params length:sizeof(decode_params) atIndex:4u];
+            [enc dispatchThreadgroups:MTLSizeMake((gate_rows + gate_rows_per_tg - 1u) / gate_rows_per_tg, 1u, 1u)
+                 threadsPerThreadgroup:MTLSizeMake(128u, 1u, 1u)];
+        } else {
+            const NSUInteger gate_threads = metal_power2_threadgroup_width(64u, gate_pipeline.maxTotalThreadsPerThreadgroup);
+            const NSUInteger gate_threadgroups = (NSUInteger)n_tokens * (NSUInteger)routed_top_k * (NSUInteger)UOCR_MOE_EXPERT_INTERMEDIATE;
+            [enc setBytes:&prefill_params length:sizeof(prefill_params) atIndex:4u];
+            [enc setThreadgroupMemoryLength:gate_threads * 2u * sizeof(float) atIndex:0u];
+            [enc dispatchThreadgroups:MTLSizeMake(gate_threadgroups, 1u, 1u)
+                 threadsPerThreadgroup:MTLSizeMake(gate_threads, 1u, 1u)];
+        }
         [enc endEncoding];
 
         enc = metal_compute_command_encoder(ctx, cb);
         if (enc == nil) {
             return metal_fail(error, error_size, "failed to create integrated routed MoE fused down/combine encoder");
         }
-        const NSUInteger down_threads = metal_power2_threadgroup_width(n_tokens == 1u ? 256u : 64u,
-                                                                       down_combine_pipeline.maxTotalThreadsPerThreadgroup);
         [enc setComputePipelineState:down_combine_pipeline];
         [enc setBuffer:mid.buffer offset:mid.offset atIndex:0u];
         [enc setBuffer:top_ids.buffer offset:top_ids.offset atIndex:1u];
@@ -13581,14 +13740,16 @@ static int metal_run_moe_interleaved_decode_fused_combine_buffer_f16(uocr_metal_
         [enc setBuffer:shared.buffer offset:shared.offset atIndex:4u];
         [enc setBuffer:residual.buffer offset:residual.offset atIndex:5u];
         [enc setBuffer:dst.buffer offset:dst.offset atIndex:6u];
-        [enc setBytes:down_params_ptr length:down_params_size atIndex:7u];
-        [enc setThreadgroupMemoryLength:down_threads * sizeof(float) atIndex:0u];
-        {
-            const NSUInteger down_threadgroups = use_decode_kernels ?
-                ((NSUInteger)UOCR_HIDDEN_SIZE + (NSUInteger)UOCR_METAL_MOE_ROUTED_DOWN_COMBINE_TILE_COLUMNS - 1u) /
-                    (NSUInteger)UOCR_METAL_MOE_ROUTED_DOWN_COMBINE_TILE_COLUMNS :
-                (NSUInteger)down_values;
-            [enc dispatchThreadgroups:MTLSizeMake(down_threadgroups, 1u, 1u)
+        if (use_decode_kernels) {
+            const NSUInteger down_rows_per_tg = metal_decode_gemv_rows_per_threadgroup(down_combine_pipeline);
+            [enc setBytes:&decode_params length:sizeof(decode_params) atIndex:7u];
+            [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)UOCR_HIDDEN_SIZE + down_rows_per_tg - 1u) / down_rows_per_tg, 1u, 1u)
+                 threadsPerThreadgroup:MTLSizeMake(128u, 1u, 1u)];
+        } else {
+            const NSUInteger down_threads = metal_power2_threadgroup_width(64u, down_combine_pipeline.maxTotalThreadsPerThreadgroup);
+            [enc setBytes:&prefill_params length:sizeof(prefill_params) atIndex:7u];
+            [enc setThreadgroupMemoryLength:down_threads * sizeof(float) atIndex:0u];
+            [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)down_values, 1u, 1u)
                  threadsPerThreadgroup:MTLSizeMake(down_threads, 1u, 1u)];
         }
         [enc endEncoding];
@@ -14391,6 +14552,9 @@ static int metal_context_generate_f16_impl(uocr_metal_context *ctx,
     }
 
     if (!metal_prebuild_mps_runtime_workspace_ndarrays(ctx, request->n_tokens, error, error_size)) {
+        return 0;
+    }
+    if (!metal_preallocate_moe_bucketed_prefill_transient_scratch(ctx, request->n_tokens, error, error_size)) {
         return 0;
     }
 

@@ -110,6 +110,71 @@ struct UocrDenseSwigluParams {
     uint has_residual;
 };
 
+struct UocrDecodeGemvF16Params {
+    uint k;
+    uint n;
+    uint has_residual;
+    uint reserved;
+};
+
+// Decode-only fp16 SwiGLU gate/up GEMV.  One simdgroup owns one output row,
+// matching the optimized Q8 decode regime but reading fp16 weights directly.
+[[max_total_threads_per_threadgroup(128)]] kernel void uocr_decode_swiglu_gate_up_gemv_f16_to_f16(
+    device const half *src [[buffer(0)]],
+    device const half *gate_weight [[buffer(1)]],
+    device const half *up_weight [[buffer(2)]],
+    device half *mid [[buffer(3)]],
+    constant UocrDecodeGemvF16Params &params [[buffer(4)]],
+    uint tgpig [[threadgroup_position_in_grid]],
+    uint ntg [[threads_per_threadgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simd_width [[threads_per_simdgroup]]) {
+    const uint rows_per_tg = ntg / simd_width;
+    const uint row = tgpig * rows_per_tg + sgitg;
+    if (row >= params.n) {
+        return;
+    }
+    device const half *gate_row = gate_weight + (ulong)row * params.k;
+    device const half *up_row = up_weight + (ulong)row * params.k;
+    const float gate = simd_sum(uocr_decode_gemv_f16_lane_dot(src, gate_row, params.k, lane, simd_width));
+    const float up = simd_sum(uocr_decode_gemv_f16_lane_dot(src, up_row, params.k, lane, simd_width));
+    if (lane == 0u) {
+        const float silu = gate / (1.0f + exp(-gate));
+        mid[row] = half(silu * up);
+    }
+}
+
+// Decode-only fp16 linear GEMV with optional residual add (dense/shared down).
+[[max_total_threads_per_threadgroup(128)]] kernel void uocr_decode_linear_residual_gemv_f16_to_f16(
+    device const half *src [[buffer(0)]],
+    device const half *weight [[buffer(1)]],
+    device const half *residual [[buffer(2)]],
+    device half *dst [[buffer(3)]],
+    constant UocrDecodeGemvF16Params &params [[buffer(4)]],
+    uint tgpig [[threadgroup_position_in_grid]],
+    uint ntg [[threads_per_threadgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simd_width [[threads_per_simdgroup]]) {
+    const uint rows_per_tg = ntg / simd_width;
+    const uint row = tgpig * rows_per_tg + sgitg;
+    if (row >= params.n) {
+        return;
+    }
+    float value = simd_sum(uocr_decode_gemv_f16_lane_dot(src,
+                                                          weight + (ulong)row * params.k,
+                                                          params.k,
+                                                          lane,
+                                                          simd_width));
+    if (lane == 0u) {
+        if (params.has_residual != 0u) {
+            value += float(residual[row]);
+        }
+        dst[row] = half(value);
+    }
+}
+
 [[max_total_threads_per_threadgroup(256)]] kernel void uocr_dense_swiglu_gate_up_f16(device const half *src [[buffer(0)]],
                                           device const half *gate_weight [[buffer(1)]],
                                           device const half *up_weight [[buffer(2)]],

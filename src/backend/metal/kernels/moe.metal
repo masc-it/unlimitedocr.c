@@ -668,6 +668,99 @@ struct UocrMoeDecodeInterleavedParams {
     uint reserved;
 };
 
+// Decode routed-MoE fp16 gate/up GEMV.  This mirrors the optimized Q8 decode
+// shape: one simdgroup per (rank, intermediate column), half4 weight/input
+// loads, and a single simd_sum per dot (no threadgroup-memory reduction).
+[[max_total_threads_per_threadgroup(128)]] kernel void uocr_moe_decode_gate_up_gemv_f16_to_f16(
+    device const half *src [[buffer(0)]],
+    device const uint *top_expert_ids [[buffer(1)]],
+    device const half *expert_slab [[buffer(2)]],
+    device half *mid [[buffer(3)]],
+    constant UocrMoeDecodeInterleavedParams &params [[buffer(4)]],
+    uint tgpig [[threadgroup_position_in_grid]],
+    uint ntg [[threads_per_threadgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simd_width [[threads_per_simdgroup]]) {
+    const uint rows_per_tg = ntg / simd_width;
+    const uint row = tgpig * rows_per_tg + sgitg;
+    const uint intermediate_size = params.intermediate_size;
+    const uint top_k = params.top_k;
+    if (row >= top_k * intermediate_size) {
+        return;
+    }
+    const uint rank = row / intermediate_size;
+    const uint col = row - rank * intermediate_size;
+    const uint expert_count = params.expert_count;
+    const uint expert = top_expert_ids[rank];
+    if (expert >= expert_count) {
+        if (lane == 0u) {
+            mid[row] = half(0.0f);
+        }
+        return;
+    }
+
+    const uint hidden_size = params.hidden_size;
+    device const half *gate_weight = expert_slab + (ulong)expert * params.expert_stride_values +
+                                     (ulong)col * hidden_size;
+    device const half *up_weight = gate_weight + params.up_offset_values;
+    const float gate = simd_sum(uocr_decode_gemv_f16_lane_dot(src, gate_weight, hidden_size, lane, simd_width));
+    const float up = simd_sum(uocr_decode_gemv_f16_lane_dot(src, up_weight, hidden_size, lane, simd_width));
+    if (lane == 0u) {
+        const float silu = gate / (1.0f + exp(-gate));
+        mid[row] = half(silu * up);
+    }
+}
+
+// Decode routed-MoE fp16 down + weighted combine GEMV.  One simdgroup owns one
+// hidden output column and accumulates all selected experts' lane partials
+// before a single simd_sum, matching the Q8 optimized decode shape.  The final
+// routed value is rounded to half before adding shared+residual to preserve the
+// previous fp16 fused-combine contract.
+[[max_total_threads_per_threadgroup(128)]] kernel void uocr_moe_decode_down_combine_gemv_f16_to_f16(
+    device const half *mid [[buffer(0)]],
+    device const uint *top_expert_ids [[buffer(1)]],
+    device const float *top_weights [[buffer(2)]],
+    device const half *expert_slab [[buffer(3)]],
+    device const half *shared [[buffer(4)]],
+    device const half *residual [[buffer(5)]],
+    device half *dst [[buffer(6)]],
+    constant UocrMoeDecodeInterleavedParams &params [[buffer(7)]],
+    uint tgpig [[threadgroup_position_in_grid]],
+    uint ntg [[threads_per_threadgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simd_width [[threads_per_simdgroup]]) {
+    const uint rows_per_tg = ntg / simd_width;
+    const uint col = tgpig * rows_per_tg + sgitg;
+    const uint hidden_size = params.hidden_size;
+    if (col >= hidden_size) {
+        return;
+    }
+    const uint intermediate_size = params.intermediate_size;
+    const uint top_k = params.top_k;
+    const uint expert_count = params.expert_count;
+    float lane_sum = 0.0f;
+    for (uint rank = 0u; rank < top_k; ++rank) {
+        const uint expert = top_expert_ids[rank];
+        if (expert >= expert_count) {
+            continue;
+        }
+        device const half *down_weight = expert_slab + (ulong)expert * params.expert_stride_values +
+                                         params.down_offset_values + (ulong)col * intermediate_size;
+        lane_sum += top_weights[rank] *
+                    uocr_decode_gemv_f16_lane_dot(mid + (ulong)rank * intermediate_size,
+                                                  down_weight,
+                                                  intermediate_size,
+                                                  lane,
+                                                  simd_width);
+    }
+    const float routed = simd_sum(lane_sum);
+    if (lane == 0u) {
+        dst[col] = half(float(half(routed)) + float(shared[col]) + float(residual[col]));
+    }
+}
+
 kernel void uocr_moe_prefill_selected_gate_up_f16(device const half *src [[buffer(0)]],
                                                   device const uint *top_expert_ids [[buffer(1)]],
                                                   device const half *gate_weight [[buffer(2)]],
