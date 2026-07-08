@@ -4329,10 +4329,10 @@ static int metal_vision_tensor_from_binding_cache(const uocr_metal_vision_bindin
                           role,
                           tensor_id);
     }
-    if (binding->qtype == UOCR_TENSOR_Q8_0) {
+    if (binding->qtype == UOCR_TENSOR_Q8_0 || binding->qtype == UOCR_TENSOR_Q4_0) {
         if (binding->scale_buffer == nil || binding->scale_size == 0u ||
             !metal_buffer_range_valid(binding->scale_buffer, binding->scale_offset, binding->scale_size)) {
-            return metal_fail(error, error_size, "%s tensor %u has an invalid q8 scale binding", role, tensor_id);
+            return metal_fail(error, error_size, "%s tensor %u has an invalid quantized scale binding", role, tensor_id);
         }
     } else if (binding->qtype != UOCR_TENSOR_F16) {
         return metal_fail(error,
