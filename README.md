@@ -13,7 +13,7 @@ management, KV cache, logits processing, and GPU execution.
 uv add unlimitedocr-c
 ```
 
-> `unlimitedocr-c` is published on PyPI. Version `0.3.0` is the latest stable release.
+> `unlimitedocr-c` is published on PyPI. Version `0.4.0` is the latest stable release.
 
 ## Quick start
 
@@ -48,7 +48,7 @@ The engine supports three model profiles:
 | --- | --- | --- | --- |
 | fp16 (default) | fp16 | ~6.7 GB | `UnlimitedOCR()` |
 | mixed Q8_0 | int8 weights + fp16 scales | ~3.5 GB | `UnlimitedOCR(quant="q8")` |
-| mixed Q4 | Q8 + int4 MoE experts | ~2.2 GB | `UnlimitedOCR(quant="q4")` |
+| mixed Q4 | int4 nearly everywhere, Q8 attention | ~1.8 GB | `UnlimitedOCR(quant="q4")` |
 
 ```python
 from unlimitedocr_c import UnlimitedOCR
@@ -69,11 +69,13 @@ fp16.  Dequantization is fused inside the Metal kernels — quantization roughly
 halves model memory and speeds up token generation, which is
 memory-bandwidth-bound.
 
-Mixed Q4 additionally stores the routed MoE expert weights (~80% of the
-decoder parameters) as group-64 Q4_0 — symmetric int4 with fp16 scales and a
-group-half-split nibble packing chosen for vectorized dequantization in the
-fused Metal kernels.  The routed-expert decode step measured ~2.7× faster
-than Q8 on M1 Pro; everything else stays Q8/fp16 as above.
+Mixed Q4 stores the routed MoE experts, shared experts, dense MLP, LM head,
+token embedding and vision encoders as group-64 Q4_0 — symmetric int4 with
+fp16 scales and a group-half-split nibble packing chosen for vectorized
+dequantization in the fused Metal kernels.  Attention projections stay Q8_0
+(highest quality sensitivity); norms, biases and convolutions stay fp16.
+On M1 Pro the routed-expert decode step measured ~2.7× faster than Q8 and
+the fused LM-head argmax ~1.2× faster.
 
 ## Input types
 
