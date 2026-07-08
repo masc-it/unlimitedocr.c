@@ -537,7 +537,7 @@ engine options.  The report includes:
 
 ---
 
-*This document describes the architecture as of unlimitedocr.c v0.2.3.  The
+*This document describes the architecture as of unlimitedocr.c v0.3.0.  The
 multi-backend design intentionally separates frontend, engine core, and backend
 concerns so that new backends (CUDA, ANE, Vulkan, etc.) can be added by
 implementing the backend interface without modifying the shared C core or Python
