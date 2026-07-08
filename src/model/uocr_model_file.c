@@ -714,10 +714,12 @@ static int validate_q4_tensor_entry(const uocr_tensor_entry *tensor,
         return fail(error, error_size, "tensor entry %u has non-q4_0 qtype %u", index, tensor->qtype);
     }
     if (tensor->family != UOCR_TENSOR_FAMILY_MOE_EXPERT && tensor->family != UOCR_TENSOR_FAMILY_LM_HEAD &&
-        tensor->family != UOCR_TENSOR_FAMILY_MOE_SHARED && tensor->family != UOCR_TENSOR_FAMILY_LAYER_DENSE_MLP) {
+        tensor->family != UOCR_TENSOR_FAMILY_MOE_SHARED && tensor->family != UOCR_TENSOR_FAMILY_LAYER_DENSE_MLP &&
+        tensor->family != UOCR_TENSOR_FAMILY_TOK_EMBED && tensor->family != UOCR_TENSOR_FAMILY_VISION_SAM &&
+        tensor->family != UOCR_TENSOR_FAMILY_VISION_CLIP && tensor->family != UOCR_TENSOR_FAMILY_PROJECTOR) {
         return fail(error,
                     error_size,
-                    "tensor entry %u q4_0 is only supported for MoE experts, MLPs and the LM head, got family %u",
+                    "tensor entry %u q4_0 is not supported for family %u",
                     index,
                     tensor->family);
     }

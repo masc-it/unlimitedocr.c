@@ -2904,7 +2904,7 @@ static int metal_decoder_tensor_allows_q4(uint32_t family, uint32_t projection, 
     if (rank != 2u) {
         return 0;
     }
-    if (family == UOCR_TENSOR_FAMILY_LM_HEAD) {
+    if (family == UOCR_TENSOR_FAMILY_LM_HEAD || family == UOCR_TENSOR_FAMILY_TOK_EMBED) {
         return projection == UOCR_TENSOR_PROJ_WEIGHT;
     }
     return (family == UOCR_TENSOR_FAMILY_MOE_EXPERT || family == UOCR_TENSOR_FAMILY_MOE_SHARED ||
@@ -3780,7 +3780,8 @@ static int metal_validate_vision_tensor_metadata(const uocr_tensor_entry *tensor
                           tensor_id,
                           uocr_tensor_usage_name(tensor->usage));
     }
-    if (tensor->qtype != UOCR_TENSOR_F16 && tensor->qtype != UOCR_TENSOR_Q8_0) {
+    if (tensor->qtype != UOCR_TENSOR_F16 && tensor->qtype != UOCR_TENSOR_Q8_0 &&
+        tensor->qtype != UOCR_TENSOR_Q4_0) {
         return metal_fail(error,
                           error_size,
                           "%s %u has unsupported qtype %s",
@@ -3788,7 +3789,9 @@ static int metal_validate_vision_tensor_metadata(const uocr_tensor_entry *tensor
                           tensor_id,
                           uocr_tensor_qtype_name(tensor->qtype));
     }
-    if (tensor->qtype == UOCR_TENSOR_Q8_0 && !metal_vision_tensor_allows_q8(family, projection, rank, dims)) {
+    /* Q4 group 64 shares the Q8 family/projection/alignment rules. */
+    if ((tensor->qtype == UOCR_TENSOR_Q8_0 || tensor->qtype == UOCR_TENSOR_Q4_0) &&
+        !metal_vision_tensor_allows_q8(family, projection, rank, dims)) {
         return metal_fail(error,
                           error_size,
                           "%s %u cannot use qtype %s for this family/projection",
@@ -3867,12 +3870,13 @@ static int metal_validate_vision_tensor_metadata(const uocr_tensor_entry *tensor
         }
     } else {
         const uint32_t cols = dims[1];
+        const uint32_t expected_row_size = tensor->qtype == UOCR_TENSOR_Q4_0 ? cols / 2u : cols;
         const uint64_t expected_scale_size = uocr_q8_0_qscale_bytes(dims[0], cols, UOCR_Q8_GROUP_SIZE_DEFAULT);
         if (expected_scale_size == 0u || tensor->block_size != UOCR_Q8_GROUP_SIZE_DEFAULT ||
-            tensor->row_size != cols || tensor->scale_size != expected_scale_size) {
+            tensor->row_size != expected_row_size || tensor->scale_size != expected_scale_size) {
             return metal_fail(error,
                               error_size,
-                              "%s %u q8_0 packing metadata mismatch",
+                              "%s %u quantized packing metadata mismatch",
                               role,
                               tensor_id);
         }
@@ -3964,6 +3968,11 @@ static int metal_append_vision_binding(uocr_metal_context *ctx,
         if (rank != 2u || !checked_mul_u64((uint64_t)dims[0], (uint64_t)dims[1], &expected_payload_size)) {
             return metal_fail(error, error_size, "vision tensor %u expected q8 byte-size overflow", tensor_id);
         }
+    } else if (tensor->qtype == UOCR_TENSOR_Q4_0) {
+        expected_payload_size = rank == 2u ? uocr_q4_0_qweight_bytes(dims[0], dims[1]) : 0u;
+        if (expected_payload_size == 0u) {
+            return metal_fail(error, error_size, "vision tensor %u expected q4 byte-size is invalid", tensor_id);
+        }
     } else if (!metal_tensor_expected_payload_bytes(rank, dims, &expected_payload_size)) {
         return metal_fail(error, error_size, "vision tensor %u expected byte-size overflow", tensor_id);
     }
@@ -4000,7 +4009,10 @@ static int metal_append_vision_binding(uocr_metal_context *ctx,
     binding->rows = rank >= 1u ? dims[0] : 0u;
     binding->cols = rank >= 2u ? dims[1] : 0u;
     binding->group_size = tensor->block_size;
-    binding->groups_per_row = (tensor->qtype == UOCR_TENSOR_Q8_0 && tensor->block_size != 0u) ? dims[1] / tensor->block_size : 0u;
+    binding->groups_per_row =
+        ((tensor->qtype == UOCR_TENSOR_Q8_0 || tensor->qtype == UOCR_TENSOR_Q4_0) && tensor->block_size != 0u)
+            ? dims[1] / tensor->block_size
+            : 0u;
     binding->buffer = buffer;
     binding->offset = offset;
     binding->payload_size = expected_payload_size;
@@ -5182,6 +5194,28 @@ static int metal_vision_require_weight_q8(uocr_metal_vision_tensor_f16 tensor,
         tensor.scale_slice.buffer == nil || tensor.scale_byte_length != qscale_bytes ||
         !metal_slice_valid(tensor.scale_slice, qscale_bytes)) {
         return metal_fail(error, error_size, "invalid Metal vision %s q8_0 tensor slice", label != NULL ? label : "weight");
+    }
+    return 1;
+}
+
+static int metal_vision_require_weight_q4(uocr_metal_vision_tensor_f16 tensor,
+                                          uint32_t rows,
+                                          uint32_t cols,
+                                          const char *label,
+                                          char *error,
+                                          size_t error_size) {
+    const uint64_t qweight_bytes = uocr_q4_0_qweight_bytes(rows, cols);
+    const uint64_t qscale_bytes = uocr_q4_0_qscale_bytes(rows, cols, UOCR_Q4_GROUP_SIZE_DEFAULT);
+    if (tensor.qtype != UOCR_TENSOR_Q4_0 || rows == 0u || cols == 0u || qweight_bytes == 0u || qscale_bytes == 0u ||
+        (cols % UOCR_Q4_GROUP_SIZE_DEFAULT) != 0u ||
+        tensor.rows != rows || tensor.cols != cols ||
+        tensor.group_size != UOCR_Q4_GROUP_SIZE_DEFAULT ||
+        tensor.groups_per_row != cols / UOCR_Q4_GROUP_SIZE_DEFAULT ||
+        tensor.slice.buffer == nil || tensor.byte_length != qweight_bytes ||
+        !metal_slice_valid(tensor.slice, qweight_bytes) ||
+        tensor.scale_slice.buffer == nil || tensor.scale_byte_length != qscale_bytes ||
+        !metal_slice_valid(tensor.scale_slice, qscale_bytes)) {
+        return metal_fail(error, error_size, "invalid Metal vision %s q4_0 tensor slice", label != NULL ? label : "weight");
     }
     return 1;
 }
@@ -6496,14 +6530,22 @@ static int metal_run_vision_gemm_q8_0(uocr_metal_context *ctx,
                                       char *error,
                                       size_t error_size) {
     const uint64_t bias_bytes = (uint64_t)output_size * 2u;
+    const int use_q4 = weight.qtype == UOCR_TENSOR_Q4_0;
     if (ctx == NULL || n_rows == 0u || (input_size % 32u) != 0u ||
         (split_size != 0u && (output_size != split_size * 3u)) ||
-        !metal_vision_require_weight_q8(weight, output_size, input_size, op_name, error, error_size) ||
+        /* Q4 B-side staging has no column guard and needs whole 64-groups. */
+        (use_q4 && ((output_size % 32u) != 0u || (input_size % UOCR_Q4_GROUP_SIZE_DEFAULT) != 0u)) ||
+        !(use_q4 ? metal_vision_require_weight_q4(weight, output_size, input_size, op_name, error, error_size)
+                 : metal_vision_require_weight_q8(weight, output_size, input_size, op_name, error, error_size)) ||
         !metal_vision_require_tensor_slice_f16(bias, bias_bytes, op_name, error, error_size)) {
         return 0;
     }
     @autoreleasepool {
-        id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, "uocr_vision_gemm_q8_0_to_f16", error, error_size);
+        id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx,
+                                                                  use_q4 ? "uocr_vision_gemm_q4_0_to_f16"
+                                                                         : "uocr_vision_gemm_q8_0_to_f16",
+                                                                  error,
+                                                                  error_size);
         if (pipeline == nil) {
             return 0;
         }
@@ -6601,7 +6643,7 @@ static int metal_context_visual_projector_f16_to_slice(uocr_metal_context *ctx,
                                                        uocr_metal_vision_workspace_slice out_rows,
                                                        char *error,
                                                        size_t error_size) {
-    if (weight.qtype == UOCR_TENSOR_Q8_0) {
+    if (weight.qtype == UOCR_TENSOR_Q8_0 || weight.qtype == UOCR_TENSOR_Q4_0) {
         return metal_run_visual_projector_q8_0_to_slice(ctx,
                                                         input,
                                                         weight,
@@ -10956,7 +10998,9 @@ static int metal_run_token_embedding_from_token_slot_f16(uocr_metal_context *ctx
         return 0;
     }
     const uint64_t table_f16_bytes = (uint64_t)UOCR_VOCAB_SIZE * (uint64_t)UOCR_HIDDEN_SIZE * 2u;
-    const uint64_t table_qweight_bytes = uocr_q8_0_qweight_bytes(UOCR_VOCAB_SIZE, UOCR_HIDDEN_SIZE);
+    const uint64_t table_qweight_bytes = embedding->qtype == UOCR_TENSOR_Q4_0
+                                             ? uocr_q4_0_qweight_bytes(UOCR_VOCAB_SIZE, UOCR_HIDDEN_SIZE)
+                                             : uocr_q8_0_qweight_bytes(UOCR_VOCAB_SIZE, UOCR_HIDDEN_SIZE);
     const uint64_t table_qscale_bytes = uocr_q8_0_qscale_bytes(UOCR_VOCAB_SIZE,
                                                                UOCR_HIDDEN_SIZE,
                                                                UOCR_Q8_GROUP_SIZE_DEFAULT);
@@ -10964,13 +11008,14 @@ static int metal_run_token_embedding_from_token_slot_f16(uocr_metal_context *ctx
         if (!metal_buffer_range_valid(embedding->buffer, embedding->offset, table_f16_bytes)) {
             return 0;
         }
-    } else if (embedding->qtype == UOCR_TENSOR_Q8_0) {
+    } else if (embedding->qtype == UOCR_TENSOR_Q8_0 || embedding->qtype == UOCR_TENSOR_Q4_0) {
+        /* Q4 group 64 has the same scale layout as Q8 group 64. */
         if (embedding->group_size != UOCR_Q8_GROUP_SIZE_DEFAULT || embedding->rows != UOCR_VOCAB_SIZE ||
             embedding->cols != UOCR_HIDDEN_SIZE || embedding->payload_size != table_qweight_bytes ||
             embedding->scale_size != table_qscale_bytes ||
             !metal_buffer_range_valid(embedding->buffer, embedding->offset, table_qweight_bytes) ||
             !metal_buffer_range_valid(embedding->scale_buffer, embedding->scale_offset, table_qscale_bytes)) {
-            return metal_fail(error, error_size, "invalid integrated Q8 token-embedding binding");
+            return metal_fail(error, error_size, "invalid integrated quantized token-embedding binding");
         }
     } else {
         return metal_fail(error,
@@ -10979,10 +11024,12 @@ static int metal_run_token_embedding_from_token_slot_f16(uocr_metal_context *ctx
                           uocr_tensor_qtype_name(embedding->qtype));
     }
     @autoreleasepool {
-        const int use_q8 = embedding->qtype == UOCR_TENSOR_Q8_0;
+        const int use_q8 = embedding->qtype == UOCR_TENSOR_Q8_0 || embedding->qtype == UOCR_TENSOR_Q4_0;
         id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx,
-                                                                  use_q8 ? "uocr_get_rows_q8_0_to_f16_h1280_g64"
-                                                                         : "uocr_get_rows_f16_to_f16",
+                                                                  embedding->qtype == UOCR_TENSOR_Q4_0
+                                                                      ? "uocr_get_rows_q4_0_to_f16_h1280_g64"
+                                                                      : (use_q8 ? "uocr_get_rows_q8_0_to_f16_h1280_g64"
+                                                                                : "uocr_get_rows_f16_to_f16"),
                                                                   error,
                                                                   error_size);
         if (pipeline == nil) {
@@ -11010,7 +11057,7 @@ static int metal_run_token_embedding_from_token_slot_f16(uocr_metal_context *ctx
             params.logical_width = UOCR_HIDDEN_SIZE;
             params.physical_width = UOCR_HIDDEN_SIZE;
             params.n_row_ids = 1u;
-            params.row_size = UOCR_HIDDEN_SIZE;
+            params.row_size = embedding->qtype == UOCR_TENSOR_Q4_0 ? UOCR_HIDDEN_SIZE / 2u : UOCR_HIDDEN_SIZE;
             [enc setBuffer:embedding->buffer offset:embedding->offset atIndex:0u];
             [enc setBuffer:embedding->scale_buffer offset:embedding->scale_offset atIndex:1u];
             [enc setBuffer:token_id.buffer offset:token_id.offset atIndex:2u];
@@ -16218,6 +16265,7 @@ static int metal_context_assemble_prompt_q8_0_with_table_buffer_to_buffer(uocr_m
                                                                             NSUInteger qweight_offset,
                                                                             id<MTLBuffer> qscale_buffer,
                                                                             NSUInteger qscale_offset,
+                                                                            uint32_t table_qtype,
                                                                             uint32_t table_rows,
                                                                             uint32_t hidden_size,
                                                                             const int32_t *input_ids,
@@ -16234,9 +16282,11 @@ static int metal_context_assemble_prompt_q8_0_with_table_buffer_to_buffer(uocr_m
                                                                             const char *op_name,
                                                                             char *error,
                                                                             size_t error_size) {
-    const char *op = op_name != NULL ? op_name : "Metal Q8 prompt assembly";
+    const char *op = op_name != NULL ? op_name : "Metal quantized prompt assembly";
+    const int use_q4 = table_qtype == UOCR_TENSOR_Q4_0;
     if (ctx == NULL || qweight_buffer == nil || qscale_buffer == nil || input_ids == NULL || dst_buffer == nil ||
-        table_rows == 0u || hidden_size != UOCR_HIDDEN_SIZE || n_tokens == 0u) {
+        table_rows == 0u || hidden_size != UOCR_HIDDEN_SIZE || n_tokens == 0u ||
+        (table_qtype != UOCR_TENSOR_Q8_0 && table_qtype != UOCR_TENSOR_Q4_0)) {
         return metal_fail(error, error_size, "invalid %s request", op);
     }
 
@@ -16271,14 +16321,17 @@ static int metal_context_assemble_prompt_q8_0_with_table_buffer_to_buffer(uocr_m
         return 0;
     }
 
-    const uint64_t qweight_bytes = uocr_q8_0_qweight_bytes(table_rows, hidden_size);
-    const uint64_t qscale_bytes = uocr_q8_0_qscale_bytes(table_rows, hidden_size, UOCR_Q8_GROUP_SIZE_DEFAULT);
+    const uint64_t qweight_bytes = use_q4 ? uocr_q4_0_qweight_bytes(table_rows, hidden_size)
+                                          : uocr_q8_0_qweight_bytes(table_rows, hidden_size);
+    const uint64_t qscale_bytes = use_q4
+                                      ? uocr_q4_0_qscale_bytes(table_rows, hidden_size, UOCR_Q4_GROUP_SIZE_DEFAULT)
+                                      : uocr_q8_0_qscale_bytes(table_rows, hidden_size, UOCR_Q8_GROUP_SIZE_DEFAULT);
     uint64_t token_bytes = 0u;
     uint64_t output_values = 0u;
     uint64_t output_bytes = 0u;
     uint64_t image_values = 0u;
     uint64_t image_bytes = 0u;
-    if (qscale_bytes == 0u ||
+    if (qscale_bytes == 0u || qweight_bytes == 0u ||
         !checked_mul_u64((uint64_t)n_tokens, (uint64_t)sizeof(int32_t), &token_bytes) ||
         !checked_mul_u64((uint64_t)n_tokens, (uint64_t)hidden_size, &output_values) ||
         !checked_mul_u64(output_values, 2u, &output_bytes) ||
@@ -16320,7 +16373,8 @@ static int metal_context_assemble_prompt_q8_0_with_table_buffer_to_buffer(uocr_m
 
     @autoreleasepool {
         id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx,
-                                                                  "uocr_get_rows_q8_0_to_f16_h1280_g64",
+                                                                  use_q4 ? "uocr_get_rows_q4_0_to_f16_h1280_g64"
+                                                                         : "uocr_get_rows_q8_0_to_f16_h1280_g64",
                                                                   error,
                                                                   error_size);
         if (pipeline == nil) {
@@ -16386,7 +16440,7 @@ static int metal_context_assemble_prompt_q8_0_with_table_buffer_to_buffer(uocr_m
         params.logical_width = hidden_size;
         params.physical_width = hidden_size;
         params.n_row_ids = n_tokens;
-        params.row_size = hidden_size;
+        params.row_size = use_q4 ? hidden_size / 2u : hidden_size;
 
         const uint64_t token_gather_start_ns = uocr_profile_now_ns();
         [enc setComputePipelineState:pipeline];
@@ -16455,6 +16509,7 @@ static int metal_context_assemble_prompt_q8_0_with_table_buffer(uocr_metal_conte
                                                                  NSUInteger qweight_offset,
                                                                  id<MTLBuffer> qscale_buffer,
                                                                  NSUInteger qscale_offset,
+                                                                 uint32_t table_qtype,
                                                                  uint32_t table_rows,
                                                                  uint32_t hidden_size,
                                                                  const int32_t *input_ids,
@@ -16492,6 +16547,7 @@ static int metal_context_assemble_prompt_q8_0_with_table_buffer(uocr_metal_conte
                                                                                            qweight_offset,
                                                                                            qscale_buffer,
                                                                                            qscale_offset,
+                                                                                           table_qtype,
                                                                                            table_rows,
                                                                                            hidden_size,
                                                                                            input_ids,
@@ -16592,14 +16648,19 @@ int uocr_metal_context_assemble_prompt_from_model_f16(uocr_metal_context *ctx,
     }
 
     const uocr_metal_tensor_binding_internal *embedding_binding = metal_find_tensor_binding(ctx, UOCR_TENSOR_ID_TOK_EMBED);
-    const int use_q8 = embedding_binding != NULL && embedding_binding->scale_size != 0u;
+    const int use_quant = embedding_binding != NULL && embedding_binding->scale_size != 0u;
+    uint32_t table_qtype = UOCR_TENSOR_F16;
     uint64_t table_bytes = 0u;
     uint64_t scale_bytes = 0u;
-    if (use_q8) {
-        table_bytes = uocr_q8_0_qweight_bytes(UOCR_VOCAB_SIZE, UOCR_HIDDEN_SIZE);
+    if (use_quant) {
+        const uint64_t q4_table_bytes = uocr_q4_0_qweight_bytes(UOCR_VOCAB_SIZE, UOCR_HIDDEN_SIZE);
+        table_qtype = embedding_binding->payload_size == q4_table_bytes ? UOCR_TENSOR_Q4_0 : UOCR_TENSOR_Q8_0;
+        table_bytes = table_qtype == UOCR_TENSOR_Q4_0 ? q4_table_bytes
+                                                      : uocr_q8_0_qweight_bytes(UOCR_VOCAB_SIZE, UOCR_HIDDEN_SIZE);
         scale_bytes = uocr_q8_0_qscale_bytes(UOCR_VOCAB_SIZE, UOCR_HIDDEN_SIZE, UOCR_Q8_GROUP_SIZE_DEFAULT);
-        if (scale_bytes == 0u || embedding_binding->scale_size != scale_bytes) {
-            return metal_fail(error, error_size, "Metal mapped Q8 prompt assembly table metadata mismatch");
+        if (table_bytes == 0u || scale_bytes == 0u || embedding_binding->scale_size != scale_bytes ||
+            embedding_binding->payload_size != table_bytes) {
+            return metal_fail(error, error_size, "Metal mapped quantized prompt assembly table metadata mismatch");
         }
     } else {
         uint64_t table_values = 0u;
@@ -16621,7 +16682,7 @@ int uocr_metal_context_assemble_prompt_from_model_f16(uocr_metal_context *ctx,
         return 0;
     }
 
-    if (use_q8) {
+    if (use_quant) {
         id<MTLBuffer> scale = nil;
         NSUInteger scale_offset = 0u;
         if (!metal_get_mapped_tensor_scale_buffer(ctx,
@@ -16638,6 +16699,7 @@ int uocr_metal_context_assemble_prompt_from_model_f16(uocr_metal_context *ctx,
                                                                      table_offset,
                                                                      scale,
                                                                      scale_offset,
+                                                                     table_qtype,
                                                                      UOCR_VOCAB_SIZE,
                                                                      UOCR_HIDDEN_SIZE,
                                                                      input_ids,
@@ -16783,14 +16845,19 @@ static int metal_context_assemble_prompt_from_model_to_arena_f16(uocr_metal_cont
     (void)output_bytes;
 
     const uocr_metal_tensor_binding_internal *embedding_binding = metal_find_tensor_binding(ctx, UOCR_TENSOR_ID_TOK_EMBED);
-    const int use_q8 = embedding_binding != NULL && embedding_binding->scale_size != 0u;
+    const int use_quant = embedding_binding != NULL && embedding_binding->scale_size != 0u;
+    uint32_t table_qtype = UOCR_TENSOR_F16;
     uint64_t table_bytes = 0u;
     uint64_t scale_bytes = 0u;
-    if (use_q8) {
-        table_bytes = uocr_q8_0_qweight_bytes(UOCR_VOCAB_SIZE, UOCR_HIDDEN_SIZE);
+    if (use_quant) {
+        const uint64_t q4_table_bytes = uocr_q4_0_qweight_bytes(UOCR_VOCAB_SIZE, UOCR_HIDDEN_SIZE);
+        table_qtype = embedding_binding->payload_size == q4_table_bytes ? UOCR_TENSOR_Q4_0 : UOCR_TENSOR_Q8_0;
+        table_bytes = table_qtype == UOCR_TENSOR_Q4_0 ? q4_table_bytes
+                                                      : uocr_q8_0_qweight_bytes(UOCR_VOCAB_SIZE, UOCR_HIDDEN_SIZE);
         scale_bytes = uocr_q8_0_qscale_bytes(UOCR_VOCAB_SIZE, UOCR_HIDDEN_SIZE, UOCR_Q8_GROUP_SIZE_DEFAULT);
-        if (scale_bytes == 0u || embedding_binding->scale_size != scale_bytes) {
-            return metal_fail(error, error_size, "Metal prompt arena Q8 embedding metadata mismatch");
+        if (table_bytes == 0u || scale_bytes == 0u || embedding_binding->scale_size != scale_bytes ||
+            embedding_binding->payload_size != table_bytes) {
+            return metal_fail(error, error_size, "Metal prompt arena quantized embedding metadata mismatch");
         }
     } else {
         uint64_t table_values = 0u;
@@ -16817,7 +16884,7 @@ static int metal_context_assemble_prompt_from_model_to_arena_f16(uocr_metal_cont
         return 0;
     }
 
-    if (use_q8) {
+    if (use_quant) {
         id<MTLBuffer> scale = nil;
         NSUInteger scale_offset = 0u;
         if (!metal_get_mapped_tensor_scale_buffer(ctx,
@@ -16834,6 +16901,7 @@ static int metal_context_assemble_prompt_from_model_to_arena_f16(uocr_metal_cont
                                                                                table_offset,
                                                                                scale,
                                                                                scale_offset,
+                                                                               table_qtype,
                                                                                UOCR_VOCAB_SIZE,
                                                                                UOCR_HIDDEN_SIZE,
                                                                                input_ids,
@@ -17445,11 +17513,15 @@ static int sam_window_partition_geometry(uint32_t grid_w,
     *out_n_windows = (uint32_t)n_windows;
     return 1;
 }
+static int metal_vision_weight_is_quant(const uocr_metal_vision_tensor_f16 *weight) {
+    return weight != NULL && (weight->qtype == UOCR_TENSOR_Q8_0 || weight->qtype == UOCR_TENSOR_Q4_0);
+}
+
 static int metal_vision_weight_slice_ready(const uocr_metal_vision_tensor_f16 *weight) {
     if (weight == NULL) {
         return 0;
     }
-    if (weight->qtype == UOCR_TENSOR_Q8_0) {
+    if (weight->qtype == UOCR_TENSOR_Q8_0 || weight->qtype == UOCR_TENSOR_Q4_0) {
         return weight->slice.buffer != nil && weight->scale_slice.buffer != nil;
     }
     return weight->host_f16 != NULL;
@@ -17661,8 +17733,8 @@ static int metal_context_clip_mlp_batch_workspace_f16_to_slice(uocr_metal_contex
     const uint64_t fc1_bias_bytes = (uint64_t)UOCR_CLIP_MLP_INTERMEDIATE * 2u;
     const uint64_t fc2_weight_bytes = (uint64_t)UOCR_CLIP_HIDDEN_SIZE * (uint64_t)UOCR_CLIP_MLP_INTERMEDIATE * 2u;
     const uint64_t fc2_bias_bytes = (uint64_t)UOCR_CLIP_HIDDEN_SIZE * 2u;
-    const int fc1_is_q8 = block != NULL && block->mlp_fc1_weight.qtype == UOCR_TENSOR_Q8_0;
-    const int fc2_is_q8 = block != NULL && block->mlp_fc2_weight.qtype == UOCR_TENSOR_Q8_0;
+    const int fc1_is_q8 = metal_vision_weight_is_quant(block != NULL ? &block->mlp_fc1_weight : NULL);
+    const int fc2_is_q8 = metal_vision_weight_is_quant(block != NULL ? &block->mlp_fc2_weight : NULL);
     if (ctx == NULL || block == NULL || rows == 0u || scratch == NULL ||
         !checked_mul_u64((uint64_t)rows, (uint64_t)UOCR_CLIP_HIDDEN_SIZE, &hidden_values) ||
         !metal_vision_f16_bytes(hidden_values, &hidden_bytes) ||
@@ -17815,8 +17887,8 @@ static int metal_context_clip_transformer_batch_block_workspace_f16_to_slice(uoc
     const uint64_t qkv_weight_bytes = (uint64_t)UOCR_CLIP_QKV_SIZE * (uint64_t)UOCR_CLIP_HIDDEN_SIZE * 2u;
     const uint64_t qkv_bias_bytes = (uint64_t)UOCR_CLIP_QKV_SIZE * 2u;
     const uint64_t projection_weight_bytes = (uint64_t)UOCR_CLIP_HIDDEN_SIZE * (uint64_t)UOCR_CLIP_HIDDEN_SIZE * 2u;
-    const int qkv_is_q8 = block->qkv_weight.qtype == UOCR_TENSOR_Q8_0;
-    const int out_proj_is_q8 = block->out_proj_weight.qtype == UOCR_TENSOR_Q8_0;
+    const int qkv_is_q8 = metal_vision_weight_is_quant(block != NULL ? &block->qkv_weight : NULL);
+    const int out_proj_is_q8 = metal_vision_weight_is_quant(block != NULL ? &block->out_proj_weight : NULL);
     if (!metal_vision_require_tensor_slice_f16(block->ln1_weight, hidden_parameter_bytes, "CLIP block ln1 weight", error, error_size) ||
         !metal_vision_require_tensor_slice_f16(block->ln1_bias, hidden_parameter_bytes, "CLIP block ln1 bias", error, error_size) ||
         (!qkv_is_q8 &&
@@ -18790,8 +18862,8 @@ static int metal_context_sam_mlp_batch_workspace_f16_to_slice(uocr_metal_context
     const uint64_t lin1_bias_bytes = (uint64_t)UOCR_SAM_MLP_INTERMEDIATE * 2u;
     const uint64_t lin2_weight_bytes = (uint64_t)UOCR_SAM_HIDDEN_SIZE * (uint64_t)UOCR_SAM_MLP_INTERMEDIATE * 2u;
     const uint64_t lin2_bias_bytes = (uint64_t)UOCR_SAM_HIDDEN_SIZE * 2u;
-    const int lin1_is_q8 = block != NULL && block->mlp_lin1_weight.qtype == UOCR_TENSOR_Q8_0;
-    const int lin2_is_q8 = block != NULL && block->mlp_lin2_weight.qtype == UOCR_TENSOR_Q8_0;
+    const int lin1_is_q8 = metal_vision_weight_is_quant(block != NULL ? &block->mlp_lin1_weight : NULL);
+    const int lin2_is_q8 = metal_vision_weight_is_quant(block != NULL ? &block->mlp_lin2_weight : NULL);
     if (ctx == NULL || !metal_sam_transformer_block_slices_have_weights(block) || rows == 0u ||
         !checked_mul_u64((uint64_t)rows, (uint64_t)UOCR_SAM_HIDDEN_SIZE, &hidden_values) ||
         !metal_vision_f16_bytes(hidden_values, &hidden_bytes) ||
@@ -18967,8 +19039,8 @@ static int metal_context_sam_transformer_batch_block_workspace_f16_to_slice(uocr
     const uint64_t projection_weight_bytes = (uint64_t)UOCR_SAM_HIDDEN_SIZE * (uint64_t)UOCR_SAM_HIDDEN_SIZE * 2u;
     const uint64_t rel_h_bytes = (uint64_t)block->rel_pos_h_length * (uint64_t)UOCR_SAM_HEAD_DIM * 2u;
     const uint64_t rel_w_bytes = (uint64_t)block->rel_pos_w_length * (uint64_t)UOCR_SAM_HEAD_DIM * 2u;
-    const int qkv_is_q8 = block->qkv_weight.qtype == UOCR_TENSOR_Q8_0;
-    const int proj_is_q8 = block->proj_weight.qtype == UOCR_TENSOR_Q8_0;
+    const int qkv_is_q8 = metal_vision_weight_is_quant(block != NULL ? &block->qkv_weight : NULL);
+    const int proj_is_q8 = metal_vision_weight_is_quant(block != NULL ? &block->proj_weight : NULL);
     if (!checked_mul_u64((uint64_t)rows, (uint64_t)UOCR_SAM_HIDDEN_SIZE, &hidden_values) ||
         hidden_values > (uint64_t)UINT32_MAX || !metal_vision_f16_bytes(hidden_values, &hidden_bytes) ||
         !checked_mul_u64((uint64_t)attention_rows, (uint64_t)UOCR_SAM_HIDDEN_SIZE, &attention_values) ||

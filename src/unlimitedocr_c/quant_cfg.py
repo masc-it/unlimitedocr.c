@@ -25,14 +25,18 @@ DEFAULT_QUANT_CFG_NAME = "quant-cfg.yaml"
 
 #: qtype names accepted by quant-cfg v2 and the families each is allowed on.
 QUANT_CFG_QTYPES = ("q8_0", "q4_0")
-#: q4_0 is restricted to the MoE expert/shared MLPs, the dense layer-0 MLP
-#: and the LM head (docs/plan_q4.md §1.3 + extensions E1/E2).
+#: q4_0 modules with fused Metal kernels (docs/plan_q4.md §1.3 + extensions
+#: E1/E2/E4).  Attention stays q8_0 (highest quality risk, no Q4 kernels).
 Q4_ALLOWED_FAMILIES = frozenset(
     {
         TensorFamily.MOE_EXPERT,
         TensorFamily.MOE_SHARED,
         TensorFamily.LAYER_DENSE_MLP,
         TensorFamily.LM_HEAD,
+        TensorFamily.TOK_EMBED,
+        TensorFamily.VISION_SAM,
+        TensorFamily.VISION_CLIP,
+        TensorFamily.PROJECTOR,
     }
 )
 

@@ -56,6 +56,79 @@ static inline void uocr_gemm_q4_stage_b(device const uchar *qweight,
     }
 }
 
+// Vision GEMM: Q4_0 twin of uocr_vision_gemm_q8_0_to_f16 (bias + activation
+// + optional QKV-split epilogue).  Requires n % 32 == 0 and k % 64 == 0 (the
+// Q4 B-side staging has no column guard); the host validates both.
+[[max_total_threads_per_threadgroup(UOCR_GEMM_Q8_THREADS)]] kernel void uocr_vision_gemm_q4_0_to_f16(
+    device const half *src [[buffer(0)]],
+    device const uchar *qweight [[buffer(1)]],
+    device const half *qscale [[buffer(2)]],
+    device const half *bias [[buffer(3)]],
+    device half *dst0 [[buffer(4)]],
+    device half *dst1 [[buffer(5)]],
+    device half *dst2 [[buffer(6)]],
+    constant UocrVisionGemmQ8Params &params [[buffer(7)]],
+    uint2 tgpig [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float smem[UOCR_GEMM_Q8_BM * UOCR_GEMM_Q8_BN];
+    threadgroup half *sa = (threadgroup half *)smem;
+    threadgroup half *sb = sa + UOCR_GEMM_Q8_BM * UOCR_GEMM_Q8_BK;
+    threadgroup float *sc = smem;
+
+    const uint K = params.k;
+    const uint row_base = tgpig.y * UOCR_GEMM_Q8_BM;
+    const uint col_base = tgpig.x * UOCR_GEMM_Q8_BN;
+
+    simdgroup_float8x8 mc[4][2];
+    for (uint i = 0u; i < 4u; ++i) {
+        for (uint j = 0u; j < 2u; ++j) {
+            mc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        }
+    }
+    const uint sg_row = (sgitg / 2u) * 32u;
+    const uint sg_col = (sgitg % 2u) * 16u;
+
+    for (uint k_base = 0u; k_base < K; k_base += UOCR_GEMM_Q8_BK) {
+        uocr_gemm_q8_stage_a(src, params.m, K, row_base, k_base, tid, sa);
+        uocr_gemm_q4_stage_b(qweight, qscale, K, params.groups_per_row, col_base, k_base, tid, sb);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uocr_gemm_q8_mma_tile(sa, sb, sg_row, sg_col, mc);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    for (uint i = 0u; i < 4u; ++i) {
+        for (uint j = 0u; j < 2u; ++j) {
+            simdgroup_store(mc[i][j], sc + (sg_row + i * 8u) * UOCR_GEMM_Q8_BN + sg_col + j * 8u, UOCR_GEMM_Q8_BN);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint i = tid; i < UOCR_GEMM_Q8_BM * UOCR_GEMM_Q8_BN; i += UOCR_GEMM_Q8_THREADS) {
+        const uint mrow = i / UOCR_GEMM_Q8_BN;
+        const uint n = i - mrow * UOCR_GEMM_Q8_BN;
+        const uint row = row_base + mrow;
+        const uint col = col_base + n;
+        if (row >= params.m || col >= params.n) {
+            continue;
+        }
+        float value = sc[i] + float(bias[col]);
+        if (params.activation == UOCR_VISION_Q8_ACT_QUICKGELU) {
+            value = uocr_quickgelu(value);
+        } else if (params.activation == UOCR_VISION_Q8_ACT_GELU_ERF) {
+            value = uocr_gelu_erf(value);
+        }
+        if (params.split_size == 0u) {
+            dst0[(ulong)row * params.n + col] = half(value);
+        } else {
+            const uint projection = col / params.split_size;
+            const uint local_col = col - projection * params.split_size;
+            device half *dst = projection == 0u ? dst0 : (projection == 1u ? dst1 : dst2);
+            dst[(ulong)row * params.split_size + local_col] = half(value);
+        }
+    }
+}
+
 // Decoder prefill GEMM with optional residual add (dense/shared MLP down
 // projection).  Q4_0 twin of uocr_decoder_gemm_residual_q8_0_to_f16; reuses
 // UocrDecoderGemmQ8Params (gemm_q8.metal is an earlier fragment).

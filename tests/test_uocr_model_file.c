@@ -554,7 +554,7 @@ static int write_synthetic_mixed_q4_uocr(const char *path, synthetic_q4_corrupti
 
     uocr_tensor_entry *tensor = (uocr_tensor_entry *)(void *)(buffer + tensor_dir_offset + sizeof(*dir));
     tensor->id = UOCR_TENSOR_ID_LAYER_MOE_EXPERT_BASE;
-    tensor->family = corruption == SYNTHETIC_Q4_BAD_FAMILY ? UOCR_TENSOR_FAMILY_TOK_EMBED
+    tensor->family = corruption == SYNTHETIC_Q4_BAD_FAMILY ? UOCR_TENSOR_FAMILY_LAYER_ATTN
                                                            : UOCR_TENSOR_FAMILY_MOE_EXPERT;
     tensor->layer = 1;
     tensor->expert = 0;
@@ -837,7 +837,7 @@ static int test_rejects_q4_outside_moe_experts(void) {
     char error[512];
     uocr_model_file model;
     CHECK(uocr_model_file_open(path, &model, error, sizeof(error)) != 0);
-    CHECK(strstr(error, "q4_0 is only supported") != NULL);
+    CHECK(strstr(error, "q4_0 is not supported") != NULL);
     unlink(path);
     return 0;
 }
