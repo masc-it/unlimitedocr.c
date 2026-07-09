@@ -61,6 +61,10 @@ endif()
 set(UOCR_METAL_MATH_FLAGS
     "-fmetal-math-mode=${UOCR_METAL_MATH_MODE_FLAG}"
     "-fmetal-math-fp32-functions=${UOCR_METAL_MATH_FP32_FUNCTIONS_FLAG}")
+set(UOCR_METAL_DEPLOYMENT_FLAGS)
+if(CMAKE_OSX_DEPLOYMENT_TARGET)
+    list(APPEND UOCR_METAL_DEPLOYMENT_FLAGS "-mmacosx-version-min=${CMAKE_OSX_DEPLOYMENT_TARGET}")
+endif()
 
 set(UOCR_METAL_ENABLED OFF)
 if(UOCR_ENABLE_METAL_UPPER STREQUAL "ON")
@@ -158,6 +162,7 @@ if(UOCR_METAL_ENABLED)
                 -I"${UOCR_METAL_KERNEL_DIR}"
                 -DUOCR_METAL_ENABLE_MPP_TENSOROPS=${UOCR_METAL_ENABLE_MPP_TENSOROPS_VALUE}
                 ${UOCR_METAL_MATH_FLAGS}
+                ${UOCR_METAL_DEPLOYMENT_FLAGS}
                 -c "${UOCR_METAL_COMBINED_SOURCE}" -o "${UOCR_METAL_AIR_FILE}"
             DEPENDS "${UOCR_METAL_COMBINED_SOURCE}"
             COMMENT "Compiling combined Metal source → uocr_all.air"

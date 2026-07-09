@@ -13,7 +13,7 @@ management, KV cache, logits processing, and GPU execution.
 uv add unlimitedocr-c
 ```
 
-> `unlimitedocr-c` is published on PyPI. Version `0.4.0` is the latest stable release.
+> `unlimitedocr-c` is published on PyPI. Version `0.4.1` is the latest stable release.
 
 ## Quick start
 
