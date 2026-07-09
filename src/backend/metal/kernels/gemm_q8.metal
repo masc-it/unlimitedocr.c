@@ -438,7 +438,7 @@ struct UocrMoeBucketQ8Params {
     uint rows_per_tile;
 };
 
-// Mirrors UocrMoePrefillInterleavedQ8Params (moe_q8.metal is a later fragment).
+// Shared with the decode GEMV Q8 MoE kernels.
 struct UocrMoeBucketedGemmQ8Params {
     uint n_tokens;
     uint hidden_size;

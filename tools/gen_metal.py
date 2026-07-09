@@ -15,7 +15,6 @@ DEFAULT_OUTPUT = KERNELS / "uocr_smoke.metal"
 ORDER = [
     "common.metal",
     "dense.metal",
-    "dense_q8.metal",
     "decode_gemv_q8.metal",
     "decode_gemv_q4.metal",
     "norm.metal",
@@ -29,7 +28,6 @@ ORDER = [
     "attention_decode.metal",
     "attention_prefill.metal",
     "attention.metal",
-    "attention_q8.metal",
     "clip.metal",
     "clip_sam.metal",
     "embedding.metal",
@@ -37,14 +35,11 @@ ORDER = [
     "kv_cache.metal",
     "layout.metal",
     "moe.metal",
-    "moe_q8.metal",
     "prompt_assembly.metal",
     "rope.metal",
     "sampling.metal",
-    "sam_conv.metal",
     "sam_window.metal",
     "smoke.metal",
-    "mpp_prototypes.metal",
 ]
 
 

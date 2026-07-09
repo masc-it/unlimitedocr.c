@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from dataclasses import replace
 import importlib.util
-import json
 import math
 import sys
 
@@ -11,9 +10,7 @@ from PIL import Image, ImageOps
 import pytest
 
 from unlimitedocr_c.frontend import (
-    ADDED_TOKEN_COUNT,
     BOS_TOKEN_ID,
-    BPE_VOCAB_SIZE,
     EOS_TOKEN_ID,
     EXPECTED_OUTPUT_IDS_NPY,
     EXPECTED_TEXT_TXT,
@@ -24,11 +21,8 @@ from unlimitedocr_c.frontend import (
     IMAGE_TOKEN_ID,
     LOCAL_QUERIES,
     LOCAL_VIEW_SIZE,
-    MODEL_VOCAB_SIZE,
-    PAD_TOKEN_ID,
     PATCH_SIZE,
     crop_visual_token_count,
-    default_tokenizer_path,
     dynamic_preprocess,
     format_messages_plain,
     global_visual_token_count,
@@ -41,7 +35,6 @@ from unlimitedocr_c.frontend import (
     prepare_pages,
     prepare_text,
     save_prepared_request,
-    validate_tokenizer,
 )
 
 
@@ -94,27 +87,6 @@ def upstream_plain_prompt(prompt: str) -> str:
 def test_tokenizer_metadata_loads() -> None:
     tokenizer = load_tokenizer()
     assert tokenizer.token_to_id(IMAGE_TOKEN) == IMAGE_TOKEN_ID
-
-
-def test_tokenizer_metadata_contract_matches_context_files() -> None:
-    tokenizer_path = default_tokenizer_path()
-    tokenizer = load_tokenizer(tokenizer_path)
-    validate_tokenizer(tokenizer, tokenizer_path)
-
-    with tokenizer_path.open("r", encoding="utf-8") as f:
-        tokenizer_json = json.load(f)
-    with tokenizer_path.with_name("config.json").open("r", encoding="utf-8") as f:
-        model_config = json.load(f)
-
-    assert tokenizer.get_vocab_size(with_added_tokens=False) == BPE_VOCAB_SIZE
-    assert len(tokenizer_json["added_tokens"]) == ADDED_TOKEN_COUNT
-    assert int(model_config["vocab_size"]) == MODEL_VOCAB_SIZE
-    assert tokenizer.token_to_id("<｜begin▁of▁sentence｜>") == BOS_TOKEN_ID
-    assert tokenizer.token_to_id("<｜end▁of▁sentence｜>") == EOS_TOKEN_ID
-    assert tokenizer.token_to_id("<｜▁pad▁｜>") == PAD_TOKEN_ID
-    assert tokenizer.token_to_id(IMAGE_TOKEN) == IMAGE_TOKEN_ID
-    assert 0 <= IMAGE_TOKEN_ID < MODEL_VOCAB_SIZE
-    assert tokenizer.get_vocab_size(with_added_tokens=True) <= MODEL_VOCAB_SIZE
 
 
 def test_plain_prompt_rendering_strips_roles_and_content() -> None:

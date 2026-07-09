@@ -14,7 +14,7 @@ API for OCR workflows.
 | **On-device, private** | No network calls; model and inference run entirely on the local machine. |
 | **Low latency** | Native C code, GPU execution via Apple Metal, no-copy model tensor views, and a bounded-memory vision pipeline. |
 | **Memory aware** | Every allocation is tracked by category.  Requests are admitted or rejected based on a fixed memory budget, preventing OOM at runtime. |
-| **Quantized** | An optional mixed-Q8_0 profile stores weight matrices as int8 + fp16 group scales (~½ model size).  Dequantization is fused inside the GPU kernels; activations, KV cache, and numerics-sensitive tensors stay fp16. |
+| **Quantized** | Optional mixed-Q8_0 and dynamic mixed-Q4 profiles store runtime-safe weight matrices as Q8_0 or Q4_0 with fp16 group scales.  Dequantization is fused inside the GPU kernels; activations, KV cache, and numerics-sensitive tensors stay fp16. |
 | **Multi-backend** | A clean C ABI lets the same engine dispatch to different backends.  Today only **Metal** (Apple GPU) is production-ready; a **CPU ref** backend exists for validation and parity testing.  Future backends (CUDA, ANE, etc.) slot in behind the same interface. |
 | **Portable Python API** | The user-facing `UnlimitedOCR` class accepts images as paths, URLs, bytes, PIL images, or base64 strings. |
 
@@ -310,18 +310,19 @@ designed for **zero-copy memory mapping**:
 ├──────────────────────┤
 │ Provenance Record    │  source safetensors info, config hashes
 ├──────────────────────┤
-│ Tensor Payloads      │  aligned fp16 / Q8_0 tensor data
+│ Tensor Payloads      │  aligned fp16 / Q8_0 / Q4_0 tensor data
 └──────────────────────┘
 ```
 
 The file carries a **quantization profile** (`qprofile`): `fp16` (all tensors
-fp16) or `mixed-q8_0`.  In the mixed profile, selected rank-2 weight matrices
-are stored as **Q8_0**: row-major int8 qweights plus one fp16 scale per
-64-element group along the input dimension (`payload_offset/size` for
-qweights, `scale_offset/size` for scales in the same tensor entry).  Which
-modules the converter may quantize is gated by `configs/quant-cfg.yaml` — a
-module is enabled only after fused runtime kernels exist and it passed
-end-to-end QA.
+fp16), `mixed-q8_0`, or dynamic `mixed-q4`.  In mixed profiles, selected
+rank-2 weight matrices are stored as **Q8_0** (row-major int8 qweights plus
+one fp16 scale per 64-element input group) or **Q4_0** (two symmetric int4
+weights per byte plus fp16 group scales).  Qweight bytes live at
+`payload_offset/size`; scales live at `scale_offset/size` in the same tensor
+entry.  Which modules the converter may quantize — and which modules become
+Q4_0 under `mixed-q4` — is gated by `configs/quant-cfg.yaml`; a module is
+enabled only after fused runtime kernels exist and it passed end-to-end QA.
 
 **Key design decisions:**
 
@@ -329,7 +330,7 @@ end-to-end QA.
   direct GPU buffer aliasing without copying.
 - **Tensor entries** carry rich metadata: family (attention, MoE, vision, etc.),
   projection (Q/K/V/O, gate/up/down, etc.), layer index, logical & physical
-  shape, and quantization profile.
+  shape, tensor qtype (`fp16`, `q8_0`, `q4_0`), and quantization profile.
 - **No-copy loading**: the file is `mmap`'d, then Metal buffers are created that
   point directly at the file pages.  Model tensor data is never copied into
   separate allocations.
@@ -444,20 +445,18 @@ contains one or more related GPU functions:
 | `common.metal` | Shared constants, function constants, threadgroup helpers |
 | `attention_prefill.metal` | Flash attention for prompt tokens |
 | `attention_decode.metal` | Flash attention for single-token decode |
-| `attention.metal` | Shared QKVO projection kernels |
-| `dense.metal` | Linear layers (matrix multiply + bias) |
+| `attention.metal` | Decode attention projection/output residual kernels |
+| `dense.metal` | Bias/residual, decode GEMV, dense/shared SwiGLU gate-up kernels |
 | `norm.metal` | RMS norm, layer norm |
 | `moe.metal` | Router, gated MLP (shared + routed experts) |
 | `rope.metal` | Rotary position embedding |
 | `embedding.metal` | Token embedding lookup |
-| `embedding_q8.metal` | Fused Q8 token-embedding gather |
-| `attention_q8.metal`, `dense_q8.metal`, `moe_q8.metal` | Fused Q8 decode projection/MLP/MoE variants |
-| `decode_gemv_q8.metal` | Simdgroup-per-row Q8 GEMV family for single-token decode |
-| `gemm_q8.metal` | Tiled simdgroup-MMA Q8 GEMM (prefill + vision) and expert-bucketed MoE prefill |
-| `lm_head_q8.metal` | Fused Q8 LM-head projection + argmax |
-| `sam.metal` | SAM patch embedding |
+| `embedding_q8.metal`, `embedding_q4.metal` | Fused Q8/Q4 token-embedding gather |
+| `decode_gemv_q8.metal`, `decode_gemv_q4.metal` | Simdgroup-per-row Q8/Q4 GEMV family for single-token decode |
+| `gemm_q8.metal`, `gemm_q4.metal` | Tiled simdgroup-MMA Q8/Q4 GEMM (prefill + vision) and expert-bucketed MoE prefill |
+| `lm_head_q8.metal`, `lm_head_q4.metal` | Fused Q8/Q4 LM-head projection + argmax |
+| `sam.metal` | SAM layernorm/activation utilities |
 | `sam_attention.metal` | SAM window attention with relative position bias |
-| `sam_conv.metal` | SAM conv layers |
 | `sam_position.metal` | SAM position embedding |
 | `sam_window.metal` | SAM window reshape utilities |
 | `clip.metal` | CLIP encoder blocks |
@@ -473,21 +472,25 @@ compile specialized pipeline variants at runtime for the exact model
 architecture (hidden size, head count, ring window, etc.), avoiding runtime
 branches inside hot kernels.
 
-### 4.5 Q8 Quantization Support
+### 4.5 Q8 and Dynamic Q4 Quantization Support
 
-The Metal backend executes the **mixed-Q8_0** model profile with fused
-quantized kernels.  All rank-2 weight matrices are quantized — the full
-decoder path (token embedding, attention Q/K/V/O, dense MLP, shared and
-routed MoE experts, LM head) and the full vision path (visual projector, CLIP
-attention QKV/O and MLP fc1/fc2, SAM attention QKV/O and MLP lin1/lin2).
-Norms, biases, position/relative-position embeddings, the MoE router, the
-rank-4 SAM conv/patch tensors, and all activations and the KV cache stay fp16.
+The Metal backend executes the **mixed-Q8_0** and dynamic **mixed-Q4** model
+profiles with fused quantized kernels.  Mixed-Q8_0 quantizes runtime-safe
+rank-2 weight matrices as Q8_0 — the full decoder path (token embedding,
+attention Q/K/V/O, dense MLP, shared and routed MoE experts, LM head) and the
+full vision path (visual projector, CLIP attention QKV/O and MLP fc1/fc2, SAM
+attention QKV/O and MLP lin1/lin2).  Dynamic mixed-Q4 uses the same
+cfg-gated module list but stores selected low-risk modules as Q4_0 (token
+embedding, LM head, dense/shared/routed MLPs, and vision GEMMs), while
+attention projections remain Q8_0 for quality.  Norms, biases,
+position/relative-position embeddings, the MoE router, the rank-4 SAM
+conv/patch tensors, and all activations and the KV cache stay fp16.
 
 Design rules (see `docs/howto_quant.md` for the full guide):
 
 - **Fused dequantization.**  No kernel materializes a dequantized weight
-  buffer; int8 qweights and fp16 group scales are read and dequantized inside
-  the same kernel that performs the dot product (registers for GEMV,
+  buffer; int8/int4 qweights and fp16 group scales are read and dequantized
+  inside the same kernel that performs the dot product (registers for GEMV,
   threadgroup tiles for GEMM).  MPS matmul is never fed dequantized copies.
 - **Two kernel regimes, selected per dispatch.**  Single-token decode uses
   simdgroup-per-row GEMV kernels (`decode_gemv_q8.metal`: char4 weight /
@@ -501,10 +504,10 @@ Design rules (see `docs/howto_quant.md` for the full guide):
   (token, expert) pairs by expert on GPU, then runs the tiled GEMM per bucket
   with gathered rows (~18× faster than per-pair GEMV at 1024 prompt tokens).
 - **Cfg-gated rollout.**  `configs/quant-cfg.yaml` lists the runtime-safe
-  (family, projection) modules; the converter quantizes only those, the
-  loader validates Q8 metadata per role, and a quantized tensor reaching a
-  call site without a fused kernel fails at bind time rather than falling
-  back silently.
+  (family, projection) modules and optional per-module qtype (`q8_0` or
+  `q4_0`).  The converter quantizes only those, the loader validates Q8/Q4
+  metadata per role, and a quantized tensor reaching a call site without a
+  fused kernel fails at bind time rather than falling back silently.
 
 ### 4.6 Orchestration
 
@@ -537,7 +540,7 @@ engine options.  The report includes:
 
 ---
 
-*This document describes the architecture as of unlimitedocr.c v0.3.0.  The
+*This document describes the architecture as of unlimitedocr.c v0.4.1.  The
 multi-backend design intentionally separates frontend, engine core, and backend
 concerns so that new backends (CUDA, ANE, Vulkan, etc.) can be added by
 implementing the backend interface without modifying the shared C core or Python

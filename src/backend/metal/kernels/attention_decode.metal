@@ -129,14 +129,3 @@ static inline void uocr_decode_attention_flash_impl(device const half *q_src,
                                                    ushort simd_width [[threads_per_simdgroup]]) {
     uocr_decode_attention_flash_impl(q_src, k_cache, v_cache, dst, params, head, lane, simd_width);
 }
-
-[[max_total_threads_per_threadgroup(256)]] kernel void uocr_decode_attention_flash_f16_to_f32(device const half *q_src [[buffer(0)]],
-                                                   device const half *k_cache [[buffer(1)]],
-                                                   device const half *v_cache [[buffer(2)]],
-                                                   device float *dst [[buffer(3)]],
-                                                   constant UocrDecodeAttentionParams &params [[buffer(4)]],
-                                                   uint head [[threadgroup_position_in_grid]],
-                                                   ushort lane [[thread_index_in_simdgroup]],
-                                                   ushort simd_width [[threads_per_simdgroup]]) {
-    uocr_decode_attention_flash_impl(q_src, k_cache, v_cache, dst, params, head, lane, simd_width);
-}

@@ -17,25 +17,6 @@ static inline bool uocr_moe_router_topk_bits_better(uint score_bits,
            (score_bits == best_score_bits && inverse_expert > best_inverse_expert);
 }
 
-static inline float uocr_moe_router_dot_f16(device const half *src,
-                                            device const half *weight,
-                                            constant UocrMoeRouterParams &params,
-                                            uint token,
-                                            uint expert,
-                                            uint tid,
-                                            uint ntg,
-                                            uint simd_width,
-                                            threadgroup float *partials) {
-    const uint hidden_size = uocr_fc_hidden_size_or(params.hidden_size);
-    float sum = 0.0f;
-    const uint src_base = token * hidden_size;
-    const uint weight_base = expert * hidden_size;
-    for (uint k = tid; k < hidden_size; k += ntg) {
-        sum += float(src[src_base + k]) * float(weight[weight_base + k]);
-    }
-    return uocr_threadgroup_sum(sum, partials, tid, ntg, simd_width);
-}
-
 static inline float uocr_moe_router_group256_sum(float value,
                                                  threadgroup float *partials,
                                                  uint group,
@@ -62,28 +43,6 @@ static inline float uocr_moe_router_group256_sum(float value,
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     return group_partials[0];
-}
-
-[[max_total_threads_per_threadgroup(256)]] kernel void uocr_moe_router_logits_f16_to_f32(device const half *src [[buffer(0)]],
-                                             device const half *weight [[buffer(1)]],
-                                             device float *logits [[buffer(2)]],
-                                             constant UocrMoeRouterParams &params [[buffer(3)]],
-                                             threadgroup float *partials [[threadgroup(0)]],
-                                             uint output_index [[threadgroup_position_in_grid]],
-                                             uint tid [[thread_index_in_threadgroup]],
-                                             uint ntg [[threads_per_threadgroup]],
-                                             uint simd_width [[threads_per_simdgroup]]) {
-    const uint experts = uocr_fc_moe_experts_or(params.experts);
-    const uint token = output_index / experts;
-    const uint expert = output_index - token * experts;
-    if (token >= params.n_tokens || expert >= experts) {
-        return;
-    }
-
-    const float value = uocr_moe_router_dot_f16(src, weight, params, token, expert, tid, ntg, simd_width, partials);
-    if (tid == 0) {
-        logits[token * experts + expert] = value;
-    }
 }
 
 // Decode-only router fusion for one hidden row.  Each 256-thread partition
@@ -551,87 +510,6 @@ struct UocrMoeSelectedParams {
 };
 
 
-
-
-kernel void uocr_moe_selected_gate_up_f16(device const half *src [[buffer(0)]],
-                                          device const half *gate_weight [[buffer(1)]],
-                                          device const half *up_weight [[buffer(2)]],
-                                          device half *mid [[buffer(3)]],
-                                          constant UocrMoeSelectedParams &params [[buffer(4)]],
-                                          threadgroup float *partials [[threadgroup(0)]],
-                                          uint output_index [[threadgroup_position_in_grid]],
-                                          uint tid [[thread_index_in_threadgroup]],
-                                          uint ntg [[threads_per_threadgroup]],
-                                          uint simd_width [[threads_per_simdgroup]]) {
-    const uint rank = output_index / params.intermediate_size;
-    const uint out_col = output_index - rank * params.intermediate_size;
-    if (rank >= params.top_k || out_col >= params.intermediate_size) {
-        return;
-    }
-
-    threadgroup float *gate_partials = partials;
-    threadgroup float *up_partials = partials + ntg;
-    float gate_sum = 0.0f;
-    float up_sum = 0.0f;
-    const ulong weight_base = (ulong(rank) * ulong(params.intermediate_size) + ulong(out_col)) *
-                              ulong(params.hidden_size);
-    for (uint k = tid; k < params.hidden_size; k += ntg) {
-        const float x = float(src[k]);
-        gate_sum += x * float(gate_weight[weight_base + ulong(k)]);
-        up_sum += x * float(up_weight[weight_base + ulong(k)]);
-    }
-    float gate = 0.0f;
-    float up = 0.0f;
-    uocr_threadgroup_sum2(gate_sum, up_sum, gate_partials, up_partials, tid, ntg, simd_width, gate, up);
-
-    if (tid == 0) {
-        const float silu = gate / (1.0f + exp(-gate));
-        mid[rank * params.intermediate_size + out_col] = half(silu * up);
-    }
-}
-
-
-static inline float uocr_moe_selected_down_sum_dot_f16(device const half *mid,
-                                                       device const half *down_weight,
-                                                       device const float *top_weights,
-                                                       constant UocrMoeSelectedParams &params,
-                                                       uint out_col,
-                                                       uint tid,
-                                                       uint ntg,
-                                              uint simd_width,
-                                                       threadgroup float *partials) {
-    float sum = 0.0f;
-    for (uint rank = 0; rank < params.top_k; ++rank) {
-        float expert_sum = 0.0f;
-        const ulong mid_base = ulong(rank) * ulong(params.intermediate_size);
-        const ulong weight_base = (ulong(rank) * ulong(params.hidden_size) + ulong(out_col)) *
-                                  ulong(params.intermediate_size);
-        for (uint k = tid; k < params.intermediate_size; k += ntg) {
-            expert_sum += float(mid[mid_base + ulong(k)]) * float(down_weight[weight_base + ulong(k)]);
-        }
-        sum += expert_sum * top_weights[rank];
-    }
-    return uocr_threadgroup_sum(sum, partials, tid, ntg, simd_width);
-}
-
-kernel void uocr_moe_selected_down_sum_f16_to_f16(device const half *mid [[buffer(0)]],
-                                                  device const half *down_weight [[buffer(1)]],
-                                                  device const float *top_weights [[buffer(2)]],
-                                                  device half *dst [[buffer(3)]],
-                                                  constant UocrMoeSelectedParams &params [[buffer(4)]],
-                                                  threadgroup float *partials [[threadgroup(0)]],
-                                                  uint out_col [[threadgroup_position_in_grid]],
-                                                  uint tid [[thread_index_in_threadgroup]],
-                                                  uint ntg [[threads_per_threadgroup]],
-                                                  uint simd_width [[threads_per_simdgroup]]) {
-    if (out_col >= params.hidden_size) {
-        return;
-    }
-    const float value = uocr_moe_selected_down_sum_dot_f16(mid, down_weight, top_weights, params, out_col, tid, ntg, simd_width, partials);
-    if (tid == 0) {
-        dst[out_col] = half(value);
-    }
-}
 struct UocrMoePrefillSelectedParams {
     uint n_tokens;
     uint hidden_size;
@@ -642,8 +520,6 @@ struct UocrMoePrefillSelectedParams {
     uint reserved1;
     uint reserved2;
 };
-
-
 
 
 struct UocrMoePrefillInterleavedParams {
@@ -761,121 +637,7 @@ struct UocrMoeDecodeInterleavedParams {
     }
 }
 
-kernel void uocr_moe_prefill_selected_gate_up_f16(device const half *src [[buffer(0)]],
-                                                  device const uint *top_expert_ids [[buffer(1)]],
-                                                  device const half *gate_weight [[buffer(2)]],
-                                                  device const half *up_weight [[buffer(3)]],
-                                                  device half *mid [[buffer(4)]],
-                                                  constant UocrMoePrefillSelectedParams &params [[buffer(5)]],
-                                                  threadgroup float *partials [[threadgroup(0)]],
-                                                  uint output_index [[threadgroup_position_in_grid]],
-                                                  uint tid [[thread_index_in_threadgroup]],
-                                                  uint ntg [[threads_per_threadgroup]],
-                                                  uint simd_width [[threads_per_simdgroup]]) {
-    const uint per_token = params.top_k * params.intermediate_size;
-    const uint token = output_index / per_token;
-    const uint token_rem = output_index - token * per_token;
-    const uint rank = token_rem / params.intermediate_size;
-    const uint out_col = token_rem - rank * params.intermediate_size;
-    if (token >= params.n_tokens || rank >= params.top_k || out_col >= params.intermediate_size) {
-        return;
-    }
 
-    const uint expert = top_expert_ids[token * params.top_k + rank];
-    if (expert >= params.expert_count) {
-        if (tid == 0) {
-            mid[(token * params.top_k + rank) * params.intermediate_size + out_col] = half(0.0f);
-        }
-        return;
-    }
-
-    threadgroup float *gate_partials = partials;
-    threadgroup float *up_partials = partials + ntg;
-    float gate_sum = 0.0f;
-    float up_sum = 0.0f;
-    const ulong src_base = ulong(token) * ulong(params.hidden_size);
-    const ulong weight_base = (ulong(expert) * ulong(params.intermediate_size) + ulong(out_col)) *
-                              ulong(params.hidden_size);
-    for (uint k = tid; k < params.hidden_size; k += ntg) {
-        const float x = float(src[src_base + ulong(k)]);
-        gate_sum += x * float(gate_weight[weight_base + ulong(k)]);
-        up_sum += x * float(up_weight[weight_base + ulong(k)]);
-    }
-    float gate = 0.0f;
-    float up = 0.0f;
-    uocr_threadgroup_sum2(gate_sum, up_sum, gate_partials, up_partials, tid, ntg, simd_width, gate, up);
-
-    if (tid == 0) {
-        const float silu = gate / (1.0f + exp(-gate));
-        const ulong mid_index = (ulong(token) * ulong(params.top_k) + ulong(rank)) *
-                                    ulong(params.intermediate_size) +
-                                ulong(out_col);
-        mid[mid_index] = half(silu * up);
-    }
-}
-
-
-static inline float uocr_moe_prefill_selected_down_dot_f16(device const half *mid,
-                                                           device const uint *top_expert_ids,
-                                                           device const float *top_weights,
-                                                           device const half *down_weight,
-                                                           constant UocrMoePrefillSelectedParams &params,
-                                                           uint token,
-                                                           uint out_col,
-                                                           uint tid,
-                                                           uint ntg,
-                                              uint simd_width,
-                                                           threadgroup float *partials) {
-    float sum = 0.0f;
-    for (uint rank = 0; rank < params.top_k; ++rank) {
-        const uint expert = top_expert_ids[token * params.top_k + rank];
-        if (expert >= params.expert_count) {
-            continue;
-        }
-        float expert_sum = 0.0f;
-        const ulong mid_base = (ulong(token) * ulong(params.top_k) + ulong(rank)) *
-                               ulong(params.intermediate_size);
-        const ulong weight_base = (ulong(expert) * ulong(params.hidden_size) + ulong(out_col)) *
-                                  ulong(params.intermediate_size);
-        for (uint k = tid; k < params.intermediate_size; k += ntg) {
-            expert_sum += float(mid[mid_base + ulong(k)]) * float(down_weight[weight_base + ulong(k)]);
-        }
-        sum += expert_sum * top_weights[token * params.top_k + rank];
-    }
-    return uocr_threadgroup_sum(sum, partials, tid, ntg, simd_width);
-}
-
-kernel void uocr_moe_prefill_selected_down_sum_f16_to_f16(device const half *mid [[buffer(0)]],
-                                                          device const uint *top_expert_ids [[buffer(1)]],
-                                                          device const float *top_weights [[buffer(2)]],
-                                                          device const half *down_weight [[buffer(3)]],
-                                                          device half *dst [[buffer(4)]],
-                                                          constant UocrMoePrefillSelectedParams &params [[buffer(5)]],
-                                                          threadgroup float *partials [[threadgroup(0)]],
-                                                          uint output_index [[threadgroup_position_in_grid]],
-                                                          uint tid [[thread_index_in_threadgroup]],
-                                                          uint ntg [[threads_per_threadgroup]],
-                                                          uint simd_width [[threads_per_simdgroup]]) {
-    const uint token = output_index / params.hidden_size;
-    const uint out_col = output_index - token * params.hidden_size;
-    if (token >= params.n_tokens || out_col >= params.hidden_size) {
-        return;
-    }
-    const float value = uocr_moe_prefill_selected_down_dot_f16(mid,
-                                                               top_expert_ids,
-                                                               top_weights,
-                                                               down_weight,
-                                                               params,
-                                                               token,
-                                                               out_col,
-                                                               tid,
-                                                               ntg,
-                                                               simd_width,
-                                                               partials);
-    if (tid == 0) {
-        dst[output_index] = half(value);
-    }
-}
 kernel void uocr_moe_prefill_interleaved_gate_up_f16(device const half *src [[buffer(0)]],
                                                      device const uint *top_expert_ids [[buffer(1)]],
                                                      device const half *expert_slab [[buffer(2)]],
@@ -929,59 +691,6 @@ kernel void uocr_moe_prefill_interleaved_gate_up_f16(device const half *src [[bu
     }
 }
 
-kernel void uocr_moe_decode_interleaved_gate_up_one_f16(device const half *src [[buffer(0)]],
-                                                        device const uint *top_expert_ids [[buffer(1)]],
-                                                        device const half *expert_slab [[buffer(2)]],
-                                                        device half *mid [[buffer(3)]],
-                                                        constant UocrMoePrefillInterleavedParams &params [[buffer(4)]],
-                                                        threadgroup float *partials [[threadgroup(0)]],
-                                                        uint output_index [[threadgroup_position_in_grid]],
-                                                        uint tid [[thread_index_in_threadgroup]],
-                                                        uint ntg [[threads_per_threadgroup]],
-                                                        uint simd_width [[threads_per_simdgroup]]) {
-    const uint per_token = params.top_k * params.intermediate_size;
-    const uint token = output_index / per_token;
-    const uint token_rem = output_index - token * per_token;
-    const uint rank = token_rem / params.intermediate_size;
-    const uint out_col = token_rem - rank * params.intermediate_size;
-    if (token >= params.n_tokens || rank >= params.top_k || out_col >= params.intermediate_size) {
-        return;
-    }
-
-    const uint expert = top_expert_ids[token * params.top_k + rank];
-    if (expert >= params.expert_count) {
-        if (tid == 0) {
-            mid[(token * params.top_k + rank) * params.intermediate_size + out_col] = half(0.0f);
-        }
-        return;
-    }
-
-    threadgroup float *gate_partials = partials;
-    threadgroup float *up_partials = partials + ntg;
-    float gate_sum = 0.0f;
-    float up_sum = 0.0f;
-    const ulong src_base = ulong(token) * ulong(params.hidden_size);
-    const ulong expert_base = ulong(expert) * ulong(params.expert_stride_values);
-    const ulong gate_base = expert_base + ulong(out_col) * ulong(params.hidden_size);
-    const ulong up_base = expert_base + ulong(params.up_offset_values) + ulong(out_col) * ulong(params.hidden_size);
-    for (uint k = tid; k < params.hidden_size; k += ntg) {
-        const float x = float(src[src_base + ulong(k)]);
-        gate_sum += x * float(expert_slab[gate_base + ulong(k)]);
-        up_sum += x * float(expert_slab[up_base + ulong(k)]);
-    }
-    float gate = 0.0f;
-    float up = 0.0f;
-    uocr_threadgroup_sum2(gate_sum, up_sum, gate_partials, up_partials, tid, ntg, simd_width, gate, up);
-
-    if (tid == 0) {
-        const float silu = gate / (1.0f + exp(-gate));
-        const ulong mid_index = (ulong(token) * ulong(params.top_k) + ulong(rank)) *
-                                    ulong(params.intermediate_size) +
-                                ulong(out_col);
-        mid[mid_index] = half(silu * up);
-    }
-}
-
 // Decode-only routed-expert gate/up tiling.  Each threadgroup covers one
 // selected rank and four adjacent intermediate columns.  The 256 lanes walk
 // hidden indices in the same order as uocr_moe_decode_interleaved_gate_up_one_f16
@@ -991,110 +700,6 @@ kernel void uocr_moe_decode_interleaved_gate_up_one_f16(device const half *src [
 // accumulation feeding the fp16 SwiGLU intermediate store.  The expert-id branch
 // is uniform for the whole threadgroup, and all valid/tail columns execute the
 // same sequence of barriers.
-[[max_total_threads_per_threadgroup(256)]] kernel void uocr_moe_decode_interleaved_gate_up_tile4_f16(device const half *src [[buffer(0)]],
-                                                        device const uint *top_expert_ids [[buffer(1)]],
-                                                        device const half *expert_slab [[buffer(2)]],
-                                                        device half *mid [[buffer(3)]],
-                                                        constant UocrMoePrefillInterleavedParams &params [[buffer(4)]],
-                                                        threadgroup float *partials [[threadgroup(0)]],
-                                                        uint output_tile [[threadgroup_position_in_grid]],
-                                                        uint tid [[thread_index_in_threadgroup]],
-                                                        uint ntg [[threads_per_threadgroup]],
-                                                        uint simd_width [[threads_per_simdgroup]]) {
-    const uint tile_columns = 4u;
-    const uint tiles_per_rank = uocr_div_up_u32(params.intermediate_size, tile_columns);
-    const uint tiles_per_token = params.top_k * tiles_per_rank;
-    const uint token = output_tile / tiles_per_token;
-    const uint token_rem = output_tile - token * tiles_per_token;
-    const uint rank = token_rem / tiles_per_rank;
-    const uint tile = token_rem - rank * tiles_per_rank;
-    if (token >= params.n_tokens || rank >= params.top_k || ntg != 256u) {
-        return;
-    }
-
-    const uint out_col0 = tile * tile_columns;
-    const uint out_col1 = out_col0 + 1u;
-    const uint out_col2 = out_col0 + 2u;
-    const uint out_col3 = out_col0 + 3u;
-    const bool valid0 = out_col0 < params.intermediate_size;
-    const bool valid1 = out_col1 < params.intermediate_size;
-    const bool valid2 = out_col2 < params.intermediate_size;
-    const bool valid3 = out_col3 < params.intermediate_size;
-    const ulong mid_base = (ulong(token) * ulong(params.top_k) + ulong(rank)) * ulong(params.intermediate_size);
-    const uint expert = top_expert_ids[token * params.top_k + rank];
-    if (expert >= params.expert_count) {
-        if (tid == 0u) {
-            if (valid0) mid[mid_base + ulong(out_col0)] = half(0.0f);
-            if (valid1) mid[mid_base + ulong(out_col1)] = half(0.0f);
-            if (valid2) mid[mid_base + ulong(out_col2)] = half(0.0f);
-            if (valid3) mid[mid_base + ulong(out_col3)] = half(0.0f);
-        }
-        return;
-    }
-
-    float gate0 = 0.0f;
-    float up0 = 0.0f;
-    float gate1 = 0.0f;
-    float up1 = 0.0f;
-    float gate2 = 0.0f;
-    float up2 = 0.0f;
-    float gate3 = 0.0f;
-    float up3 = 0.0f;
-    const ulong src_base = ulong(token) * ulong(params.hidden_size);
-    const ulong expert_base = ulong(expert) * ulong(params.expert_stride_values);
-    const ulong gate_base0 = expert_base + ulong(out_col0) * ulong(params.hidden_size);
-    const ulong gate_base1 = expert_base + ulong(out_col1) * ulong(params.hidden_size);
-    const ulong gate_base2 = expert_base + ulong(out_col2) * ulong(params.hidden_size);
-    const ulong gate_base3 = expert_base + ulong(out_col3) * ulong(params.hidden_size);
-    const ulong up_base0 = expert_base + ulong(params.up_offset_values) + ulong(out_col0) * ulong(params.hidden_size);
-    const ulong up_base1 = expert_base + ulong(params.up_offset_values) + ulong(out_col1) * ulong(params.hidden_size);
-    const ulong up_base2 = expert_base + ulong(params.up_offset_values) + ulong(out_col2) * ulong(params.hidden_size);
-    const ulong up_base3 = expert_base + ulong(params.up_offset_values) + ulong(out_col3) * ulong(params.hidden_size);
-    for (uint k = tid; k < params.hidden_size; k += ntg) {
-        const ulong kk = ulong(k);
-        const float x = float(src[src_base + kk]);
-        if (valid0) {
-            gate0 += x * float(expert_slab[gate_base0 + kk]);
-            up0 += x * float(expert_slab[up_base0 + kk]);
-        }
-        if (valid1) {
-            gate1 += x * float(expert_slab[gate_base1 + kk]);
-            up1 += x * float(expert_slab[up_base1 + kk]);
-        }
-        if (valid2) {
-            gate2 += x * float(expert_slab[gate_base2 + kk]);
-            up2 += x * float(expert_slab[up_base2 + kk]);
-        }
-        if (valid3) {
-            gate3 += x * float(expert_slab[gate_base3 + kk]);
-            up3 += x * float(expert_slab[up_base3 + kk]);
-        }
-    }
-
-    float gate = 0.0f;
-    float up = 0.0f;
-    uocr_threadgroup_sum2(gate0, up0, partials, partials + ntg, tid, ntg, simd_width, gate, up);
-    if (tid == 0u && valid0) {
-        const float silu = gate / (1.0f + exp(-gate));
-        mid[mid_base + ulong(out_col0)] = half(silu * up);
-    }
-    uocr_threadgroup_sum2(gate1, up1, partials, partials + ntg, tid, ntg, simd_width, gate, up);
-    if (tid == 0u && valid1) {
-        const float silu = gate / (1.0f + exp(-gate));
-        mid[mid_base + ulong(out_col1)] = half(silu * up);
-    }
-    uocr_threadgroup_sum2(gate2, up2, partials, partials + ntg, tid, ntg, simd_width, gate, up);
-    if (tid == 0u && valid2) {
-        const float silu = gate / (1.0f + exp(-gate));
-        mid[mid_base + ulong(out_col2)] = half(silu * up);
-    }
-    uocr_threadgroup_sum2(gate3, up3, partials, partials + ntg, tid, ntg, simd_width, gate, up);
-    if (tid == 0u && valid3) {
-        const float silu = gate / (1.0f + exp(-gate));
-        mid[mid_base + ulong(out_col3)] = half(silu * up);
-    }
-}
-
 static inline float uocr_moe_prefill_interleaved_down_dot_f16(device const half *mid,
                                                               device const uint *top_expert_ids,
                                                               device const float *top_weights,
@@ -1124,66 +729,6 @@ static inline float uocr_moe_prefill_interleaved_down_dot_f16(device const half 
         sum += expert_sum * top_weights[token * params.top_k + rank];
     }
     return uocr_threadgroup_sum(sum, partials, tid, ntg, simd_width);
-}
-
-static inline float uocr_moe_decode_interleaved_down_dot_f16(device const half *mid,
-                                                             device const uint *top_expert_ids,
-                                                             device const float *top_weights,
-                                                             device const half *expert_slab,
-                                                             constant UocrMoeDecodeInterleavedParams &params,
-                                                             uint out_col,
-                                                             uint tid,
-                                                             uint ntg,
-                                                             uint simd_width,
-                                                             threadgroup float *partials) {
-    const uint intermediate_size = uocr_fc_moe_expert_intermediate_or(params.intermediate_size);
-    const uint top_k = uocr_fc_moe_top_k_or(params.top_k);
-    float sum = 0.0f;
-    for (uint rank = 0; rank < top_k; ++rank) {
-        const uint expert = top_expert_ids[rank];
-        float expert_sum = 0.0f;
-        const ulong mid_base = ulong(rank) * ulong(intermediate_size);
-        const ulong weight_base = ulong(expert) * ulong(params.expert_stride_values) +
-                                  ulong(params.down_offset_values) +
-                                  ulong(out_col) * ulong(intermediate_size);
-        for (uint k = tid; k < intermediate_size; k += ntg) {
-            expert_sum += float(mid[mid_base + ulong(k)]) * float(expert_slab[weight_base + ulong(k)]);
-        }
-        sum += expert_sum * top_weights[rank];
-    }
-    return uocr_threadgroup_sum(sum, partials, tid, ntg, simd_width);
-}
-
-kernel void uocr_moe_prefill_interleaved_down_sum_f16_to_f16(device const half *mid [[buffer(0)]],
-                                                             device const uint *top_expert_ids [[buffer(1)]],
-                                                             device const float *top_weights [[buffer(2)]],
-                                                             device const half *expert_slab [[buffer(3)]],
-                                                             device half *dst [[buffer(4)]],
-                                                             constant UocrMoePrefillInterleavedParams &params [[buffer(5)]],
-                                                             threadgroup float *partials [[threadgroup(0)]],
-                                                             uint output_index [[threadgroup_position_in_grid]],
-                                                             uint tid [[thread_index_in_threadgroup]],
-                                                             uint ntg [[threads_per_threadgroup]],
-                                                             uint simd_width [[threads_per_simdgroup]]) {
-    const uint token = output_index / params.hidden_size;
-    const uint out_col = output_index - token * params.hidden_size;
-    if (token >= params.n_tokens || out_col >= params.hidden_size) {
-        return;
-    }
-    const float value = uocr_moe_prefill_interleaved_down_dot_f16(mid,
-                                                                  top_expert_ids,
-                                                                  top_weights,
-                                                                  expert_slab,
-                                                                  params,
-                                                                  token,
-                                                                  out_col,
-                                                                  tid,
-                                                                  ntg,
-                                                                  simd_width,
-                                                                  partials);
-    if (tid == 0) {
-        dst[output_index] = half(value);
-    }
 }
 
 [[max_total_threads_per_threadgroup(256)]] kernel void uocr_moe_decode_interleaved_down_sum_combine_f16_to_f16(device const half *mid [[buffer(0)]],
@@ -1220,37 +765,6 @@ kernel void uocr_moe_prefill_interleaved_down_sum_f16_to_f16(device const half *
         // projection is rounded to half before MoE combine reads it back.
         const float routed = float(half(routed_value));
         dst[output_index] = half(routed + float(shared[output_index]) + float(residual[output_index]));
-    }
-}
-
-[[max_total_threads_per_threadgroup(256)]] kernel void uocr_moe_decode_interleaved_down_sum_combine_one_f16_to_f16(device const half *mid [[buffer(0)]],
-                                                                                                                    device const uint *top_expert_ids [[buffer(1)]],
-                                                                                                                    device const float *top_weights [[buffer(2)]],
-                                                                                                                    device const half *expert_slab [[buffer(3)]],
-                                                                                                                    device const half *shared [[buffer(4)]],
-                                                                                                                    device const half *residual [[buffer(5)]],
-                                                                                                                    device half *dst [[buffer(6)]],
-                                                                                                                    constant UocrMoeDecodeInterleavedParams &params [[buffer(7)]],
-                                                                                                                    threadgroup float *partials [[threadgroup(0)]],
-                                                                                                                    uint out_col [[threadgroup_position_in_grid]],
-                                                                                                                    uint tid [[thread_index_in_threadgroup]],
-                                                                                                                    uint ntg [[threads_per_threadgroup]],
-                                                                                                                    uint simd_width [[threads_per_simdgroup]]) {
-    const float routed_value = uocr_moe_decode_interleaved_down_dot_f16(mid,
-                                                                        top_expert_ids,
-                                                                        top_weights,
-                                                                        expert_slab,
-                                                                        params,
-                                                                        out_col,
-                                                                        tid,
-                                                                        ntg,
-                                                                        simd_width,
-                                                                        partials);
-    if (tid == 0) {
-        // Preserve the existing fp16 behavior of the unfused path: routed down
-        // projection is rounded to half before MoE combine reads it back.
-        const float routed = float(half(routed_value));
-        dst[out_col] = half(routed + float(shared[out_col]) + float(residual[out_col]));
     }
 }
 
@@ -1505,56 +1019,3 @@ struct UocrMoeCombineParams {
     uint has_residual;
     uint reserved;
 };
-
-static inline float uocr_moe_combine_value_f16(device const half *routed,
-                                               device const half *shared,
-                                               device const half *residual,
-                                               constant UocrMoeCombineParams &params,
-                                               uint gid) {
-    float value = float(routed[gid]) + float(shared[gid]);
-    if (params.has_residual != 0u) {
-        value += float(residual[gid]);
-    }
-    return value;
-}
-
-[[max_total_threads_per_threadgroup(256)]] kernel void uocr_moe_combine_f16_to_f16(device const half *routed [[buffer(0)]],
-                                        device const half *shared [[buffer(1)]],
-                                        device const half *residual [[buffer(2)]],
-                                        device half *dst [[buffer(3)]],
-                                        constant UocrMoeCombineParams &params [[buffer(4)]],
-                                        uint gid [[thread_position_in_grid]]) {
-    const uint hidden_size = uocr_fc_hidden_size_or(params.hidden_size);
-    const uint total = params.n_tokens * hidden_size;
-    const uint value_base = gid * UOCR_HALF4_WIDTH;
-    if (value_base >= total) {
-        return;
-    }
-    if (value_base + (UOCR_HALF4_WIDTH - 1u) < total) {
-        float4 value = float4(uocr_load_half4(routed, ulong(value_base))) +
-                       float4(uocr_load_half4(shared, ulong(value_base)));
-        if (params.has_residual != 0u) {
-            value += float4(uocr_load_half4(residual, ulong(value_base)));
-        }
-        uocr_store_half4(dst, ulong(value_base), half4(value));
-    } else {
-        for (uint i = 0u; i < UOCR_HALF4_WIDTH && value_base + i < total; ++i) {
-            const uint idx = value_base + i;
-            dst[idx] = half(uocr_moe_combine_value_f16(routed, shared, residual, params, idx));
-        }
-    }
-}
-
-[[max_total_threads_per_threadgroup(256)]] kernel void uocr_moe_combine_f16_to_f32(device const half *routed [[buffer(0)]],
-                                        device const half *shared [[buffer(1)]],
-                                        device const half *residual [[buffer(2)]],
-                                        device float *dst [[buffer(3)]],
-                                        constant UocrMoeCombineParams &params [[buffer(4)]],
-                                        uint gid [[thread_position_in_grid]]) {
-    const uint hidden_size = uocr_fc_hidden_size_or(params.hidden_size);
-    const uint total = params.n_tokens * hidden_size;
-    if (gid >= total) {
-        return;
-    }
-    dst[gid] = uocr_moe_combine_value_f16(routed, shared, residual, params, gid);
-}

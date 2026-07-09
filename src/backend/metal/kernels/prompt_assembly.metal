@@ -83,30 +83,6 @@ kernel void uocr_assemble_prompt_text_skip_image_f16(device const half *embeddin
     }
 }
 
-kernel void uocr_assemble_prompt_with_image_f16(device const half *embedding_table [[buffer(0)]],
-                                                device const int *input_ids [[buffer(1)]],
-                                                device const half *image_features [[buffer(2)]],
-                                                device half *dst [[buffer(3)]],
-                                                constant UocrPromptAssemblyParams &params [[buffer(4)]],
-                                                uint2 gid [[thread_position_in_grid]]) {
-    const uint col = gid.x;
-    const uint token = gid.y;
-    if (col >= params.hidden_size || token >= params.n_tokens) {
-        return;
-    }
-    if (token >= params.image_span_start && token < params.image_span_start + params.image_span_length) {
-        const uint image_row = token - params.image_span_start;
-        dst[token * params.hidden_size + col] = image_features[image_row * params.hidden_size + col];
-        return;
-    }
-    const int row = input_ids[token];
-    if (row < 0 || (uint)row >= params.table_rows) {
-        dst[token * params.hidden_size + col] = half(0.0);
-        return;
-    }
-    dst[token * params.hidden_size + col] = embedding_table[(uint)row * params.hidden_size + col];
-}
-
 struct UocrVisualFormatGlobalParams {
     uint hidden_size;
     uint grid_size;

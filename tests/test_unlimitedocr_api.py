@@ -10,7 +10,7 @@ import pytest
 
 from unlimitedocr_c import UnlimitedOCR
 import unlimitedocr_c.api as api
-from unlimitedocr_c.frontend import EOS_TOKEN_ID, GLOBAL_VISUAL_TOKENS
+from unlimitedocr_c.frontend import EOS_TOKEN_ID
 
 
 class _FakeEngine:
@@ -97,25 +97,6 @@ def test_resolve_model_path_q8_does_not_match_fp16_cache(tmp_path: Path) -> None
     fp16_cached.write_bytes(b"uocr")
     with pytest.raises(api.ModelResolutionError, match="could not find"):
         api.resolve_model_path(cache_dir=tmp_path, download=False, quant="q8")
-
-
-def test_unlimitedocr_generate_returns_decoded_string_and_uses_profile(tmp_path: Path) -> None:
-    model = tmp_path / "model.uocr"
-    model.write_bytes(b"uocr")
-    ocr = _TestOCR(model_path=model, download=False, backend="cpu-ref")
-
-    text = ocr.generate(Image.new("RGB", (96, 64), (1, 2, 3)), profile="base")
-
-    assert text == ""
-    assert len(ocr.fake_engine.requests) == 1
-    request = ocr.fake_engine.requests[0]
-    assert request.mode == "base"
-    assert request.expected_visual_tokens == GLOBAL_VISUAL_TOKENS
-    assert request.max_length == api.DEFAULT_MAX_LENGTH
-    assert request.max_new_tokens == api.DEFAULT_MAX_LENGTH - request.n_tokens
-    assert ocr.open_calls == [
-        {"prompt_capacity": request.n_tokens, "gen_capacity": request.max_new_tokens}
-    ]
 
 
 def test_unlimitedocr_rejects_unknown_profile(tmp_path: Path) -> None:

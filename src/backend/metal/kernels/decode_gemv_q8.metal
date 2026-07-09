@@ -14,7 +14,7 @@ struct UocrDecodeGemvQ8Params {
     uint has_residual;
 };
 
-// Mirrors UocrMoePrefillInterleavedQ8Params (moe_q8.metal is a later fragment).
+// Shared with the prefill bucketed Q8 MoE kernels.
 struct UocrMoeDecodeGemvQ8Params {
     uint n_tokens;
     uint hidden_size;

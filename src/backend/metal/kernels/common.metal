@@ -2,13 +2,6 @@
 // Extracted from uocr_smoke.metal
 //
 #include <metal_stdlib>
-#ifndef UOCR_METAL_ENABLE_MPP_TENSOROPS
-#define UOCR_METAL_ENABLE_MPP_TENSOROPS 0
-#endif
-#if UOCR_METAL_ENABLE_MPP_TENSOROPS
-#include <metal_tensor>
-#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
-#endif
 using namespace metal;
 
 // Shared infrastructure (function constants, helpers, threadgroup reductions)
@@ -90,10 +83,6 @@ static inline float uocr_fc_rope_freq_scale_or(float runtime_value) {
 
 static inline float uocr_fc_attention_scale_or(float runtime_value) {
     return is_function_constant_defined(uocr_fc_attention_scale) ? uocr_fc_attention_scale : runtime_value;
-}
-
-static inline uint uocr_fc_attention_projection_count_or(uint runtime_value) {
-    return is_function_constant_defined(uocr_fc_attention_projection_count) ? uocr_fc_attention_projection_count : runtime_value;
 }
 
 static inline uint uocr_fc_vocab_size_or(uint runtime_value) {

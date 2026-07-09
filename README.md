@@ -40,7 +40,7 @@ for image_path in ["page-1.png", "page-2.png", "page-3.png"]:
 ocr.close()
 ```
 
-## Quantization (Q8 / Q4)
+## Quantization (Q8 / dynamic Q4)
 
 The engine supports three model profiles:
 
@@ -48,7 +48,7 @@ The engine supports three model profiles:
 | --- | --- | --- | --- |
 | fp16 (default) | fp16 | ~6.7 GB | `UnlimitedOCR()` |
 | mixed Q8_0 | int8 weights + fp16 scales | ~3.5 GB | `UnlimitedOCR(quant="q8")` |
-| mixed Q4 | int4 nearly everywhere, Q8 attention | ~1.8 GB | `UnlimitedOCR(quant="q4")` |
+| dynamic mixed Q4 | int4 nearly everywhere, Q8 attention | ~1.8 GB | `UnlimitedOCR(quant="q4")` |
 
 ```python
 from unlimitedocr_c import UnlimitedOCR
@@ -69,10 +69,12 @@ fp16.  Dequantization is fused inside the Metal kernels — quantization roughly
 halves model memory and speeds up token generation, which is
 memory-bandwidth-bound.
 
-Mixed Q4 stores the routed MoE experts, shared experts, dense MLP, LM head,
-token embedding and vision encoders as group-64 Q4_0 — symmetric int4 with
-fp16 scales and a group-half-split nibble packing chosen for vectorized
-dequantization in the fused Metal kernels.  Attention projections stay Q8_0
+Dynamic mixed Q4 stores the routed MoE experts, shared experts, dense MLP,
+LM head, token embedding and vision encoders as group-64 Q4_0 — symmetric
+int4 with fp16 scales and a group-half-split nibble packing chosen for
+vectorized dequantization in the fused Metal kernels.  The exact Q4 subset is
+cfg-gated by `configs/quant-cfg.yaml`, so the converter only emits Q4 for
+modules with runtime-safe fused kernels; attention projections stay Q8_0
 (highest quality sensitivity); norms, biases and convolutions stay fp16.
 On M1 Pro the routed-expert decode step measured ~2.7× faster than Q8 and
 the fused LM-head argmax ~1.2× faster.

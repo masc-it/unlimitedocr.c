@@ -27,7 +27,6 @@ option(UOCR_BUILD_TOOLS "Build native tools" ON)
 option(UOCR_BUILD_TESTS "Build native tests" ON)
 option(UOCR_METAL_RUNTIME_COMPILE "Compile Metal sources at runtime during development" ON)
 option(UOCR_METAL_PRECOMPILE "Precompile Metal sources into a metallib" OFF)
-option(UOCR_METAL_ENABLE_MPP_TENSOROPS "Build the experimental Metal 4 MPP TensorOps matmul prototype" OFF)
 set(UOCR_METAL_MATH_MODE "FAST" CACHE STRING "Metal math mode: FAST, RELAXED, or SAFE")
 set_property(CACHE UOCR_METAL_MATH_MODE PROPERTY STRINGS FAST RELAXED SAFE)
 option(UOCR_SANITIZE "Enable address/undefined sanitizers for supported compilers" OFF)
@@ -130,12 +129,6 @@ if(UOCR_METAL_ENABLED)
     set(UOCR_METAL_KERNEL_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src/backend/metal/kernels")
     set(UOCR_METALLIB_OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/unlimitedocr.metallib")
     file(GLOB UOCR_METAL_SOURCES "${UOCR_METAL_KERNEL_DIR}/*.metal")
-    if(UOCR_METAL_ENABLE_MPP_TENSOROPS)
-        set(UOCR_METAL_ENABLE_MPP_TENSOROPS_VALUE 1)
-    else()
-        set(UOCR_METAL_ENABLE_MPP_TENSOROPS_VALUE 0)
-    endif()
-
     if(UOCR_METAL_PRECOMPILE)
         find_program(UOCR_XCRUN_EXECUTABLE xcrun)
         if(NOT UOCR_XCRUN_EXECUTABLE)
@@ -160,7 +153,6 @@ if(UOCR_METAL_ENABLED)
             OUTPUT "${UOCR_METAL_AIR_FILE}"
             COMMAND "${UOCR_XCRUN_EXECUTABLE}" -sdk macosx metal
                 -I"${UOCR_METAL_KERNEL_DIR}"
-                -DUOCR_METAL_ENABLE_MPP_TENSOROPS=${UOCR_METAL_ENABLE_MPP_TENSOROPS_VALUE}
                 ${UOCR_METAL_MATH_FLAGS}
                 ${UOCR_METAL_DEPLOYMENT_FLAGS}
                 -c "${UOCR_METAL_COMBINED_SOURCE}" -o "${UOCR_METAL_AIR_FILE}"
@@ -191,7 +183,6 @@ if(UOCR_METAL_ENABLED)
         PRIVATE
             UOCR_ENABLE_PROFILING=$<BOOL:${UOCR_ENABLE_PROFILING}>
             UOCR_METAL_RUNTIME_COMPILE=$<BOOL:${UOCR_METAL_RUNTIME_COMPILE}>
-            UOCR_METAL_ENABLE_MPP_TENSOROPS=${UOCR_METAL_ENABLE_MPP_TENSOROPS_VALUE}
             UOCR_METAL_MATH_MODE=${UOCR_METAL_MATH_MODE_VALUE}
             UOCR_METAL_MATH_FP32_FAST=${UOCR_METAL_MATH_FP32_FAST_VALUE}
             UOCR_DEFAULT_RESOURCE_PATH=\"${UOCR_METAL_KERNEL_DIR}\"

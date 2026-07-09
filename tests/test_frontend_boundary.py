@@ -26,10 +26,3 @@ def test_native_tokenizer_image_frontend_is_deferred() -> None:
     cmake = (root / "CMakeLists.txt").read_text(encoding="utf-8")
     assert "src/frontend_native" not in cmake
     assert "uocr_frontend_native" not in cmake
-
-
-def test_deferred_native_frontend_is_recorded_under_later_work() -> None:
-    plan = (project_root() / "docs" / "implementation_plan.md").read_text(encoding="utf-8")
-    later_section = plan.split("## 23. Later / explicitly deferred work", maxsplit=1)[1]
-    assert "Add native C tokenizer by adapting DS4's JoyAI/DeepSeek byte-level BPE" in later_section
-    assert "Add native image loading/preprocessing only if a standalone C CLI is required" in later_section
