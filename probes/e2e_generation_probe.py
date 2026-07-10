@@ -20,12 +20,13 @@ process RSS, native memory accounting, and Metal profile events.
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
+import hashlib
 import json
 import os
 from pathlib import Path
 import sys
 import threading
-import time
 from time import perf_counter
 from typing import Any
 
@@ -39,8 +40,6 @@ if str(SRC) not in sys.path:
 
 from unlimitedocr_c.api import (  # noqa: E402
     DEFAULT_MAX_LENGTH,
-    DEFAULT_NO_REPEAT_NGRAM_SIZE,
-    DEFAULT_NO_REPEAT_WINDOW,
     load_user_image,
     resolve_model_path,
 )
@@ -368,6 +367,16 @@ def vision_schedule_dict(request: PreparedRequest) -> dict[str, Any]:
     }
 
 
+def positive_int(value: str) -> int:
+    try:
+        parsed = int(value, 10)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"expected an integer, got {value!r}") from exc
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("value must be at least 1")
+    return parsed
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--image", type=Path, default=ROOT / "docs" / "test.png")
@@ -398,6 +407,13 @@ def parse_args() -> argparse.Namespace:
         help="override generation length; omit to mimic demo.ipynb",
     )
     parser.add_argument("--memory-budget-bytes", type=int, default=0)
+    parser.add_argument(
+        "--parallel-requests",
+        type=positive_int,
+        default=1,
+        metavar="N",
+        help="invoke the same Engine concurrently from N synchronized caller threads (default: 1)",
+    )
     parser.add_argument("--profile-events", type=int, default=20)
     parser.add_argument("--rss-interval", type=float, default=0.05)
     parser.add_argument(
@@ -411,14 +427,18 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def token_ids_sha256(tokens: np.ndarray) -> str:
+    contiguous = np.ascontiguousarray(tokens, dtype=np.int32)
+    return hashlib.sha256(contiguous.tobytes()).hexdigest()
+
+
 def main() -> int:
     args = parse_args()
     sampler = RssSampler(interval=args.rss_interval)
     timings: dict[str, float] = {}
     profile: ProfileReport | None = None
     memory: MemoryReport | None = None
-    decoded = ""
-    generated_count = 0
+    request_runs: list[dict[str, Any]] = []
 
     sampler.start()
     total_start = perf_counter()
@@ -443,8 +463,6 @@ def main() -> int:
             tokenizer_path=default_tokenizer_path(),
             max_length=DEFAULT_MAX_LENGTH,
             max_new_tokens=args.max_new_tokens,
-            no_repeat_ngram_size=DEFAULT_NO_REPEAT_NGRAM_SIZE,
-            no_repeat_window=DEFAULT_NO_REPEAT_WINDOW,
             dtype=np.float16,
         )
         timings["prepare_request_s"] = perf_counter() - t
@@ -478,19 +496,83 @@ def main() -> int:
 
         try:
             engine.profile_reset()
-            t = perf_counter()
-            outputs = engine.generate_prepared(request)
-            timings["generate_native_s"] = perf_counter() - t
+            start_barrier = threading.Barrier(args.parallel_requests)
+
+            def generate_one(index: int) -> dict[str, Any]:
+                run: dict[str, Any] = {
+                    "index": index,
+                    "elapsed_s": None,
+                    "generated_tokens": 0,
+                    "token_ids_sha256": None,
+                    "token_ids_match_reference": None,
+                    "text_sha256": None,
+                    "text_matches_reference": None,
+                    "error": None,
+                    "_tokens": None,
+                    "_text": None,
+                }
+                generate_start: float | None = None
+                try:
+                    start_barrier.wait()
+                    generate_start = perf_counter()
+                    outputs = engine.generate_prepared(request)
+                    if len(outputs) != 1:
+                        raise RuntimeError(
+                            f"expected one generated output, got {len(outputs)}"
+                        )
+                    tokens = outputs[0]
+                    run["generated_tokens"] = int(tokens.shape[0])
+                    run["token_ids_sha256"] = token_ids_sha256(tokens)
+                    run["_tokens"] = tokens
+                except Exception as exc:  # report all caller failures together
+                    run["error"] = f"{type(exc).__name__}: {exc}"
+                finally:
+                    if generate_start is not None:
+                        run["elapsed_s"] = perf_counter() - generate_start
+                return run
+
+            generation_start = perf_counter()
+            if args.parallel_requests == 1:
+                request_runs = [generate_one(0)]
+            else:
+                with ThreadPoolExecutor(
+                    max_workers=args.parallel_requests,
+                    thread_name_prefix="uocr-e2e",
+                ) as executor:
+                    futures = [
+                        executor.submit(generate_one, index)
+                        for index in range(args.parallel_requests)
+                    ]
+                    request_runs = [future.result() for future in futures]
+            timings["generate_native_s"] = perf_counter() - generation_start
             sampler.checkpoint("after_generate")
 
-            if len(outputs) != 1:
-                raise RuntimeError(f"expected one generated output, got {len(outputs)}")
-            generated_count = int(outputs[0].shape[0])
-
-            t = perf_counter()
-            decoded = decode_generated_ids(outputs[0], request.tokenizer_path)
-            timings["decode_s"] = perf_counter() - t
+            decode_start = perf_counter()
+            for run in request_runs:
+                tokens = run["_tokens"]
+                if tokens is None or run["error"] is not None:
+                    continue
+                try:
+                    text = decode_generated_ids(tokens, request.tokenizer_path)
+                    run["_text"] = text
+                    run["text_sha256"] = hashlib.sha256(
+                        text.encode("utf-8")
+                    ).hexdigest()
+                except Exception as exc:
+                    run["error"] = f"{type(exc).__name__}: {exc}"
+            timings["decode_s"] = perf_counter() - decode_start
             sampler.checkpoint("after_decode")
+
+            successful_runs = [run for run in request_runs if run["error"] is None]
+            reference_run = successful_runs[0] if successful_runs else None
+            if reference_run is not None:
+                reference_tokens = reference_run["_tokens"]
+                reference_text = reference_run["_text"]
+                for run in successful_runs:
+                    run["token_ids_match_reference"] = bool(
+                        np.array_equal(run["_tokens"], reference_tokens)
+                    )
+                    run["text_matches_reference"] = run["_text"] == reference_text
 
             profile = engine.profile_report()
             memory = engine.memory_report()
@@ -503,6 +585,26 @@ def main() -> int:
         timings["total_s"] = perf_counter() - total_start
     finally:
         sampler.stop()
+
+    successful_runs = [run for run in request_runs if run["error"] is None]
+    parity_ok = len(successful_runs) == args.parallel_requests and all(
+        run["token_ids_match_reference"] is True
+        and run["text_matches_reference"] is True
+        for run in successful_runs
+    )
+    first_run = request_runs[0] if request_runs else None
+    generated_count = int(first_run["generated_tokens"]) if first_run else 0
+    decoded = str(first_run["_text"] or "") if first_run else ""
+    aggregate_generated_tokens = sum(
+        int(run["generated_tokens"]) for run in successful_runs
+    )
+    generation_wall_s = timings.get("generate_native_s", 0.0)
+
+    serializable_runs = []
+    for run in request_runs:
+        serializable_runs.append(
+            {key: value for key, value in run.items() if not key.startswith("_")}
+        )
 
     memory_payload = memory_report_dict(memory) if memory is not None else None
     profile_payload = profile_report_dict(profile, args.profile_events)
@@ -517,10 +619,20 @@ def main() -> int:
         else default_release_resource(),
         "prompt_tokens": request.n_tokens,
         "max_new_tokens": request.max_new_tokens,
+        "parallel_requests": args.parallel_requests,
+        "generation_wall_s": generation_wall_s,
+        "request_runs": serializable_runs,
+        "parity_ok": parity_ok,
         "vision_schedule": vision_schedule_dict(request),
         "generated_tokens": generated_count,
-        "tokens_per_second_native": (generated_count / timings["generate_native_s"])
-        if timings.get("generate_native_s", 0.0) > 0.0
+        "aggregate_generated_tokens": aggregate_generated_tokens,
+        "tokens_per_second_native": (generated_count / generation_wall_s)
+        if generation_wall_s > 0.0
+        else None,
+        "aggregate_tokens_per_second_native": (
+            aggregate_generated_tokens / generation_wall_s
+        )
+        if generation_wall_s > 0.0
         else None,
         "timings_s": timings,
         "rss_peak_bytes": sampler.max_rss,
@@ -530,9 +642,10 @@ def main() -> int:
         "text": decoded,
     }
 
+    exit_status = 0 if parity_ok else 1
     if args.json:
         print(json.dumps(payload, indent=2, sort_keys=True))
-        return 0
+        return exit_status
 
     print("E2E UnlimitedOCR generation probe")
     print(f"model:    {payload['model_path']}")
@@ -540,7 +653,8 @@ def main() -> int:
     print(f"library:  {payload['library_path']}")
     print(f"resource: {payload['resource_path']}")
     print(
-        f"request:  profile={args.profile} prompt_tokens={request.n_tokens} max_new_tokens={request.max_new_tokens}"
+        f"request:  profile={args.profile} prompt_tokens={request.n_tokens} "
+        f"max_new_tokens={request.max_new_tokens} parallel_requests={args.parallel_requests}"
     )
     schedule = payload["vision_schedule"]
     print(
@@ -558,9 +672,24 @@ def main() -> int:
             f"max_chunk_projected_rows={shape['max_chunk_projected_rows']} "
             f"max_view_size={shape['max_view_size']} grid={shape['projected_grid_w']}x{shape['projected_grid_h']}"
         )
+    native_tok_s = payload["tokens_per_second_native"]
+    native_tok_s_text = f"{native_tok_s:.3f}" if native_tok_s is not None else "n/a"
     print(
-        f"output:   generated_tokens={generated_count} native_tok_s={payload['tokens_per_second_native']:.3f}"
+        f"output:   generated_tokens={generated_count} native_tok_s={native_tok_s_text} "
+        f"parity={'PASS' if parity_ok else 'FAIL'}"
     )
+    print("\nRequest runs:")
+    for run in serializable_runs:
+        elapsed = run["elapsed_s"]
+        elapsed_text = f"{elapsed * 1000.0:.3f} ms" if elapsed is not None else "n/a"
+        token_hash = run["token_ids_sha256"] or "n/a"
+        error = run["error"] or "OK"
+        print(
+            f"  [{run['index']:2d}] elapsed={elapsed_text:>14s} "
+            f"tokens={run['generated_tokens']:6d} hash={token_hash[:16]} "
+            f"token_match={run['token_ids_match_reference']} "
+            f"text_match={run['text_matches_reference']} error={error}"
+        )
     print("\nTimings:")
     for name, seconds in timings.items():
         print(f"  {name:28s} {seconds * 1000.0:10.3f} ms")
@@ -599,7 +728,7 @@ def main() -> int:
             )
     print("\nText preview:")
     print(decoded)
-    return 0
+    return exit_status
 
 
 if __name__ == "__main__":
