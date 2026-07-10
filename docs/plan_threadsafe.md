@@ -1,13 +1,14 @@
 # Grounded Python thread-safety implementation plan for `unlimitedocr.c`
 
-> **Status: in progress.** Sections 1–3 are implemented and QA'd on
-> `feat/threadsafe`; QA 1–2 passed with the mixed-q4 model
-> (`--parallel-requests 4` produced identical token hashes with serialized
-> elapsed times) and QA 3 passed with two concurrent mixed-q8 engines.
-> Note: the cached `unlimitedocr-q4.uocr` was converted by a newer
-> attention-Q4 converter and only opens with that branch's library; on this
-> branch use q8/fp16 or reconvert q4.  Section 4 (performance/docs/release QA)
-> is next. The Python API gains
+> **Status: implemented; release QA pending.** Sections 1–4 are implemented on
+> `feat/threadsafe`.  QA 1–2 passed (`--parallel-requests 4`, identical token
+> hashes, serialized elapsed times); QA 3 passed with two concurrent mixed-q8
+> engines; section-4 measurements show threaded aggregate throughput equal to
+> serial (q8 base: 24.8 vs 24.4 tok/s, exact hash parity), confirming
+> noise-level lock overhead.  Note: the cached `unlimitedocr-q4.uocr` was
+> converted by a newer attention-Q4 converter and only opens with that
+> branch's library; on this branch use q8/fp16 or reconvert q4.  Manual QA
+> gate 4 (release candidate) remains. The Python API gains
 > per-object thread safety. Calls sharing one `UnlimitedOCR` / `Engine` object
 > serialize before entering its native context. Applications create one model
 > object per execution lane when they want several inference calls in flight.
@@ -380,13 +381,18 @@ planning.
 
 Checklist:
 
-* [ ] Compare serial probe performance before/after on the same model/build.
-* [ ] Explain sustained changes beyond the accepted noise threshold.
-* [ ] Verify memory/profile reports remain stable for serial use.
-* [ ] Add the Python threading contract to `Engine` and `UnlimitedOCR`
+* [x] Compare serial probe performance against threaded on the same
+      model/build (q8 base: serial 24.43 tok/s vs 4-caller aggregate
+      24.77 tok/s, exact hash parity `3173bb76…` across all callers).
+* [x] Explain sustained changes beyond the accepted noise threshold.
+      *(within noise)*
+* [x] Verify memory/profile reports remain stable for serial use.
+* [x] Add the Python threading contract to `Engine` and `UnlimitedOCR`
       docstrings.
-* [ ] Add raw C caller ownership guidance to `include/unlimitedocr.h`.
-* [ ] Update README with shared-object and multi-object examples.
+* [x] Add raw C caller ownership guidance to `include/unlimitedocr.h`.
+* [x] Update README with shared-object and multi-object examples.
+* [x] Route library-side warmup/model prints to stderr so `--json` probe
+      output stays machine-readable.
 
 ### Manual QA gate 4 — release candidate
 

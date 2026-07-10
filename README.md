@@ -40,6 +40,43 @@ for image_path in ["page-1.png", "page-2.png", "page-3.png"]:
 ocr.close()
 ```
 
+## Threading
+
+One `UnlimitedOCR` instance is safe to share across threads.  A per-object
+lock serializes native inference, so shared calls are correct but execute one
+at a time; `close()` waits for the active call.  Image loading and request
+preparation run outside the lock and overlap freely.
+
+```python
+from concurrent.futures import ThreadPoolExecutor
+from unlimitedocr_c import UnlimitedOCR
+
+ocr = UnlimitedOCR()
+with ThreadPoolExecutor(max_workers=4) as pool:
+    texts = list(pool.map(ocr.generate, ["a.png", "b.png", "c.png", "d.png"]))
+ocr.close()
+```
+
+For calls that actually run concurrently, create one instance per execution
+lane and assign work on your side.  Each instance owns its own engine and
+runtime memory (KV cache, scratch, caches), so budget memory per instance;
+the mmap-backed model weights are shared by the OS across instances.
+
+```python
+from concurrent.futures import ThreadPoolExecutor
+from unlimitedocr_c import UnlimitedOCR
+
+lanes = [UnlimitedOCR(quant="q8"), UnlimitedOCR(quant="q8")]
+with ThreadPoolExecutor(max_workers=len(lanes)) as pool:
+    texts = list(pool.map(lambda t: t[0].generate(t[1]), zip(lanes, ["a.png", "b.png"])))
+for lane in lanes:
+    lane.close()
+```
+
+At the C ABI, callers serialize operations sharing one `uocr_engine` and
+quiesce calls before `uocr_engine_close()`; separate engines may be used from
+separate threads (see the threading contract in `include/unlimitedocr.h`).
+
 ## Quantization (Q8 / dynamic Q4)
 
 The engine supports three model profiles:

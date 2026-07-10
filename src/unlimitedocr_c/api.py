@@ -375,7 +375,7 @@ class UnlimitedOCR:
         # Eagerly open the engine so warmup runs at construction time.
         # Use maximum capacities so the engine is never recreated for any
         # subsequent request — warmup runs exactly once.
-        print(f"model: {self._model_path}")
+        print(f"model: {self._model_path}", file=sys.stderr)
         self._ensure_engine(prompt_capacity=DEFAULT_MAX_LENGTH, gen_capacity=DEFAULT_MAX_LENGTH)
 
     @property

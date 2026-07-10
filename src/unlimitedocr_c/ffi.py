@@ -631,7 +631,7 @@ class Engine:
     def _warmup(self) -> None:
         """Run a synthetic generation to warm up Metal pipelines and MPS JIT kernels."""
         try:
-            print("  warmup: compiling Metal pipelines...", end="", flush=True)
+            print("  warmup: compiling Metal pipelines...", end="", flush=True, file=sys.stderr)
             from PIL import Image, ImageDraw
 
             img = Image.new("RGB", (224, 224), (255, 255, 255))
@@ -648,7 +648,7 @@ class Engine:
             )
             _ = self.generate_prepared(request)
             self.profile_reset()
-            print(" done")
+            print(" done", file=sys.stderr)
         except Exception as exc:
             import warnings
             warnings.warn(f"GPU warmup failed (non-fatal): {exc}")
