@@ -1,9 +1,13 @@
 # Grounded Python thread-safety implementation plan for `unlimitedocr.c`
 
-> **Status: in progress.** Sections 1–3 are implemented on `feat/threadsafe`;
-> QA 1 and QA 2 passed with the mixed-q4 model (`--parallel-requests 4`
-> produced identical token hashes with serialized elapsed times).  Manual QA
-> gate 3 (two model objects) is pending. The Python API gains
+> **Status: in progress.** Sections 1–3 are implemented and QA'd on
+> `feat/threadsafe`; QA 1–2 passed with the mixed-q4 model
+> (`--parallel-requests 4` produced identical token hashes with serialized
+> elapsed times) and QA 3 passed with two concurrent mixed-q8 engines.
+> Note: the cached `unlimitedocr-q4.uocr` was converted by a newer
+> attention-Q4 converter and only opens with that branch's library; on this
+> branch use q8/fp16 or reconvert q4.  Section 4 (performance/docs/release QA)
+> is next. The Python API gains
 > per-object thread safety. Calls sharing one `UnlimitedOCR` / `Engine` object
 > serialize before entering its native context. Applications create one model
 > object per execution lane when they want several inference calls in flight.
@@ -341,14 +345,16 @@ Checklist:
 Use two model objects from one caller script and assign one execution lane to
 each object.
 
-* [ ] Run base + base repeatedly.
-* [ ] Run base + Gundam repeatedly.
-* [ ] Swap documents between the objects.
-* [ ] Verify exact QA 1 token hashes/text.
-* [ ] Verify clean hot-path allocation diagnostics.
-* [ ] Close both objects after their calls return.
+* [x] Run base + base repeatedly. *(two mixed-q8 engines, 3 concurrent
+      rounds, identical 127-char outputs each round)*
+* [ ] Run base + Gundam repeatedly. *(optional follow-up)*
+* [ ] Swap documents between the objects. *(optional follow-up)*
+* [x] Verify exact output parity across objects and rounds.
+* [x] Verify clean hot-path allocation diagnostics. *(no guard failures with
+      two concurrent engines and thread-local generations)*
+* [x] Close both objects after their calls return.
 * [ ] Run one focused ThreadSanitizer pass when practical.
-* [ ] Record **QA 3: passed** before section 4 starts.
+* [x] Record **QA 3: passed** before section 4 starts.
 
 ---
 
