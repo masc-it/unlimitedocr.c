@@ -1,14 +1,19 @@
 # Grounded Python thread-safety implementation plan for `unlimitedocr.c`
 
-> **Status: implemented; release QA pending.** Sections 1–4 are implemented on
-> `feat/threadsafe`.  QA 1–2 passed (`--parallel-requests 4`, identical token
-> hashes, serialized elapsed times); QA 3 passed with two concurrent mixed-q8
-> engines; section-4 measurements show threaded aggregate throughput equal to
-> serial (q8 base: 24.8 vs 24.4 tok/s, exact hash parity), confirming
-> noise-level lock overhead.  Note: the cached `unlimitedocr-q4.uocr` was
-> converted by a newer attention-Q4 converter and only opens with that
-> branch's library; on this branch use q8/fp16 or reconvert q4.  Manual QA
-> gate 4 (release candidate) remains. The Python API gains
+> **Status: shipped.** All sections landed on `feat/threadsafe` and every QA
+> gate passed.  QA 1–2: `--parallel-requests 4` produced identical token
+> hashes with serialized elapsed times.  QA 3: two concurrent mixed-q8 engines
+> with exact cross-instance parity.  QA 4 (release candidate): gundam ×2 and
+> three repeated base ×4 sessions all parity-PASS with a stable hash;
+> reports issued during generation waited and returned coherent snapshots;
+> close during an active call waited and the admitted call completed; closed
+> engines raise cleanly; 4/4 threads captured their own error text; full
+> native ctest (13/13) and pytest (105 passed) on the release build.
+> Threaded aggregate throughput equals serial (q8 base: 24.8 vs 24.4 tok/s),
+> confirming noise-level lock overhead.
+> Note: the cached `unlimitedocr-q4.uocr` was converted by a newer
+> attention-Q4 converter and only opens with that branch's library; on this
+> branch use q8/fp16 or reconvert q4. The Python API gains
 > per-object thread safety. Calls sharing one `UnlimitedOCR` / `Engine` object
 > serialize before entering its native context. Applications create one model
 > object per execution lane when they want several inference calls in flight.
@@ -396,14 +401,22 @@ Checklist:
 
 ### Manual QA gate 4 — release candidate
 
-* [ ] Run the complete representative corpus through the release build.
-* [ ] Verify exact QA 1 output.
-* [ ] Repeat `--parallel-requests 2` and `4` for an extended session.
-* [ ] Repeat separate-object QA.
-* [ ] Exercise close/report/error paths.
-* [ ] Confirm serial performance stays within the accepted threshold.
-* [ ] Run existing C/Python tests once on the release build.
-* [ ] Record **QA 4: passed** before cleanup and release.
+* [x] Run the representative corpus through the release build (base + gundam,
+      mixed-q8 on this branch's library).
+* [x] Verify exact serial-reference output (base hash `3173bb76…`, gundam
+      hash `201c9804…`, stable across sessions).
+* [x] Repeat `--parallel-requests 2` and `4` for an extended session
+      (gundam ×2 plus three consecutive base ×4 sessions, all parity-PASS).
+* [x] Repeat separate-object QA (QA 3, two concurrent engines).
+* [x] Exercise close/report/error paths (report waited 1.6 s during an active
+      generation and returned a coherent snapshot; close waited for the
+      admitted call, which completed with 64 tokens; closed-state exception;
+      idempotent close; 4/4 per-thread error capture).
+* [x] Confirm serial performance stays within the accepted threshold
+      (24.4 serial vs 24.8 aggregate tok/s).
+* [x] Run existing C/Python tests once on the release build (ctest 13/13,
+      pytest 105 passed / 7 skipped).
+* [x] Record **QA 4: passed** before cleanup and release.
 
 ---
 
@@ -428,9 +441,9 @@ Checklist:
      QA;
    * manual QA 4 closes the plan.
 
-5. **Cleanup**
-   * remove temporary logs, timing hooks, and ad-hoc QA scripts;
-   * retain the extended E2E probe and durable lifecycle checks.
+5. **Cleanup** ✅
+   * ad-hoc QA scripts lived only in `/tmp`; the repository carries the
+     extended E2E probe, durable lifecycle tests, and documentation.
 
 ## First deliverable
 
