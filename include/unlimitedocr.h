@@ -150,6 +150,22 @@ typedef struct uocr_engine_opts {
     uint64_t memory_budget_bytes;/* 0 = backend default */
 } uocr_engine_opts;
 
+/* Threading contract
+ *
+ * Library-level functions (uocr_abi_version, uocr_status_string,
+ * uocr_memory_category_name) are safe to call from multiple threads.
+ *
+ * Callers serialize operations that share one uocr_engine: at most one
+ * uocr_generate_prepared / report / reset call runs on an engine at a time.
+ * Separate uocr_engine instances may be used from separate threads.
+ *
+ * The engine owner quiesces all calls on an engine before invoking
+ * uocr_engine_close() and retires the pointer at that boundary.
+ *
+ * Separate uocr_result objects may be read and freed on separate threads;
+ * the owner synchronizes access and release of each individual result.
+ */
+
 UOCR_API uint32_t uocr_abi_version(void);
 UOCR_API const char *uocr_status_string(int status);
 

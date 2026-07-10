@@ -7,6 +7,7 @@ from pathlib import Path
 import ctypes as ct
 import os
 import sys
+import threading
 from typing import Sequence
 
 import numpy as np
@@ -335,15 +336,17 @@ def _bind_library(path: Path) -> ct.CDLL:
 
 
 _LIB: ct.CDLL | None = None
+_LIB_LOCK = threading.Lock()
 
 
 def load_library(path: str | Path | None = None) -> ct.CDLL:
     global _LIB
     if path is not None:
         return _bind_library(_require_source_tree_release_library(Path(path), "library_path"))
-    if _LIB is None:
-        _LIB = _bind_library(find_library_path())
-    return _LIB
+    with _LIB_LOCK:
+        if _LIB is None:
+            _LIB = _bind_library(find_library_path())
+        return _LIB
 
 
 def _bytes_or_null(value: str | None) -> bytes | None:
@@ -499,7 +502,19 @@ def as_c_request(request: PreparedRequest) -> _PreparedKeepalive:
 
 
 class Engine:
+    """Python handle for one native `uocr_engine`.
+
+    Thread safety: one `Engine` may be shared by several threads.  A per-object
+    reentrant lock serializes every native operation (`generate_prepared`,
+    reports, reset, `close`), so calls sharing this object execute one at a
+    time and `close()` waits for the active call.  Native error text is read
+    while the failing call still owns the lock, keeping messages paired with
+    the call that produced them.  Applications that want several inference
+    calls in flight create one `Engine` per execution lane.
+    """
+
     def __init__(self, options: EngineOptions | None = None, *, library_path: str | Path | None = None) -> None:
+        self._lock = threading.RLock()
         self._handle: ct.c_void_p | None = None
         self._lib = load_library(library_path)
         opts = options or EngineOptions()
@@ -521,10 +536,17 @@ class Engine:
         if opts.warmup and self.backend != "cpu-ref":
             self._warmup()
 
+    def _require_open(self) -> ct.c_void_p:
+        handle = self._handle
+        if not handle:
+            raise RuntimeError("engine is closed")
+        return handle
+
     @property
     def backend(self) -> str:
-        raw = self._lib.uocr_engine_backend(self._handle)
-        return raw.decode("utf-8") if raw else ""
+        with self._lock:
+            raw = self._lib.uocr_engine_backend(self._require_open())
+            return raw.decode("utf-8") if raw else ""
 
     def memory_category_name(self, category: int) -> str:
         raw = self._lib.uocr_memory_category_name(category)
@@ -557,22 +579,25 @@ class Engine:
         )
 
     def memory_report(self) -> MemoryReport:
-        report = CMemoryReport()
-        status = self._lib.uocr_engine_memory_report(self._handle, ct.byref(report))
-        if status != UOCR_OK:
-            raise RuntimeError(f"uocr_engine_memory_report failed ({status}): {self.last_error()}")
+        with self._lock:
+            report = CMemoryReport()
+            status = self._lib.uocr_engine_memory_report(self._require_open(), ct.byref(report))
+            if status != UOCR_OK:
+                raise RuntimeError(f"uocr_engine_memory_report failed ({status}): {self.last_error()}")
         return self._memory_report_from_c(report)
 
     def profile_reset(self) -> None:
-        status = self._lib.uocr_engine_profile_reset(self._handle)
-        if status != UOCR_OK:
-            raise RuntimeError(f"uocr_engine_profile_reset failed ({status}): {self.last_error()}")
+        with self._lock:
+            status = self._lib.uocr_engine_profile_reset(self._require_open())
+            if status != UOCR_OK:
+                raise RuntimeError(f"uocr_engine_profile_reset failed ({status}): {self.last_error()}")
 
     def profile_report(self) -> ProfileReport:
-        report = CProfileReport()
-        status = self._lib.uocr_engine_profile_report(self._handle, ct.byref(report))
-        if status != UOCR_OK:
-            raise RuntimeError(f"uocr_engine_profile_report failed ({status}): {self.last_error()}")
+        with self._lock:
+            report = CProfileReport()
+            status = self._lib.uocr_engine_profile_report(self._require_open(), ct.byref(report))
+            if status != UOCR_OK:
+                raise RuntimeError(f"uocr_engine_profile_report failed ({status}): {self.last_error()}")
         event_count = min(int(report.event_count), UOCR_PROFILE_MAX_EVENTS)
         events = []
         for i in range(event_count):
@@ -629,10 +654,14 @@ class Engine:
             warnings.warn(f"GPU warmup failed (non-fatal): {exc}")
 
     def close(self) -> None:
-        handle = getattr(self, "_handle", None)
-        if handle:
-            self._lib.uocr_engine_close(handle)
-            self._handle = None
+        lock = getattr(self, "_lock", None)
+        if lock is None:
+            return
+        with lock:
+            handle = getattr(self, "_handle", None)
+            if handle:
+                self._lib.uocr_engine_close(handle)
+                self._handle = None
 
     def __enter__(self) -> "Engine":
         return self
@@ -644,9 +673,10 @@ class Engine:
         self.close()
 
     def last_error(self, *, global_error: bool = False) -> str:
-        handle = None if global_error else self._handle
-        raw = self._lib.uocr_last_error(handle)
-        return raw.decode("utf-8") if raw else ""
+        with self._lock:
+            handle = None if global_error else self._handle
+            raw = self._lib.uocr_last_error(handle)
+            return raw.decode("utf-8") if raw else ""
 
     def generate_prepared(self, requests: PreparedRequest | Sequence[PreparedRequest]) -> list[NDArray[np.int32]]:
         if isinstance(requests, PreparedRequest):
@@ -658,11 +688,12 @@ class Engine:
 
         keepalive = [as_c_request(req) for req in request_list]
         c_requests = (CPreparedRequest * len(keepalive))(*(item.c_request for item in keepalive))
-        result = ct.c_void_p()
-        status = self._lib.uocr_generate_prepared(self._handle, c_requests, len(keepalive), ct.byref(result))
-        if status != UOCR_OK:
-            raise RuntimeError(f"uocr_generate_prepared failed ({status}): {self.last_error()}")
-        try:
-            return _copy_result_tokens(self._lib, result)
-        finally:
-            self._lib.uocr_result_free(result)
+        with self._lock:
+            result = ct.c_void_p()
+            status = self._lib.uocr_generate_prepared(self._require_open(), c_requests, len(keepalive), ct.byref(result))
+            if status != UOCR_OK:
+                raise RuntimeError(f"uocr_generate_prepared failed ({status}): {self.last_error()}")
+            try:
+                return _copy_result_tokens(self._lib, result)
+            finally:
+                self._lib.uocr_result_free(result)

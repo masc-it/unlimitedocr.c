@@ -1,7 +1,8 @@
 # Grounded Python thread-safety implementation plan for `unlimitedocr.c`
 
-> **Status: in progress.** The threaded E2E probe is implemented on
-> `feat/threadsafe`; manual QA gate 1 is pending. The Python API gains
+> **Status: in progress.** The threaded E2E probe (section 1) and the Python
+> per-object locks (section 2) are implemented on `feat/threadsafe`; manual QA
+> gates 1 and 2 are pending. The Python API gains
 > per-object thread safety. Calls sharing one `UnlimitedOCR` / `Engine` object
 > serialize before entering its native context. Applications create one model
 > object per execution lane when they want several inference calls in flight.
@@ -246,16 +247,21 @@ The owner quiesces engine calls before uocr_engine_close().
 
 Checklist:
 
-* [ ] Add a per-object `RLock` to `Engine`.
-* [ ] Centralize guarded handle validation and native calls.
-* [ ] Capture native errors before releasing the `Engine` lock.
-* [ ] Make `Engine.close()` idempotent and serialized with methods.
-* [ ] Add a per-object `RLock` to `UnlimitedOCR`.
-* [ ] Protect engine selection, invocation, replacement, and close.
-* [ ] Keep request preparation ahead of the high-level critical section.
-* [ ] Keep `__del__` safe during partial initialization and interpreter
+* [x] Add a per-object `RLock` to `Engine`.
+* [x] Centralize guarded handle validation and native calls
+      (`_require_open()` inside the lock).
+* [x] Capture native errors before releasing the `Engine` lock.
+* [x] Make `Engine.close()` idempotent and serialized with methods; later
+      methods raise `RuntimeError("engine is closed")`.
+* [x] Add a per-object `RLock` to `UnlimitedOCR`.
+* [x] Protect engine selection, invocation, replacement, and close.
+* [x] Keep request preparation ahead of the high-level critical section.
+* [x] Keep `__del__` safe during partial initialization and interpreter
       shutdown.
-* [ ] Document raw C caller synchronization and lifetime ownership.
+* [x] Document raw C caller synchronization and lifetime ownership
+      (`include/unlimitedocr.h` threading contract + Python docstrings).
+* [x] Durable contract tests: closed-state behavior, idempotent close, and
+      shared-engine threaded calls (`tests/test_ffi.py`).
 
 ### Manual QA gate 2 — shared-object safety
 
