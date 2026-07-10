@@ -387,6 +387,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=".uocr model path; defaults to normal UnlimitedOCR resolution",
     )
+    parser.add_argument(
+        "--quant",
+        choices=["fp16", "q8", "q4"],
+        default=None,
+        help="quant profile for cached-model resolution (ignored when --model is set)",
+    )
     parser.add_argument("--backend", default="metal")
     parser.add_argument(
         "--library",
@@ -446,7 +452,9 @@ def main() -> int:
         sampler.checkpoint("start")
 
         t = perf_counter()
-        model_path = resolve_model_path(args.model, download=not args.no_download)
+        model_path = resolve_model_path(
+            args.model, download=not args.no_download, quant=args.quant
+        )
         timings["resolve_model_s"] = perf_counter() - t
         sampler.checkpoint("after_model_resolve")
 
