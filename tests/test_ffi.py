@@ -312,3 +312,50 @@ def test_public_metal_image_generation_extended_smoke() -> None:
                 f"views={len(request.views)} grid={request.crop_grid_w}x{request.crop_grid_h} "
                 f"visual={request.expected_visual_tokens} token id={token_id} decoded={decoded!r}"
             )
+
+
+def test_engine_close_is_idempotent_and_methods_raise_after_close() -> None:
+    req = prepare_text("hello", max_new_tokens=0)
+    engine = Engine(EngineOptions(backend="cpu-ref", max_prompt_tokens=64, max_gen_tokens=4))
+    engine.close()
+    engine.close()
+    with pytest.raises(RuntimeError, match="engine is closed"):
+        engine.generate_prepared(req)
+    with pytest.raises(RuntimeError, match="engine is closed"):
+        _ = engine.backend
+    with pytest.raises(RuntimeError, match="engine is closed"):
+        engine.memory_report()
+    with pytest.raises(RuntimeError, match="engine is closed"):
+        engine.profile_report()
+    with pytest.raises(RuntimeError, match="engine is closed"):
+        engine.profile_reset()
+
+
+def test_engine_shared_by_threads_serializes_calls() -> None:
+    import threading
+
+    req = prepare_text("hello", max_new_tokens=0)
+    caller_count = 4
+    barrier = threading.Barrier(caller_count)
+    results: list[list[np.ndarray] | Exception] = [None] * caller_count  # type: ignore[list-item]
+
+    with Engine(EngineOptions(backend="cpu-ref", max_prompt_tokens=64, max_gen_tokens=4)) as engine:
+
+        def call(index: int) -> None:
+            try:
+                barrier.wait()
+                results[index] = engine.generate_prepared(req)
+            except Exception as exc:  # surfaced via assertions below
+                results[index] = exc
+
+        threads = [threading.Thread(target=call, args=(i,)) for i in range(caller_count)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=30.0)
+        assert all(not thread.is_alive() for thread in threads)
+
+    for outcome in results:
+        assert isinstance(outcome, list), f"caller failed: {outcome}"
+        assert len(outcome) == 1
+        assert outcome[0].shape == (0,)

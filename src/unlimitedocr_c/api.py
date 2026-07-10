@@ -16,6 +16,7 @@ from io import BytesIO
 import os
 from pathlib import Path
 import sys
+import threading
 from typing import IO, Literal
 from urllib.request import Request, urlopen
 
@@ -327,6 +328,13 @@ class UnlimitedOCR:
 
     The constructor opens the native engine eagerly (GPU warmup).  The engine is
     resized automatically if a later request needs more prompt/gen capacity.
+
+    Thread safety: one instance may be shared by several threads.  A per-object
+    lock serializes engine selection, native generation, replacement, and
+    ``close()``, so shared calls execute one at a time and ``close()`` waits
+    for the active call.  Image loading and request preparation run before the
+    lock and can overlap across threads.  Applications that want several
+    inference calls in flight create one instance per execution lane.
     """
 
     def __init__(
@@ -359,6 +367,7 @@ class UnlimitedOCR:
         self._resource_path = str(resolved_resource_path) if resolved_resource_path is not None else None
         self._tokenizer_path = str(default_tokenizer_path())
         self._request_timeout = float(request_timeout)
+        self._lock = threading.RLock()
         self._engine: Engine | None = None
         self._engine_prompt_capacity = 0
         self._engine_gen_capacity = 0
@@ -366,7 +375,7 @@ class UnlimitedOCR:
         # Eagerly open the engine so warmup runs at construction time.
         # Use maximum capacities so the engine is never recreated for any
         # subsequent request — warmup runs exactly once.
-        print(f"model: {self._model_path}")
+        print(f"model: {self._model_path}", file=sys.stderr)
         self._ensure_engine(prompt_capacity=DEFAULT_MAX_LENGTH, gen_capacity=DEFAULT_MAX_LENGTH)
 
     @property
@@ -384,11 +393,15 @@ class UnlimitedOCR:
     def close(self) -> None:
         """Close the lazily opened native engine, if any."""
 
-        if self._engine is not None:
-            self._engine.close()
-            self._engine = None
-            self._engine_prompt_capacity = 0
-            self._engine_gen_capacity = 0
+        lock = getattr(self, "_lock", None)
+        if lock is None:
+            return
+        with lock:
+            if self._engine is not None:
+                self._engine.close()
+                self._engine = None
+                self._engine_prompt_capacity = 0
+                self._engine_gen_capacity = 0
 
     def __enter__(self) -> "UnlimitedOCR":
         return self
@@ -414,18 +427,19 @@ class UnlimitedOCR:
         )
 
     def _ensure_engine(self, *, prompt_capacity: int, gen_capacity: int) -> Engine:
-        if (
-            self._engine is not None
-            and prompt_capacity <= self._engine_prompt_capacity
-            and gen_capacity <= self._engine_gen_capacity
-        ):
-            return self._engine
+        with self._lock:
+            if (
+                self._engine is not None
+                and prompt_capacity <= self._engine_prompt_capacity
+                and gen_capacity <= self._engine_gen_capacity
+            ):
+                return self._engine
 
-        self.close()
-        self._engine = self._open_engine(prompt_capacity=prompt_capacity, gen_capacity=gen_capacity)
-        self._engine_prompt_capacity = prompt_capacity
-        self._engine_gen_capacity = gen_capacity
-        return self._engine
+            self.close()
+            self._engine = self._open_engine(prompt_capacity=prompt_capacity, gen_capacity=gen_capacity)
+            self._engine_prompt_capacity = prompt_capacity
+            self._engine_gen_capacity = gen_capacity
+            return self._engine
 
     def generate(self, image: ImageSource, profile: ProfileName = "base") -> str:
         """Run OCR for one image and return the decoded text.
@@ -452,11 +466,12 @@ class UnlimitedOCR:
             max_length=DEFAULT_MAX_LENGTH,
             max_new_tokens=None,
         )
-        engine = self._ensure_engine(
-            prompt_capacity=max(1, request.n_tokens),
-            gen_capacity=max(1, request.max_new_tokens),
-        )
-        outputs = engine.generate_prepared(request)
+        with self._lock:
+            engine = self._ensure_engine(
+                prompt_capacity=max(1, request.n_tokens),
+                gen_capacity=max(1, request.max_new_tokens),
+            )
+            outputs = engine.generate_prepared(request)
         if len(outputs) != 1:
             raise RuntimeError(f"expected one generated output, got {len(outputs)}")
         return decode_generated_ids(outputs[0], request.tokenizer_path)

@@ -18,6 +18,11 @@ typedef struct uocr_alloc_stats {
     uint64_t failed_allocation_count;
 } uocr_alloc_stats;
 
+/* Hot-path allocation guard.  Counters are thread-local: a guard observes
+ * allocations made by the calling thread, so allocations by other engines or
+ * threads leave an unrelated guarded operation unaffected.  Aggregate
+ * uocr_alloc_stats stay process-wide.
+ */
 typedef struct uocr_alloc_guard {
     uint64_t allocation_count;
     uint64_t failed_allocation_count;
