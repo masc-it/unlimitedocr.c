@@ -31,13 +31,11 @@ int uocr_profile_env_enabled(void) {
 
 uint64_t uocr_profile_now_ns(void) {
 #if defined(_WIN32)
-    static LARGE_INTEGER frequency;
-    static int initialized = 0;
+    /* QueryPerformanceFrequency is cheap and constant after boot; calling it
+     * per sample keeps this path free of racy lazy initialization. */
+    LARGE_INTEGER frequency;
     LARGE_INTEGER counter;
-    if (!initialized) {
-        QueryPerformanceFrequency(&frequency);
-        initialized = 1;
-    }
+    QueryPerformanceFrequency(&frequency);
     QueryPerformanceCounter(&counter);
     if (frequency.QuadPart <= 0) {
         return 0u;

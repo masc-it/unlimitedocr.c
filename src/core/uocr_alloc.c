@@ -25,6 +25,12 @@ static atomic_uint_fast64_t g_allocation_count;
 static atomic_uint_fast64_t g_free_count;
 static atomic_uint_fast64_t g_failed_allocation_count;
 
+/* Thread-local allocation generations back the hot-path allocation guard so a
+ * guard only observes allocations made by its own thread (see uocr_alloc.h).
+ */
+static _Thread_local uint64_t t_allocation_count;
+static _Thread_local uint64_t t_failed_allocation_count;
+
 static int checked_allocation_size(size_t payload_size, size_t *total_size) {
     if (payload_size > SIZE_MAX - sizeof(uocr_alloc_header)) {
         return 0;
@@ -34,6 +40,7 @@ static int checked_allocation_size(size_t payload_size, size_t *total_size) {
 }
 
 static void record_allocation(size_t size) {
+    t_allocation_count += 1u;
     atomic_fetch_add_explicit(&g_allocation_count, 1u, memory_order_relaxed);
     atomic_fetch_add_explicit(&g_total_allocated_bytes, (uint64_t)size, memory_order_relaxed);
     const uint64_t live = atomic_fetch_add_explicit(&g_live_bytes, (uint64_t)size, memory_order_relaxed) + (uint64_t)size;
@@ -54,6 +61,7 @@ static void record_free(size_t size) {
 }
 
 static void record_failure(void) {
+    t_failed_allocation_count += 1u;
     atomic_fetch_add_explicit(&g_failed_allocation_count, 1u, memory_order_relaxed);
 }
 
@@ -121,6 +129,7 @@ void *uocr_realloc(void *ptr, size_t size) {
     new_header->meta.magic = UOCR_ALLOC_MAGIC;
     new_header->meta.size = size;
 
+    t_allocation_count += 1u;
     atomic_fetch_add_explicit(&g_allocation_count, 1u, memory_order_relaxed);
     if (size >= old_size) {
         const size_t delta = size - old_size;
@@ -186,8 +195,8 @@ void uocr_alloc_reset_peak(void) {
 
 uocr_alloc_guard uocr_alloc_guard_begin(void) {
     uocr_alloc_guard guard;
-    guard.allocation_count = atomic_load_explicit(&g_allocation_count, memory_order_relaxed);
-    guard.failed_allocation_count = atomic_load_explicit(&g_failed_allocation_count, memory_order_relaxed);
+    guard.allocation_count = t_allocation_count;
+    guard.failed_allocation_count = t_failed_allocation_count;
     return guard;
 }
 
@@ -195,6 +204,6 @@ int uocr_alloc_guard_end_no_alloc(const uocr_alloc_guard *guard) {
     if (guard == NULL) {
         return 0;
     }
-    return atomic_load_explicit(&g_allocation_count, memory_order_relaxed) == guard->allocation_count &&
-           atomic_load_explicit(&g_failed_allocation_count, memory_order_relaxed) == guard->failed_allocation_count;
+    return t_allocation_count == guard->allocation_count &&
+           t_failed_allocation_count == guard->failed_allocation_count;
 }

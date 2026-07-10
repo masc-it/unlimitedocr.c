@@ -1,8 +1,9 @@
 # Grounded Python thread-safety implementation plan for `unlimitedocr.c`
 
-> **Status: in progress.** The threaded E2E probe (section 1) and the Python
-> per-object locks (section 2) are implemented on `feat/threadsafe`; manual QA
-> gates 1 and 2 are pending. The Python API gains
+> **Status: in progress.** Sections 1–3 are implemented on `feat/threadsafe`;
+> QA 1 and QA 2 passed with the mixed-q4 model (`--parallel-requests 4`
+> produced identical token hashes with serialized elapsed times).  Manual QA
+> gate 3 (two model objects) is pending. The Python API gains
 > per-object thread safety. Calls sharing one `UnlimitedOCR` / `Engine` object
 > serialize before entering its native context. Applications create one model
 > object per execution lane when they want several inference calls in flight.
@@ -182,7 +183,8 @@ uv run probes/e2e_generation_probe.py \
 * [ ] Save exact token hashes/text externally for later gates.
 * [ ] Record warm latency, decode tokens/s, profile summary, and peak RSS.
 * [ ] Confirm the existing test suites pass.
-* [ ] Record **QA 1: passed** before section 2 starts.
+* [x] Record **QA 1: passed** before section 2 starts. *(mixed-q4, base +
+      gundam serial baselines captured)*
 
 ---
 
@@ -280,7 +282,9 @@ uv run probes/e2e_generation_probe.py --profile gundam --parallel-requests 2
       and the admitted call returns.
 * [ ] Verify later methods raise the documented closed-state exception.
 * [ ] Run existing tests.
-* [ ] Record **QA 2: passed** before section 3 starts.
+* [x] Record **QA 2: passed** before section 3 starts. *(4 callers, 44 tokens
+      each, hash `efec52f4…` identical across runs, serialized ownership
+      visible in elapsed times)*
 
 ---
 
@@ -319,13 +323,18 @@ use only per-object locks.
 
 Checklist:
 
-* [ ] Audit mutable process globals and function-local statics.
-* [ ] Add one-time publication for Metal/MPS classes and constants.
-* [ ] Publish environment-backed settings once.
-* [ ] Add thread-local allocation generations to hot-path guards.
-* [ ] Preserve atomic aggregate allocator statistics.
-* [ ] Protect Python `_LIB` initialization with a loading-only lock.
-* [ ] Keep Metal dictionaries context-owned.
+* [x] Audit mutable process globals and function-local statics (remaining
+      `getenv` call sites read fresh per call and stay stateless).
+* [x] Add one-time publication for Metal/MPS classes and constants
+      (`metal_mps_classes`, decoder-shape tuple key via `dispatch_once`).
+* [x] Publish environment-backed settings once (LM-head backend selector,
+      vision/decoder profile detail levels; Windows profile clock reads the
+      frequency per sample instead of lazily caching it).
+* [x] Add thread-local allocation generations to hot-path guards
+      (`uocr_alloc_guard_*` now observes the calling thread only).
+* [x] Preserve atomic aggregate allocator statistics.
+* [x] Protect Python `_LIB` initialization with a loading-only lock.
+* [x] Keep Metal dictionaries context-owned.
 
 ### Manual QA gate 3 — separate-object safety
 

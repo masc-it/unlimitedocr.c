@@ -1719,7 +1719,8 @@ static id<MTLComputePipelineState> metal_get_decoder_shape_pipeline(uocr_metal_c
         const uint32_t moe_expert_intermediate = UOCR_MOE_EXPERT_INTERMEDIATE;
         const uint32_t moe_shared_intermediate = UOCR_MOE_SHARED_INTERMEDIATE;
         static NSString *tuple_key = nil;
-        if (tuple_key == nil) {
+        static dispatch_once_t tuple_key_once;
+        dispatch_once(&tuple_key_once, ^{
             tuple_key = [[NSString stringWithFormat:@"#decoder-shape:h%u:a%u:d%u:r%u:e%u:k%u:v%u:t%u:l%u:ei%u:si%u",
                           hidden_size,
                           attention_heads,
@@ -1732,7 +1733,7 @@ static id<MTLComputePipelineState> metal_get_decoder_shape_pipeline(uocr_metal_c
                           lm_head_lanes_per_token,
                           moe_expert_intermediate,
                           moe_shared_intermediate] retain];
-        }
+        });
         NSString *name = [NSString stringWithUTF8String:function_name];
         NSString *cache_key = [name stringByAppendingString:tuple_key];
         id<MTLComputePipelineState> cached = [ctx->pipeline_cache objectForKey:cache_key];
@@ -8815,36 +8816,35 @@ static int metal_command_batch_commit_and_wait(uocr_metal_context *ctx,
 }
 
 #if UOCR_ENABLE_PROFILING
-static int metal_vision_profile_detail_level(void) {
-    static int cached = -1;
-    if (cached >= 0) {
-        return cached;
-    }
-    const char *env = getenv(UOCR_METAL_VISION_PROFILE_DETAIL_ENV);
+/* Parse a profile-detail env value: off/stage/block-or-layer/op or a number. */
+static int metal_profile_detail_level_parse(const char *env) {
     if (env == NULL || env[0] == '\0' || strcmp(env, "0") == 0 || strcmp(env, "false") == 0 || strcmp(env, "off") == 0) {
-        cached = 0;
-        return cached;
+        return 0;
     }
     if (strcmp(env, "stage") == 0 || strcmp(env, "stages") == 0 || strcmp(env, "true") == 0 || strcmp(env, "yes") == 0) {
-        cached = 1;
-        return cached;
+        return 1;
     }
-    if (strcmp(env, "block") == 0 || strcmp(env, "blocks") == 0) {
-        cached = 2;
-        return cached;
+    if (strcmp(env, "layer") == 0 || strcmp(env, "layers") == 0 || strcmp(env, "block") == 0 || strcmp(env, "blocks") == 0) {
+        return 2;
     }
     if (strcmp(env, "op") == 0 || strcmp(env, "ops") == 0 || strcmp(env, "operation") == 0 || strcmp(env, "operations") == 0) {
-        cached = 3;
-        return cached;
+        return 3;
     }
     errno = 0;
     char *end = NULL;
     long parsed = strtol(env, &end, 0);
     if (errno == 0 && end != env && end != NULL && *end == '\0' && parsed > 0) {
-        cached = parsed > 3 ? 3 : (int)parsed;
-    } else {
-        cached = 1;
+        return parsed > 3 ? 3 : (int)parsed;
     }
+    return 1;
+}
+
+static int metal_vision_profile_detail_level(void) {
+    static int cached;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        cached = metal_profile_detail_level_parse(getenv(UOCR_METAL_VISION_PROFILE_DETAIL_ENV));
+    });
     return cached;
 }
 
@@ -8872,35 +8872,11 @@ static int metal_vision_profile_checkpoint(uocr_metal_context *ctx,
 }
 
 static int metal_decoder_profile_detail_level(void) {
-    static int cached = -1;
-    if (cached >= 0) {
-        return cached;
-    }
-    const char *env = getenv(UOCR_METAL_DECODER_PROFILE_DETAIL_ENV);
-    if (env == NULL || env[0] == '\0' || strcmp(env, "0") == 0 || strcmp(env, "false") == 0 || strcmp(env, "off") == 0) {
-        cached = 0;
-        return cached;
-    }
-    if (strcmp(env, "stage") == 0 || strcmp(env, "stages") == 0 || strcmp(env, "true") == 0 || strcmp(env, "yes") == 0) {
-        cached = 1;
-        return cached;
-    }
-    if (strcmp(env, "layer") == 0 || strcmp(env, "layers") == 0 || strcmp(env, "block") == 0 || strcmp(env, "blocks") == 0) {
-        cached = 2;
-        return cached;
-    }
-    if (strcmp(env, "op") == 0 || strcmp(env, "ops") == 0 || strcmp(env, "operation") == 0 || strcmp(env, "operations") == 0) {
-        cached = 3;
-        return cached;
-    }
-    errno = 0;
-    char *end = NULL;
-    long parsed = strtol(env, &end, 0);
-    if (errno == 0 && end != env && end != NULL && *end == '\0' && parsed > 0) {
-        cached = parsed > 3 ? 3 : (int)parsed;
-    } else {
-        cached = 1;
-    }
+    static int cached;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        cached = metal_profile_detail_level_parse(getenv(UOCR_METAL_DECODER_PROFILE_DETAIL_ENV));
+    });
     return cached;
 }
 
@@ -9038,23 +9014,23 @@ typedef struct uocr_metal_mps_class_cache {
 
 static const uocr_metal_mps_class_cache *metal_mps_classes(void) {
     static uocr_metal_mps_class_cache cache;
-    if (cache.attempted) {
-        return &cache;
-    }
-    cache.attempted = 1;
-    cache.matmul_class = NSClassFromString(@"MPSNDArrayMatrixMultiplication");
-    cache.descriptor_class = NSClassFromString(@"MPSNDArrayDescriptor");
-    cache.array_class = NSClassFromString(@"MPSNDArray");
-    if (cache.matmul_class == Nil || cache.descriptor_class == Nil || cache.array_class == Nil) {
-        NSBundle *bundle = [NSBundle bundleWithPath:@"/System/Library/Frameworks/MetalPerformanceShaders.framework"];
-        if (bundle != nil) {
-            (void)[bundle load];
-        }
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        cache.attempted = 1;
         cache.matmul_class = NSClassFromString(@"MPSNDArrayMatrixMultiplication");
         cache.descriptor_class = NSClassFromString(@"MPSNDArrayDescriptor");
         cache.array_class = NSClassFromString(@"MPSNDArray");
-    }
-    cache.available = cache.matmul_class != Nil && cache.descriptor_class != Nil && cache.array_class != Nil;
+        if (cache.matmul_class == Nil || cache.descriptor_class == Nil || cache.array_class == Nil) {
+            NSBundle *bundle = [NSBundle bundleWithPath:@"/System/Library/Frameworks/MetalPerformanceShaders.framework"];
+            if (bundle != nil) {
+                (void)[bundle load];
+            }
+            cache.matmul_class = NSClassFromString(@"MPSNDArrayMatrixMultiplication");
+            cache.descriptor_class = NSClassFromString(@"MPSNDArrayDescriptor");
+            cache.array_class = NSClassFromString(@"MPSNDArray");
+        }
+        cache.available = cache.matmul_class != Nil && cache.descriptor_class != Nil && cache.array_class != Nil;
+    });
     return &cache;
 }
 
@@ -11186,11 +11162,12 @@ static int metal_run_argmax_pairs_to_token(uocr_metal_context *ctx,
 #define UOCR_METAL_LM_HEAD_BACKEND_ENV "UOCR_METAL_LM_HEAD_SELECTION_BACKEND"
 
 static int metal_lm_head_backend_is_mps(void) {
-    static int cached = -1;
-    if (cached < 0) {
+    static int cached;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
         const char *env = getenv(UOCR_METAL_LM_HEAD_BACKEND_ENV);
         cached = (env != NULL && strcmp(env, "mps") == 0) ? 1 : 0;
-    }
+    });
     return cached;
 }
 
