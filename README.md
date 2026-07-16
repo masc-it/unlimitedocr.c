@@ -146,3 +146,11 @@ text_from_pil = ocr.generate(Image.open("page.png"))
 
 ocr.close()
 ```
+
+## Acknowledgements
+
+This would not have been possible without these projects as solid foundations to give AI high quality context and techniques:
+
+- [llama.cpp](https://github.com/ggml-org/llama.cpp)
+- [ds4](https://github.com/antirez/ds4)
+
