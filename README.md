@@ -117,6 +117,15 @@ payload = asdict(document)  # Ready for json.dumps().
 
 Format references and verification: [parser contract](docs/plan_ocr_parsing.md).
 
+To generate synthetic documents, run OCR and save raw/parsed predictions:
+
+```bash
+uv run python tools/stress_ocr.py --models v1 v2
+```
+
+See the [stress runner guide](docs/synthetic_ocr_stress.md) for cases, saved
+artifacts and failure reporting. It defaults to mixed Q4 and cached models.
+
 ## Threading
 
 One `UnlimitedOCR` instance is safe to share across threads.  A per-object
