@@ -251,6 +251,12 @@ static int estimate_vision_memory_for_shape_internal(uint32_t max_view_size,
     uint64_t sam_attention_tokens = patch_tokens;
     uint64_t sam_attention_values = 0u;
     uint64_t sam_attention_batch_values = 0u;
+    uint64_t sam_global_logits_values = 0u;
+    uint64_t sam_global_logits_f32_values = 0u;
+    uint64_t sam_global_rel_f32_values = 0u;
+    uint64_t conv_rows = 0u;
+    uint64_t conv_bhwc_values = 0u;
+    uint64_t conv_im2col_values = 0u;
     uint64_t sam_mlp_values = 0u;
     uint64_t sam_mlp_batch_values = 0u;
     uint64_t clip_values = 0u;
@@ -282,6 +288,15 @@ static int estimate_vision_memory_for_shape_internal(uint32_t max_view_size,
                          (uint64_t)UOCR_SAM_HIDDEN_SIZE,
                          &sam_attention_values) ||
         !checked_mul_u64(sam_attention_values, chunk_view_capacity, &sam_attention_batch_values) ||
+        !checked_mul_u64(chunk_view_capacity, UOCR_SAM_ATTENTION_HEADS, &sam_global_logits_values) ||
+        !checked_mul_u64(sam_global_logits_values, patch_tokens, &sam_global_logits_values) ||
+        !checked_mul_u64(sam_global_logits_values, patch_grid, &sam_global_rel_f32_values) ||
+        !checked_mul_u64(sam_global_rel_f32_values, 2u, &sam_global_rel_f32_values) ||
+        !checked_mul_u64(sam_global_logits_values, patch_tokens, &sam_global_logits_values) ||
+        !checked_mul_u64(sam_global_logits_values, 2u, &sam_global_logits_f32_values) ||
+        !checked_mul_u64(patch_tokens, chunk_view_capacity, &conv_rows) ||
+        !checked_mul_u64(conv_rows, UOCR_SAM_NET3_CHANNELS, &conv_bhwc_values) ||
+        !checked_mul_u64(conv_bhwc_values, 9u, &conv_im2col_values) ||
         !checked_mul_u64(patch_tokens, (uint64_t)UOCR_SAM_MLP_INTERMEDIATE, &sam_mlp_values) ||
         !checked_mul_u64(sam_mlp_values, chunk_view_capacity, &sam_mlp_batch_values) ||
         !checked_mul_u64(clip_tokens, (uint64_t)UOCR_CLIP_HIDDEN_SIZE, &clip_values) ||
@@ -301,6 +316,16 @@ static int estimate_vision_memory_for_shape_internal(uint32_t max_view_size,
         !add_aligned_f16_slice_bytes(&total, sam_attention_batch_values) ||
         !add_aligned_f16_slice_bytes(&total, sam_attention_batch_values) ||
         !add_aligned_f16_slice_bytes(&total, sam_attention_batch_values) ||
+        /* Match metal_vision_workspace_init: packed Q/K/VT/output, dense
+         * global attention and relative logits. FP32 uses two FP16 units. */
+        !add_aligned_f16_slice_bytes(&total, sam_transformer_batch_values) ||
+        !add_aligned_f16_slice_bytes(&total, sam_transformer_batch_values) ||
+        !add_aligned_f16_slice_bytes(&total, sam_transformer_batch_values) ||
+        !add_aligned_f16_slice_bytes(&total, sam_global_logits_f32_values) ||
+        !add_aligned_f16_slice_bytes(&total, sam_global_logits_values) ||
+        !add_aligned_f16_slice_bytes(&total, sam_transformer_batch_values) ||
+        !add_aligned_f16_slice_bytes(&total, sam_global_rel_f32_values) ||
+        !add_aligned_f16_slice_bytes(&total, sam_global_rel_f32_values) ||
         !add_aligned_f16_slice_bytes(&total, sam_transformer_batch_values) ||
         !add_aligned_f16_slice_bytes(&total, sam_transformer_batch_values) ||
         !add_aligned_f16_slice_bytes(&total, sam_transformer_batch_values) ||
@@ -310,6 +335,8 @@ static int estimate_vision_memory_for_shape_internal(uint32_t max_view_size,
         !add_aligned_f16_slice_bytes(&total, sam_neck_values) ||
         !add_aligned_f16_slice_bytes(&total, sam_net2_values) ||
         !add_aligned_f16_slice_bytes(&total, sam_net3_values) ||
+        !add_aligned_f16_slice_bytes(&total, conv_im2col_values) ||
+        !add_aligned_f16_slice_bytes(&total, conv_bhwc_values) ||
         !add_aligned_f16_slice_bytes(&total, clip_final_values) ||
         !add_aligned_f16_slice_bytes(&total, clip_final_values) ||
         !add_aligned_f16_slice_bytes(&total, clip_final_values) ||
