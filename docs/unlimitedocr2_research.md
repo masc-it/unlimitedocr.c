@@ -14,10 +14,10 @@ Add `baidu/Unlimited-OCR-2` to the native C/Metal engine while preserving v1 beh
 - [done] Compared these with `data/context/` and the current converter, frontend, runtime, and Metal implementation.
 - [done] Confirmed that all 2,710 v1 tensor names exist in v2 with identical shapes and dtypes. This does not imply identical weight values.
 - [done] Inspected the pinned customized SGLang wheel's window planner, KV copy/splice, page guard, and cache relocation. Exact contract is recorded below.
-- [todo] Run upstream inference and capture numerical reference fixtures. No full weights were downloaded or model inference executed during this investigation.
+- [todo] Run upstream inference and capture numerical reference fixtures. Pinned weights have now been downloaded and converted to mixed-Q8; model inference has not run.
 
 Upstream revision: `c14071b549f4fcab10909f3c4acc6a2edb366947`.
-Local research downloads are temporary files under `/tmp/unlimitedocr2-research-c14071b/`, not committed fixtures. Only source, tokenizer, metadata, weight headers, and the SGLang wheel were downloaded. The wheel was extracted for inspection, not installed or executed.
+Initial research downloads are temporary files under `/tmp/unlimitedocr2-research-c14071b/`, not committed fixtures: source, tokenizer, metadata, weight headers, and the SGLang wheel. The wheel was extracted for inspection, not installed or executed. Full checkpoint shards were later downloaded into the normal Hugging Face cache; real mixed-Q8 conversion/loading evidence is recorded in the implementation plan.
 
 Sources:
 

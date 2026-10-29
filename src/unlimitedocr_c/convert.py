@@ -2512,8 +2512,13 @@ def _metadata_mismatches_for_compare(
         mismatches.append(f"block_size actual={view.block_size} expected={tensor.block_size}")
     if view.row_size != tensor.row_size:
         mismatches.append(f"row_size actual={view.row_size} expected={tensor.row_size}")
-    if view.scale_offset != tensor.scale_offset:
-        mismatches.append(f"scale_offset actual={view.scale_offset} expected={tensor.scale_offset}")
+    # Filtering relays out the plan, including quantization-scale slabs. The
+    # target file owns its absolute offsets; payload comparison follows those
+    # offsets and verifies the bytes. Only the zero/no-scales contract is fixed.
+    if bool(view.scale_offset) != bool(tensor.scale_size):
+        mismatches.append(
+            f"scale_offset={view.scale_offset} inconsistent with expected scale_size={tensor.scale_size}"
+        )
     if view.scale_size != tensor.scale_size:
         mismatches.append(f"scale_size actual={view.scale_size} expected={tensor.scale_size}")
     if view.qtype_reason_id != tensor.qtype_reason_id:

@@ -38,7 +38,7 @@ Files: `src/unlimitedocr_c/{api,convert,tensor_registry,frontend}.py`, `src/mode
 
 QA checkpoint:
 
-- [todo] Convert the real checkpoint, load it, and compare one tensor from each shard with its source. Verify every source tensor is accounted for.
+- [done] Convert the real checkpoint to mixed-Q8, load it natively, and compare FP16/Q8 tensors from each shard with their source. Verify every source tensor is accounted for.
 - [done] Run a disposable two-shard conversion probe (FP16/Q8/Q4, cached headers, missing shard, wrong index assignment) and existing converter/API checks.
 - [done] Run native model-file checks after adding v2 metadata.
 
@@ -50,7 +50,9 @@ QA evidence:
 - Small synthetic v2 tensors were converted, compared against source, and loaded natively, including filtered conversion. Invalid position buffers, unsupported configs, malformed file versions, and quantized router records are rejected. CPU/Metal engine opening reports v2 inference unavailable. Probes removed after verification.
 - Rewriting a previously validated config exposed a path-only JSON cache bug; cache keys now include file identity. Repeatable check: build a plan, change `dash_stage0` to `indexer` at the same path, build again in the same process; the second build must reject it.
 - Model selection/frontend checks: `uv run python -m pytest tests/test_unlimitedocr_api.py tests/test_frontend.py tests/test_frontend_boundary.py tests/test_convert.py -q`: 52 passed, 1 skipped. A disposable offline probe verified repo/revision/quant cache isolation, pinned v2 tokenizer resolution, mismatched variants/tokenizers, failed reconversion preserving the cache, and the constructor-to-preparation-to-decoding path with a fake engine. Downloads/conversion were stubbed for this probe; tokenizers were real cached HF files. Probe removed.
-- Phase-1 code is implemented. Full checkpoint payload conversion/loading and numerical OCR remain unverified; no full v2 weight download or inference has run.
+- Real pinned payload download and mixed-Q8 conversion completed through `resolve_model_path(model='v2', quant='q8')`. Cached file: `~/Library/Caches/unlimitedocr/v2/7e04dada5a6c1229/mixed-q8_0/unlimitedocr-q8.uocr`, 3,468,861,440 bytes. Conversion reported zero source NaN/Inf values. `build/uocr-dump` loaded the complete file and confirmed format 2, 2819 source tensors, 2769 runtime, 49 preserved-unused, and 1 omitted.
+- Source-byte checks matched layer-0 attention Q and router Q-norm from shard 1, plus layer-10 expert-53 down-projection and input norm from shard 2. Both Q8 weights/scales and FP16 payloads were checked. Real-file verification exposed a comparison-tool bug: filtered plans relocate scale slabs, so absolute scale offsets cannot be compared with the full target file. Comparison now follows target offsets and verifies their bytes, retaining scale-presence/size checks. Wrong scale pointers still fail payload comparison. Disposable regression probe removed; converter/API checks again passed (26 passed, 1 opt-in test skipped).
+- Phase-1 conversion/loading is verified for the real mixed-Q8 model. Full FP16/Q4 conversion and model-level OCR inference remain unverified.
 
 ## Phase 2: Generate a single page
 
@@ -87,7 +89,7 @@ QA evidence:
 - Disposable retained-cache probe passed on actual Metal: two prefill chunks (65/64 tokens), then 131 one-token decode appends through all 12 layers. An extra answer page forced remote-text fallback, exercising generated K/V older than 128 tokens. Layer 0/11 outputs at selected boundaries matched a freshly recomputed full-retained-key primitive. Synthetic projections were used; no model weights or FFN/MoE were executed.
 - For capacities 260 tokens / 129 query rows / 3 page buckets, tracked cache/workspace memory stayed at 17,551,664 bytes and returned to zero on release. This is a within-window allocation check, not the long-document memory proof. Exact-budget allocation, insufficient budget, capacity exhaustion, invalid-token rollback, layer ordering, cancellation/reset, and destruction passed. An intentionally incomplete Metal library verified that an encode failure leaves output untouched and poisons the request until reset. Temporary probes removed.
 - Rebuilt `unlimitedocr`, `test_api`, `test_metal`, `test_memory`, and `test_sequence`; `ctest --test-dir build -R '^uocr_(api|metal|memory|sequence)$' --output-on-failure`: 4 passed.
-- Native/reference model inference has not run; it still requires full decoder/engine integration, weights, and a suitable reference environment. The v2 inference guard remains enabled. HF top-M routing and the wheel's optimized full-candidate entmax path differ; see research notes before interpreting scheduler output parity.
+- Native/reference model inference has not run; it still requires full decoder/engine integration and a suitable reference environment. Real source weights and a converted mixed-Q8 model are now cached. The v2 inference guard remains enabled. HF top-M routing and the wheel's optimized full-candidate entmax path differ; see research notes before interpreting scheduler output parity.
 
 ## Phase 3: Multi-page and quantization
 
