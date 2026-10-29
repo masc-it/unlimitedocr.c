@@ -13,7 +13,7 @@ management, KV cache, logits processing, and GPU execution.
 uv add unlimitedocr-c
 ```
 
-> `unlimitedocr-c` is published on PyPI. Version `0.4.1` is the latest stable release.
+> `unlimitedocr-c` is published on PyPI. Version `0.5.0` is the latest release; v2 inference is experimental and single-page only.
 
 ## Quick start
 
@@ -40,7 +40,7 @@ for image_path in ["page-1.png", "page-2.png", "page-3.png"]:
 ocr.close()
 ```
 
-## Unlimited-OCR-2 (development branch)
+## Unlimited-OCR-2 (experimental single-page support)
 
 Experimental native v2 **single-page** OCR works in `base` and `gundam` modes.
 Mixed Q4 is the primary v2 quantization profile. Both Q4 and Q8 have passed

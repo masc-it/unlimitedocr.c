@@ -120,7 +120,7 @@ UOCR_Q4_GROUP_SIZE_DEFAULT = 64
 UOCR_Q4_MIN = -8
 UOCR_Q4_MAX = 7
 
-CONVERTER_VERSION = (0, 3, 0)
+CONVERTER_VERSION = (0, 5, 0)
 
 QUANT_POLICY_EMBEDDINGS_DECODER = "embeddings+decoder"
 #: Candidate (family, projection) universe for cfg-gated mixed Q8 planning.
