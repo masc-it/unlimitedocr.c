@@ -427,6 +427,35 @@ int uocr_metal_context_dash_attention_f16(uocr_metal_context *ctx,
     uint16_t *output, uocr_dash_selection *selections, float *summaries,
     char *error, size_t error_size);
 
+/* Request-owned v2 attention cache, independent of the v1 generated-token ring.
+ * Capacity includes prompt AND generated tokens. query_capacity bounds a single
+ * append; page_capacity includes the prefix bucket. Budget covers this cache's
+ * aligned GPU payload and CPU state, excluding the model/vision/MoE/driver.
+ * weights: FP16 [12,3,128] in q_norm/k_norm/head_cls order, copied at allocation.
+ * One cache per context; context/tracker must outlive it. All calls are serialized.
+ * begin advances coordinates once; layer calls must consume all 12 layers in
+ * order before another begin. Projected arrays are [pending_rows,10,128] for
+ * main Q/K/V and [pending_rows,128] for router Q/K, before norm/RoPE. This host
+ * bridge exercises retained attention; full decoder integration remains separate.
+ * GPU failures poison the request until reset/release. Reset discards all KV;
+ * it is cancellation/new-document reset, not cross-window continuation. */
+uint64_t uocr_metal_dash_cache_required_bytes(uint32_t token_capacity,
+    uint32_t query_capacity, uint32_t page_capacity); /* 0 for invalid capacities */
+int uocr_metal_context_allocate_dash_cache(uocr_metal_context *ctx,
+    uint32_t token_capacity, uint32_t query_capacity, uint32_t page_capacity,
+    uint64_t document_page_base, uint64_t budget_bytes, const uint16_t *weights,
+    char *error, size_t error_size);
+void uocr_metal_context_release_dash_cache(uocr_metal_context *ctx);
+int uocr_metal_context_reset_dash_cache(uocr_metal_context *ctx, uint64_t document_page_base,
+    char *error, size_t error_size);
+uint32_t uocr_metal_context_dash_cache_length(const uocr_metal_context *ctx);
+int uocr_metal_context_dash_begin(uocr_metal_context *ctx, const int32_t *tokens,
+    uint32_t n_tokens, int generated, char *error, size_t error_size);
+int uocr_metal_context_dash_layer_f16(uocr_metal_context *ctx, uint32_t layer,
+    const uint16_t *q, const uint16_t *k, const uint16_t *v,
+    const uint16_t *router_q, const uint16_t *router_k, uint16_t *output,
+    char *error, size_t error_size);
+
 /* Standalone synchronous v2 RoPE operation; no model weights required.
  * Q/K are in-place FP16 arrays [n_tokens, heads, 128], heads is 1 or 10.
  * Positions use uocr_page_state's CPU/Metal layout. The v2 decoder will use

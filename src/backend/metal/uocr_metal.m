@@ -404,6 +404,7 @@ struct uocr_metal_context {
     id<MTLBuffer> sam_rel_pos_local_buffer;
     id<MTLBuffer> clip_abs_pos_local_buffer;
     char vision_binding_error[256];
+    struct uocr_metal_dash_cache *dash_cache;
     uocr_metal_kv_cache_layout kv_cache_layout;
     int has_kv_cache_layout;
     int has_integrated_prefill;
@@ -12621,6 +12622,222 @@ int uocr_metal_context_dash_attention_f16(uocr_metal_context *ctx,
     }
 }
 
+typedef struct uocr_metal_dash_layout {
+    uint64_t offsets[DASH_BUFFER_COUNT];
+    uint64_t sizes[DASH_BUFFER_COUNT];
+    uint64_t gpu_bytes, host_bytes, kv_bytes;
+    uint32_t token_capacity, query_capacity, page_capacity;
+} uocr_metal_dash_layout;
+
+typedef struct uocr_metal_dash_cache {
+    uocr_metal_dash_layout layout;
+    id<MTLBuffer> arena;
+    uocr_memory_tracker *tracker; // borrowed for the cache lifetime
+    uocr_page_state pages;
+    uint32_t length, pending, next_layer;
+    int failed;
+    uint32_t counters[]; // live page counters followed by rollback scratch
+} uocr_metal_dash_cache;
+
+static uint64_t metal_dash_align(uint64_t bytes, uint64_t alignment) {
+    return (bytes + alignment - 1u) / alignment * alignment;
+}
+
+static int metal_dash_layout(uint32_t tokens, uint32_t queries, uint32_t pages,
+                             uocr_metal_dash_layout *layout) {
+    if (tokens == 0u || tokens > UOCR_V2_MAX_POSITIONS || queries == 0u || queries > tokens ||
+        pages < 2u || pages > tokens + 1u) return 0;
+    memset(layout, 0, sizeof(*layout));
+    layout->token_capacity = tokens; layout->query_capacity = queries; layout->page_capacity = pages;
+    if (!metal_dash_buffer_sizes((uocr_metal_dash_params){tokens, 0u, queries, 0u}, layout->sizes, NULL, 0u)) return 0;
+    const uint32_t retained[] = {DASH_K, DASH_V, DASH_ROUTER_K, DASH_SUMMARIES, DASH_PAGE_RANGES, DASH_POSITIONS};
+    // Bounds above make all sums/products fit uint64_t even at maximum capacity.
+    for (uint32_t i = 0; i < 6u; ++i) {
+        const uint32_t slot = retained[i];
+        if (i < 4u) layout->sizes[slot] *= UOCR_DECODER_LAYERS;
+        layout->gpu_bytes = metal_dash_align(layout->gpu_bytes, 256u);
+        layout->offsets[slot] = layout->gpu_bytes;
+        layout->gpu_bytes += layout->sizes[slot];
+    }
+    layout->host_bytes = sizeof(uocr_metal_dash_cache) + (uint64_t)pages * 2u * sizeof(uint32_t);
+    layout->kv_bytes = metal_dash_align(layout->gpu_bytes, 256u);
+    layout->gpu_bytes = layout->kv_bytes;
+    const uint32_t scratch[] = {DASH_Q, DASH_ROUTER_Q, DASH_HEAD_CLS, DASH_SELECTIONS, DASH_OUTPUT};
+    layout->sizes[DASH_HEAD_CLS] *= UOCR_DECODER_LAYERS * 3u;
+    for (uint32_t i = 0; i < 5u; ++i) {
+        const uint32_t slot = scratch[i];
+        layout->gpu_bytes = metal_dash_align(layout->gpu_bytes, 256u);
+        layout->offsets[slot] = layout->gpu_bytes;
+        layout->gpu_bytes += layout->sizes[slot];
+    }
+    layout->gpu_bytes = metal_dash_align(layout->gpu_bytes, 4096u);
+    return 1;
+}
+
+uint64_t uocr_metal_dash_cache_required_bytes(uint32_t tokens, uint32_t queries, uint32_t pages) {
+    uocr_metal_dash_layout layout;
+    return metal_dash_layout(tokens, queries, pages, &layout) ? layout.gpu_bytes + layout.host_bytes : 0u;
+}
+
+void uocr_metal_context_release_dash_cache(uocr_metal_context *ctx) {
+    if (ctx == NULL || ctx->dash_cache == NULL) return;
+    metal_command_batch_abort(ctx);
+    uocr_metal_dash_cache *cache = ctx->dash_cache;
+    ctx->dash_cache = NULL;
+    [cache->arena release];
+    if (cache->tracker != NULL) {
+        (void)uocr_memory_release(cache->tracker, UOCR_MEMORY_KV_CACHE, cache->layout.kv_bytes + cache->layout.host_bytes);
+        (void)uocr_memory_release(cache->tracker, UOCR_MEMORY_DECODER_SCRATCH, cache->layout.gpu_bytes - cache->layout.kv_bytes);
+    }
+    free(cache);
+}
+
+int uocr_metal_context_allocate_dash_cache(uocr_metal_context *ctx,
+    uint32_t tokens, uint32_t queries, uint32_t pages, uint64_t document_page_base,
+    uint64_t budget_bytes, const uint16_t *weights, char *error, size_t error_size) {
+    metal_clear_error(error, error_size);
+    uocr_metal_dash_layout layout;
+    if (ctx == NULL || weights == NULL || !metal_dash_layout(tokens, queries, pages, &layout))
+        return metal_fail(error, error_size, "invalid DASH cache allocation request");
+    if (ctx->dash_cache != NULL || metal_command_batch_active(ctx))
+        return metal_fail(error, error_size, "release the existing DASH request before allocating a cache");
+    const uint64_t required = layout.gpu_bytes + layout.host_bytes;
+    if (required > budget_bytes)
+        return metal_fail(error, error_size, "DASH cache requires %llu bytes; budget is %llu",
+                          (unsigned long long)required, (unsigned long long)budget_bytes);
+    if (layout.gpu_bytes > SIZE_MAX || layout.gpu_bytes > metal_device_max_buffer_length(ctx->device))
+        return metal_fail(error, error_size, "DASH cache arena exceeds device buffer limits");
+    uocr_metal_dash_cache *cache = calloc(1u, (size_t)layout.host_bytes);
+    if (cache == NULL) return metal_fail(error, error_size, "failed to allocate DASH page state");
+    cache->layout = layout;
+    if (uocr_page_state_init(&cache->pages, cache->counters, pages, document_page_base, error, error_size) != UOCR_OK) {
+        free(cache); return 0;
+    }
+    @autoreleasepool {
+        cache->arena = metal_new_buffer_with_length(ctx, (NSUInteger)layout.gpu_bytes, MTLResourceStorageModeShared);
+        if (cache->arena == nil) { free(cache); return metal_fail(error, error_size, "failed to allocate DASH cache arena"); }
+        const uint64_t kv_bytes = layout.kv_bytes + layout.host_bytes, scratch_bytes = layout.gpu_bytes - layout.kv_bytes;
+        if (!metal_memory_reserve(ctx, UOCR_MEMORY_KV_CACHE, kv_bytes, "DASH retained state", error, error_size)) {
+            [cache->arena release]; free(cache); return 0;
+        }
+        if (!metal_memory_reserve(ctx, UOCR_MEMORY_DECODER_SCRATCH, scratch_bytes, "DASH workspace", error, error_size)) {
+            metal_memory_release(ctx, UOCR_MEMORY_KV_CACHE, kv_bytes);
+            [cache->arena release]; free(cache); return 0;
+        }
+        cache->tracker = ctx->memory_tracker;
+        memcpy((uint8_t *)[cache->arena contents] + layout.offsets[DASH_HEAD_CLS], weights,
+               (size_t)layout.sizes[DASH_HEAD_CLS]);
+        ctx->dash_cache = cache;
+        return 1;
+    }
+}
+
+int uocr_metal_context_reset_dash_cache(uocr_metal_context *ctx, uint64_t document_page_base,
+    char *error, size_t error_size) {
+    metal_clear_error(error, error_size);
+    if (ctx == NULL || ctx->dash_cache == NULL || metal_command_batch_active(ctx))
+        return metal_fail(error, error_size, "DASH reset requires an idle allocated cache");
+    uocr_metal_dash_cache *c = ctx->dash_cache;
+    if (uocr_page_state_init(&c->pages, c->counters, c->layout.page_capacity, document_page_base, error, error_size) != UOCR_OK) return 0;
+    c->length = c->pending = c->next_layer = 0u; c->failed = 0;
+    // Old GPU rows remain allocated but inaccessible. First prefill rewrites all
+    // live blocks and masks the partial tail before any summary can be read.
+    return 1;
+}
+
+uint32_t uocr_metal_context_dash_cache_length(const uocr_metal_context *ctx) {
+    return ctx != NULL && ctx->dash_cache != NULL ? ctx->dash_cache->length : 0u;
+}
+
+int uocr_metal_context_dash_begin(uocr_metal_context *ctx, const int32_t *tokens,
+    uint32_t n_tokens, int generated, char *error, size_t error_size) {
+    metal_clear_error(error, error_size);
+    if (ctx == NULL || ctx->dash_cache == NULL || tokens == NULL || metal_command_batch_active(ctx))
+        return metal_fail(error, error_size, "DASH append requires an idle allocated cache");
+    uocr_metal_dash_cache *c = ctx->dash_cache;
+    if (c->failed || c->pending != 0u)
+        return metal_fail(error, error_size, "DASH request failed or has unfinished layers; finish or reset it");
+    if (n_tokens == 0u || n_tokens > c->layout.query_capacity || n_tokens > c->layout.token_capacity - c->length)
+        return metal_fail(error, error_size, "DASH append exceeds query or retained-window capacity");
+    uocr_page_state previous = c->pages;
+    const size_t counter_bytes = (size_t)c->layout.page_capacity * sizeof(uint32_t);
+    uint32_t *backup = c->counters + c->layout.page_capacity;
+    memcpy(backup, c->counters, counter_bytes);
+    uocr_page_position *positions = (uocr_page_position *)((uint8_t *)[c->arena contents] + c->layout.offsets[DASH_POSITIONS]);
+    for (uint32_t i = 0; i < n_tokens; ++i) {
+        if (uocr_page_state_step(&c->pages, tokens[i], generated, &positions[c->length+i], error, error_size) != UOCR_OK) {
+            c->pages = previous; memcpy(c->counters, backup, counter_bytes);
+            return 0;
+        }
+    }
+    c->pending = n_tokens; c->next_layer = 0u;
+    return 1;
+}
+
+static void metal_dash_cache_slices(uocr_metal_dash_cache *c, uint32_t layer,
+                                    uocr_metal_buffer_slice buffers[DASH_BUFFER_COUNT]) {
+    for (uint32_t i = 0; i < DASH_BUFFER_COUNT; ++i)
+        buffers[i] = (uocr_metal_buffer_slice){c->arena, (NSUInteger)c->layout.offsets[i]};
+    const uint32_t per_layer[] = {DASH_K, DASH_V, DASH_ROUTER_K, DASH_SUMMARIES};
+    for (uint32_t i = 0; i < 4u; ++i) {
+        const uint32_t slot = per_layer[i];
+        buffers[slot].offset += (NSUInteger)(layer * (c->layout.sizes[slot] / UOCR_DECODER_LAYERS));
+    }
+    buffers[DASH_HEAD_CLS].offset += (NSUInteger)((layer*3u + 2u)*256u);
+}
+
+// Encoder-only path for decoder integration. Q and newly appended K/V/router
+// projections must already occupy their cache slices; no host readback here.
+static int metal_run_cached_dash_layer(uocr_metal_context *ctx, uocr_metal_dash_cache *c,
+    const uocr_metal_buffer_slice buffers[DASH_BUFFER_COUNT], char *error, size_t error_size) {
+    uocr_metal_buffer_slice new_k = buffers[DASH_K], new_router_k = buffers[DASH_ROUTER_K];
+    uocr_metal_buffer_slice positions = buffers[DASH_POSITIONS];
+    new_k.offset += (NSUInteger)c->length * 2560u;
+    new_router_k.offset += (NSUInteger)c->length * 256u;
+    positions.offset += (NSUInteger)c->length * sizeof(uocr_page_position);
+    uocr_metal_buffer_slice norms[4] = {buffers[DASH_ROUTER_Q], new_router_k, buffers[DASH_HEAD_CLS], buffers[DASH_HEAD_CLS]};
+    norms[2].offset -= 512u; norms[3].offset -= 256u;
+    return metal_run_dash_norm_buffer_f16(ctx, norms, c->pending, error, error_size) &&
+        metal_run_page_rope_qk_buffer_f16(ctx, buffers[DASH_Q], new_k, positions, c->pending, 10u, error, error_size) &&
+        metal_run_page_rope_qk_buffer_f16(ctx, buffers[DASH_ROUTER_Q], new_router_k, positions, c->pending, 1u, error, error_size) &&
+        metal_run_dash_buffer_f16(ctx, buffers,
+            (uocr_metal_dash_params){c->length + c->pending, c->length, c->pending, c->length / 32u}, error, error_size);
+}
+
+int uocr_metal_context_dash_layer_f16(uocr_metal_context *ctx, uint32_t layer,
+    const uint16_t *q, const uint16_t *k, const uint16_t *v,
+    const uint16_t *router_q, const uint16_t *router_k, uint16_t *output,
+    char *error, size_t error_size) {
+    metal_clear_error(error, error_size);
+    if (ctx == NULL || ctx->dash_cache == NULL || q == NULL || k == NULL || v == NULL ||
+        router_q == NULL || router_k == NULL || output == NULL || metal_command_batch_active(ctx))
+        return metal_fail(error, error_size, "invalid cached DASH layer request");
+    uocr_metal_dash_cache *c = ctx->dash_cache;
+    if (c->failed) return metal_fail(error, error_size, "DASH cache is poisoned; reset or release it");
+    if (c->pending == 0u || layer != c->next_layer || layer >= UOCR_DECODER_LAYERS)
+        return metal_fail(error, error_size, "cached DASH layers must run once, in order, after begin");
+    uocr_metal_buffer_slice buffers[DASH_BUFFER_COUNT];
+    metal_dash_cache_slices(c, layer, buffers);
+    uint8_t *base = [c->arena contents];
+    const size_t main_bytes = (size_t)c->pending*2560u, router_bytes = (size_t)c->pending*256u;
+    memcpy(base+buffers[DASH_Q].offset, q, main_bytes);
+    memcpy(base+buffers[DASH_K].offset+(size_t)c->length*2560u, k, main_bytes);
+    memcpy(base+buffers[DASH_V].offset+(size_t)c->length*2560u, v, main_bytes);
+    memcpy(base+buffers[DASH_ROUTER_Q].offset, router_q, router_bytes);
+    memcpy(base+buffers[DASH_ROUTER_K].offset+(size_t)c->length*256u, router_k, router_bytes);
+    if (!metal_command_batch_begin(ctx, error, error_size) ||
+        !metal_run_cached_dash_layer(ctx, c, buffers, error, error_size) ||
+        !metal_command_batch_commit_and_wait(ctx, "cached DASH layer", error, error_size)) {
+        metal_command_batch_abort(ctx); c->failed = 1;
+        return 0;
+    }
+    memcpy(output, base+buffers[DASH_OUTPUT].offset, main_bytes);
+    if (++c->next_layer == UOCR_DECODER_LAYERS) {
+        c->length += c->pending; c->pending = c->next_layer = 0u;
+    }
+    return 1;
+}
+
 static int metal_run_rope_qk_buffer_f16(uocr_metal_context *ctx,
                                         uocr_metal_buffer_slice q,
                                         uocr_metal_buffer_slice k,
@@ -19570,6 +19787,7 @@ void uocr_metal_context_destroy(uocr_metal_context *ctx) {
         return;
     }
     metal_command_batch_abort(ctx);
+    uocr_metal_context_release_dash_cache(ctx);
     uocr_metal_context_unmap_model(ctx);
     uocr_metal_context_release_runtime_arenas(ctx);
     release_all_scratch(ctx);
