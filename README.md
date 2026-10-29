@@ -40,6 +40,30 @@ for image_path in ["page-1.png", "page-2.png", "page-3.png"]:
 ocr.close()
 ```
 
+## Unlimited-OCR-2 (development branch)
+
+V2 conversion, model selection, and input preparation are implemented on this
+branch. **Native v2 inference is not ready yet**: `UnlimitedOCR(model="v2")`
+reports that sparse attention is not implemented. The default remains v1.
+
+To prepare only the converted model (downloads the checkpoint on first use):
+
+```python
+from unlimitedocr_c import resolve_model_path
+
+model_path = resolve_model_path(model="v2", quant="q8")
+```
+
+The official v2 weights and tokenizer use the same pinned Hugging Face revision.
+Converted files are cached separately by variant, repository/revision, and
+quantization. Default v1 still finds its older cache files. Tokenizers use the
+repository-specific Hugging Face snapshot cache, not a shared copied file.
+For `UnlimitedOCR`, `download=False` requires both the model and tokenizer to be
+available locally.
+`force_reconvert=True` replaces the selected model only after conversion succeeds.
+
+Progress and remaining work: [implementation plan](docs/plan_unlimitedocr2.md).
+
 ## Threading
 
 One `UnlimitedOCR` instance is safe to share across threads.  A per-object
