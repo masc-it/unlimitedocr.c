@@ -13,9 +13,11 @@
 #     family       TensorFamily enum name
 #     projections  list of TensorProjection enum names this module covers
 #     supported    whether the runtime can consume quantized weights for this module
-#     qtype        optional storage qtype: q8_0 (default) or q4_0; q4_0 is only
-#                  valid for MOE_EXPERT (docs/plan_q4.md) and only takes effect
-#                  under --qprofile mixed-q4
+#     qtype        optional storage qtype: q8_0 (default) or q4_0; Q4 is valid
+#                  for the supported embedding, LM-head, MLP/MoE and vision
+#                  modules below and only takes effect under --qprofile mixed-q4
+#
+# V2 uses the same mix. DASH and MoE routers stay FP16 via the converter keep-list.
 #
 # Note: attention_qkv covers Q/K/V and attention_output covers O.  Both prefill
 # and decode have fused Q8 kernels for Q/K/V and O projections.

@@ -43,13 +43,15 @@ ocr.close()
 ## Unlimited-OCR-2 (development branch)
 
 Experimental native v2 **single-page** OCR works in `base` and `gundam` modes.
-Mixed-Q8 has been checked on real rendered pages; upstream numerical parity and
-v2 FP16/Q4 OCR remain unverified. The default remains v1.
+Mixed Q4 is the primary v2 quantization profile. Both Q4 and Q8 have passed
+base/gundam OCR on rendered invoices, including outputs longer than 128 tokens.
+Upstream numerical parity and v2 FP16 OCR remain unverified. The default model
+remains v1; select Q4 explicitly.
 
 ```python
 from unlimitedocr_c import UnlimitedOCR
 
-with UnlimitedOCR(model="v2", quant="q8") as ocr:
+with UnlimitedOCR(model="v2", quant="q4") as ocr:
     print(ocr.generate("page.png", profile="base"))
 ```
 
@@ -63,7 +65,7 @@ To prepare only the converted model (downloads the checkpoint on first use):
 ```python
 from unlimitedocr_c import resolve_model_path
 
-model_path = resolve_model_path(model="v2", quant="q8")
+model_path = resolve_model_path(model="v2", quant="q4")
 ```
 
 The official v2 weights and tokenizer use the same pinned Hugging Face revision.
@@ -147,10 +149,17 @@ LM head, token embedding and vision encoders as group-64 Q4_0 — symmetric
 int4 with fp16 scales and a group-half-split nibble packing chosen for
 vectorized dequantization in the fused Metal kernels.  The exact Q4 subset is
 cfg-gated by `configs/quant-cfg.yaml`, so the converter only emits Q4 for
-modules with runtime-safe fused kernels; attention projections stay Q8_0
+modules with runtime-safe fused kernels; decoder attention projections stay Q8_0
 (highest quality sensitivity); norms, biases and convolutions stay fp16.
+The precision mix is selected during conversion, not adapted during inference.
+V2 keeps all 60 DASH router tensors in FP16. Its mixed-Q4 model file is about
+1.85 GB; observed tracked native peaks on the invoice fixtures were 3.33 GB in
+base mode and 4.14 GB in gundam mode. These are fixture measurements, not fixed
+limits; admission includes request capacity and a safety margin.
+
 On M1 Pro the routed-expert decode step measured ~2.7× faster than Q8 and
-the fused LM-head argmax ~1.2× faster.
+the fused LM-head argmax ~1.2× faster. These are kernel measurements, not
+end-to-end v2 timings.
 
 ## Input types
 

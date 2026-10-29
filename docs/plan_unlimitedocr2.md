@@ -6,7 +6,7 @@ Status: `todo`
 
 Ship v2 OCR with bounded-memory long-document parsing, without changing v1 behavior. Reuse existing vision, MoE, projection, and quantization kernels. Single-window inference is an intermediate checkpoint, not the finished feature.
 
-Model selection is implemented: `UnlimitedOCR(model="v2", quant="q8")`; default remains v1. Experimental single-page v2 generation works in base/gundam modes (mixed-Q8 verified); upstream parity and multi-page/windowed generation remain pending. Keep `generate(image)`. Add `stream_pages(images)` accepting an iterable of ordered base-mode pages and yielding text chunks; `generate_pages(images)` joins those chunks for convenience. Only the joining API intentionally retains the full output.
+Model selection is implemented: `UnlimitedOCR(model="v2", quant="q4")`; default remains v1. Mixed Q4 is the primary v2 quantization profile. Experimental single-page v2 generation works in base/gundam modes (mixed-Q4 and mixed-Q8 verified); upstream parity and multi-page/windowed generation remain pending. Keep `generate(image)`. Add `stream_pages(images)` accepting an iterable of ordered base-mode pages and yielding text chunks; `generate_pages(images)` joins those chunks for convenience. Only the joining API intentionally retains the full output.
 
 Detailed tensor inventory, math, source links, and pitfalls: [research notes](unlimitedocr2_research.md).
 Pinned HF revision: `c14071b549f4fcab10909f3c4acc6a2edb366947`.
@@ -14,7 +14,7 @@ Pinned HF revision: `c14071b549f4fcab10909f3c4acc6a2edb366947`.
 ## Scope decisions
 
 - Implement this checkpoint, not a generic model framework. Use a small v1/v2 descriptor and explicit dispatch; avoid unrelated refactoring.
-- Keep new router weights FP16 and router reductions/entmax FP32. Reuse existing FP16/Q8/Q4 handling for other weights.
+- Use mixed Q4 as the primary profile for remaining multi-page and document-window checkpoints; retain Q8 for comparison. Keep new router weights FP16 and router reductions/entmax FP32. Reuse existing FP16/Q8/Q4 handling for other weights. Do not change the existing constructor defaults.
 - Start with retained v2 K/V for one active page window, bounded by its token limit and the existing memory budget. Keep the v1 ring unchanged. Do not allocate for the entire document or the full 131072-token maximum by default.
 - Support standard page-marked OCR first. Reject v2 text-only/markerless requests initially instead of implementing unused 1D YaRN fallback.
 - Page-window scheduling and KV-tail reuse are required. Follow upstream continuation semantics, not independent OCR calls stitched together. Defer only multi-page tiling, router quantization, and unrelated performance tuning.
@@ -47,16 +47,16 @@ QA evidence:
 - `uv run python -m pytest tests/test_convert.py tests/test_unlimitedocr_api.py -q`: 26 passed, 1 opt-in large-model test skipped.
 - Rebuilt native loader/API/Metal/dump; `ctest --test-dir build -R '^uocr_(model_file|constants|dump|api)$' --output-on-failure`: 4 passed.
 - Disposable probes first reproduced missing sharding/v2 support, then passed. Actual v2 headers/config/tokenizer validate for FP16/Q8/Q4: 2819 tensors, 2769 runtime, 49 preserved-unused, 1 omitted; all v1 IDs unchanged. FP16 planned payload is 6,687,956,480 bytes.
-- Small synthetic v2 tensors were converted, compared against source, and loaded natively, including filtered conversion. Invalid position buffers, unsupported configs, malformed file versions, and quantized router records are rejected. CPU/Metal engine opening reports v2 inference unavailable. Probes removed after verification.
+- Small synthetic v2 tensors were converted, compared against source, and loaded natively, including filtered conversion. Invalid position buffers, unsupported configs, malformed file versions, and quantized router records are rejected. At that conversion-only checkpoint, CPU/Metal engine opening reported v2 inference unavailable. Probes removed after verification.
 - Rewriting a previously validated config exposed a path-only JSON cache bug; cache keys now include file identity. Repeatable check: build a plan, change `dash_stage0` to `indexer` at the same path, build again in the same process; the second build must reject it.
 - Model selection/frontend checks: `uv run python -m pytest tests/test_unlimitedocr_api.py tests/test_frontend.py tests/test_frontend_boundary.py tests/test_convert.py -q`: 52 passed, 1 skipped. A disposable offline probe verified repo/revision/quant cache isolation, pinned v2 tokenizer resolution, mismatched variants/tokenizers, failed reconversion preserving the cache, and the constructor-to-preparation-to-decoding path with a fake engine. Downloads/conversion were stubbed for this probe; tokenizers were real cached HF files. Probe removed.
 - Real pinned payload download and mixed-Q8 conversion completed through `resolve_model_path(model='v2', quant='q8')`. Cached file: `~/Library/Caches/unlimitedocr/v2/7e04dada5a6c1229/mixed-q8_0/unlimitedocr-q8.uocr`, 3,468,861,440 bytes. Conversion reported zero source NaN/Inf values. `build/uocr-dump` loaded the complete file and confirmed format 2, 2819 source tensors, 2769 runtime, 49 preserved-unused, and 1 omitted.
 - Source-byte checks matched layer-0 attention Q and router Q-norm from shard 1, plus layer-10 expert-53 down-projection and input norm from shard 2. Both Q8 weights/scales and FP16 payloads were checked. Real-file verification exposed a comparison-tool bug: filtered plans relocate scale slabs, so absolute scale offsets cannot be compared with the full target file. Comparison now follows target offsets and verifies their bytes, retaining scale-presence/size checks. Wrong scale pointers still fail payload comparison. Disposable regression probe removed; converter/API checks again passed (26 passed, 1 opt-in test skipped).
-- Phase-1 conversion/loading is verified for the real mixed-Q8 model. Full FP16/Q4 conversion remains unverified; mixed-Q8 OCR evidence follows in phase 2.
+- Phase-1 conversion/loading is verified for the real mixed-Q8 model. Full FP16 conversion remains unverified; mixed-Q4 conversion and Q4/Q8 OCR evidence follows in phase 2.
 
 ## Phase 2: Generate a single page
 
-Outcome: `UnlimitedOCR(model="v2").generate(image)` works in base and gundam modes.
+Outcome: `UnlimitedOCR(model="v2", quant="q4").generate(image)` works in base and gundam modes.
 
 Files: `src/unlimitedocr_c/{frontend,api,ocr}.py`, `src/runtime/`, `src/core/uocr_api.c`, `src/backend/metal/uocr_metal.m`, Metal RoPE/attention kernels.
 
@@ -80,6 +80,7 @@ QA checkpoint:
 - [todo] Compare real base and gundam OCR with pinned upstream `infer`, including a page producing more than 128 tokens. Check prompt IDs, final text, and page markers; inspect intermediate logits only if results diverge. Account for BF16/FP16 rounding rather than requiring bitwise identity.
 - [done] Confirm a too-small request memory budget rejects before workspace allocation, and real v1 image output matches a baseline build exactly.
 - [done] Read real rendered text in v2 base/gundam modes, preserve markers, reach EOS, and generate a page with more than 128 output tokens. This does not replace the pending upstream comparison.
+- [done] Convert the real checkpoint to mixed Q4, verify source-byte conversions across both shards and the FP16 DASH keep-list, compare Q4/Q8 OCR on the same fixtures, and verify budget rejection, truncated-request cleanup and engine reuse.
 
 QA evidence:
 
@@ -101,7 +102,11 @@ QA evidence:
 - A ten-item invoice produced 271 tokens with all ten rows correct and EOS. Measured tracked live/peak/estimated bytes were 3,468,464,128 / 4,956,287,488 / 5,204,104,012. After each request, live bytes returned to model-only usage. Markerless input rejected; a budget between the former underestimate and actual peak rejected before workspace allocation.
 - That memory probe exposed a shared estimator drift: ten SAM global-attention/relative-logit/packing and convolution im2col/temp slices were missing. `2b0bd5b` adds them for both variants. The predicted single-global workspace now matches Metal exactly at 1,487,122,432 bytes (previously 144,945,152). The failing CPU/real-image probes passed after the fix.
 - Real v1 mixed-Q8 image OCR matched token IDs and decoded text exactly against a baseline built from `2b0bd5b`. A library with its DASH norm kernel deliberately removed failed after vision encoding; two attempts both released all request allocations and retained only model usage. Final checks: Python 105 passed / 7 skipped (large/perf opt-ins disabled, 3 expected invalid-limit warmup warnings); CTest 13 passed. Temporary images, probes, and baseline build removed after verification.
-- Native single-page OCR is exercised end-to-end. Upstream BF16/model parity and v2 FP16/Q4 image inference remain unverified. HF top-M routing and the wheel's optimized full-candidate entmax path differ; see research notes before interpreting scheduler output parity.
+- Mixed-Q4 qualification used the existing conversion/runtime paths without kernel or runtime changes. `HF_HUB_OFFLINE=1 uv run python -c 'from unlimitedocr_c import resolve_model_path; print(resolve_model_path(model="v2", quant="q4"))'` converted the pinned cached checkpoint to `~/Library/Caches/unlimitedocr/v2/7e04dada5a6c1229/mixed-q4/unlimitedocr-q4.uocr`. File size: 1,846,509,568 bytes; tensor-data/model-view size: 1,846,112,256 bytes. Source NaN/Inf count was zero. Native `uocr-dump` confirmed format 2 and 2295 Q4 / 48 Q8 / 476 FP16 records (including the omitted position-ID record).
+- Source conversion bytes matched all 60 FP16 DASH tensors, sampled Q8 attention projections, and Q4 embeddings, LM head, dense MLP, shared/routed experts, projector, CLIP and SAM matrices. Samples span both source shards. No precision policy changed: decoder attention stays Q8 and DASH stays FP16.
+- Q4/Q8 comparison used two Arial-36 rendered fixtures: a 640x896 invoice (12345 / USD 42.00) and a 640x1024 ten-item invoice (Item 01: USD 11.00 through Item 10: USD 20.00). Both quantizations read all expected content in base/gundam modes, preserved one `<PAGE>` and reached EOS. Q4 produced 68 tokens for the short fixture and 271 for the long fixture in both modes. Gundam used 13 and 16 views respectively. Text blocks matched Q8 exactly in all four comparisons, with all ten rows ordered. Coordinates and some heading labels differed; token equality is not required. The public `UnlimitedOCR(model="v2", quant="q4", download=False)` path also passed.
+- Q4 tracked live bytes returned to model-only 1,846,112,256 after each request. Base peak/estimate: 3,333,935,616 / 3,500,634,547 bytes. Long gundam peak/estimate: 4,140,166,656 / 4,347,177,139 bytes. A model-size-plus-512-MiB budget rejected before request allocation. Markerless input rejected; a one-token truncated request released state, and the same engine then completed the invoice. Final checks: `uv run python -m pytest tests -q` with large/perf opt-ins disabled: 105 passed, 7 skipped, 3 expected invalid-limit warmup warnings; `ctest --test-dir build --output-on-failure`: 13 passed. Disposable probes/images removed; the converted model remains cached.
+- Native single-page OCR is exercised end-to-end. Upstream BF16/model parity, broader OCR quality evaluation and v2 FP16 image inference remain unverified. HF top-M routing and the wheel's optimized full-candidate entmax path differ; see research notes before interpreting scheduler output parity.
 
 ## Phase 3: Multi-page and quantization
 
@@ -111,14 +116,14 @@ Files: frontend/API, `src/runtime/uocr_{request_validation,sequence,vision}.*`, 
 
 - [todo] Replace the single-image-span assumption with a mask-driven visual-row mapping. Keep `<PAGE>` embeddings between image spans; reuse the existing request image mask and avoid a public ABI change unless needed.
 - [todo] Add `generate_pages(images)` using one 1024 global view per page, correct page transitions, and the same attention implementation from phase 2.
-- [todo] Enable existing Q8/Q4 policies for unchanged tensor families; keep DASH weights FP16. Update model-selection and supported-limit documentation.
+- [done] Enable existing Q8/Q4 policies for unchanged tensor families; keep DASH weights FP16. Single-page Q4 qualification and primary-profile documentation completed before multi-page work.
 
 QA checkpoint:
 
 - [todo] One two-page fixture verifies prompt placement, page coordinates/transitions, output ordering, and EOS guarding against upstream. Reuse this document for FP16/Q8/Q4 smoke checks; compare OCR quality, not exact quantized token equality.
 - [done] Confirm switching v1/v2 cannot reuse the wrong tokenizer/model cache using the offline probe. No new broad benchmark matrix or tests of unchanged vision/MoE math.
 
-QA evidence: not run.
+QA evidence: single-page mixed-Q4/Q8 qualification is recorded in phase 2. Multi-page checks have not run.
 
 ## Phase 4: Long documents with bounded working memory
 

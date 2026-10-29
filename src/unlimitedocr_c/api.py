@@ -193,9 +193,10 @@ def resolve_model_path(
 
     ``quant`` selects the conversion profile when downloading/converting:
     ``None``/``"fp16"`` keeps the fp16 baseline; ``"q8"`` produces a
-    runtime-safe mixed-Q8_0 model and ``"q4"`` a mixed-q4 model (routed MoE
-    experts Q4_0, remaining decoder modules Q8_0), both gated by
-    ``configs/quant-cfg.yaml``.
+    runtime-safe mixed-Q8_0 model and ``"q4"`` a mixed-Q4 model (embeddings,
+    LM head, MLP/MoE and supported vision matrices Q4_0; decoder attention
+    Q8_0), both gated by ``configs/quant-cfg.yaml``. V2 DASH router weights
+    always remain FP16.
 
     ``force_reconvert`` bypasses the selected cache entry and atomically replaces
     it after conversion succeeds; failed conversions leave existing files intact.

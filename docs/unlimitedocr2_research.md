@@ -6,7 +6,7 @@ Implementation scope and order: [plan_unlimitedocr2.md](plan_unlimitedocr2.md).
 
 ## Goal and scope
 
-Add `baidu/Unlimited-OCR-2` to the native C/Metal engine while preserving v1 behavior and existing model files. Required scope includes single-page, base-mode multi-page inference, and bounded-memory document scheduling with upstream-compatible continuation. Single-window inference is an intermediate checkpoint. Keep model selection separate from image profile (`base`/`gundam`) and quantization (`fp16`/`q8`/`q4`).
+Add `baidu/Unlimited-OCR-2` to the native C/Metal engine while preserving v1 behavior and existing model files. Required scope includes single-page, base-mode multi-page inference, and bounded-memory document scheduling with upstream-compatible continuation. Single-window inference is an intermediate checkpoint. Keep model selection separate from image profile (`base`/`gundam`) and quantization (`fp16`/`q8`/`q4`). Mixed Q4 is the primary v2 profile; use it for the remaining multi-page/windowed checkpoints.
 
 ## Research evidence
 
@@ -14,10 +14,10 @@ Add `baidu/Unlimited-OCR-2` to the native C/Metal engine while preserving v1 beh
 - [done] Compared these with `data/context/` and the current converter, frontend, runtime, and Metal implementation.
 - [done] Confirmed that all 2,710 v1 tensor names exist in v2 with identical shapes and dtypes. This does not imply identical weight values.
 - [done] Inspected the pinned customized SGLang wheel's window planner, KV copy/splice, page guard, and cache relocation. Exact contract is recorded below.
-- [todo] Run upstream inference and capture numerical reference fixtures. Pinned weights have been downloaded and converted to mixed-Q8. Native mixed-Q8 single-page OCR has run in base/gundam modes, including a 271-token output. Upstream numerical comparison has not run.
+- [todo] Run upstream inference and capture numerical reference fixtures. Pinned weights have been downloaded and converted to mixed-Q4 and mixed-Q8. Both have passed native single-page base/gundam OCR on the same rendered fixtures, including 271-token Q4 output and all ten expected invoice rows. Upstream numerical comparison has not run.
 
 Upstream revision: `c14071b549f4fcab10909f3c4acc6a2edb366947`.
-Initial research downloads are temporary files under `/tmp/unlimitedocr2-research-c14071b/`, not committed fixtures: source, tokenizer, metadata, weight headers, and the SGLang wheel. The wheel was extracted for inspection, not installed or executed. Full checkpoint shards were later downloaded into the normal Hugging Face cache; real mixed-Q8 conversion/loading evidence is recorded in the implementation plan.
+Initial research downloads are temporary files under `/tmp/unlimitedocr2-research-c14071b/`, not committed fixtures: source, tokenizer, metadata, weight headers, and the SGLang wheel. The wheel was extracted for inspection, not installed or executed. Full checkpoint shards were later downloaded into the normal Hugging Face cache; real mixed-Q4/Q8 conversion/loading and OCR evidence is recorded in the implementation plan.
 
 Sources:
 

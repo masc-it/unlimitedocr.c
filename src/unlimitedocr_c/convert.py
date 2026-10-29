@@ -75,9 +75,9 @@ UOCR_FORMAT_VERSION = 1
 UOCR_ENDIAN_MARKER = 0x01020304
 UOCR_QPROFILE_FP16 = 1
 UOCR_QPROFILE_MIXED_Q8_0 = 2
-#: mixed-q4: routed MoE experts Q4_0, remaining quantized decoder modules Q8_0,
-#: everything else fp16 (see docs/plan_q4.md).  Not yet in QPROFILE_IDS: the
-#: converter CLI gains "mixed-q4" with the Q4 planner/writer (plan step 2).
+#: Config-gated Q4/Q8 mix: supported embeddings, LM head, MLP/MoE and vision
+#: matrices use Q4_0; decoder attention uses Q8_0. Keep-list weights stay FP16,
+#: including v2 DASH routers (see configs/quant-cfg.yaml).
 UOCR_QPROFILE_MIXED_Q4 = 3
 UOCR_TOKENIZER_FLAG_C_V1_NOT_REQUIRED = 1 << 0
 UOCR_PROVENANCE_FLAG_JSON_PAYLOAD = 1 << 0
