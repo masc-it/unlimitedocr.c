@@ -5,7 +5,7 @@ runtime can actually consume with fused quantized kernels.  This list lives in
 ``configs/quant-cfg.yaml`` and grows as kernels land.
 
 Schema version 2 adds an optional per-module ``qtype`` (``q8_0`` default,
-``q4_0`` allowed only for the routed MoE experts — see docs/plan_q4.md).
+``q4_0`` for supported embedding, LM-head, MLP/MoE and vision matrices).
 Version 1 files remain valid and imply ``qtype: q8_0`` everywhere.
 """
 
@@ -166,34 +166,17 @@ def load_quant_config(path: str | Path) -> QuantConfig:
 
 
 def default_quant_cfg_path() -> Path:
-    """Return the bundled runtime-safe quant-cfg path under the project root."""
-    from .frontend import project_root
+    """Return the source policy or its installed-wheel copy."""
+    from .frontend import is_source_tree_package, project_root
 
-    return project_root() / "configs" / DEFAULT_QUANT_CFG_NAME
+    if is_source_tree_package():
+        return project_root() / "configs" / DEFAULT_QUANT_CFG_NAME
+    return Path(__file__).with_name(DEFAULT_QUANT_CFG_NAME)
 
 
 def load_default_quant_config() -> QuantConfig:
-    """Load the bundled runtime-safe quant-cfg, falling back to embeddings-only."""
-    path = default_quant_cfg_path()
-    if path.is_file():
-        return load_quant_config(path)
-    # Source-tree fallback when the configs/ directory is not co-located.
-    return _embeddings_only_config()
-
-
-def _embeddings_only_config() -> QuantConfig:
-    spec = QuantModuleSpec(
-        name="token_embedding",
-        family=TensorFamily.TOK_EMBED,
-        projections=frozenset({TensorProjection.WEIGHT}),
-        supported=True,
-    )
-    return QuantConfig(
-        version=1,
-        group_size=64,
-        modules=(spec,),
-        supported_pairs={(TensorFamily.TOK_EMBED, TensorProjection.WEIGHT): "q8_0"},
-    )
+    """Load the required runtime-safe policy; missing package data is an error."""
+    return load_quant_config(default_quant_cfg_path())
 
 
 def all_supported_quant_config(*, expert_qtype: str = "q8_0") -> QuantConfig:

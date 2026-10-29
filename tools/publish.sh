@@ -3,9 +3,18 @@ set -euo pipefail
 
 # Build the native library + metallib, assemble a macOS arm64 wheel, publish to PyPI.
 #
-# Usage: tools/publish.sh
+# Usage: tools/publish.sh [--build-only]
+# Build-only permits isolated wheel checks before `uv publish <wheel>`.
 #
-# Requires: uv, cmake, xcrun, and PyPI credentials (UV_PUBLISH_TOKEN or ~/.pypirc).
+# Requires: uv, cmake, xcrun; publishing also needs UV_PUBLISH_TOKEN or uv auth.
+
+PUBLISH=1
+if [[ "${1:-}" == "--build-only" && "$#" == 1 ]]; then
+    PUBLISH=0
+elif [[ "$#" != 0 ]]; then
+    echo "Usage: $0 [--build-only]" >&2
+    exit 2
+fi
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT}"
@@ -15,10 +24,17 @@ MACOSX_DEPLOYMENT_TAG="${MACOSX_DEPLOYMENT_TARGET//./_}"
 WHEEL_PLATFORM_TAG="macosx_${MACOSX_DEPLOYMENT_TAG}_arm64"
 BUILD_DIR="${UOCR_PUBLISH_BUILD_DIR:-build/release-publish}"
 
+# Only remove staging paths created by this invocation.
+for staging in src/unlimitedocr_c/lib src/unlimitedocr_c/metal src/unlimitedocr_c/quant-cfg.yaml; do
+    if [[ -e "${staging}" || -L "${staging}" ]]; then
+        echo "staging path already exists; inspect it before building: ${staging}" >&2
+        exit 1
+    fi
+done
 cleanup() {
     rm -rf src/unlimitedocr_c/lib src/unlimitedocr_c/metal
+    rm -f src/unlimitedocr_c/quant-cfg.yaml
 }
-cleanup
 trap cleanup EXIT
 
 # 1. Build a clean Release native library + precompiled Metal library for the
@@ -74,6 +90,7 @@ echo "==> Staging native artifacts…"
 mkdir -p src/unlimitedocr_c/lib src/unlimitedocr_c/metal
 cp "${BUILT_DYLIB}" src/unlimitedocr_c/lib/libunlimitedocr.dylib
 cp "${BUILT_METALLIB}" src/unlimitedocr_c/metal/unlimitedocr.metallib
+cp configs/quant-cfg.yaml src/unlimitedocr_c/quant-cfg.yaml
 
 # 4. Read version from pyproject.toml.
 VERSION="$(uv run python -c "import tomllib,sys; print(tomllib.load(sys.stdin.buffer)['project']['version'])" < pyproject.toml)"
@@ -81,7 +98,6 @@ echo "==> Package version: ${VERSION}"
 
 # 5. Build the wheel.
 echo "==> Building wheel…"
-rm -rf dist/*.whl dist/*.tar.gz
 uv build --wheel
 
 # 6. Retag the wheel as macOS arm64 (uv_build emits py3-none-any because the
@@ -114,6 +130,7 @@ try:
     required = [
         "unlimitedocr_c/lib/libunlimitedocr.dylib",
         "unlimitedocr_c/metal/unlimitedocr.metallib",
+        "unlimitedocr_c/quant-cfg.yaml",
     ]
     missing = [rel for rel in required if not (tmp / rel).is_file()]
     if missing:
@@ -142,8 +159,11 @@ PY
 
 echo "==> Wheel: ${DST_WHL}"
 
-# 7. Publish to PyPI.
-echo "==> Publishing to PyPI…"
-uv publish "${DST_WHL}"
-
-echo "==> Published ${DST_WHL}"
+# 7. Publish only when requested; keep the exact built artifact for smoke tests.
+if [[ "${PUBLISH}" == 1 ]]; then
+    echo "==> Publishing to PyPI…"
+    uv publish "${DST_WHL}"
+    echo "==> Published ${DST_WHL}"
+else
+    echo "==> Build-only complete. After verification: uv publish ${DST_WHL}"
+fi
