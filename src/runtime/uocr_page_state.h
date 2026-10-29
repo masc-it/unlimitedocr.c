@@ -32,6 +32,15 @@ typedef struct uocr_page_state {
     uint32_t *token_counts;
 } uocr_page_state;
 
+/* Generated-output state only; prompt markers are not counted here.
+ * Selection filter: 0 = unrestricted, token+1 = exclude, high bit = force.
+ * max_page_tokens=0 disables the cap. Mirrors the pinned HF page-count guard. */
+typedef struct uocr_page_guard {
+    uint32_t expected_pages, max_page_tokens, markers, page_length;
+} uocr_page_guard;
+uint32_t uocr_page_guard_filter(const uocr_page_guard *guard);
+void uocr_page_guard_accept(uocr_page_guard *guard, int32_t token_id);
+
 int uocr_page_state_init(uocr_page_state *state, uint32_t *token_counts,
                          uint32_t page_capacity, uint64_t document_page_base,
                          char *error, size_t error_size);

@@ -17,6 +17,13 @@ using namespace metal;
 #define UOCR_FLASH_Q_PER_TG 4u
 #define UOCR_FLASH_MAX_LANE_VALUES 4u
 #define UOCR_FLASH_NEG_INF (-3.4028234663852886e38f)
+// See runtime/uocr_page_state.h. Filtering happens before every argmax
+// reduction, including quantized heads; excluded IDs cannot win a tie.
+static inline bool uocr_lm_token_allowed(uint token, uint filter) {
+    return filter == 0u || ((filter & 0x80000000u) != 0u
+        ? token == (filter & 0x7fffffffu) - 1u : token != filter - 1u);
+}
+
 #define UOCR_FC_HIDDEN_SIZE 0
 #define UOCR_FC_ATTENTION_HEADS 1
 #define UOCR_FC_HEAD_DIM 2
@@ -2660,7 +2667,7 @@ struct UocrLmHeadArgmaxQ4Params {
 
     float score = -INFINITY;
     uint id = 0xffffffffu;
-    if (row < vocab_size && params.group_size == 64u) {
+    if (row < vocab_size && uocr_lm_token_allowed(row, params.reserved0) && params.group_size == 64u) {
         device const uchar *w_row = qweight + (ulong)row * (ulong)(hidden_size / 2u);
         device const half *s_row = qscale + (ulong)row * (ulong)params.groups_per_row;
         device const uchar4 *w4 = (device const uchar4 *)w_row;
@@ -6199,7 +6206,7 @@ static inline void uocr_threadgroup_argmax_pair(thread float &best_score,
     if (local_token < tile_tokens && lane == 0u) {
         float score = sum;
         uint id = token_id;
-        if (token_id >= vocab_size) {
+        if (token_id >= vocab_size || !uocr_lm_token_allowed(token_id, params.reserved0)) {
             id = 0xffffffffu;
             score = -INFINITY;
         } else if (params.banned_count != 0u && ban_flags[token_id] != uchar(0u)) {
@@ -6580,7 +6587,7 @@ static inline void uocr_lm_head_q8_threadgroup_argmax_pair(thread float &best_sc
     if (local_token < tile_tokens && lane == 0u) {
         float score = sum;
         uint id = token_id;
-        if (token_id >= vocab_size || isnan(score)) {
+        if (token_id >= vocab_size || !uocr_lm_token_allowed(token_id, params.reserved0) || isnan(score)) {
             id = 0xffffffffu;
             score = -INFINITY;
         }

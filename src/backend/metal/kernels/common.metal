@@ -9,6 +9,13 @@ using namespace metal;
 #define UOCR_FLASH_Q_PER_TG 4u
 #define UOCR_FLASH_MAX_LANE_VALUES 4u
 #define UOCR_FLASH_NEG_INF (-3.4028234663852886e38f)
+// See runtime/uocr_page_state.h. Filtering happens before every argmax
+// reduction, including quantized heads; excluded IDs cannot win a tie.
+static inline bool uocr_lm_token_allowed(uint token, uint filter) {
+    return filter == 0u || ((filter & 0x80000000u) != 0u
+        ? token == (filter & 0x7fffffffu) - 1u : token != filter - 1u);
+}
+
 #define UOCR_FC_HIDDEN_SIZE 0
 #define UOCR_FC_ATTENTION_HEADS 1
 #define UOCR_FC_HEAD_DIM 2

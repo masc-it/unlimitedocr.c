@@ -10901,6 +10901,7 @@ static int metal_run_lm_head_argmax_f16(uocr_metal_context *ctx,
                                         uocr_metal_buffer_slice partial_scores,
                                         uocr_metal_buffer_slice partial_ids,
                                         uint32_t partial_count,
+                                        uint32_t token_filter,
                                         char *error,
                                         size_t error_size) {
     const uint64_t input_bytes = (uint64_t)UOCR_HIDDEN_SIZE * 2u;
@@ -10961,7 +10962,7 @@ static int metal_run_lm_head_argmax_f16(uocr_metal_context *ctx,
         params.lanes_per_token = UOCR_METAL_LM_HEAD_ARGMAX_LANES_PER_TOKEN;
         params.banned_count = banned_count;
         params.partial_count = partial_count;
-        params.reserved0 = 0u;
+        params.reserved0 = token_filter;
         params.reserved1 = 0u;
         [enc setComputePipelineState:pipeline];
         [enc setBuffer:input.buffer offset:input.offset atIndex:0u];
@@ -10985,6 +10986,7 @@ static int metal_run_lm_head_argmax_q8_0(uocr_metal_context *ctx,
                                          uocr_metal_buffer_slice partial_scores,
                                          uocr_metal_buffer_slice partial_ids,
                                          uint32_t partial_count,
+                                         uint32_t token_filter,
                                          char *error,
                                          size_t error_size) {
     const uint64_t input_bytes = (uint64_t)UOCR_HIDDEN_SIZE * 2u;
@@ -11056,7 +11058,7 @@ static int metal_run_lm_head_argmax_q8_0(uocr_metal_context *ctx,
         params.group_size = UOCR_Q8_GROUP_SIZE_DEFAULT;
         params.groups_per_row = UOCR_HIDDEN_SIZE / UOCR_Q8_GROUP_SIZE_DEFAULT;
         params.partial_count = partial_count;
-        params.reserved0 = 0u;
+        params.reserved0 = token_filter;
         [enc setComputePipelineState:pipeline];
         [enc setBuffer:input.buffer offset:input.offset atIndex:0u];
         [enc setBuffer:lm_head->buffer offset:lm_head->offset atIndex:1u];
@@ -11084,6 +11086,7 @@ static int metal_run_lm_head_argmax_q4_0(uocr_metal_context *ctx,
                                          uocr_metal_buffer_slice partial_scores,
                                          uocr_metal_buffer_slice partial_ids,
                                          uint32_t partial_count,
+                                         uint32_t token_filter,
                                          char *error,
                                          size_t error_size) {
     const uint64_t input_bytes = (uint64_t)UOCR_HIDDEN_SIZE * 2u;
@@ -11154,7 +11157,7 @@ static int metal_run_lm_head_argmax_q4_0(uocr_metal_context *ctx,
         params.group_size = UOCR_Q4_GROUP_SIZE_DEFAULT;
         params.groups_per_row = UOCR_HIDDEN_SIZE / UOCR_Q4_GROUP_SIZE_DEFAULT;
         params.partial_count = partial_count;
-        params.reserved0 = 0u;
+        params.reserved0 = token_filter;
         [enc setComputePipelineState:pipeline];
         [enc setBuffer:input.buffer offset:input.offset atIndex:0u];
         [enc setBuffer:lm_head->buffer offset:lm_head->offset atIndex:1u];
@@ -11435,6 +11438,7 @@ static int metal_encode_chunk_step_selection_f16(
     uocr_metal_buffer_slice selection_scratch,
     uocr_metal_buffer_slice chunk_token_out,   /* single int32 slot for this step */
     uocr_metal_buffer_slice chunk_score_out,   /* single float slot for this step */
+    uint32_t token_filter,
     char *error,
     size_t error_size) {
     if (ctx == NULL ||
@@ -11480,12 +11484,12 @@ static int metal_encode_chunk_step_selection_f16(
                                                                   selection_slices.partial_scores,
                                                                   selection_slices.partial_ids,
                                                                   selection_slices.partial_count,
-                                                                  error, error_size)
+                                                                  token_filter, error, error_size)
                                   : metal_run_lm_head_argmax_q8_0(ctx, norm_scratch,
                                                                   selection_slices.partial_scores,
                                                                   selection_slices.partial_ids,
                                                                   selection_slices.partial_count,
-                                                                  error, error_size);
+                                                                  token_filter, error, error_size);
         if (!argmax_ok) {
             return 0;
         }
@@ -11498,7 +11502,7 @@ static int metal_encode_chunk_step_selection_f16(
                                              error, error_size)) {
             return 0;
         }
-    } else if (metal_lm_head_backend_is_mps()) {
+    } else if (token_filter == 0u && metal_lm_head_backend_is_mps()) {
         uocr_metal_buffer_slice lm_head_logits;
         if (!metal_lm_head_logits_scratch_slice(ctx, 0u, &lm_head_logits)) {
             return metal_fail(error, error_size, "MPS chunk LM head: failed to get lm_head_logits slice");
@@ -11516,7 +11520,7 @@ static int metal_encode_chunk_step_selection_f16(
                                           selection_slices.partial_scores,
                                           selection_slices.partial_ids,
                                           selection_slices.partial_count,
-                                          error, error_size)) {
+                                          token_filter, error, error_size)) {
             return 0;
         }
         if (!metal_run_argmax_pairs_to_token(ctx,
@@ -11607,7 +11611,7 @@ static int metal_run_decoder_decode_chunk_f16(
                                                        selection_scratch,
                                                        token_out,
                                                        score_out,
-                                                       error, error_size)) {
+                                                       0u, error, error_size)) {
                 return 0;
             }
         }
@@ -15598,7 +15602,7 @@ failed:
     return 0;
 }
 
-int uocr_metal_context_v2_raw_argmax(uocr_metal_context *ctx, int32_t *token_id,
+static int metal_v2_argmax(uocr_metal_context *ctx, uint32_t token_filter, int32_t *token_id,
     float *score, char *error, size_t error_size) {
     metal_clear_error(error, error_size);
     if (ctx == NULL || !ctx->v2_decoder_ready || ctx->dash_cache == NULL || token_id == NULL ||
@@ -15614,7 +15618,7 @@ int uocr_metal_context_v2_raw_argmax(uocr_metal_context *ctx, int32_t *token_id,
         !metal_token_readback_arena_slices(ctx, 0u, &token, &value))
         return metal_fail(error, error_size, "v2 raw argmax workspace is invalid");
     if (!metal_command_batch_begin(ctx, error, error_size) ||
-        !metal_encode_chunk_step_selection_f16(ctx, hidden, norm, selection, token, value, error, error_size) ||
+        !metal_encode_chunk_step_selection_f16(ctx, hidden, norm, selection, token, value, token_filter, error, error_size) ||
         !metal_command_batch_commit_and_wait(ctx, "v2 raw argmax", error, error_size)) {
         metal_command_batch_abort(ctx); ctx->dash_cache->failed = 1; return 0;
     }
@@ -15627,6 +15631,11 @@ int uocr_metal_context_v2_raw_argmax(uocr_metal_context *ctx, int32_t *token_id,
     *token_id = id;
     if (score != NULL) memcpy(score, (uint8_t *)[value.buffer contents] + value.offset, sizeof(*score));
     return 1;
+}
+
+int uocr_metal_context_v2_raw_argmax(uocr_metal_context *ctx, int32_t *token_id,
+    float *score, char *error, size_t error_size) {
+    return metal_v2_argmax(ctx, 0u, token_id, score, error, error_size);
 }
 
 static int metal_context_generate_f16_impl(uocr_metal_context *ctx,

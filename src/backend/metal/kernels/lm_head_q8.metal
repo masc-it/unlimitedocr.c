@@ -165,7 +165,7 @@ static inline void uocr_lm_head_q8_threadgroup_argmax_pair(thread float &best_sc
     if (local_token < tile_tokens && lane == 0u) {
         float score = sum;
         uint id = token_id;
-        if (token_id >= vocab_size || isnan(score)) {
+        if (token_id >= vocab_size || !uocr_lm_token_allowed(token_id, params.reserved0) || isnan(score)) {
             id = 0xffffffffu;
             score = -INFINITY;
         }

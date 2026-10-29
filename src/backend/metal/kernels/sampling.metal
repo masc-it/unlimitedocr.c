@@ -146,7 +146,7 @@ static inline void uocr_threadgroup_argmax_pair(thread float &best_score,
     if (local_token < tile_tokens && lane == 0u) {
         float score = sum;
         uint id = token_id;
-        if (token_id >= vocab_size) {
+        if (token_id >= vocab_size || !uocr_lm_token_allowed(token_id, params.reserved0)) {
             id = 0xffffffffu;
             score = -INFINITY;
         } else if (params.banned_count != 0u && ban_flags[token_id] != uchar(0u)) {

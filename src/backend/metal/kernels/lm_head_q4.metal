@@ -47,7 +47,7 @@ struct UocrLmHeadArgmaxQ4Params {
 
     float score = -INFINITY;
     uint id = 0xffffffffu;
-    if (row < vocab_size && params.group_size == 64u) {
+    if (row < vocab_size && uocr_lm_token_allowed(row, params.reserved0) && params.group_size == 64u) {
         device const uchar *w_row = qweight + (ulong)row * (ulong)(hidden_size / 2u);
         device const half *s_row = qscale + (ulong)row * (ulong)params.groups_per_row;
         device const uchar4 *w4 = (device const uchar4 *)w_row;

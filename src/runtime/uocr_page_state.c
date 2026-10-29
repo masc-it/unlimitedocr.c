@@ -8,6 +8,19 @@
 
 _Static_assert(sizeof(uocr_page_position) == 16u, "CPU/Metal page-position layout mismatch");
 
+uint32_t uocr_page_guard_filter(const uocr_page_guard *g) {
+    if (g->expected_pages == 0u) return 0u;
+    if (g->markers > g->expected_pages) return 0x80000000u | (UOCR_TOKEN_EOS + 1u);
+    if (g->max_page_tokens != 0u && g->page_length >= g->max_page_tokens)
+        return 0x80000000u | ((g->markers < g->expected_pages ? UOCR_TOKEN_PAGE : UOCR_TOKEN_EOS) + 1u);
+    return g->markers < g->expected_pages ? UOCR_TOKEN_EOS + 1u : 0u;
+}
+
+void uocr_page_guard_accept(uocr_page_guard *g, int32_t token_id) {
+    if (token_id == UOCR_TOKEN_PAGE) { ++g->markers; g->page_length = 0u; }
+    else ++g->page_length;
+}
+
 static int fail(char *error, size_t error_size, const char *message) {
     if (error != NULL && error_size != 0u) {
         (void)snprintf(error, error_size, "%s", message);
