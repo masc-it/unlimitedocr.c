@@ -6,7 +6,7 @@ Status: `todo`
 
 Ship v2 OCR with bounded-memory long-document parsing, without changing v1 behavior. Reuse existing vision, MoE, projection, and quantization kernels. Single-window inference is an intermediate checkpoint, not the finished feature.
 
-Model selection is implemented: `UnlimitedOCR(model="v2", quant="q8")`; default remains v1. Native v2 inference is still blocked pending phase 2. Keep `generate(image)`. Add `stream_pages(images)` accepting an iterable of ordered base-mode pages and yielding text chunks; `generate_pages(images)` joins those chunks for convenience. Only the joining API intentionally retains the full output.
+Model selection is implemented: `UnlimitedOCR(model="v2", quant="q8")`; default remains v1. Public v2 generation is still blocked pending phase 2. Keep `generate(image)`. Add `stream_pages(images)` accepting an iterable of ordered base-mode pages and yielding text chunks; `generate_pages(images)` joins those chunks for convenience. Only the joining API intentionally retains the full output.
 
 Detailed tensor inventory, math, source links, and pitfalls: [research notes](unlimitedocr2_research.md).
 Pinned HF revision: `c14071b549f4fcab10909f3c4acc6a2edb366947`.
@@ -34,7 +34,7 @@ Files: `src/unlimitedocr_c/{api,convert,tensor_registry,frontend}.py`, `src/mode
 - [done] Merge both shard headers and stream tensors from their own shard offsets, including FP16/Q8/Q4 and filtered tensor comparison.
 - [done] Validate the v2 config/tokenizer without requiring its absent `processor_config.json`.
 - [done] Register DASH tensors with stable IDs. Preserve existing vision IDs; validate/omit deterministic I64 `position_ids` and explicitly classify unused indexer weights.
-- [done] Add variant metadata to `.uocr` and native loading. V2 uses file format 2 with a 60-byte config extension; v1 files retain their layout. Reject unknown configs and block v2 engine/Metal inference until sparse attention is implemented.
+- [done] Add variant metadata to `.uocr` and native loading. V2 uses file format 2 with a 60-byte config extension; v1 files retain their layout. Reject unknown configs and keep public v2 generation guarded until engine admission and page/EOS handling are connected.
 
 QA checkpoint:
 
@@ -62,13 +62,14 @@ Files: `src/unlimitedocr_c/{frontend,api,ocr}.py`, `src/runtime/`, `src/core/uoc
 
 - [done] Load v2's 834 added-token entries; build `<PAGE><image>Multi page parsing.` and cap gundam crops at 16. Preserve page markers in output. Reject markerless and text-only v2 inputs.
 - [done] Implement standalone request-owned page/token state and Metal page2d RoPE (63 resampled token pairs plus one page pair), supporting both 10-head main attention and 1-head routing. Prefix/instruction positions remain page 0; routing page IDs remain window-local.
-- [todo] Wire the page state and persistent GPU position buffer into v2 prefill/decode. Advance state once per input token and share coordinates across layers; the standalone operation is not yet connected to generation.
+- [done] Wire page state and persistent GPU positions into the mapped-model v2 decoder forward path. Coordinates advance once per input token and are shared across all layers for chunked prefill and decode; public generation remains separate.
 - [done] Implement standalone Metal DASH math: 128-dimensional Gemma RMSNorm (`1 + weight` in FP32), learned `head_cls` summaries over 32-token blocks, page-aware candidates/fallback, top-16 entmax-1.5, up to 12 selected blocks, centered log-prior bias, and local 128-token attention. Local entries win on overlap. GPU scratch is linear in window/query capacity; attention never constructs a dense score matrix.
 - [done] Add a request-owned 12-layer retained attention cache with chunked prefill/decode, one page-state advance per input token, cached block summaries, and tail-only refresh. A host bridge accepts synthetic projected Q/K/V and exercises Gemma norm, page RoPE, routing, and attention together without a model.
-- [todo] Connect mapped decoder projections and FFN/MoE to the retained attention encoder. The projected-input host bridge is a bring-up path, not end-to-end OCR.
-- [todo] Reuse matrix/norm primitives where mathematically equivalent. Add only the missing router and sparse-gather attention operations; avoid a dense attention implementation that must later be replaced.
+- [done] Map and validate the 60 DASH weights, connect actual main/router projections to retained attention, and reuse the existing 12-layer decoder loop including residuals, dense FFN, and MoE. The decoder-forward boundary accepts pre-embedded rows; it does not run public OCR.
+- [done] Reuse existing projection/norm/FFN/MoE and FP16/Q8/Q4 final-head selection operations. Add a diagnostic raw argmax for the latest v2 hidden state; it intentionally does not implement page/EOS guards.
 - [done] Allocate retained main/router K/V, summaries, positions, and reusable attention scratch from explicit window/query/page capacities. Enforce the attention-cache budget before allocation; account GPU payload and CPU state. Reject over-capacity appends, incomplete/out-of-order layers, and invalid page transitions. Reset/release supports cancellation; GPU errors poison the request until reset.
-- [todo] Add the attention-cache estimate to the full engine request budget alongside model/vision/FFN/MoE allocations. Connect its lifecycle to public generation and retain v1's existing ring.
+- [done] Add decoder-only admission for retained attention, hidden/FFN/MoE workspaces, token staging, and rounded selection/logit/transient scratch. Skip the v1 ring arena for v2. Keep v1's existing ring and generation path unchanged.
+- [todo] Combine decoder admission with model/vision costs and safety overhead in the full engine request budget; connect preparation, GPU-resident visual embeddings, selection, and cleanup to public generation.
 - [todo] Apply upstream page-count/EOS guard before argmax, with the 20000-token per-page cap. Leave optional repetition processing off by default, as upstream does.
 
 QA checkpoint:
@@ -89,7 +90,11 @@ QA evidence:
 - Disposable retained-cache probe passed on actual Metal: two prefill chunks (65/64 tokens), then 131 one-token decode appends through all 12 layers. An extra answer page forced remote-text fallback, exercising generated K/V older than 128 tokens. Layer 0/11 outputs at selected boundaries matched a freshly recomputed full-retained-key primitive. Synthetic projections were used; no model weights or FFN/MoE were executed.
 - For capacities 260 tokens / 129 query rows / 3 page buckets, tracked cache/workspace memory stayed at 17,551,664 bytes and returned to zero on release. This is a within-window allocation check, not the long-document memory proof. Exact-budget allocation, insufficient budget, capacity exhaustion, invalid-token rollback, layer ordering, cancellation/reset, and destruction passed. An intentionally incomplete Metal library verified that an encode failure leaves output untouched and poisons the request until reset. Temporary probes removed.
 - Rebuilt `unlimitedocr`, `test_api`, `test_metal`, `test_memory`, and `test_sequence`; `ctest --test-dir build -R '^uocr_(api|metal|memory|sequence)$' --output-on-failure`: 4 passed.
-- Native/reference model inference has not run; it still requires full decoder/engine integration and a suitable reference environment. Real source weights and a converted mixed-Q8 model are now cached. The v2 inference guard remains enabled. HF top-M routing and the wheel's optimized full-candidate entmax path differ; see research notes before interpreting scheduler output parity.
+- Real mapped mixed-Q8 decoder probe passed: 2294 decoder bindings, a 769-token synthetic-embedding prompt, and two decode steps through all 12 layers. Whole prefill and 385/384-token chunks produced bit-identical hidden states and the same raw next token (11297). This exercised more than 16 remote candidates. The learned weights were real, but inputs were synthetic embeddings, not vision output or a pinned upstream numerical reference.
+- Decoder admission matched tracked live allocations at 95,548,012 bytes for 771 retained tokens / 769 query rows / 3 page buckets. One-byte-short admission rejected before allocation; missing DASH bindings rejected mapping; reset invalidated stale selection; destruction returned tracked allocations to zero. No v1 ring buffer was allocated. Public text/image generation remains explicitly guarded for v2.
+- The new check exposed a pre-existing generic Metal pipeline issue: optional function constants still require specialization before pipeline creation. A tiny failing shader probe reproduced the validation abort; specialization with empty values restored runtime fallbacks and preserved pipeline caching. Actual mapped final RMSNorm also matched a scalar reference. Fix committed separately as `b1bd388`.
+- An actual v1 mixed-Q8 text-decoder run produced identical eight-token IDs and scores before/after the decoder changes, using a baseline built from `b1bd388`. V1 image golden QA remains todo. Rebuilt both `build/` and `build/release/`: CTest 13 passed; `uv run python -m pytest tests -q` with large/perf opt-ins disabled: 105 passed, 7 skipped, 3 expected invalid-limit warmup warnings. An initial unscoped pytest run collected the temporary baseline's duplicate test files; removing that archive and targeting `tests/` resolved collection. All disposable probes removed.
+- Native decoder execution is verified at the mapped-weight boundary. Public OCR and upstream model parity still require engine/vision/generation integration and a suitable reference environment. HF top-M routing and the wheel's optimized full-candidate entmax path differ; see research notes before interpreting scheduler output parity.
 
 ## Phase 3: Multi-page and quantization
 

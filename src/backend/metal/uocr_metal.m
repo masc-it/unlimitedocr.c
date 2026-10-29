@@ -138,6 +138,7 @@ typedef struct uocr_metal_buffer_slice {
 
 #define UOCR_METAL_DECODER_REQUIRED_TENSOR_COUNT \
     (3u + (UOCR_DECODER_LAYERS * 6u) + 3u + ((UOCR_DECODER_LAYERS - 1u) * (1u + 3u + UOCR_ROUTED_EXPERTS * 3u)))
+#define UOCR_METAL_DECODER_MAX_TENSOR_COUNT (UOCR_METAL_DECODER_REQUIRED_TENSOR_COUNT + UOCR_DECODER_LAYERS * 5u)
 #define UOCR_METAL_SAM_REQUIRED_TENSOR_COUNT (UOCR_SAM_BLOCKS * 14u + 11u)
 #define UOCR_METAL_CLIP_REQUIRED_TENSOR_COUNT (4u + UOCR_CLIP_BLOCKS * 12u)
 #define UOCR_METAL_VISION_REQUIRED_TENSOR_COUNT \
@@ -197,6 +198,7 @@ typedef struct uocr_metal_decoder_layer_binding_cache {
     uint32_t k_proj;
     uint32_t v_proj;
     uint32_t o_proj;
+    uint32_t dash[5]; /* Q, K, Q norm, K norm, head_cls */
     uint32_t dense_gate;
     uint32_t dense_up;
     uint32_t dense_down;
@@ -214,7 +216,7 @@ typedef struct uocr_metal_decoder_binding_cache {
     uint32_t lm_head;
     uint32_t final_norm;
     uocr_metal_decoder_layer_binding_cache layers[UOCR_DECODER_LAYERS];
-    uocr_metal_decoder_binding tensors[UOCR_METAL_DECODER_REQUIRED_TENSOR_COUNT];
+    uocr_metal_decoder_binding tensors[UOCR_METAL_DECODER_MAX_TENSOR_COUNT];
 } uocr_metal_decoder_binding_cache;
 
 typedef struct uocr_metal_vision_binding {
@@ -404,6 +406,9 @@ struct uocr_metal_context {
     id<MTLBuffer> sam_rel_pos_local_buffer;
     id<MTLBuffer> clip_abs_pos_local_buffer;
     char vision_binding_error[256];
+    int model_is_v2;
+    int v2_decoder_ready;
+    uint64_t v2_runtime_accounted[UOCR_MEMORY_CATEGORY_COUNT];
     struct uocr_metal_dash_cache *dash_cache;
     uocr_metal_kv_cache_layout kv_cache_layout;
     int has_kv_cache_layout;
@@ -414,6 +419,10 @@ struct uocr_metal_context {
     uocr_profile_state *profile;
     uocr_memory_tracker *memory_tracker;
 };
+
+static uint32_t metal_decoder_required_tensor_count(const uocr_metal_context *ctx) {
+    return ctx->model_is_v2 ? UOCR_METAL_DECODER_MAX_TENSOR_COUNT : UOCR_METAL_DECODER_REQUIRED_TENSOR_COUNT;
+}
 
 static int metal_fail(char *error, size_t error_size, const char *fmt, ...);
 static int metal_buffer_range_valid(id<MTLBuffer> buffer, NSUInteger offset, uint64_t bytes);
@@ -2344,6 +2353,9 @@ void uocr_metal_context_unmap_model(uocr_metal_context *ctx) {
     if (ctx == NULL) {
         return;
     }
+    uocr_metal_context_release_dash_cache(ctx);
+    if (ctx->model_is_v2) uocr_metal_context_release_runtime_arenas(ctx);
+    ctx->model_is_v2 = 0;
     @autoreleasepool {
         metal_clear_mps_weight_ndarray_cache(ctx);
         if (ctx->model_views != NULL) {
@@ -2371,9 +2383,6 @@ int uocr_metal_context_map_model(uocr_metal_context *ctx, const uocr_model_file 
         return metal_fail(error, error_size, "Metal model mapping requires a context and loaded .uocr model");
     }
 
-    if (model->v2_config != NULL) {
-        return metal_fail(error, error_size, "Unlimited-OCR-2 sparse-attention inference is not implemented yet");
-    }
     const uocr_section_entry *tensor_data = uocr_model_file_find_section(model, UOCR_SECTION_TENSOR_DATA);
     if (tensor_data == NULL || tensor_data->size == 0u) {
         return metal_fail(error, error_size, ".uocr model has no tensor-data section to map");
@@ -2456,10 +2465,15 @@ int uocr_metal_context_map_model(uocr_metal_context *ctx, const uocr_model_file 
     ctx->tensor_bindings = bindings;
     ctx->tensor_binding_count = tensor_binding_count;
     ctx->model_view_bytes = tensor_data->size;
+    ctx->model_is_v2 = model->v2_config != NULL;
 
     char decoder_error[256];
     memset(decoder_error, 0, sizeof(decoder_error));
     if (!metal_refresh_decoder_binding_cache(ctx, model, decoder_error, sizeof(decoder_error))) {
+        if (ctx->model_is_v2) {
+            uocr_metal_context_unmap_model(ctx);
+            return metal_fail(error, error_size, "invalid v2 decoder bindings: %s", decoder_error);
+        }
         metal_invalidate_decoder_binding_cache(ctx,
                                                decoder_error[0] != '\0' ? decoder_error : "decoder tensor bindings are not available");
     }
@@ -2693,6 +2707,7 @@ static void metal_decoder_binding_cache_init(uocr_metal_decoder_binding_cache *c
         layer_cache->k_proj = UOCR_METAL_DECODER_BINDING_INDEX_INVALID;
         layer_cache->v_proj = UOCR_METAL_DECODER_BINDING_INDEX_INVALID;
         layer_cache->o_proj = UOCR_METAL_DECODER_BINDING_INDEX_INVALID;
+        for (uint32_t i = 0u; i < 5u; ++i) layer_cache->dash[i] = UOCR_METAL_DECODER_BINDING_INDEX_INVALID;
         layer_cache->dense_gate = UOCR_METAL_DECODER_BINDING_INDEX_INVALID;
         layer_cache->dense_up = UOCR_METAL_DECODER_BINDING_INDEX_INVALID;
         layer_cache->dense_down = UOCR_METAL_DECODER_BINDING_INDEX_INVALID;
@@ -2915,7 +2930,7 @@ static int metal_append_decoder_binding(uocr_metal_context *ctx,
                                         const uint32_t dims[UOCR_TENSOR_MAX_DIMS],
                                         char *error,
                                         size_t error_size) {
-    if (ctx == NULL || model == NULL || cache == NULL || cache->count >= UOCR_METAL_DECODER_REQUIRED_TENSOR_COUNT) {
+    if (ctx == NULL || model == NULL || cache == NULL || cache->count >= UOCR_METAL_DECODER_MAX_TENSOR_COUNT) {
         return metal_fail(error, error_size, "decoder tensor binding cache overflow");
     }
     const uocr_tensor_entry *tensor = uocr_model_file_find_tensor(model, tensor_id);
@@ -3209,6 +3224,13 @@ static int metal_decoder_binding_cache_build_direct(uocr_metal_context *ctx,
 
     for (uint32_t layer = 0u; layer < UOCR_DECODER_LAYERS; ++layer) {
         uocr_metal_decoder_layer_binding_cache *layer_cache = &cache->layers[layer];
+        if (ctx->model_is_v2) {
+            for (uint32_t i = 0u; i < 5u; ++i) {
+                if (!metal_decoder_binding_cache_require_index(cache,
+                        uocr_tensor_id_layer(layer, UOCR_TENSOR_ID_LAYER_DASH_BASE + i),
+                        "DASH weight", &layer_cache->dash[i], error, error_size)) return 0;
+            }
+        }
         if (!metal_decoder_binding_cache_require_index(cache,
                                                        uocr_tensor_id_layer_input_norm(layer),
                                                        "layer input norm",
@@ -3401,6 +3423,18 @@ static int metal_refresh_decoder_binding_cache(uocr_metal_context *ctx,
                 UOCR_TENSOR_PROJ_O,
                 UOCR_HIDDEN_SIZE,
                 UOCR_HIDDEN_SIZE);
+        if (ctx->model_is_v2) {
+            const uint32_t projections[5] = {UOCR_TENSOR_PROJ_Q, UOCR_TENSOR_PROJ_K,
+                UOCR_TENSOR_PROJ_Q_NORM, UOCR_TENSOR_PROJ_K_NORM, UOCR_TENSOR_PROJ_HEAD_CLS};
+            for (uint32_t i = 0u; i < 5u; ++i) {
+                const uint32_t id = uocr_tensor_id_layer(layer, UOCR_TENSOR_ID_LAYER_DASH_BASE + i);
+                if (i < 2u) {
+                    APPEND2(id, UOCR_TENSOR_FAMILY_DASH_ROUTER, (int32_t)layer, -1, projections[i], 128u, UOCR_HIDDEN_SIZE);
+                } else {
+                    APPEND1(id, UOCR_TENSOR_FAMILY_DASH_ROUTER, (int32_t)layer, -1, projections[i], 128u);
+                }
+            }
+        }
     }
 
     APPEND2(uocr_tensor_id_layer_dense_mlp(UOCR_TENSOR_PROJ_GATE),
@@ -3482,12 +3516,12 @@ static int metal_refresh_decoder_binding_cache(uocr_metal_context *ctx,
 #undef APPEND1
 #undef APPEND2
 
-    if (cache.count != UOCR_METAL_DECODER_REQUIRED_TENSOR_COUNT) {
+    if (cache.count != metal_decoder_required_tensor_count(ctx)) {
         return metal_fail(error,
                           error_size,
                           "decoder tensor binding count mismatch: got %u expected %u",
                           cache.count,
-                          (uint32_t)UOCR_METAL_DECODER_REQUIRED_TENSOR_COUNT);
+                          metal_decoder_required_tensor_count(ctx));
     }
     const uint64_t direct_cache_start_ns = uocr_profile_now_ns();
     if (!metal_decoder_binding_cache_build_direct(ctx, &cache, error, error_size)) {
@@ -3576,7 +3610,7 @@ uint32_t uocr_metal_context_decoder_binding_count(const uocr_metal_context *ctx)
 
 int uocr_metal_context_decoder_bindings_ready(const uocr_metal_context *ctx) {
     return ctx != NULL && ctx->decoder_bindings.valid &&
-           ctx->decoder_bindings.count == UOCR_METAL_DECODER_REQUIRED_TENSOR_COUNT;
+           ctx->decoder_bindings.count == metal_decoder_required_tensor_count(ctx);
 }
 
 static void metal_release_precomputed_vision_tables(uocr_metal_context *ctx) {
@@ -8002,13 +8036,14 @@ static int metal_init_kv_cache_layout(uint32_t batch_slots,
 
 static int runtime_arena_capacities(uint32_t batch_slots,
                                     uint32_t prompt_token_capacity,
+                                    int dash,
                                     uint64_t capacities[UOCR_METAL_ARENA_COUNT]) {
     if (capacities == NULL || batch_slots == 0u || prompt_token_capacity == 0u) {
         return UOCR_ERROR_INVALID_ARGUMENT;
     }
     memset(capacities, 0, (size_t)UOCR_METAL_ARENA_COUNT * sizeof(capacities[0]));
 
-    int status = uocr_estimate_kv_cache_bytes(batch_slots, prompt_token_capacity, &capacities[UOCR_METAL_ARENA_KV_CACHE]);
+    int status = dash ? UOCR_OK : uocr_estimate_kv_cache_bytes(batch_slots, prompt_token_capacity, &capacities[UOCR_METAL_ARENA_KV_CACHE]);
     if (status != UOCR_OK) {
         return status;
     }
@@ -8054,6 +8089,10 @@ void uocr_metal_context_release_runtime_arenas(uocr_metal_context *ctx) {
     }
     @autoreleasepool {
         int changed = ctx->prompt_token_ids_buffer != nil || ctx->has_kv_cache_layout != 0;
+        for (uint32_t i = 0u; i < UOCR_MEMORY_CATEGORY_COUNT; ++i) {
+            metal_memory_release(ctx, (uocr_memory_category)i, ctx->v2_runtime_accounted[i]);
+            ctx->v2_runtime_accounted[i] = 0u;
+        }
         metal_clear_mps_workspace_ndarray_cache(ctx);
         for (uint32_t i = 0u; i < (uint32_t)UOCR_METAL_ARENA_COUNT; ++i) {
             uocr_metal_runtime_arena *arena = &ctx->runtime_arenas[i];
@@ -8072,6 +8111,7 @@ void uocr_metal_context_release_runtime_arenas(uocr_metal_context *ctx) {
         ctx->prompt_token_ids_prompt_capacity = 0u;
         memset(&ctx->kv_cache_layout, 0, sizeof(ctx->kv_cache_layout));
         ctx->has_kv_cache_layout = 0;
+        ctx->v2_decoder_ready = 0;
         ctx->has_integrated_prefill = 0;
         ctx->integrated_prefill_slot = 0u;
         ctx->integrated_prefill_tokens = 0u;
@@ -8098,7 +8138,9 @@ int uocr_metal_context_allocate_runtime_arenas(uocr_metal_context *ctx,
     }
 
     uint64_t capacities[UOCR_METAL_ARENA_COUNT];
-    const int estimate_status = runtime_arena_capacities(batch_slots, prompt_token_capacity, capacities);
+    if (ctx->model_is_v2 && batch_slots != 1u)
+        return metal_fail(error, error_size, "v2 decoder currently supports one retained window per context");
+    const int estimate_status = runtime_arena_capacities(batch_slots, prompt_token_capacity, ctx->model_is_v2, capacities);
     if (estimate_status != UOCR_OK) {
         return metal_fail(error,
                           error_size,
@@ -8108,10 +8150,13 @@ int uocr_metal_context_allocate_runtime_arenas(uocr_metal_context *ctx,
 
     uocr_metal_kv_cache_layout kv_layout;
     if (!metal_init_kv_cache_layout(batch_slots, prompt_token_capacity, &kv_layout) ||
-        kv_layout.total_bytes != capacities[UOCR_METAL_ARENA_KV_CACHE]) {
+        (!ctx->model_is_v2 && kv_layout.total_bytes != capacities[UOCR_METAL_ARENA_KV_CACHE])) {
         return metal_fail(error, error_size, "failed to build Metal KV cache layout");
     }
 
+    // Keep workspace batch/row dimensions in the existing descriptor. V2 has
+    // no v1 KV arena and must never expose/use its generated-token ring offsets.
+    if (ctx->model_is_v2) kv_layout.total_bytes = 0u;
     const uint64_t max_buffer_length = metal_device_max_buffer_length(ctx->device);
     if (max_buffer_length == 0u) {
         return metal_fail(error, error_size, "Metal device reported maxBufferLength=0");
@@ -8134,7 +8179,8 @@ int uocr_metal_context_allocate_runtime_arenas(uocr_metal_context *ctx,
                                   (unsigned long long)bytes,
                                   (unsigned long long)max_buffer_length);
             }
-            const int cpu_visible = runtime_arena_is_cpu_visible(slot);
+            const int cpu_visible = runtime_arena_is_cpu_visible(slot) ||
+                (ctx->model_is_v2 && slot == UOCR_METAL_ARENA_PROMPT_EMBEDDINGS);
             const MTLResourceOptions storage_mode = cpu_visible ? MTLResourceStorageModeShared : MTLResourceStorageModePrivate;
             id<MTLBuffer> buffer = metal_new_buffer_with_length(ctx, (NSUInteger)bytes, storage_mode);
             if (buffer == nil) {
@@ -8215,7 +8261,7 @@ uint32_t uocr_metal_context_runtime_arena_prompt_token_capacity(const uocr_metal
 
 int uocr_metal_context_get_kv_cache_layout(const uocr_metal_context *ctx,
                                            uocr_metal_kv_cache_layout *out_layout) {
-    if (ctx == NULL || out_layout == NULL || !ctx->has_kv_cache_layout) {
+    if (ctx == NULL || out_layout == NULL || !ctx->has_kv_cache_layout || ctx->model_is_v2) {
         return 0;
     }
     *out_layout = ctx->kv_cache_layout;
@@ -8407,7 +8453,7 @@ static int metal_decoder_runtime_arenas_ready(const uocr_metal_context *ctx) {
     if (ctx == NULL || !ctx->has_kv_cache_layout) {
         return 0;
     }
-    return ctx->runtime_arenas[UOCR_METAL_ARENA_KV_CACHE].buffer != nil &&
+    return (ctx->model_is_v2 ? ctx->dash_cache != NULL : ctx->runtime_arenas[UOCR_METAL_ARENA_KV_CACHE].buffer != nil) &&
            ctx->runtime_arenas[UOCR_METAL_ARENA_PROMPT_EMBEDDINGS].buffer != nil &&
            ctx->runtime_arenas[UOCR_METAL_ARENA_HIDDEN_PINGPONG].buffer != nil &&
            ctx->runtime_arenas[UOCR_METAL_ARENA_ROUTER_TOPK].buffer != nil &&
@@ -12693,6 +12739,8 @@ void uocr_metal_context_release_dash_cache(uocr_metal_context *ctx) {
     metal_command_batch_abort(ctx);
     uocr_metal_dash_cache *cache = ctx->dash_cache;
     ctx->dash_cache = NULL;
+    ctx->v2_decoder_ready = 0;
+    ctx->has_integrated_prefill = 0;
     [cache->arena release];
     if (cache->tracker != NULL) {
         (void)uocr_memory_release(cache->tracker, UOCR_MEMORY_KV_CACHE, cache->layout.kv_bytes + cache->layout.host_bytes);
@@ -12749,6 +12797,7 @@ int uocr_metal_context_reset_dash_cache(uocr_metal_context *ctx, uint64_t docume
     uocr_metal_dash_cache *c = ctx->dash_cache;
     if (uocr_page_state_init(&c->pages, c->counters, c->layout.page_capacity, document_page_base, error, error_size) != UOCR_OK) return 0;
     c->length = c->pending = c->next_layer = 0u; c->failed = 0;
+    ctx->has_integrated_prefill = 0;
     // Old GPU rows remain allocated but inaccessible. First prefill rewrites all
     // live blocks and masks the partial tail before any summary can be read.
     return 1;
@@ -12780,6 +12829,7 @@ int uocr_metal_context_dash_begin(uocr_metal_context *ctx, const int32_t *tokens
         }
     }
     c->pending = n_tokens; c->next_layer = 0u;
+    ctx->has_integrated_prefill = 0;
     return 1;
 }
 
@@ -15056,6 +15106,112 @@ static int metal_run_decoder_decode_one_f16(uocr_metal_context *ctx,
     return 1;
 }
 
+static int metal_v2_decoder_sizes(uint32_t tokens, uint32_t queries, uint32_t pages,
+    uint64_t capacities[UOCR_METAL_ARENA_COUNT], uint64_t *transient, uint64_t *total) {
+    const uint64_t retained = uocr_metal_dash_cache_required_bytes(tokens, queries, pages);
+    if (retained == 0u || runtime_arena_capacities(1u, queries, 1, capacities) != UOCR_OK) return 0;
+    *transient = 0u;
+    if (queries > 1u) {
+        uocr_metal_moe_bucketed_prefill_scratch_layout layout;
+        if (!metal_moe_bucketed_prefill_scratch_layout(queries, &layout) ||
+            !scratch_capacity_for_request(UOCR_METAL_SCRATCH_TRANSIENT, 0u, layout.total_bytes, transient)) return 0;
+    }
+    uint64_t selection = 0u, logits = 0u;
+    if (!scratch_capacity_for_request(UOCR_METAL_SCRATCH_LOGITS, 0u,
+            metal_decode_selection_scratch_bytes_per_slot(), &selection) ||
+        !scratch_capacity_for_request(UOCR_METAL_SCRATCH_LM_HEAD_LOGITS, 0u,
+            (uint64_t)UOCR_VOCAB_SIZE * sizeof(float), &logits)) return 0;
+    *total = retained + *transient + selection + logits + (uint64_t)queries * sizeof(int32_t);
+    for (uint32_t i = 0u; i < UOCR_METAL_ARENA_COUNT; ++i) *total += capacities[i];
+    return 1;
+}
+
+uint64_t uocr_metal_v2_decoder_required_bytes(uint32_t tokens, uint32_t queries, uint32_t pages) {
+    uint64_t capacities[UOCR_METAL_ARENA_COUNT], transient, total;
+    return metal_v2_decoder_sizes(tokens, queries, pages, capacities, &transient, &total) ? total : 0u;
+}
+
+int uocr_metal_context_prepare_v2_decoder(uocr_metal_context *ctx,
+    uint32_t tokens, uint32_t queries, uint32_t pages, uint64_t document_page_base,
+    uint64_t budget_bytes, char *error, size_t error_size) {
+    metal_clear_error(error, error_size);
+    uint64_t capacities[UOCR_METAL_ARENA_COUNT], transient, required;
+    if (ctx == NULL || !ctx->model_is_v2 || !uocr_metal_context_decoder_bindings_ready(ctx) ||
+        !metal_v2_decoder_sizes(tokens, queries, pages, capacities, &transient, &required))
+        return metal_fail(error, error_size, "v2 decoder requires a complete mapped model and valid capacities");
+    if (ctx->dash_cache != NULL || ctx->has_kv_cache_layout || metal_command_batch_active(ctx))
+        return metal_fail(error, error_size, "release existing retained cache/runtime arenas before preparing v2 decoder");
+    if (required > budget_bytes)
+        return metal_fail(error, error_size, "v2 decoder requires %llu bytes; budget is %llu",
+                          (unsigned long long)required, (unsigned long long)budget_bytes);
+    uint16_t weights[UOCR_DECODER_LAYERS][3][128];
+    for (uint32_t layer = 0u; layer < UOCR_DECODER_LAYERS; ++layer) {
+        for (uint32_t i = 0u; i < 3u; ++i) {
+            const uocr_metal_decoder_binding *w = &ctx->decoder_bindings.tensors[ctx->decoder_bindings.layers[layer].dash[i+2u]];
+            memcpy(weights[layer][i], (const uint8_t *)[w->buffer contents] + w->offset, 256u);
+        }
+    }
+    // No active request remains. Drop a previous transient high-water allocation
+    // so admission and the new request's actual retained capacity agree.
+    uocr_metal_context_release_scratch(ctx, UOCR_METAL_SCRATCH_TRANSIENT);
+    uocr_metal_context_release_scratch(ctx, UOCR_METAL_SCRATCH_LOGITS);
+    uocr_metal_context_release_scratch(ctx, UOCR_METAL_SCRATCH_LM_HEAD_LOGITS);
+    if (!uocr_metal_context_allocate_dash_cache(ctx, tokens, queries, pages, document_page_base,
+            uocr_metal_dash_cache_required_bytes(tokens, queries, pages), &weights[0][0][0], error, error_size) ||
+        !uocr_metal_context_allocate_runtime_arenas(ctx, 1u, queries, error, error_size) ||
+        !metal_preallocate_moe_bucketed_prefill_transient_scratch(ctx, queries, error, error_size) ||
+        !uocr_metal_context_ensure_scratch(ctx, UOCR_METAL_SCRATCH_LOGITS,
+            metal_decode_selection_scratch_bytes_per_slot(), 0, error, error_size) ||
+        !uocr_metal_context_ensure_scratch(ctx, UOCR_METAL_SCRATCH_LM_HEAD_LOGITS,
+            (uint64_t)UOCR_VOCAB_SIZE * sizeof(float), 0, error, error_size)) goto failed;
+    const uocr_memory_category categories[UOCR_METAL_ARENA_COUNT] = {
+        UOCR_MEMORY_KV_CACHE, UOCR_MEMORY_PROMPT_EMBEDDINGS, UOCR_MEMORY_DECODER_SCRATCH,
+        UOCR_MEMORY_MOE_SCRATCH, UOCR_MEMORY_MOE_SCRATCH, UOCR_MEMORY_VISION_GPU_WORKSPACE,
+        UOCR_MEMORY_LOGITS_READBACK
+    };
+    for (uint32_t i = 0u; i < UOCR_METAL_ARENA_COUNT; ++i) {
+        const uint64_t bytes = capacities[i] + (i == UOCR_METAL_ARENA_PROMPT_EMBEDDINGS ? (uint64_t)queries * sizeof(int32_t) : 0u);
+        if (!metal_memory_reserve(ctx, categories[i], bytes, "v2 decoder workspace", error, error_size)) goto failed;
+        ctx->v2_runtime_accounted[categories[i]] += bytes;
+    }
+    ctx->v2_decoder_ready = 1;
+    return 1;
+failed:
+    uocr_metal_context_release_dash_cache(ctx);
+    uocr_metal_context_release_runtime_arenas(ctx);
+    uocr_metal_context_release_scratch(ctx, UOCR_METAL_SCRATCH_TRANSIENT);
+    uocr_metal_context_release_scratch(ctx, UOCR_METAL_SCRATCH_LOGITS);
+    uocr_metal_context_release_scratch(ctx, UOCR_METAL_SCRATCH_LM_HEAD_LOGITS);
+    return 0;
+}
+
+static int metal_run_mapped_dash_attention(uocr_metal_context *ctx,
+    uocr_metal_buffer_slice norm, uint32_t layer, uint32_t n_tokens, char *error, size_t error_size) {
+    uocr_metal_dash_cache *c = ctx->dash_cache;
+    if (c == NULL || c->failed || c->pending != n_tokens || c->next_layer != layer)
+        return metal_fail(error, error_size, "mapped DASH attention requires an ordered pending decoder append");
+    const uocr_metal_decoder_layer_fast_bindings *main = &ctx->decoder_fast_bindings[layer];
+    const uocr_metal_decoder_layer_binding_cache *indices = &ctx->decoder_bindings.layers[layer];
+    const uocr_metal_decoder_binding *rq = &ctx->decoder_bindings.tensors[indices->dash[0]];
+    const uocr_metal_decoder_binding *rk = &ctx->decoder_bindings.tensors[indices->dash[1]];
+    uocr_metal_buffer_slice buffers[DASH_BUFFER_COUNT];
+    metal_dash_cache_slices(c, layer, buffers);
+    uocr_metal_buffer_slice k = buffers[DASH_K], v = buffers[DASH_V], router_k = buffers[DASH_ROUTER_K];
+    k.offset += (NSUInteger)c->length * 2560u;
+    v.offset += (NSUInteger)c->length * 2560u;
+    router_k.offset += (NSUInteger)c->length * 256u;
+    // All projections consume norm before attention overwrites it. The main Q,
+    // retained K/V and router keys never round-trip through host memory.
+    buffers[DASH_OUTPUT] = norm;
+    return metal_run_attention_qkv_buffer_f16(ctx, norm, main->q_proj, main->k_proj, main->v_proj,
+                n_tokens, buffers[DASH_Q], k, v, error, error_size) &&
+        metal_run_mps_matmul_nt_f16(ctx, norm, (uocr_metal_buffer_slice){rq->buffer, rq->offset},
+                buffers[DASH_ROUTER_Q], n_tokens, UOCR_HIDDEN_SIZE, 128u, "DASH Q projection", error, error_size) &&
+        metal_run_mps_matmul_nt_f16(ctx, norm, (uocr_metal_buffer_slice){rk->buffer, rk->offset},
+                router_k, n_tokens, UOCR_HIDDEN_SIZE, 128u, "DASH K projection", error, error_size) &&
+        metal_run_cached_dash_layer(ctx, c, buffers, error, error_size);
+}
+
 static int metal_run_decoder_prefill_text_f16(uocr_metal_context *ctx,
                                               uint32_t slot,
                                               uint32_t n_tokens,
@@ -15198,28 +15354,20 @@ static int metal_run_decoder_prefill_text_f16(uocr_metal_context *ctx,
                                                     "integrated input RMSNorm",
                                                     error,
                                                     error_size));
-        RUN_PREFILL_OP("attention_qkv",
-                       "metal.prefill.attention_qkv",
-                       metal_run_attention_qkv_buffer_f16(ctx,
-                                                          norm,
-                                                          q_weight,
-                                                          k_weight,
-                                                          v_weight,
-                                                          n_tokens,
-                                                          q,
-                                                          k,
-                                                          v,
-                                                          error,
-                                                          error_size));
-        RUN_PREFILL_OP("rope",
-                       "metal.prefill.rope",
-                       metal_run_rope_qk_buffer_f16(ctx, q, k, n_tokens, 0u, error, error_size));
-        RUN_PREFILL_OP("kv_write",
-                       "metal.prefill.kv_write",
-                       metal_run_kv_write_buffer_f16(ctx, k, v, n_tokens, layer, slot, n_tokens, 0u, error, error_size));
-        RUN_PREFILL_OP("attention",
-                       "metal.prefill.attention",
-                       metal_run_prefill_attention_buffer_f16(ctx, q, k, v, n_tokens, norm, error, error_size));
+        if (ctx->model_is_v2) {
+            RUN_PREFILL_OP("dash_attention", "metal.prefill.dash_attention",
+                metal_run_mapped_dash_attention(ctx, norm, layer, n_tokens, error, error_size));
+        } else {
+            RUN_PREFILL_OP("attention_qkv", "metal.prefill.attention_qkv",
+                metal_run_attention_qkv_buffer_f16(ctx, norm, q_weight, k_weight, v_weight,
+                    n_tokens, q, k, v, error, error_size));
+            RUN_PREFILL_OP("rope", "metal.prefill.rope",
+                metal_run_rope_qk_buffer_f16(ctx, q, k, n_tokens, 0u, error, error_size));
+            RUN_PREFILL_OP("kv_write", "metal.prefill.kv_write",
+                metal_run_kv_write_buffer_f16(ctx, k, v, n_tokens, layer, slot, n_tokens, 0u, error, error_size));
+            RUN_PREFILL_OP("attention", "metal.prefill.attention",
+                metal_run_prefill_attention_buffer_f16(ctx, q, k, v, n_tokens, norm, error, error_size));
+        }
         RUN_PREFILL_OP("attention_output",
                        "metal.prefill.attention_output",
                        metal_run_attention_output_residual_buffer_f16(ctx,
@@ -15366,6 +15514,7 @@ static int metal_run_decoder_prefill_text_f16(uocr_metal_context *ctx,
 
         current = output;
         current_segment = output_segment;
+        if (ctx->model_is_v2) ++ctx->dash_cache->next_layer;
 #if UOCR_ENABLE_PROFILING
         metal_profile_add_event_now(ctx, "metal.prefill.layer", layer_start_ns);
         metal_profile_add_event_now_f(ctx, layer_start_ns, "metal.prefill.layer.%02u", layer);
@@ -15415,6 +15564,71 @@ static int metal_run_decoder_prefill_text_f16(uocr_metal_context *ctx,
     return 1;
 }
 
+int uocr_metal_context_forward_v2_f16(uocr_metal_context *ctx, const int32_t *tokens,
+    const uint16_t *embeddings, uint32_t n_tokens, int generated, uint16_t *output,
+    char *error, size_t error_size) {
+    metal_clear_error(error, error_size);
+    if (ctx == NULL || !ctx->model_is_v2 || !ctx->v2_decoder_ready ||
+        !uocr_metal_context_decoder_bindings_ready(ctx) || !metal_decoder_runtime_arenas_ready(ctx) ||
+        embeddings == NULL || output == NULL || metal_command_batch_active(ctx))
+        return metal_fail(error, error_size, "v2 forward requires prepared decoder state and host input/output rows");
+    if (!uocr_metal_context_dash_begin(ctx, tokens, n_tokens, generated, error, error_size)) return 0;
+    uocr_metal_dash_cache *c = ctx->dash_cache;
+    ctx->has_integrated_prefill = 0;
+    uocr_metal_buffer_slice prompt, hidden;
+    uint64_t bytes = 0u, hidden_bytes = 0u;
+    if (!metal_prompt_arena_slice(ctx, 0u, n_tokens, &prompt, &bytes)) {
+        (void)metal_fail(error, error_size, "v2 decoder input workspace is invalid"); goto failed;
+    }
+    memcpy((uint8_t *)[prompt.buffer contents] + prompt.offset, embeddings, (size_t)bytes);
+    if (!metal_prebuild_mps_runtime_workspace_ndarrays(ctx, n_tokens, error, error_size) ||
+        !metal_run_decoder_prefill_text_f16(ctx, 0u, n_tokens, error, error_size)) goto failed;
+    if (!metal_hidden_arena_segment_slice(ctx, 0u, ctx->integrated_prefill_final_segment, n_tokens, &hidden, &hidden_bytes) ||
+        hidden_bytes != bytes || c->next_layer != UOCR_DECODER_LAYERS) {
+        (void)metal_fail(error, error_size, "v2 decoder did not complete all layer outputs"); goto failed;
+    }
+    // Diagnostic host boundary only. Reuse the shared input arena for readback;
+    // production vision/decoder orchestration can keep the hidden slice on GPU.
+    if (!metal_copy_slice(ctx, hidden, prompt, bytes, "v2 hidden readback", error, error_size)) goto failed;
+    memcpy(output, (uint8_t *)[prompt.buffer contents] + prompt.offset, (size_t)bytes);
+    c->length += c->pending; c->pending = c->next_layer = 0u;
+    return 1;
+failed:
+    metal_command_batch_abort(ctx); c->failed = 1; ctx->has_integrated_prefill = 0;
+    return 0;
+}
+
+int uocr_metal_context_v2_raw_argmax(uocr_metal_context *ctx, int32_t *token_id,
+    float *score, char *error, size_t error_size) {
+    metal_clear_error(error, error_size);
+    if (ctx == NULL || !ctx->v2_decoder_ready || ctx->dash_cache == NULL || token_id == NULL ||
+        ctx->dash_cache->failed || ctx->dash_cache->pending != 0u || ctx->dash_cache->length == 0u ||
+        !ctx->has_integrated_prefill || ctx->integrated_prefill_tokens == 0u || metal_command_batch_active(ctx))
+        return metal_fail(error, error_size, "v2 raw argmax requires a completed decoder forward");
+    uocr_metal_buffer_slice hidden, norm, selection, token, value;
+    uint64_t bytes = 0u;
+    if (!metal_hidden_arena_token_slice(ctx, 0u, ctx->integrated_prefill_final_segment,
+            ctx->integrated_prefill_tokens - 1u, &hidden) ||
+        !metal_hidden_arena_segment_slice(ctx, 0u, 1u, 1u, &norm, &bytes) ||
+        !metal_decode_selection_scratch_slice(ctx, 0u, &selection) ||
+        !metal_token_readback_arena_slices(ctx, 0u, &token, &value))
+        return metal_fail(error, error_size, "v2 raw argmax workspace is invalid");
+    if (!metal_command_batch_begin(ctx, error, error_size) ||
+        !metal_encode_chunk_step_selection_f16(ctx, hidden, norm, selection, token, value, error, error_size) ||
+        !metal_command_batch_commit_and_wait(ctx, "v2 raw argmax", error, error_size)) {
+        metal_command_batch_abort(ctx); ctx->dash_cache->failed = 1; return 0;
+    }
+    int32_t id;
+    memcpy(&id, (uint8_t *)[token.buffer contents] + token.offset, sizeof(id));
+    if (id < 0 || (uint32_t)id >= UOCR_VOCAB_SIZE) {
+        ctx->dash_cache->failed = 1;
+        return metal_fail(error, error_size, "v2 raw argmax returned an invalid token");
+    }
+    *token_id = id;
+    if (score != NULL) memcpy(score, (uint8_t *)[value.buffer contents] + value.offset, sizeof(*score));
+    return 1;
+}
+
 static int metal_context_generate_f16_impl(uocr_metal_context *ctx,
                                            const uocr_metal_decoder_request_f16 *request,
                                            id<MTLBuffer> image_features_buffer,
@@ -15427,6 +15641,8 @@ static int metal_context_generate_f16_impl(uocr_metal_context *ctx,
         return metal_fail(error, error_size, "invalid Metal integrated decoder request");
     }
     metal_decoder_result_reset(result);
+    if (ctx->model_is_v2)
+        return metal_fail(error, error_size, "v2 generation requires engine admission and page/EOS guards; use the decoder-forward boundary for bring-up");
 
     if (!metal_decoder_runtime_arenas_ready(ctx)) {
         return metal_fail(error, error_size, "Metal integrated decoder requires allocated runtime arenas");
@@ -15918,6 +16134,8 @@ static int metal_context_generate_image_f16_impl(uocr_metal_context *ctx,
     if (ctx == NULL || request == NULL || result == NULL) {
         return metal_fail(error, error_size, "invalid Metal image generation request");
     }
+    if (ctx->model_is_v2)
+        return metal_fail(error, error_size, "v2 generation requires engine admission and page/EOS guards");
     if (!uocr_metal_context_vision_bindings_ready(ctx)) {
         return metal_fail(error,
                           error_size,

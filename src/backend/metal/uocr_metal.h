@@ -386,8 +386,9 @@ int uocr_metal_context_select_greedy_f32(uocr_metal_context *ctx,
                                          size_t error_size);
 
 /* Decode-time final-token selection helper. This wires the mapped final
- * RMSNorm, mapped LM head, and Metal greedy argmax into one synchronous stage
- * for bring-up/parity tests. The caller provides fp16 normalized-hidden
+ * RMSNorm, mapped FP16 LM head, and Metal greedy argmax into one synchronous
+ * stage for bring-up/parity tests. Quantized models use the integrated selector.
+ * The caller provides fp16 normalized-hidden
  * scratch sized [n_rows,1280] and fp32 logits scratch sized [n_rows,129280].
  */
 int uocr_metal_context_select_next_token_f16(uocr_metal_context *ctx,
@@ -455,6 +456,32 @@ int uocr_metal_context_dash_layer_f16(uocr_metal_context *ctx, uint32_t layer,
     const uint16_t *q, const uint16_t *k, const uint16_t *v,
     const uint16_t *router_q, const uint16_t *router_k, uint16_t *output,
     char *error, size_t error_size);
+
+/* Mapped-model v2 decoder bring-up. Includes all 12 attention/FFN/MoE layers;
+ * input/output rows are FP16 [n_tokens,1280], before the final LM-head norm.
+ * Uses the model's actual router projections/norms/head_cls. The budget covers
+ * retained attention, runtime workspaces, token IDs, selection/LM-head scratch,
+ * and rounded MoE transient storage; model views, vision, allocator/driver
+ * overhead are excluded. Public
+ * engine admission and page/EOS guarding are still required for generation.
+ * Prepare requires no live retained cache/runtime arenas. Reset the DASH cache
+ * to reuse the same capacities; release cache/runtime arenas before resizing.
+ * Context/tracker ownership and serialization match the retained-cache API;
+ * do not replace the attached tracker while decoder workspaces are live.
+ * Failed GPU work poisons the request; failed admission leaves it unallocated. */
+uint64_t uocr_metal_v2_decoder_required_bytes(uint32_t token_capacity,
+    uint32_t query_capacity, uint32_t page_capacity);
+int uocr_metal_context_prepare_v2_decoder(uocr_metal_context *ctx,
+    uint32_t token_capacity, uint32_t query_capacity, uint32_t page_capacity,
+    uint64_t document_page_base, uint64_t budget_bytes, char *error, size_t error_size);
+int uocr_metal_context_forward_v2_f16(uocr_metal_context *ctx, const int32_t *tokens,
+    const uint16_t *embeddings, uint32_t n_tokens, int generated, uint16_t *output,
+    char *error, size_t error_size);
+
+/* Diagnostic unguarded greedy selection from the latest v2 forward output,
+ * using final norm and the FP16/Q8/Q4 LM head. Does NOT apply page/EOS rules. */
+int uocr_metal_context_v2_raw_argmax(uocr_metal_context *ctx, int32_t *token_id,
+    float *score, char *error, size_t error_size);
 
 /* Standalone synchronous v2 RoPE operation; no model weights required.
  * Q/K are in-place FP16 arrays [n_tokens, heads, 128], heads is 1 or 10.

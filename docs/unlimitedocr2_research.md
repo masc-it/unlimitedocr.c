@@ -14,7 +14,7 @@ Add `baidu/Unlimited-OCR-2` to the native C/Metal engine while preserving v1 beh
 - [done] Compared these with `data/context/` and the current converter, frontend, runtime, and Metal implementation.
 - [done] Confirmed that all 2,710 v1 tensor names exist in v2 with identical shapes and dtypes. This does not imply identical weight values.
 - [done] Inspected the pinned customized SGLang wheel's window planner, KV copy/splice, page guard, and cache relocation. Exact contract is recorded below.
-- [todo] Run upstream inference and capture numerical reference fixtures. Pinned weights have now been downloaded and converted to mixed-Q8; model inference has not run.
+- [todo] Run upstream inference and capture numerical reference fixtures. Pinned weights have been downloaded and converted to mixed-Q8. Native decoder execution with synthetic embeddings is verified; upstream and real-image inference have not run.
 
 Upstream revision: `c14071b549f4fcab10909f3c4acc6a2edb366947`.
 Initial research downloads are temporary files under `/tmp/unlimitedocr2-research-c14071b/`, not committed fixtures: source, tokenizer, metadata, weight headers, and the SGLang wheel. The wheel was extracted for inspection, not installed or executed. Full checkpoint shards were later downloaded into the normal Hugging Face cache; real mixed-Q8 conversion/loading evidence is recorded in the implementation plan.
@@ -90,8 +90,8 @@ Simply replacing `UOCR_ROPE_THETA` or increasing `UOCR_MAX_POSITIONS` is incorre
 
 Files: `src/unlimitedocr_c/api.py`, `convert.py`, `tensor_registry.py`, `frontend.py`; `src/model/uocr_format.h`, `uocr_constants.h`, `uocr_tensor_registry.h`, `uocr_model_file.c`.
 
-- Implemented: explicit `model="v1"|"v2"` selection and source resolution. Both checkpoints report `model_type=unlimited-ocr`; conversion distinguishes them by the validated sparse-attention contract. Native v2 generation remains guarded until decoder support is ready.
-- Implemented: v2 uses `.uocr` file version 2, retaining the common version-1 subrecords and appending a 60-byte `uocr_v2_config_record` to the config section. It records variant, page token, sparse dimensions/budgets, page RoPE, crop cap, and router scale/floor/sigma. The native loader validates the supported contract; engine/Metal inference currently rejects v2 explicitly.
+- Implemented: explicit `model="v1"|"v2"` selection and source resolution. Both checkpoints report `model_type=unlimited-ocr`; conversion distinguishes them by the validated sparse-attention contract. Public v2 generation remains guarded until engine admission and page/EOS handling are connected.
+- Implemented: v2 uses `.uocr` file version 2, retaining the common version-1 subrecords and appending a 60-byte `uocr_v2_config_record` to the config section. It records variant, page token, sparse dimensions/budgets, page RoPE, crop cap, and router scale/floor/sigma. The native loader validates the supported contract. Complete v2 models now map into Metal and run through the decoder-forward boundary; public engine generation remains explicitly guarded.
 - Implemented: merge both shard headers and retain per-tensor source-file/offset information. Conversion validates variant-specific counts, sizes, config, and tokenizer. V2's absent `processor_config.json` is replaced by the pinned preprocessing contract, not disabled validation.
 - Implemented: new families `DASH_ROUTER=15` and `SPARSE_INDEXER=16`, with per-layer local IDs 60-64 and 70-73. Existing IDs remain unchanged. Deterministic `position_ids` gets fixed ID 299999, outside the sorted CLIP numbering, and is omitted only after validating its I64 payload.
 - Implemented: converted files live under `<cache>/<variant>/<repo-revision-hash>/<qprofile>/<filename>`. Default v1 also checks legacy locations; v2 and custom source/revision selections do not. Tokenizers come directly from repository/revision-specific HF snapshots. The official v2 source and tokenizer default to the pinned revision. Known wrong-variant files/tokenizers are rejected, and reconversion failures leave the old model intact.
@@ -113,7 +113,7 @@ Files: `src/unlimitedocr_c/frontend.py`, `api.py`, `ffi.py`, `ocr.py`; `include/
 Files: `src/backend/metal/uocr_metal.m`, `kernels/rope.metal`, `attention_prefill.metal`, `attention_decode.metal`, `kv_cache.metal`, new router kernels; `src/backend/cpu_ref/`; `src/runtime/uocr_memory.[ch]`, `uocr_sequence.[ch]`, `uocr_logits_processor.[ch]`; `src/core/uocr_api.c`.
 
 - Use small Python reference calculations to check the new math; do not build a second C inference path. Reuse SAM/CLIP/projector/MoE and main projection kernels.
-- Dispatch prefill and decode attention by model variant. New scratch/cache data includes router keys or summaries, block/page metadata, selected indices/biases, and per-page position counters.
+- Implemented at the decoder-forward boundary: variant-specific attention dispatch, persistent main/router K/V and summaries, block/page metadata, selection biases, and per-page counters. Main/router projections and all FFN/MoE layers use mapped model weights. Decoder-only admission excludes the v1 ring; full engine/vision admission is still pending.
 - Redesign v2 KV retention separately from v1's `prompt + 128` layout. All state belongs to an engine/request; do not copy upstream's process-global inference switch into the thread-safe native API.
 - Make positional and allocation limits model-specific and enforce the memory budget before allocating.
 - Implement upstream page-count guarding before greedy argmax: suppress premature EOS and force a page marker or EOS at the configured per-page output cap (default 20000). Match optional repetition processing separately; upstream native inference defaults it off.
