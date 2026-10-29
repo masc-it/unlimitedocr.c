@@ -1,4 +1,4 @@
-"""Python v1 frontend for Unlimited-OCR prepared requests.
+"""Python frontend for Unlimited-OCR prepared requests.
 
 This module mirrors the upstream Hugging Face remote-code input path but stops
 before model execution. It owns PIL image handling, prompt rendering,
@@ -15,12 +15,13 @@ from typing import Any, Iterable, Literal, Sequence
 import json
 import math
 import os
-import sys
 
 import numpy as np
 from numpy.typing import NDArray
 from PIL import Image, ImageOps
 from tokenizers import Tokenizer
+
+from .model_variants import ModelName, V2_ADDED_TOKENS, get_model_variant, source_tokenizer
 
 BOS_TOKEN_ID = 0
 EOS_TOKEN_ID = 1
@@ -41,6 +42,7 @@ GLOBAL_VISUAL_TOKENS = (GLOBAL_QUERIES + 1) * GLOBAL_QUERIES + 1
 
 SINGLE_PROMPT = "<image>document parsing."
 MULTI_PROMPT = "<image>Multi page parsing."
+V2_PROMPT = "<PAGE><image>Multi page parsing."
 EXPECTED_OUTPUT_IDS_NPY = "expected_output_ids.npy"
 EXPECTED_TEXT_TXT = "expected_text.txt"
 
@@ -181,18 +183,6 @@ def package_resource_dir() -> Path:
     return Path(__file__).resolve().parent / "resources"
 
 
-def _cache_dir() -> Path:
-    env = os.environ.get("UOCR_CACHE_DIR")
-    if env:
-        return Path(env).expanduser()
-    xdg_cache = os.environ.get("XDG_CACHE_HOME")
-    if xdg_cache:
-        return Path(xdg_cache).expanduser() / "unlimitedocr"
-    if sys.platform == "darwin":
-        return Path.home() / "Library" / "Caches" / "unlimitedocr"
-    return Path.home() / ".cache" / "unlimitedocr"
-
-
 def _env_flag(name: str, *, default: bool) -> bool:
     value = os.environ.get(name)
     if value is None or value == "":
@@ -200,33 +190,28 @@ def _env_flag(name: str, *, default: bool) -> bool:
     return value.lower() not in {"0", "false", "no", "off"}
 
 
-def _download_tokenizer_context() -> Path:
+def _download_tokenizer_context(model: ModelName = "v1", *, local_files_only: bool = False) -> Path:
     from huggingface_hub import hf_hub_download
 
-    repo_id = os.environ.get("UOCR_TOKENIZER_REPO_ID") or os.environ.get(
-        "UOCR_SOURCE_MODEL_REPO_ID", "baidu/Unlimited-OCR"
-    )
-    revision = os.environ.get("UOCR_TOKENIZER_REVISION") or os.environ.get("UOCR_SOURCE_MODEL_REVISION") or None
-    cache_dir = _cache_dir() / "context"
-    downloaded = hf_hub_download(
+    repo_id, revision = source_tokenizer(model)
+    downloaded = Path(hf_hub_download(
         repo_id=repo_id,
         filename="tokenizer.json",
         revision=revision,
-        local_files_only=_env_flag("UOCR_HF_LOCAL_FILES_ONLY", default=False),
-    )
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    tokenizer_path = cache_dir / "tokenizer.json"
-    if not tokenizer_path.exists():
-        tokenizer_path.write_bytes(Path(downloaded).read_bytes())
-    return cache_dir
+        local_files_only=local_files_only or _env_flag("UOCR_HF_LOCAL_FILES_ONLY", default=False),
+    ))
+    load_tokenizer(downloaded, model=model)
+    # The HF snapshot already isolates repository/revision. A shared copied
+    # context/tokenizer.json could silently retain a previous model's tokenizer.
+    return downloaded.parent
 
 
-def default_context_dir() -> Path:
-    return _download_tokenizer_context()
+def default_context_dir(model: ModelName = "v1", *, local_files_only: bool = False) -> Path:
+    return _download_tokenizer_context(model, local_files_only=local_files_only)
 
 
-def default_tokenizer_path() -> Path:
-    return default_context_dir() / "tokenizer.json"
+def default_tokenizer_path(model: ModelName = "v1", *, local_files_only: bool = False) -> Path:
+    return default_context_dir(model, local_files_only=local_files_only) / "tokenizer.json"
 
 
 def _load_json(path: Path) -> dict[str, Any]:
@@ -237,8 +222,8 @@ def _load_json(path: Path) -> dict[str, Any]:
     return data
 
 
-def _resolve_tokenizer_path(tokenizer_path: str | Path | None = None) -> Path:
-    path = Path(tokenizer_path) if tokenizer_path is not None else default_tokenizer_path()
+def _resolve_tokenizer_path(tokenizer_path: str | Path | None = None, *, model: ModelName = "v1") -> Path:
+    path = Path(tokenizer_path) if tokenizer_path is not None else default_tokenizer_path(model)
     return path.expanduser().resolve()
 
 
@@ -253,23 +238,25 @@ def _tokenizer_file_identity(path: Path) -> tuple[Any, ...]:
     return (_file_identity(path), config_identity)
 
 
-def load_tokenizer(tokenizer_path: str | Path | None = None) -> Tokenizer:
-    path = _resolve_tokenizer_path(tokenizer_path)
+def load_tokenizer(tokenizer_path: str | Path | None = None, *, model: ModelName | None = None) -> Tokenizer:
+    path = _resolve_tokenizer_path(tokenizer_path, model=model or "v1")
     identity = _tokenizer_file_identity(path)
     cache_key = str(path)
     with _TOKENIZER_CACHE_LOCK:
         cached = _TOKENIZER_CACHE.get(cache_key)
         if cached is not None and cached[0] == identity:
+            if model is not None:
+                validate_tokenizer(cached[1], path, model=model)
             return cached[1]
 
     tokenizer = Tokenizer.from_file(str(path))
-    validate_tokenizer(tokenizer, path)
+    validate_tokenizer(tokenizer, path, model=model)
     with _TOKENIZER_CACHE_LOCK:
         _TOKENIZER_CACHE[cache_key] = (identity, tokenizer)
     return tokenizer
 
 
-def validate_tokenizer(tokenizer: Tokenizer, tokenizer_path: str | Path | None = None) -> None:
+def validate_tokenizer(tokenizer: Tokenizer, tokenizer_path: str | Path | None = None, *, model: ModelName | None = None) -> None:
     validation_key: tuple[str, tuple[Any, ...]] | None = None
     validation_cached = False
     path: Path | None = None
@@ -292,14 +279,24 @@ def validate_tokenizer(tokenizer: Tokenizer, tokenizer_path: str | Path | None =
     if tokenizer.token_to_id(IMAGE_TOKEN) != IMAGE_TOKEN_ID:
         raise ValueError("<image> token id mismatch")
 
+    detected_model = "v2" if tokenizer.token_to_id("<PAGE>") == 128827 else "v1"
+    if model is not None:
+        get_model_variant(model)
+        if model != detected_model:
+            raise ValueError(f"tokenizer is for {detected_model}, but model={model!r} was requested")
+    variant = get_model_variant(detected_model)
+    if detected_model == "v2":
+        for token_id, token in V2_ADDED_TOKENS.items():
+            if tokenizer.token_to_id(token) != token_id:
+                raise ValueError(f"v2 {token} token id mismatch")
     if validation_cached:
         return
 
     if path is not None:
         raw = _load_json(path)
         added = raw.get("added_tokens", [])
-        if len(added) != ADDED_TOKEN_COUNT:
-            raise ValueError(f"added token count mismatch: expected {ADDED_TOKEN_COUNT}, got {len(added)}")
+        if len(added) != variant.added_token_count:
+            raise ValueError(f"added token count mismatch: expected {variant.added_token_count}, got {len(added)}")
 
         config_path = path.with_name("config.json")
         if config_path.exists():
@@ -503,15 +500,21 @@ def _max_new_tokens_from_total(max_length: int, prompt_tokens: int, explicit_max
 
 def prepare_image(image: ImageInput,
                   *,
-                  prompt: str = SINGLE_PROMPT,
+                  prompt: str | None = None,
+                  model: ModelName = "v1",
                   preset: str | Preset = "gundam",
                   tokenizer_path: str | Path | None = None,
                   max_length: int = 32768,
                   max_new_tokens: int | None = None,
                   dtype: np.dtype[Any] | type[np.float16] | type[np.float32] = np.float16) -> PreparedRequest:
+    get_model_variant(model)
     cfg = _resolve_preset(preset)
-    tokenizer_path_resolved = _resolve_tokenizer_path(tokenizer_path)
-    tokenizer = load_tokenizer(tokenizer_path_resolved)
+    if prompt is None:
+        prompt = V2_PROMPT if model == "v2" else SINGLE_PROMPT
+    if model == "v2" and (prompt.count("<PAGE>") != 1 or "<PAGE><image>" not in prompt):
+        raise ValueError("v2 single-page prompts require one <PAGE><image> pair")
+    tokenizer_path_resolved = _resolve_tokenizer_path(tokenizer_path, model=model)
+    tokenizer = load_tokenizer(tokenizer_path_resolved, model=model)
     rendered = render_prompt(prompt)
     pil_image, source_metadata = _load_image_with_metadata(image, source_index=0)
 
@@ -522,7 +525,7 @@ def prepare_image(image: ImageInput,
             crop_grid = (1, 1)
             local_crops: list[Image.Image] = []
         else:
-            local_crops, crop_grid = dynamic_preprocess(pil_image, image_size=cfg.image_size)
+            local_crops, crop_grid = dynamic_preprocess(pil_image, image_size=cfg.image_size, max_num=16 if model == "v2" else 32)
         if crop_grid[0] > 1 or crop_grid[1] > 1:
             for crop in local_crops:
                 views.append(ImageView.from_pixels(preprocess_view(crop, cfg.image_size, dtype=dtype), kind="local", source_index=0))
@@ -553,19 +556,25 @@ def prepare_image(image: ImageInput,
 
 def prepare_pages(images: Sequence[ImageInput],
                   *,
-                  prompt: str = MULTI_PROMPT,
+                  prompt: str | None = None,
+                  model: ModelName = "v1",
                   tokenizer_path: str | Path | None = None,
                   image_size: int = GLOBAL_VIEW_SIZE,
                   max_length: int = 32768,
                   max_new_tokens: int | None = None,
                   dtype: np.dtype[Any] | type[np.float16] | type[np.float32] = np.float16) -> PreparedRequest:
+    get_model_variant(model)
     if not images:
         raise ValueError("prepare_pages requires at least one image")
     if image_size != GLOBAL_VIEW_SIZE:
-        raise ValueError("v1 multi-page frontend supports only 1024x1024 global views")
+        raise ValueError("multi-page frontend supports only 1024x1024 global views")
 
-    tokenizer_path_resolved = _resolve_tokenizer_path(tokenizer_path)
-    tokenizer = load_tokenizer(tokenizer_path_resolved)
+    if prompt is None:
+        prompt = "<PAGE><image>" * len(images) + "Multi page parsing." if model == "v2" else MULTI_PROMPT
+    if model == "v2" and (prompt.count("<PAGE>") != len(images) or prompt.count("<PAGE><image>") != len(images)):
+        raise ValueError("v2 multi-page prompts require one <PAGE><image> pair per image")
+    tokenizer_path_resolved = _resolve_tokenizer_path(tokenizer_path, model=model)
+    tokenizer = load_tokenizer(tokenizer_path_resolved, model=model)
     rendered = render_prompt(prompt)
 
     views: list[ImageView] = []
@@ -575,7 +584,8 @@ def prepare_pages(images: Sequence[ImageInput],
         source_images.append(source_metadata)
         views.append(ImageView.from_pixels(preprocess_view(pil_image, image_size, dtype=dtype), kind="global", source_index=source_index))
 
-    visual_counts = [global_visual_token_count(image_size) * len(views)]
+    visual_counts = ([global_visual_token_count(image_size)] * len(views) if model == "v2"
+                     else [global_visual_token_count(image_size) * len(views)])
     input_ids, image_mask = _build_token_sequence(tokenizer, rendered, visual_counts)
     request_max_new = _max_new_tokens_from_total(max_length, int(input_ids.shape[0]), max_new_tokens)
     return PreparedRequest(
@@ -596,11 +606,15 @@ def prepare_pages(images: Sequence[ImageInput],
 
 def prepare_text(prompt: str,
                  *,
+                 model: ModelName = "v1",
                  tokenizer_path: str | Path | None = None,
                  max_length: int = 32768,
                  max_new_tokens: int | None = None) -> PreparedRequest:
-    tokenizer_path_resolved = _resolve_tokenizer_path(tokenizer_path)
-    tokenizer = load_tokenizer(tokenizer_path_resolved)
+    get_model_variant(model)
+    if model == "v2":
+        raise ValueError("v2 currently supports page-marked OCR requests only")
+    tokenizer_path_resolved = _resolve_tokenizer_path(tokenizer_path, model=model)
+    tokenizer = load_tokenizer(tokenizer_path_resolved, model=model)
     rendered = render_prompt(prompt)
     input_ids, image_mask = _build_token_sequence(tokenizer, rendered, [])
     request_max_new = _max_new_tokens_from_total(max_length, int(input_ids.shape[0]), max_new_tokens)

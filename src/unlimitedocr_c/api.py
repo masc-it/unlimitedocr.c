@@ -16,23 +16,22 @@ from io import BytesIO
 import os
 from pathlib import Path
 import sys
+import struct
 import threading
 from typing import IO, Literal
 from urllib.request import Request, urlopen
 
 from PIL import Image
 
-from .convert import build_dry_run_plan, write_uocr_model
+from .convert import QPROFILE_IDS, build_dry_run_plan, write_uocr_model
 from .ffi import Engine, EngineOptions
 from .frontend import (
     PRESETS,
-    SINGLE_PROMPT,
     default_tokenizer_path,
-    is_source_tree_package,
     prepare_image,
-    project_root,
 )
 from .ocr import decode_generated_ids, default_resource_path
+from .model_variants import ModelName, MODEL_REPOSITORIES, get_model_variant, model_cache_dir, source_model
 
 ProfileName = Literal["base", "gundam"]
 ImageSource = str | os.PathLike[str] | bytes | bytearray | memoryview | IO[bytes] | Image.Image
@@ -40,7 +39,7 @@ ImageSource = str | os.PathLike[str] | bytes | bytearray | memoryview | IO[bytes
 DEFAULT_MODEL_FILENAME = "unlimitedocr-fp16.uocr"
 DEFAULT_Q8_MODEL_FILENAME = "unlimitedocr-q8.uocr"
 DEFAULT_Q4_MODEL_FILENAME = "unlimitedocr-q4.uocr"
-DEFAULT_SOURCE_MODEL_REPO_ID = "baidu/Unlimited-OCR"
+DEFAULT_SOURCE_MODEL_REPO_ID = MODEL_REPOSITORIES["v1"]
 DEFAULT_MAX_LENGTH = 32768
 class ModelResolutionError(FileNotFoundError):
     """Raised when a usable `.uocr` model cannot be found or downloaded."""
@@ -67,17 +66,30 @@ def _env_flag(name: str, *, default: bool) -> bool:
     return value.lower() not in {"0", "false", "no", "off"}
 
 
-def _require_existing_model(path: str | Path, *, source: str) -> Path:
+def _require_existing_model(path: str | Path, *, source: str, model: ModelName = "v1", qprofile: str | None = None) -> Path:
     resolved = Path(path).expanduser()
     if not resolved.exists():
         raise ModelResolutionError(f"{source} points to a missing model file: {resolved}")
     if not resolved.is_file():
         raise ModelResolutionError(f"{source} must be a .uocr file, got: {resolved}")
+    # Full file validation remains native. Reject a recognized but incompatible
+    # variant here, before selecting its tokenizer or allocating an engine.
+    with resolved.open("rb") as f:
+        prefix = f.read(24)
+    if len(prefix) >= 8 and prefix[:4] == b"UOCR":
+        version = struct.unpack_from("<I", prefix, 4)[0]
+        if version != get_model_variant(model).format_version:
+            raise ModelResolutionError(f"{source} has format version {version}, incompatible with model={model!r}")
+        if qprofile is not None and len(prefix) == 24 and struct.unpack_from("<I", prefix, 20)[0] != QPROFILE_IDS[qprofile]:
+            raise ModelResolutionError(f"{source} has incompatible quantization; expected {qprofile}")
     return resolved.resolve()
 
 
-def _candidate_model_paths(cache_dir: Path, filename: str) -> list[Path]:
-    return [cache_dir / filename, cache_dir / "models" / filename]
+def _candidate_model_paths(cache_dir: Path, filename: str, model: ModelName = "v1", *, qprofile: str = "fp16") -> list[Path]:
+    paths = [model_cache_dir(cache_dir, model) / qprofile / filename]
+    if model == "v1" and source_model(model) == (MODEL_REPOSITORIES["v1"], None):
+        paths.extend([cache_dir / filename, cache_dir / "models" / filename])
+    return paths
 
 
 def _hf_local_files_only() -> bool:
@@ -117,16 +129,17 @@ def _download_and_convert_source_model(
     qprofile: str = "fp16",
     quant_cfg_path: str | Path | None = None,
     force: bool = False,
+    model: ModelName = "v1",
 ) -> Path:
     from huggingface_hub import snapshot_download
     from .quant_cfg import load_default_quant_config, load_quant_config
 
+    cache_dir = model_cache_dir(cache_dir, model) / qprofile
     out_path = cache_dir / filename
     if out_path.exists() and not force:
-        return out_path.resolve()
+        return _require_existing_model(out_path, source="cached model", model=model, qprofile=qprofile)
 
-    source_repo_id = os.environ.get("UOCR_SOURCE_MODEL_REPO_ID", DEFAULT_SOURCE_MODEL_REPO_ID)
-    revision = os.environ.get("UOCR_SOURCE_MODEL_REVISION") or None
+    source_repo_id, revision = source_model(model)
     snapshot = Path(
         snapshot_download(
             repo_id=source_repo_id,
@@ -152,6 +165,8 @@ def _download_and_convert_source_model(
         tmp_path.unlink()
     quant_cfg = load_quant_config(quant_cfg_path) if quant_cfg_path is not None else load_default_quant_config()
     plan = build_dry_run_plan(snapshot, qprofile=qprofile, quant_cfg=quant_cfg)
+    if plan.model_variant != model:
+        raise ValueError(f"source checkpoint is {plan.model_variant}, but model={model!r} was requested")
     write_uocr_model(plan, tmp_path, overwrite=True, stats_path=stats_path)
     tmp_path.replace(out_path)
     return out_path.resolve()
@@ -165,13 +180,15 @@ def resolve_model_path(
     quant: str | None = None,
     quant_cfg_path: str | Path | None = None,
     force_reconvert: bool = False,
+    model: ModelName = "v1",
 ) -> Path:
     """Resolve a `.uocr` model path using env, local cache, and HF conversion.
 
     Resolution order:
     1. explicit ``model_path``
     2. ``UOCR_MODEL_PATH``
-    3. cache directory (filename depends on ``quant``)
+    3. model/repository/revision cache (filename depends on ``quant``), then
+       legacy cache paths for the default v1 source only
     4. Hugging Face download of the upstream checkpoint followed by conversion
 
     ``quant`` selects the conversion profile when downloading/converting:
@@ -180,42 +197,40 @@ def resolve_model_path(
     experts Q4_0, remaining decoder modules Q8_0), both gated by
     ``configs/quant-cfg.yaml``.
 
-    ``force_reconvert`` deletes any cached model for the selected ``quant`` and
-    re-runs conversion.  This is useful when ``configs/quant-cfg.yaml`` has
-    changed and the cached model is stale.  It has no effect when
+    ``force_reconvert`` bypasses the selected cache entry and atomically replaces
+    it after conversion succeeds; failed conversions leave existing files intact.
+    It requires ``download=True`` and has no effect when
     ``model_path``/``UOCR_MODEL_PATH`` is set.
     """
 
+    get_model_variant(model)
     if model_path is not None:
-        return _require_existing_model(model_path, source="model_path")
+        return _require_existing_model(model_path, source="model_path", model=model)
 
     env_model_path = os.environ.get("UOCR_MODEL_PATH")
     if env_model_path:
-        return _require_existing_model(env_model_path, source="UOCR_MODEL_PATH")
+        return _require_existing_model(env_model_path, source="UOCR_MODEL_PATH", model=model)
 
     qprofile = _quant_profile_for(quant)
-    filename = _model_filename_for(quant) if qprofile in {"mixed-q8_0", "mixed-q4"} else os.environ.get(
-        "UOCR_MODEL_FILENAME", DEFAULT_MODEL_FILENAME
-    )
+    filename = _model_filename_for(quant)
+    if not filename or Path(filename).name != filename:
+        raise ValueError("UOCR model filename must be a filename, not a path; use UOCR_MODEL_PATH for explicit files")
     resolved_cache_dir = Path(cache_dir).expanduser() if cache_dir is not None else default_cache_dir()
-
-    if force_reconvert:
-        for candidate in _candidate_model_paths(resolved_cache_dir, filename):
-            candidate = candidate.expanduser()
-            if candidate.exists() and candidate.is_file():
-                candidate.unlink()
+    candidates = _candidate_model_paths(resolved_cache_dir, filename, model, qprofile=qprofile)
+    if force_reconvert and not download:
+        raise ValueError("force_reconvert requires download=True")
 
     seen: set[Path] = set()
-    for candidate in _candidate_model_paths(resolved_cache_dir, filename):
+    for candidate in candidates:
         candidate = candidate.expanduser()
         if candidate in seen:
             continue
         seen.add(candidate)
-        if candidate.exists() and candidate.is_file():
-            return candidate.resolve()
+        if not force_reconvert and candidate.exists() and candidate.is_file():
+            return _require_existing_model(candidate, source="cached model", model=model, qprofile=qprofile)
 
     if not download:
-        searched = "\n  ".join(str(path) for path in _candidate_model_paths(resolved_cache_dir, filename))
+        searched = "\n  ".join(str(path) for path in candidates)
         raise ModelResolutionError(
             "could not find an UnlimitedOCR .uocr model. Searched:\n  "
             + searched
@@ -230,6 +245,7 @@ def resolve_model_path(
             qprofile=qprofile,
             quant_cfg_path=quant_cfg_path,
             force=force_reconvert,
+            model=model,
         )
     except Exception as exc:  # pragma: no cover - network/large-conversion path
         raise ModelResolutionError(
@@ -351,7 +367,10 @@ class UnlimitedOCR:
         quant: str | None = None,
         quant_cfg_path: str | Path | None = None,
         force_reconvert: bool = False,
+        model: ModelName = "v1",
     ) -> None:
+        get_model_variant(model)
+        self._model = model
         self._model_path = resolve_model_path(
             model_path,
             cache_dir=cache_dir,
@@ -359,24 +378,32 @@ class UnlimitedOCR:
             quant=quant,
             quant_cfg_path=quant_cfg_path,
             force_reconvert=force_reconvert,
+            model=model,
         )
         self._backend = backend.lower()
         self._memory_budget_bytes = int(memory_budget_bytes)
         self._library_path = str(library_path) if library_path is not None else None
         resolved_resource_path = resource_path if resource_path is not None else default_resource_path(self._backend)
         self._resource_path = str(resolved_resource_path) if resolved_resource_path is not None else None
-        self._tokenizer_path = str(default_tokenizer_path())
+        self._tokenizer_path = str(default_tokenizer_path(model=model, local_files_only=not download or _hf_local_files_only()))
         self._request_timeout = float(request_timeout)
         self._lock = threading.RLock()
         self._engine: Engine | None = None
         self._engine_prompt_capacity = 0
         self._engine_gen_capacity = 0
 
-        # Eagerly open the engine so warmup runs at construction time.
-        # Use maximum capacities so the engine is never recreated for any
-        # subsequent request — warmup runs exactly once.
+        # V1 keeps its existing eager capacity. V2 must not eagerly allocate
+        # the entire 131072-token context; grow to actual window budgets later.
         print(f"model: {self._model_path}", file=sys.stderr)
-        self._ensure_engine(prompt_capacity=DEFAULT_MAX_LENGTH, gen_capacity=DEFAULT_MAX_LENGTH)
+        self._ensure_engine(
+            prompt_capacity=DEFAULT_MAX_LENGTH if model == "v1" else 4096,
+            gen_capacity=DEFAULT_MAX_LENGTH if model == "v1" else 512,
+        )
+
+    @property
+    def model(self) -> ModelName:
+        """Selected checkpoint variant, independent of image/quantization profile."""
+        return self._model
 
     @property
     def model_path(self) -> Path:
@@ -415,7 +442,7 @@ class UnlimitedOCR:
     def _open_engine(self, *, prompt_capacity: int, gen_capacity: int) -> Engine:
         return Engine(
             EngineOptions(
-                model_path=str(self._model_path) if self._backend != "cpu-ref" else None,
+                model_path=str(self._model_path) if self._backend != "cpu-ref" or self._model == "v2" else None,
                 backend=self._backend,
                 resource_path=self._resource_path,
                 max_batch=1,
@@ -460,7 +487,7 @@ class UnlimitedOCR:
         pil_image = load_user_image(image, timeout=self._request_timeout)
         request = prepare_image(
             pil_image,
-            prompt=SINGLE_PROMPT,
+            model=self._model,
             preset=profile,
             tokenizer_path=self._tokenizer_path,
             max_length=DEFAULT_MAX_LENGTH,
@@ -483,6 +510,7 @@ __all__ = [
     "DEFAULT_SOURCE_MODEL_REPO_ID",
     "ImageSource",
     "ModelResolutionError",
+    "ModelName",
     "ProfileName",
     "UnlimitedOCR",
     "default_cache_dir",
