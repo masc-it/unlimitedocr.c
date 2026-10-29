@@ -12437,6 +12437,190 @@ int uocr_metal_context_page_rope_f16(uocr_metal_context *ctx,
     }
 }
 
+static int metal_run_dash_norm_buffer_f16(uocr_metal_context *ctx,
+    const uocr_metal_buffer_slice buffers[4], uint32_t n_rows, char *error, size_t error_size) {
+    if (ctx == NULL || n_rows == 0u || n_rows > UOCR_V2_MAX_POSITIONS)
+        return metal_fail(error, error_size, "invalid DASH norm dimensions");
+    for (uint32_t i = 0; i < 4u; ++i) {
+        if (!metal_slice_valid(buffers[i], (i < 2u ? (uint64_t)n_rows : 1u) * 128u * 2u))
+            return metal_fail(error, error_size, "invalid DASH norm buffer %u", i);
+    }
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, "uocr_dash_norm_f16_inplace", error, error_size);
+        if (pipeline == nil) return 0;
+        if (pipeline.threadExecutionWidth != 32u || pipeline.maxTotalThreadsPerThreadgroup < 32u)
+            return metal_fail(error, error_size, "DASH norm requires 32-lane Metal SIMD groups");
+        int owned = 0;
+        id<MTLCommandBuffer> cb = metal_command_buffer_for_op(ctx, &owned, "DASH norm", error, error_size);
+        if (cb == nil) return 0;
+        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
+        if (enc == nil) return metal_fail(error, error_size, "failed to create DASH norm encoder");
+        [enc setComputePipelineState:pipeline];
+        for (uint32_t i = 0; i < 4u; ++i) [enc setBuffer:buffers[i].buffer offset:buffers[i].offset atIndex:i];
+        [enc dispatchThreadgroups:MTLSizeMake(n_rows, 2u, 1u) threadsPerThreadgroup:MTLSizeMake(32u, 1u, 1u)];
+        [enc endEncoding];
+        return metal_finish_command_buffer_for_op(ctx, cb, owned, "DASH norm", error, error_size);
+    }
+}
+
+int uocr_metal_context_dash_norm_f16(uocr_metal_context *ctx,
+    uint16_t *q, uint16_t *k, const uint16_t *q_weight, const uint16_t *k_weight,
+    uint32_t n_rows, char *error, size_t error_size) {
+    metal_clear_error(error, error_size);
+    if (ctx == NULL || q == NULL || k == NULL || q_weight == NULL || k_weight == NULL ||
+        n_rows == 0u || n_rows > UOCR_V2_MAX_POSITIONS)
+        return metal_fail(error, error_size, "invalid host DASH norm request");
+    if (metal_command_batch_active(ctx))
+        return metal_fail(error, error_size, "host DASH norm requires an idle command batch");
+    const uint64_t bytes = (uint64_t)n_rows * 128u * 2u;
+    if (bytes > SIZE_MAX || bytes > metal_device_max_buffer_length(ctx->device))
+        return metal_fail(error, error_size, "DASH norm exceeds device buffer limits");
+    @autoreleasepool {
+        const void *inputs[4] = {q, k, q_weight, k_weight};
+        uocr_metal_buffer_slice buffers[4] = {0};
+        int ok = 1;
+        for (uint32_t i = 0; i < 4u; ++i) {
+            buffers[i].buffer = metal_new_buffer_with_bytes(ctx, inputs[i], i < 2u ? (NSUInteger)bytes : 256u,
+                                                           MTLResourceStorageModeShared);
+            if (buffers[i].buffer == nil) {
+                ok = metal_fail(error, error_size, "failed to allocate host DASH norm buffer %u", i);
+                break;
+            }
+        }
+        if (ok) ok = metal_run_dash_norm_buffer_f16(ctx, buffers, n_rows, error, error_size);
+        if (ok) {
+            memcpy(q, [buffers[0].buffer contents], (size_t)bytes);
+            memcpy(k, [buffers[1].buffer contents], (size_t)bytes);
+        }
+        for (uint32_t i = 0; i < 4u; ++i) [buffers[i].buffer release];
+        return ok;
+    }
+}
+
+typedef struct uocr_metal_dash_params {
+    uint32_t n_keys, query_start, n_queries, first_block;
+} uocr_metal_dash_params;
+
+enum uocr_metal_dash_slot {
+    DASH_Q, DASH_K, DASH_V, DASH_ROUTER_Q, DASH_ROUTER_K, DASH_HEAD_CLS,
+    DASH_POSITIONS, DASH_SUMMARIES, DASH_PAGE_RANGES, DASH_SELECTIONS, DASH_OUTPUT,
+    DASH_BUFFER_COUNT
+};
+_Static_assert(sizeof(uocr_dash_selection) == 96u, "DASH CPU/Metal selection layout mismatch");
+
+static int metal_dash_buffer_sizes(uocr_metal_dash_params p, uint64_t bytes[DASH_BUFFER_COUNT],
+                                   char *error, size_t error_size) {
+    if (p.n_keys == 0u || p.n_keys > UOCR_V2_MAX_POSITIONS || p.n_queries == 0u ||
+        p.query_start >= p.n_keys || p.n_queries > p.n_keys - p.query_start ||
+        p.first_block > p.query_start / 32u) {
+        return metal_fail(error, error_size, "invalid DASH active-window dimensions");
+    }
+    const uint64_t blocks = ((uint64_t)p.n_keys + 31u) / 32u;
+    bytes[DASH_Q] = bytes[DASH_OUTPUT] = (uint64_t)p.n_queries * UOCR_HIDDEN_SIZE * 2u;
+    bytes[DASH_K] = bytes[DASH_V] = (uint64_t)p.n_keys * UOCR_HIDDEN_SIZE * 2u;
+    bytes[DASH_ROUTER_Q] = (uint64_t)p.n_queries * 128u * 2u;
+    bytes[DASH_ROUTER_K] = (uint64_t)p.n_keys * 128u * 2u;
+    bytes[DASH_HEAD_CLS] = 128u * 2u;
+    bytes[DASH_POSITIONS] = (uint64_t)p.n_keys * sizeof(uocr_page_position);
+    bytes[DASH_SUMMARIES] = blocks * 128u * sizeof(float);
+    bytes[DASH_PAGE_RANGES] = blocks * 2u * sizeof(int32_t);
+    bytes[DASH_SELECTIONS] = (uint64_t)p.n_queries * sizeof(uocr_dash_selection);
+    return 1;
+}
+
+// Three ordered GPU stages; caller owns all slices. No per-query score matrix
+// or gathered K/V allocation. first_block allows cached completed summaries.
+static int metal_run_dash_buffer_f16(uocr_metal_context *ctx,
+                                     const uocr_metal_buffer_slice buffers[DASH_BUFFER_COUNT],
+                                     uocr_metal_dash_params params,
+                                     char *error, size_t error_size) {
+    uint64_t bytes[DASH_BUFFER_COUNT];
+    if (ctx == NULL) return metal_fail(error, error_size, "missing DASH Metal context");
+    if (!metal_dash_buffer_sizes(params, bytes, error, error_size)) return 0;
+    for (uint32_t i = 0; i < DASH_BUFFER_COUNT; ++i) {
+        if (!metal_slice_valid(buffers[i], bytes[i]))
+            return metal_fail(error, error_size, "invalid DASH buffer %u", i);
+    }
+    const char *names[3] = {"uocr_dash_summary_f16", "uocr_dash_route_f16", "uocr_dash_attend_f16"};
+    const uint32_t bindings[3][5] = {
+        {DASH_ROUTER_K, DASH_HEAD_CLS, DASH_POSITIONS, DASH_SUMMARIES, DASH_PAGE_RANGES},
+        {DASH_ROUTER_Q, DASH_SUMMARIES, DASH_PAGE_RANGES, DASH_POSITIONS, DASH_SELECTIONS},
+        {DASH_Q, DASH_K, DASH_V, DASH_SELECTIONS, DASH_OUTPUT}
+    };
+    const MTLSize groups[3] = {
+        MTLSizeMake((params.n_keys+31u)/32u - params.first_block, 1u, 1u),
+        MTLSizeMake(params.n_queries, 1u, 1u),
+        MTLSizeMake(params.n_queries, UOCR_ATTENTION_HEADS, 1u)
+    };
+    @autoreleasepool {
+        int owned = 0;
+        id<MTLCommandBuffer> cb = metal_command_buffer_for_op(ctx, &owned, "DASH attention", error, error_size);
+        if (cb == nil) return 0;
+        for (uint32_t stage = 0; stage < 3u; ++stage) {
+            id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, names[stage], error, error_size);
+            if (pipeline == nil) return 0;
+            if (pipeline.threadExecutionWidth != 32u || pipeline.maxTotalThreadsPerThreadgroup < 32u)
+                return metal_fail(error, error_size, "DASH requires 32-lane Metal SIMD groups");
+            id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
+            if (enc == nil) return metal_fail(error, error_size, "failed to create DASH encoder");
+            [enc setComputePipelineState:pipeline];
+            for (uint32_t slot = 0; slot < 5u; ++slot) {
+                const uocr_metal_buffer_slice slice = buffers[bindings[stage][slot]];
+                [enc setBuffer:slice.buffer offset:slice.offset atIndex:slot];
+            }
+            [enc setBytes:&params length:sizeof(params) atIndex:5u];
+            [enc dispatchThreadgroups:groups[stage] threadsPerThreadgroup:MTLSizeMake(32u, 1u, 1u)];
+            [enc endEncoding];
+        }
+        return metal_finish_command_buffer_for_op(ctx, cb, owned, "DASH attention", error, error_size);
+    }
+}
+
+int uocr_metal_context_dash_attention_f16(uocr_metal_context *ctx,
+    const uint16_t *q, const uint16_t *k, const uint16_t *v,
+    const uint16_t *router_q, const uint16_t *router_k, const uint16_t *head_cls,
+    const uocr_page_position *positions,
+    uint32_t n_keys, uint32_t query_start, uint32_t n_queries,
+    uint16_t *output, uocr_dash_selection *selections, float *summaries,
+    char *error, size_t error_size) {
+    metal_clear_error(error, error_size);
+    if (ctx == NULL || q == NULL || k == NULL || v == NULL || router_q == NULL || router_k == NULL ||
+        head_cls == NULL || positions == NULL || output == NULL || selections == NULL || summaries == NULL)
+        return metal_fail(error, error_size, "missing host DASH arrays");
+    if (metal_command_batch_active(ctx))
+        return metal_fail(error, error_size, "host DASH requires an idle command batch");
+    const uocr_metal_dash_params params = {n_keys, query_start, n_queries, 0u};
+    uint64_t bytes[DASH_BUFFER_COUNT];
+    if (!metal_dash_buffer_sizes(params, bytes, error, error_size)) return 0;
+    const uint64_t limit = metal_device_max_buffer_length(ctx->device);
+    for (uint32_t i = 0; i < DASH_BUFFER_COUNT; ++i) {
+        if (bytes[i] > limit || bytes[i] > SIZE_MAX)
+            return metal_fail(error, error_size, "DASH buffer %u exceeds device limits", i);
+    }
+    @autoreleasepool {
+        const void *inputs[DASH_BUFFER_COUNT] = {q, k, v, router_q, router_k, head_cls, positions};
+        uocr_metal_buffer_slice buffers[DASH_BUFFER_COUNT] = {0};
+        int ok = 1;
+        for (uint32_t i = 0; i < DASH_BUFFER_COUNT; ++i) {
+            buffers[i].buffer = inputs[i] != NULL
+                ? metal_new_buffer_with_bytes(ctx, inputs[i], (NSUInteger)bytes[i], MTLResourceStorageModeShared)
+                : metal_new_buffer_with_length(ctx, (NSUInteger)bytes[i], MTLResourceStorageModeShared);
+            if (buffers[i].buffer == nil) {
+                ok = metal_fail(error, error_size, "failed to allocate host DASH buffer %u", i);
+                break;
+            }
+        }
+        if (ok) ok = metal_run_dash_buffer_f16(ctx, buffers, params, error, error_size);
+        if (ok) {
+            memcpy(output, [buffers[DASH_OUTPUT].buffer contents], (size_t)bytes[DASH_OUTPUT]);
+            memcpy(selections, [buffers[DASH_SELECTIONS].buffer contents], (size_t)bytes[DASH_SELECTIONS]);
+            memcpy(summaries, [buffers[DASH_SUMMARIES].buffer contents], (size_t)bytes[DASH_SUMMARIES]);
+        }
+        for (uint32_t i = 0; i < DASH_BUFFER_COUNT; ++i) [buffers[i].buffer release];
+        return ok;
+    }
+}
+
 static int metal_run_rope_qk_buffer_f16(uocr_metal_context *ctx,
                                         uocr_metal_buffer_slice q,
                                         uocr_metal_buffer_slice k,

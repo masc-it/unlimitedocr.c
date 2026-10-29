@@ -399,6 +399,34 @@ int uocr_metal_context_select_next_token_f16(uocr_metal_context *ctx,
                                              float *scores_out_f32_or_null,
                                              char *error,
                                              size_t error_size);
+/* In-place Gemma RMSNorm on projected router Q/K [n_rows,128], using raw
+ * checkpoint weights [128]. Adds 1 to weights in FP32, eps=1e-6. */
+int uocr_metal_context_dash_norm_f16(uocr_metal_context *ctx,
+    uint16_t *q, uint16_t *k, const uint16_t *q_weight, const uint16_t *k_weight,
+    uint32_t n_rows, char *error, size_t error_size);
+
+/* CPU/Metal layout: one fixed remote-read budget per query. */
+typedef struct uocr_dash_selection {
+    int32_t blocks[12]; /* -1 for unused slots */
+    float bias[12];
+} uocr_dash_selection;
+
+/* Synchronous DASH bring-up operation. Main Q/output: [n_queries,10,128];
+ * main K/V: [n_keys,10,128]. Router Q/K: [n_queries,128]/[n_keys,128],
+ * already Gemma-normalized and RoPE'd; head_cls: [128]. All are FP16.
+ * Queries occupy [query_start, query_start+n_queries) in the retained window.
+ * positions: [n_keys]; selections: [n_queries]; summaries: [ceil(n_keys/32),128]
+ * FP32. All outputs are required and remain untouched on failure. The internal
+ * buffer path retains summaries and refreshes only changed blocks on decode.
+ * This does not map model weights or enable v2 generation. */
+int uocr_metal_context_dash_attention_f16(uocr_metal_context *ctx,
+    const uint16_t *q, const uint16_t *k, const uint16_t *v,
+    const uint16_t *router_q, const uint16_t *router_k, const uint16_t *head_cls,
+    const uocr_page_position *positions,
+    uint32_t n_keys, uint32_t query_start, uint32_t n_queries,
+    uint16_t *output, uocr_dash_selection *selections, float *summaries,
+    char *error, size_t error_size);
+
 /* Standalone synchronous v2 RoPE operation; no model weights required.
  * Q/K are in-place FP16 arrays [n_tokens, heads, 128], heads is 1 or 10.
  * Positions use uocr_page_state's CPU/Metal layout. The v2 decoder will use

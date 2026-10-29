@@ -64,10 +64,14 @@ The authoritative path is `configure_dash_inference` plus `_infer_prefill_attend
 2. Apply page-aware RoPE to router Q/K as well as main attention Q/K.
 3. Partition keys into 32-token blocks. The learned `head_cls` produces a softmax-weighted router-key summary per block.
 4. Score remote blocks and apply the page-aware image candidate mask. Preserve upstream fallback when a query has no allowed candidates.
-5. Select the top 16 candidate scores for entmax-1.5, then retain up to 12 remote blocks. The per-layer configured scale is 128 and prior floor is 0.0001.
+5. Select the top 16 scores after finite candidate masking for entmax-1.5, then retain up to 12 remote blocks. Reapply candidacy after selection: the -10000 masked sentinel can outrank extremely negative valid scores. The per-layer configured scale is 128 and prior floor is 0.0001.
 6. Convert priors into centered log-prior attention biases. Attend to selected blocks plus the causal local 128-token window. Local entries have zero bias and take precedence on overlap.
 
 The read set is at most 12 * 32 + 128 = 512 tokens per query, before accounting for overlap or fewer valid blocks. Routing and candidate-state management still have their own cost; bounded reads do not alone prove bounded total runtime or storage.
+
+The native primitive follows HF `_infer_route_select` and the wheel's Torch `DashRouterMath.route_and_select`: compute entmax over top-M, then center log priors over valid selected slots. Equal scores use earlier-block-first ordering natively; Torch `topk` does not promise stable tie ordering.
+
+The pinned wheel's optimized `route_triton.py::_entmax_kernel` differs: it bisects an entmax threshold over the full candidate domain, caps the selected support separately, and packs blocks in index order. Its `M` is an output width, not a pre-entmax top-M truncation. Saturated support or ties can therefore differ from HF. Keep HF as the single-window math oracle and use the wheel for continuation-state semantics; do not assume exact scheduler text parity without accounting for this difference.
 
 ### Position semantics
 

@@ -37,6 +37,7 @@ ORDER = [
     "moe.metal",
     "prompt_assembly.metal",
     "rope.metal",
+    "dash.metal",
     "sampling.metal",
     "sam_window.metal",
     "smoke.metal",
