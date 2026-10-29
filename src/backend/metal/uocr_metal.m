@@ -1664,6 +1664,15 @@ static id<MTLComputePipelineState> metal_get_pipeline_with_constants(uocr_metal_
         fn = [ctx->library newFunctionWithName:name constantValues:constant_values error:&ns_error];
     } else {
         fn = [ctx->library newFunctionWithName:name];
+        if ([fn.functionConstantsDictionary count] != 0u) {
+            // Even optional constants need an explicit specialization before
+            // pipeline creation. Empty values select the shader's runtime
+            // fallbacks; passing the unspecialized function aborts validation.
+            [fn release];
+            MTLFunctionConstantValues *empty = [MTLFunctionConstantValues new];
+            fn = [ctx->library newFunctionWithName:name constantValues:empty error:&ns_error];
+            [empty release];
+        }
     }
     if (fn == nil) {
         if (ns_error != nil) {
