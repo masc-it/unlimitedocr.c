@@ -16,6 +16,7 @@ typedef struct uocr_model_file {
     const uocr_file_header *header;
     const uocr_section_entry *sections;
     const uocr_config_record *config;
+    const uocr_v2_config_record *v2_config; /* NULL for v1 */
     const uocr_tokenizer_metadata_record *tokenizer_metadata;
     const uint8_t *tokenizer_payload;
     size_t tokenizer_payload_size;

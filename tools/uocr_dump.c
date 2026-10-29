@@ -38,6 +38,7 @@ int main(int argc, char **argv) {
     printf("path: %s\n", path);
     printf("size: %llu bytes\n", (unsigned long long)model.size);
     printf("format_version: %u\n", model.header->version);
+    printf("model_variant: %s\n", model.v2_config != NULL ? "v2" : "v1");
     printf("alignment: %u\n", model.header->required_alignment);
     printf("qprofile: %s (%u)\n", uocr_qprofile_name(model.header->qprofile), model.header->qprofile);
     printf("sections: %u\n", model.header->section_count);
@@ -76,6 +77,15 @@ int main(int argc, char **argv) {
                model.config->supported_local_view,
                model.config->vision_patch_size,
                model.config->downsample_ratio);
+    }
+
+    if (model.v2_config != NULL) {
+        const uocr_v2_config_record *v2 = model.v2_config;
+        printf("  sparse: page_token=%u block=%u index_dim=%u local=%u remote_blocks=%u top_m=%u\n",
+               v2->page_token_id, v2->sparse_block_size, v2->sparse_index_dim,
+               v2->local_window, v2->remote_blocks, v2->entmax_topm);
+        printf("  page_rope: token_theta=%u page_theta=%u page_pairs=%u page_mod=%u\n",
+               v2->rope_token_theta, v2->rope_page_theta, v2->rope_page_pairs, v2->rope_page_mod);
     }
 
     if (model.tokenizer_metadata != NULL) {

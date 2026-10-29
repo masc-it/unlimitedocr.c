@@ -1,15 +1,15 @@
 """FP16 conversion planning and `.uocr` writing for Unlimited-OCR.
 
-The planner can run from the cached safetensors header/index only, which keeps
-fast tests independent from the 6.67 GB checkpoint payload.  When the real
-safetensors file is present, the writer streams tensor ranges into the planned
-`.uocr` layout and converts BF16 payload bytes to fp16 without allocating a
-full-model temporary buffer.
+The planner can run from cached safetensors headers/index only, which keeps
+fast tests independent from the checkpoint payload. The writer streams tensor
+ranges from each shard into the planned `.uocr` layout and converts BF16 payload
+bytes without allocating a full-model temporary buffer.
 """
 
 from __future__ import annotations
 
 from collections import Counter
+from contextlib import ExitStack
 from dataclasses import dataclass, replace
 from functools import lru_cache
 import argparse
@@ -24,8 +24,11 @@ from typing import Any, BinaryIO, Iterable, Mapping
 import numpy as np
 
 from .frontend import project_root
+from .model_variants import MODEL_VARIANTS, V2_ADDED_TOKENS, V2_SPARSE_CONFIG, V2_ROPE_SCALING, V2_CONFIG_VALUES
 from .quant_cfg import QuantConfig, load_default_quant_config, load_quant_config
 from .tensor_registry import (
+    CLIP_POSITION_IDS_NAME,
+    SPARSE_PROJECTIONS,
     TensorFamily,
     TensorProjection,
     TensorRegistryEntry,
@@ -258,6 +261,7 @@ EXPECTED_SPECIAL_TOKENS: Mapping[int, str] = {
 _FILE_HEADER_STRUCT = struct.Struct("<4s7I2Q32s32s")
 _SECTION_ENTRY_STRUCT = struct.Struct("<IIQQQ")
 _CONFIG_RECORD_STRUCT = struct.Struct("<27I")
+_V2_CONFIG_STRUCT = struct.Struct("<12I3f")
 _TOKENIZER_METADATA_STRUCT = struct.Struct("<4I32s7I2Q")
 _PROVENANCE_RECORD_STRUCT = struct.Struct("<14I32s32s32s32s2Q")
 _TENSOR_DIRECTORY_HEADER_STRUCT = struct.Struct("<4I")
@@ -336,11 +340,13 @@ class TensorPlan:
     layout_flags: int
     transposed: bool
     layout_reason: str
+    source_file: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "name": self.name,
             "source_dtype": self.source_dtype,
+            "source_file": self.source_file,
             "shape": list(self.shape),
             "logical_shape": list(self.logical_shape),
             "physical_shape": list(self.physical_shape),
@@ -599,6 +605,10 @@ class DryRunPlan:
     family_histogram: Mapping[str, int]
 
     @property
+    def model_variant(self) -> str:
+        return str(self.source_metadata.config.get("model_variant", "v1"))
+
+    @property
     def tensor_count(self) -> int:
         return len(self.tensors)
 
@@ -611,6 +621,7 @@ class DryRunPlan:
     def summary_dict(self) -> dict[str, Any]:
         return {
             "hf_dir": str(self.hf_dir),
+            "model_variant": self.model_variant,
             "qprofile": self.qprofile,
             "tensor_count": self.tensor_count,
             "total_source_bytes": self.total_source_bytes,
@@ -654,7 +665,8 @@ def _read_json(path: Path) -> Any:
 
 
 @lru_cache(maxsize=16)
-def _read_json_cached(path: str) -> Any:
+def _read_json_cached(path: str, identity: tuple[int, int, int, int]) -> Any:
+    # Identity participates in the cache key so reconversion validates edits.
     return _read_json(Path(path))
 
 
@@ -669,7 +681,8 @@ def _read_json_object_if_exists(path: Path, *, strict: bool, label: str) -> dict
         if strict:
             raise FileNotFoundError(f"missing {label} file {path}")
         return None
-    data = _read_json_cached(str(path.resolve()))
+    stat = path.stat()
+    data = _read_json_cached(str(path.resolve()), (stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns))
     if not isinstance(data, dict):
         raise ValueError(f"{label} file {path} must contain a JSON object")
     return data
@@ -929,6 +942,7 @@ def _layout_dry_run_file(
     tensors: tuple[TensorPlan, ...],
     *,
     provenance_json_size: int = 0,
+    model_variant: str = "v1",
 ) -> tuple[tuple[SectionPlan, ...], tuple[TensorPlan, ...], int, int]:
     """Assign deterministic `.uocr` section and payload offsets for dry-run planning.
 
@@ -940,7 +954,8 @@ def _layout_dry_run_file(
     section_count = 5
     section_dir_offset = UOCR_FILE_HEADER_SIZE
     config_offset = _align_up(section_dir_offset + section_count * UOCR_SECTION_ENTRY_SIZE, 8)
-    tokenizer_offset = _align_up(config_offset + UOCR_CONFIG_RECORD_SIZE, 8)
+    config_size = UOCR_CONFIG_RECORD_SIZE + (_V2_CONFIG_STRUCT.size if model_variant == "v2" else 0)
+    tokenizer_offset = _align_up(config_offset + config_size, 8)
     provenance_offset = _align_up(tokenizer_offset + UOCR_TOKENIZER_METADATA_RECORD_SIZE, 8)
     provenance_size = UOCR_PROVENANCE_RECORD_SIZE + max(0, provenance_json_size)
     tensor_dir_offset = _align_up(provenance_offset + provenance_size, 8)
@@ -1000,7 +1015,7 @@ def _layout_dry_run_file(
     laid_out = [laid_out_by_id[tensor.tensor_id] for tensor in tensors]
     tensor_data_size = cursor - tensor_data_offset
     sections = (
-        SectionPlan(UOCR_SECTION_CONFIG, SECTION_NAMES[UOCR_SECTION_CONFIG], config_offset, UOCR_CONFIG_RECORD_SIZE, 8),
+        SectionPlan(UOCR_SECTION_CONFIG, SECTION_NAMES[UOCR_SECTION_CONFIG], config_offset, config_size, 8),
         SectionPlan(
             UOCR_SECTION_TOKENIZER_METADATA,
             SECTION_NAMES[UOCR_SECTION_TOKENIZER_METADATA],
@@ -1076,9 +1091,59 @@ def _default_safetensors_payload_path(hf_dir: Path) -> Path:
     raise FileNotFoundError(f"no real .safetensors payload file found under {hf_dir}")
 
 
+def _checkpoint_headers(
+    hf_dir: Path,
+    index: Mapping[str, Any] | None,
+    header_path: str | Path | None,
+) -> tuple[dict[str, Mapping[str, Any]], dict[str, str]]:
+    """Merge shard headers while keeping offsets relative to their own files."""
+    weight_map = index.get("weight_map", {}) if index is not None else {}
+    if not isinstance(weight_map, dict):
+        raise ValueError("safetensors index weight_map must be an object")
+    for name, filename in weight_map.items():
+        if (
+            not isinstance(filename, str)
+            or Path(filename).name != filename
+            or not filename.endswith(".safetensors")
+        ):
+            raise ValueError(f"invalid source shard for {name}: {filename!r}")
+    source_files = sorted(set(weight_map.values()))
+    if len(source_files) <= 1:
+        path = Path(header_path) if header_path is not None else None
+        if path is None and source_files:
+            source = hf_dir / source_files[0]
+            cached = source.with_name(source.name + ".header")
+            if source.is_file():
+                path = source
+            elif cached.is_file():
+                path = cached
+        header = _read_safetensors_header(path if path is not None else _default_header_path(hf_dir))
+        entries = {name: entry for name, entry in header.items() if name != "__metadata__"}
+    else:
+        if header_path is not None:
+            raise ValueError("--header cannot override a multi-shard checkpoint; use per-shard .header files")
+        entries = {}
+        for filename in source_files:
+            path = hf_dir / filename
+            if not path.is_file():
+                path = path.with_name(path.name + ".header")
+            header = _read_safetensors_header(path)
+            for name, entry in header.items():
+                if name == "__metadata__":
+                    continue
+                if name in entries:
+                    raise ValueError(f"duplicate tensor {name} in source shards")
+                if weight_map.get(name) != filename:
+                    raise ValueError(f"index shard mismatch for {name}: found in {filename}")
+                entries[name] = entry
+    if index is not None and set(entries) != set(weight_map):
+        raise ValueError("safetensors index and shard tensor names do not match")
+    return entries, weight_map
+
+
 def _check_config_value(actual: Any, expected: Any, key: str, *, label: str = "config") -> None:
     if isinstance(expected, float):
-        if abs(float(actual) - expected) > 1e-12:
+        if not math.isfinite(float(actual)) or abs(float(actual) - expected) > 1e-12:
             raise ValueError(f"{label} {key} mismatch: got {actual!r}, expected {expected!r}")
     elif actual != expected:
         raise ValueError(f"{label} {key} mismatch: got {actual!r}, expected {expected!r}")
@@ -1107,20 +1172,39 @@ def _check_token_content(value: Any, expected: str, key: str, *, label: str) -> 
 
 
 def _validate_config_object(config: Mapping[str, Any], *, label: str = "config") -> dict[str, Any]:
-    _check_required_values(config, EXPECTED_CONFIG, label=label)
-    _check_required_values(config, EXPECTED_TOP_LEVEL_CONFIG, label=label)
-    for key, expected in EXPECTED_CONFIG_DEFAULTS.items():
+    model_variant = "v2" if config.get("sparse_attention_config") else "v1"
+    variant = MODEL_VARIANTS[model_variant]
+    expected_config = {**EXPECTED_CONFIG, "max_position_embeddings": variant.max_positions}
+    expected_top = {**EXPECTED_TOP_LEVEL_CONFIG, "sliding_window": None if model_variant == "v2" else 128}
+    _check_required_values(config, expected_config, label=label)
+    _check_required_values(config, expected_top, label=label)
+    defaults = {**EXPECTED_CONFIG_DEFAULTS, "rope_theta": variant.rope_theta}
+    for key, expected in defaults.items():
         if key in config:
             _check_config_value(config[key], expected, key, label=label)
 
     language_config = config.get("language_config")
     if isinstance(language_config, Mapping):
-        _check_required_values(language_config, EXPECTED_CONFIG, label=f"{label}.language_config")
+        _check_required_values(language_config, expected_config, label=f"{label}.language_config")
         language_label = f"{label}.language_config"
         _check_config_value(language_config.get("use_mla"), False, "use_mla", label=language_label)
         _check_config_value(language_config.get("sliding_window_size"), 128, "sliding_window_size", label=language_label)
         _check_config_value(language_config.get("bos_token_id"), 0, "bos_token_id", label=language_label)
         _check_config_value(language_config.get("eos_token_id"), 1, "eos_token_id", label=language_label)
+
+    if model_variant == "v2":
+        sparse = config["sparse_attention_config"]
+        if not isinstance(sparse, Mapping):
+            raise ValueError("sparse_attention_config must be an object")
+        _check_required_values(sparse, V2_SPARSE_CONFIG, label="sparse_attention_config")
+        if "sparse_inconsistency_freq" in sparse:
+            _check_config_value(sparse["sparse_inconsistency_freq"], [1] * 12, "sparse_inconsistency_freq")
+        if not isinstance(language_config, Mapping):
+            raise ValueError("v2 requires language_config")
+        for obj, name in ((config, label), (language_config, f"{label}.language_config")):
+            _check_config_value(obj.get("rope_theta"), variant.rope_theta, "rope_theta", label=name)
+            _check_config_value(obj.get("rope_scaling"), V2_ROPE_SCALING, "rope_scaling", label=name)
+            _check_config_value(obj.get("sliding_window_size"), 128, "sliding_window_size", label=name)
 
     projector_config = config.get("projector_config")
     if not isinstance(projector_config, Mapping):
@@ -1155,6 +1239,7 @@ def _validate_config_object(config: Mapping[str, Any], *, label: str = "config")
         "present": True,
         "validated": True,
         "model_type": str(config.get("model_type")),
+        "model_variant": model_variant,
         "torch_dtype": str(config.get("torch_dtype")),
         "vocab_size": int(config["vocab_size"]),
         "hidden_size": int(config["hidden_size"]),
@@ -1162,7 +1247,7 @@ def _validate_config_object(config: Mapping[str, Any], *, label: str = "config")
         "attention_heads": int(config["num_attention_heads"]),
         "kv_heads": int(config["num_key_value_heads"]),
         "head_dim": head_dim,
-        "sliding_window": int(config.get("sliding_window", 0)),
+        "sliding_window": int(config.get("sliding_window") or 0),
         "projector_in": int(projector_config["input_dim"]),
         "projector_out": int(projector_config["n_embed"]),
         "sam_layers": int(sam["layers"]),
@@ -1176,11 +1261,19 @@ def validate_config(hf_dir: Path, *, strict: bool = True) -> dict[str, Any]:
     if config is None:
         return {"present": False, "validated": False}
     if not strict and not all(key in config for key in EXPECTED_CONFIG):
+        if config.get("sparse_attention_config"):
+            raise ValueError("v2 conversion requires a complete model config")
         return {"present": True, "validated": False}
     return _validate_config_object(config)
 
 
-def validate_processor_config(hf_dir: Path, *, strict: bool = True) -> dict[str, Any]:
+def validate_processor_config(hf_dir: Path, *, strict: bool = True, model_variant: str = "v1") -> dict[str, Any]:
+    if model_variant == "v2" and not (hf_dir / "processor_config.json").exists():
+        return {
+            "present": False, "validated": True, "source": "pinned-v2-input-contract",
+            "image_mean": [0.5] * 3, "image_std": [0.5] * 3,
+            "global_view_size": 1024, "local_view_size": 640, "max_crops": 16,
+        }
     processor = _read_json_object_if_exists(hf_dir / "processor_config.json", strict=strict, label="processor_config")
     if processor is None:
         return {"present": False, "validated": False}
@@ -1201,7 +1294,9 @@ def validate_processor_config(hf_dir: Path, *, strict: bool = True) -> dict[str,
     }
 
 
-def validate_tokenizer_metadata(hf_dir: Path, *, strict: bool = True) -> dict[str, Any]:
+def validate_tokenizer_metadata(hf_dir: Path, *, strict: bool = True, model_variant: str = "v1") -> dict[str, Any]:
+    variant = MODEL_VARIANTS[model_variant]
+    expected_tokens = {**EXPECTED_SPECIAL_TOKENS, **(V2_ADDED_TOKENS if model_variant == "v2" else {})}
     tokenizer_path = hf_dir / "tokenizer.json"
     tokenizer_config_path = hf_dir / "tokenizer_config.json"
     special_tokens_path = hf_dir / "special_tokens_map.json"
@@ -1229,11 +1324,11 @@ def validate_tokenizer_metadata(hf_dir: Path, *, strict: bool = True) -> dict[st
     _check_config_value(tokenizer_config.get("add_bos_token"), True, "add_bos_token", label="tokenizer_config")
     _check_config_value(tokenizer_config.get("add_eos_token"), False, "add_eos_token", label="tokenizer_config")
     added_decoder = tokenizer_config.get("added_tokens_decoder", {})
-    for token_id, content in EXPECTED_SPECIAL_TOKENS.items():
+    for token_id, content in expected_tokens.items():
         _check_token_content(
             added_decoder.get(str(token_id)), content, str(token_id), label="tokenizer_config.added_tokens_decoder"
         )
-    _check_config_value(len(added_decoder), 830, "added_tokens_decoder", label="tokenizer_config")
+    _check_config_value(len(added_decoder), variant.added_token_count, "added_tokens_decoder", label="tokenizer_config")
     _check_token_content(
         tokenizer_config.get("bos_token"), EXPECTED_SPECIAL_TOKENS[0], "bos_token", label="tokenizer_config"
     )
@@ -1264,11 +1359,11 @@ def validate_tokenizer_metadata(hf_dir: Path, *, strict: bool = True) -> dict[st
         raise ValueError("tokenizer.json missing vocab or added_tokens metadata")
     _check_config_value(model.get("type"), EXPECTED_TOKENIZER_MODEL_TYPE, "model.type", label="tokenizer")
     _check_config_value(len(vocab), 128_000, "model.vocab", label="tokenizer")
-    _check_config_value(len(added_tokens), 830, "added_tokens", label="tokenizer")
+    _check_config_value(len(added_tokens), variant.added_token_count, "added_tokens", label="tokenizer")
     added_by_id = {
         int(token["id"]): token for token in added_tokens if isinstance(token, Mapping) and "id" in token
     }
-    for token_id, content in EXPECTED_SPECIAL_TOKENS.items():
+    for token_id, content in expected_tokens.items():
         _check_token_content(
             added_by_id.get(token_id), content, str(token_id), label="tokenizer.added_tokens"
         )
@@ -1291,19 +1386,20 @@ def validate_tokenizer_metadata(hf_dir: Path, *, strict: bool = True) -> dict[st
     }
 
 
-def _validate_header_entry(name: str, entry: Mapping[str, Any]) -> None:
+def _validate_header_entry(name: str, entry: Mapping[str, Any], *, model_variant: str = "v1") -> None:
     dtype = entry.get("dtype")
     shape = entry.get("shape")
     offsets = entry.get("data_offsets")
-    if dtype != EXPECTED_SOURCE_DTYPE:
-        raise ValueError(f"tensor {name} dtype mismatch: got {dtype!r}, expected {EXPECTED_SOURCE_DTYPE}")
+    expected_dtype = "I64" if model_variant == "v2" and name == CLIP_POSITION_IDS_NAME else EXPECTED_SOURCE_DTYPE
+    if dtype != expected_dtype:
+        raise ValueError(f"tensor {name} dtype mismatch: got {dtype!r}, expected {expected_dtype}")
     if not isinstance(shape, list) or not all(isinstance(dim, int) and dim >= 0 for dim in shape):
         raise ValueError(f"tensor {name} has invalid shape {shape!r}")
     if not isinstance(offsets, list) or len(offsets) != 2 or not all(isinstance(v, int) and v >= 0 for v in offsets):
         raise ValueError(f"tensor {name} has invalid data_offsets {offsets!r}")
     if offsets[1] < offsets[0]:
         raise ValueError(f"tensor {name} has descending data_offsets {offsets!r}")
-    expected_bytes = _product(shape) * 2
+    expected_bytes = _product(shape) * (8 if expected_dtype == "I64" else 2)
     actual_bytes = offsets[1] - offsets[0]
     if actual_bytes != expected_bytes:
         raise ValueError(
@@ -1328,22 +1424,26 @@ def _build_source_metadata(
     index: Mapping[str, Any] | None,
     index_path: Path,
     strict: bool,
+    config: dict[str, Any],
 ) -> SourceMetadata:
-    config = validate_config(hf_dir, strict=strict)
-    processor = validate_processor_config(hf_dir, strict=strict)
-    tokenizer = validate_tokenizer_metadata(hf_dir, strict=strict)
+    model_variant = str(config.get("model_variant", "v1"))
+    variant = MODEL_VARIANTS[model_variant]
+    processor = validate_processor_config(hf_dir, strict=strict, model_variant=model_variant)
+    tokenizer = validate_tokenizer_metadata(hf_dir, strict=strict, model_variant=model_variant)
 
+    weight_map = index.get("weight_map", {}) if isinstance(index, Mapping) else {}
     total_payload_bytes = 0
-    max_payload_end = 0
+    payload_ends: dict[str, int] = {}
     dtype_counts: Counter[str] = Counter()
-    for entry in entries.values():
+    for name, entry in entries.items():
         offsets = entry.get("data_offsets", [0, 0])
         start, end = int(offsets[0]), int(offsets[1])
         total_payload_bytes += end - start
-        max_payload_end = max(max_payload_end, end)
+        source_file = weight_map.get(name, "")
+        payload_ends[source_file] = max(payload_ends.get(source_file, 0), end)
         dtype_counts[str(entry.get("dtype", ""))] += 1
+    max_payload_end = sum(payload_ends.values())
 
-    weight_map = index.get("weight_map", {}) if isinstance(index, Mapping) else {}
     source_files = sorted({str(value) for value in weight_map.values()}) if isinstance(weight_map, Mapping) else []
     index_total = int(index.get("metadata", {}).get("total_size", -1)) if isinstance(index, Mapping) else -1
     source_dtype = next(iter(dtype_counts)) if len(dtype_counts) == 1 else "mixed"
@@ -1359,19 +1459,14 @@ def _build_source_metadata(
         "index_present": index is not None,
     }
     if strict:
-        _check_config_value(safetensors["tensor_count"], EXPECTED_TENSOR_COUNT, "tensor_count", label="safetensors")
-        _check_config_value(
-            safetensors["total_payload_bytes"], EXPECTED_TOTAL_BYTES, "total_payload_bytes", label="safetensors"
-        )
-        _check_config_value(
-            safetensors["max_payload_end"], EXPECTED_TOTAL_BYTES, "max_payload_end", label="safetensors"
-        )
-        _check_config_value(safetensors["source_dtype"], EXPECTED_SOURCE_DTYPE, "source_dtype", label="safetensors")
+        _check_config_value(safetensors["tensor_count"], variant.tensor_count, "tensor_count", label="safetensors")
+        _check_config_value(safetensors["total_payload_bytes"], variant.source_bytes, "total_payload_bytes", label="safetensors")
+        _check_config_value(safetensors["max_payload_end"], variant.source_bytes, "max_payload_end", label="safetensors")
+        expected_dtypes = {"BF16": 2818, "I64": 1} if model_variant == "v2" else {"BF16": 2710}
+        _check_config_value(dict(dtype_counts), expected_dtypes, "dtype_counts", label="safetensors")
         if index is not None:
-            _check_config_value(index_total, EXPECTED_TOTAL_BYTES, "index_total_size", label="safetensors")
-            _check_config_value(len(weight_map), EXPECTED_TENSOR_COUNT, "index.weight_map", label="safetensors")
-            if len(source_files) != 1:
-                raise ValueError(f"safetensors expected one source file, got {source_files!r}")
+            _check_config_value(index_total, variant.source_bytes, "index_total_size", label="safetensors")
+            _check_config_value(len(weight_map), variant.tensor_count, "index.weight_map", label="safetensors")
 
     hashes = {
         "config_sha256": _sha256_file_hex(hf_dir / "config.json"),
@@ -1396,6 +1491,12 @@ def is_preserved_unused_in_normal_ocr(name: str) -> bool:
 
 
 def _usage_for_name(name: str) -> tuple[str, int, str]:
+    if name == CLIP_POSITION_IDS_NAME:
+        return "omitted-with-reason", 3, "deterministic CLIP positions 0..256; generated by runtime"
+    if ".self_attn.indexer." in name:
+        return "preserved-unused", 2, "DASH uses its own learned projections; indexer weights retained for provenance"
+    if ".self_attn.dash_router." in name:
+        return "runtime", 1, "DASH router: mandatory fp16 keep-list"
     if is_preserved_unused_in_normal_ocr(name):
         return (
             "preserved-unused",
@@ -1428,7 +1529,7 @@ def _is_mixed_q8_candidate(
 ) -> bool:
     if usage_id != UOCR_TENSOR_USAGE_RUNTIME or len(shape) != 2:
         return False
-    if registry_entry.family == TensorFamily.MOE_ROUTER:
+    if registry_entry.family in {TensorFamily.MOE_ROUTER, TensorFamily.DASH_ROUTER, TensorFamily.SPARSE_INDEXER}:
         return False
     return quant_cfg.is_supported(registry_entry.family, registry_entry.projection)
 
@@ -1462,6 +1563,9 @@ def _make_tensor_plan(
     logical_shape, physical_shape, output_bytes, block_size, row_size, qtype_id, output_dtype = _fp16_tensor_metadata(
         shape, source_bytes
     )
+    if usage_id == UOCR_TENSOR_USAGE_OMITTED_WITH_REASON:
+        output_bytes = 0
+        output_dtype = "omitted"
     qweight_bytes = output_bytes
     qscale_bytes = 0
     scale_size = 0
@@ -1523,7 +1627,7 @@ def _make_tensor_plan(
         scale_size=scale_size,
         qweight_bytes=qweight_bytes,
         qscale_bytes=qscale_bytes,
-        fp16_equivalent_bytes=source_bytes,
+        fp16_equivalent_bytes=_product(shape) * 2 if usage_id != UOCR_TENSOR_USAGE_OMITTED_WITH_REASON else 0,
         block_size=block_size,
         row_size=row_size,
         tensor_id=registry_entry.tensor_id,
@@ -1555,6 +1659,7 @@ def _relayout_plan(plan: DryRunPlan, tensors: Iterable[TensorPlan]) -> DryRunPla
     sections, laid_out, planned_file_size, metadata_bytes = _layout_dry_run_file(
         ordered,
         provenance_json_size=len(_provenance_json_payload(plan.qprofile, plan.source_metadata)),
+        model_variant=plan.model_variant,
     )
     _validate_layout_transform_contract(laid_out)
     return replace(
@@ -1616,21 +1721,41 @@ def build_dry_run_plan(
         raise ValueError(f"unsupported --quant-policy {quant_policy!r}; expected {QUANT_POLICY_EMBEDDINGS_DECODER!r}")
     cfg = quant_cfg if quant_cfg is not None else load_default_quant_config()
 
-    header = _read_safetensors_header(Path(header_path) if header_path is not None else _default_header_path(hf_dir))
-    entries: dict[str, Mapping[str, Any]] = {
-        name: entry for name, entry in header.items() if name != "__metadata__"
-    }
+    index_file = Path(index_path) if index_path is not None else hf_dir / "model.safetensors.index.json"
+    index = _read_json_if_exists(index_file)
+    if index is None and strict:
+        raise FileNotFoundError(f"missing safetensors index file {index_file}")
+    config = validate_config(hf_dir, strict=strict)
+    model_variant = str(config.get("model_variant", "v1"))
+    variant = MODEL_VARIANTS[model_variant]
+    entries, weight_map = _checkpoint_headers(hf_dir, index, header_path)
     if not entries:
         raise ValueError("safetensors header contains no tensors")
-    if strict and len(entries) != EXPECTED_TENSOR_COUNT:
-        raise ValueError(f"safetensors tensor count mismatch: got {len(entries)}, expected {EXPECTED_TENSOR_COUNT}")
+    if strict and len(entries) != variant.tensor_count:
+        raise ValueError(f"safetensors tensor count mismatch: got {len(entries)}, expected {variant.tensor_count}")
 
     for name, entry in entries.items():
-        _validate_header_entry(name, entry)
+        _validate_header_entry(name, entry, model_variant=model_variant)
     if strict:
         _validate_key_shapes(entries)
 
     registry = build_tensor_registry(entries)
+    sparse_families = {TensorFamily.DASH_ROUTER, TensorFamily.SPARSE_INDEXER}
+    if model_variant == "v1" and any(entry.family in sparse_families for entry in registry.values()):
+        raise ValueError("sparse tensors require a supported v2 config")
+    if model_variant == "v2":
+        validate_registry_shapes(registry, {name: tuple(entry["shape"]) for name, entry in entries.items()})
+        if strict:
+            for layer in range(12):
+                for module in ("dash_router", "indexer"):
+                    for suffix in SPARSE_PROJECTIONS:
+                        if module == "indexer" and suffix == "head_cls":
+                            continue
+                        name = f"model.layers.{layer}.self_attn.{module}.{suffix}"
+                        if name not in registry:
+                            raise ValueError(f"missing v2 tensor {name}")
+            if CLIP_POSITION_IDS_NAME not in registry:
+                raise ValueError("missing v2 CLIP position_ids")
     if strict:
         validate_registry_shapes(registry, {name: tuple(int(dim) for dim in entry["shape"]) for name, entry in entries.items()})
 
@@ -1646,27 +1771,17 @@ def build_dry_run_plan(
         )
         for name in sorted(entries, key=lambda key: registry[key].tensor_id)
     )
+    tensors = tuple(replace(tensor, source_file=weight_map.get(tensor.name)) for tensor in tensors)
     total_source_bytes = sum(t.source_bytes for t in tensors)
-    if strict and total_source_bytes != EXPECTED_TOTAL_BYTES:
+    if strict and total_source_bytes != variant.source_bytes:
         raise ValueError(
-            f"source payload byte count mismatch: got {total_source_bytes}, expected {EXPECTED_TOTAL_BYTES}"
+            f"source payload byte count mismatch: got {total_source_bytes}, expected {variant.source_bytes}"
         )
 
-    index_file = Path(index_path) if index_path is not None else hf_dir / "model.safetensors.index.json"
-    index = _read_json_if_exists(index_file)
-    if index is None:
-        if strict:
-            raise FileNotFoundError(f"missing safetensors index file {index_file}")
-    else:
+    if index is not None:
         index_total = int(index.get("metadata", {}).get("total_size", -1))
         if index_total >= 0 and index_total != total_source_bytes:
             raise ValueError(f"index total_size mismatch: got {index_total}, header implies {total_source_bytes}")
-        weight_map = index.get("weight_map", {})
-        if strict and len(weight_map) != len(entries):
-            raise ValueError(f"index weight_map count mismatch: got {len(weight_map)}, expected {len(entries)}")
-        missing_from_index = sorted(set(entries) - set(weight_map))
-        if missing_from_index:
-            raise ValueError(f"{len(missing_from_index)} header tensors missing from index; first={missing_from_index[0]}")
 
     source_metadata = _build_source_metadata(
         hf_dir,
@@ -1674,12 +1789,14 @@ def build_dry_run_plan(
         index=index,
         index_path=index_file,
         strict=strict,
+        config=config,
     )
 
     provenance_json_size = len(_provenance_json_payload(qprofile, source_metadata))
     sections, tensors, planned_file_size, metadata_bytes = _layout_dry_run_file(
         tensors,
         provenance_json_size=provenance_json_size,
+        model_variant=model_variant,
     )
     _validate_layout_transform_contract(tensors)
     _validate_moe_expert_interleaved_layout(tensors, require_complete=strict)
@@ -1703,11 +1820,12 @@ def build_dry_run_plan(
     )
 
 
-def _config_record_bytes() -> bytes:
-    return _CONFIG_RECORD_STRUCT.pack(
+def _config_record_bytes(model_variant: str = "v1") -> bytes:
+    variant = MODEL_VARIANTS[model_variant]
+    record = _CONFIG_RECORD_STRUCT.pack(
         129_280,
         128_000,
-        830,
+        variant.added_token_count,
         0,
         1,
         2,
@@ -1717,9 +1835,9 @@ def _config_record_bytes() -> bytes:
         10,
         10,
         128,
-        10_000,
-        32_768,
-        128,
+        variant.rope_theta,
+        variant.max_positions,
+        variant.generated_ring_window,
         1,
         64,
         6,
@@ -1733,6 +1851,7 @@ def _config_record_bytes() -> bytes:
         1024,
         640,
     )
+    return record + (_V2_CONFIG_STRUCT.pack(*V2_CONFIG_VALUES) if model_variant == "v2" else b"")
 
 
 def _section_bytes(plan: DryRunPlan) -> bytes:
@@ -1773,7 +1892,7 @@ def _provenance_json_payload(qprofile: str, source_metadata: SourceMetadata | No
     return json.dumps({"quantization": quantization}, separators=(",", ":"), sort_keys=True).encode("utf-8")
 
 
-def _tokenizer_metadata_bytes(tokenizer_hash: bytes) -> bytes:
+def _tokenizer_metadata_bytes(tokenizer_hash: bytes, model_variant: str = "v1") -> bytes:
     return _TOKENIZER_METADATA_STRUCT.pack(
         UOCR_TOKENIZER_METADATA_MAGIC,
         UOCR_FORMAT_VERSION,
@@ -1782,7 +1901,7 @@ def _tokenizer_metadata_bytes(tokenizer_hash: bytes) -> bytes:
         tokenizer_hash,
         129_280,
         128_000,
-        830,
+        MODEL_VARIANTS[model_variant].added_token_count,
         0,
         1,
         2,
@@ -1869,44 +1988,42 @@ def _tensor_directory_bytes(plan: DryRunPlan) -> bytes:
     return bytes(payload)
 
 
-def _source_files_for_plan(plan: DryRunPlan) -> set[str]:
-    index = _read_json_if_exists(plan.hf_dir / "model.safetensors.index.json")
-    if index is None:
-        return set()
-    weight_map = index.get("weight_map", {})
-    return {str(weight_map[tensor.name]) for tensor in plan.tensors if tensor.name in weight_map}
-
-
-def _resolve_safetensors_payload_path(plan: DryRunPlan, safetensors_path: str | Path | None) -> tuple[Path, int]:
-    if safetensors_path is not None:
-        source = Path(safetensors_path)
-    else:
-        source_files = _source_files_for_plan(plan)
-        if len(source_files) == 1:
-            source = plan.hf_dir / next(iter(source_files))
-        elif len(source_files) > 1:
-            raise NotImplementedError("multi-file safetensors streaming is not implemented yet")
+def _resolve_safetensors_payloads(
+    plan: DryRunPlan, safetensors_path: str | Path | None
+) -> dict[str, tuple[Path, int]]:
+    """Validate source files before writing and resolve each tensor's shard."""
+    if safetensors_path is not None and len({t.source_file for t in plan.tensors}) > 1:
+        raise ValueError("--safetensors cannot override multiple shards; select one tensor first")
+    grouped: dict[Path, list[TensorPlan]] = {}
+    for tensor in plan.tensors:
+        if safetensors_path is not None:
+            source = Path(safetensors_path)
+        elif tensor.source_file is not None:
+            source = plan.hf_dir / tensor.source_file
         else:
             source = _default_safetensors_payload_path(plan.hf_dir)
-    if not source.exists():
-        raise FileNotFoundError(f"safetensors payload file does not exist: {source}")
-    header, data_start = _read_safetensors_header_and_data_start(source)
-    if data_start is None:
-        raise ValueError(f"{source} is a cached header/json file, not a real safetensors payload")
-    required_end = max((tensor.source_offsets[1] for tensor in plan.tensors), default=0)
-    if source.stat().st_size < data_start + required_end:
-        raise ValueError(f"{source} does not contain the planned safetensors payload bytes")
-    header_names = {name for name in header if name != "__metadata__"}
-    missing = [tensor.name for tensor in plan.tensors if tensor.name not in header_names]
-    if missing:
-        raise ValueError(f"{len(missing)} planned tensors are missing from {source}; first={missing[0]}")
-    for tensor in plan.tensors:
-        entry = header[tensor.name]
-        shape = tuple(int(dim) for dim in entry.get("shape", ()))
-        offsets = tuple(int(value) for value in entry.get("data_offsets", ()))
-        if entry.get("dtype") != EXPECTED_SOURCE_DTYPE or shape != tensor.shape or offsets != tensor.source_offsets:
-            raise ValueError(f"source safetensors metadata for {tensor.name} does not match the conversion plan")
-    return source, data_start
+        grouped.setdefault(source, []).append(tensor)
+
+    sources: dict[str, tuple[Path, int]] = {}
+    for source, tensors in grouped.items():
+        if not source.is_file():
+            raise FileNotFoundError(f"safetensors payload file does not exist: {source}")
+        header, data_start = _read_safetensors_header_and_data_start(source)
+        if data_start is None:
+            raise ValueError(f"{source} is a cached header/json file, not a real safetensors payload")
+        required_end = max(tensor.source_offsets[1] for tensor in tensors)
+        if source.stat().st_size < data_start + required_end:
+            raise ValueError(f"{source} does not contain the planned safetensors payload bytes")
+        for tensor in tensors:
+            if tensor.name not in header:
+                raise ValueError(f"planned tensor {tensor.name} is missing from {source}")
+            entry = header[tensor.name]
+            shape = tuple(int(dim) for dim in entry.get("shape", ()))
+            offsets = tuple(int(value) for value in entry.get("data_offsets", ()))
+            if entry.get("dtype") != tensor.source_dtype or shape != tensor.shape or offsets != tensor.source_offsets:
+                raise ValueError(f"source safetensors metadata for {tensor.name} does not match the conversion plan")
+            sources[tensor.name] = source, data_start
+    return sources
 
 
 def _bf16_bytes_to_f32(raw: bytes) -> np.ndarray:
@@ -2154,7 +2271,7 @@ def _read_uocr_tensor_payload_view(model_path: str | Path, tensor_id: int) -> _U
         file_size, section_dir_offset = header[8], header[9]
         if magic != b"UOCR":
             raise ValueError(f"{path} is not a .uocr file")
-        if version != UOCR_FORMAT_VERSION:
+        if version not in {1, 2}:
             raise ValueError(f"{path} has unsupported .uocr version {version}")
         if header_size != UOCR_FILE_HEADER_SIZE:
             raise ValueError(f"{path} has unexpected .uocr header size {header_size}")
@@ -2431,7 +2548,7 @@ def compare_single_tensor_conversion(
     model = Path(model_path)
     view = _read_uocr_tensor_payload_view(model, tensor.tensor_id)
     metadata_mismatches = _metadata_mismatches_for_compare(plan, tensor, view)
-    source, data_start = _resolve_safetensors_payload_path(plan, safetensors_path)
+    source, data_start = _resolve_safetensors_payloads(plan, safetensors_path)[tensor.name]
 
     expected_hash = hashlib.sha256()
     actual_hash = hashlib.sha256()
@@ -2535,10 +2652,10 @@ def write_uocr_model(
 ) -> Path:
     """Stream a planned `.uocr` file to disk.
 
-    The writer supports fp16 and mixed Q8_0 plans.  It converts each BF16
-    safetensors range in bounded chunks and writes directly into the
-    mmap-friendly layout produced by :func:`build_dry_run_plan`.  Q8 tensors are
-    quantized row-major without materializing a full tensor-sized copy.
+    The writer supports fp16, mixed Q8_0, and mixed Q4 plans. It converts each
+    BF16 shard range in bounded chunks and writes directly into the mmap-friendly
+    layout produced by :func:`build_dry_run_plan`. Quantized tensors are written
+    row-major without materializing a full tensor-sized copy.
     """
 
     if plan.qprofile not in QPROFILE_IDS:
@@ -2551,24 +2668,29 @@ def write_uocr_model(
         raise FileExistsError(f"output file already exists: {out}")
     out.parent.mkdir(parents=True, exist_ok=True)
 
-    source, data_start = _resolve_safetensors_payload_path(plan, safetensors_path)
+    sources = _resolve_safetensors_payloads(plan, safetensors_path)
     config_path = plan.hf_dir / "config.json"
     tokenizer_path = plan.hf_dir / "tokenizer.json"
-    index_path = plan.hf_dir / "model.safetensors.index.json"
     config_hash = _sha256_file(config_path)
     tokenizer_hash = _sha256_file(tokenizer_path)
-    index_hash = _sha256_file(index_path)
-    source_file_count = max(1, len(_source_files_for_plan(plan)))
+    index_hash_hex = plan.source_metadata.hashes["safetensors_index_sha256"]
+    index_hash = bytes.fromhex(index_hash_hex) if index_hash_hex else hashlib.sha256().digest()
+    source_file_count = len({source for source, _ in sources.values()})
 
     tmp = out.with_name(f".{out.name}.tmp")
     if tmp.exists():
         tmp.unlink()
     conversion_stats: list[TensorConversionStats] | None = [] if stats_path is not None else None
     try:
-        with source.open("rb") as src, tmp.open("w+b") as dst:
+        with ExitStack() as stack:
+            readers = {
+                source: stack.enter_context(source.open("rb"))
+                for source in sorted({source for source, _ in sources.values()})
+            }
+            dst = stack.enter_context(tmp.open("w+b"))
             header = _FILE_HEADER_STRUCT.pack(
                 b"UOCR",
-                UOCR_FORMAT_VERSION,
+                MODEL_VARIANTS[plan.model_variant].format_version,
                 UOCR_FILE_HEADER_SIZE,
                 UOCR_ENDIAN_MARKER,
                 UOCR_FILE_ALIGNMENT,
@@ -2586,9 +2708,9 @@ def write_uocr_model(
             dst.write(_section_bytes(plan))
             section_by_type = {section.section_type: section for section in plan.sections}
             dst.seek(section_by_type[UOCR_SECTION_CONFIG].offset)
-            dst.write(_config_record_bytes())
+            dst.write(_config_record_bytes(plan.model_variant))
             dst.seek(section_by_type[UOCR_SECTION_TOKENIZER_METADATA].offset)
-            dst.write(_tokenizer_metadata_bytes(tokenizer_hash))
+            dst.write(_tokenizer_metadata_bytes(tokenizer_hash, plan.model_variant))
             dst.seek(section_by_type[UOCR_SECTION_PROVENANCE].offset)
             dst.write(
                 _provenance_bytes(
@@ -2603,9 +2725,13 @@ def write_uocr_model(
             dst.write(_tensor_directory_bytes(plan))
 
             for tensor in plan.tensors:
-                if tensor.usage_id == UOCR_TENSOR_USAGE_OMITTED_WITH_REASON:
-                    continue
+                source, data_start = sources[tensor.name]
+                src = readers[source]
                 src.seek(data_start + tensor.source_offsets[0])
+                if tensor.usage_id == UOCR_TENSOR_USAGE_OMITTED_WITH_REASON:
+                    if tensor.name != CLIP_POSITION_IDS_NAME or src.read(tensor.source_bytes) != np.arange(257, dtype="<i8").tobytes():
+                        raise ValueError(f"invalid deterministic position_ids tensor: {tensor.name}")
+                    continue
                 value_stats = _StreamingValueStats() if conversion_stats is not None else None
                 if tensor.qtype_id == UOCR_TENSOR_F16:
                     dst.seek(tensor.payload_offset)
@@ -2645,6 +2771,7 @@ def write_uocr_model(
 def _print_summary(plan: DryRunPlan, *, dry_run: bool) -> None:
     print("Unlimited-OCR converter dry-run" if dry_run else "Unlimited-OCR converter plan")
     print(f"hf_dir: {plan.hf_dir}")
+    print(f"model_variant: {plan.model_variant}")
     print(f"qprofile: {plan.qprofile}")
     print(f"tensors: {plan.tensor_count}")
     print(f"source bytes: {plan.total_source_bytes}")

@@ -170,6 +170,10 @@ const char *uocr_tensor_family_name(uint32_t family) {
             return "VISION_SAM";
         case UOCR_TENSOR_FAMILY_VISION_CLIP:
             return "VISION_CLIP";
+        case UOCR_TENSOR_FAMILY_DASH_ROUTER:
+            return "DASH_ROUTER";
+        case UOCR_TENSOR_FAMILY_SPARSE_INDEXER:
+            return "SPARSE_INDEXER";
         case UOCR_TENSOR_FAMILY_PROJECTOR:
             return "PROJECTOR";
         case UOCR_TENSOR_FAMILY_IMAGE_NEWLINE:
@@ -225,44 +229,50 @@ int uocr_model_file_validate_full_fp16_accounting(const uocr_model_file *file, c
                     file->header->qprofile,
                     file->provenance->qprofile);
     }
-    if (file->provenance->source_tensor_count != UOCR_SOURCE_TENSOR_COUNT) {
+    const int is_v2 = file->v2_config != NULL;
+    const uint32_t expected_count = is_v2 ? 2819u : UOCR_SOURCE_TENSOR_COUNT;
+    const uint32_t expected_runtime = is_v2 ? 2769u : UOCR_FP16_RUNTIME_TENSOR_COUNT;
+    const uint32_t expected_preserved = is_v2 ? 49u : UOCR_FP16_PRESERVED_UNUSED_TENSOR_COUNT;
+    const uint32_t expected_omitted = is_v2 ? 1u : UOCR_FP16_OMITTED_TENSOR_COUNT;
+    const uint64_t expected_bytes = is_v2 ? 6687956480ull : UOCR_FP16_TENSOR_PAYLOAD_BYTES;
+    if (file->provenance->source_tensor_count != expected_count) {
         return fail(error,
                     error_size,
                     "full fp16 source tensor count mismatch: got %u expected %u",
                     file->provenance->source_tensor_count,
-                    UOCR_SOURCE_TENSOR_COUNT);
+                    expected_count);
     }
-    if (file->tensor_count != UOCR_SOURCE_TENSOR_COUNT) {
+    if (file->tensor_count != expected_count) {
         return fail(error,
                     error_size,
                     "full fp16 tensor directory count mismatch: got %u expected %u",
                     file->tensor_count,
-                    UOCR_SOURCE_TENSOR_COUNT);
+                    expected_count);
     }
-    if (file->provenance->runtime_tensor_count != UOCR_FP16_RUNTIME_TENSOR_COUNT ||
-        file->provenance->preserved_unused_tensor_count != UOCR_FP16_PRESERVED_UNUSED_TENSOR_COUNT ||
-        file->provenance->omitted_tensor_count != UOCR_FP16_OMITTED_TENSOR_COUNT) {
+    if (file->provenance->runtime_tensor_count != expected_runtime ||
+        file->provenance->preserved_unused_tensor_count != expected_preserved ||
+        file->provenance->omitted_tensor_count != expected_omitted) {
         return fail(error,
                     error_size,
                     "full fp16 usage accounting mismatch: runtime=%u preserved-unused=%u omitted=%u expected=%u/%u/%u",
                     file->provenance->runtime_tensor_count,
                     file->provenance->preserved_unused_tensor_count,
                     file->provenance->omitted_tensor_count,
-                    UOCR_FP16_RUNTIME_TENSOR_COUNT,
-                    UOCR_FP16_PRESERVED_UNUSED_TENSOR_COUNT,
-                    UOCR_FP16_OMITTED_TENSOR_COUNT);
+                    expected_runtime,
+                    expected_preserved,
+                    expected_omitted);
     }
 
     const uocr_section_entry *tensor_data = uocr_model_file_find_section(file, UOCR_SECTION_TENSOR_DATA);
     if (tensor_data == NULL) {
         return fail(error, error_size, "full fp16 accounting requires a tensor-data section");
     }
-    if (tensor_data->size != UOCR_FP16_TENSOR_PAYLOAD_BYTES) {
+    if (tensor_data->size != expected_bytes) {
         return fail(error,
                     error_size,
                     "full fp16 tensor-data byte mismatch: got %llu expected %llu",
                     (unsigned long long)tensor_data->size,
-                    (unsigned long long)UOCR_FP16_TENSOR_PAYLOAD_BYTES);
+                    (unsigned long long)expected_bytes);
     }
 
     uint32_t runtime = 0u;
@@ -284,7 +294,9 @@ int uocr_model_file_validate_full_fp16_accounting(const uocr_model_file *file, c
             ++runtime;
         } else if (tensor->usage == UOCR_TENSOR_USAGE_PRESERVED_UNUSED) {
             ++preserved;
-            preserved_tensor = tensor;
+            if (tensor->id == UOCR_TENSOR_ID_VISION_CLIP_UNUSED_PATCH_EMBED_WEIGHT) {
+                preserved_tensor = tensor;
+            }
         } else if (tensor->usage == UOCR_TENSOR_USAGE_OMITTED_WITH_REASON) {
             ++omitted;
         } else {
@@ -292,24 +304,24 @@ int uocr_model_file_validate_full_fp16_accounting(const uocr_model_file *file, c
         }
         payload_bytes += tensor->payload_size;
     }
-    if (runtime != UOCR_FP16_RUNTIME_TENSOR_COUNT || preserved != UOCR_FP16_PRESERVED_UNUSED_TENSOR_COUNT ||
-        omitted != UOCR_FP16_OMITTED_TENSOR_COUNT) {
+    if (runtime != expected_runtime || preserved != expected_preserved ||
+        omitted != expected_omitted) {
         return fail(error,
                     error_size,
                     "full fp16 tensor usage count mismatch: runtime=%u preserved-unused=%u omitted=%u expected=%u/%u/%u",
                     runtime,
                     preserved,
                     omitted,
-                    UOCR_FP16_RUNTIME_TENSOR_COUNT,
-                    UOCR_FP16_PRESERVED_UNUSED_TENSOR_COUNT,
-                    UOCR_FP16_OMITTED_TENSOR_COUNT);
+                    expected_runtime,
+                    expected_preserved,
+                    expected_omitted);
     }
-    if (payload_bytes != UOCR_FP16_TENSOR_PAYLOAD_BYTES) {
+    if (payload_bytes != expected_bytes) {
         return fail(error,
                     error_size,
                     "full fp16 tensor payload byte mismatch: got %llu expected %llu",
                     (unsigned long long)payload_bytes,
-                    (unsigned long long)UOCR_FP16_TENSOR_PAYLOAD_BYTES);
+                    (unsigned long long)expected_bytes);
     }
     if (preserved_tensor == NULL || preserved_tensor->id != UOCR_TENSOR_ID_VISION_CLIP_UNUSED_PATCH_EMBED_WEIGHT ||
         preserved_tensor->family != UOCR_TENSOR_FAMILY_VISION_CLIP) {
@@ -321,8 +333,14 @@ int uocr_model_file_validate_full_fp16_accounting(const uocr_model_file *file, c
     return 0;
 }
 
-static int validate_config(const uocr_config_record *cfg, char *error, size_t error_size) {
-    const uocr_config_record expected = uocr_default_config_record();
+static int validate_config(const uocr_config_record *cfg, int is_v2, char *error, size_t error_size) {
+    uocr_config_record expected = uocr_default_config_record();
+    if (is_v2) {
+        expected.added_token_count = 834u;
+        expected.rope_theta = 500000u;
+        expected.max_positions = 131072u;
+        expected.generated_ring_window = 0u;
+    }
 #define CHECK_FIELD(field)                                                                 \
     do {                                                                                   \
         if (cfg->field != expected.field) {                                                \
@@ -405,7 +423,7 @@ static int validate_tokenizer_metadata(const uint8_t *bytes,
 
     CHECK_TOKENIZER_FIELD(vocab_size, UOCR_VOCAB_SIZE);
     CHECK_TOKENIZER_FIELD(bpe_vocab_size, UOCR_BPE_VOCAB_SIZE);
-    CHECK_TOKENIZER_FIELD(added_token_count, UOCR_ADDED_TOKEN_COUNT);
+    CHECK_TOKENIZER_FIELD(added_token_count, view->config->added_token_count);
     CHECK_TOKENIZER_FIELD(bos_token_id, UOCR_TOKEN_BOS);
     CHECK_TOKENIZER_FIELD(eos_token_id, UOCR_TOKEN_EOS);
     CHECK_TOKENIZER_FIELD(pad_token_id, UOCR_TOKEN_PAD);
@@ -824,6 +842,43 @@ static int validate_q4_tensor_entry(const uocr_tensor_entry *tensor,
     return 0;
 }
 
+static int validate_sparse_tensor(const uocr_tensor_entry *tensor, int is_v2,
+                                  char *error, size_t error_size) {
+    if (tensor->id == UOCR_TENSOR_ID_VISION_CLIP_POSITION_IDS) {
+        if (!is_v2 || tensor->family != UOCR_TENSOR_FAMILY_VISION_CLIP ||
+            tensor->usage != UOCR_TENSOR_USAGE_OMITTED_WITH_REASON || tensor->qtype != UOCR_TENSOR_F16 ||
+            tensor->rank != 2u || tensor->logical_shape[0] != 1u || tensor->logical_shape[1] != 257u) {
+            return fail(error, error_size, "invalid v2 CLIP position_ids record");
+        }
+        return 0;
+    }
+    const uint32_t local = tensor->id >= UOCR_TENSOR_ID_LAYER_BASE
+        ? (tensor->id - UOCR_TENSOR_ID_LAYER_BASE) % UOCR_TENSOR_ID_LAYER_STRIDE : 0u;
+    const uint32_t id_layer = tensor->id >= UOCR_TENSOR_ID_LAYER_BASE
+        ? (tensor->id - UOCR_TENSOR_ID_LAYER_BASE) / UOCR_TENSOR_ID_LAYER_STRIDE : UINT32_MAX;
+    const int dash = id_layer < UOCR_DECODER_LAYERS && local >= UOCR_TENSOR_ID_LAYER_DASH_BASE &&
+                     local <= UOCR_TENSOR_ID_LAYER_DASH_BASE + 4u;
+    const int indexer = id_layer < UOCR_DECODER_LAYERS && local >= UOCR_TENSOR_ID_LAYER_INDEXER_BASE &&
+                        local <= UOCR_TENSOR_ID_LAYER_INDEXER_BASE + 3u;
+    const int sparse_family = tensor->family == UOCR_TENSOR_FAMILY_DASH_ROUTER ||
+                              tensor->family == UOCR_TENSOR_FAMILY_SPARSE_INDEXER;
+    if (!dash && !indexer && !sparse_family) return 0;
+    if (!is_v2 || (!dash && !indexer)) {
+        return fail(error, error_size, "unsupported sparse tensor id %u", tensor->id);
+    }
+    const uint32_t offset = local - (dash ? UOCR_TENSOR_ID_LAYER_DASH_BASE : UOCR_TENSOR_ID_LAYER_INDEXER_BASE);
+    const uint32_t projections[] = {UOCR_TENSOR_PROJ_Q, UOCR_TENSOR_PROJ_K,
+                                   UOCR_TENSOR_PROJ_Q_NORM, UOCR_TENSOR_PROJ_K_NORM, UOCR_TENSOR_PROJ_HEAD_CLS};
+    if (tensor->family != (dash ? UOCR_TENSOR_FAMILY_DASH_ROUTER : UOCR_TENSOR_FAMILY_SPARSE_INDEXER) ||
+        tensor->usage != (dash ? UOCR_TENSOR_USAGE_RUNTIME : UOCR_TENSOR_USAGE_PRESERVED_UNUSED) ||
+        tensor->qtype != UOCR_TENSOR_F16 || tensor->layer != (int32_t)id_layer || tensor->expert != -1 ||
+        tensor->projection != projections[offset] || tensor->rank != (offset < 2u ? 2u : 1u) ||
+        tensor->logical_shape[0] != 128u || (offset < 2u && tensor->logical_shape[1] != 1280u)) {
+        return fail(error, error_size, "invalid v2 sparse tensor id %u", tensor->id);
+    }
+    return 0;
+}
+
 static int validate_tensor_directory(const uint8_t *bytes,
                                      size_t file_size,
                                      uint32_t qprofile,
@@ -903,6 +958,9 @@ static int validate_tensor_directory(const uint8_t *bytes,
         }
         if ((tensor->flags & UOCR_TENSOR_FLAG_TRANSPOSED) != 0u) {
             return fail(error, error_size, "tensor entry %u requests unsupported transposed layout", i);
+        }
+        if (validate_sparse_tensor(tensor, view->v2_config != NULL, error, error_size) != 0) {
+            return -1;
         }
         if (tensor->usage == UOCR_TENSOR_USAGE_OMITTED_WITH_REASON) {
             if (tensor->payload_offset != 0u || tensor->payload_size != 0u) {
@@ -996,7 +1054,7 @@ int uocr_model_file_validate_memory(const void *data, size_t size, uocr_model_fi
     if (memcmp(header->magic, UOCR_FILE_MAGIC, 4u) != 0) {
         return fail(error, error_size, "bad UOCR magic");
     }
-    if (header->version != UOCR_FORMAT_VERSION) {
+    if (header->version != UOCR_FORMAT_VERSION && header->version != UOCR_FORMAT_VERSION_V2) {
         return fail(error, error_size, "unsupported UOCR format version %u", header->version);
     }
     if (header->header_size != sizeof(uocr_file_header)) {
@@ -1100,7 +1158,18 @@ int uocr_model_file_validate_memory(const void *data, size_t size, uocr_model_fi
         return fail(error, error_size, "config section too small");
     }
     view.config = (const uocr_config_record *)(const void *)(bytes + config_section->offset);
-    if (validate_config(view.config, error, error_size) != 0) {
+    if (header->version == UOCR_FORMAT_VERSION_V2) {
+        if (config_section->size != sizeof(uocr_config_record) + sizeof(uocr_v2_config_record)) {
+            return fail(error, error_size, "v2 config section size mismatch");
+        }
+        view.v2_config = (const uocr_v2_config_record *)(const void *)(
+            bytes + config_section->offset + sizeof(uocr_config_record));
+        const uocr_v2_config_record expected = uocr_default_v2_config_record();
+        if (memcmp(view.v2_config, &expected, sizeof(expected)) != 0) {
+            return fail(error, error_size, "unsupported v2 sparse-attention configuration");
+        }
+    }
+    if (validate_config(view.config, view.v2_config != NULL, error, error_size) != 0) {
         return -1;
     }
 

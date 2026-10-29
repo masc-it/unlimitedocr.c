@@ -887,6 +887,12 @@ uocr_engine *uocr_engine_open(const uocr_engine_opts *opts) {
             return NULL;
         }
         engine->has_model_file = 1;
+        if (engine->model_file.v2_config != NULL) {
+            set_engine_errorf(engine, UOCR_ERROR_NOT_IMPLEMENTED,
+                              "Unlimited-OCR-2 model loaded, but sparse-attention inference is not implemented yet");
+            uocr_engine_close(engine);
+            return NULL;
+        }
         engine->model_view_bytes = model_tensor_data_bytes(&engine->model_file);
         if (engine->memory_budget_bytes != 0u && engine->model_view_bytes > engine->memory_budget_bytes) {
             uocr_runtime_memory_estimate reject_estimate;

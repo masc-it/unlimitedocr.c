@@ -6,7 +6,8 @@
 #include "model/uocr_constants.h"
 
 #define UOCR_FILE_MAGIC "UOCR"
-#define UOCR_FORMAT_VERSION 1u
+#define UOCR_FORMAT_VERSION 1u /* common subrecord version; v1 file version */
+#define UOCR_FORMAT_VERSION_V2 2u
 #define UOCR_ENDIAN_MARKER 0x01020304u
 #define UOCR_FILE_ALIGNMENT 4096u
 #define UOCR_TENSOR_DATA_ALIGNMENT 4096u
@@ -134,7 +135,9 @@ typedef enum uocr_tensor_family {
     UOCR_TENSOR_FAMILY_VISION_CLIP = 11,
     UOCR_TENSOR_FAMILY_PROJECTOR = 12,
     UOCR_TENSOR_FAMILY_IMAGE_NEWLINE = 13,
-    UOCR_TENSOR_FAMILY_VIEW_SEPARATOR = 14
+    UOCR_TENSOR_FAMILY_VIEW_SEPARATOR = 14,
+    UOCR_TENSOR_FAMILY_DASH_ROUTER = 15,
+    UOCR_TENSOR_FAMILY_SPARSE_INDEXER = 16
 } uocr_tensor_family;
 
 typedef enum uocr_tensor_projection {
@@ -154,7 +157,10 @@ typedef enum uocr_tensor_projection {
     UOCR_TENSOR_PROJ_VISION_MLP_FC2 = 33,
     UOCR_TENSOR_PROJ_VISION_PATCH_EMBED = 34,
     UOCR_TENSOR_PROJ_VISION_CONV_1X1 = 35,
-    UOCR_TENSOR_PROJ_VISION_CONV_3X3 = 36
+    UOCR_TENSOR_PROJ_VISION_CONV_3X3 = 36,
+    UOCR_TENSOR_PROJ_Q_NORM = 40,
+    UOCR_TENSOR_PROJ_K_NORM = 41,
+    UOCR_TENSOR_PROJ_HEAD_CLS = 42
 } uocr_tensor_projection;
 
 #define UOCR_TOKENIZER_METADATA_MAGIC 0x4b4f5455u /* "UTOK" little-endian */
@@ -224,6 +230,27 @@ typedef struct UOCR_PACKED uocr_config_record {
     uint32_t supported_global_view;
     uint32_t supported_local_view;
 } uocr_config_record;
+
+/* Required config-section suffix for format-v2 files. The variant identifies
+ * head_cls routing, entmax-1.5, same-page candidates and resampled page2d RoPE.
+ * Unsupported settings are rejected rather than silently running v1 kernels. */
+typedef struct UOCR_PACKED uocr_v2_config_record {
+    uint32_t model_variant;
+    uint32_t page_token_id;
+    uint32_t sparse_block_size;
+    uint32_t sparse_index_dim;
+    uint32_t local_window;
+    uint32_t remote_blocks;
+    uint32_t entmax_topm;
+    uint32_t rope_token_theta;
+    uint32_t rope_page_theta;
+    uint32_t rope_page_pairs;
+    uint32_t rope_page_mod;
+    uint32_t max_crops;
+    float router_scale;
+    float prior_floor;
+    float sigma;
+} uocr_v2_config_record;
 
 typedef struct UOCR_PACKED uocr_tokenizer_metadata_record {
     uint32_t magic;
@@ -307,6 +334,7 @@ typedef struct UOCR_PACKED uocr_tensor_entry {
 _Static_assert(sizeof(uocr_file_header) == 112u, "unexpected uocr_file_header size");
 _Static_assert(sizeof(uocr_section_entry) == 32u, "unexpected uocr_section_entry size");
 _Static_assert(sizeof(uocr_config_record) == 108u, "unexpected uocr_config_record size");
+_Static_assert(sizeof(uocr_v2_config_record) == 60u, "unexpected uocr_v2_config_record size");
 _Static_assert(sizeof(uocr_tokenizer_metadata_record) == 92u, "unexpected uocr_tokenizer_metadata_record size");
 _Static_assert(sizeof(uocr_provenance_record) == 200u, "unexpected uocr_provenance_record size");
 _Static_assert(sizeof(uocr_tensor_directory_header) == 16u, "unexpected uocr_tensor_directory_header size");
@@ -341,6 +369,14 @@ static inline uocr_config_record uocr_default_config_record(void) {
     cfg.downsample_ratio = UOCR_DOWNSAMPLE_RATIO;
     cfg.supported_global_view = UOCR_GLOBAL_VIEW_SIZE;
     cfg.supported_local_view = UOCR_LOCAL_VIEW_SIZE;
+    return cfg;
+}
+
+static inline uocr_v2_config_record uocr_default_v2_config_record(void) {
+    const uocr_v2_config_record cfg = {
+        2u, 128827u, 32u, 128u, 128u, 12u, 16u, 10000u, 256u, 1u, 2u, 16u,
+        128.0f, 0.0001f, 1.0f
+    };
     return cfg;
 }
 

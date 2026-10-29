@@ -2349,6 +2349,9 @@ int uocr_metal_context_map_model(uocr_metal_context *ctx, const uocr_model_file 
         return metal_fail(error, error_size, "Metal model mapping requires a context and loaded .uocr model");
     }
 
+    if (model->v2_config != NULL) {
+        return metal_fail(error, error_size, "Unlimited-OCR-2 sparse-attention inference is not implemented yet");
+    }
     const uocr_section_entry *tensor_data = uocr_model_file_find_section(model, UOCR_SECTION_TENSOR_DATA);
     if (tensor_data == NULL || tensor_data->size == 0u) {
         return metal_fail(error, error_size, ".uocr model has no tensor-data section to map");

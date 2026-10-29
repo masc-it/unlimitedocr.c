@@ -29,6 +29,8 @@ class TensorFamily(IntEnum):
     PROJECTOR = 12
     IMAGE_NEWLINE = 13
     VIEW_SEPARATOR = 14
+    DASH_ROUTER = 15
+    SPARSE_INDEXER = 16
 
 
 class TensorProjection(IntEnum):
@@ -49,6 +51,9 @@ class TensorProjection(IntEnum):
     VISION_PATCH_EMBED = 34
     VISION_CONV_1X1 = 35
     VISION_CONV_3X3 = 36
+    Q_NORM = 40
+    K_NORM = 41
+    HEAD_CLS = 42
 
 
 INVALID_TENSOR_ID = 0
@@ -83,6 +88,18 @@ LAYER_MOE_EXPERT_DOWN = 2
 
 VISION_SAM_BASE = 100_000
 VISION_CLIP_BASE = 200_000
+TENSOR_ID_CLIP_POSITION_IDS = 299_999
+CLIP_POSITION_IDS_NAME = "model.vision_model.embeddings.position_ids"
+LAYER_DASH_BASE = 60
+LAYER_INDEXER_BASE = 70
+SPARSE_PROJECTIONS = {
+    "q_proj.weight": (0, TensorProjection.Q, (128, 1280)),
+    "k_proj.weight": (1, TensorProjection.K, (128, 1280)),
+    "q_norm.weight": (2, TensorProjection.Q_NORM, (128,)),
+    "k_norm.weight": (3, TensorProjection.K_NORM, (128,)),
+    "head_cls": (4, TensorProjection.HEAD_CLS, (128,)),
+}
+_SPARSE_RE = re.compile(r"^model\.layers\.(\d+)\.self_attn\.(dash_router|indexer)\.(.+)$")
 
 _LAYER_NORM_RE = re.compile(r"^model\.layers\.(\d+)\.(input_layernorm|post_attention_layernorm)\.weight$")
 _ATTN_RE = re.compile(r"^model\.layers\.(\d+)\.self_attn\.(q_proj|k_proj|v_proj|o_proj)\.weight$")
@@ -194,6 +211,19 @@ def _entry_without_vision(name: str) -> TensorRegistryEntry | None:
     if name == "model.projector.layers.bias":
         return TensorRegistryEntry(name, TENSOR_ID_PROJECTOR_BIAS, TensorFamily.PROJECTOR, -1, -1, TensorProjection.BIAS, (1280,))
 
+    if name == CLIP_POSITION_IDS_NAME:
+        return TensorRegistryEntry(name, TENSOR_ID_CLIP_POSITION_IDS, TensorFamily.VISION_CLIP,
+                                   -1, -1, TensorProjection.NONE, (1, 257))
+    match = _SPARSE_RE.match(name)
+    if match:
+        layer, module, suffix = int(match.group(1)), match.group(2), match.group(3)
+        if layer >= 12 or suffix not in SPARSE_PROJECTIONS or (module == "indexer" and suffix == "head_cls"):
+            raise ValueError(f"unsupported sparse tensor {name}")
+        offset, projection, shape = SPARSE_PROJECTIONS[suffix]
+        base = LAYER_DASH_BASE if module == "dash_router" else LAYER_INDEXER_BASE
+        family = TensorFamily.DASH_ROUTER if module == "dash_router" else TensorFamily.SPARSE_INDEXER
+        return TensorRegistryEntry(name, tensor_id_layer(layer, base + offset), family, layer, -1, projection, shape)
+
     match = _LAYER_NORM_RE.match(name)
     if match:
         layer = int(match.group(1))
@@ -267,7 +297,9 @@ def _vision_entry(name: str, tensor_id: int, family: TensorFamily) -> TensorRegi
 def build_tensor_registry(names: Iterable[str]) -> dict[str, TensorRegistryEntry]:
     names_tuple = tuple(names)
     sam_names = sorted(name for name in names_tuple if name.startswith("model.sam_model."))
-    clip_names = sorted(name for name in names_tuple if name.startswith("model.vision_model."))
+    # V2's deterministic position buffer must not renumber the existing CLIP tensors.
+    clip_names = sorted(name for name in names_tuple
+                        if name.startswith("model.vision_model.") and name != CLIP_POSITION_IDS_NAME)
     sam_ids = {name: VISION_SAM_BASE + i for i, name in enumerate(sam_names)}
     clip_ids = {name: VISION_CLIP_BASE + i for i, name in enumerate(clip_names)}
 
