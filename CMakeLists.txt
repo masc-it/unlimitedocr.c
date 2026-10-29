@@ -101,6 +101,7 @@ add_library(uocr_core STATIC
     src/runtime/uocr_profile.c
     src/runtime/uocr_request_validation.c
     src/runtime/uocr_sequence.c
+    src/runtime/uocr_page_state.c
     src/runtime/uocr_vision.c)
 target_include_directories(uocr_core
     PUBLIC

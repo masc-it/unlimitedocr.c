@@ -364,6 +364,7 @@ struct uocr_metal_context {
     id mps_matmul_kernel;
     id<MTLLibrary> library;
     NSMutableDictionary<NSString *, id<MTLComputePipelineState>> *pipeline_cache;
+    float page_rope_inv_freq[63];
     NSMutableDictionary<NSString *, id> *mps_descriptor_cache;
     NSMutableDictionary<NSString *, id> *mps_weight_ndarray_cache;
     NSMutableDictionary<NSString *, id> *mps_workspace_ndarray_cache;
@@ -1488,6 +1489,11 @@ typedef struct uocr_metal_moe_combine_params {
     uint32_t reserved;
 } uocr_metal_moe_combine_params;
 
+typedef struct uocr_metal_page_rope_params {
+    uint32_t n_tokens;
+    uint32_t heads;
+} uocr_metal_page_rope_params;
+
 typedef struct uocr_metal_rope_qk_params {
     uint32_t n_tokens;
     uint32_t heads;
@@ -1837,6 +1843,12 @@ uocr_metal_context *uocr_metal_context_create(const char *resource_path, char *e
             return NULL;
         }
 
+        // Build the fixed page2d token spectrum in host FP32 once. Shader-side
+        // frequency evaluation can differ by an ULP under fast math; long
+        // token offsets amplify that into a measurable phase error.
+        for (uint32_t pair = 0u; pair < 63u; ++pair) {
+            ctx->page_rope_inv_freq[pair] = 1.0f / powf(10000.0f, (float)pair / 63.0f);
+        }
         ctx->queue = [ctx->device newCommandQueue];
         if (ctx->queue == nil) {
             (void)metal_fail(error, error_size, "failed to create Metal command queue");
@@ -12339,6 +12351,90 @@ static int metal_run_attention_qkv_buffer_f16(uocr_metal_context *ctx,
                                        "integrated attention V MPS matmul",
                                        error,
                                        error_size);
+}
+
+static int metal_run_page_rope_qk_buffer_f16(uocr_metal_context *ctx,
+                                             uocr_metal_buffer_slice q,
+                                             uocr_metal_buffer_slice k,
+                                             uocr_metal_buffer_slice positions,
+                                             uint32_t n_tokens, uint32_t heads,
+                                             char *error, size_t error_size) {
+    if (ctx == NULL || n_tokens == 0u || n_tokens > UOCR_V2_MAX_POSITIONS ||
+        (heads != 1u && heads != UOCR_ATTENTION_HEADS)) {
+        return metal_fail(error, error_size, "invalid v2 page RoPE dimensions");
+    }
+    const uint64_t bytes = (uint64_t)n_tokens * heads * UOCR_HEAD_DIM * sizeof(uint16_t);
+    if (!metal_slice_valid(q, bytes) || !metal_slice_valid(k, bytes) ||
+        !metal_slice_valid(positions, (uint64_t)n_tokens * sizeof(uocr_page_position))) {
+        return metal_fail(error, error_size, "invalid v2 page RoPE buffers");
+    }
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, "uocr_page_rope_qk_f16_inplace", error, error_size);
+        if (pipeline == nil) return 0;
+        int owned = 0;
+        id<MTLCommandBuffer> cb = metal_command_buffer_for_op(ctx, &owned, "page RoPE", error, error_size);
+        if (cb == nil) return 0;
+        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
+        if (enc == nil) return metal_fail(error, error_size, "failed to create page RoPE encoder");
+        const uocr_metal_page_rope_params params = {n_tokens, heads};
+        NSUInteger threads = MIN((NSUInteger)256u, pipeline.maxTotalThreadsPerThreadgroup);
+        if (threads == 0u) threads = 1u;
+        [enc setComputePipelineState:pipeline];
+        [enc setBuffer:q.buffer offset:q.offset atIndex:0u];
+        [enc setBuffer:k.buffer offset:k.offset atIndex:1u];
+        [enc setBuffer:positions.buffer offset:positions.offset atIndex:2u];
+        [enc setBytes:&params length:sizeof(params) atIndex:3u];
+        [enc setBytes:ctx->page_rope_inv_freq length:sizeof(ctx->page_rope_inv_freq) atIndex:4u];
+        [enc dispatchThreads:MTLSizeMake((NSUInteger)n_tokens * heads * (UOCR_HEAD_DIM / 2u), 1u, 1u)
+       threadsPerThreadgroup:MTLSizeMake(threads, 1u, 1u)];
+        [enc endEncoding];
+        return metal_finish_command_buffer_for_op(ctx, cb, owned, "page RoPE", error, error_size);
+    }
+}
+
+int uocr_metal_context_page_rope_f16(uocr_metal_context *ctx,
+                                    uint16_t *q_f16, uint16_t *k_f16,
+                                    const uocr_page_position *positions,
+                                    uint32_t n_tokens, uint32_t heads,
+                                    char *error, size_t error_size) {
+    metal_clear_error(error, error_size);
+    if (ctx == NULL || q_f16 == NULL || k_f16 == NULL || positions == NULL ||
+        n_tokens == 0u || n_tokens > UOCR_V2_MAX_POSITIONS ||
+        (heads != 1u && heads != UOCR_ATTENTION_HEADS)) {
+        return metal_fail(error, error_size, "invalid host page RoPE request");
+    }
+    if (metal_command_batch_active(ctx)) {
+        return metal_fail(error, error_size, "host page RoPE requires an idle command batch");
+    }
+    for (uint32_t i = 0u; i < n_tokens; ++i) {
+        if (positions[i].token_position >= UOCR_V2_MAX_POSITIONS) {
+            return metal_fail(error, error_size, "page RoPE token position exceeds v2 limit");
+        }
+    }
+    const uint64_t bytes = (uint64_t)n_tokens * heads * UOCR_HEAD_DIM * sizeof(uint16_t);
+    const uint64_t position_bytes = (uint64_t)n_tokens * sizeof(*positions);
+    const uint64_t limit = metal_device_max_buffer_length(ctx->device);
+    if (bytes > limit || position_bytes > limit || bytes > SIZE_MAX || position_bytes > SIZE_MAX) {
+        return metal_fail(error, error_size, "page RoPE buffers exceed device limits");
+    }
+    @autoreleasepool {
+        id<MTLBuffer> q = metal_new_buffer_with_bytes(ctx, q_f16, (NSUInteger)bytes, MTLResourceStorageModeShared);
+        id<MTLBuffer> k = metal_new_buffer_with_bytes(ctx, k_f16, (NSUInteger)bytes, MTLResourceStorageModeShared);
+        id<MTLBuffer> p = metal_new_buffer_with_bytes(ctx, positions, (NSUInteger)position_bytes, MTLResourceStorageModeShared);
+        if (q == nil || k == nil || p == nil) {
+            [q release]; [k release]; [p release];
+            return metal_fail(error, error_size, "failed to allocate host page RoPE buffers");
+        }
+        const int ok = metal_run_page_rope_qk_buffer_f16(ctx,
+            (uocr_metal_buffer_slice){q, 0u}, (uocr_metal_buffer_slice){k, 0u},
+            (uocr_metal_buffer_slice){p, 0u}, n_tokens, heads, error, error_size);
+        if (ok) {
+            memcpy(q_f16, [q contents], (size_t)bytes);
+            memcpy(k_f16, [k contents], (size_t)bytes);
+        }
+        [q release]; [k release]; [p release];
+        return ok;
+    }
 }
 
 static int metal_run_rope_qk_buffer_f16(uocr_metal_context *ctx,

@@ -59,7 +59,8 @@ Outcome: `UnlimitedOCR(model="v2").generate(image)` works in base and gundam mod
 Files: `src/unlimitedocr_c/{frontend,api,ocr}.py`, `src/runtime/`, `src/core/uocr_api.c`, `src/backend/metal/uocr_metal.m`, Metal RoPE/attention kernels.
 
 - [done] Load v2's 834 added-token entries; build `<PAGE><image>Multi page parsing.` and cap gundam crops at 16. Preserve page markers in output. Reject markerless and text-only v2 inputs.
-- [todo] Implement page/token coordinates and incremental page state. Page RoPE uses 63 token pairs (theta 10000, resampled) plus one page pair (page modulo 2), for both main and router Q/K.
+- [done] Implement standalone request-owned page/token state and Metal page2d RoPE (63 resampled token pairs plus one page pair), supporting both 10-head main attention and 1-head routing. Prefix/instruction positions remain page 0; routing page IDs remain window-local.
+- [todo] Wire the page state and persistent GPU position buffer into v2 prefill/decode. Advance state once per input token and share coordinates across layers; the standalone operation is not yet connected to generation.
 - [todo] Implement DASH in both prefill and decode: 128-dimensional Q/K, Gemma RMSNorm (`1 + weight`), learned `head_cls` summaries over 32-token blocks, page-aware candidates/fallback, top-16 entmax-1.5, up to 12 selected blocks, centered log-prior bias, and local 128-token attention. Local entries win on overlap.
 - [todo] Reuse matrix/norm primitives where mathematically equivalent. Add only the missing router and sparse-gather attention operations; avoid a dense attention implementation that must later be replaced.
 - [todo] Allocate v2 K/V and router state from actual request capacity; enforce the memory budget. State stays per engine/request, never process-global.
@@ -67,11 +68,18 @@ Files: `src/unlimitedocr_c/{frontend,api,ocr}.py`, `src/runtime/`, `src/core/uoc
 
 QA checkpoint:
 
-- [todo] One compact math-parity fixture checks page RoPE, router selections/biases, and attention output across a partial block, the 128-token boundary, and empty-candidate fallback. Use pinned upstream helpers on small tensors; no full-model dependency for this check.
+- [done] Check page-state coordinates against pinned SGLang pure helpers and Metal page RoPE against an FP16 numerical reference, including offsets beyond 32768 and both head counts.
+- [todo] Extend the compact math probe to router selections/biases and attention output across a partial block, the 128-token boundary, and empty-candidate fallback. Use pinned upstream helpers on small tensors; no full-model dependency.
 - [todo] Compare real base and gundam OCR with pinned upstream `infer`, including a page producing more than 128 tokens. Check prompt IDs, final text, and page markers; inspect intermediate logits only if results diverge. Account for BF16/FP16 rounding rather than requiring bitwise identity.
 - [todo] Confirm a too-small memory budget fails cleanly and one existing v1 golden page still works.
 
-QA evidence: frontend-only probes passed for single/two-page markers, 834 added-token entries, a 16-crop gundam image, and page-marker decoding. Native/reference inference has not run; it requires decoder implementation, weights, and a suitable reference environment. Do not label the current frontend checks as numerical inference parity.
+QA evidence:
+
+- Frontend probes passed for single/two-page markers, 834 added-token entries, a 16-crop gundam image, and page-marker decoding.
+- Disposable page-state probe matched `replay_coords` and `replay_page_isolation` extracted from the pinned SGLang source. Covered 273/701-token image spans, more than 128 decode tokens, extra page markers, page bases 0/1/(2^40+1), and invalid transitions/counter overflow without state mutation.
+- On local Apple Metal, freshly compiled FAST and SAFE libraries produced bit-identical FP16 RoPE outputs to the NumPy FP16 reference for both head counts, including offsets 32768 and 131071. Shader-side frequency evaluation initially caused 0.00659 max absolute error at a long offset; a host-computed FP32 frequency table reduced the tested error to zero. This is FP16 primitive parity, not upstream BF16 model parity. Temporary probe and libraries removed.
+- `cmake --build build --target unlimitedocr test_sequence test_metal test_api test_request_validation -j 4` succeeded. `ctest --test-dir build -R '^uocr_(api|sequence|request_validation|metal)$' --output-on-failure`: 4 passed.
+- Native/reference model inference has not run; it still requires DASH attention, decoder/cache integration, weights, and a suitable reference environment. The v2 inference guard remains enabled.
 
 ## Phase 3: Multi-page and quantization
 

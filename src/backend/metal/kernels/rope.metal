@@ -69,6 +69,55 @@ static inline void uocr_rope_pair(uint gid,
     k_dst[base + ulong(b)] = half(k0 * s + k1 * c);
 }
 
+// V2 page2d RoPE. Do not use v1 decoder function constants here: the same
+// operation handles the ten main-attention heads and the single router head.
+// Layout matches runtime/uocr_page_state.h.
+struct UocrPagePosition {
+    uint token_position;
+    uint page_position;
+    int image_page;
+    int query_page;
+};
+struct UocrPageRopeParams {
+    uint n_tokens;
+    uint heads;
+};
+
+static inline half uocr_page_rope_component(half value, half other, half c, half s, bool subtract) {
+#pragma clang fp contract(off)
+    // Upstream casts trig values and rounds each product before summation.
+    // Use the equivalent FP16 schedule for native FP16 activations.
+    const half first = half(float(value) * float(c));
+    const half second = half(float(other) * float(s));
+    return half(subtract ? float(first) - float(second) : float(first) + float(second));
+}
+
+[[max_total_threads_per_threadgroup(256)]]
+kernel void uocr_page_rope_qk_f16_inplace(device half *q [[buffer(0)]],
+                                         device half *k [[buffer(1)]],
+                                         device const UocrPagePosition *positions [[buffer(2)]],
+                                         constant UocrPageRopeParams &params [[buffer(3)]],
+                                         constant float *inv_freq [[buffer(4)]],
+                                         uint gid [[thread_position_in_grid]]) {
+    if (gid >= params.n_tokens * params.heads * 64u) return;
+    const uint pair = gid % 64u;
+    const uint row = gid / 64u;
+    const uint token = row / params.heads;
+    // One page pair has frequency 1 (theta^0). The other 63 pairs span the
+    // token spectrum at their own reduced dimension, not the v1 64-pair grid.
+    const float angle = pair == 63u ? float(positions[token].page_position & 1u)
+        : float(positions[token].token_position) * inv_freq[pair];
+    const half c = half(precise::cos(angle));
+    const half s = half(precise::sin(angle));
+    const ulong a = ulong(row) * 128u + pair;
+    const ulong b = a + 64u;
+    const half qa = q[a], qb = q[b], ka = k[a], kb = k[b];
+    q[a] = uocr_page_rope_component(qa, qb, c, s, true);
+    q[b] = uocr_page_rope_component(qb, qa, c, s, false);
+    k[a] = uocr_page_rope_component(ka, kb, c, s, true);
+    k[b] = uocr_page_rope_component(kb, ka, c, s, false);
+}
+
 // Decode RoPE KV write
 struct UocrDecodeRopeKvWriteParams {
     uint heads;

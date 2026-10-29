@@ -7,6 +7,7 @@
 #include "model/uocr_model_file.h"
 #include "runtime/uocr_logits_processor.h"
 #include "runtime/uocr_memory.h"
+#include "runtime/uocr_page_state.h"
 #include "runtime/uocr_profile.h"
 #include "unlimitedocr.h"
 
@@ -398,6 +399,17 @@ int uocr_metal_context_select_next_token_f16(uocr_metal_context *ctx,
                                              float *scores_out_f32_or_null,
                                              char *error,
                                              size_t error_size);
+/* Standalone synchronous v2 RoPE operation; no model weights required.
+ * Q/K are in-place FP16 arrays [n_tokens, heads, 128], heads is 1 or 10.
+ * Positions use uocr_page_state's CPU/Metal layout. The v2 decoder will use
+ * the buffer-level operation to retain activations on the GPU between layers.
+ * Callers serialize access to ctx, as for the other context operations. */
+int uocr_metal_context_page_rope_f16(uocr_metal_context *ctx,
+                                    uint16_t *q_f16, uint16_t *k_f16,
+                                    const uocr_page_position *positions,
+                                    uint32_t n_tokens, uint32_t heads,
+                                    char *error, size_t error_size);
+
 int uocr_metal_smoke_test(const char *resource_path, char *error, size_t error_size);
 
 #ifdef __cplusplus
