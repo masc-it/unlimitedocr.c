@@ -462,13 +462,18 @@ int uocr_metal_context_dash_layer_f16(uocr_metal_context *ctx, uint32_t layer,
  * Uses the model's actual router projections/norms/head_cls. The budget covers
  * retained attention, runtime workspaces, token IDs, selection/LM-head scratch,
  * and rounded MoE transient storage; model views, vision, allocator/driver
- * overhead are excluded. Public
- * engine admission and page/EOS guarding are still required for generation.
+ * overhead are excluded. Public image generation performs combined engine
+ * admission and page/EOS guarding separately.
  * Prepare requires no live retained cache/runtime arenas. Reset the DASH cache
  * to reuse the same capacities; release cache/runtime arenas before resizing.
  * Context/tracker ownership and serialization match the retained-cache API;
  * do not replace the attached tracker while decoder workspaces are live.
  * Failed GPU work poisons the request; failed admission leaves it unallocated. */
+/* Breakdown used by public model/vision/decoder admission. */
+int uocr_metal_v2_decoder_estimate(uint32_t token_capacity, uint32_t query_capacity,
+    uint32_t page_capacity, uocr_runtime_memory_estimate *out_estimate);
+/* Release all request-owned v2 storage, retaining mapped model/pipeline caches. */
+void uocr_metal_context_release_v2_request(uocr_metal_context *ctx);
 uint64_t uocr_metal_v2_decoder_required_bytes(uint32_t token_capacity,
     uint32_t query_capacity, uint32_t page_capacity);
 int uocr_metal_context_prepare_v2_decoder(uocr_metal_context *ctx,

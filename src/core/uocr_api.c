@@ -52,6 +52,10 @@ struct uocr_engine {
     char last_error[UOCR_ERROR_TEXT_SIZE];
 };
 
+static int engine_is_v2(const uocr_engine *engine) {
+    return engine != NULL && engine->has_model_file && engine->model_file.v2_config != NULL;
+}
+
 static UOCR_THREAD_LOCAL char g_last_error[UOCR_ERROR_TEXT_SIZE] = "OK";
 
 static char *uocr_strdup_or_null(const char *s) {
@@ -887,9 +891,9 @@ uocr_engine *uocr_engine_open(const uocr_engine_opts *opts) {
             return NULL;
         }
         engine->has_model_file = 1;
-        if (engine->model_file.v2_config != NULL) {
-            set_engine_errorf(engine, UOCR_ERROR_NOT_IMPLEMENTED,
-                              "Unlimited-OCR-2 model loaded, but sparse-attention inference is not implemented yet");
+        if (engine_is_v2(engine) && strcmp(requested_backend, "metal") != 0) {
+            set_engine_errorf(engine, UOCR_ERROR_UNSUPPORTED,
+                              "Unlimited-OCR-2 inference requires the Metal backend");
             uocr_engine_close(engine);
             return NULL;
         }
@@ -923,10 +927,16 @@ uocr_engine *uocr_engine_open(const uocr_engine_opts *opts) {
         }
     }
 
-    const int estimate_status = uocr_estimate_minimal_runtime_memory(engine->max_batch,
-                                                                     engine->max_prompt_tokens,
-                                                                     engine->model_view_bytes,
-                                                                     &engine->capacity_estimate);
+    int estimate_status = UOCR_OK;
+    if (engine_is_v2(engine)) {
+        // V2 is admitted from actual prompt/generation capacity at request time.
+        // Engine opening maps weights only, not a configured maximum KV window.
+        engine->capacity_estimate.model_views_bytes = engine->model_view_bytes;
+        engine->capacity_estimate.total_bytes = engine->model_view_bytes;
+    } else {
+        estimate_status = uocr_estimate_minimal_runtime_memory(engine->max_batch,
+            engine->max_prompt_tokens, engine->model_view_bytes, &engine->capacity_estimate);
+    }
     if (estimate_status != UOCR_OK) {
         set_engine_errorf(engine, estimate_status, "failed to estimate engine memory requirements");
         uocr_engine_close(engine);
@@ -1082,8 +1092,11 @@ int uocr_generate_prepared(uocr_engine *engine,
     memset(&limits, 0, sizeof(limits));
     limits.max_prompt_tokens = engine->max_prompt_tokens;
     limits.max_gen_tokens = engine->max_gen_tokens;
-    limits.max_position_tokens = UOCR_MAX_POSITIONS;
-    limits.generated_ring_window = UOCR_GENERATED_RING_WINDOW;
+    const int v2 = engine_is_v2(engine);
+    if (v2 && n_requests != 1u)
+        return set_engine_errorf(engine, UOCR_ERROR_UNSUPPORTED, "v2 currently supports one single-page request at a time");
+    limits.max_position_tokens = v2 ? UOCR_V2_MAX_POSITIONS : UOCR_MAX_POSITIONS;
+    limits.generated_ring_window = v2 ? 0u : UOCR_GENERATED_RING_WINDOW;
     uint32_t max_prompt_tokens_in_batch = 0u;
     uint32_t max_new_tokens_in_batch = 0u;
     uint32_t max_visual_tokens_in_batch = 0u;
@@ -1121,7 +1134,19 @@ int uocr_generate_prepared(uocr_engine *engine,
         if (state_status != UOCR_OK) {
             return set_engine_errorf(engine, state_status, "request %u state build failed: %s", i, validation_error);
         }
-        (void)sequence_state; /* retained here to exercise state construction before inference kernels land */
+        if (v2) {
+            uint32_t markers = 0u, globals = 0u, locals = 0u;
+            for (uint32_t j = 0u; j < requests[i].n_tokens; ++j) markers += requests[i].input_ids[j] == UOCR_TOKEN_PAGE;
+            for (uint32_t j = 0u; j < requests[i].n_views; ++j) {
+                globals += requests[i].views[j].kind == UOCR_VIEW_GLOBAL;
+                locals += requests[i].views[j].kind == UOCR_VIEW_LOCAL;
+            }
+            if (markers != 1u || globals != 1u || locals > 16u || sequence_state.image_span_length == 0u ||
+                sequence_state.image_span_start == 0u ||
+                requests[i].input_ids[sequence_state.image_span_start - 1u] != UOCR_TOKEN_PAGE)
+                return set_engine_errorf(engine, UOCR_ERROR_INVALID_ARGUMENT,
+                    "v2 requires one <PAGE> immediately before its image span, one global view, and at most 16 local crops; multi-page/text-only generation is not enabled");
+        }
         uocr_vision_schedule vision_schedule;
         memset(&vision_schedule, 0, sizeof(vision_schedule));
         const uint32_t vision_max_views_per_chunk = uocr_default_vision_max_views_per_chunk(&requests[i]);
@@ -1181,6 +1206,33 @@ int uocr_generate_prepared(uocr_engine *engine,
     if (estimate_status != UOCR_OK) {
         return set_engine_errorf(engine, estimate_status, "failed to estimate request memory requirements");
     }
+#if UOCR_HAVE_METAL
+    if (v2) {
+        uocr_runtime_memory_estimate estimate;
+        const uint32_t tokens = max_prompt_tokens_in_batch + max_new_tokens_in_batch;
+        if (!uocr_metal_v2_decoder_estimate(tokens, max_prompt_tokens_in_batch, 2u, &estimate))
+            return set_engine_errorf(engine, UOCR_ERROR_INVALID_ARGUMENT, "invalid v2 retained-window capacity");
+        const uint64_t decoder_bytes = estimate.total_bytes;
+        estimate.model_views_bytes = engine->model_view_bytes;
+        estimate.vision_scratch_bytes = request_estimate.vision_scratch_bytes;
+        estimate.vision_gpu_workspace_bytes = request_estimate.vision_gpu_workspace_bytes;
+        estimate.vision_final_features_bytes = request_estimate.vision_final_features_bytes;
+        estimate.vision_host_staging_bytes = request_estimate.vision_host_staging_bytes;
+        // Vision scratch is released before decoder allocation. Final visual
+        // rows overlap decoder setup; retain that overlap in admission.
+        const uint64_t decoder_phase = saturated_add_u64(decoder_bytes, estimate.vision_final_features_bytes);
+        const uint64_t phase_peak = decoder_phase > estimate.vision_scratch_bytes ? decoder_phase : estimate.vision_scratch_bytes;
+        const uint64_t output_bytes = (uint64_t)max_new_tokens_in_batch * sizeof(int32_t) * 2u;
+        const uint64_t subtotal = saturated_add_u64(engine->model_view_bytes, saturated_add_u64(phase_peak, output_bytes));
+        estimate.transient_bytes += output_bytes;
+        if (subtotal == UINT64_MAX || uocr_estimate_safety_margin_bytes(subtotal, &estimate.safety_margin_bytes) != UOCR_OK)
+            return set_engine_errorf(engine, UOCR_ERROR_OUT_OF_MEMORY, "v2 memory estimate overflow");
+        estimate.total_bytes = saturated_add_u64(subtotal, estimate.safety_margin_bytes);
+        if (estimate.total_bytes == UINT64_MAX)
+            return set_engine_errorf(engine, UOCR_ERROR_OUT_OF_MEMORY, "v2 memory estimate overflow");
+        request_estimate = estimate;
+    }
+#endif
     engine->last_estimate = request_estimate;
     uocr_profile_add_event_now(&engine->profile, "request.memory_estimate", estimate_start_ns);
     if (engine->memory_budget_bytes != 0u && request_estimate.total_bytes > engine->memory_budget_bytes) {

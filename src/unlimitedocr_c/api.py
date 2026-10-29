@@ -342,7 +342,8 @@ class UnlimitedOCR:
     >>> ocr = UnlimitedOCR()  # resolves model, opens engine, runs GPU warmup
     >>> text = ocr.generate("page.png")
 
-    The constructor opens the native engine eagerly (GPU warmup).  The engine is
+    The constructor opens the native engine eagerly. V1 also runs synthetic
+    GPU warmup; v2 warms pipelines on its first real image request. The engine is
     resized automatically if a later request needs more prompt/gen capacity.
 
     Thread safety: one instance may be shared by several threads.  A per-object
@@ -449,6 +450,7 @@ class UnlimitedOCR:
                 max_prompt_tokens=prompt_capacity,
                 max_gen_tokens=gen_capacity,
                 memory_budget_bytes=self._memory_budget_bytes,
+                warmup=self._model == "v1",  # The legacy synthetic warmup prompt has no <PAGE>.
             ),
             library_path=self._library_path,
         )

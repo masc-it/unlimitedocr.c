@@ -42,9 +42,21 @@ ocr.close()
 
 ## Unlimited-OCR-2 (development branch)
 
-V2 conversion, model selection, and input preparation are implemented on this
-branch. **Native v2 inference is not ready yet**: `UnlimitedOCR(model="v2")`
-reports that sparse attention is not implemented. The default remains v1.
+Experimental native v2 **single-page** OCR works in `base` and `gundam` modes.
+Mixed-Q8 has been checked on real rendered pages; upstream numerical parity and
+v2 FP16/Q4 OCR remain unverified. The default remains v1.
+
+```python
+from unlimitedocr_c import UnlimitedOCR
+
+with UnlimitedOCR(model="v2", quant="q8") as ocr:
+    print(ocr.generate("page.png", profile="base"))
+```
+
+V2 requires Metal and preserves its page/block markup in output. It warms GPU
+pipelines on the first image request. Multi-page generation and bounded-memory
+cross-window continuation are **not implemented yet**; separate `generate` calls
+do not preserve document context.
 
 To prepare only the converted model (downloads the checkpoint on first use):
 
