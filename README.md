@@ -78,6 +78,45 @@ available locally.
 
 Progress and remaining work: [implementation plan](docs/plan_unlimitedocr2.md).
 
+## Typed OCR output
+
+`generate()` returns raw markup. `parse_ocr()` auto-detects v1/v2 and returns
+immutable `Document -> Page -> Block` records, in generated reading order:
+
+```python
+from dataclasses import asdict
+from unlimitedocr_c import UnlimitedOCR, parse_ocr
+
+with UnlimitedOCR(model="v2", quant="q4") as ocr:
+    document = parse_ocr(ocr.generate("page.png"))
+for page in document.pages:
+    for block in page.blocks:
+        print(block.kind, block.bbox, block.heading_level, block.content)
+
+payload = asdict(document)  # Ready for json.dumps().
+```
+
+- `BBox(x1, y1, x2, y2)` uses page-relative coordinates in **[0, 1]**, with a
+  top-left origin. V1 coordinates are divided by **999**; v2 by **1000**.
+  Boxes are not clipped or reordered. Zero-width/height boxes are retained.
+- V1 produces one implicit page. V2 preserves explicit page boundaries,
+  including blank pages. A v2 block without coordinates has `bbox=None`.
+- Labels (including unknown labels and `cross_`/`append_` prefixes), heading
+  levels and content are preserved. Content includes its original HTML/LaTeX
+  and whitespace. `block.merge_previous` records a same-page `<MERGE>` link;
+  parsing does not combine blocks or cross-page table fragments.
+- Invalid/unsupported layout markup raises `OCRParseError`, a `ValueError`
+  subclass with a zero-based character `offset`. There is no partial-result
+  or repair mode. Non-string input raises `TypeError`. Only single rectangular
+  boxes are supported; `<CHILD>` hierarchy is rejected because its semantics
+  are not defined by the upstream postprocessor.
+- Embedded HTML/LaTeX is opaque, not validated. A plain string cannot establish
+  whether generation reached EOS: truncation inside otherwise valid content
+  is undetectable. Reserved layout controls in content are interpreted as
+  structure, not literal text.
+
+Format references and verification: [parser contract](docs/plan_ocr_parsing.md).
+
 ## Threading
 
 One `UnlimitedOCR` instance is safe to share across threads.  A per-object

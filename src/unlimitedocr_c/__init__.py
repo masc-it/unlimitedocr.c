@@ -23,6 +23,7 @@ from .convert import (
     filter_plan_tensors,
     write_uocr_model,
 )
+from .parsing import BBox, Block, Document, OCRParseError, Page, parse_ocr
 from .tensor_registry import TensorFamily, TensorProjection
 from .golden import (
     PromptEmbeddingDump,
@@ -162,6 +163,12 @@ __all__ = [
     "compare_single_tensor_conversion",
     "filter_plan_tensors",
     "write_uocr_model",
+    "BBox",
+    "Block",
+    "Document",
+    "OCRParseError",
+    "Page",
+    "parse_ocr",
     "TensorFamily",
     "TensorProjection",
     "PromptEmbeddingDump",
