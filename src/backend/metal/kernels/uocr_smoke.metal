@@ -3350,6 +3350,133 @@ kernel void uocr_sam_rel_pos_attention_tiled_precomputed_f16_to_f16(device const
     }
 }
 
+// Fixed 14x14 SAM windows, head dimension 64. Each group computes 16
+// queries against 32 keys at a time with four SIMD groups. Image-padding
+// tokens within the 196-token window still participate; only tile tails mask.
+// Probabilities and accumulators stay FP32, avoiding an extra FP16 rounding
+// step compared with the scalar online-softmax path.
+[[max_total_threads_per_threadgroup(128)]]
+kernel void uocr_sam_window_attention_mma_f16(
+    device const half *q_src [[buffer(0)]],
+    device const half *k_src [[buffer(1)]],
+    device const half *v_src [[buffer(2)]],
+    device const float *rel_h_logits [[buffer(3)]],
+    device const float *rel_w_logits [[buffer(4)]],
+    device half *dst [[buffer(5)]],
+    constant UocrSamRelPosAttentionParams &params [[buffer(6)]],
+    uint3 tg [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    ushort simdgroup [[simdgroup_index_in_threadgroup]],
+    ushort lane [[thread_index_in_simdgroup]]) {
+    const uint query_base = tg.y * 16u;
+    const uint head = tg.x;
+    const uint logical_window = tg.z;
+    if (params.grid_width != 14u || params.grid_height != 14u || params.head_dim != 64u ||
+        params.tokens_per_window != 196u || head >= params.heads || query_base >= 196u ||
+        logical_window >= params.windows * uocr_sam_rel_pos_attention_batch_size(params)) {
+        return;
+    }
+    threadgroup half q_tile[16u * 64u];
+    threadgroup half kv_tile[32u * 64u];
+    threadgroup float probabilities[16u * 32u];
+    // Scores and the rescaled output use this storage at separate barriers.
+    threadgroup float work[16u * 64u];
+    threadgroup float maxima[16u], sums[16u], correction[16u];
+    const ulong base = (ulong(logical_window) * 196ul * ulong(params.heads) + ulong(head)) * 64ul;
+    const uint stride = params.heads * 64u;
+    for (uint i = tid; i < 16u * 64u; i += 128u) {
+        const uint row = query_base + i / 64u;
+        q_tile[i] = row < 196u ? q_src[base + ulong(row) * stride + i % 64u] : half(0);
+    }
+    if (tid < 16u) {
+        maxima[tid] = UOCR_FLASH_NEG_INF;
+        sums[tid] = 0.0f;
+    }
+    simdgroup_float8x8 acc[4];
+    for (uint j = 0u; j < 4u; ++j) acc[j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    const uint query_row = (uint(simdgroup) / 2u) * 8u;
+    const uint key_col = (uint(simdgroup) % 2u) * 16u;
+    const uint output_col = (uint(simdgroup) % 2u) * 32u;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint key_base = 0u; key_base < 196u; key_base += 32u) {
+        for (uint i = tid; i < 32u * 64u; i += 128u) {
+            const uint key = key_base + i / 64u;
+            kv_tile[i] = key < 196u ? k_src[base + ulong(key) * stride + i % 64u] : half(0);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        simdgroup_float8x8 score[2];
+        for (uint j = 0u; j < 2u; ++j) score[j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        for (uint d = 0u; d < 64u; d += 8u) {
+            simdgroup_half8x8 q, k;
+            simdgroup_load(q, q_tile + query_row * 64u + d, 64u);
+            for (uint j = 0u; j < 2u; ++j) {
+                simdgroup_load(k, kv_tile + (key_col + j * 8u) * 64u + d, 64u, ulong2(0), true);
+                simdgroup_multiply_accumulate(score[j], q, k, score[j]);
+            }
+        }
+        for (uint j = 0u; j < 2u; ++j) {
+            simdgroup_store(score[j], work + query_row * 32u + key_col + j * 8u, 32u);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // One SIMD group reduces each row's 32 scores; four rows per group.
+        for (uint r = 0u; r < 4u; ++r) {
+            const uint row = uint(simdgroup) * 4u + r;
+            const uint query = query_base + row;
+            const uint key = key_base + uint(lane);
+            const ulong rel_row = (ulong(logical_window) * params.heads + head) * 196ul + query;
+            float s = work[row * 32u + uint(lane)] * params.scale;
+            if (query < 196u && key < 196u) {
+                s += rel_h_logits[rel_row * 14ul + key / 14u] + rel_w_logits[rel_row * 14ul + key % 14u];
+            }
+            if (key >= 196u) s = UOCR_FLASH_NEG_INF;
+            const float m = max(maxima[row], simd_max(s));
+            const float rescale = exp(maxima[row] - m);
+            const float e = exp(s - m);
+            const float sum = sums[row] * rescale + simd_sum(e);
+            probabilities[row * 32u + uint(lane)] = e;
+            if (lane == 0u) {
+                maxima[row] = m;
+                sums[row] = sum;
+                correction[row] = rescale;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint j = 0u; j < 4u; ++j) {
+            simdgroup_store(acc[j], work + query_row * 64u + output_col + j * 8u, 64u);
+        }
+        // K is no longer consumed; reuse its tile for V.
+        for (uint i = tid; i < 32u * 64u; i += 128u) {
+            const uint key = key_base + i / 64u;
+            kv_tile[i] = key < 196u ? v_src[base + ulong(key) * stride + i % 64u] : half(0);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint i = tid; i < 16u * 64u; i += 128u) work[i] *= correction[i / 64u];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint j = 0u; j < 4u; ++j) {
+            simdgroup_load(acc[j], work + query_row * 64u + output_col + j * 8u, 64u);
+        }
+        for (uint t = 0u; t < 32u; t += 8u) {
+            simdgroup_float8x8 p;
+            simdgroup_half8x8 v;
+            simdgroup_load(p, probabilities + query_row * 32u + t, 32u);
+            for (uint j = 0u; j < 4u; ++j) {
+                simdgroup_load(v, kv_tile + t * 64u + output_col + j * 8u, 64u);
+                simdgroup_multiply_accumulate(acc[j], p, v, acc[j]);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    for (uint j = 0u; j < 4u; ++j) {
+        simdgroup_store(acc[j], work + query_row * 64u + output_col + j * 8u, 64u);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i = tid; i < 16u * 64u; i += 128u) {
+        const uint row = query_base + i / 64u;
+        if (row < 196u) dst[base + ulong(row) * stride + i % 64u] = half(work[i] / sums[i / 64u]);
+    }
+}
+
 // ═══════════════════════════════════════════
 //  sam_position.metal
 // ═══════════════════════════════════════════

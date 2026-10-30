@@ -9,8 +9,9 @@ chunking is deferred after an unfavorable prototype tradeoff. Phase 2's shared
 SAM relative-logit storage, shared local/global backing storage, and batch-abort
 ownership fixes are implemented. Four-crop batches are qualified on the measured
 M1 Pro. Phase 3's bounded-query MPS checkpoint is implemented and verified;
-custom fused online attention is deferred after slower prototypes. Remaining
-staging/cached-buffer accounting is not done.
+custom fused global online attention is deferred after slower prototypes.
+Phase 4's v2 SAM window MMA kernel is implemented and verified. CLIP reuse and
+remaining staging/cached-buffer accounting are not done.
 
 ## Goal and scope
 
@@ -118,7 +119,7 @@ and broader qualification remains `todo` in phase 2.
 | 1 | V2 submission/encoder scheduling | Decode speed | single-token checkpoint done; GPU chunking deferred |
 | 2 | Vision scratch lifetimes and chunk sizing | Memory | lifetimes/chunk qualification done; staging accounting remains todo |
 | 3 | Bounded SAM global attention | Memory and first-token latency | bounded MPS checkpoint done; fused online kernel deferred |
-| 4 | SAM window matrix-tiled attention | First-token latency | todo |
+| 4 | SAM window matrix-tiled attention | First-token latency | v2 SAM checkpoint done; CLIP reuse remains todo |
 | 5 | DASH attention parallelism | Decode speed; prefill opportunity | todo |
 | 6 | Occupancy-aware routed-MoE prefill | Prefill speed | todo |
 | 7 | Q4 vision GEMM staging | Vision speed | todo |
@@ -661,27 +662,138 @@ References: [1], [2] remain relevant to a future faster fused implementation.
 
 ## Phase 4: Matrix-tiled SAM window attention
 
-Outcome: SAM window attention retains current semantics while using matrix MMA
-for QK and PV instead of serial per-key SIMD dot products.
+Outcome: v2's canonical SAM windows use matrix MMA for QK/PV with FP32 online
+softmax. V1 retains its original reduction order. Small v2 floating-point
+rounding differences are explicitly qualified below.
 
 Window attention already stages K/V tiles and uses online softmax. The new work
 is matrix-core utilization and reuse across multiple queries.
 
-- [ ] todo: Specialize matrix tiles for head dimension 64 and 14x14 windows,
+- [x] done: Specialize matrix tiles for head dimension 64 and 14x14 windows,
   preserving relative-position terms and existing image-padding semantics.
-- [ ] todo: Reuse the global attention implementation where useful without
-  forcing both workloads into the same tile configuration.
+- [x] done: Adapt the earlier matrix-tile prototype to short windows without
+  forcing the same dispatch onto global attention. Global attention remains MPS.
 - [ ] todo: Evaluate reuse for CLIP attention only after the SAM checkpoint;
   keep it only if the different sequence lengths benefit.
 
 QA checkpoint:
 
-- [ ] todo: Verify padded/non-padded window behavior and tile-edge masking.
-- [ ] todo: Compare window kernel time and full vision latency in base/gundam;
+- [x] done: Verify padded/non-padded window behavior and tile-edge masking.
+- [x] done: Compare window kernel time and full vision latency in base/gundam;
   confirm improvements survive with detailed checkpoints disabled.
-- [ ] todo: Verify OCR, memory accounting, and both shader build paths.
+- [x] done: Verify OCR, memory accounting, and both shader build paths.
 
-QA evidence: not run. References: [1], [2].
+### V2 window-MMA checkpoint evidence (2026-10-30)
+
+Baseline: `809c72b`; same M1 Pro, 16 GB, pinned models and Release/profiling build.
+The kernel is `uocr_sam_window_attention_mma_f16` in `sam_attention.metal`;
+`uocr_smoke.metal` is regenerated from the fragments.
+
+- Each 128-thread group computes **16 queries x 32 keys** with four SIMD groups.
+  QK uses FP16 input matrices and FP32 accumulation. PV uses **FP32
+  probabilities**, FP16 V and FP32 accumulation; no additional half-precision
+  probability rounding or persistent dequantized weights are introduced.
+- Online maxima/sums are updated per key tile. Shared K storage is reused for V,
+  and score storage is reused for output rescaling after barriers. Static
+  threadgroup memory is **12,480 bytes**; no new device buffers are allocated.
+- All 196 tokens participate, including image-padding tokens already present in
+  a 14x14 window. Only query/key positions beyond 196 are masked as tile tails.
+- Dispatch selects MMA only for **v2, 14x14 windows, head dimension 64**, with
+  matching relative tables. V1 and other shapes retain their previous kernels;
+  nonmatching-table interpolation is unchanged. A missing MMA pipeline fails
+  explicitly rather than silently changing dispatch.
+- An exploratory v1 run moved a box coordinate by one unit on its 0-999 grid.
+  Production therefore leaves v1 arithmetic unchanged to preserve compatibility.
+  This checkpoint does not enable the new kernel for v1.
+
+#### Numerical and OCR qualification
+
+Synthetic checks exercised 1/25 windows, 9-window batches of 4/8 views, uniform
+attention, large finite logits, biased image-padding tokens, and the partial
+query/key tiles at token 196. The tolerance was `atol=0.003, rtol=0.003` against
+both the prior implementation and an independent sampled FP64 oracle. Maximum
+absolute difference from the scalar path was **0.0004883** on the normal cases
+and **0.0019532** on the extreme-logit case; maximum sampled FP64 error was
+approximately **0.0009664**. No nonfinite outputs occurred.
+
+A diagnostic backend compared complete outputs on real Q4 tensors across
+**32 window-attention calls**: eight layers in base plus eight layers for each
+of the maximum-crop request's three chunks. Maximum absolute difference was
+**0.0009765625**, with per-call RMS error no greater than **3.583e-6**. These
+results are numerically close, not bitwise identical. Diagnostic waits/readbacks
+were excluded from performance measurements.
+
+Complete natural-EOS and strict parsing checks:
+
+| Path / fixture | Tokens | Comparison with baseline |
+|---|---:|---|
+| V2 Q4 invoice, base / 13-view / 17-view gundam | 385 | Exact IDs |
+| V2 Q4 blank, base | 19 | Exact IDs |
+| V2 Q4 table, base | 448 | Exact IDs |
+| V2 Q4 columns, base | 577 | Exact IDs |
+| V2 Q4 edge text, gundam | 300 | Exact IDs |
+| V2 Q4 degraded scan, gundam | 385 | Exact IDs |
+| V1 Q4 invoice, base / gundam | 381 | Exact IDs; original kernel |
+| V2 Q8 invoice, base | 385 | Same text, block order/types and metadata; four box coordinates moved by one unit |
+
+**Q8 is not token-identical:** four coordinates across three blocks moved by
+**0.001** on the normalized v2 page grid. The comparison required exact text and
+non-geometric structure, and no box coordinate change beyond one native integer
+unit. The drift was repeatable in the checked cold/warm runs. This is a measured
+rounding difference, not a repair applied by the parser or a guarantee that all
+inputs have the same bound. V2 FP16 end-to-end OCR and universal output parity
+remain unverified.
+
+#### Performance and memory
+
+Isolated attention probes used one warmup and four measured runs (median GPU
+command-buffer duration), including unchanged relative-logit production:
+
+| Shape | Scalar | Matrix |
+|---|---:|---:|
+| 25 windows, one global view | 42.14 ms | 9.21 ms |
+| 9 windows, eight local views | 121.20 ms | 26.65 ms |
+| 9 windows, four local views | 60.63 ms | 13.34 ms |
+
+This is approximately **4.6x faster** for the window operation. A separate
+complete-request A/B probe warmed both libraries and alternated order across
+three pairs, with detailed checkpoints and polling disabled:
+
+| V2 Q4 invoice | Total, before -> after | Vision, before -> after |
+|---|---:|---:|
+| Base | 4.311 -> 4.046 s | 1.101 -> 0.836 s |
+| Gundam, 13 views | 9.588 -> 8.181 s | 5.127 -> 3.728 s |
+
+Complete-request latency fell about **6.2% / 14.7%**, with unchanged output
+lengths. This is a measured fixture result, not a general throughput guarantee.
+Encoder/wait/allocation counts were unchanged: base **1,039 / 386 / 14** and
+13-view gundam **3,496 / 388 / 18**. Tracked peaks remained **2,176,307,712 /
+2,680,173,056 bytes**. Separate 1 ms Metal sampling also retained peaks of
+**2,205,302,784 / 2,735,915,008 bytes**, with end-of-request usage **1,862,516,736
+bytes**. No admission-estimate or crop-default change was needed.
+
+#### Build, failure and cleanup checks
+
+- Runtime-compiled and precompiled base/maximum-crop output IDs matched. The
+  runtime-only probe used an empty resource directory and the regenerated
+  source. Regeneration was checked for byte-for-byte idempotence.
+- Four-crop maximum-view output matched the eight-crop baseline. A standalone
+  probe checked v1 dispatch, v2 MMA, a noncanonical 10x10 window, and interpolated
+  relative tables. Constant-V results were exact. An undersized relative slice
+  rejected before encoding and allowed reuse after restoration.
+- Injected matrix-pipeline and post-encoding failures cleaned up and allowed
+  reuse, including a subsequent complete request matching all 385 baseline IDs.
+  A 2.5 GB budget still rejected the eight-crop maximum request and accepted a
+  smaller base request afterward. Actual GPU execution faults were not injected.
+- Numerical, dispatch, failure and runtime maximum-crop probes passed Metal API
+  validation. Release build and existing suites passed: **105 Python checks,
+  7 opt-in skips**, the three expected warmup warnings, and **13 native checks**.
+- Probes/libraries/logs and generated images under
+  `data.tmp/probes/v2-q4-sam-window/` were removed after recording evidence. The
+  persistent stress dataset and the user's concurrent notebook edits were not
+  modified or staged.
+
+CLIP specialization remains `todo`. References: [1], [2].
 
 ## Phase 5: Parallel DASH sparse attention
 

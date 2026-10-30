@@ -19010,9 +19010,11 @@ static int metal_context_sam_rel_pos_attention_batch_f16_to_slice(uocr_metal_con
     }
 
     if (rel_pos_tables_match_target) {
-        const char *op_name = n_windows == 1u ?
-                                  "Metal SAM global precomputed rel-pos attention" :
-                                  "Metal SAM window precomputed rel-pos attention";
+        const char *op_name = "Metal SAM window precomputed rel-pos attention";
+        // Preserve v1's reduction order; the matrix arithmetic is qualified for v2.
+        const int use_matrix_window = ctx->model_is_v2 && grid_w == 14u && grid_h == 14u && UOCR_SAM_HEAD_DIM == 64u;
+        // Both kernels use four SIMD groups; the matrix kernel covers 16 queries.
+        const uint32_t query_rows = use_matrix_window ? 16u : UOCR_METAL_FLASH_Q_PER_TG;
         uint64_t rel_h_logit_count = 0u;
         uint64_t rel_w_logit_count = 0u;
         uint64_t rel_h_logit_bytes = 0u;
@@ -19033,12 +19035,15 @@ static int metal_context_sam_rel_pos_attention_batch_f16_to_slice(uocr_metal_con
         @autoreleasepool {
             id<MTLComputePipelineState> logits_pipeline = metal_get_pipeline(ctx, "uocr_sam_rel_pos_logits_f16_to_f32", error, error_size);
             id<MTLComputePipelineState> attention_pipeline = metal_get_pipeline(ctx,
-                                                                                "uocr_sam_rel_pos_attention_tiled_precomputed_f16_to_f16",
+                                                                                use_matrix_window ? "uocr_sam_window_attention_mma_f16" :
+                                                                                    "uocr_sam_rel_pos_attention_tiled_precomputed_f16_to_f16",
                                                                                 error,
                                                                                 error_size);
             if (logits_pipeline == nil || attention_pipeline == nil) {
                 return 0;
             }
+            if (use_matrix_window && attention_pipeline.threadExecutionWidth != 32u)
+                return metal_fail(error, error_size, "Metal SAM matrix window attention requires 32-lane SIMD groups");
             NSUInteger logits_threads_per_group = 0u;
             NSUInteger attention_threads_per_group = 0u;
             if (!metal_flash_attention_threads_per_threadgroup(logits_pipeline,
@@ -19057,6 +19062,9 @@ static int metal_context_sam_rel_pos_attention_batch_f16_to_slice(uocr_metal_con
                                                                error_size)) {
                 return 0;
             }
+
+            if (attention_pipeline.staticThreadgroupMemoryLength > ctx->device.maxThreadgroupMemoryLength)
+                return metal_fail(error, error_size, "Metal SAM window attention threadgroup memory exceeds device limit");
 
             // For the supported 40/64 patch grids, the global relative-logit
             // slots cover padded 14x14 windows too. Borrow the accounted storage
@@ -19090,9 +19098,7 @@ static int metal_context_sam_rel_pos_attention_batch_f16_to_slice(uocr_metal_con
                  threadsPerThreadgroup:MTLSizeMake(logits_threads_per_group, 1u, 1u)];
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
-            const NSUInteger query_blocks = (NSUInteger)(((uint32_t)tokens + UOCR_METAL_FLASH_Q_PER_TG - 1u) / UOCR_METAL_FLASH_Q_PER_TG);
-            const NSUInteger tile_keys = 16u;
-            const NSUInteger tile_bytes = tile_keys * (NSUInteger)UOCR_SAM_HEAD_DIM * sizeof(uint16_t);
+            const NSUInteger query_blocks = (NSUInteger)(((uint32_t)tokens + query_rows - 1u) / query_rows);
             [enc setComputePipelineState:attention_pipeline];
             [enc setBuffer:q.buffer offset:q.offset atIndex:0u];
             [enc setBuffer:k.buffer offset:k.offset atIndex:1u];
@@ -19101,8 +19107,11 @@ static int metal_context_sam_rel_pos_attention_batch_f16_to_slice(uocr_metal_con
             [enc setBuffer:rel_w_logits.buffer offset:rel_w_logits.offset atIndex:4u];
             [enc setBuffer:out.buffer offset:out.offset atIndex:5u];
             [enc setBytes:&params length:sizeof(params) atIndex:6u];
-            [enc setThreadgroupMemoryLength:tile_bytes atIndex:0u];
-            [enc setThreadgroupMemoryLength:tile_bytes atIndex:1u];
+            if (!use_matrix_window) {
+                const NSUInteger tile_bytes = 16u * (NSUInteger)UOCR_SAM_HEAD_DIM * sizeof(uint16_t);
+                [enc setThreadgroupMemoryLength:tile_bytes atIndex:0u];
+                [enc setThreadgroupMemoryLength:tile_bytes atIndex:1u];
+            }
             [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)UOCR_SAM_ATTENTION_HEADS, query_blocks, (NSUInteger)logical_windows)
                  threadsPerThreadgroup:MTLSizeMake(attention_threads_per_group, 1u, 1u)];
             metal_end_compute_encoder(ctx, enc);
