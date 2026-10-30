@@ -1312,6 +1312,8 @@ enum {
 
 _Static_assert(UOCR_METAL_LM_HEAD_ARGMAX_THREADS == 256u,
                "LM-head argmax kernel expects 256 threads per threadgroup");
+_Static_assert(UOCR_METAL_LM_HEAD_ARGMAX_TILE_TOKENS == 32u,
+               "Q4 LM-head SIMD argmax expects 32-row partials");
 
 typedef struct uocr_metal_argmax_params {
     uint32_t rows;
@@ -11172,13 +11174,11 @@ static int metal_run_lm_head_argmax_q4_0(uocr_metal_context *ctx,
         if (pipeline == nil) {
             return 0;
         }
-        NSUInteger simd_width = pipeline.threadExecutionWidth;
-        if (simd_width == 0u) {
-            simd_width = 32u;
+        if (pipeline.threadExecutionWidth != 32u) {
+            return metal_fail(error, error_size, "Q4 LM-head argmax requires 32-lane SIMD groups");
         }
-        /* One simdgroup per row, TILE_TOKENS rows per threadgroup so the
-         * partial layout matches the Q8 kernel. */
-        const NSUInteger threads = simd_width * (NSUInteger)UOCR_METAL_LM_HEAD_ARGMAX_TILE_TOKENS;
+        // Eight SIMD groups visit four rows each; the partial layout is unchanged.
+        const NSUInteger threads = (NSUInteger)UOCR_METAL_LM_HEAD_ARGMAX_THREADS;
         if (pipeline.maxTotalThreadsPerThreadgroup < threads) {
             return metal_fail(error,
                               error_size,

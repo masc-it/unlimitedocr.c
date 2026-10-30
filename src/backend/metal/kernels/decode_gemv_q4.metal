@@ -56,6 +56,35 @@ static inline float uocr_decode_gemv_q4_lane_dot(device const half *x,
     return sum;
 }
 
+// Gate/up share activation loads and conversions. Each dot retains the same
+// chunk order and scale placement as uocr_decode_gemv_q4_lane_dot.
+static inline float2 uocr_decode_gemv_q4_lane_gate_up(device const half *x,
+                                                     device const uchar *gate_weight,
+                                                     device const uchar *up_weight,
+                                                     device const half *gate_scale,
+                                                     device const half *up_scale,
+                                                     uint k,
+                                                     uint lane,
+                                                     uint simd_width) {
+    device const half4 *x4 = (device const half4 *)x;
+    device const uchar4 *gate4 = (device const uchar4 *)gate_weight;
+    device const uchar4 *up4 = (device const uchar4 *)up_weight;
+    float gate = 0.0f, up = 0.0f;
+    for (uint c = lane; c < k / 8u; c += simd_width) {
+        const uint group = c / 8u, j4 = c - group * 8u;
+        const uint xbase = group * 16u + j4;
+        const float4 lo = float4(x4[xbase]), hi = float4(x4[xbase + 8u]);
+        const uchar4 gw = gate4[c], uw = up4[c];
+        float gd = dot(lo, float4(int4(gw) & 0xF) - 8.0f);
+        gd += dot(hi, float4(int4(gw) >> 4) - 8.0f);
+        gate += gd * float(gate_scale[group]);
+        float ud = dot(lo, float4(int4(uw) & 0xF) - 8.0f);
+        ud += dot(hi, float4(int4(uw) >> 4) - 8.0f);
+        up += ud * float(up_scale[group]);
+    }
+    return float2(gate, up);
+}
+
 // Mirrors UocrDecodeGemvQ8Params (decode_gemv_q8.metal is an earlier
 // fragment).
 struct UocrDecodeGemvQ4Params {
@@ -116,18 +145,11 @@ struct UocrDecodeGemvQ4Params {
     if (row >= params.n) {
         return;
     }
-    const float gate = simd_sum(uocr_decode_gemv_q4_lane_dot(src,
-                                                             gate_qweight + (ulong)row * (params.k / 2u),
-                                                             gate_qscale + (ulong)row * params.groups_per_row,
-                                                             params.k,
-                                                             lane,
-                                                             simd_width));
-    const float up = simd_sum(uocr_decode_gemv_q4_lane_dot(src,
-                                                           up_qweight + (ulong)row * (params.k / 2u),
-                                                           up_qscale + (ulong)row * params.groups_per_row,
-                                                           params.k,
-                                                           lane,
-                                                           simd_width));
+    const float2 dots = uocr_decode_gemv_q4_lane_gate_up(src,
+        gate_qweight + (ulong)row * (params.k / 2u), up_qweight + (ulong)row * (params.k / 2u),
+        gate_qscale + (ulong)row * params.groups_per_row, up_qscale + (ulong)row * params.groups_per_row,
+        params.k, lane, simd_width);
+    const float gate = simd_sum(dots.x), up = simd_sum(dots.y);
     if (lane == 0u) {
         const float silu = gate / (1.0f + exp(-gate));
         mid[row] = half(silu * up);
@@ -171,8 +193,9 @@ struct UocrDecodeGemvQ4Params {
                                      (ulong)col * groups_per_row;
     device const half *up_qscale = gate_qscale + params.up_scale_offset_values;
 
-    const float gate = simd_sum(uocr_decode_gemv_q4_lane_dot(src, gate_qweight, gate_qscale, K, lane, simd_width));
-    const float up = simd_sum(uocr_decode_gemv_q4_lane_dot(src, up_qweight, up_qscale, K, lane, simd_width));
+    const float2 dots = uocr_decode_gemv_q4_lane_gate_up(src, gate_qweight, up_qweight,
+                                                       gate_qscale, up_qscale, K, lane, simd_width);
+    const float gate = simd_sum(dots.x), up = simd_sum(dots.y);
     if (lane == 0u) {
         const float silu = gate / (1.0f + exp(-gate));
         mid[row] = half(silu * up);

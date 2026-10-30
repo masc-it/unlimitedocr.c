@@ -14,9 +14,10 @@ Phase 4's v2 SAM window MMA kernel and phase 5's order-preserving DASH decode
 kernel are implemented and verified. Phase 6's v2 Q4 M16 routed-prefill
 checkpoint is also implemented and verified. Phase 7's vision-GEMM prototypes
 were measured; production rollout is deferred because complete-request gains
-were small relative to variation and added dispatch complexity. CLIP reuse,
-matrix-tiled sparse prefill, and remaining staging/cached-buffer accounting are
-not done.
+were small relative to variation and added dispatch complexity. Phase 8's
+Q4 LM-head scheduling/reduction and paired gate/up checkpoint is implemented
+and verified. CLIP reuse, matrix-tiled sparse prefill, and remaining
+staging/cached-buffer accounting are not done.
 
 ## Goal and scope
 
@@ -128,7 +129,7 @@ and broader qualification remains `todo` in phase 2.
 | 5 | DASH attention parallelism | Decode speed; prefill opportunity | decode checkpoint done; matrix-tiled sparse prefill remains todo |
 | 6 | Occupancy-aware routed-MoE prefill | Prefill speed | v2 Q4 M16 checkpoint done; mixed-width/compact dispatch not justified |
 | 7 | Q4 vision GEMM staging | Vision speed | investigated; production deferred after small whole-request gains |
-| 8 | Q4 LM-head and decode GEMVs | Decode speed | todo |
+| 8 | Q4 LM-head and decode GEMVs | Decode speed | LM-head/paired gate-up checkpoint done; down GEMVs unchanged |
 | 9 | DASH router/projection specialization | Decode and future longer windows | todo |
 
 Files:
@@ -1254,27 +1255,171 @@ Reference: [5].
 Outcome: measured decode improvements without full-logit or dequantized-weight
 buffers and without changing model-file layout.
 
-The LM head reads approximately 88 MB of weights/scales per token and currently
-uses 1,024-thread groups. Existing unpacking and argmax designs were already
-benchmarked during the earlier Q4 work.
+The LM head reads approximately 88 MB of weights/scales per token. The baseline
+used 1,024-thread groups; the accepted path uses 256 threads while preserving
+32-row argmax partials. Existing packing and scale semantics are unchanged.
 
-- [ ] todo: Benchmark smaller groups with multiple output rows per SIMD group
+- [x] done: Benchmark smaller groups with multiple output rows per SIMD group
   and activation/preprocessing reuse across rows.
-- [ ] todo: Investigate cheaper quantized dot-product instruction sequences
-  while retaining the current packing and scale semantics.
-- [ ] todo: Preserve fused partial argmax and update partial-buffer sizing
-  coherently if the logical reduction geometry changes.
-- [ ] todo: Apply improvements to expert/shared/dense decode GEMVs only where
-  their actual dimensions show a benefit.
+- [x] done: Investigate quantized dot-product instruction sequences while
+  retaining current packing/scales. Reject slower signed-nibble conversion.
+- [x] done: Preserve fused partial argmax and the existing logical geometry;
+  partial-buffer sizing and the finalize pass do not change.
+- [x] done: Apply activation-load reuse to routed/shared/dense gate/up GEMVs;
+  retain the existing linear/down-combine paths and their group sizes.
 
 QA checkpoint:
 
-- [ ] todo: Verify tail dimensions, tied logits, invalid-token masks, and page/EOS
+- [x] done: Verify tail dimensions, tied logits, invalid-token masks, and page/EOS
   filtering before argmax; compare against the existing quantized path.
-- [ ] todo: Measure effective bandwidth and instruction/occupancy limits, then
-  confirm an end-to-end decode improvement rather than a microbenchmark-only win.
+- [x] done: Measure effective payload bandwidth and shape-specific GPU time,
+  then confirm a complete-request improvement.
+- [ ] todo: Collect hardware instruction/register/occupancy counters if further
+  tuning is needed; these counters were not measured in this checkpoint.
 
-QA evidence: not run. Reference: [5].
+### Q4 decode checkpoint evidence (2026-10-31)
+
+Baseline: `e66094f` (production code from `264afc8`), Apple M1 Pro with 16 GB
+RAM, pinned models and Release/profiling build. The saved native library and
+metallib were used together for production A/B comparisons, since the LM-head
+launch contract changes from 1,024 to 256 threads.
+
+#### Selected changes and rejected alternatives
+
+- The LM head now uses **eight 32-lane SIMD groups / 256 threads**. Each SIMD
+  group visits four vocabulary rows sequentially, retaining the original
+  per-lane dot/chunk order. It still produces one partial per **32 vocabulary
+  rows**, or **4,040 partials** at vocabulary size 129,280.
+- After an unconditional threadgroup barrier, the first SIMD group reduces the
+  32 scores with `simd_max` and chooses the lowest matching valid ID with
+  `simd_min`. The score is fetched from the winning row, preserving its bits
+  even on signed-zero ties. Filtering and NaN exclusion still happen before
+  reduction; fully masked groups retain the invalid-ID/-infinity sentinel.
+- Scores and IDs still occupy **32,320 bytes total**. Dynamic threadgroup
+  partial storage remains **256 bytes**. There is no full-logit buffer, new
+  dispatch, persistent dequantized copy, format change or estimator change.
+  Host validation requires 32-lane SIMD groups; compile-time assertions pin
+  the 32-row partial/256-thread contract.
+- Gate/up GEMVs now load and convert each activation chunk once for both dots.
+  Gate and up have independent FP32 accumulators with the same chunk order,
+  dot expressions and scale placement as before. SwiGLU/FP16 stores are
+  unchanged. The linear/down-combine kernels are not modified.
+- These shared Q4 primitives also serve **v1**. Unlike the earlier v2-only
+  window/MoE-tile changes, this checkpoint intentionally applies the same
+  arithmetic-preserving change to both versions; v1 output checks are below.
+  Q8/FP16 paths and prefill GEMMs are unchanged.
+
+LM-head candidates included 128/256/512-thread groups, two simultaneous rows
+per SIMD group, canonical-hidden-size specialization, cached activation
+vectors, 128/256-row physical tiles, and parallel partial reductions. Smaller
+groups alone saved about 2-3%; parallel reduction supplied the rest. Wider
+physical tiles and simultaneous-row computation did not beat the selected
+32-row/256-thread path. Signed-nibble conversion and activation preloading were
+about 45% slower on the full-vocabulary probe and were discarded. GEMV group
+sizes 32/64/128/256 did not justify replacing the existing 128-thread dispatch.
+
+#### Kernel measurements
+
+The production LM-head probe used one warmup and three measured command
+buffers, each with 24 dependent dispatches. At hidden size 1,280 / vocabulary
+129,280, median GPU time changed **0.797 -> 0.748 ms**. The nominal weight/scale
+payload is **87,910,400 bytes**, implying approximately **110 -> 118 GB/s**
+effective payload bandwidth, not a measured DRAM counter. Forced-token cases
+were also checked; they should not be interpreted as streaming bandwidth.
+
+Small GEMV timings varied when each candidate reallocated buffers. A follow-up
+kept identical buffers resident and alternated old/new pipelines over five
+pairs after warmup, with 256 dependent dispatches per buffer:
+
+| Gate/up shape | Before | After |
+|---|---:|---:|
+| Shared: K=1280, N=1792 | 23.65 us | 22.15 us |
+| Dense: K=1280, N=6848 | 77.62 us | 72.75 us |
+| Routed: six experts, K=1280, N=896 each | 66.99 us | 63.25 us |
+
+These approximately **6%** isolated improvements are not claims about total
+request speed. The unchanged down kernel also showed allocation/run-order
+variation in early probes; that was not counted as an optimization.
+
+#### Numerical, filters and compatibility
+
+- LM-head partial scores and IDs matched the baseline **bit-for-bit**, including
+  vocabulary sizes 1/31/33/65/129,280; hidden sizes 64/896/1,280; ties within and
+  across partials; excluded IDs; forced PAGE/EOS/other IDs; an out-of-range forced
+  ID (all masked); a NaN row; and all-NaN activations. Small cases also used an
+  independent FP64 oracle for scores/selection.
+- A diagnostic backend compared **130 real Q4 LM-head invocations**, 65 each
+  from base/gundam, including initial prefill and 64 decode steps. Every score
+  and ID in all **4,040 partials per invocation** matched. Diagnostic waits and
+  readbacks were excluded from timing.
+- Production GEMVs matched baseline FP16 outputs bit-for-bit on nine synthetic
+  shapes, including partial output rows, partial lane coverage, real shared/
+  dense/routed dimensions, and invalid expert IDs. Metal API/GPU shader
+  validation passed the LM-head edge cases and GEMV checks.
+- Complete natural-EOS/strict-parsing checks matched baseline IDs:
+
+| Path / fixture | Output tokens |
+|---|---:|
+| V2 Q4 invoice, base / 13-view / maximum 17-view gundam | 385 |
+| V2 Q4 blank, base | 19 |
+| V2 Q4 table, base | 448 |
+| V2 Q4 edge text, gundam | 300 |
+| V2 Q4 degraded scan, gundam | 385 |
+| V2 Q4 tiny text, base | 1,172 |
+| V1 Q4 invoice, base / gundam | 381 |
+| V1 Q4 table, base | 444 |
+| V2 Q8 invoice, base | 385 |
+
+Q8 matched the observed baseline output set; the earlier baseline-variation
+caveat still applies. Universal/compiler-independent bitwise equivalence and
+upstream/full-v2-FP16 numerical parity are not established by these checks.
+
+#### Whole-request acceptance and memory
+
+Final production A/B measurements warmed both engines, alternated order over
+four complete-request pairs and disabled detailed checkpoints/polling:
+
+| V2 Q4 invoice | Before | After | Mean saving |
+|---|---:|---:|---:|
+| Base, 385 IDs | 3.478 s | 3.414 s | 64 ms / 1.8% |
+| Gundam, 385 IDs | 7.454 s | 7.392 s | 62 ms / 0.8% |
+
+Each final production pair improved. Subtracting the unchanged vision-stage
+timer left **2.630 -> 2.579 s** base and **3.699 -> 3.650 s** gundam, supporting
+about 50 ms of post-vision benefit rather than attributing vision timing noise
+to the new kernels. A separate warmed tiny-text comparison changed **8.815 ->
+8.677 s** with 1,172 identical IDs. An interleaved v1 table check also improved
+on all four pairs, but its high timing variation is not a general v1 speed claim.
+An earlier prototype gundam A/B run timed out; acceptance uses the subsequently
+completed production runs, not its incomplete samples.
+
+Encoder/wait/allocation counts remained **1,039 / 386 / 14** base and
+**3,496 / 388 / 18** gundam. Tracked peaks remained **2,176,307,712 /
+2,680,173,056 bytes**. Separate 1 ms Metal sampling of 65-token requests retained
+peaks **2,205,302,784 / 2,735,915,008 bytes** and end usage **1,862,516,736 bytes**.
+RSS high-water marks were approximately **2.142 -> 2.132 GB** base and
+**2.227 -> 2.213 GB** gundam; these include Python/compiler/driver state and
+are not the native admission estimate.
+
+#### Failure, builds and cleanup
+
+- Injected LM-head pipeline-lookup and post-dispatch failures released request
+  allocations and allowed repeated reuse, followed by a complete matching
+  385-ID request. Actual GPU execution faults were not injected. Admission
+  estimates/scratch geometry did not change; budget rejection was not
+  separately repeated in this checkpoint.
+- Runtime-only compilation from generated source in an empty resource directory
+  matched precompiled base/gundam outputs. A profiling-OFF, runtime-compilation-
+  OFF precompiled build passed all 13 native checks and matched complete base
+  output. Regeneration was byte-identical.
+- Release build and existing suites passed: **105 Python checks, 7 opt-in
+  skips**, the three expected warmup warnings, and **13 native checks**.
+- Owned probes, private builds/libraries and logs under
+  `data.tmp/probes/v2-q4-decode-tuning/` were removed after recording evidence.
+  No permanent tests were added. Persistent stress data and concurrent notebook
+  edits were not modified or staged by this work.
+
+Reference: [5].
 
 ## Phase 9: DASH router/projection specialization
 

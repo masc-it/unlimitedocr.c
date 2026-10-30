@@ -857,6 +857,35 @@ static inline float uocr_decode_gemv_q4_lane_dot(device const half *x,
     return sum;
 }
 
+// Gate/up share activation loads and conversions. Each dot retains the same
+// chunk order and scale placement as uocr_decode_gemv_q4_lane_dot.
+static inline float2 uocr_decode_gemv_q4_lane_gate_up(device const half *x,
+                                                     device const uchar *gate_weight,
+                                                     device const uchar *up_weight,
+                                                     device const half *gate_scale,
+                                                     device const half *up_scale,
+                                                     uint k,
+                                                     uint lane,
+                                                     uint simd_width) {
+    device const half4 *x4 = (device const half4 *)x;
+    device const uchar4 *gate4 = (device const uchar4 *)gate_weight;
+    device const uchar4 *up4 = (device const uchar4 *)up_weight;
+    float gate = 0.0f, up = 0.0f;
+    for (uint c = lane; c < k / 8u; c += simd_width) {
+        const uint group = c / 8u, j4 = c - group * 8u;
+        const uint xbase = group * 16u + j4;
+        const float4 lo = float4(x4[xbase]), hi = float4(x4[xbase + 8u]);
+        const uchar4 gw = gate4[c], uw = up4[c];
+        float gd = dot(lo, float4(int4(gw) & 0xF) - 8.0f);
+        gd += dot(hi, float4(int4(gw) >> 4) - 8.0f);
+        gate += gd * float(gate_scale[group]);
+        float ud = dot(lo, float4(int4(uw) & 0xF) - 8.0f);
+        ud += dot(hi, float4(int4(uw) >> 4) - 8.0f);
+        up += ud * float(up_scale[group]);
+    }
+    return float2(gate, up);
+}
+
 // Mirrors UocrDecodeGemvQ8Params (decode_gemv_q8.metal is an earlier
 // fragment).
 struct UocrDecodeGemvQ4Params {
@@ -917,18 +946,11 @@ struct UocrDecodeGemvQ4Params {
     if (row >= params.n) {
         return;
     }
-    const float gate = simd_sum(uocr_decode_gemv_q4_lane_dot(src,
-                                                             gate_qweight + (ulong)row * (params.k / 2u),
-                                                             gate_qscale + (ulong)row * params.groups_per_row,
-                                                             params.k,
-                                                             lane,
-                                                             simd_width));
-    const float up = simd_sum(uocr_decode_gemv_q4_lane_dot(src,
-                                                           up_qweight + (ulong)row * (params.k / 2u),
-                                                           up_qscale + (ulong)row * params.groups_per_row,
-                                                           params.k,
-                                                           lane,
-                                                           simd_width));
+    const float2 dots = uocr_decode_gemv_q4_lane_gate_up(src,
+        gate_qweight + (ulong)row * (params.k / 2u), up_qweight + (ulong)row * (params.k / 2u),
+        gate_qscale + (ulong)row * params.groups_per_row, up_qscale + (ulong)row * params.groups_per_row,
+        params.k, lane, simd_width);
+    const float gate = simd_sum(dots.x), up = simd_sum(dots.y);
     if (lane == 0u) {
         const float silu = gate / (1.0f + exp(-gate));
         mid[row] = half(silu * up);
@@ -972,8 +994,9 @@ struct UocrDecodeGemvQ4Params {
                                      (ulong)col * groups_per_row;
     device const half *up_qscale = gate_qscale + params.up_scale_offset_values;
 
-    const float gate = simd_sum(uocr_decode_gemv_q4_lane_dot(src, gate_qweight, gate_qscale, K, lane, simd_width));
-    const float up = simd_sum(uocr_decode_gemv_q4_lane_dot(src, up_qweight, up_qscale, K, lane, simd_width));
+    const float2 dots = uocr_decode_gemv_q4_lane_gate_up(src, gate_qweight, up_qweight,
+                                                       gate_qscale, up_qscale, K, lane, simd_width);
+    const float gate = simd_sum(dots.x), up = simd_sum(dots.y);
     if (lane == 0u) {
         const float silu = gate / (1.0f + exp(-gate));
         mid[row] = half(silu * up);
@@ -2831,12 +2854,11 @@ static inline void uocr_moe_q4_m16_stage_a(device const half *src,
 // Structure differs from the Q8 kernel: instead of 8 lanes per token with the
 // hidden vector staged in threadgroup memory (which caps Q4 at ~1.1x because
 // the TG-load instruction rate does not halve with the weight bytes), one
-// simdgroup owns one vocab row and streams the packed Q4 weights with the
-// group-half-split unpack, reading the 2.5 KB hidden vector through the
-// device cache.  32 simdgroups per 1024-thread threadgroup produce one
-// argmax partial per 32 rows - the same partial layout as the Q8 kernel
-// (vocab / 32), so the selection scratch and finalize pass are unchanged.
-// Measured ~1.2x vs the Q8 argmax on M1 Pro (~0.15 ms/token).
+// simdgroup computes one vocab row at a time, using group-half-split unpacking
+// and reading the 2.5 KB hidden vector through the
+// device cache. Eight SIMD groups per 256-thread group visit four rows each.
+// A SIMD reduction produces one partial per 32 rows, preserving the Q8
+// partial layout and the existing selection scratch/finalize pass.
 
 struct UocrLmHeadArgmaxQ4Params {
     uint vocab_size;
@@ -2849,7 +2871,7 @@ struct UocrLmHeadArgmaxQ4Params {
     uint reserved0;
 };
 
-[[max_total_threads_per_threadgroup(1024)]] kernel void uocr_lm_head_argmax_q4_0_to_f16(
+[[max_total_threads_per_threadgroup(256)]] kernel void uocr_lm_head_argmax_q4_0_to_f16(
     device const half *hidden [[buffer(0)]],
     device const uchar *qweight [[buffer(1)]],
     device const half *qscale [[buffer(2)]],
@@ -2859,7 +2881,6 @@ struct UocrLmHeadArgmaxQ4Params {
     threadgroup float *partials [[threadgroup(0)]],
     threadgroup uint *partial_ids [[threadgroup(1)]],
     uint tile [[threadgroup_position_in_grid]],
-    uint tid [[thread_index_in_threadgroup]],
     uint ntg [[threads_per_threadgroup]],
     ushort lane_u16 [[thread_index_in_simdgroup]],
     ushort simdgroup_u16 [[simdgroup_index_in_threadgroup]],
@@ -2867,60 +2888,55 @@ struct UocrLmHeadArgmaxQ4Params {
     const uint lane = uint(lane_u16);
     const uint simdgroup = uint(simdgroup_u16);
     const uint simd_width = uint(simd_width_u16);
-    const uint rows_per_tg = ntg / simd_width;
-    const uint row = tile * rows_per_tg + simdgroup;
+    const uint groups = ntg / simd_width;
     const uint hidden_size = params.hidden_size;
     const uint vocab_size = params.vocab_size;
 
-    float score = -INFINITY;
-    uint id = 0xffffffffu;
-    if (row < vocab_size && uocr_lm_token_allowed(row, params.reserved0) && params.group_size == 64u) {
-        device const uchar *w_row = qweight + (ulong)row * (ulong)(hidden_size / 2u);
-        device const half *s_row = qscale + (ulong)row * (ulong)params.groups_per_row;
-        device const uchar4 *w4 = (device const uchar4 *)w_row;
-        device const half4 *x4 = (device const half4 *)hidden;
-        float sum = 0.0f;
-        const uint chunks = hidden_size / 8u; // 4 packed bytes -> 8 weights
-        for (uint c = lane; c < chunks; c += simd_width) {
-            const uchar4 w = w4[c];
-            const uint group = c / 8u;       // 8 uchar4 chunks per 64-wide group
-            const uint j4 = c - group * 8u;  // half4 index inside the low half
-            const float scale = float(s_row[group]);
-            const uint xbase = group * 16u + j4; // 16 half4 per 64-wide group
-            float d = dot(float4(x4[xbase]), float4(int4(w) & 0xF) - 8.0f);
-            d += dot(float4(x4[xbase + 8u]), float4(int4(w) >> 4) - 8.0f);
-            sum += d * scale;
+    // Each SIMD group visits four rows with the original lane-dot order.
+    for (uint local = simdgroup; local < 32u; local += groups) {
+        const uint row = tile * 32u + local;
+        float score = -INFINITY;
+        uint id = 0xffffffffu;
+        if (row < vocab_size && uocr_lm_token_allowed(row, params.reserved0) && params.group_size == 64u) {
+            device const uchar *w_row = qweight + (ulong)row * (ulong)(hidden_size / 2u);
+            device const half *s_row = qscale + (ulong)row * (ulong)params.groups_per_row;
+            device const uchar4 *w4 = (device const uchar4 *)w_row;
+            device const half4 *x4 = (device const half4 *)hidden;
+            float sum = 0.0f;
+            const uint chunks = hidden_size / 8u; // 4 packed bytes -> 8 weights
+            for (uint c = lane; c < chunks; c += simd_width) {
+                const uchar4 w = w4[c];
+                const uint group = c / 8u;       // 8 uchar4 chunks per 64-wide group
+                const uint j4 = c - group * 8u;  // half4 index inside the low half
+                const float scale = float(s_row[group]);
+                const uint xbase = group * 16u + j4; // 16 half4 per 64-wide group
+                float d = dot(float4(x4[xbase]), float4(int4(w) & 0xF) - 8.0f);
+                d += dot(float4(x4[xbase + 8u]), float4(int4(w) >> 4) - 8.0f);
+                sum += d * scale;
+            }
+            const float total = simd_sum(sum);
+            if (!isnan(total)) {
+                score = total;
+                id = row;
+            }
         }
-        const float total = simd_sum(sum);
-        if (!isnan(total)) {
-            score = total;
-            id = row;
-        }
-    }
 
-    if (lane == 0u) {
-        partials[simdgroup] = score;
-        partial_ids[simdgroup] = id;
+        if (lane == 0u) {
+            partials[local] = score;
+            partial_ids[local] = id;
+        }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    /* Rows ascend with simdgroup index, so a strict > keeps the lowest id on
-     * ties - matching the Q8 argmax tie-break. */
-    if (tid == 0u && tile < params.partial_count) {
-        float best = -INFINITY;
-        uint best_id = 0xffffffffu;
-        for (uint i = 0u; i < rows_per_tg; ++i) {
-            if (partial_ids[i] == 0xffffffffu) {
-                continue;
-            }
-            if (best_id == 0xffffffffu || partials[i] > best ||
-                (partials[i] == best && partial_ids[i] < best_id)) {
-                best = partials[i];
-                best_id = partial_ids[i];
-            }
+    // Preserve the 32-row partial layout and lowest-ID tie break. Fetch the
+    // winning row's score so signed-zero ties retain the selected score bits.
+    if (simdgroup == 0u) {
+        const float best = simd_max(partials[lane]);
+        const uint winner = simd_min(partials[lane] == best ? partial_ids[lane] : 0xffffffffu);
+        if (lane == 0u && tile < params.partial_count) {
+            partial_ids_out[tile] = winner;
+            partial_scores_out[tile] = winner == 0xffffffffu ? -INFINITY : partials[winner - tile * 32u];
         }
-        partial_scores_out[tile] = best_id == 0xffffffffu ? -INFINITY : best;
-        partial_ids_out[tile] = best_id;
     }
 }
 
