@@ -363,6 +363,8 @@ struct uocr_metal_context {
     id<MTLDevice> device;
     id<MTLCommandQueue> queue;
     id<MTLCommandBuffer> active_command_buffer;
+    id<MTLComputeCommandEncoder> active_compute_encoder;
+    int reuse_compute_encoder; /* Opt-in only during v2 generation. */
     id mps_matmul_kernel;
     id<MTLLibrary> library;
     NSMutableDictionary<NSString *, id<MTLComputePipelineState>> *pipeline_cache;
@@ -629,6 +631,7 @@ static id<MTLBuffer> metal_new_buffer_with_bytes_no_copy(uocr_metal_context *ctx
 
 static id<MTLCommandBuffer> metal_new_command_buffer(uocr_metal_context *ctx);
 static id<MTLComputeCommandEncoder> metal_compute_command_encoder(uocr_metal_context *ctx, id<MTLCommandBuffer> cb);
+static void metal_end_compute_encoder(uocr_metal_context *ctx, id<MTLComputeCommandEncoder> enc);
 static id<MTLBlitCommandEncoder> metal_blit_command_encoder(uocr_metal_context *ctx, id<MTLCommandBuffer> cb);
 static int metal_command_batch_active(const uocr_metal_context *ctx);
 static int metal_command_batch_begin(uocr_metal_context *ctx, char *error, size_t error_size);
@@ -5230,7 +5233,7 @@ static int metal_precompute_sam_abs_pos_tables(uocr_metal_context *ctx,
         [enc setBytes:&params length:sizeof(params) atIndex:3u];
         [enc dispatchThreads:MTLSizeMake((NSUInteger)target_values, 1u, 1u)
        threadsPerThreadgroup:MTLSizeMake(threads, 1u, 1u)];
-        [enc endEncoding];
+        metal_end_compute_encoder(ctx, enc);
         if (!metal_wait_for_command_buffer_profiled(ctx, cb, "Metal SAM absolute-position precompute", error, error_size)) {
             [local_buffer release];
             return 0;
@@ -5405,7 +5408,7 @@ static int metal_precompute_sam_rel_pos_tables(uocr_metal_context *ctx,
                                                        "SAM global relative-position W source table",
                                                        error,
                                                        error_size)) {
-                [enc endEncoding];
+                metal_end_compute_encoder(ctx, enc);
                 [local_buffer release];
                 return 0;
             }
@@ -5428,7 +5431,7 @@ static int metal_precompute_sam_rel_pos_tables(uocr_metal_context *ctx,
            threadsPerThreadgroup:MTLSizeMake(threads, 1u, 1u)];
             dst_offset += (NSUInteger)table_bytes;
         }
-        [enc endEncoding];
+        metal_end_compute_encoder(ctx, enc);
         if (!metal_wait_for_command_buffer_profiled(ctx, cb, "Metal SAM relative-position precompute", error, error_size)) {
             [local_buffer release];
             return 0;
@@ -5580,7 +5583,7 @@ static int metal_precompute_clip_abs_pos_tables(uocr_metal_context *ctx,
         [enc setBytes:&params length:sizeof(params) atIndex:3u];
         [enc dispatchThreads:MTLSizeMake((NSUInteger)target_values, 1u, 1u)
        threadsPerThreadgroup:MTLSizeMake(threads, 1u, 1u)];
-        [enc endEncoding];
+        metal_end_compute_encoder(ctx, enc);
         if (!metal_wait_for_command_buffer_profiled(ctx, cb, "Metal CLIP absolute-position precompute", error, error_size)) {
             [local_buffer release];
             return 0;
@@ -5665,7 +5668,7 @@ static int metal_context_sam_add_abs_pos_batch_f16_to_slice(uocr_metal_context *
         [enc setBytes:&params length:sizeof(params) atIndex:3u];
         [enc dispatchThreads:MTLSizeMake((NSUInteger)values, 1u, 1u)
        threadsPerThreadgroup:MTLSizeMake(threads, 1u, 1u)];
-        [enc endEncoding];
+        metal_end_compute_encoder(ctx, enc);
         return metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, "Metal SAM abs-pos batch", error, error_size);
     }
 }
@@ -5726,7 +5729,7 @@ static int metal_context_bhwc_to_nchw_f16(uocr_metal_context *ctx,
         [enc setBytes:&dims length:sizeof(dims) atIndex:2u];
         [enc dispatchThreads:MTLSizeMake((NSUInteger)spatial, (NSUInteger)channels, (NSUInteger)batch_size)
        threadsPerThreadgroup:MTLSizeMake(1u, 1u, 1u)];
-        [enc endEncoding];
+        metal_end_compute_encoder(ctx, enc);
         return metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, "Metal BHWC→NCHW transpose", error, error_size);
     }
 }
@@ -5798,7 +5801,7 @@ static int metal_context_sam_layernorm2d_bhwc_batch_f16_to_slice(uocr_metal_cont
         [enc setThreadgroupMemoryLength:(NSUInteger)threadgroup_bytes atIndex:0u];
         [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(grid_w * grid_h), 1u, (NSUInteger)view_count)
              threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1u, 1u)];
-        [enc endEncoding];
+        metal_end_compute_encoder(ctx, enc);
         return metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, "Metal SAM LayerNorm2d BHWC batch", error, error_size);
     }
 }
@@ -5906,7 +5909,7 @@ static int metal_context_sam_conv3x3_im2col_mps_bhwc_batch_f16_to_slice(uocr_met
             [enc setBytes:&p length:sizeof(p) atIndex:2u];
             [enc dispatchThreads:MTLSizeMake(9u * c4_count, (NSUInteger)rows, 1u)
            threadsPerThreadgroup:MTLSizeMake(32u, 8u, 1u)];
-            [enc endEncoding];
+            metal_end_compute_encoder(ctx, enc);
             if (!metal_finish_command_buffer_for_op(ctx, cb, owned, "Metal SAM BHWC im2col", error, error_size)) {
                 if (allocated) [col_buffer release]; return 0;
             }
@@ -6161,7 +6164,7 @@ static int metal_context_clip_embed_sam_batch_f16_to_slice(uocr_metal_context *c
         [enc setBytes:&params length:sizeof(params) atIndex:3u];
         [enc dispatchThreads:MTLSizeMake((NSUInteger)UOCR_CLIP_HIDDEN_SIZE, (NSUInteger)output_tokens, (NSUInteger)view_count)
        threadsPerThreadgroup:MTLSizeMake(threads_x, 1u, 1u)];
-        [enc endEncoding];
+        metal_end_compute_encoder(ctx, enc);
         return metal_finish_command_buffer_for_op(ctx,
                                                   cb,
                                                   owned_command_buffer,
@@ -6237,7 +6240,7 @@ static int metal_context_clip_add_abs_pos_batch_f16_to_slice(uocr_metal_context 
         [enc setBytes:&params length:sizeof(params) atIndex:3u];
         [enc dispatchThreads:MTLSizeMake((NSUInteger)token_values, 1u, 1u)
        threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1u, 1u)];
-        [enc endEncoding];
+        metal_end_compute_encoder(ctx, enc);
         return metal_finish_command_buffer_for_op(ctx,
                                                   cb,
                                                   owned_command_buffer,
@@ -6360,7 +6363,7 @@ static int metal_context_clip_sam_concat_batch_f16_to_slice(uocr_metal_context *
         }
         [enc dispatchThreads:MTLSizeMake((NSUInteger)UOCR_PROJECTOR_IN_SIZE, (NSUInteger)spatial, (NSUInteger)view_count)
        threadsPerThreadgroup:MTLSizeMake(threads_x, 1u, 1u)];
-        [enc endEncoding];
+        metal_end_compute_encoder(ctx, enc);
         return metal_finish_command_buffer_for_op(ctx,
                                                   cb,
                                                   owned_command_buffer,
@@ -6449,7 +6452,7 @@ static int metal_run_vision_gemm_q8_0(uocr_metal_context *ctx,
         const NSUInteger row_tiles = ((NSUInteger)n_rows + UOCR_METAL_GEMM_Q8_BM - 1u) / UOCR_METAL_GEMM_Q8_BM;
         [enc dispatchThreadgroups:MTLSizeMake(col_tiles, row_tiles, 1u)
             threadsPerThreadgroup:MTLSizeMake(UOCR_METAL_GEMM_Q8_THREADS, 1u, 1u)];
-        [enc endEncoding];
+        metal_end_compute_encoder(ctx, enc);
         return metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, op_name, error, error_size);
     }
 }
@@ -6683,7 +6686,7 @@ static int metal_context_sam_patch_embed_batch_f16_to_slice(uocr_metal_vision_pr
             [enc setBytes:&dims length:sizeof(dims) atIndex:2u];
             [enc dispatchThreads:MTLSizeMake(768u, (NSUInteger)total_patches, 1u)
            threadsPerThreadgroup:MTLSizeMake(32u, 1u, 1u)];
-            [enc endEncoding];
+            metal_end_compute_encoder(project->ctx, enc);
             const int extract_ok = metal_finish_command_buffer_for_op(project->ctx, cb, owned, "Metal SAM patch extraction", error, error_size);
             if (!extract_ok) {
                 [patch_buffer release];
@@ -6808,7 +6811,7 @@ static int metal_dispatch_visual_format_kernel(uocr_metal_context *ctx,
         }
         [enc dispatchThreads:MTLSizeMake(dispatch_width, (NSUInteger)rows, 1u)
        threadsPerThreadgroup:MTLSizeMake(threads_x, 1u, 1u)];
-        [enc endEncoding];
+        metal_end_compute_encoder(ctx, enc);
         return metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, op_name, error, error_size);
     }
 }
@@ -7943,7 +7946,7 @@ int uocr_metal_context_warmup_model_views(uocr_metal_context *ctx,
            threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1u, 1u)];
             dst_base += probes;
         }
-        [enc endEncoding];
+        metal_end_compute_encoder(ctx, enc);
 
         UOCR_METAL_COMMIT_AND_WAIT_PROFILED(ctx, cb);
         if (cb.status == MTLCommandBufferStatusError) {
@@ -8815,7 +8818,24 @@ static id<MTLCommandBuffer> metal_new_command_buffer(uocr_metal_context *ctx) {
     return cb;
 }
 
+static void metal_flush_compute_encoder(uocr_metal_context *ctx) {
+    if (ctx->active_compute_encoder == nil) return;
+    [ctx->active_compute_encoder endEncoding];
+    [ctx->active_compute_encoder release];
+    ctx->active_compute_encoder = nil;
+}
+
+static void metal_end_compute_encoder(uocr_metal_context *ctx, id<MTLComputeCommandEncoder> enc) {
+    if (enc == ctx->active_compute_encoder) {
+        // Preserve producer/consumer ordering across the former encoder boundary.
+        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    } else {
+        [enc endEncoding];
+    }
+}
+
 static id<MTLComputeCommandEncoder> metal_compute_command_encoder(uocr_metal_context *ctx, id<MTLCommandBuffer> cb) {
+    if (ctx->active_compute_encoder != nil) return ctx->active_compute_encoder;
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wobjc-method-access"
     id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
@@ -8823,10 +8843,13 @@ static id<MTLComputeCommandEncoder> metal_compute_command_encoder(uocr_metal_con
     if (enc != nil && metal_profile_enabled(ctx)) {
         uocr_profile_add_metal_command_encoder(ctx->profile);
     }
+    if (enc != nil && ctx->reuse_compute_encoder && cb == ctx->active_command_buffer)
+        ctx->active_compute_encoder = [enc retain];
     return enc;
 }
 
 static id<MTLBlitCommandEncoder> metal_blit_command_encoder(uocr_metal_context *ctx, id<MTLCommandBuffer> cb) {
+    metal_flush_compute_encoder(ctx);
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wobjc-method-access"
     id<MTLBlitCommandEncoder> enc = [cb blitCommandEncoder];
@@ -8860,6 +8883,7 @@ static void metal_command_batch_abort(uocr_metal_context *ctx) {
     if (ctx == NULL || ctx->active_command_buffer == nil) {
         return;
     }
+    metal_flush_compute_encoder(ctx);
     [ctx->active_command_buffer release];
     ctx->active_command_buffer = nil;
     if (ctx->transient_retains != nil) {
@@ -8880,6 +8904,7 @@ static int metal_command_batch_commit_and_wait(uocr_metal_context *ctx,
     if (cb == nil) {
         return 1;
     }
+    metal_flush_compute_encoder(ctx);
     ctx->active_command_buffer = nil;
     const int ok = metal_wait_for_command_buffer_profiled(ctx, cb, op_name, error, error_size);
     [cb release];
@@ -9800,7 +9825,7 @@ static int metal_run_mps_matmul_nt_f16_to_type(uocr_metal_context *ctx,
                           commandBuffer:cb
                            sourceArrays:sources
                        destinationArray:y_array];
-        [enc endEncoding];
+        metal_end_compute_encoder(ctx, enc);
         metal_profile_add_event_now(ctx, "metal.mps.matmul.encode", encode_start_ns);
         [sources release];
         const uint64_t retain_start_ns = uocr_profile_now_ns();
@@ -10433,7 +10458,7 @@ static int metal_run_residual_add_f16(uocr_metal_context *ctx,
         [enc setBytes:&value_count length:sizeof(value_count) atIndex:3u];
         [enc dispatchThreads:MTLSizeMake(dispatch_values, 1u, 1u)
        threadsPerThreadgroup:MTLSizeMake(threads, 1u, 1u)];
-        [enc endEncoding];
+        metal_end_compute_encoder(ctx, enc);
         return metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, op_name != NULL ? op_name : "residual add", error, error_size);
     }
 }
@@ -10487,7 +10512,7 @@ static int metal_run_bias_add_f16_inplace(uocr_metal_context *ctx,
         [enc setBytes:&params length:sizeof(params) atIndex:2u];
         [enc dispatchThreads:MTLSizeMake((NSUInteger)vector_count, 1u, 1u)
        threadsPerThreadgroup:MTLSizeMake(threads, 1u, 1u)];
-        [enc endEncoding];
+        metal_end_compute_encoder(ctx, enc);
         return metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, op_name != NULL ? op_name : "bias add", error, error_size);
     }
 }
@@ -10539,7 +10564,7 @@ static int metal_run_bias_gelu_f16_inplace(uocr_metal_context *ctx,
         [enc setBytes:&params length:sizeof(params) atIndex:2u];
         [enc dispatchThreads:MTLSizeMake((NSUInteger)value_count, 1u, 1u)
        threadsPerThreadgroup:MTLSizeMake(threads, 1u, 1u)];
-        [enc endEncoding];
+        metal_end_compute_encoder(ctx, enc);
         return metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, op_name != NULL ? op_name : "bias GELU", error, error_size);
     }
 }
@@ -10598,7 +10623,7 @@ static int metal_run_bias_quickgelu_f16_inplace(uocr_metal_context *ctx,
         [enc setBytes:&params length:sizeof(params) atIndex:2u];
         [enc dispatchThreads:MTLSizeMake((NSUInteger)value_count, 1u, 1u)
        threadsPerThreadgroup:MTLSizeMake(threads, 1u, 1u)];
-        [enc endEncoding];
+        metal_end_compute_encoder(ctx, enc);
         return metal_finish_command_buffer_for_op(ctx,
                                                   cb,
                                                   owned_command_buffer,
@@ -10698,7 +10723,7 @@ static int metal_run_packed_qkv_mps_f16(uocr_metal_context *ctx,
             [enc setBytes:&split_params length:sizeof(split_params) atIndex:5u];
             [enc dispatchThreads:MTLSizeMake((NSUInteger)(hidden_size / 4u), (NSUInteger)rows, 1u)
            threadsPerThreadgroup:MTLSizeMake(32u, 1u, 1u)];
-            [enc endEncoding];
+            metal_end_compute_encoder(ctx, enc);
             if (!metal_finish_command_buffer_for_op(ctx, cb, owned, "Metal QKV bias split", error, error_size)) {
                 return 0;
             }
@@ -10762,7 +10787,7 @@ static int metal_run_bias_residual_add_f16(uocr_metal_context *ctx,
         [enc setBytes:&params length:sizeof(params) atIndex:4u];
         [enc dispatchThreads:MTLSizeMake((NSUInteger)vector_count, 1u, 1u)
        threadsPerThreadgroup:MTLSizeMake(threads, 1u, 1u)];
-        [enc endEncoding];
+        metal_end_compute_encoder(ctx, enc);
         return metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, op_name != NULL ? op_name : "bias residual add", error, error_size);
     }
 }
@@ -10889,7 +10914,7 @@ static int metal_run_token_embedding_from_token_slot_f16(uocr_metal_context *ctx
         }
         [enc dispatchThreads:MTLSizeMake(dispatch_width, 1u, 1u)
        threadsPerThreadgroup:MTLSizeMake(threads, 1u, 1u)];
-        [enc endEncoding];
+        metal_end_compute_encoder(ctx, enc);
         return metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, "integrated token embedding", error, error_size);
     }
 }
@@ -10976,7 +11001,7 @@ static int metal_run_lm_head_argmax_f16(uocr_metal_context *ctx,
         [enc setThreadgroupMemoryLength:(NSUInteger)hidden_bytes atIndex:2u];
         [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)partial_count, 1u, 1u)
              threadsPerThreadgroup:MTLSizeMake(threads, 1u, 1u)];
-        [enc endEncoding];
+        metal_end_compute_encoder(ctx, enc);
         return metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, "integrated fused LM-head argmax", error, error_size);
     }
 }
@@ -11071,7 +11096,7 @@ static int metal_run_lm_head_argmax_q8_0(uocr_metal_context *ctx,
         [enc setThreadgroupMemoryLength:(NSUInteger)hidden_bytes atIndex:2u];
         [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)partial_count, 1u, 1u)
              threadsPerThreadgroup:MTLSizeMake(threads, 1u, 1u)];
-        [enc endEncoding];
+        metal_end_compute_encoder(ctx, enc);
         return metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, "integrated Q8 LM-head argmax", error, error_size);
     }
 }
@@ -11169,7 +11194,7 @@ static int metal_run_lm_head_argmax_q4_0(uocr_metal_context *ctx,
         [enc setThreadgroupMemoryLength:(NSUInteger)id_bytes atIndex:1u];
         [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)partial_count, 1u, 1u)
              threadsPerThreadgroup:MTLSizeMake(threads, 1u, 1u)];
-        [enc endEncoding];
+        metal_end_compute_encoder(ctx, enc);
         return metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, "integrated Q4 LM-head argmax", error, error_size);
     }
 }
@@ -11227,7 +11252,7 @@ static int metal_run_argmax_pairs_to_token(uocr_metal_context *ctx,
         [enc setThreadgroupMemoryLength:(NSUInteger)id_tg_bytes atIndex:1u];
         [enc dispatchThreadgroups:MTLSizeMake(1u, 1u, 1u)
              threadsPerThreadgroup:MTLSizeMake(threads, 1u, 1u)];
-        [enc endEncoding];
+        metal_end_compute_encoder(ctx, enc);
         return metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, "integrated argmax-pair finalization", error, error_size);
     }
 }
@@ -11340,7 +11365,7 @@ static int metal_run_lm_head_mps_path(uocr_metal_context *ctx,
         [enc setThreadgroupMemoryLength:(NSUInteger)(threads * sizeof(uint32_t)) atIndex:1u];
         [enc dispatchThreadgroups:MTLSizeMake(1u, 1u, 1u)
              threadsPerThreadgroup:MTLSizeMake(threads, 1u, 1u)];
-        [enc endEncoding];
+        metal_end_compute_encoder(ctx, enc);
         if (!metal_finish_command_buffer_for_op(ctx, cb, owned, "MPS LM head argmax", error, error_size)) {
             return 0;
         }
@@ -11392,7 +11417,7 @@ static int metal_run_rmsnorm_buffer_f16(uocr_metal_context *ctx,
         [enc setThreadgroupMemoryLength:threads * sizeof(float) atIndex:0u];
         [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_rows, 1u, 1u)
              threadsPerThreadgroup:MTLSizeMake(threads, 1u, 1u)];
-        [enc endEncoding];
+        metal_end_compute_encoder(ctx, enc);
         return metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, op_name, error, error_size);
     }
 }
@@ -11744,7 +11769,7 @@ static int metal_run_decode_attention_qkv_one_f16(uocr_metal_context *ctx,
         [enc setBytes:&params length:sizeof(params) atIndex:7u];
         [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)output_values + rows_per_tg - 1u) / rows_per_tg, 1u, 1u)
              threadsPerThreadgroup:MTLSizeMake(128u, 1u, 1u)];
-        [enc endEncoding];
+        metal_end_compute_encoder(ctx, enc);
         return metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, "decode attention QKV", error, error_size);
     }
 }
@@ -11809,7 +11834,7 @@ static int metal_run_attention_output_residual_q8_0(uocr_metal_context *ctx,
                                                   ((NSUInteger)n_tokens + UOCR_METAL_GEMM_Q8_BM - 1u) / UOCR_METAL_GEMM_Q8_BM,
                                                   1u)
                 threadsPerThreadgroup:MTLSizeMake(UOCR_METAL_GEMM_Q8_THREADS, 1u, 1u)];
-            [enc endEncoding];
+            metal_end_compute_encoder(ctx, enc);
             return metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, op, error, error_size);
         }
     }
@@ -11843,7 +11868,7 @@ static int metal_run_attention_output_residual_q8_0(uocr_metal_context *ctx,
         const NSUInteger rows_per_tg = metal_decode_gemv_rows_per_threadgroup(pipeline);
         [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)UOCR_HIDDEN_SIZE + rows_per_tg - 1u) / rows_per_tg, 1u, 1u)
              threadsPerThreadgroup:MTLSizeMake(128u, 1u, 1u)];
-        [enc endEncoding];
+        metal_end_compute_encoder(ctx, enc);
         return metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, op, error, error_size);
     }
 }
@@ -11905,7 +11930,7 @@ static int metal_run_decode_attention_output_one_f16(uocr_metal_context *ctx,
         [enc setBytes:&params length:sizeof(params) atIndex:4u];
         [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)output_values + rows_per_tg - 1u) / rows_per_tg, 1u, 1u)
              threadsPerThreadgroup:MTLSizeMake(128u, 1u, 1u)];
-        [enc endEncoding];
+        metal_end_compute_encoder(ctx, enc);
         return metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, "decode attention output", error, error_size);
     }
 }
@@ -12024,7 +12049,7 @@ static int metal_run_decode_dense_swiglu_one_q8_0(uocr_metal_context *ctx,
         [enc setBytes:&gate_params length:sizeof(gate_params) atIndex:6u];
         [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)intermediate_size + gate_rows_per_tg - 1u) / gate_rows_per_tg, 1u, 1u)
              threadsPerThreadgroup:MTLSizeMake(128u, 1u, 1u)];
-        [enc endEncoding];
+        metal_end_compute_encoder(ctx, enc);
 
         /* down → dst (+ residual) */
         enc = metal_compute_command_encoder(ctx, cb);
@@ -12041,7 +12066,7 @@ static int metal_run_decode_dense_swiglu_one_q8_0(uocr_metal_context *ctx,
         [enc setBytes:&down_params length:sizeof(down_params) atIndex:5u];
         [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)UOCR_HIDDEN_SIZE + down_rows_per_tg - 1u) / down_rows_per_tg, 1u, 1u)
              threadsPerThreadgroup:MTLSizeMake(128u, 1u, 1u)];
-        [enc endEncoding];
+        metal_end_compute_encoder(ctx, enc);
         return metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, op, error, error_size);
     }
 }
@@ -12124,7 +12149,7 @@ static int metal_run_decode_dense_swiglu_one_f16(uocr_metal_context *ctx,
         [enc setBytes:&gate_params length:sizeof(gate_params) atIndex:4u];
         [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)intermediate_size + gate_rows_per_tg - 1u) / gate_rows_per_tg, 1u, 1u)
              threadsPerThreadgroup:MTLSizeMake(128u, 1u, 1u)];
-        [enc endEncoding];
+        metal_end_compute_encoder(ctx, enc);
 
         enc = metal_compute_command_encoder(ctx, cb);
         if (enc == nil) {
@@ -12139,7 +12164,7 @@ static int metal_run_decode_dense_swiglu_one_f16(uocr_metal_context *ctx,
         [enc setBytes:&down_params length:sizeof(down_params) atIndex:4u];
         [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)UOCR_HIDDEN_SIZE + down_rows_per_tg - 1u) / down_rows_per_tg, 1u, 1u)
              threadsPerThreadgroup:MTLSizeMake(128u, 1u, 1u)];
-        [enc endEncoding];
+        metal_end_compute_encoder(ctx, enc);
         return metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, op_name, error, error_size);
     }
 }
@@ -12207,7 +12232,7 @@ static int metal_run_decode_moe_router_one_f16(uocr_metal_context *ctx,
         [enc setThreadgroupMemoryLength:scratch_tg_bytes atIndex:1u];
         [enc dispatchThreadgroups:MTLSizeMake(1u, 1u, 1u)
              threadsPerThreadgroup:MTLSizeMake(fused_threads, 1u, 1u)];
-        [enc endEncoding];
+        metal_end_compute_encoder(ctx, enc);
         if (!metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, "decode MoE router", error, error_size)) {
             return 0;
         }
@@ -12292,7 +12317,7 @@ static int metal_run_attention_qkv_buffer_q8_0(uocr_metal_context *ctx,
                                                   ((NSUInteger)n_tokens + UOCR_METAL_GEMM_Q8_BM - 1u) / UOCR_METAL_GEMM_Q8_BM,
                                                   3u)
                 threadsPerThreadgroup:MTLSizeMake(UOCR_METAL_GEMM_Q8_THREADS, 1u, 1u)];
-            [enc endEncoding];
+            metal_end_compute_encoder(ctx, enc);
             return metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, "prefill Q8 attention QKV GEMM", error, error_size);
         }
     }
@@ -12331,7 +12356,7 @@ static int metal_run_attention_qkv_buffer_q8_0(uocr_metal_context *ctx,
         const NSUInteger rows_per_tg = metal_decode_gemv_rows_per_threadgroup(pipeline);
         [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)UOCR_HIDDEN_SIZE * 3u + rows_per_tg - 1u) / rows_per_tg, 1u, 1u)
              threadsPerThreadgroup:MTLSizeMake(128u, 1u, 1u)];
-        [enc endEncoding];
+        metal_end_compute_encoder(ctx, enc);
         return metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, "integrated Q8 attention QKV", error, error_size);
     }
 }
@@ -12447,7 +12472,7 @@ static int metal_run_page_rope_qk_buffer_f16(uocr_metal_context *ctx,
         [enc setBytes:ctx->page_rope_inv_freq length:sizeof(ctx->page_rope_inv_freq) atIndex:4u];
         [enc dispatchThreads:MTLSizeMake((NSUInteger)n_tokens * heads * (UOCR_HEAD_DIM / 2u), 1u, 1u)
        threadsPerThreadgroup:MTLSizeMake(threads, 1u, 1u)];
-        [enc endEncoding];
+        metal_end_compute_encoder(ctx, enc);
         return metal_finish_command_buffer_for_op(ctx, cb, owned, "page RoPE", error, error_size);
     }
 }
@@ -12518,7 +12543,7 @@ static int metal_run_dash_norm_buffer_f16(uocr_metal_context *ctx,
         [enc setComputePipelineState:pipeline];
         for (uint32_t i = 0; i < 4u; ++i) [enc setBuffer:buffers[i].buffer offset:buffers[i].offset atIndex:i];
         [enc dispatchThreadgroups:MTLSizeMake(n_rows, 2u, 1u) threadsPerThreadgroup:MTLSizeMake(32u, 1u, 1u)];
-        [enc endEncoding];
+        metal_end_compute_encoder(ctx, enc);
         return metal_finish_command_buffer_for_op(ctx, cb, owned, "DASH norm", error, error_size);
     }
 }
@@ -12630,7 +12655,7 @@ static int metal_run_dash_buffer_f16(uocr_metal_context *ctx,
             }
             [enc setBytes:&params length:sizeof(params) atIndex:5u];
             [enc dispatchThreadgroups:groups[stage] threadsPerThreadgroup:MTLSizeMake(32u, 1u, 1u)];
-            [enc endEncoding];
+            metal_end_compute_encoder(ctx, enc);
         }
         return metal_finish_command_buffer_for_op(ctx, cb, owned, "DASH attention", error, error_size);
     }
@@ -12954,7 +12979,7 @@ static int metal_run_rope_qk_buffer_f16(uocr_metal_context *ctx,
         [enc setBytes:&params length:sizeof(params) atIndex:4u];
         [enc dispatchThreads:MTLSizeMake((NSUInteger)pair_threads, 1u, 1u)
        threadsPerThreadgroup:MTLSizeMake(threads, 1u, 1u)];
-        [enc endEncoding];
+        metal_end_compute_encoder(ctx, enc);
         return metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, "integrated RoPE", error, error_size);
     }
 }
@@ -13028,7 +13053,7 @@ static int metal_run_kv_write_buffer_f16(uocr_metal_context *ctx,
         [enc setBytes:&params length:sizeof(params) atIndex:4u];
         [enc dispatchThreads:MTLSizeMake((NSUInteger)src_vector_values, 1u, 1u)
        threadsPerThreadgroup:MTLSizeMake(threads, 1u, 1u)];
-        [enc endEncoding];
+        metal_end_compute_encoder(ctx, enc);
         return metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, "integrated KV write", error, error_size);
     }
 }
@@ -13108,7 +13133,7 @@ static int metal_run_decode_attention_buffer_f16(uocr_metal_context *ctx,
         [enc setBytes:&params length:sizeof(params) atIndex:4u];
         [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)UOCR_ATTENTION_HEADS, 1u, 1u)
              threadsPerThreadgroup:MTLSizeMake(threads, 1u, 1u)];
-        [enc endEncoding];
+        metal_end_compute_encoder(ctx, enc);
         return metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, "integrated decode attention", error, error_size);
     }
 }
@@ -13163,7 +13188,7 @@ static int metal_run_prefill_attention_buffer_f16(uocr_metal_context *ctx,
         [enc setBytes:&params length:sizeof(params) atIndex:4u];
         [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)UOCR_ATTENTION_HEADS, (NSUInteger)staged_query_blocks, 1u)
              threadsPerThreadgroup:MTLSizeMake((NSUInteger)UOCR_METAL_FLASH_STAGED_THREADS, 1u, 1u)];
-        [enc endEncoding];
+        metal_end_compute_encoder(ctx, enc);
         return metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, "integrated prefill attention", error, error_size);
     }
 }
@@ -13316,7 +13341,7 @@ static int metal_run_dense_swiglu_buffer_q8_0(uocr_metal_context *ctx,
             [enc setBytes:&gate_params length:sizeof(gate_params) atIndex:6u];
             [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(intermediate_size / UOCR_METAL_GEMM_Q8_BN), row_tiles, 1u)
                 threadsPerThreadgroup:MTLSizeMake(UOCR_METAL_GEMM_Q8_THREADS, 1u, 1u)];
-            [enc endEncoding];
+            metal_end_compute_encoder(ctx, enc);
 
             uocr_metal_decoder_gemm_q8_params down_params;
             memset(&down_params, 0, sizeof(down_params));
@@ -13341,7 +13366,7 @@ static int metal_run_dense_swiglu_buffer_q8_0(uocr_metal_context *ctx,
             [enc setBytes:&down_params length:sizeof(down_params) atIndex:5u];
             [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(UOCR_HIDDEN_SIZE / UOCR_METAL_GEMM_Q8_BN), row_tiles, 1u)
                 threadsPerThreadgroup:MTLSizeMake(UOCR_METAL_GEMM_Q8_THREADS, 1u, 1u)];
-            [enc endEncoding];
+            metal_end_compute_encoder(ctx, enc);
             return metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, op, error, error_size);
         }
     }
@@ -13456,7 +13481,7 @@ static int metal_run_dense_swiglu_buffer_q4_0(uocr_metal_context *ctx,
             [enc setBytes:&gate_params length:sizeof(gate_params) atIndex:6u];
             [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(intermediate_size / UOCR_METAL_GEMM_Q8_BN), row_tiles, 1u)
                 threadsPerThreadgroup:MTLSizeMake(UOCR_METAL_GEMM_Q8_THREADS, 1u, 1u)];
-            [enc endEncoding];
+            metal_end_compute_encoder(ctx, enc);
 
             uocr_metal_decoder_gemm_q8_params down_params;
             memset(&down_params, 0, sizeof(down_params));
@@ -13481,7 +13506,7 @@ static int metal_run_dense_swiglu_buffer_q4_0(uocr_metal_context *ctx,
             [enc setBytes:&down_params length:sizeof(down_params) atIndex:5u];
             [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(UOCR_HIDDEN_SIZE / UOCR_METAL_GEMM_Q8_BN), row_tiles, 1u)
                 threadsPerThreadgroup:MTLSizeMake(UOCR_METAL_GEMM_Q8_THREADS, 1u, 1u)];
-            [enc endEncoding];
+            metal_end_compute_encoder(ctx, enc);
             return metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, op, error, error_size);
         }
     }
@@ -13529,7 +13554,7 @@ static int metal_run_dense_swiglu_buffer_q4_0(uocr_metal_context *ctx,
         [enc setBytes:&gate_params length:sizeof(gate_params) atIndex:6u];
         [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)intermediate_size + gate_rows_per_tg - 1u) / gate_rows_per_tg, 1u, 1u)
              threadsPerThreadgroup:MTLSizeMake(128u, 1u, 1u)];
-        [enc endEncoding];
+        metal_end_compute_encoder(ctx, enc);
 
         enc = metal_compute_command_encoder(ctx, cb);
         if (enc == nil) {
@@ -13545,7 +13570,7 @@ static int metal_run_dense_swiglu_buffer_q4_0(uocr_metal_context *ctx,
         [enc setBytes:&down_params length:sizeof(down_params) atIndex:5u];
         [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)UOCR_HIDDEN_SIZE + down_rows_per_tg - 1u) / down_rows_per_tg, 1u, 1u)
              threadsPerThreadgroup:MTLSizeMake(128u, 1u, 1u)];
-        [enc endEncoding];
+        metal_end_compute_encoder(ctx, enc);
         return metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, op, error, error_size);
     }
 }
@@ -13626,7 +13651,7 @@ static int metal_run_dense_swiglu_buffer_f16(uocr_metal_context *ctx,
                                                   row_tiles,
                                                   1u)
                 threadsPerThreadgroup:MTLSizeMake(UOCR_METAL_GEMM_Q8_THREADS, 1u, 1u)];
-            [enc endEncoding];
+            metal_end_compute_encoder(ctx, enc);
 
             uocr_metal_buffer_slice down_weight_slice = { down_weight->buffer, down_weight->offset };
             if (!metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, op_name, error, error_size) ||
@@ -13701,7 +13726,7 @@ static int metal_run_dense_swiglu_buffer_f16(uocr_metal_context *ctx,
         [enc setThreadgroupMemoryLength:gate_threads * 2u * sizeof(float) atIndex:0u];
         [enc dispatchThreadgroups:MTLSizeMake(gate_threadgroups, 1u, 1u)
              threadsPerThreadgroup:MTLSizeMake(gate_threads, 1u, 1u)];
-        [enc endEncoding];
+        metal_end_compute_encoder(ctx, enc);
 
         uocr_metal_buffer_slice down_weight_slice = { down_weight->buffer, down_weight->offset };
         if (!metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, op_name, error, error_size) ||
@@ -13805,7 +13830,7 @@ static int metal_run_moe_router_buffer_f16(uocr_metal_context *ctx,
             [enc setThreadgroupMemoryLength:scratch_tg_bytes atIndex:1u];
             [enc dispatchThreadgroups:MTLSizeMake(1u, 1u, 1u)
                  threadsPerThreadgroup:MTLSizeMake(fused_threads, 1u, 1u)];
-            [enc endEncoding];
+            metal_end_compute_encoder(ctx, enc);
         } else {
             uocr_metal_buffer_slice router_weight_slice = { router_weight->buffer, router_weight->offset };
             const uint64_t router_mps_start_ns = uocr_profile_now_ns();
@@ -13840,7 +13865,7 @@ static int metal_run_moe_router_buffer_f16(uocr_metal_context *ctx,
             [enc setThreadgroupMemoryLength:topk_scratch_bytes atIndex:0u];
             [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_tokens, 1u, 1u)
                  threadsPerThreadgroup:MTLSizeMake(topk_threads, 1u, 1u)];
-            [enc endEncoding];
+            metal_end_compute_encoder(ctx, enc);
         }
         if (!metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, "integrated MoE router", error, error_size)) {
             return 0;
@@ -14005,7 +14030,7 @@ static int metal_run_moe_prefill_bucketed_q8_0(uocr_metal_context *ctx,
         [enc setBuffer:transient offset:(NSUInteger)tile_prefix_offset atIndex:3u];
         [enc setBytes:&bucket_params length:sizeof(bucket_params) atIndex:4u];
         [enc dispatchThreadgroups:MTLSizeMake(1u, 1u, 1u) threadsPerThreadgroup:MTLSizeMake(256u, 1u, 1u)];
-        [enc endEncoding];
+        metal_end_compute_encoder(ctx, enc);
 
         /* Overdispatch bound: sum_e ceil(count_e / BM) <= ceil(pairs / BM) + experts. */
         const NSUInteger tile_slots = (NSUInteger)((pair_count + UOCR_METAL_GEMM_Q8_BM - 1u) / UOCR_METAL_GEMM_Q8_BM) +
@@ -14027,7 +14052,7 @@ static int metal_run_moe_prefill_bucketed_q8_0(uocr_metal_context *ctx,
         [enc setBytes:prefill_params length:sizeof(*prefill_params) atIndex:7u];
         [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(UOCR_MOE_EXPERT_INTERMEDIATE / UOCR_METAL_GEMM_Q8_BN), tile_slots, 1u)
             threadsPerThreadgroup:MTLSizeMake(UOCR_METAL_GEMM_Q8_THREADS, 1u, 1u)];
-        [enc endEncoding];
+        metal_end_compute_encoder(ctx, enc);
 
         /* Pass 3: bucketed down GEMM -> down_out. */
         enc = metal_compute_command_encoder(ctx, cb);
@@ -14045,7 +14070,7 @@ static int metal_run_moe_prefill_bucketed_q8_0(uocr_metal_context *ctx,
         [enc setBytes:prefill_params length:sizeof(*prefill_params) atIndex:7u];
         [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(UOCR_HIDDEN_SIZE / UOCR_METAL_GEMM_Q8_BN), tile_slots, 1u)
             threadsPerThreadgroup:MTLSizeMake(UOCR_METAL_GEMM_Q8_THREADS, 1u, 1u)];
-        [enc endEncoding];
+        metal_end_compute_encoder(ctx, enc);
 
         /* Pass 4: weighted combine with shared experts and residual. */
         enc = metal_compute_command_encoder(ctx, cb);
@@ -14065,7 +14090,7 @@ static int metal_run_moe_prefill_bucketed_q8_0(uocr_metal_context *ctx,
         [enc setBytes:prefill_params length:sizeof(*prefill_params) atIndex:6u];
         [enc dispatchThreads:MTLSizeMake((NSUInteger)n_tokens * (NSUInteger)UOCR_HIDDEN_SIZE, 1u, 1u)
        threadsPerThreadgroup:MTLSizeMake(combine_threads, 1u, 1u)];
-        [enc endEncoding];
+        metal_end_compute_encoder(ctx, enc);
 
         const int ok = metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, op, error, error_size);
         if (ok) {
@@ -14136,7 +14161,7 @@ static int metal_run_moe_prefill_bucketed_f16(uocr_metal_context *ctx,
         [enc setBuffer:transient offset:(NSUInteger)tile_prefix_offset atIndex:3u];
         [enc setBytes:&bucket_params length:sizeof(bucket_params) atIndex:4u];
         [enc dispatchThreadgroups:MTLSizeMake(1u, 1u, 1u) threadsPerThreadgroup:MTLSizeMake(256u, 1u, 1u)];
-        [enc endEncoding];
+        metal_end_compute_encoder(ctx, enc);
 
         const NSUInteger tile_slots = (NSUInteger)((pair_count + UOCR_METAL_GEMM_Q8_BM - 1u) / UOCR_METAL_GEMM_Q8_BM) +
                                       (NSUInteger)UOCR_ROUTED_EXPERTS;
@@ -14155,7 +14180,7 @@ static int metal_run_moe_prefill_bucketed_f16(uocr_metal_context *ctx,
         [enc setBytes:prefill_params length:sizeof(*prefill_params) atIndex:6u];
         [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(UOCR_MOE_EXPERT_INTERMEDIATE / UOCR_METAL_GEMM_Q8_BN), tile_slots, 1u)
             threadsPerThreadgroup:MTLSizeMake(UOCR_METAL_GEMM_Q8_THREADS, 1u, 1u)];
-        [enc endEncoding];
+        metal_end_compute_encoder(ctx, enc);
 
         enc = metal_compute_command_encoder(ctx, cb);
         if (enc == nil) {
@@ -14171,7 +14196,7 @@ static int metal_run_moe_prefill_bucketed_f16(uocr_metal_context *ctx,
         [enc setBytes:prefill_params length:sizeof(*prefill_params) atIndex:6u];
         [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(UOCR_HIDDEN_SIZE / UOCR_METAL_GEMM_Q8_BN), tile_slots, 1u)
             threadsPerThreadgroup:MTLSizeMake(UOCR_METAL_GEMM_Q8_THREADS, 1u, 1u)];
-        [enc endEncoding];
+        metal_end_compute_encoder(ctx, enc);
 
         enc = metal_compute_command_encoder(ctx, cb);
         if (enc == nil) {
@@ -14190,7 +14215,7 @@ static int metal_run_moe_prefill_bucketed_f16(uocr_metal_context *ctx,
         [enc setBytes:prefill_params length:sizeof(*prefill_params) atIndex:6u];
         [enc dispatchThreads:MTLSizeMake((NSUInteger)n_tokens * (NSUInteger)UOCR_HIDDEN_SIZE, 1u, 1u)
        threadsPerThreadgroup:MTLSizeMake(combine_threads, 1u, 1u)];
-        [enc endEncoding];
+        metal_end_compute_encoder(ctx, enc);
 
         const int ok = metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, op, error, error_size);
         if (ok) {
@@ -14306,7 +14331,7 @@ static int metal_run_moe_interleaved_decode_fused_combine_buffer_q8_0(
         [enc setBytes:&gemv_params length:sizeof(gemv_params) atIndex:5u];
         [enc dispatchThreadgroups:MTLSizeMake((gate_rows + gate_rows_per_tg - 1u) / gate_rows_per_tg, 1u, 1u)
              threadsPerThreadgroup:MTLSizeMake(128u, 1u, 1u)];
-        [enc endEncoding];
+        metal_end_compute_encoder(ctx, enc);
 
         enc = metal_compute_command_encoder(ctx, cb);
         if (enc == nil) {
@@ -14325,7 +14350,7 @@ static int metal_run_moe_interleaved_decode_fused_combine_buffer_q8_0(
         [enc setBytes:&gemv_params length:sizeof(gemv_params) atIndex:8u];
         [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)UOCR_HIDDEN_SIZE + down_rows_per_tg - 1u) / down_rows_per_tg, 1u, 1u)
              threadsPerThreadgroup:MTLSizeMake(128u, 1u, 1u)];
-        [enc endEncoding];
+        metal_end_compute_encoder(ctx, enc);
         return metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, "integrated routed MoE Q8 fused combine", error, error_size);
     }
 }
@@ -14399,7 +14424,7 @@ static int metal_run_moe_prefill_bucketed_q4_0(uocr_metal_context *ctx,
         [enc setBuffer:transient offset:(NSUInteger)tile_prefix_offset atIndex:3u];
         [enc setBytes:&bucket_params length:sizeof(bucket_params) atIndex:4u];
         [enc dispatchThreadgroups:MTLSizeMake(1u, 1u, 1u) threadsPerThreadgroup:MTLSizeMake(256u, 1u, 1u)];
-        [enc endEncoding];
+        metal_end_compute_encoder(ctx, enc);
 
         const NSUInteger tile_slots = (NSUInteger)((pair_count + UOCR_METAL_GEMM_Q8_BM - 1u) / UOCR_METAL_GEMM_Q8_BM) +
                                       (NSUInteger)UOCR_ROUTED_EXPERTS;
@@ -14420,7 +14445,7 @@ static int metal_run_moe_prefill_bucketed_q4_0(uocr_metal_context *ctx,
         [enc setBytes:prefill_params length:sizeof(*prefill_params) atIndex:7u];
         [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(UOCR_MOE_EXPERT_INTERMEDIATE / UOCR_METAL_GEMM_Q8_BN), tile_slots, 1u)
             threadsPerThreadgroup:MTLSizeMake(UOCR_METAL_GEMM_Q8_THREADS, 1u, 1u)];
-        [enc endEncoding];
+        metal_end_compute_encoder(ctx, enc);
 
         /* Pass 3: bucketed down GEMM -> down_out. */
         enc = metal_compute_command_encoder(ctx, cb);
@@ -14438,7 +14463,7 @@ static int metal_run_moe_prefill_bucketed_q4_0(uocr_metal_context *ctx,
         [enc setBytes:prefill_params length:sizeof(*prefill_params) atIndex:7u];
         [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(UOCR_HIDDEN_SIZE / UOCR_METAL_GEMM_Q8_BN), tile_slots, 1u)
             threadsPerThreadgroup:MTLSizeMake(UOCR_METAL_GEMM_Q8_THREADS, 1u, 1u)];
-        [enc endEncoding];
+        metal_end_compute_encoder(ctx, enc);
 
         /* Pass 4: weighted combine with shared experts and residual. */
         enc = metal_compute_command_encoder(ctx, cb);
@@ -14458,7 +14483,7 @@ static int metal_run_moe_prefill_bucketed_q4_0(uocr_metal_context *ctx,
         [enc setBytes:prefill_params length:sizeof(*prefill_params) atIndex:6u];
         [enc dispatchThreads:MTLSizeMake((NSUInteger)n_tokens * (NSUInteger)UOCR_HIDDEN_SIZE, 1u, 1u)
        threadsPerThreadgroup:MTLSizeMake(combine_threads, 1u, 1u)];
-        [enc endEncoding];
+        metal_end_compute_encoder(ctx, enc);
 
         const int ok = metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, op, error, error_size);
         if (ok) {
@@ -14584,7 +14609,7 @@ static int metal_run_moe_interleaved_decode_fused_combine_buffer_q4_0(
         [enc setBytes:&gemv_params length:sizeof(gemv_params) atIndex:5u];
         [enc dispatchThreadgroups:MTLSizeMake((gate_rows + gate_rows_per_tg - 1u) / gate_rows_per_tg, 1u, 1u)
              threadsPerThreadgroup:MTLSizeMake(128u, 1u, 1u)];
-        [enc endEncoding];
+        metal_end_compute_encoder(ctx, enc);
 
         enc = metal_compute_command_encoder(ctx, cb);
         if (enc == nil) {
@@ -14603,7 +14628,7 @@ static int metal_run_moe_interleaved_decode_fused_combine_buffer_q4_0(
         [enc setBytes:&gemv_params length:sizeof(gemv_params) atIndex:8u];
         [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)UOCR_HIDDEN_SIZE + down_rows_per_tg - 1u) / down_rows_per_tg, 1u, 1u)
              threadsPerThreadgroup:MTLSizeMake(128u, 1u, 1u)];
-        [enc endEncoding];
+        metal_end_compute_encoder(ctx, enc);
         return metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, "integrated routed MoE Q4 fused combine", error, error_size);
     }
 }
@@ -14754,7 +14779,7 @@ static int metal_run_moe_interleaved_decode_fused_combine_buffer_f16(uocr_metal_
             [enc dispatchThreadgroups:MTLSizeMake(gate_threadgroups, 1u, 1u)
                  threadsPerThreadgroup:MTLSizeMake(gate_threads, 1u, 1u)];
         }
-        [enc endEncoding];
+        metal_end_compute_encoder(ctx, enc);
 
         enc = metal_compute_command_encoder(ctx, cb);
         if (enc == nil) {
@@ -14780,7 +14805,7 @@ static int metal_run_moe_interleaved_decode_fused_combine_buffer_f16(uocr_metal_
             [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)down_values, 1u, 1u)
                  threadsPerThreadgroup:MTLSizeMake(down_threads, 1u, 1u)];
         }
-        [enc endEncoding];
+        metal_end_compute_encoder(ctx, enc);
         return metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, "integrated routed MoE fused combine", error, error_size);
     }
 }
@@ -15243,7 +15268,8 @@ static int metal_run_mapped_dash_attention(uocr_metal_context *ctx,
         metal_run_cached_dash_layer(ctx, c, buffers, error, error_size);
 }
 
-static int metal_run_decoder_prefill_text_f16(uocr_metal_context *ctx,
+// Encode only: the caller owns submission and the host readback boundary.
+static int metal_encode_decoder_prefill_text_f16(uocr_metal_context *ctx,
                                               uint32_t slot,
                                               uint32_t n_tokens,
                                               char *error,
@@ -15265,8 +15291,8 @@ static int metal_run_decoder_prefill_text_f16(uocr_metal_context *ctx,
 #if UOCR_ENABLE_PROFILING
     const uint64_t prefill_command_encoding_start_ns = uocr_profile_now_ns();
 #endif
-    if (!metal_command_batch_begin(ctx, error, error_size)) {
-        return 0;
+    if (!metal_command_batch_active(ctx)) {
+        return metal_fail(error, error_size, "decoder encoding requires an active command batch");
     }
 
     uocr_metal_buffer_slice current = prompt;
@@ -15561,7 +15587,9 @@ static int metal_run_decoder_prefill_text_f16(uocr_metal_context *ctx,
     }
 #undef RUN_PREFILL_OP
 
-    if (current_segment != 0u) {
+    // V1's chunk decoder consumes segment zero; v2 selection follows the
+    // recorded final segment and can stay in the same compute encoder.
+    if (current_segment != 0u && !ctx->model_is_v2) {
         if (!metal_copy_slice(ctx, current, scratch[0], hidden_bytes, "integrated prefill final-hidden copy", error, error_size)) {
             return 0;
         }
@@ -15576,17 +15604,6 @@ static int metal_run_decoder_prefill_text_f16(uocr_metal_context *ctx,
     }
 #if UOCR_ENABLE_PROFILING
     metal_profile_add_event_now(ctx, "metal.prefill.command_encoding", prefill_command_encoding_start_ns);
-    const uint64_t prefill_command_wait_start_ns = uocr_profile_now_ns();
-    if (!metal_command_batch_commit_and_wait(ctx, "integrated decoder prefill batch", error, error_size)) {
-        ctx->has_integrated_prefill = 0;
-        return 0;
-    }
-    metal_profile_add_event_now(ctx, "metal.prefill.command_wait", prefill_command_wait_start_ns);
-#else
-    if (!metal_command_batch_commit_and_wait(ctx, "integrated decoder prefill batch", error, error_size)) {
-        ctx->has_integrated_prefill = 0;
-        return 0;
-    }
 #endif
     ctx->has_integrated_prefill = 1;
     ctx->integrated_prefill_slot = slot;
@@ -15595,13 +15612,23 @@ static int metal_run_decoder_prefill_text_f16(uocr_metal_context *ctx,
     return 1;
 }
 
-// Shared GPU-resident forward path for visual prompt rows and decoded tokens.
-static int metal_forward_v2_arena(uocr_metal_context *ctx, const int32_t *tokens,
-    uint32_t n_tokens, int generated, char *error, size_t error_size) {
-    if (!uocr_metal_context_dash_begin(ctx, tokens, n_tokens, generated, error, error_size)) return 0;
+static int metal_commit_decoder_prefill(uocr_metal_context *ctx, char *error, size_t error_size) {
+    const uint64_t start_ns = uocr_profile_now_ns();
+    const int ok = metal_command_batch_commit_and_wait(ctx, "integrated decoder prefill batch", error, error_size);
+    metal_profile_add_event_now(ctx, "metal.prefill.command_wait", start_ns);
+    if (!ok) ctx->has_integrated_prefill = 0;
+    return ok;
+}
+
+// DASH positions must be prepared on the host before opening this batch.
+// Completion of the encoded append is provisional until the caller submits it.
+static int metal_encode_v2_arena(uocr_metal_context *ctx, char *error, size_t error_size) {
     uocr_metal_dash_cache *c = ctx->dash_cache;
+    if (c == NULL || c->failed || c->pending == 0u || c->next_layer != 0u || !metal_command_batch_active(ctx))
+        return metal_fail(error, error_size, "v2 encoding requires a pending append and active command batch");
+    const uint32_t n_tokens = c->pending;
     if (!metal_prebuild_mps_runtime_workspace_ndarrays(ctx, n_tokens, error, error_size) ||
-        !metal_run_decoder_prefill_text_f16(ctx, 0u, n_tokens, error, error_size)) goto failed;
+        !metal_encode_decoder_prefill_text_f16(ctx, 0u, n_tokens, error, error_size)) goto failed;
     if (c->next_layer != UOCR_DECODER_LAYERS) {
         (void)metal_fail(error, error_size, "v2 decoder did not complete all layers"); goto failed;
     }
@@ -15631,7 +15658,10 @@ int uocr_metal_context_forward_v2_f16(uocr_metal_context *ctx, const int32_t *to
         (void)metal_fail(error, error_size, "v2 decoder input workspace is invalid"); goto failed;
     }
     memcpy((uint8_t *)[prompt.buffer contents] + prompt.offset, embeddings, (size_t)bytes);
-    if (!metal_forward_v2_arena(ctx, tokens, n_tokens, generated, error, error_size)) return 0;
+    if (!uocr_metal_context_dash_begin(ctx, tokens, n_tokens, generated, error, error_size)) return 0;
+    if (!metal_command_batch_begin(ctx, error, error_size) ||
+        !metal_encode_v2_arena(ctx, error, error_size) ||
+        !metal_commit_decoder_prefill(ctx, error, error_size)) goto failed;
     if (!metal_hidden_arena_segment_slice(ctx, 0u, ctx->integrated_prefill_final_segment, n_tokens, &hidden, &hidden_bytes) ||
         hidden_bytes != bytes) {
         (void)metal_fail(error, error_size, "v2 decoder did not complete all layer outputs"); goto failed;
@@ -15651,8 +15681,8 @@ static int metal_v2_argmax(uocr_metal_context *ctx, uint32_t token_filter, int32
     metal_clear_error(error, error_size);
     if (ctx == NULL || !ctx->v2_decoder_ready || ctx->dash_cache == NULL || token_id == NULL ||
         ctx->dash_cache->failed || ctx->dash_cache->pending != 0u || ctx->dash_cache->length == 0u ||
-        !ctx->has_integrated_prefill || ctx->integrated_prefill_tokens == 0u || metal_command_batch_active(ctx))
-        return metal_fail(error, error_size, "v2 raw argmax requires a completed decoder forward");
+        !ctx->has_integrated_prefill || ctx->integrated_prefill_tokens == 0u)
+        return metal_fail(error, error_size, "v2 argmax requires a completed or encoded decoder forward");
     uocr_metal_buffer_slice hidden, norm, selection, token, value;
     uint64_t bytes = 0u;
     if (!metal_hidden_arena_token_slice(ctx, 0u, ctx->integrated_prefill_final_segment,
@@ -15661,24 +15691,33 @@ static int metal_v2_argmax(uocr_metal_context *ctx, uint32_t token_filter, int32
         !metal_decode_selection_scratch_slice(ctx, 0u, &selection) ||
         !metal_token_readback_arena_slices(ctx, 0u, &token, &value))
         return metal_fail(error, error_size, "v2 raw argmax workspace is invalid");
+    const int has_forward_batch = metal_command_batch_active(ctx);
     if (!metal_command_batch_begin(ctx, error, error_size) ||
-        !metal_encode_chunk_step_selection_f16(ctx, hidden, norm, selection, token, value, token_filter, error, error_size) ||
-        !metal_command_batch_commit_and_wait(ctx, "v2 raw argmax", error, error_size)) {
-        metal_command_batch_abort(ctx); ctx->dash_cache->failed = 1; return 0;
-    }
+        !metal_encode_chunk_step_selection_f16(ctx, hidden, norm, selection, token, value, token_filter, error, error_size))
+        goto failed;
+    const uint64_t wait_start_ns = uocr_profile_now_ns();
+    if (!metal_command_batch_commit_and_wait(ctx, "v2 token selection", error, error_size)) goto failed;
+    metal_profile_add_event_now(ctx, !has_forward_batch ? "metal.v2.argmax.command_wait" :
+        ctx->integrated_prefill_tokens > 1u ? "metal.v2.prefill.command_wait" : "metal.v2.decode.command_wait",
+        wait_start_ns);
     int32_t id;
     memcpy(&id, (uint8_t *)[token.buffer contents] + token.offset, sizeof(id));
     if (id < 0 || (uint32_t)id >= UOCR_VOCAB_SIZE) {
-        ctx->dash_cache->failed = 1;
-        return metal_fail(error, error_size, "v2 raw argmax returned an invalid token");
+        (void)metal_fail(error, error_size, "v2 raw argmax returned an invalid token");
+        goto failed;
     }
     *token_id = id;
     if (score != NULL) memcpy(score, (uint8_t *)[value.buffer contents] + value.offset, sizeof(*score));
     return 1;
+failed:
+    metal_command_batch_abort(ctx); ctx->dash_cache->failed = 1; ctx->has_integrated_prefill = 0;
+    return 0;
 }
 
 int uocr_metal_context_v2_raw_argmax(uocr_metal_context *ctx, int32_t *token_id,
     float *score, char *error, size_t error_size) {
+    if (metal_command_batch_active(ctx))
+        return metal_fail(error, error_size, "v2 raw argmax requires an idle command batch");
     return metal_v2_argmax(ctx, 0u, token_id, score, error, error_size);
 }
 
@@ -15689,13 +15728,18 @@ static int metal_context_generate_v2_f16(uocr_metal_context *ctx,
     if (!ctx->v2_decoder_ready || r->slot != 0u || r->max_new_tokens == 0u ||
         result->generated_ids == NULL || result->generated_capacity < r->max_new_tokens)
         return metal_fail(error, error_size, "invalid prepared v2 generation/output capacity");
-    if (!metal_context_assemble_prompt_from_model_to_arena_f16(ctx, r->input_ids, r->n_tokens,
+    ctx->reuse_compute_encoder = 1;
+    // Host-written page positions are updated only after the preceding batch
+    // has completed. Prompt/embedding, forward and selection then share a batch.
+    if (!uocr_metal_context_dash_begin(ctx, r->input_ids, r->n_tokens, 0, error, error_size) ||
+        !metal_command_batch_begin(ctx, error, error_size) ||
+        !metal_context_assemble_prompt_from_model_to_arena_f16(ctx, r->input_ids, r->n_tokens,
             r->image_span_start, r->image_span_length, NULL, visual, visual_offset, 0u, error, error_size) ||
-        !metal_forward_v2_arena(ctx, r->input_ids, r->n_tokens, 0, error, error_size)) return 0;
+        !metal_encode_v2_arena(ctx, error, error_size)) goto failed;
     uocr_page_guard guard = {ctx->dash_cache->pages.prompt_pages, 20000u, 0u, 0u};
     for (uint32_t i = 0u; i < r->max_new_tokens; ++i) {
         int32_t id; float score;
-        if (!metal_v2_argmax(ctx, uocr_page_guard_filter(&guard), &id, &score, error, error_size)) return 0;
+        if (!metal_v2_argmax(ctx, uocr_page_guard_filter(&guard), &id, &score, error, error_size)) goto failed;
         result->generated_ids[i] = id;
         if (result->generated_scores_f32_or_null != NULL) result->generated_scores_f32_or_null[i] = score;
         result->generated_count = i + 1u; result->last_token_id = (uint32_t)id; result->last_score_f32 = score;
@@ -15705,12 +15749,21 @@ static int metal_context_generate_v2_f16(uocr_metal_context *ctx,
         uocr_metal_buffer_slice token, value, prompt;
         uint64_t bytes;
         if (!metal_token_readback_arena_slices(ctx, 0u, &token, &value) ||
-            !metal_prompt_arena_slice(ctx, 0u, 1u, &prompt, &bytes))
-            return metal_fail(error, error_size, "v2 decode embedding workspace is invalid");
-        if (!metal_run_token_embedding_from_token_slot_f16(ctx, token, prompt, error, error_size) ||
-            !metal_forward_v2_arena(ctx, &id, 1u, 1, error, error_size)) return 0;
+            !metal_prompt_arena_slice(ctx, 0u, 1u, &prompt, &bytes)) {
+            (void)metal_fail(error, error_size, "v2 decode embedding workspace is invalid");
+            goto failed;
+        }
+        if (!uocr_metal_context_dash_begin(ctx, &id, 1u, 1, error, error_size) ||
+            !metal_command_batch_begin(ctx, error, error_size) ||
+            !metal_run_token_embedding_from_token_slot_f16(ctx, token, prompt, error, error_size) ||
+            !metal_encode_v2_arena(ctx, error, error_size)) goto failed;
     }
+    ctx->reuse_compute_encoder = 0;
     return 1;
+failed:
+    metal_command_batch_abort(ctx); ctx->dash_cache->failed = 1; ctx->has_integrated_prefill = 0;
+    ctx->reuse_compute_encoder = 0;
+    return 0;
 }
 
 static int metal_context_generate_f16_impl(uocr_metal_context *ctx,
@@ -15866,11 +15919,12 @@ static int metal_context_generate_f16_impl(uocr_metal_context *ctx,
     char prefill_error[512];
     prefill_error[0] = '\0';
     const uint64_t prefill_start_ns = uocr_profile_now_ns();
-    const int prefill_ok = metal_run_decoder_prefill_text_f16(ctx,
-                                                             request->slot,
-                                                             request->n_tokens,
-                                                             prefill_error,
-                                                             sizeof(prefill_error));
+    const int prefill_ok = metal_encode_decoder_prefill_text_f16(ctx,
+                                                                request->slot,
+                                                                request->n_tokens,
+                                                                prefill_error,
+                                                                sizeof(prefill_error)) &&
+                           metal_commit_decoder_prefill(ctx, prefill_error, sizeof(prefill_error));
     if (!metal_hot_path_alloc_guard_end(ctx,
                                         &prefill_guard,
                                         "integrated Metal fp16 prompt prefill",
@@ -16665,7 +16719,7 @@ static int metal_context_assemble_prompt_f16_with_table_buffer_to_buffer(uocr_me
         }
         [enc dispatchThreads:MTLSizeMake(dispatch_width, (NSUInteger)n_tokens, 1u)
        threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1u, 1u)];
-        [enc endEncoding];
+        metal_end_compute_encoder(ctx, enc);
         metal_profile_add_event_now(ctx, "metal.prompt.token_gather", token_gather_start_ns);
         metal_profile_add_event_now(ctx, "metal.prefill.token_gather", token_gather_start_ns);
 
@@ -16925,7 +16979,7 @@ static int metal_context_assemble_prompt_q8_0_with_table_buffer_to_buffer(uocr_m
         if (threads_per_group > dispatch_width) threads_per_group = dispatch_width;
         [enc dispatchThreads:MTLSizeMake(dispatch_width, (NSUInteger)n_tokens, 1u)
        threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1u, 1u)];
-        [enc endEncoding];
+        metal_end_compute_encoder(ctx, enc);
         metal_profile_add_event_now(ctx, "metal.prompt.token_gather_q8", token_gather_start_ns);
         metal_profile_add_event_now(ctx, "metal.prefill.token_gather_q8", token_gather_start_ns);
 
@@ -17643,7 +17697,7 @@ static int metal_context_rmsnorm_f16_with_weight_buffer(uocr_metal_context *ctx,
         [enc setThreadgroupMemoryLength:threads_per_group * sizeof(float) atIndex:0u];
         [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_rows, 1u, 1u)
              threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1u, 1u)];
-        [enc endEncoding];
+        metal_end_compute_encoder(ctx, enc);
 
         UOCR_METAL_COMMIT_AND_WAIT_PROFILED(ctx, cb);
         if (cb.status == MTLCommandBufferStatusError) {
@@ -17764,7 +17818,7 @@ static int metal_context_layernorm_f16_slices_with_parameter_buffers(
         [enc setThreadgroupMemoryLength:threads_per_group * sizeof(float) atIndex:0u];
         [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_rows, 1u, 1u)
              threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1u, 1u)];
-        [enc endEncoding];
+        metal_end_compute_encoder(ctx, enc);
 
         if (!owned_command_buffer &&
             (!metal_retain_transient_until_completed(ctx, cb, input_slice.buffer, error, error_size) ||
@@ -17922,7 +17976,7 @@ static int metal_context_clip_attention_batch_f16_to_slice(uocr_metal_context *c
         [enc setBytes:&params length:sizeof(params) atIndex:4u];
         [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)UOCR_CLIP_ATTENTION_HEADS, query_blocks, (NSUInteger)view_count)
              threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1u, 1u)];
-        [enc endEncoding];
+        metal_end_compute_encoder(ctx, enc);
         return metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, "Metal CLIP batch attention", error, error_size);
     }
 }
@@ -18555,7 +18609,7 @@ static int metal_context_sam_window_partition_batch_f16_to_slice(uocr_metal_cont
         [enc setBytes:&params length:sizeof(params) atIndex:2u];
         [enc dispatchThreads:MTLSizeMake((NSUInteger)window_values, 1u, 1u)
        threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1u, 1u)];
-        [enc endEncoding];
+        metal_end_compute_encoder(ctx, enc);
         if (!metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, "Metal SAM window partition batch", error, error_size)) {
             return 0;
         }
@@ -18644,7 +18698,7 @@ static int metal_context_sam_window_unpartition_batch_f16_to_slice(uocr_metal_co
         [enc setBytes:&params length:sizeof(params) atIndex:2u];
         [enc dispatchThreads:MTLSizeMake((NSUInteger)output_values, 1u, 1u)
        threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1u, 1u)];
-        [enc endEncoding];
+        metal_end_compute_encoder(ctx, enc);
         return metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, "Metal SAM window unpartition batch", error, error_size);
     }
 }
@@ -18741,7 +18795,7 @@ static int metal_context_sam_global_attention_mps_f16_to_slice(uocr_metal_contex
         [enc setBytes:params length:sizeof(*params) atIndex:5u];
         [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)UOCR_SAM_ATTENTION_HEADS, (NSUInteger)tokens, (NSUInteger)view_count)
              threadsPerThreadgroup:MTLSizeMake(rel_threads, 1u, 1u)];
-        [enc endEncoding];
+        metal_end_compute_encoder(ctx, enc);
         if (!metal_finish_command_buffer_for_op(ctx, cb, owned, "Metal SAM global attention pack", error, error_size)) {
             return 0;
         }
@@ -18798,7 +18852,7 @@ static int metal_context_sam_global_attention_mps_f16_to_slice(uocr_metal_contex
         [enc setThreadgroupMemoryLength:(NSUInteger)softmax_tg_bytes atIndex:0u];
         [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)tokens, (NSUInteger)logical_heads, 1u)
              threadsPerThreadgroup:MTLSizeMake(softmax_threads, 1u, 1u)];
-        [enc endEncoding];
+        metal_end_compute_encoder(ctx, enc);
         if (!metal_finish_command_buffer_for_op(ctx, cb, owned, "Metal SAM global attention softmax", error, error_size)) {
             return 0;
         }
@@ -18848,7 +18902,7 @@ static int metal_context_sam_global_attention_mps_f16_to_slice(uocr_metal_contex
         [enc setBytes:params length:sizeof(*params) atIndex:2u];
         [enc dispatchThreads:MTLSizeMake((NSUInteger)pack_values, 1u, 1u)
        threadsPerThreadgroup:MTLSizeMake(unpack_threads, 1u, 1u)];
-        [enc endEncoding];
+        metal_end_compute_encoder(ctx, enc);
         return metal_finish_command_buffer_for_op(ctx, cb, owned, "Metal SAM global attention unpack", error, error_size);
     }
 }
@@ -19067,7 +19121,7 @@ static int metal_context_sam_rel_pos_attention_batch_f16_to_slice(uocr_metal_con
             [enc setThreadgroupMemoryLength:tile_bytes atIndex:1u];
             [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)UOCR_SAM_ATTENTION_HEADS, query_blocks, (NSUInteger)logical_windows)
                  threadsPerThreadgroup:MTLSizeMake(attention_threads_per_group, 1u, 1u)];
-            [enc endEncoding];
+            metal_end_compute_encoder(ctx, enc);
 
             const int result = metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, op_name, error, error_size);
             [rel_w_logits release];
@@ -19115,7 +19169,7 @@ static int metal_context_sam_rel_pos_attention_batch_f16_to_slice(uocr_metal_con
         [enc setBytes:&params length:sizeof(params) atIndex:6u];
         [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)UOCR_SAM_ATTENTION_HEADS, query_blocks, (NSUInteger)logical_windows)
              threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1u, 1u)];
-        [enc endEncoding];
+        metal_end_compute_encoder(ctx, enc);
         return metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, op_name, error, error_size);
     }
 }
@@ -19983,7 +20037,7 @@ int uocr_metal_context_argmax_f32(uocr_metal_context *ctx,
         [enc setThreadgroupMemoryLength:threads_per_group * sizeof(uint32_t) atIndex:1u];
         [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_rows, 1u, 1u)
              threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1u, 1u)];
-        [enc endEncoding];
+        metal_end_compute_encoder(ctx, enc);
 
         UOCR_METAL_COMMIT_AND_WAIT_PROFILED(ctx, cb);
         if (cb.status == MTLCommandBufferStatusError) {
@@ -20240,7 +20294,7 @@ static int run_no_copy_kernel_smoke(uocr_metal_context *ctx, char *error, size_t
     }
     [enc dispatchThreads:MTLSizeMake((NSUInteger)N, 1u, 1u)
    threadsPerThreadgroup:MTLSizeMake(threads_per_group, 1u, 1u)];
-    [enc endEncoding];
+    metal_end_compute_encoder(ctx, enc);
 
     const uint32_t transient_count_before = metal_inflight_transient_count(ctx);
     if (!metal_retain_transient_until_completed(ctx, cb, src, error, error_size)) {

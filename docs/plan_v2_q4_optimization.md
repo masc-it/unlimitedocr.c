@@ -3,8 +3,9 @@
 Status: `todo` (not done)
 
 Checkboxes: `- [x] done` means completed and verified; `- [ ] todo` means not
-done. Research and measurements are complete for the initial investigation;
-none of the proposed kernel or scheduling changes have been implemented.
+done. Initial research is complete. Phase 1's single-token submission and
+encoder-consolidation checkpoint is implemented and verified. GPU decode
+chunking and the remaining phases are not done.
 
 ## Goal and scope
 
@@ -109,7 +110,7 @@ and broader qualification remains `todo` in phase 2.
 
 | Phase | Target | Main benefit | Status |
 |---|---|---|---|
-| 1 | V2 submission/encoder scheduling | Decode speed | todo |
+| 1 | V2 submission/encoder scheduling | Decode speed | todo: single-token checkpoint done; GPU chunking remains |
 | 2 | Vision scratch lifetimes and chunk sizing | Memory | todo |
 | 3 | SAM global matrix-tiled attention | Memory and first-token latency | todo |
 | 4 | SAM window matrix-tiled attention | First-token latency | todo |
@@ -137,12 +138,12 @@ Files:
 
 ## Shared measurement and acceptance gates
 
-- [ ] todo: Recreate the normal baseline on the same model and fixture; record
+- [x] done: Recreate the normal baseline on the same model and fixture; record
   commit, hardware, build flags, view counts, prompt/output counts, and warmup.
 - [ ] todo: Separate prefill from decode attribution. Use GPU timestamps,
   counter sampling, or isolated GPU probes for kernel measurements; use normal
   non-checkpoint runs for end-to-end acceptance.
-- [ ] todo: Compare candidates with the same inputs and output lengths, using
+- [x] done: Compare candidates with the same inputs and output lengths, using
   repeated/interleaved runs. Include natural EOS runs as a separate quality
   check so changed output lengths cannot masquerade as speedups.
 - [ ] todo: Record tracked allocations, Metal allocation usage where available,
@@ -151,7 +152,7 @@ Files:
 - [ ] todo: Validate numerical behavior against the current native path and
   small reference calculations, then exercise real v2 Q4 base/gundam OCR,
   strict parsing, v1 regression, and v2 Q8 dispatch compatibility.
-- [ ] todo: Exercise budget rejection and reuse after failure/truncation for
+- [x] done: Exercise budget rejection and reuse after failure/truncation for
   changes affecting allocation or generation state.
 - [ ] todo: Verify runtime-compiled and precompiled Metal paths when shaders
   change. Run the relevant existing checks at each implementation checkpoint.
@@ -165,10 +166,10 @@ explicitly requested. Keep unrun checks marked `todo` and state blockers.
 Outcome: public v2 OCR uses one submission per token before attempting larger
 GPU-resident decode chunks.
 
-- [ ] todo: Move command-buffer ownership to generation orchestration so
+- [x] done: Move command-buffer ownership to generation orchestration so
   embedding, forward, and argmax can be encoded in one batch per token.
-- [ ] todo: Consolidate compatible compute encoders with correct dependencies.
-- [ ] todo: Keep CPU page-state updates at safe boundaries and preserve explicit
+- [x] done: Consolidate compatible compute encoders with correct dependencies.
+- [x] done: Keep CPU page-state updates at safe boundaries and preserve explicit
   abort/cleanup behavior if encoding or GPU execution fails.
 - [ ] todo: After the single-token checkpoint passes, adapt v1-style GPU chunks
   to v2, including GPU page positions, page/EOS guards, output limits, and
@@ -176,14 +177,96 @@ GPU-resident decode chunks.
 
 QA checkpoint:
 
-- [ ] todo: Confirm the measured three-waits-per-token pattern is removed;
+- [x] done: Confirm the measured three-waits-per-token pattern is removed;
   report encoder counts and normal-run decode latency before/after.
-- [ ] todo: Check first PAGE, EOS, short token caps, page boundaries in low-level
+- [x] done: Check first PAGE, EOS, short token caps, page boundaries in low-level
   probes, and engine reuse after a failed request.
 - [ ] todo: Confirm chunked output/state matches the unchunked path, including
   stopping inside a chunk. Keep the one-token path working throughout rollout.
 
-QA evidence: not run. Reference: [3].
+### Single-token checkpoint evidence (2026-10-30)
+
+Implementation in `src/backend/metal/uocr_metal.m`:
+
+- Decoder forward is encoder-only. V1 and the diagnostic host-forward API keep
+  their explicit synchronous submission boundaries.
+- V2 generation prepares CPU page positions while idle, then batches embedding,
+  forward, and filtered argmax. Host token readback follows successful completion.
+- Compute-encoder reuse is opt-in during v2 generation only. Former encoder
+  boundaries insert buffer memory barriers. Blits, submission, and abort close
+  the shared encoder; both success and failure clear the opt-in state.
+- V2 selection reads the recorded final hidden segment directly, removing the
+  unnecessary segment-zero blit. V1 retains that copy for its chunk decoder.
+- Normal combined waits have separate `metal.v2.prefill.command_wait` and
+  `metal.v2.decode.command_wait` events. They are host wait durations, not isolated
+  GPU kernel timings; legacy per-operation encoding labels remain unchanged.
+
+The initial submission-only candidate preserved outputs and reduced waits but
+showed no reliable speed improvement. Encoder consolidation supplied the measured
+win; the submission-only candidate was not landed separately.
+
+Normal-mode incremental counts per decoded token:
+
+| Counter | Baseline | Checkpoint |
+|---|---:|---:|
+| Command buffers / waits | 3 / 3 | 1 / 1 |
+| Command encoders | 206 | 1 |
+
+Same M1 Pro, pinned mixed-Q4 model and invoice as the initial investigation.
+The baseline was saved from the Release build at `697ff33`, before code changes.
+A disposable A/B probe loaded that saved library and the candidate explicitly,
+warmed both engines, and interleaved old/new runs. Three pairs per version used
+output caps 1 and 257, with identical 257-token outputs. Mean incremental decode
+cost fell from **10.85 to 7.44 ms/token**, about **31% lower latency**. Mean total
+257-token request time fell from **4.16 to 3.32 s**. These measurements used
+profiling-enabled Release builds with detailed checkpoints disabled.
+
+Separate EOS-complete comparisons, with identical token IDs and strict parsing:
+
+| Path | Output tokens | Baseline | Checkpoint |
+|---|---:|---:|---:|
+| V2 Q4 base | 385 | 5.74 s | 4.36 s |
+| V2 Q4 gundam | 385 | 11.00 s | 9.84 s |
+| V2 Q8 base | 385 | 6.64 s | 4.57 s |
+
+These complete-request figures are single comparisons, not broad throughput
+claims. V1 Q4 base also retained all 381 output IDs and unchanged submission/
+encoder counts. Repeated caps 1/65 checked truncation and subsequent reuse.
+Tracked complete-request peaks were unchanged: **3,333,935,616 bytes** base and
+**4,139,373,056 bytes** gundam. V2 live tracked bytes returned to model-only after
+each request. Process RSS and driver/MPS allocation peaks were not measured.
+
+A low-level probe exercised a two-page host-embedding forward, generated page
+transitions, and raw argmax; this is not multi-page image generation. A budget
+of required decoder bytes minus one rejected before allocation. Three injected
+readback-workspace failures occurred after forward encoding with the shared
+encoder open. Each aborted with no active batch/encoder, cleared transient
+retains and the reuse flag, then successfully reused the same context after
+request release. Tracked request bytes returned to zero. The probe also passed
+with `MTL_DEBUG_LAYER=1`. Actual GPU execution faults were not injected.
+
+Public `UnlimitedOCR(model="v2", quant="q4", download=False)` matched the baseline
+text and parsed under Metal API validation. A separate Release build with
+profiling OFF and runtime Metal compilation OFF produced the same 385 tokens
+using the precompiled metallib (4.37 s). No shaders or model formats changed;
+therefore runtime shader compilation was not separately requalified. Decoder
+detail level 3 also completed after encoder consolidation and retained the
+baseline first-token output; its added checkpoint waits remain intentional.
+
+Commands/checks used:
+
+```bash
+cmake --build build/release --parallel 4
+UOCR_RUN_LARGE_TESTS=0 UOCR_RUN_PERF_TESTS=0 HF_HUB_OFFLINE=1 \
+  uv run --extra dev python -m pytest tests -q
+ctest --test-dir build/release --output-on-failure
+```
+
+Results: **105 Python checks passed, 7 opt-in checks skipped**, with three expected
+invalid-limit warmup warnings; **13 native checks passed**. Disposable scripts,
+saved libraries, and profiles lived under `data.tmp/probes/v2-q4-submit/` and were
+removed after recording this evidence. The dedicated profiling-OFF build was
+also removed. GPU chunking remains the next Phase 1 item. Reference: [3].
 
 ## Phase 2: Reusable vision scratch and qualified chunk sizing
 
