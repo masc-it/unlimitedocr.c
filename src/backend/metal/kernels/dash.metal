@@ -186,3 +186,63 @@ kernel void uocr_dash_attend_f16(device const half *queries [[buffer(0)]],
     }
     for (uint j = 0; j < 4; ++j) output[(row*10u+head)*128u+lane+j*32u] = half(acc[j]/denom);
 }
+
+// Decode has only ten query/head groups. Cooperatively stage one sparse block
+// at a time so QK and V loads do not serialize behind each softmax update.
+// Four consumer SIMD groups own disjoint output dimensions and retain the
+// original key order and FP32 recurrence; there is no split-softmax reduction.
+[[max_total_threads_per_threadgroup(512)]]
+kernel void uocr_dash_attend_decode_tiled_f16(device const half *queries [[buffer(0)]],
+                                              device const half *keys [[buffer(1)]],
+                                              device const half *values [[buffer(2)]],
+                                              device const UocrDashSelection *selection [[buffer(3)]],
+                                              device half *output [[buffer(4)]],
+                                              constant UocrDashParams &p [[buffer(5)]],
+                                              uint2 group [[threadgroup_position_in_grid]],
+                                              uint lane [[thread_index_in_simdgroup]],
+                                              uint sg [[simdgroup_index_in_threadgroup]]) {
+    constexpr uint tile_keys = 32u, simdgroups = 16u;
+    const uint row = group.x, head = group.y, pos = p.query_start + row;
+    const uint local_start = pos >= 127u ? pos - 127u : 0u;
+    float q[4];
+    for (uint j = 0; j < 4; ++j)
+        q[j] = float(queries[(row*10u+head)*128u+lane+j*32u]);
+    threadgroup float scores[tile_keys];
+    threadgroup half cached_v[tile_keys*128u];
+    float m = -INFINITY, denom = 0, acc = 0;
+    for (uint section = 0; section < 13u; ++section) {
+        const bool local = section == 12u;
+        const int block = local ? 0 : selection[row].blocks[section];
+        if (block < 0) continue;
+        const uint begin = local ? local_start : uint(block)*32u;
+        // Keep overlap only in the unbiased local section, as in the scalar path.
+        const uint end = local ? pos+1u : min((uint(block)+1u)*32u, local_start);
+        const float bias = local ? 0.0f : selection[row].bias[section];
+        for (uint tile = begin; tile < end; tile += tile_keys) {
+            const uint count = min(tile_keys, end-tile);
+            for (uint i = sg; i < count; i += simdgroups) {
+                const uint t = tile+i;
+                float dot = 0;
+                for (uint j = 0; j < 4; ++j) {
+                    dot += q[j]*float(keys[(t*10u+head)*128u+lane+j*32u]);
+                    cached_v[i*128u+lane+j*32u] = values[(t*10u+head)*128u+lane+j*32u];
+                }
+                const float score = simd_sum(dot)*0.08838834764831845f + bias;
+                if (lane == 0u) scores[i] = score;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (sg < 4u) {
+                for (uint i = 0; i < count; ++i) {
+                    const float score = scores[i];
+                    const float next_m = max(m, score), corr = exp(m-next_m), e = exp(score-next_m);
+                    acc = acc*corr + e*float(cached_v[i*128u+lane+sg*32u]);
+                    denom = denom*corr + e;
+                    m = next_m;
+                }
+            }
+            // All producers must wait for the consumers before reusing the tile.
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+    if (sg < 4u) output[(row*10u+head)*128u+lane+sg*32u] = half(acc/denom);
+}

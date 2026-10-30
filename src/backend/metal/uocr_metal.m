@@ -12649,7 +12649,11 @@ static int metal_run_dash_buffer_f16(uocr_metal_context *ctx,
         if (!metal_slice_valid(buffers[i], bytes[i]))
             return metal_fail(error, error_size, "invalid DASH buffer %u", i);
     }
-    const char *names[3] = {"uocr_dash_summary_f16", "uocr_dash_route_f16", "uocr_dash_attend_f16"};
+    // Keep prefill and short queries on the scalar path. Tiling pays off for
+    // single-query decode once the full 128-token local window is present.
+    const int tiled_decode = params.n_queries == 1u && params.query_start >= 127u;
+    const char *names[3] = {"uocr_dash_summary_f16", "uocr_dash_route_f16",
+        tiled_decode ? "uocr_dash_attend_decode_tiled_f16" : "uocr_dash_attend_f16"};
     const uint32_t bindings[3][5] = {
         {DASH_ROUTER_K, DASH_HEAD_CLS, DASH_POSITIONS, DASH_SUMMARIES, DASH_PAGE_RANGES},
         {DASH_ROUTER_Q, DASH_SUMMARIES, DASH_PAGE_RANGES, DASH_POSITIONS, DASH_SELECTIONS},
@@ -12667,8 +12671,12 @@ static int metal_run_dash_buffer_f16(uocr_metal_context *ctx,
         for (uint32_t stage = 0; stage < 3u; ++stage) {
             id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, names[stage], error, error_size);
             if (pipeline == nil) return 0;
-            if (pipeline.threadExecutionWidth != 32u || pipeline.maxTotalThreadsPerThreadgroup < 32u)
-                return metal_fail(error, error_size, "DASH requires 32-lane Metal SIMD groups");
+            const NSUInteger threads = stage == 2u && tiled_decode ? 512u : 32u;
+            if (pipeline.threadExecutionWidth != 32u || pipeline.maxTotalThreadsPerThreadgroup < threads)
+                return metal_fail(error, error_size, "DASH requires 32-lane SIMD groups and %llu threads per group",
+                                  (unsigned long long)threads);
+            if (pipeline.staticThreadgroupMemoryLength > ctx->device.maxThreadgroupMemoryLength)
+                return metal_fail(error, error_size, "DASH threadgroup memory exceeds device limit");
             id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
             if (enc == nil) return metal_fail(error, error_size, "failed to create DASH encoder");
             [enc setComputePipelineState:pipeline];
@@ -12677,7 +12685,7 @@ static int metal_run_dash_buffer_f16(uocr_metal_context *ctx,
                 [enc setBuffer:slice.buffer offset:slice.offset atIndex:slot];
             }
             [enc setBytes:&params length:sizeof(params) atIndex:5u];
-            [enc dispatchThreadgroups:groups[stage] threadsPerThreadgroup:MTLSizeMake(32u, 1u, 1u)];
+            [enc dispatchThreadgroups:groups[stage] threadsPerThreadgroup:MTLSizeMake(threads, 1u, 1u)];
             metal_end_compute_encoder(ctx, enc);
         }
         return metal_finish_command_buffer_for_op(ctx, cb, owned, "DASH attention", error, error_size);

@@ -10,8 +10,9 @@ SAM relative-logit storage, shared local/global backing storage, and batch-abort
 ownership fixes are implemented. Four-crop batches are qualified on the measured
 M1 Pro. Phase 3's bounded-query MPS checkpoint is implemented and verified;
 custom fused global online attention is deferred after slower prototypes.
-Phase 4's v2 SAM window MMA kernel is implemented and verified. CLIP reuse and
-remaining staging/cached-buffer accounting are not done.
+Phase 4's v2 SAM window MMA kernel and phase 5's order-preserving DASH decode
+kernel are implemented and verified. CLIP reuse, matrix-tiled sparse prefill,
+and remaining staging/cached-buffer accounting are not done.
 
 ## Goal and scope
 
@@ -120,7 +121,7 @@ and broader qualification remains `todo` in phase 2.
 | 2 | Vision scratch lifetimes and chunk sizing | Memory | lifetimes/chunk qualification done; staging accounting remains todo |
 | 3 | Bounded SAM global attention | Memory and first-token latency | bounded MPS checkpoint done; fused online kernel deferred |
 | 4 | SAM window matrix-tiled attention | First-token latency | v2 SAM checkpoint done; CLIP reuse remains todo |
-| 5 | DASH attention parallelism | Decode speed; prefill opportunity | todo |
+| 5 | DASH attention parallelism | Decode speed; prefill opportunity | decode checkpoint done; matrix-tiled sparse prefill remains todo |
 | 6 | Occupancy-aware routed-MoE prefill | Prefill speed | todo |
 | 7 | Q4 vision GEMM staging | Vision speed | todo |
 | 8 | Q4 LM-head and decode GEMVs | Decode speed | todo |
@@ -800,27 +801,169 @@ CLIP specialization remains `todo`. References: [1], [2].
 Outcome: decode attention has enough parallel work while retaining sparse
 memory usage and the exact selection/bias contract.
 
-The current kernel assigns one SIMD group per query/head: only 10 SIMD groups
-for decode, each visiting up to 512 selected/local keys serially.
+The baseline assigns one SIMD group per query/head: only 10 SIMD groups for
+decode, each visiting up to 512 selected/local keys serially. The accepted
+specialization computes scores and stages values cooperatively while preserving
+the original recurrence.
 
-- [ ] todo: Benchmark multiple SIMD groups per head and small split-K variants.
-  Merge partial maxima, denominators, and weighted outputs stably.
-- [ ] todo: Preserve remote biases, causal bounds, empty partitions, and
+- [x] done: Benchmark multiple SIMD groups per head and small split-K variants,
+  including stable merging of partial maxima, denominators and weighted outputs.
+  Retain an order-preserving tiled variant instead of split-softmax reductions.
+- [x] done: Preserve remote biases, causal bounds, empty partitions, and
   single inclusion of overlapping local tokens.
 - [ ] todo: Separately investigate matrix-tiled sparse prefill where selections
   allow useful reuse; do not materialize a dense attention matrix.
-- [ ] todo: Size/account for any reduction scratch and keep decode/prefill
-  dispatch based on measured workload shape.
+- [x] done: Bound temporary storage in static threadgroup memory;
+  the accepted kernel needs no device reduction scratch. Select dispatch from
+  measured query shape and retain the scalar prefill/short-query path.
 
 QA checkpoint:
 
-- [ ] todo: Compare against current attention with fixed selections, overlap,
+- [x] done: Compare against current attention with fixed selections, overlap,
   empty remote sets, partial blocks, and extreme logits.
-- [ ] todo: Measure kernel occupancy/latency and full decode cost. Reject split
-  counts whose reduction overhead outweighs additional parallelism.
-- [ ] todo: Confirm unchanged page/EOS behavior and full OCR quality checks.
+- [x] done: Compare SIMD-group/tile configurations and kernel/full-decode latency;
+  reject configurations that regress the target shape. Hardware-counter
+  occupancy was not measured.
+- [x] done: Confirm unchanged page/EOS behavior and full OCR quality checks.
 
-QA evidence: not run. References: [2], [4].
+### Order-preserving DASH decode checkpoint evidence (2026-10-30)
+
+Baseline: `ceed60c`, Apple M1 Pro with 16 GB RAM, the same pinned models and
+Release/profiling configuration as phase 4. Production changes are limited to
+`dash.metal`, its regenerated source, and DASH dispatch in `uocr_metal.m`.
+
+#### Candidates and selected behavior
+
+- Split-softmax variants used 2/4/8/16 SIMD groups per head. They merged partial
+  maxima, denominators and weighted values in FP32, explicitly handling empty
+  partitions. They passed `atol=0.003, rtol=0.003` against the scalar path and a
+  separate FP64 reference, and the fastest variants were about 6-7x faster on
+  the representative isolated decode shapes.
+- The eight-group split variant reduced warmed base invoice time from about
+  **4.028 to 3.359 s**, but moved several box coordinates, including a two-unit
+  shift on the v2 0-1000 grid. Text remained unchanged. This variant was not
+  accepted: an order-preserving alternative recovered most of its request-level
+  benefit without the measured output drift.
+- Precomputing scores alone retained bitwise outputs but gave only about 20%
+  isolated improvement. Staging V alongside scores removed the remaining
+  serialized device reads. Four consumer SIMD groups each handle 32 output
+  dimensions while retaining the original key order and scalar FP32 operations.
+- The accepted `uocr_dash_attend_decode_tiled_f16` uses **16 SIMD groups / 512
+  threads**, a **32-key tile**, FP32 scores and FP16 staged V: **8,320 bytes** of
+  static threadgroup storage. QK still uses the original four terms per lane
+  and SIMD reduction. Softmax and weighted accumulation do not merge partial
+  reductions or introduce probability downcasts.
+- Tile widths 16/32/64 and 4/8/16/32-group variants were explored. A 64-key tile
+  improved representative isolated timings only about 1-2% over the selected
+  configuration while doubling shared storage; 32 groups did not improve it.
+  The selected tile also matches the 32-token sparse block size.
+- Dispatch uses the new kernel only when `n_queries == 1` and
+  `query_start >= 127`, so a complete 128-token local window is available.
+  Prefill and shorter queries retain the original kernel. Prefill measurements
+  regressed with the decode specialization; matrix-tiled sparse prefill remains
+  a separate `todo` rather than being enabled through this dispatch.
+- Buffer bindings, selection order/biases, causal/local overlap handling,
+  summaries, routing, page-aware RoPE, cache retention and page/EOS guards are
+  unchanged. V1 does not use DASH. Pipeline/width/thread-count/shared-memory
+  failures are explicit; there is no silent fallback after a selected pipeline
+  fails. No new device buffers, reductions or CPU/GPU submissions are added.
+
+#### Numerical and functional checks
+
+- The production shader was compared against the prior scalar kernel and an
+  independent FP64 sparse-attention reference on **16 cases**. These cover
+  empty remote sets, uniform attention, large finite logits/biases, overlap,
+  partial blocks/tiles, short queries, multiple queries, and scattered block
+  selections with key counts up to **32,769**. Production output was **bitwise
+  identical** to the scalar kernel; maximum absolute FP64 error was
+  **0.000958801**. API and GPU shader validation passed in a separate run whose
+  instrumented timings were excluded from performance evidence.
+- A diagnostic backend compared outputs and selections on **1,536 real Q4
+  attention calls**: 64 decode steps across 12 layers in each of base/gundam.
+  Every output element and selection byte matched. Diagnostic synchronization
+  and readback were excluded from timing.
+- The host DASH bridge matched baseline outputs, selections and summaries on
+  nine shapes, including the 127/128-key dispatch boundary, a partially
+  overlapping remote block, multi-query prefill, and varying image-page ranges.
+  Invalid query ranges left outputs untouched, and valid reuse succeeded.
+- Complete natural-EOS/strict-parsing checks matched all baseline IDs:
+
+| Path / fixture | Output tokens |
+|---|---:|
+| V2 Q4 invoice, base / 13-view / maximum 17-view gundam | 385 |
+| V2 Q4 blank, base | 19 |
+| V2 Q4 table, base | 448 |
+| V2 Q4 edge text, gundam | 300 |
+| V2 Q4 degraded scan, gundam | 385 |
+| V2 Q4 tiny text, base | 1,172 |
+| V2 Q8 invoice, base | 385 |
+| V1 Q4 invoice, base / gundam | 381 |
+
+Q8 matches this checkpoint's `ceed60c` baseline; the earlier phase 4 rounding
+qualification is unchanged. Four-crop maximum-view output also matched the
+eight-crop baseline. These checks do not establish universal/compiler-independent
+bitwise equivalence or upstream/v2-FP16 end-to-end parity.
+
+#### Timing and memory
+
+Isolated probes timed repeated dependent dispatches with GPU timestamps, one
+warmup command buffer and three measured buffers. Each measured tuning buffer
+contained 256 serial dispatches; the table reports median time per dispatch.
+These use fixed selections and include sparse attention only, not routing:
+
+| Retained keys / single query | Scalar | Selected tiled kernel |
+|---|---:|---:|
+| 128, local only | 48.05 us | 22.18 us |
+| 279, selected prefix plus local window | 100.05 us | 42.16 us |
+| 1,519, 12 remote blocks plus local window | 178.40 us | 73.84 us |
+
+The selected path is about **2.2-2.4x faster** in these isolated shapes. Whole
+request A/B measurements warmed both libraries and alternated order across
+three pairs at each output cap, without polling or detailed checkpoints:
+
+| V2 Q4 invoice | Before | After |
+|---|---:|---:|
+| Base, cap 1 | 1.067 s | 1.052 s |
+| Base, cap 65 | 1.511 s | 1.459 s |
+| Base, natural EOS / 385 IDs | 4.083 s | 3.675 s |
+| Gundam, cap 1 | 4.578 s | 4.577 s |
+| Gundam, cap 65 | 5.163 s | 5.052 s |
+| Gundam, natural EOS / 385 IDs | 8.260 s | 7.566 s |
+
+Complete-request means improved **10.0% / 8.4%**. Base candidate timings ranged
+from **3.586 to 3.832 s**; all three samples are retained in that mean. The
+early incremental decode estimate `(T65-T1)/64` changed from **6.94 to 6.36
+ms/token** in base and **9.14 to 7.42 ms/token** in gundam. First-token/prefill
+work is unchanged; the small cap-1 difference is measurement variation. A
+separate, non-interleaved warmed tiny-text check improved **10.534 to 8.863 s**
+with exactly 1,172 IDs. These are fixture results, not general throughput claims.
+
+Encoder/wait/allocation counts remained **1,039 / 386 / 14** for base and
+**3,496 / 388 / 18** for gundam. Tracked peaks remained **2,176,307,712 /
+2,680,173,056 bytes**. Separate 1 ms Metal sampling during 65-token requests
+retained peaks **2,205,302,784 / 2,735,915,008 bytes**, and end-of-request Metal
+usage **1,862,516,736 bytes**. Process RSS high-water marks were approximately
+**2.131 -> 2.140 GB** for base and **2.214 -> 2.215 GB** for gundam; these include
+Python/compiler/driver state and are not the native admission estimate.
+
+#### Failure, build and cleanup checks
+
+- Injected pipeline-lookup and post-dispatch failures returned errors, released
+  request allocations, and allowed repeated reuse, followed by a complete
+  385-ID request matching baseline. Actual GPU execution faults were not
+  injected. A 2.5 GB budget rejected gundam and permitted base afterward.
+- Runtime-only compilation from regenerated source in an empty resource
+  directory matched precompiled base/gundam outputs. A separate profiling-OFF,
+  runtime-compilation-OFF, precompiled build passed all 13 native checks and
+  matched the complete base output. Source regeneration was byte-identical.
+- Main Release build and existing suites passed: **105 Python checks, 7 opt-in
+  skips**, the three expected warmup warnings, and **13 native checks**.
+- Owned probes, private libraries/builds and logs under
+  `data.tmp/probes/v2-q4-dash/` were removed after recording evidence. No
+  permanent tests were added. The persistent stress dataset and concurrent
+  notebook edits were not modified or staged by this work.
+
+References: [2], [4].
 
 ## Phase 6: Occupancy-aware routed-MoE prefill
 
