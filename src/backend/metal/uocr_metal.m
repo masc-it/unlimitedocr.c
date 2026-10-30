@@ -4778,9 +4778,8 @@ static int metal_vision_workspace_init(uocr_metal_context *ctx,
                          (uint64_t)UOCR_SAM_HIDDEN_SIZE,
                          &sam_attention_values) ||
         !checked_mul_u64(sam_attention_values, clip_view_capacity, &sam_attention_batch_values) ||
-        !checked_mul_u64((uint64_t)clip_view_capacity, (uint64_t)UOCR_SAM_ATTENTION_HEADS, &sam_global_logits_values) ||
-        !checked_mul_u64(sam_global_logits_values, patch_tokens, &sam_global_logits_values) ||
-        !checked_mul_u64(sam_global_logits_values, patch_tokens, &sam_global_logits_values) ||
+        !checked_mul_u64(patch_tokens < UOCR_SAM_GLOBAL_MPS_QUERY_TILE ? patch_tokens : UOCR_SAM_GLOBAL_MPS_QUERY_TILE,
+                         patch_tokens, &sam_global_logits_values) ||
         !checked_mul_u64((uint64_t)clip_view_capacity, (uint64_t)UOCR_SAM_ATTENTION_HEADS, &sam_global_rel_h_values) ||
         !checked_mul_u64(sam_global_rel_h_values, patch_tokens, &sam_global_rel_h_values) ||
         !checked_mul_u64(sam_global_rel_h_values, patch_grid, &sam_global_rel_h_values) ||
@@ -18747,7 +18746,8 @@ static int metal_context_sam_global_attention_mps_f16_to_slice(uocr_metal_contex
     const uint32_t logical_heads = view_count * UOCR_SAM_ATTENTION_HEADS;
     const uint64_t pack_values = (uint64_t)logical_heads * (uint64_t)tokens * (uint64_t)UOCR_SAM_HEAD_DIM;
     const uint64_t pack_bytes = pack_values * 2u;
-    const uint64_t logits_values = (uint64_t)logical_heads * (uint64_t)tokens * (uint64_t)tokens;
+    const uint32_t query_rows = tokens < UOCR_SAM_GLOBAL_MPS_QUERY_TILE ? tokens : UOCR_SAM_GLOBAL_MPS_QUERY_TILE;
+    const uint64_t logits_values = (uint64_t)query_rows * (uint64_t)tokens;
     const uint64_t logits_f32_bytes = logits_values * (uint64_t)sizeof(float);
     const uint64_t probs_bytes = logits_values * 2u;
     const uint64_t rel_h_bytes = (uint64_t)logical_heads * (uint64_t)tokens * (uint64_t)grid_h * (uint64_t)sizeof(float);
@@ -18824,85 +18824,62 @@ static int metal_context_sam_global_attention_mps_f16_to_slice(uocr_metal_contex
             return 0;
         }
 
-        uocr_metal_buffer_slice q_base = { scratch->sam_global_q_pack.buffer, scratch->sam_global_q_pack.offset };
-        uocr_metal_buffer_slice k_base = { scratch->sam_global_k_pack.buffer, scratch->sam_global_k_pack.offset };
-        uocr_metal_buffer_slice logits_base = { scratch->sam_global_logits_f32.buffer, scratch->sam_global_logits_f32.offset };
-        for (uint32_t logical_head = 0u; logical_head < logical_heads; ++logical_head) {
-            uocr_metal_buffer_slice q_head;
-            uocr_metal_buffer_slice k_head;
-            uocr_metal_buffer_slice logits_head;
-            uint64_t unused = 0u;
-            if (!metal_matrix_subslice(q_base, pack_bytes, logical_head * tokens, tokens, UOCR_SAM_HEAD_DIM, 2u, &q_head, &unused) ||
-                !metal_matrix_subslice(k_base, pack_bytes, logical_head * tokens, tokens, UOCR_SAM_HEAD_DIM, 2u, &k_head, &unused) ||
-                !metal_matrix_subslice(logits_base, logits_f32_bytes, logical_head * tokens, tokens, tokens, sizeof(float), &logits_head, &unused) ||
-                !metal_run_mps_matmul_nt_f16_to_f32(ctx,
-                                                     q_head,
-                                                     k_head,
-                                                     logits_head,
-                                                     tokens,
-                                                     UOCR_SAM_HEAD_DIM,
-                                                     tokens,
-                                                     "Metal SAM global attention QK MPS",
-                                                     error,
-                                                     error_size)) {
-                return 0;
-            }
-        }
-
         id<MTLComputePipelineState> softmax_pipeline = metal_get_pipeline(ctx, "uocr_sam_global_attention_softmax_f32_to_f16", error, error_size);
-        if (softmax_pipeline == nil) {
-            return 0;
-        }
-        owned = 0;
-        cb = metal_command_buffer_for_op(ctx, &owned, "Metal SAM global attention softmax", error, error_size);
-        if (cb == nil) {
-            return 0;
-        }
-        enc = metal_compute_command_encoder(ctx, cb);
-        if (enc == nil) {
-            return metal_fail(error, error_size, "failed to create Metal SAM global attention softmax encoder");
-        }
+        if (softmax_pipeline == nil) return 0;
         const NSUInteger softmax_threads = metal_power2_threadgroup_width(256u, softmax_pipeline.maxTotalThreadsPerThreadgroup);
-        const uint64_t softmax_tg_bytes = (uint64_t)softmax_threads * (uint64_t)sizeof(float);
-        if (softmax_tg_bytes > (uint64_t)ctx->device.maxThreadgroupMemoryLength) {
+        const NSUInteger softmax_tg_bytes = softmax_threads * sizeof(float);
+        if (softmax_tg_bytes > ctx->device.maxThreadgroupMemoryLength) {
             return metal_fail(error, error_size, "Metal SAM global attention softmax threadgroup memory exceeds device limit");
         }
-        [enc setComputePipelineState:softmax_pipeline];
-        [enc setBuffer:scratch->sam_global_logits_f32.buffer offset:scratch->sam_global_logits_f32.offset atIndex:0u];
-        [enc setBuffer:scratch->sam_global_rel_h_f32.buffer offset:scratch->sam_global_rel_h_f32.offset atIndex:1u];
-        [enc setBuffer:scratch->sam_global_rel_w_f32.buffer offset:scratch->sam_global_rel_w_f32.offset atIndex:2u];
-        [enc setBuffer:scratch->sam_global_probs.buffer offset:scratch->sam_global_probs.offset atIndex:3u];
-        [enc setBytes:params length:sizeof(*params) atIndex:4u];
-        [enc setThreadgroupMemoryLength:(NSUInteger)softmax_tg_bytes atIndex:0u];
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)tokens, (NSUInteger)logical_heads, 1u)
-             threadsPerThreadgroup:MTLSizeMake(softmax_threads, 1u, 1u)];
-        metal_end_compute_encoder(ctx, enc);
-        if (!metal_finish_command_buffer_for_op(ctx, cb, owned, "Metal SAM global attention softmax", error, error_size)) {
-            return 0;
-        }
+        // Each tile consumes its probabilities before the next tile overwrites
+        // them. Keep the existing MPS products and FP16 softmax rounding, without
+        // materializing scores for every head/view at once.
+        for (uint32_t head = 0u; head < logical_heads; ++head) {
+            for (uint32_t first = 0u; first < tokens; first += UOCR_SAM_GLOBAL_MPS_QUERY_TILE) {
+                const uint32_t count = tokens - first < UOCR_SAM_GLOBAL_MPS_QUERY_TILE ?
+                                           tokens - first : UOCR_SAM_GLOBAL_MPS_QUERY_TILE;
+                const NSUInteger q_offset = (NSUInteger)(((uint64_t)head * tokens + first) * UOCR_SAM_HEAD_DIM * 2u);
+                const NSUInteger k_offset = (NSUInteger)((uint64_t)head * tokens * UOCR_SAM_HEAD_DIM * 2u);
+                const uocr_metal_buffer_slice q_head = {scratch->sam_global_q_pack.buffer, scratch->sam_global_q_pack.offset + q_offset};
+                const uocr_metal_buffer_slice k_head = {scratch->sam_global_k_pack.buffer, scratch->sam_global_k_pack.offset + k_offset};
+                const uocr_metal_buffer_slice scores = {scratch->sam_global_logits_f32.buffer, scratch->sam_global_logits_f32.offset};
+                const uocr_metal_buffer_slice probabilities = {scratch->sam_global_probs.buffer, scratch->sam_global_probs.offset};
+                const uocr_metal_buffer_slice vt_head = {scratch->sam_global_vt_pack.buffer, scratch->sam_global_vt_pack.offset + k_offset};
+                const uocr_metal_buffer_slice output = {scratch->sam_global_out_pack.buffer, scratch->sam_global_out_pack.offset + q_offset};
+                if (!metal_run_mps_matmul_nt_f16_to_f32(ctx, q_head, k_head, scores,
+                        count, UOCR_SAM_HEAD_DIM, tokens, "Metal SAM global tiled QK MPS", error, error_size)) return 0;
 
-        uocr_metal_buffer_slice probs_base = { scratch->sam_global_probs.buffer, scratch->sam_global_probs.offset };
-        uocr_metal_buffer_slice vt_base = { scratch->sam_global_vt_pack.buffer, scratch->sam_global_vt_pack.offset };
-        uocr_metal_buffer_slice out_pack_base = { scratch->sam_global_out_pack.buffer, scratch->sam_global_out_pack.offset };
-        for (uint32_t logical_head = 0u; logical_head < logical_heads; ++logical_head) {
-            uocr_metal_buffer_slice probs_head;
-            uocr_metal_buffer_slice vt_head;
-            uocr_metal_buffer_slice out_head;
-            uint64_t unused = 0u;
-            if (!metal_matrix_subslice(probs_base, probs_bytes, logical_head * tokens, tokens, tokens, 2u, &probs_head, &unused) ||
-                !metal_matrix_subslice(vt_base, pack_bytes, logical_head * UOCR_SAM_HEAD_DIM, UOCR_SAM_HEAD_DIM, tokens, 2u, &vt_head, &unused) ||
-                !metal_matrix_subslice(out_pack_base, pack_bytes, logical_head * tokens, tokens, UOCR_SAM_HEAD_DIM, 2u, &out_head, &unused) ||
-                !metal_run_mps_matmul_nt_f16(ctx,
-                                             probs_head,
-                                             vt_head,
-                                             out_head,
-                                             tokens,
-                                             tokens,
-                                             UOCR_SAM_HEAD_DIM,
-                                             "Metal SAM global attention AV MPS",
-                                             error,
-                                             error_size)) {
-                return 0;
+                int tile_owned = 0;
+                id<MTLCommandBuffer> tile_cb = metal_command_buffer_for_op(ctx, &tile_owned,
+                    "Metal SAM global tiled softmax", error, error_size);
+                if (tile_cb == nil) return 0;
+                id<MTLComputeCommandEncoder> tile_enc = metal_compute_command_encoder(ctx, tile_cb);
+                if (tile_enc == nil) {
+                    return metal_fail(error, error_size, "failed to create Metal SAM global tiled softmax encoder");
+                }
+                // The existing softmax kernel sees one head starting at query
+                // zero; shift the relative-logit bindings to this tile's rows.
+                uocr_metal_sam_rel_pos_attention_params tile_params = *params;
+                tile_params.batch_size = 1u;
+                tile_params.heads = 1u;
+                tile_params.windows = 1u;
+                const uint64_t rel_row = (uint64_t)head * tokens + first;
+                [tile_enc setComputePipelineState:softmax_pipeline];
+                [tile_enc setBuffer:scores.buffer offset:scores.offset atIndex:0u];
+                [tile_enc setBuffer:scratch->sam_global_rel_h_f32.buffer
+                            offset:scratch->sam_global_rel_h_f32.offset + (NSUInteger)(rel_row * grid_h * sizeof(float)) atIndex:1u];
+                [tile_enc setBuffer:scratch->sam_global_rel_w_f32.buffer
+                            offset:scratch->sam_global_rel_w_f32.offset + (NSUInteger)(rel_row * grid_w * sizeof(float)) atIndex:2u];
+                [tile_enc setBuffer:probabilities.buffer offset:probabilities.offset atIndex:3u];
+                [tile_enc setBytes:&tile_params length:sizeof(tile_params) atIndex:4u];
+                [tile_enc setThreadgroupMemoryLength:softmax_tg_bytes atIndex:0u];
+                [tile_enc dispatchThreadgroups:MTLSizeMake(count, 1u, 1u)
+                         threadsPerThreadgroup:MTLSizeMake(softmax_threads, 1u, 1u)];
+                metal_end_compute_encoder(ctx, tile_enc);
+                if (!metal_finish_command_buffer_for_op(ctx, tile_cb, tile_owned,
+                        "Metal SAM global tiled softmax", error, error_size) ||
+                    !metal_run_mps_matmul_nt_f16(ctx, probabilities, vt_head, output,
+                        count, tokens, UOCR_SAM_HEAD_DIM, "Metal SAM global tiled PV MPS", error, error_size)) return 0;
             }
         }
 

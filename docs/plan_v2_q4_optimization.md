@@ -8,7 +8,9 @@ encoder-consolidation checkpoint is implemented and verified. GPU decode
 chunking is deferred after an unfavorable prototype tradeoff. Phase 2's shared
 SAM relative-logit storage, shared local/global backing storage, and batch-abort
 ownership fixes are implemented. Four-crop batches are qualified on the measured
-M1 Pro. Remaining staging/cached-buffer accounting is not done.
+M1 Pro. Phase 3's bounded-query MPS checkpoint is implemented and verified;
+custom fused online attention is deferred after slower prototypes. Remaining
+staging/cached-buffer accounting is not done.
 
 ## Goal and scope
 
@@ -115,7 +117,7 @@ and broader qualification remains `todo` in phase 2.
 |---|---|---|---|
 | 1 | V2 submission/encoder scheduling | Decode speed | single-token checkpoint done; GPU chunking deferred |
 | 2 | Vision scratch lifetimes and chunk sizing | Memory | lifetimes/chunk qualification done; staging accounting remains todo |
-| 3 | SAM global matrix-tiled attention | Memory and first-token latency | todo |
+| 3 | Bounded SAM global attention | Memory and first-token latency | bounded MPS checkpoint done; fused online kernel deferred |
 | 4 | SAM window matrix-tiled attention | First-token latency | todo |
 | 5 | DASH attention parallelism | Decode speed; prefill opportunity | todo |
 | 6 | Occupancy-aware routed-MoE prefill | Prefill speed | todo |
@@ -515,32 +517,147 @@ padded images lived under `data.tmp/probes/v2-q4-lifetimes/` and were removed af
 recording these results. The user notebook and persistent stress data were left
 untouched.
 
-## Phase 3: SAM global attention without dense score matrices
+## Phase 3: Bounded SAM global attention
 
-Outcome: the global SAM attention path uses tiled QK/softmax/PV and the native
-memory estimate reflects the new working set.
+Outcome: SAM global attention uses one bounded score/probability tile rather
+than materializing every head/view's matrices simultaneously. Native admission
+and allocation agree on the smaller working set. A fused online kernel remains
+a separate, unfinished optimization.
 
-Current FP32 logits plus FP16 probabilities for one 1024-pixel global view cost
-`12 * 4096 * 4096 * (4 + 2) = 1,207,959,552` bytes. This is removable buffer
-capacity, not a promised net memory saving before replacement scratch is sized.
+- [x] done: Prototype `simdgroup_matrix` QK/PV with FP32 accumulation and online
+  softmax; compare multiple tile/storage variants against MPS.
+- [ ] todo: Ship a fused online kernel only after it beats the existing path.
+  **Deferred:** tested variants were slower on the M1 Pro. They are not in
+  production, and this checkpoint must not be called fused FlashAttention.
+- [x] done: Preserve query-dependent decomposed H/W relative terms and the
+  existing FP16 normalized-probability rounding in the accepted MPS path.
+- [x] done: Process heads and bounded query blocks sequentially, reusing one
+  score/probability pair. Update the shared planner and admission estimator.
 
-- [ ] todo: Implement matrix-tiled attention for SAM head dimension 64 using
-  `simdgroup_matrix`, FP32 accumulation, and online softmax statistics.
-- [ ] todo: Preserve query-dependent decomposed H/W relative-position terms;
-  use smaller precomputed relative logits or tile-local evaluation as measured.
-- [ ] todo: Integrate the replacement into global-view and local-crop global
-  attention, then remove obsolete dense logits/probabilities from the planner.
+QA checkpoint for the bounded-MPS implementation:
 
-QA checkpoint:
+- [x] done: Compare full attention outputs to the prior MPS implementation on
+  real tensors and adversarial inputs; check a sampled FP64 reference.
+- [x] done: Measure GPU latency, normal complete-request latency and allocation
+  peaks for 1024/640 views, including maximum crop count.
+- [x] done: Pass complete v2 Q4 base/gundam OCR, v2 Q8 base and v1 Q4 regression.
+- [x] done: Exercise tile tails, undersized slices, budget rejection, failures
+  after encoding, engine reuse, and runtime/precompiled Metal paths.
 
-- [ ] todo: Compare attention output to the current MPS path on real tensors
-  and adversarial softmax inputs, with explicit numerical tolerances.
-- [ ] todo: Measure GPU latency and total memory for relevant 1024/640 view
-  shapes; confirm removal of the quadratic buffers in allocation evidence.
-- [ ] todo: Pass real base/gundam OCR and existing v1 checks before switching
-  the production dispatch.
+### Bounded-query checkpoint evidence (2026-10-30)
 
-QA evidence: not run. References: [1], [2].
+Baseline: `5c1dfaa`; same M1 Pro, 16 GB, pinned mixed-Q4 model and invoice.
+All custom shader experiments stayed under `data.tmp/probes/v2-q4-sam-global/`.
+No shader change is shipped in this checkpoint.
+
+#### Rejected fused candidates and selected implementation
+
+Disposable matrix-MMA prototypes used online softmax, FP32 accumulators and
+precomputed relative logits. Query/key tiles included 16x32, 32x64, 32x32 and
+64x32, with shared-memory and register epilogues. They passed synthetic numerical
+checks but lost to MPS. The best tested 64x32 variant took about **78.18 ms versus
+49.54 ms** for a 64x64 grid/one view, and **101.84 versus 79.80 ms** for a 40x40
+grid/eight views. These are completed command-buffer GPU times for the attention
+operation, not full OCR latency. No claim of an exhaustive kernel search is made.
+
+The accepted alternative keeps the current MPS products and softmax shader.
+For each head, it processes at most **2,048 query rows**, consumes the resulting
+probabilities in PV, and then reuses the same scratch for the next tile. Q/K/VT
+packing, relative-logit production and output unpacking remain unchanged. The
+softmax sees one head with relative-logit buffer offsets shifted to the tile's
+query rows. Existing batch ordering protects producer/consumer lifetimes; no
+additional CPU waits are introduced in public generation.
+
+`UOCR_SAM_GLOBAL_MPS_QUERY_TILE` in `src/runtime/uocr_memory.h` is the shared
+layout constant for the Metal allocator, dispatch and admission estimator.
+The score/probability pair now holds `min(N, 2048) * N * (4 + 2)` bytes, independent
+of head and view counts. It is still a dense tile; the fused online work remains
+unfinished.
+
+| Shape | Old score/probability pair | New pair | Full vision backing, old -> new |
+|---|---:|---:|---:|
+| 1024 pixels, one view | 1,207,959,552 B | 50,331,648 B | 1,487,122,432 -> 329,494,528 B |
+| 640 pixels, eight views | 1,474,560,000 B | 15,360,000 B | 2,289,385,472 -> 830,185,472 B |
+| 640 pixels, four views | 737,280,000 B | 15,360,000 B | 1,145,921,536 -> 424,001,536 B |
+
+A 512-query MPS tile was materially slower. A full 4,096-query tile removed less
+base memory. The 2,048-row choice preserved tested numerical results and offered
+a useful memory/latency tradeoff. Isolated GPU means, one warmup then three runs,
+were **49.53 -> 52.62 ms** for the global view and **79.36 -> 82.75 ms** for eight
+local views. The accepted attention operation itself is slightly slower; the
+complete-request checks below are the rollout gate.
+
+#### Correctness and public behavior
+
+- Synthetic grids 7/17/40/63/64 exercised one, two and eight views, normal inputs,
+  uniform attention, large finite logits and a partial query tile (63x63).
+  The accepted path's full FP16 outputs matched the prior MPS path bitwise in
+  these checks. An independent FP64 oracle checked sampled queries/all heads
+  with `atol=0.003, rtol=0.01`; maximum sampled absolute error was approximately
+  0.001454 in the extreme-logit case, including the baseline's FP16 probability
+  rounding. No nonfinite outputs occurred.
+- A diagnostic backend captured both implementations' complete outputs on real
+  Q4 vision tensors. All **16 comparisons** across SAM global layers, global
+  views and two eight-crop chunks matched bitwise. These synchronization-heavy
+  runs were used only for numerical QA, not performance claims.
+- Complete natural-EOS v2 Q4 base, 13-view and 17-view gundam outputs retained
+  all **385 IDs** and strict parse results. Four-crop maximum-view output also
+  matched. V2 Q8 base retained 385 IDs; v1 Q4 base/gundam retained **381 IDs**.
+  These checks establish local regression parity, not upstream full-model parity.
+
+#### Memory and normal latency
+
+Separate-process 1 ms sampling of `MTLDevice.currentAllocatedSize` measured:
+
+| V2 Q4 request | Tracked peak, old -> new | Sampled Metal peak, old -> new |
+|---|---:|---:|
+| Base | 3,333,935,616 -> 2,176,307,712 B | 3,362,930,688 -> 2,205,302,784 B |
+| Gundam, 13 views | 4,139,373,056 -> 2,680,173,056 B | 4,195,106,816 -> 2,735,915,008 B |
+| Gundam, 17 views | 4,140,397,056 -> 2,681,197,056 B | 4,196,122,624 -> 2,736,930,816 B |
+
+Four-crop maximum-view gundam measured **2,275,013,120 tracked bytes** and
+**2,311,077,888 Metal bytes**. The default remains eight crops. End-of-request
+v2 tracked bytes returned to **1,846,112,256**. RSS did not consistently follow
+GPU allocation changes, so no RSS improvement is claimed. Sampling can miss
+short peaks, and the remaining accounting limits from Phase 2 still apply.
+
+A separate A/B probe loaded both saved-baseline and candidate libraries, warmed
+both engines, disabled polling/checkpoint instrumentation, and alternated order
+across three pairs of complete requests. Loading/preparation were excluded:
+
+| Request | Baseline mean | Candidate mean |
+|---|---:|---:|
+| V2 Q4 base | 4.408 s | 4.316 s |
+| V2 Q4 gundam, 13 views | 9.690 s | 9.577 s |
+| V1 Q4 base | 5.092 s | 5.059 s |
+
+The primary result is lower memory, with no complete-request regression in this
+small A/B sample. Do not extrapolate a general throughput improvement from one
+fixture. Profiled encoder counts rose **851 -> 1,039** for base and **2,740 ->
+3,496** for 13-view gundam; waits stayed **386** and **388**, respectively.
+
+#### Failure, build and cleanup checks
+
+- The disposable workspace-bound probe failed on the old estimator, then
+  passed with actual workspace sizes matching the new estimates. An undersized
+  score slice rejected before dispatch and could be restored/reused.
+- Three injected failures after tiled QK or after tiled PV cleaned up, returned
+  tracked bytes to model-only and Metal usage within 1 MiB of its warmed baseline,
+  and allowed reuse. A complete 385-token request after those failures matched
+  the baseline. Actual GPU execution faults were not injected.
+- A **2.5 GB** budget rejected the eight-crop maximum-view request (estimate
+  **2,815,254,766 bytes**), then accepted base and four-crop maximum-view requests
+  on the same engine.
+- Numerical and failure probes passed `MTL_DEBUG_LAYER=1`; complete maximum-crop
+  production generation also passed validation. A runtime-only probe library
+  ran from an empty resource directory with the generated shader source and
+  matched precompiled base output. Production shader sources are unchanged.
+- Release build passed; **105 Python checks passed, 7 opt-in checks skipped**,
+  with the three expected invalid-limit warmup warnings; **13 native checks
+  passed**. Disposable prototypes, libraries, logs and padded images were removed.
+  The user notebook and persistent synthetic stress data were untouched.
+
+References: [1], [2] remain relevant to a future faster fused implementation.
 
 ## Phase 4: Matrix-tiled SAM window attention
 

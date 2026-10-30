@@ -9,6 +9,10 @@
 extern "C" {
 #endif
 
+/* Maximum query rows in the reusable single-head SAM score workspace.
+ * Keep the admission estimator and Metal dispatch on the same layout. */
+#define UOCR_SAM_GLOBAL_MPS_QUERY_TILE 2048u
+
 typedef struct uocr_memory_counter {
     uint64_t live_bytes;
     uint64_t peak_bytes;
