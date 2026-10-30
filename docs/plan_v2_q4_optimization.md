@@ -5,7 +5,9 @@ Status: `todo` (not done)
 Checkboxes: `- [x] done` means completed and verified; `- [ ] todo` means not
 done. Initial research is complete. Phase 1's single-token submission and
 encoder-consolidation checkpoint is implemented and verified. GPU decode
-chunking and the remaining phases are not done.
+chunking is deferred after an unfavorable prototype tradeoff. Phase 2's shared
+SAM relative-logit storage is implemented; its broader allocation audit and
+chunk-size qualification remain not done.
 
 ## Goal and scope
 
@@ -75,8 +77,8 @@ GB means decimal bytes. These are token-capped measurements on one fixture,
 not complete-document throughput or a general accuracy qualification.
 
 Normal profiles showed three additional command buffers/waits and 206 command
-encoders per additional generated token. V2 currently uses separate submissions
-for embedding, decoder forward, and argmax; v1 already has an eight-token GPU
+encoders per additional generated token. That baseline used separate submissions
+for embedding, decoder forward, and argmax; v1 already had an eight-token GPU
 chunk path.
 
 Profiling limits:
@@ -110,8 +112,8 @@ and broader qualification remains `todo` in phase 2.
 
 | Phase | Target | Main benefit | Status |
 |---|---|---|---|
-| 1 | V2 submission/encoder scheduling | Decode speed | todo: single-token checkpoint done; GPU chunking remains |
-| 2 | Vision scratch lifetimes and chunk sizing | Memory | todo |
+| 1 | V2 submission/encoder scheduling | Decode speed | single-token checkpoint done; GPU chunking deferred |
+| 2 | Vision scratch lifetimes and chunk sizing | Memory | todo: shared relative-logit storage done; broader audit remains |
 | 3 | SAM global matrix-tiled attention | Memory and first-token latency | todo |
 | 4 | SAM window matrix-tiled attention | First-token latency | todo |
 | 5 | DASH attention parallelism | Decode speed; prefill opportunity | todo |
@@ -146,7 +148,7 @@ Files:
 - [x] done: Compare candidates with the same inputs and output lengths, using
   repeated/interleaved runs. Include natural EOS runs as a separate quality
   check so changed output lengths cannot masquerade as speedups.
-- [ ] todo: Record tracked allocations, Metal allocation usage where available,
+- [x] done: Record tracked allocations, Metal allocation usage where available,
   and process memory. Do not sum independent category high-water marks or claim
   tracked peak is RSS.
 - [ ] todo: Validate numerical behavior against the current native path and
@@ -174,6 +176,8 @@ GPU-resident decode chunks.
 - [ ] todo: After the single-token checkpoint passes, adapt v1-style GPU chunks
   to v2, including GPU page positions, page/EOS guards, output limits, and
   correct treatment of work after EOS. Do not copy v1 cache semantics.
+  **Deferred:** the oracle prototype below found a small long-output benefit and
+  a short-output regression. No production GPU chunking has been implemented.
 
 QA checkpoint:
 
@@ -266,18 +270,64 @@ Results: **105 Python checks passed, 7 opt-in checks skipped**, with three expec
 invalid-limit warmup warnings; **13 native checks passed**. Disposable scripts,
 saved libraries, and profiles lived under `data.tmp/probes/v2-q4-submit/` and were
 removed after recording this evidence. The dedicated profiling-OFF build was
-also removed. GPU chunking remains the next Phase 1 item. Reference: [3].
+also removed. Reference: [3].
+
+### GPU chunking experiment and deferral (2026-10-30)
+
+- [x] done: Measure an optimistic eight-token chunk prototype before adding
+  production GPU page/EOS-state machinery.
+- [x] done: Compare valid output IDs and include a short natural-EOS case.
+- [x] done: Record the tradeoff and retain single-token production decoding.
+
+A disposable native probe used real image prefill and mixed-Q4 decoder weights.
+It compared one-token submissions with eight-token submissions in the same
+process. The chunk path chained token embeddings from GPU selection results,
+but supplied future page coordinates and selection filters from a verified
+reference trace. This removes the cost of the required GPU state kernels and
+is therefore an optimistic scheduling experiment, not a shippable decoder.
+
+One warmup per variant was discarded, followed by three interleaved measurements
+per variant. Times below cover decode only; model load, image preparation and
+vision/prefill are excluded. GPU durations were also collected from completed
+command buffers' `GPUStartTime`/`GPUEndTime`.
+
+| Fixture | Useful decode steps | One-token wall time | Eight-token wall time | Change |
+|---|---:|---:|---:|---:|
+| Invoice base | 256 | 1,959.54 ms | 1,890.88 ms | 3.5% lower |
+| Invoice gundam | 256 | 2,395.38 ms | 2,327.32 ms | 2.8% lower |
+| Blank base, natural EOS | 18 | 125.32 ms | 158.44 ms | 26.4% higher |
+
+For the invoice, waits/encoders fell from 256 to 32. Most time remained GPU work:
+roughly 1.76-1.79 s base and 2.20-2.24 s gundam. The blank page emits 19 tokens
+including the initial prefill selection; chunking executes 24 decode steps for
+18 useful steps. Dead-step selection was forced to EOS, but decoder forwards
+still ran. Valid output IDs matched. Repeated gundam prefill produced small
+score differences, so the probe checked scores within 0.01 rather than claiming
+bitwise logit equality.
+
+Decision: **defer production chunking**. The modest long-output gain does not
+yet justify GPU page-state/guard machinery, exact retained-state handling after
+EOS, and short-output overrun. This does not rule out a later EOS-predicated or
+pipelined implementation. Revisit after larger compute wins or a concrete way
+to avoid dead forwards. The prototype did not implement retained-state rollback,
+and must not be treated as passing the chunked-state QA gate above.
+
+The next practical checkpoint was Phase 2's shared relative-logit storage.
+The oracle source/library and traces were disposable and removed after recording
+these results; no chunking code or scheduling default was changed.
 
 ## Phase 2: Reusable vision scratch and qualified chunk sizing
 
 Outcome: sequential SAM layers reuse temporary relative-position storage;
 chunk-size choices have measured speed/memory behavior.
 
-- [ ] todo: Replace per-layer H/W relative-logit allocations retained until
+- [x] done: Replace per-layer H/W relative-logit allocations retained until
   batch completion with a reusable, capacity-checked workspace pair.
-- [ ] todo: Account for this storage and audit other untracked dynamic vision
-  allocations. Extend the existing planner instead of adding a new allocator
-  unless a clear need is demonstrated.
+- [x] done: Cover relative-logit storage with the existing accounted workspace;
+  no additional allocation or larger admission estimate is needed.
+- [ ] todo: Audit other dynamic vision allocations and intermittent Metal
+  allocation peaks. Extend the existing planner instead of adding a new
+  allocator unless a clear need is demonstrated.
 - [ ] todo: Alias additional workspace regions only where GPU lifetimes do not
   overlap; preserve required ordering/fences.
 - [ ] todo: Qualify four-view local chunks across representative crop counts
@@ -285,15 +335,76 @@ chunk-size choices have measured speed/memory behavior.
 
 QA checkpoint:
 
-- [ ] todo: Compare actual allocation counts/peaks as well as the native report;
+- [x] done: Compare actual allocation counts/peaks as well as the native report;
   verify that relative-logit storage no longer grows with encoded layer count.
 - [ ] todo: Compare chunk sizes 4 and 8 on base and several gundam shapes,
   including a maximum-crop case, with complete OCR and parsing checks.
 - [ ] todo: Verify budget rejection, allocation failure cleanup, and repeat
   requests without retained-memory growth.
 
-QA evidence: the initial chunk-size result is recorded above; workspace reuse
-and broader chunk qualification have not run. Reference: [7].
+### Shared relative-logit checkpoint evidence (2026-10-30)
+
+`metal_context_sam_rel_pos_attention_batch_f16_to_slice()` now borrows the
+existing `sam_global_rel_h_f32` / `sam_global_rel_w_f32` workspace slices. Global
+and window attention run sequentially. For the supported patch grids G=40/64,
+the global capacity per axis (`B * 12 * G^3 * 4` bytes) exceeds the padded-window
+requirement (`B * 12 * ceil(G/14)^2 * 14^3 * 4`). Both slice capacities are checked
+before encoding. A buffer memory barrier separates relative-logit production
+from consumption. No per-layer allocation, retain, or release remains here.
+
+Before the change, a disposable allocation-count probe failed its target of no
+per-layer relative-logit buffers. Afterward, complete requests retained identical
+output IDs and strict parse results: v2 Q4 base, 13-view gundam, maximum 17-view
+gundam, v2 Q8 base, and v1 Q4 base. The maximum-crop fixture placed the invoice
+on a 2048x2048 white canvas. Each case was warmed and repeated twice.
+
+| Request | Native buffer allocations before | After |
+|---|---:|---:|
+| V2 Q4/Q8 base | 30 | 14 |
+| V2 Q4 gundam, 13 or 17 views | 67 | 19 |
+| V1 Q4 base | 28 | 12 |
+
+This removes 16 allocations in base and 48 across the three gundam chunks. The
+old buffers retained across eight SAM window layers totaled 52,684,800 bytes
+for a global-view batch and 151,732,224 bytes for an eight-local-view batch.
+Those bytes now reuse storage that was already allocated and admitted.
+
+A 1 ms sampler read `MTLDevice.currentAllocatedSize`; process peak RSS was also
+recorded in separate before/after processes. Representative repeated Metal
+samples were:
+
+| V2 Q4 request | Before | After |
+|---|---:|---:|
+| Base | 3,415,621,632 B | 3,362,930,688 B |
+| Gundam, 13 views | 4,346,888,192 B | 4,195,106,816 B |
+| Gundam, 17 views | 4,347,904,000 B | 4,196,122,624 B |
+
+The approximately 52.69/151.78 MB differences include allocation alignment.
+**These are not guaranteed overall peak reductions:** one before-change
+13-view run sampled 5,718,933,504 bytes, and one after-change 17-view run sampled
+5,650,219,008 bytes. The cause of these larger transient peaks is not yet
+established; broader resource-lifetime accounting remains open. A 1 ms sampler
+can also miss short peaks. Process peak RSS stayed roughly 2.13-2.27 GB and did
+not track the private GPU allocation savings consistently. No RSS improvement
+or end-to-end speedup is claimed from these memory-probe runs.
+
+Native tracked workspace estimates and peaks remain unchanged because the
+reused slots were already counted. A direct probe validated 1024/one-view and
+640/eight-view shapes with zero Q/K, constant V=2, and poisoned relative-logit
+scratch. Window/global/window operations in one command buffer returned exactly
+2, allocated zero new buffers, and performed one wait. An undersized H slice
+rejected explicitly before dispatch; restoring it allowed reuse. Request bytes
+returned to zero after workspace release. This passed with `MTL_DEBUG_LAYER=1`.
+
+Build/checks: `cmake --build build/release --parallel 4`; the existing Python
+suite passed **105 checks**, skipped **7 opt-in checks**, and emitted the three
+expected invalid-limit warmup warnings. `ctest --test-dir build/release
+--output-on-failure` passed **13 checks**. No shaders changed. Probes, profiles,
+and the generated square image under `data.tmp/probes/v2-q4-chunk/` were removed.
+The persistent synthetic dataset and user notebook edits were left untouched.
+
+Broader allocation/failure auditing and four-versus-eight-view chunk
+qualification remain `todo`; the default remains eight local views. Reference: [7].
 
 ## Phase 3: SAM global attention without dense score matrices
 

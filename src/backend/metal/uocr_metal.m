@@ -4515,6 +4515,7 @@ typedef struct uocr_metal_vision_workspace {
     uocr_metal_vision_workspace_slice sam_global_logits_f32;
     uocr_metal_vision_workspace_slice sam_global_probs;
     uocr_metal_vision_workspace_slice sam_global_out_pack;
+    /* Global/window attention share these slots; their GPU lifetimes do not overlap. */
     uocr_metal_vision_workspace_slice sam_global_rel_h_f32;
     uocr_metal_vision_workspace_slice sam_global_rel_w_f32;
     uocr_metal_vision_workspace_slice sam_block_attention_bhwc;
@@ -19057,54 +19058,37 @@ static int metal_context_sam_rel_pos_attention_batch_f16_to_slice(uocr_metal_con
                 return 0;
             }
 
-            id<MTLBuffer> rel_h_logits = metal_new_buffer_with_length(ctx,
-                                                                      (NSUInteger)rel_h_logit_bytes,
-                                                                      MTLResourceStorageModePrivate);
-            id<MTLBuffer> rel_w_logits = metal_new_buffer_with_length(ctx,
-                                                                      (NSUInteger)rel_w_logit_bytes,
-                                                                      MTLResourceStorageModePrivate);
-            if (rel_h_logits == nil || rel_w_logits == nil) {
-                [rel_w_logits release];
-                [rel_h_logits release];
-                return metal_fail(error, error_size, "failed to allocate Metal SAM precomputed rel-pos logits");
-            }
-            rel_h_logits.label = @"uocr_sam_rel_h_logits_f32";
-            rel_w_logits.label = @"uocr_sam_rel_w_logits_f32";
+            // For the supported 40/64 patch grids, the global relative-logit
+            // slots cover padded 14x14 windows too. Borrow the accounted storage
+            // instead of retaining two new buffers for every encoded layer.
+            if (scratch == NULL)
+                return metal_fail(error, error_size, "SAM window attention requires a relative-logit workspace");
+            const uocr_metal_vision_workspace_slice rel_h_logits = scratch->sam_global_rel_h_f32;
+            const uocr_metal_vision_workspace_slice rel_w_logits = scratch->sam_global_rel_w_f32;
+            if (!metal_vision_require_workspace_slice(rel_h_logits, rel_h_logit_bytes,
+                    "SAM window relative-H logits", error, error_size) ||
+                !metal_vision_require_workspace_slice(rel_w_logits, rel_w_logit_bytes,
+                    "SAM window relative-W logits", error, error_size)) return 0;
 
             int owned_command_buffer = 0;
             id<MTLCommandBuffer> cb = metal_command_buffer_for_op(ctx, &owned_command_buffer, op_name, error, error_size);
-            if (cb == nil) {
-                [rel_w_logits release];
-                [rel_h_logits release];
-                return 0;
-            }
-            if (!owned_command_buffer) {
-                if (!metal_retain_transient_until_completed(ctx, cb, rel_h_logits, error, error_size) ||
-                    !metal_retain_transient_until_completed(ctx, cb, rel_w_logits, error, error_size)) {
-                    [rel_w_logits release];
-                    [rel_h_logits release];
-                    return 0;
-                }
-            }
-
+            if (cb == nil) return 0;
             id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
-            if (enc == nil) {
-                [rel_w_logits release];
-                [rel_h_logits release];
+            if (enc == nil)
                 return metal_fail(error, error_size, "failed to create Metal SAM precomputed rel-pos attention command encoder");
-            }
 
             [enc setComputePipelineState:logits_pipeline];
             [enc setBuffer:q.buffer offset:q.offset atIndex:0u];
             [enc setBuffer:rel_pos_h.slice.buffer offset:rel_pos_h.slice.offset atIndex:1u];
             [enc setBuffer:rel_pos_w.slice.buffer offset:rel_pos_w.slice.offset atIndex:2u];
-            [enc setBuffer:rel_h_logits offset:0u atIndex:3u];
-            [enc setBuffer:rel_w_logits offset:0u atIndex:4u];
+            [enc setBuffer:rel_h_logits.buffer offset:rel_h_logits.offset atIndex:3u];
+            [enc setBuffer:rel_w_logits.buffer offset:rel_w_logits.offset atIndex:4u];
             [enc setBytes:&params length:sizeof(params) atIndex:5u];
             [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)UOCR_SAM_ATTENTION_HEADS,
                                                   (NSUInteger)tokens,
                                                   (NSUInteger)logical_windows)
                  threadsPerThreadgroup:MTLSizeMake(logits_threads_per_group, 1u, 1u)];
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
             const NSUInteger query_blocks = (NSUInteger)(((uint32_t)tokens + UOCR_METAL_FLASH_Q_PER_TG - 1u) / UOCR_METAL_FLASH_Q_PER_TG);
             const NSUInteger tile_keys = 16u;
@@ -19113,8 +19097,8 @@ static int metal_context_sam_rel_pos_attention_batch_f16_to_slice(uocr_metal_con
             [enc setBuffer:q.buffer offset:q.offset atIndex:0u];
             [enc setBuffer:k.buffer offset:k.offset atIndex:1u];
             [enc setBuffer:v.buffer offset:v.offset atIndex:2u];
-            [enc setBuffer:rel_h_logits offset:0u atIndex:3u];
-            [enc setBuffer:rel_w_logits offset:0u atIndex:4u];
+            [enc setBuffer:rel_h_logits.buffer offset:rel_h_logits.offset atIndex:3u];
+            [enc setBuffer:rel_w_logits.buffer offset:rel_w_logits.offset atIndex:4u];
             [enc setBuffer:out.buffer offset:out.offset atIndex:5u];
             [enc setBytes:&params length:sizeof(params) atIndex:6u];
             [enc setThreadgroupMemoryLength:tile_bytes atIndex:0u];
@@ -19123,10 +19107,7 @@ static int metal_context_sam_rel_pos_attention_batch_f16_to_slice(uocr_metal_con
                  threadsPerThreadgroup:MTLSizeMake(attention_threads_per_group, 1u, 1u)];
             metal_end_compute_encoder(ctx, enc);
 
-            const int result = metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, op_name, error, error_size);
-            [rel_w_logits release];
-            [rel_h_logits release];
-            return result;
+            return metal_finish_command_buffer_for_op(ctx, cb, owned_command_buffer, op_name, error, error_size);
         }
     }
 
