@@ -11,8 +11,9 @@ ownership fixes are implemented. Four-crop batches are qualified on the measured
 M1 Pro. Phase 3's bounded-query MPS checkpoint is implemented and verified;
 custom fused global online attention is deferred after slower prototypes.
 Phase 4's v2 SAM window MMA kernel and phase 5's order-preserving DASH decode
-kernel are implemented and verified. CLIP reuse, matrix-tiled sparse prefill,
-and remaining staging/cached-buffer accounting are not done.
+kernel are implemented and verified. Phase 6's v2 Q4 M16 routed-prefill
+checkpoint is also implemented and verified. CLIP reuse, matrix-tiled sparse
+prefill, and remaining staging/cached-buffer accounting are not done.
 
 ## Goal and scope
 
@@ -122,7 +123,7 @@ and broader qualification remains `todo` in phase 2.
 | 3 | Bounded SAM global attention | Memory and first-token latency | bounded MPS checkpoint done; fused online kernel deferred |
 | 4 | SAM window matrix-tiled attention | First-token latency | v2 SAM checkpoint done; CLIP reuse remains todo |
 | 5 | DASH attention parallelism | Decode speed; prefill opportunity | decode checkpoint done; matrix-tiled sparse prefill remains todo |
-| 6 | Occupancy-aware routed-MoE prefill | Prefill speed | todo |
+| 6 | Occupancy-aware routed-MoE prefill | Prefill speed | v2 Q4 M16 checkpoint done; mixed-width/compact dispatch not justified |
 | 7 | Q4 vision GEMM staging | Vision speed | todo |
 | 8 | Q4 LM-head and decode GEMVs | Decode speed | todo |
 | 9 | DASH router/projection specialization | Decode and future longer windows | todo |
@@ -974,21 +975,142 @@ The base fixture averages `279 * 6 / 64 = 26.2` selected rows per expert;
 actual routing distribution must be measured before choosing a dispatch policy.
 Expert sorting/bucketing and fused Q4 MMA are already implemented.
 
-- [ ] todo: Measure per-expert row-count distributions on representative prompts.
-- [ ] todo: Benchmark 16/32-row variants alongside the existing 64-row path.
-- [ ] todo: Choose bucket/tile scheduling on GPU without routing readback.
-- [ ] todo: Investigate compact dispatch only if empty/partial tile overhead
-  is material; preserve fused gate/up and deterministic expert combination.
+- [x] done: Measure per-expert row-count distributions on representative prompts.
+- [x] done: Benchmark 16/32-row variants alongside the existing 64-row path.
+- [x] done: Retain GPU bucketing/prefix scheduling with a fixed 16-row v2 Q4
+  tile; measured results did not justify a mixed-width policy or route readback.
+- [x] done: Evaluate empty/partial-tile overhead. Smaller tiles address padding;
+  compact/indirect dispatch is deferred because measured empty-work cost is small.
+  Fused gate/up and deterministic expert combination are preserved.
 
 QA checkpoint:
 
-- [ ] todo: Exercise skewed routing, empty experts, and partial tiles against
+- [x] done: Exercise skewed routing, empty experts, and partial tiles against
   the current implementation using the same routes and quantized weights.
-- [ ] todo: Measure complete MoE prefill including bucket/combine overhead,
+- [x] done: Measure complete MoE prefill including bucket/combine overhead,
   then verify end-to-end base/gundam latency and output quality.
 
-QA evidence: not run. References: [5], [6]. External performance figures are
-from different models/hardware and are not expected speedups for this engine.
+### V2 Q4 M16 checkpoint evidence (2026-10-30)
+
+Baseline: `f63be0b`, Apple M1 Pro with 16 GB RAM, pinned mixed-Q4 models and
+Release/profiling build. Changes are limited to the Q4 Metal fragment, its
+regenerated source, and the routed-Q4 prefill dispatch in `uocr_metal.m`.
+
+#### Routing distribution and tile decision
+
+A diagnostic backend collected counts for all 64 experts in each of 11 routed
+layers. Counts and padding utilization were measured before choosing a policy;
+production does not read routing data back to the CPU.
+
+| Prompt | Min / median / max rows per expert | Empty buckets across 11 layers | Useful rows / padded rows, M64 -> M16 |
+|---|---:|---:|---:|
+| Invoice, base / 279 tokens | 0 / 25 / 117 | 18 of 704 | 41.0% -> 77.8% |
+| Invoice, gundam / 1,519 tokens | 4 / 128 / 1,039 | 0 of 704 | 81.3% -> 94.9% |
+| Blank, base / 279 tokens | 0 / 18 / 240 | 33 of 704 | 38.7% -> 76.4% |
+
+GPU command-buffer timestamps measured all four MoE passes (bucket, fused
+SwiGLU gate/up, down, combine), using identical real inputs, routes and weights.
+Each layer/width had one warmup plus three measured runs; the table sums the
+per-layer medians. Diagnostic readbacks and synchronization outside these
+command buffers are not included:
+
+| Invoice prompt | M64 | M32 | M16 |
+|---|---:|---:|---:|
+| Base, all 11 routed layers | 156.36 ms | 99.33 ms | 81.33 ms |
+| Gundam, all 11 routed layers | 443.72 ms | 378.63 ms | 362.97 ms |
+
+M16 also won or tied the tested skew cases: six expert slots with **0, 1, 16,
+17, 32, 33, 65, 128, 279 or 1,519 rows each**, with the remaining experts empty.
+Invalid pair IDs supplied the fully empty case and unused rows. Examples of
+complete first-layer GPU time, M64 -> M16: **1.492 -> 0.431 ms** at one row,
+**2.934 -> 2.720 ms** at 128 rows, and **33.820 -> 31.309 ms** at 1,519 rows.
+All widths matched the reference combined outputs bit-for-bit.
+
+No measured occupancy range favored adding a mixed-width scheduler. The
+all-empty 279-token four-pass probe cost approximately **0.08 ms** for each
+width, so indirect dispatch would target less than about 1 ms across 11 layers
+in that probe. It was not added. Hardware-counter occupancy was not measured.
+
+#### Implementation and scope
+
+- New M16 gate/up and down kernels use **16x32x32 tiles and 128 threads**.
+  Q4 unpacking/scales, BK=32, the per-output 8x8 MMA reduction sequence,
+  FP32 accumulators, FP16 intermediate stores and final combine remain unchanged.
+- Static threadgroup storage, including pair IDs, is **5,184 bytes gate/up /
+  3,136 bytes down**, versus **16,640 / 8,448 bytes** for M64. The M16 staging
+  buffers are sized for A/B inputs, which exceed the smaller output-tile sizes;
+  simply scaling the M64 output-storage formula would underallocate them.
+- The existing GPU histogram/scatter/prefix pass uses 16 rows per tile. The
+  conservative launch bound remains `ceil(pair_count / rows_per_tile) + 64`;
+  unused slots return before GEMM. There is no route readback, new buffer,
+  persistent dequantized weight copy or additional dispatch.
+- Only **v2 Q4 routed prefill** selects M16. Decode, v1, Q8/FP16, vision GEMMs
+  and dense/shared MLPs retain their previous dispatch. Required pipelines,
+  32-lane SIMD width, thread capacity and threadgroup memory are checked;
+  failures are explicit rather than silently selecting M64.
+
+#### Whole-request acceptance
+
+Both libraries were warmed, then request order alternated over six pairs at
+cap 1 and four pairs at natural EOS. Image preparation/model loading were
+excluded, and detailed checkpoints/polling were disabled:
+
+| V2 Q4 invoice | Before | After | Improvement |
+|---|---:|---:|---:|
+| Base, first output token | 1.067 s | 0.982 s | 8.0% |
+| Gundam, first output token | 4.531 s | 4.447 s | 1.9% |
+| Base, complete 385-ID output | 3.530 s | 3.455 s | 2.1% |
+| Gundam, complete 385-ID output | 7.525 s | 7.450 s | 1.0% |
+
+The approximately **85 ms first-token / 75 ms complete-request** savings are
+fixture results, not a decode-speed or general throughput claim. Complete Q4
+IDs matched on base/13-view/maximum-17-view invoices, blank (19 IDs), table
+(448), edge text (300) and degraded scan (385), with natural EOS and strict
+parsing. V1 base/gundam invoice IDs also matched (381).
+
+Q8 remained on its original Q8 bucketed path, confirmed by profile events.
+An initial baseline run itself varied two box coordinates by one unit between
+cold/warm requests. Six further requests per library were checked; every
+candidate output matched an observed baseline ID sequence, with no new output
+variant. The initial baseline had two variants and the candidate repeats one.
+This is not a claim of deterministic Q8 output; the cause of that existing
+variation was not established in this checkpoint.
+
+#### Memory, failure and build QA
+
+- Production M16 combined outputs matched M64 bit-for-bit across **33 real
+  layer inputs** (base/gundam invoices and base blank). Synthetic skew/empty/
+  tail comparisons also matched. These are native-reference checks, not
+  upstream or FP16-model numerical parity claims.
+- Encoder/wait/allocation counts remain **1,039 / 386 / 14** for base and
+  **3,496 / 388 / 18** for gundam. Tracked peaks remain **2,176,307,712 /
+  2,680,173,056 bytes**. Separate 1 ms Metal sampling retained approximately
+  **2.205 / 2.736 GB** peaks (one base sample was 16 KiB higher), with unchanged
+  end usage **1,862,516,736 bytes**. RSS high-water marks were approximately
+  **2.142 -> 2.139 GB** base and **2.224 -> 2.223 GB** gundam; these process
+  measurements are not the native admission estimate.
+- Injected M16 pipeline and post-gate-encoding failures released request
+  allocations and allowed repeated reuse, then a complete matching 385-ID
+  output. A 2.5 GB budget rejected gundam and accepted base afterward. Actual
+  GPU execution faults were not injected.
+- Metal API validation passed the comparison/failure probes. Production M16
+  base prefill also passed GPU shader validation. **Limitation:** running the
+  M64 comparison under GPU shader validation aborted because instrumentation
+  expanded its gate kernel to **33,280 bytes**, above the device's **32,768-byte**
+  threadgroup limit. M64 comparisons therefore used API validation only; the
+  ordinary M64 allocation is within the hardware limit.
+- Runtime-only source compilation from an empty resource directory matched
+  precompiled base/gundam complete outputs. Regeneration was byte-identical.
+  Profiling-OFF was not separately rebuilt in this checkpoint.
+- Release build and existing suites passed: **105 Python checks, 7 opt-in
+  skips**, the three expected warmup warnings, and **13 native checks**.
+- Owned probes, private libraries and logs under
+  `data.tmp/probes/v2-q4-moe-prefill/` were removed after recording evidence.
+  No permanent tests were added. Persistent stress data and concurrent notebook
+  edits were not modified or staged by this work.
+
+References: [5], [6]. External performance figures are from different
+models/hardware and are not expected speedups for this engine.
 
 ## Phase 7: Q4-specific vision GEMM staging
 

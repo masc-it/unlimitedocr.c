@@ -14407,6 +14407,8 @@ static int metal_run_moe_prefill_bucketed_q4_0(uocr_metal_context *ctx,
                                                char *error,
                                                size_t error_size) {
     const char *op = "prefill routed MoE Q4 bucketed GEMM";
+    // M16 won across measured v2 bucket occupancies; retain v1 arithmetic/dispatch.
+    const uint32_t rows_per_tile = ctx != NULL && ctx->model_is_v2 ? 16u : UOCR_METAL_GEMM_Q8_BM;
     uocr_metal_moe_bucketed_prefill_scratch_layout layout;
     if (ctx == NULL || prefill_params == NULL || n_tokens <= 1u ||
         !metal_moe_bucketed_prefill_scratch_layout(n_tokens, &layout) ||
@@ -14424,11 +14426,23 @@ static int metal_run_moe_prefill_bucketed_q4_0(uocr_metal_context *ctx,
     }
     @autoreleasepool {
         id<MTLComputePipelineState> bucket_pipeline = metal_get_pipeline(ctx, "uocr_moe_prefill_bucket_pairs", error, error_size);
-        id<MTLComputePipelineState> gate_pipeline = metal_get_pipeline(ctx, "uocr_moe_prefill_bucketed_swiglu_gate_up_gemm_q4_0_to_f16", error, error_size);
-        id<MTLComputePipelineState> down_pipeline = metal_get_pipeline(ctx, "uocr_moe_prefill_bucketed_down_gemm_q4_0_to_f16", error, error_size);
+        id<MTLComputePipelineState> gate_pipeline = metal_get_pipeline(ctx,
+            rows_per_tile == 16u ? "uocr_moe_prefill_bucketed_swiglu_gate_up_gemm_q4_0_m16_to_f16" :
+                                  "uocr_moe_prefill_bucketed_swiglu_gate_up_gemm_q4_0_to_f16", error, error_size);
+        id<MTLComputePipelineState> down_pipeline = metal_get_pipeline(ctx,
+            rows_per_tile == 16u ? "uocr_moe_prefill_bucketed_down_gemm_q4_0_m16_to_f16" :
+                                  "uocr_moe_prefill_bucketed_down_gemm_q4_0_to_f16", error, error_size);
         id<MTLComputePipelineState> combine_pipeline = metal_get_pipeline(ctx, "uocr_moe_prefill_bucketed_combine_f16", error, error_size);
         if (bucket_pipeline == nil || gate_pipeline == nil || down_pipeline == nil || combine_pipeline == nil) {
             return 0;
+        }
+        if (rows_per_tile == 16u &&
+            (gate_pipeline.threadExecutionWidth != 32u || down_pipeline.threadExecutionWidth != 32u ||
+             gate_pipeline.maxTotalThreadsPerThreadgroup < UOCR_METAL_GEMM_Q8_THREADS ||
+             down_pipeline.maxTotalThreadsPerThreadgroup < UOCR_METAL_GEMM_Q8_THREADS ||
+             gate_pipeline.staticThreadgroupMemoryLength > ctx->device.maxThreadgroupMemoryLength ||
+             down_pipeline.staticThreadgroupMemoryLength > ctx->device.maxThreadgroupMemoryLength)) {
+            return metal_fail(error, error_size, "Metal Q4 M16 prefill requires four 32-lane SIMD groups and sufficient shared memory");
         }
         int owned_command_buffer = 0;
         id<MTLCommandBuffer> cb = metal_command_buffer_for_op(ctx, &owned_command_buffer, op, error, error_size);
@@ -14447,7 +14461,7 @@ static int metal_run_moe_prefill_bucketed_q4_0(uocr_metal_context *ctx,
             uint32_t top_k;
             uint32_t expert_count;
             uint32_t rows_per_tile;
-        } bucket_params = { n_tokens, UOCR_MOE_TOP_K, UOCR_ROUTED_EXPERTS, UOCR_METAL_GEMM_Q8_BM };
+        } bucket_params = { n_tokens, UOCR_MOE_TOP_K, UOCR_ROUTED_EXPERTS, rows_per_tile };
         [enc setComputePipelineState:bucket_pipeline];
         [enc setBuffer:top_ids.buffer offset:top_ids.offset atIndex:0u];
         [enc setBuffer:transient offset:(NSUInteger)pair_rows_offset atIndex:1u];
@@ -14457,7 +14471,7 @@ static int metal_run_moe_prefill_bucketed_q4_0(uocr_metal_context *ctx,
         [enc dispatchThreadgroups:MTLSizeMake(1u, 1u, 1u) threadsPerThreadgroup:MTLSizeMake(256u, 1u, 1u)];
         metal_end_compute_encoder(ctx, enc);
 
-        const NSUInteger tile_slots = (NSUInteger)((pair_count + UOCR_METAL_GEMM_Q8_BM - 1u) / UOCR_METAL_GEMM_Q8_BM) +
+        const NSUInteger tile_slots = (NSUInteger)((pair_count + rows_per_tile - 1u) / rows_per_tile) +
                                       (NSUInteger)UOCR_ROUTED_EXPERTS;
 
         /* Pass 2: bucketed gate/up SwiGLU GEMM -> mid. */
