@@ -12,8 +12,11 @@ M1 Pro. Phase 3's bounded-query MPS checkpoint is implemented and verified;
 custom fused global online attention is deferred after slower prototypes.
 Phase 4's v2 SAM window MMA kernel and phase 5's order-preserving DASH decode
 kernel are implemented and verified. Phase 6's v2 Q4 M16 routed-prefill
-checkpoint is also implemented and verified. CLIP reuse, matrix-tiled sparse
-prefill, and remaining staging/cached-buffer accounting are not done.
+checkpoint is also implemented and verified. Phase 7's vision-GEMM prototypes
+were measured; production rollout is deferred because complete-request gains
+were small relative to variation and added dispatch complexity. CLIP reuse,
+matrix-tiled sparse prefill, and remaining staging/cached-buffer accounting are
+not done.
 
 ## Goal and scope
 
@@ -124,7 +127,7 @@ and broader qualification remains `todo` in phase 2.
 | 4 | SAM window matrix-tiled attention | First-token latency | v2 SAM checkpoint done; CLIP reuse remains todo |
 | 5 | DASH attention parallelism | Decode speed; prefill opportunity | decode checkpoint done; matrix-tiled sparse prefill remains todo |
 | 6 | Occupancy-aware routed-MoE prefill | Prefill speed | v2 Q4 M16 checkpoint done; mixed-width/compact dispatch not justified |
-| 7 | Q4 vision GEMM staging | Vision speed | todo |
+| 7 | Q4 vision GEMM staging | Vision speed | investigated; production deferred after small whole-request gains |
 | 8 | Q4 LM-head and decode GEMVs | Decode speed | todo |
 | 9 | DASH router/projection specialization | Decode and future longer windows | todo |
 
@@ -1117,11 +1120,15 @@ models/hardware and are not expected speedups for this engine.
 Outcome: faster vision GEMMs with unchanged group-64 half-split storage and no
 persistent dequantized copies.
 
-- [ ] todo: Benchmark vectorized packed loads, cheaper nibble conversion, and
+- [x] done: Benchmark vectorized packed loads, cheaper nibble conversion, and
   packed-byte/scale reuse across the two halves of a quantization group.
-- [ ] todo: Evaluate register prefetching or bounded software pipelining while
-  measuring register and threadgroup-memory pressure.
-- [ ] todo: Tune large vision GEMMs separately from small expert buckets.
+- [x] done: Evaluate one-group-ahead register prefetching, recording latency and
+  static threadgroup storage. It did not improve the tested shapes.
+- [x] done: Tune large vision GEMMs separately from small expert buckets.
+- [ ] todo: If revisiting this work, collect hardware register/occupancy counters;
+  register pressure was not directly measured in this investigation.
+- [ ] todo: Qualify and land a production candidate whose whole-request benefit
+  justifies the extra kernels/dispatch. Current prototypes are deferred.
 
 Prior evidence in `howto_quant.md`: Q8 `BN=64` caused occupancy collapse and
 `BK=64` was slightly slower. Revisit larger tiles only with a concrete
@@ -1129,13 +1136,118 @@ Q4-specific rationale; bigger tiles are not an optimization by themselves.
 
 QA checkpoint:
 
-- [ ] todo: Compare numerical results on actual quantized tensors, preserving
+- [x] done: Compare numerical results on actual quantized tensors, preserving
   SAM erf-GELU and CLIP QuickGELU behavior and all fused epilogues.
-- [ ] todo: Report shape-specific GPU throughput and normal-run vision latency;
+- [x] done: Report shape-specific GPU time and normal-run vision/request latency;
   reject variants that merely shift cost into staging or extra allocations.
-- [ ] todo: Verify base/gundam OCR and runtime/precompiled shader parity.
+- [x] done: Verify base/gundam OCR and runtime/precompiled shader parity for the
+  leading prototype. This is not an accepted production checkpoint.
 
-QA evidence: not run. Reference: [5].
+### Vision-GEMM investigation evidence (2026-10-30)
+
+Baseline: `264afc8`, Apple M1 Pro with 16 GB RAM, pinned v2 mixed-Q4 model and
+Release/profiling build. **No production code, shader, dispatch or estimator was
+changed.** Private kernels/backends were used for the measurements below.
+
+Tracing found **145 Q4 vision GEMM calls / 11 shapes** in base and **435 calls /
+33 shapes** in 13-view gundam. These include SAM's padded-window QKV/project
+shapes, SAM MLPs, CLIP QKV/project/MLPs, and the visual projector. For example,
+CLIP uses K=1024/4096 with M=257/404/808, while large SAM matrices reach
+M=14,112. All shapes use the existing group-64 half-split Q4 storage.
+
+#### Candidates
+
+Ten variants were evaluated, with no persistent dequantized copies:
+
+1. Packed vector loads replacing scalar byte loads.
+2. Reusing packed bytes and scale across low/high halves while retaining BK=32.
+3. BK=64 staging, unpacking both halves together.
+4. FP32 FMA-based nibble conversion.
+5. One-group-ahead register prefetching.
+6. BM=32/BK=32.
+7. BM=32/BK=32 plus packed-byte/scale reuse.
+8. Balanced BM=32/BK=64, which keeps staging within 8 KiB.
+9. Contiguous B staging with transposed SIMD-matrix loads.
+10. Contiguous/transposed B staging plus low/high-half reuse.
+
+Vector loads and FMA conversion gave small gains on some shapes. Reuse with
+BK=32 was usually about 1-2% faster. Register prefetching and transposed staging
+did not improve the representative cases. BM=32/BK=32 regressed large SAM
+matrices. BK=64 with BM=64 needed **12 KiB** rather than the baseline **8 KiB**
+and was generally slower. Balancing it with BM=32 restored **8 KiB** staging
+and helped small matrices, but still regressed large SAM shapes.
+
+Representative isolated GPU times (M, N, K; median milliseconds per dispatch):
+
+| Shape / epilogue | Baseline | BK32 reuse | BM32/BK64 |
+|---|---:|---:|---:|
+| 257, 4096, 1024 / QuickGELU | 1.211 | 1.194 | 1.129 |
+| 4900, 2304, 768 / QKV split | 8.136 | 8.020 | 8.398 |
+| 12800, 3072, 768 / erf-GELU | 27.169 | 26.772 | 28.123 |
+
+Each case used one warmup command buffer and three measured buffers, each with
+four dependent dispatches. These are synthetic-input kernel timings, not
+complete vision latency. A broader three-way sweep covered all 33 traced
+shapes. Weighting by actual call counts predicted Q4-GEMM time of **419.84 ->
+407.15 ms** base and **2,271.47 -> 2,229.62 ms** gundam for the leading policy:
+BM32/BK64 at M <= 512, BK32 reuse otherwise. This policy was a probe heuristic,
+not a general shape-dispatch qualification.
+
+#### Numerical and build checks
+
+- Synthetic checks exercised bias-only, QKV-split, QuickGELU and erf-GELU
+  epilogues, including a 65-row tail. All tested candidates matched baseline
+  FP16 outputs bit-for-bit. An independent sampled FP64 reference included the
+  existing FP16 dequant-on-stage rounding; maximum sampled error in the
+  all-shape sweep was **0.000873** (`atol=0.003, rtol=0.003`).
+- A separate small-shape sweep included zero scales, FP16 subnormal scales and
+  larger finite scales, and passed Metal API/GPU shader validation for all ten
+  variants. Maximum sampled FP64 error was **0.001764**. Instrumented timings
+  were not used for performance decisions.
+- The leading policy matched baseline outputs bit-for-bit on **44 actual
+  quantized GEMM inputs**: one call per distinct base/gundam shape. Diagnostic
+  synchronization/readbacks were excluded from timing.
+- Complete base/gundam invoice outputs matched all **385 IDs**, reached natural
+  EOS and passed strict parsing. Runtime-only compilation from the prototype
+  source in an empty resource directory also matched precompiled outputs.
+- V1/Q8/FP16, broader OCR fixtures, failure injection and profiling-OFF builds
+  were not requalified for the prototype, since no production rollout was
+  accepted. A future candidate still needs those applicable checks.
+
+#### Whole-request measurements and decision
+
+Both private libraries were warmed. Order alternated across eight pairs at cap
+1 and four pairs at natural EOS, with detailed checkpoints and polling disabled.
+Preparation/model loading were excluded; output lengths were identical:
+
+| V2 Q4 invoice | Before | Candidate | Mean saving |
+|---|---:|---:|---:|
+| Base, first token | 0.995 s | 0.968 s | 27 ms / 2.7% |
+| Gundam, first token | 4.452 s | 4.405 s | 47 ms / 1.1% |
+| Base, complete request | 3.458 s | 3.450 s | 7 ms / 0.2% |
+| Gundam, complete request | 7.444 s | 7.408 s | 36 ms / 0.5% |
+
+Normal-run vision means in the complete requests were **833.88 -> 823.50 ms**
+base and **3,745.74 -> 3,709.64 ms** gundam. Complete-request paired savings
+ranged **-43.7 to +55.6 ms** in base and **-15.8 to +86.7 ms** in gundam;
+paired standard deviations were **51.7 / 46.8 ms**. Every gundam cap-1 pair was
+faster, so the result is not evidence of zero benefit. The complete-request
+benefit was nevertheless too small and variable to justify two additional
+kernels and a shape-dependent policy in this checkpoint. **Production rollout
+is deferred**, rather than presenting isolated GEMM gains as an OCR speedup.
+
+Tracked memory reports matched exactly. Complete-request encoder/wait/allocation
+counts stayed **1,039 / 386 / 14** base and **3,496 / 388 / 18** gundam; tracked
+peaks remained **2,176,307,712 / 2,680,173,056 bytes**. Separate Metal/RSS sampling
+was not repeated for these discarded prototypes.
+
+The unchanged production build passed **105 Python checks, 7 opt-in skips**,
+the three expected warmup warnings, and **13 native checks**. Owned probes,
+private libraries and logs under `data.tmp/probes/v2-q4-vision-gemm/` were removed
+after recording evidence. No permanent tests were added; persistent stress data
+and concurrent notebook edits were not modified or staged by this work.
+
+Reference: [5].
 
 ## Phase 8: Q4 LM-head and decode GEMV tuning
 
