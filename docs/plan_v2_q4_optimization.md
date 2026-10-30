@@ -6,8 +6,9 @@ Checkboxes: `- [x] done` means completed and verified; `- [ ] todo` means not
 done. Initial research is complete. Phase 1's single-token submission and
 encoder-consolidation checkpoint is implemented and verified. GPU decode
 chunking is deferred after an unfavorable prototype tradeoff. Phase 2's shared
-SAM relative-logit storage is implemented; its broader allocation audit and
-chunk-size qualification remain not done.
+SAM relative-logit storage, shared local/global backing storage, and batch-abort
+ownership fixes are implemented. Four-crop batches are qualified on the measured
+M1 Pro. Remaining staging/cached-buffer accounting is not done.
 
 ## Goal and scope
 
@@ -113,7 +114,7 @@ and broader qualification remains `todo` in phase 2.
 | Phase | Target | Main benefit | Status |
 |---|---|---|---|
 | 1 | V2 submission/encoder scheduling | Decode speed | single-token checkpoint done; GPU chunking deferred |
-| 2 | Vision scratch lifetimes and chunk sizing | Memory | todo: shared relative-logit storage done; broader audit remains |
+| 2 | Vision scratch lifetimes and chunk sizing | Memory | lifetimes/chunk qualification done; staging accounting remains todo |
 | 3 | SAM global matrix-tiled attention | Memory and first-token latency | todo |
 | 4 | SAM window matrix-tiled attention | First-token latency | todo |
 | 5 | DASH attention parallelism | Decode speed; prefill opportunity | todo |
@@ -325,21 +326,25 @@ chunk-size choices have measured speed/memory behavior.
   batch completion with a reusable, capacity-checked workspace pair.
 - [x] done: Cover relative-logit storage with the existing accounted workspace;
   no additional allocation or larger admission estimate is needed.
-- [ ] todo: Audit other dynamic vision allocations and intermittent Metal
-  allocation peaks. Extend the existing planner instead of adding a new
-  allocator unless a clear need is demonstrated.
-- [ ] todo: Alias additional workspace regions only where GPU lifetimes do not
-  overlap; preserve required ordering/fences.
-- [ ] todo: Qualify four-view local chunks across representative crop counts
-  and document the tradeoff. Change the default only if evidence supports it.
+- [x] done: Trace intermittent Metal allocation peaks and audit explicit
+  allocations in the public vision path.
+- [x] done: Reuse one backing buffer for local/global workspace layouts after
+  chunk completion; invalidate cached MPS views before changing offsets.
+- [x] done: Fix batch-abort ownership for C/ctypes callers without an outer
+  autorelease pool.
+- [x] done: Qualify four-view local chunks across representative crop counts
+  on the M1 Pro and document the tradeoff. Keep the shared default unchanged.
+- [ ] todo: Reuse/account pixel-upload and patch-extraction buffers and account
+  cached position-conversion buffers. Keep MPS/driver usage separately visible;
+  the native report is still not a complete device-memory cap.
 
 QA checkpoint:
 
 - [x] done: Compare actual allocation counts/peaks as well as the native report;
   verify that relative-logit storage no longer grows with encoded layer count.
-- [ ] todo: Compare chunk sizes 4 and 8 on base and several gundam shapes,
+- [x] done: Compare chunk sizes 4 and 8 on base and several gundam shapes,
   including a maximum-crop case, with complete OCR and parsing checks.
-- [ ] todo: Verify budget rejection, allocation failure cleanup, and repeat
+- [x] done: Verify budget rejection, allocation failure cleanup, and repeat
   requests without retained-memory growth.
 
 ### Shared relative-logit checkpoint evidence (2026-10-30)
@@ -405,6 +410,110 @@ The persistent synthetic dataset and user notebook edits were left untouched.
 
 Broader allocation/failure auditing and four-versus-eight-view chunk
 qualification remain `todo`; the default remains eight local views. Reference: [7].
+
+### Backing-storage lifetime and chunk-size checkpoint (2026-10-30)
+
+Baseline: `4c6ee1f`, same M1 Pro, model caches, Release/profiling build and invoice.
+A disposable instrumented backend sampled `currentAllocatedSize` at workspace
+allocation/release boundaries, in addition to the 1 ms sampler. The boundary
+trace reproduced the overlap on every maximum-crop request, even when polling
+missed it:
+
+- Local workspace: **2,289,385,472 bytes**. After the local wait and MPS cache
+  invalidation, one extra reference remained and releasing our reference did
+  not free the buffer.
+- Allocating the **1,487,122,432-byte** global workspace raised Metal usage to
+  **5,663,588,352 bytes** on warmed runs.
+- A disposable deallocation marker captured the old buffer's eventual release
+  on the driver's completion thread through `MTLResourceList`,
+  `IOGPUMetalCommandBufferStorageDealloc`, and `didCompleteWithStartTime`.
+  The application's completed-handler retain list was already empty.
+
+The CPU wait establishes GPU completion but does not guarantee that the driver's
+resource-list teardown has finished. A tighter autorelease pool around command
+buffer creation alone did not remove this overlap; no timing sleeps or extra
+GPU submissions were adopted.
+
+The public vision path now uses the existing chunk-shape estimator to reserve
+`max(local_workspace, global_workspace)` once. Each shape receives its existing
+slice layout within that buffer. Chunk waits remain unchanged, and MPS views are
+invalidated before relayout. This also handles four-crop batches, where the
+global layout is larger than the local layout. Final visual features remain in
+their separate buffer, and the shared workspace is released before decoder
+allocation. Native admission estimates do not increase.
+
+The allocation-count regression probe failed before the change (two vision
+backing allocations per request), then passed afterward (one). Warmed gundam
+allocation counts fell **19 -> 18** at eight crops per chunk. Four maximum-crop
+instrumented requests and four ordinary one-token requests showed no shape
+transition spike; ordinary warmed Metal peaks were **4,196,122,624 bytes** and
+end-of-request usage stayed **1,862,516,736 bytes**. This removes the observed
+roughly **1.47 GB** overlap; it is not a hard cap on every driver allocation.
+
+A separate C-caller probe exposed an abort leak: an autoreleased, unsubmitted
+batch kept a **32 MiB** GPU buffer alive even after native tracked bytes reached
+zero. `metal_command_batch_begin()` now drains the creation autorelease within
+its own pool while retaining the context's owned reference. Abort can then
+release the batch and its resources without requiring a caller-side pool.
+Three repeated aborts returned both tracked bytes and Metal allocation delta
+to zero, including transient retention. The probe passed Metal API validation.
+
+#### Four-versus-eight-crop qualification
+
+Four v2 Q4 shapes used complete natural-EOS output, not token-capped throughput:
+base (one view), an 800x800 padded invoice (five views), the original invoice
+(13 views), and a 2048x2048 padded invoice (17 views, the v2 crop maximum).
+Each variant had a warmup, then three interleaved runs in alternating order.
+Polling was disabled for latency measurements; model load and image preparation
+were excluded. All **385 output IDs** matched between chunk sizes and against
+the saved baseline; strict parsing passed.
+
+| Views | Eight-crop request mean | Four-crop request mean | Tracked peak, eight | Tracked peak, four |
+|---|---:|---:|---:|---:|
+| 1 | 4.320 s | 4.337 s | 3.334 GB | 3.334 GB |
+| 5 | 6.286 s | 6.288 s | 3.335 GB | 3.335 GB |
+| 13 | 9.636 s | 9.644 s | 4.139 GB | 3.337 GB |
+| 17 | 11.282 s | 11.329 s | 4.140 GB | 3.338 GB |
+
+Separate one-token, 1 ms sampled maximum-crop runs measured **4,196,122,624 ->
+3,374,202,880 bytes** with eight versus four crops: approximately **822 MB less**
+Metal allocation. Four crops cost about 0.4% on the 17-view complete request in
+this small sample. Use `UOCR_VISION_LOCAL_MAX_VIEWS_PER_CHUNK=4` for this measured
+low-memory configuration. The shared default remains eight: v1 scheduling and
+other hardware have not been qualified for a default change. Revisit the
+tradeoff after the dense SAM attention buffers are removed.
+
+#### Compatibility, failures, and remaining limits
+
+- Saved-baseline/candidate complete outputs matched for v2 Q8 base (385 IDs),
+  v1 Q4 base and gundam (381 IDs), including repeated engine reuse. One initial
+  baseline Q8 run differed between cold and warm selections; a fresh baseline
+  and candidate repeat matched both cold and warmed outputs. This does not
+  establish universal bitwise determinism or upstream numerical parity.
+- Under `MTL_DEBUG_LAYER=1`, injected failures at workspace, final-feature,
+  pixel-upload and patch-extraction allocation, plus failure after encoding an
+  entire local chunk before commit, all cleaned up and allowed reuse. Tracked
+  bytes returned to model-only and Metal usage returned within 1 MiB of the
+  warmed baseline after each failure. Actual GPU execution faults were not
+  injected.
+- A 3.6 GB budget rejected the 17-view/eight-crop request before allocation
+  (estimate 4,347,414,766 bytes), then accepted a base request on the same engine.
+- Native tracked live bytes returned to **1,846,112,256 bytes** after v2 requests.
+  Completed repeated requests showed no retained-resource growth. Process RSS
+  remains a separate measure; no RSS reduction is claimed.
+- The audit found remaining unaccounted pixel-upload and patch-extraction
+  allocations: each is 19,660,800 bytes for eight FP16 640-pixel crops. Cached
+  position-conversion buffers and framework/driver allocations also remain
+  outside complete native accounting. The large backing-buffer overlap is
+  fixed, but full accounting remains `todo`.
+
+Checks: Release build passed; **105 Python checks passed, 7 opt-in checks
+skipped**, with the same three expected warmup warnings; **13 native checks
+passed**. No shader, model-file, precision-policy, or scheduling-default changes.
+Disposable instrumented libraries, allocation-failure/abort probes, samples and
+padded images lived under `data.tmp/probes/v2-q4-lifetimes/` and were removed after
+recording these results. The user notebook and persistent stress data were left
+untouched.
 
 ## Phase 3: SAM global attention without dense score matrices
 

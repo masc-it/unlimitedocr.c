@@ -7304,6 +7304,25 @@ static int metal_context_encode_visual_features_to_workspace_f16(uocr_metal_cont
         return metal_fail(error, error_size, "Metal vision schedule changed before encoding: %s", detail);
     }
 
+    // Size one backing buffer for every scheduled layout. Metal may retain a
+    // completed command buffer's resources briefly after waitUntilCompleted;
+    // releasing and reallocating at a shape change can overlap both workspaces.
+    uocr_vision_memory_estimate vision_memory;
+    if (uocr_estimate_vision_memory_for_chunk_shapes(schedule->final_visual_tokens,
+            schedule->max_local_chunk_projected_tokens,
+            schedule->max_global_chunk_projected_tokens, &vision_memory) != UOCR_OK) {
+        free(chunks);
+        metal_vision_workspace_reset(scratch);
+        return metal_fail(error, error_size, "Metal vision workspace capacity estimation failed");
+    }
+    if (!metal_context_ensure_scratch_accounted(ctx, UOCR_METAL_SCRATCH_VISION,
+            vision_memory.gpu_workspace_bytes, cpu_visible_workspace,
+            UOCR_MEMORY_VISION_FINAL_FEATURES, 0u, error, error_size)) {
+        free(chunks);
+        metal_vision_workspace_reset(scratch);
+        return 0;
+    }
+
     uocr_metal_vision_workspace_slice final_visual_rows;
     if (!metal_vision_final_rows_init(ctx,
                                       &final_visual_rows,
@@ -7339,14 +7358,14 @@ static int metal_context_encode_visual_features_to_workspace_f16(uocr_metal_cont
         if (active_chunk_kind != (int)chunk->kind) {
             const uocr_metal_vision_workspace_slice final_rows = scratch->final_visual_rows;
             const uint32_t final_row_capacity = scratch->final_visual_row_capacity;
-            if (active_chunk_kind >= 0 || ctx->scratch[UOCR_METAL_SCRATCH_VISION].buffer != nil) {
-                if (metal_command_batch_active(ctx)) {
-                    process_status = UOCR_ERROR_INTERNAL;
-                    (void)metal_fail(error, error_size, "Metal vision workspace shape changed inside an active command batch");
-                    break;
-                }
-                uocr_metal_context_release_scratch(ctx, UOCR_METAL_SCRATCH_VISION);
+            if (metal_command_batch_active(ctx)) {
+                process_status = UOCR_ERROR_INTERNAL;
+                (void)metal_fail(error, error_size, "Metal vision workspace shape changed inside an active command batch");
+                break;
             }
+            // The previous chunk has completed, so its bytes can be reused with
+            // new offsets. Drop cached MPS views, but keep the backing buffer.
+            metal_clear_mps_workspace_ndarray_cache(ctx);
             const uint32_t kind_view_capacity = chunk->kind == UOCR_VISION_CHUNK_LOCAL ?
                                                    schedule->max_local_chunk_views :
                                                    schedule->max_global_chunk_views;
@@ -8872,11 +8891,15 @@ static int metal_command_batch_begin(uocr_metal_context *ctx, char *error, size_
     if (ctx->active_command_buffer != nil) {
         return 1;
     }
-    id<MTLCommandBuffer> cb = metal_new_command_buffer(ctx);
-    if (cb == nil) {
-        return metal_fail(error, error_size, "failed to create Metal command batch buffer");
+    // C/ctypes callers need not have an autorelease pool. Keep exactly our
+    // owned reference so abort can release an unsubmitted batch's resources.
+    @autoreleasepool {
+        id<MTLCommandBuffer> cb = metal_new_command_buffer(ctx);
+        if (cb == nil) {
+            return metal_fail(error, error_size, "failed to create Metal command batch buffer");
+        }
+        ctx->active_command_buffer = [cb retain];
     }
-    ctx->active_command_buffer = [cb retain];
     return 1;
 }
 
