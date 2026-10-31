@@ -21,8 +21,9 @@ checkpoint and incremental tail-summary checkpoint are implemented and
 verified. CLIP matrix-tiled attention remains qualified for v2 Q4 only.
 The Q8/FP16 fused-head selection race is now fixed and repeatability checks
 pass; deferred Q8 optimizations still require requalification below.
-Matrix-tiled sparse prefill and remaining staging/cached-buffer accounting
-are not done.
+Matrix-tiled sparse prefill was investigated and remains deferred after
+insufficient complete-request gains. Remaining staging/cached-buffer accounting
+is not done.
 
 ## Goal and scope
 
@@ -131,7 +132,7 @@ and broader qualification remains `todo` in phase 2.
 | 2 | Vision scratch lifetimes and chunk sizing | Memory | lifetimes/chunk sizing/unused CLIP slice done; staging accounting todo |
 | 3 | Bounded SAM global attention | Memory and first-token latency | bounded MPS checkpoint done; fused online kernel deferred |
 | 4 | SAM window matrix-tiled attention | First-token latency | v2 SAM and v2 Q4 CLIP checkpoints done; other CLIP precision modes deferred |
-| 5 | DASH attention parallelism | Decode speed; prefill opportunity | decode checkpoint done; matrix-tiled sparse prefill remains todo |
+| 5 | DASH attention parallelism | Decode speed; prefill opportunity | decode done; sparse prefill investigated, rollout deferred |
 | 6 | Occupancy-aware routed-MoE prefill | Prefill speed | v2 Q4 M16 checkpoint done; mixed-width/compact dispatch not justified |
 | 7 | Q4 vision GEMM staging | Vision speed | investigated; production deferred after small whole-request gains |
 | 8 | Q4 LM-head and decode GEMVs | Decode speed | LM-head/paired gate-up checkpoint done; down GEMVs unchanged |
@@ -1026,8 +1027,10 @@ the original recurrence.
   Retain an order-preserving tiled variant instead of split-softmax reductions.
 - [x] done: Preserve remote biases, causal bounds, empty partitions, and
   single inclusion of overlapping local tokens.
-- [ ] todo: Separately investigate matrix-tiled sparse prefill where selections
-  allow useful reuse; do not materialize a dense attention matrix.
+- [x] done: Investigate matrix-tiled sparse prefill with bounded storage and
+  per-query selection masks; reject the measured variants after whole-request QA.
+- [ ] todo: Qualify a faster prefill design only if complete-OCR gains justify
+  its dispatch and numerical complexity.
 - [x] done: Bound temporary storage in static threadgroup memory;
   the accepted kernel needs no device reduction scratch. Select dispatch from
   measured query shape and retain the scalar prefill/short-query path.
@@ -1179,6 +1182,128 @@ Python/compiler/driver state and are not the native admission estimate.
   notebook edits were not modified or staged by this work.
 
 References: [2], [4].
+
+### Matrix-tiled sparse-prefill investigation (2026-10-31)
+
+Status: `done` investigation; production rollout remains `todo` and is not
+qualified. Baseline: `052f8ce`, Apple M1 Pro / 16 GB, Release/profiling build,
+pinned mixed-Q4 model and invoice fixture. **No production code was changed.**
+
+- [x] done: Profile real base/gundam prefill and capture Q/K/V and selections
+  for all 12 layers in each shape (279 / 1519 queries).
+- [x] done: Explore bounded matrix-tiled attention with unchanged routing,
+  remote biases, causal bounds and single unbiased inclusion of local overlap.
+- [x] done: Compare fixed-input outputs against scalar attention and FP64;
+  measure actual complete requests with verified candidate dispatch.
+- [x] done: Reject rollout because the isolated gain does not produce a
+  meaningful complete-OCR improvement.
+- [ ] todo: Revisit only with a materially better design/workload opportunity;
+  retain scalar prefill and the already-qualified tiled decode path meanwhile.
+
+#### Opportunity and prototypes
+
+Detailed first-token checkpoint waits attributed about **27.5 ms base /
+160 ms gundam** to the combined DASH operation. That operation includes main
+Q/K/V projections, router projections/norm/RoPE, summaries, routing and sparse
+attention. Replaying just scalar attention on the 24 captured real inputs took
+about **4.77 ms / 67.17 ms**, summed across 12 layers. The larger DASH total
+must not be treated as the budget available to an attention-only optimization.
+
+Twenty private variants explored:
+
+- 8/16-query by 32-key MMA tiles with 128/256 threads, staged Q/K/V, FP32 scores,
+  probabilities and accumulators, and a shared per-query block-bias table;
+- smaller working sets with on-demand bias lookup;
+- MMA QK plus scalar FP32 weighted-value accumulation;
+- 32-query tiles with 256/512 threads;
+- FP32 diagonal MMA rescaling of the retained output accumulators, avoiding
+  per-tile output spill/reload;
+- shared score/probability storage, direct Q loads with a bounded tail tile,
+  and 64-key tiles.
+
+Each tile formed a union of its queries' selected remote blocks and local
+windows. It visited each selected block once, masked per-query keys, applied
+remote biases only below the local window and kept local overlap unbiased.
+Ascending block traversal and matrix accumulation change floating-point order;
+this was not a bitwise-preserving replacement. No probability downcast or
+persistent device scratch was introduced. Private dispatch was limited to
+mixed-Q4 multi-query shapes with at most 2048 retained keys; longer shapes and
+decode kept their prior paths. No dense device attention matrix was allocated.
+
+The best variant used **32 queries x 32 keys, 512 threads and 25,984 bytes** of
+static threadgroup memory. It retained staged Q, separate FP32 probability
+storage and FP32 diagonal rescaling. Removing more shared storage or widening
+the key tile did not improve it. Actual query/key-slot utilization for 32-query
+unions was about **85% base / 59% gundam**; union formation introduces masked
+work even when selections overlap. Hardware occupancy/counters were not read,
+so the specific hardware cause of each regression is not established.
+
+Representative summed isolated times on the same real inputs:
+
+| Variant | Base | Gundam |
+|---|---:|---:|
+| Scalar attention | 4.77 ms | 67.17 ms |
+| Initial 16-query / 256-thread MMA | 6.24 ms | 105.82 ms |
+| Best 32-query / 512-thread diagonal MMA | 3.38 ms | 60.26 ms |
+
+Each isolated measurement used one warmup and three timed command buffers,
+eight serial dispatches per buffer, and GPU timestamps. The final candidate
+was rebuilt with the production fast-math/deployment flags and remeasured.
+Its gain was only about **1.4 ms / 6.9 ms** across all layers.
+
+#### Numerical, whole-request and memory evidence
+
+Each variant passed eight synthetic cases covering 1/31/33/129/279/513/1519/
+2048 keys, short/offset queries, tails, empty remote sets, uniform attention,
+large finite logits, scattered selections and partially overlapping remote
+blocks. Real-input replay compared every output element on 24 captured inputs;
+independent FP64 checks sampled first/middle/last queries across all ten heads.
+Maximum observed differences were **0.001953125 synthetic / 0.0009765625 real**
+against scalar, and **0.000761551 / 0.000479179** against sampled FP64. Checks
+used `atol=0.003, rtol=0.003`; they do not establish universal numerical parity.
+
+An initial whole-request smoke was excluded when tracing showed its Q4 gate
+was inactive: mixed-Q4 attention projections remain Q8. The corrected private
+gate used Q4 expert storage, and tracing confirmed all **12 prefill layers**
+used the candidate. Subsequent natural-EOS base/gundam invoice results matched
+all **385 baseline IDs**, including the complete paired series below.
+
+Both libraries were warmed, then measured in seven alternating-order pairs at
+cap 1 and natural EOS, without diagnostic checkpoints, tracing or polling.
+To balance order counts, the table reports pairs 1..6 after the first pair:
+
+| Complete request / cap | Before mean | Candidate mean |
+|---|---:|---:|
+| Base / 1 | 0.93086 s | 0.92783 s |
+| Base / 385 IDs | 3.01559 s | 3.01515 s |
+| Gundam / 1 | 4.29578 s | 4.29217 s |
+| Gundam / 385 IDs | 6.52478 s | 6.51924 s |
+
+All seven pairs together gave **3.01295 -> 3.01772 s** for complete base and
+**6.52525 -> 6.51976 s** for gundam. Individual paired differences changed sign
+and varied by tens of milliseconds with order. The roughly **0.01% / 0.08%**
+complete-request changes in the balanced subset are insufficient to justify
+another dispatch branch and non-bitwise numerical path. No speedup is shipped.
+
+Tracked peaks remained **2,174,202,368 / 2,673,553,920 bytes** base/gundam.
+Encoder/wait/allocation counts remained **1039/386/14** and **3496/388/18**.
+No Metal/RSS polling, exact-budget, failure injection, broad stress-fixture,
+Q8/v1 compatibility, or runtime-only rollout qualification was repeated for
+the rejected prototype.
+
+Metal API validation passed the diagonal variants. GPU shader validation passed
+the smaller eight-query variant, but instrumenting the 16-query diagonal
+variant required **34,176 bytes**, above the device's **32,768-byte** limit.
+The best larger variant therefore was not GPU-shader-validation qualified.
+Instrumented runs were excluded from timing. This limitation does not affect
+the unchanged production path.
+
+The source/build shaders were unchanged. Existing suites passed again:
+**105 Python checks, 7 opt-in skips**, three expected warmup warnings, and
+**13 native checks**. Owned captures, prototype sources, libraries and logs in
+`data.tmp/probes/dash-prefill/` were removed after recording this evidence.
+Persistent stress fixtures, cached models and concurrent notebook edits were
+left untouched. No permanent tests were added.
 
 ## Phase 6: Occupancy-aware routed-MoE prefill
 
