@@ -431,14 +431,16 @@ int uocr_metal_context_dash_attention_f16(uocr_metal_context *ctx,
 /* Request-owned v2 attention cache, independent of the v1 generated-token ring.
  * Capacity includes prompt AND generated tokens. query_capacity bounds a single
  * append; page_capacity includes the prefix bucket. Budget covers this cache's
- * aligned GPU payload and CPU state, excluding the model/vision/MoE/driver.
+ * aligned GPU payload (including per-layer FP32 tail-summary accumulators)
+ * and CPU state, excluding the model/vision/MoE/driver.
  * weights: FP16 [12,3,128] in q_norm/k_norm/head_cls order, copied at allocation.
  * One cache per context; context/tracker must outlive it. All calls are serialized.
  * begin advances coordinates once; layer calls must consume all 12 layers in
  * order before another begin. Projected arrays are [pending_rows,10,128] for
  * main Q/K/V and [pending_rows,128] for router Q/K, before norm/RoPE. This host
  * bridge exercises retained attention; full decoder integration remains separate.
- * GPU failures poison the request until reset/release. Reset discards all KV;
+ * GPU failures poison the request until reset/release. Reset invalidates all
+ * KV and tail-summary state;
  * it is cancellation/new-document reset, not cross-window continuation. */
 uint64_t uocr_metal_dash_cache_required_bytes(uint32_t token_capacity,
     uint32_t query_capacity, uint32_t page_capacity); /* 0 for invalid capacities */

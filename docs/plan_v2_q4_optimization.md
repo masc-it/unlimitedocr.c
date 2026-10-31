@@ -17,9 +17,9 @@ were measured; production rollout is deferred because complete-request gains
 were small relative to variation and added dispatch complexity. Phase 8's
 Q4 LM-head scheduling/reduction and paired gate/up checkpoint is implemented
 and verified. Phase 9's projection, fused router norm/RoPE, and SIMD routing
-checkpoint is implemented and verified, with the Q8 caveat below. Incremental
-tail summaries, CLIP reuse, matrix-tiled sparse prefill, and remaining
-staging/cached-buffer accounting are not done.
+checkpoint and incremental tail-summary checkpoint are implemented and
+verified, with the earlier Q8 caveat retained below. CLIP reuse, matrix-tiled
+sparse prefill, and remaining staging/cached-buffer accounting are not done.
 
 ## Goal and scope
 
@@ -132,7 +132,7 @@ and broader qualification remains `todo` in phase 2.
 | 6 | Occupancy-aware routed-MoE prefill | Prefill speed | v2 Q4 M16 checkpoint done; mixed-width/compact dispatch not justified |
 | 7 | Q4 vision GEMM staging | Vision speed | investigated; production deferred after small whole-request gains |
 | 8 | Q4 LM-head and decode GEMVs | Decode speed | LM-head/paired gate-up checkpoint done; down GEMVs unchanged |
-| 9 | DASH router/projection specialization | Decode and future longer windows | Projection/norm/routing checkpoint done; incremental summaries todo |
+| 9 | DASH router/projection specialization | Decode and future longer windows | Projection/norm/routing and incremental-tail checkpoints done |
 
 Files:
 
@@ -1430,8 +1430,8 @@ counts, without changing the sparse routing algorithm.
 
 - [x] done: Specialize single-token router Q/K projections and fuse router
   normalization/RoPE with preserved rounding.
-- [ ] todo: Maintain incremental tail-summary accumulator state rather than
-  recomputing the partial block, with explicit ownership/reset at boundaries.
+- [x] done: Maintain per-layer incremental tail-summary state for single-token
+  appends, with explicit ownership, block initialization and reset rules.
 - [x] done: Benchmark parallel block scoring and SIMD top-16 insertion against
   serial scoring/lane-zero insertion; qualify bounded score tiles.
 - [x] done: Preserve top-16 entmax, finite masked sentinels, stable ties, FP32
@@ -1442,8 +1442,8 @@ QA checkpoint:
 
 - [x] done: Compare projections, norm/RoPE, selected blocks and biases against
   the native baseline and independent reference calculations.
-- [ ] todo: Compare incremental summary state against full tail recomputation
-  when that separate checkpoint is implemented. Summary code is unchanged here.
+- [x] done: Compare incremental summaries/page ranges against full recomputation,
+  including mixed append sizes, block boundaries, reset, admission and failure.
 - [x] done: Exercise 32-token boundaries, masked candidates, ties, extremes,
   failure cleanup and reset/reuse; retain the Q8 caveat below.
 - [x] done: Measure single-page benefit separately from synthetic long-context
@@ -1508,11 +1508,10 @@ qualify document scheduling. Hardware instruction/register/occupancy counters
 were not collected.
 
 Tail-summary recomputation measured **3.0 / 6.5 / 10.7 / 14.0 / 18.7 us** for
-1/8/16/24/32 entries. Incremental summaries remain **todo**: they need owned
-FP32 accumulator/max/denominator state, reset/boundary rules, estimator updates
-if storage is added, and separate failure qualification. Reconstructing state
-from normalized summaries would change rounding. This stateful work is a
-separate checkpoint.
+1/8/16/24/32 entries. At this checkpoint incremental summaries were deferred
+pending owned FP32 state, reset/boundary rules, estimator updates and failure
+qualification. Reconstructing state from normalized summaries would change
+rounding. The subsequent stateful checkpoint is recorded below.
 
 #### Numerical and edge qualification
 
@@ -1597,6 +1596,120 @@ compiler and Python state and are not the native admission estimate.
 
 See [v2 research notes](unlimitedocr2_research.md) for the routing oracle and
 continuation distinctions.
+
+### Incremental tail-summary checkpoint evidence (2026-10-31)
+
+Baseline: `878fa93`, the same M1 Pro, pinned models and Release/profiling build.
+This checkpoint completes the planned tail-state work. It does not implement
+multi-page scheduling or window continuation.
+
+#### State, boundaries and ownership
+
+- `uocr_dash_summary_cached_f16` preserves the existing FP32 recurrence and
+  normalized summary/page-range outputs. It retains the **128 unnormalized
+  FP32 accumulators**, running maximum, denominator and two page bounds.
+  State is never reconstructed from the normalized summary.
+- Each layer owns **528 bytes** of state in a **768-byte aligned slice** of the
+  existing request-owned DASH arena: **9216 bytes** reserved across 12 layers.
+  No separate Metal buffer, dequantized weights or per-token allocation is added.
+  The host layout gains eight bytes for the state-region offset.
+- A single-token append inside an existing block resumes its layer's state and
+  processes one key. A new 32-token block starts from empty accumulators.
+  Multi-token appends recompute changed blocks from retained keys; only the
+  last changed block writes tail state. They never read old state, avoiding a
+  cross-threadgroup read/write race when an append spans several blocks.
+- The cached dispatch requires `n_keys == query_start + n_queries` and
+  `first_block == query_start / 32`. Existing ordered-layer/pending-append
+  checks establish which layer owns the slice. The stateless host/reference
+  path retains the original summary kernel without a state binding.
+- Reset invalidates state through the zero-length cursor. The first append
+  cannot read stale accumulators and initializes every layer's tail. Release
+  frees the arena and its accounting. Failed requests stay poisoned until
+  reset/release, including when GPU work already changed the state.
+- V1, router scoring/selection, normalized-summary layout, RoPE, local overlap,
+  page/EOS guards and model files/caches are unchanged. The v2 cache path is
+  shared across quantization modes; full v2 FP16 OCR remains unverified.
+
+#### Numerical and lifecycle checks
+
+- Disposable probes first failed on the missing cached kernel, then passed
+  **24 stream cases** against full recomputation. Cases started at lengths
+  1/31/32/33/279/511 and mixed 70 single-token appends with multi-token appends,
+  block crossings and a reset. Inputs included zeros, extreme finite values,
+  NaNs/infinities and image/text page ranges. Every live normalized summary
+  and page range matched baseline bits after every append. Final summaries
+  also passed an independent FP64 oracle check; extreme-value comparisons
+  allowed `0.04` absolute / `3e-4` relative error.
+- A native cache-bridge probe used different data and weights for all 12 layers,
+  mixed append sizes and three resets, ending at lengths 129/34/99. All FP16
+  attention outputs and reported lengths matched the saved baseline. Metal
+  API/GPU shader validation passed both raw-summary and cache-bridge checks.
+- The production diagnostic compared prefill plus **128 decode steps** per
+  preset: **3096 summary dispatches / 3756 changed blocks** across Q4 base and
+  gundam. Every FP32 normalized summary and page range matched recomputation
+  on identical inputs. Diagnostic synchronization was excluded from timing.
+- Exact-budget cache allocation succeeded; one byte less was rejected, followed
+  by successful allocation/reuse on the same context. For capacity
+  `(tokens=256, queries=64, pages=3)`, the estimate changed **16,929,072 ->
+  16,941,368 bytes**. Seven layouts from one token to maximum dimensions
+  confirmed consistent cache and complete-v2-decoder estimate deltas.
+- Failure probes covered pipeline lookup, encoded-but-unsubmitted summary work,
+  and a host error injected **after committed GPU work wrote the tail**. Cache
+  calls rejected further use while poisoned; reset restored bitwise baseline
+  output with new data. Public engine generation released request allocations
+  and recovered repeatedly, including complete/capped invoice and blank reuse.
+  The first host fault harness omitted encoder closure; that probe was fixed
+  before the successful validation runs. No production fix was needed for it.
+  Actual GPU execution faults were not injected.
+
+Complete natural-EOS/strict-parsing checks matched current baseline IDs:
+Q4 base/13-view/17-view invoices (385), blank (19), table (448), edge text (300),
+degraded scan (385), tiny text (1172), Q8 base/gundam invoices (385), and v1
+base/gundam invoices (381). The preceding checkpoint's isolated Q8 caveat
+remains documented; these runs do not establish deterministic/upstream parity.
+
+#### Performance and memory
+
+Final production A/B runs warmed both engines and alternated order over four
+complete-request pairs, without diagnostic readbacks or memory polling:
+
+| Q4 invoice | Before | After | Mean saving |
+|---|---:|---:|---:|
+| Base, 385 IDs | 3.101 s | 3.061 s | 40 ms / 1.3% |
+| Gundam, 385 IDs | 6.678 s | 6.641 s | 37 ms / 0.6% |
+
+Three of four whole-request pairs improved in each preset. After subtracting
+vision time, **every pair improved**: means **2.256 -> 2.230 s** base and
+**2.947 -> 2.916 s** gundam. A separate warmed tiny-text comparison changed
+**7.490 -> 7.390 s**, preserving all 1172 IDs. Small gains on short requests
+remain susceptible to vision/host variation; no universal speed claim is made.
+
+Final arena rounding adds **8192 or 12288 GPU bytes**, plus eight host bytes,
+to cache/admission estimates. For the tested 512-token-cap invoices, complete
+v2 decoder requirements changed **71,064,796 -> 71,077,092 bytes** base and
+**220,475,580 -> 220,487,876 bytes** gundam (excluding model/vision allocations).
+The tail region is charged to retained KV state and released through the same
+existing ownership path.
+
+Whole-request tracked peaks remain **2,176,307,712 / 2,680,173,056 bytes**;
+the larger vision phase still dominates. Separate 1 ms sampling retained Metal
+peaks **2,205,302,784 / 2,735,915,008 bytes** and end usage **1,862,516,736 bytes**.
+RSS high-water marks were approximately **2.138 -> 2.131 GB** base and
+**2.222 -> 2.224 GB** gundam; RSS is not the native admission estimate.
+Encoders/waits/allocations remain **1039 / 386 / 14** base and
+**3496 / 388 / 18** gundam.
+
+#### Builds and cleanup
+
+- Runtime-only compilation from generated source in an empty resource directory
+  matched precompiled base/gundam IDs. Regeneration was byte-identical.
+- A profiling-OFF, runtime-compilation-OFF precompiled build passed all 13
+  native checks and matched complete base output.
+- Release build and existing suites passed: **105 Python checks, 7 opt-in
+  skips**, three expected warmup warnings, and **13 native checks**.
+- Owned probes/private builds under `data.tmp/probes/v2-dash-tail/` were removed
+  after recording evidence. No permanent tests were added. Persistent stress
+  data and concurrent notebook edits were left untouched and unstaged.
 
 ## Deferred work and guardrails
 

@@ -128,6 +128,65 @@ kernel void uocr_dash_summary_f16(device const half *keys [[buffer(0)]],
     if (lane == 0u) page_range[block] = int2(hi >= 0 ? lo : -1, hi);
 }
 
+// Retained append state is private to one layer. Keep the unnormalized FP32
+// recurrence; reconstructing it from normalized summaries would lose bits.
+struct UocrDashTailState {
+    float acc[128];
+    float maximum, denominator;
+    int page_lo, page_hi;
+};
+
+[[max_total_threads_per_threadgroup(32)]]
+kernel void uocr_dash_summary_cached_f16(device const half *keys [[buffer(0)]],
+                                  device const half *head_cls [[buffer(1)]],
+                                  device const UocrPagePosition *positions [[buffer(2)]],
+                                  device float *summary [[buffer(3)]],
+                                  device int2 *page_range [[buffer(4)]],
+                                  constant UocrDashParams &p [[buffer(5)]],
+                                  device UocrDashTailState *tail [[buffer(6)]],
+                                  uint group [[threadgroup_position_in_grid]],
+                                  uint lane [[thread_index_in_simdgroup]]) {
+    const uint block = p.first_block + group;
+    const uint end = min((block + 1u) * 32u, p.n_keys);
+    float hc[4], acc[4];
+    for (uint j = 0; j < 4; ++j) { hc[j] = float(head_cls[lane + j*32]); acc[j] = 0; }
+    float m = -INFINITY, denom = 0;
+    int lo = 2147483647, hi = -1;
+    const bool resume = p.n_queries == 1u && (p.query_start % 32u) != 0u;
+    if (resume) {
+        for (uint j = 0; j < 4; ++j) acc[j] = tail->acc[lane + j*32u];
+        m = tail->maximum; denom = tail->denominator;
+        if (lane == 0u) { lo = tail->page_lo; hi = tail->page_hi; }
+    }
+    for (uint t = resume ? p.query_start : block * 32u; t < end; ++t) {
+        float kv[4], dot = 0;
+        for (uint j = 0; j < 4; ++j) {
+            kv[j] = uocr_dash_value(keys[t*128u + lane + j*32u]);
+            dot += kv[j] * hc[j];
+        }
+        const float score = clamp(simd_sum(dot) * 0.08838834764831845f, -1e4f, 1e4f);
+        const float next_m = max(m, score), corr = exp(m-next_m), e = exp(score-next_m);
+        for (uint j = 0; j < 4; ++j) acc[j] = acc[j]*corr + kv[j]*e;
+        denom = denom*corr + e;
+        m = next_m;
+        if (lane == 0u) {
+            const int page = positions[t].image_page;
+            if (page >= 0) { lo = min(lo, page); hi = max(hi, page); }
+        }
+    }
+    // Only the final changed block writes state. Multi-token appends never
+    // read it, so different threadgroups cannot race on old/new tail state.
+    if (block == (p.n_keys - 1u) / 32u) {
+        for (uint j = 0; j < 4; ++j) tail->acc[lane + j*32u] = acc[j];
+        if (lane == 0u) {
+            tail->maximum = m; tail->denominator = denom;
+            tail->page_lo = lo; tail->page_hi = hi;
+        }
+    }
+    for (uint j = 0; j < 4; ++j) summary[block*128u + lane + j*32u] = acc[j] / max(denom, 1e-6f);
+    if (lane == 0u) page_range[block] = int2(hi >= 0 ? lo : -1, hi);
+}
+
 // All 32 lanes participate; lanes 0..15 hold the ordered top-16 entries.
 // Strict comparison inserts after equal scores, preserving earlier-block ties.
 static inline void uocr_dash_insert_top16(thread float &ranked, thread int &ranked_id,

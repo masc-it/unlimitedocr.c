@@ -12609,6 +12609,17 @@ typedef struct uocr_metal_dash_params {
     uint32_t n_keys, query_start, n_queries, first_block;
 } uocr_metal_dash_params;
 
+typedef struct uocr_metal_dash_tail_state {
+    float acc[128];
+    float maximum, denominator;
+    int32_t page_lo, page_hi;
+} uocr_metal_dash_tail_state;
+
+enum { UOCR_METAL_DASH_TAIL_STRIDE = 768u };
+_Static_assert(sizeof(uocr_metal_dash_tail_state) == 528u, "DASH tail state ABI mismatch");
+_Static_assert(UOCR_METAL_DASH_TAIL_STRIDE == (sizeof(uocr_metal_dash_tail_state) + 255u) / 256u * 256u,
+               "DASH tail states require independent 256-byte-aligned bindings");
+
 enum uocr_metal_dash_slot {
     DASH_Q, DASH_K, DASH_V, DASH_ROUTER_Q, DASH_ROUTER_K, DASH_HEAD_CLS,
     DASH_POSITIONS, DASH_SUMMARIES, DASH_PAGE_RANGES, DASH_SELECTIONS, DASH_OUTPUT,
@@ -12637,10 +12648,13 @@ static int metal_dash_buffer_sizes(uocr_metal_dash_params p, uint64_t bytes[DASH
 }
 
 // Three ordered GPU stages; caller owns all slices. No per-query score matrix
-// or gathered K/V allocation. first_block allows cached completed summaries.
+// or gathered K/V allocation. first_block preserves completed summaries; an
+// optional per-layer tail slice resumes single-token appends. A nil slice is
+// the stateless host-reference path and always recomputes changed blocks.
 static int metal_run_dash_buffer_f16(uocr_metal_context *ctx,
                                      const uocr_metal_buffer_slice buffers[DASH_BUFFER_COUNT],
                                      uocr_metal_dash_params params,
+                                     uocr_metal_buffer_slice tail,
                                      char *error, size_t error_size) {
     uint64_t bytes[DASH_BUFFER_COUNT];
     if (ctx == NULL) return metal_fail(error, error_size, "missing DASH Metal context");
@@ -12649,11 +12663,15 @@ static int metal_run_dash_buffer_f16(uocr_metal_context *ctx,
         if (!metal_slice_valid(buffers[i], bytes[i]))
             return metal_fail(error, error_size, "invalid DASH buffer %u", i);
     }
+    if (tail.buffer != nil && (!metal_slice_valid(tail, sizeof(uocr_metal_dash_tail_state)) ||
+                              params.n_keys != params.query_start + params.n_queries ||
+                              params.first_block != params.query_start / 32u))
+        return metal_fail(error, error_size, "invalid DASH tail state or append extent");
     // Keep prefill and short queries on the scalar path. Tiling pays off for
     // single-query decode once the full 128-token local window is present.
     const int tiled_decode = params.n_queries == 1u && params.query_start >= 127u;
     const int tiled_route = params.n_queries == 1u && params.n_keys > 256u;
-    const char *names[3] = {"uocr_dash_summary_f16",
+    const char *names[3] = {tail.buffer != nil ? "uocr_dash_summary_cached_f16" : "uocr_dash_summary_f16",
         tiled_route ? "uocr_dash_route_decode_tiled_f16" : "uocr_dash_route_f16",
         tiled_decode ? "uocr_dash_attend_decode_tiled_f16" : "uocr_dash_attend_f16"};
     const uint32_t bindings[3][5] = {
@@ -12686,6 +12704,8 @@ static int metal_run_dash_buffer_f16(uocr_metal_context *ctx,
                 const uocr_metal_buffer_slice slice = buffers[bindings[stage][slot]];
                 [enc setBuffer:slice.buffer offset:slice.offset atIndex:slot];
             }
+            if (stage == 0u && tail.buffer != nil)
+                [enc setBuffer:tail.buffer offset:tail.offset atIndex:6u];
             [enc setBytes:&params length:sizeof(params) atIndex:5u];
             [enc dispatchThreadgroups:groups[stage] threadsPerThreadgroup:MTLSizeMake(threads, 1u, 1u)];
             metal_end_compute_encoder(ctx, enc);
@@ -12728,7 +12748,7 @@ int uocr_metal_context_dash_attention_f16(uocr_metal_context *ctx,
                 break;
             }
         }
-        if (ok) ok = metal_run_dash_buffer_f16(ctx, buffers, params, error, error_size);
+        if (ok) ok = metal_run_dash_buffer_f16(ctx, buffers, params, (uocr_metal_buffer_slice){nil, 0u}, error, error_size);
         if (ok) {
             memcpy(output, [buffers[DASH_OUTPUT].buffer contents], (size_t)bytes[DASH_OUTPUT]);
             memcpy(selections, [buffers[DASH_SELECTIONS].buffer contents], (size_t)bytes[DASH_SELECTIONS]);
@@ -12742,7 +12762,7 @@ int uocr_metal_context_dash_attention_f16(uocr_metal_context *ctx,
 typedef struct uocr_metal_dash_layout {
     uint64_t offsets[DASH_BUFFER_COUNT];
     uint64_t sizes[DASH_BUFFER_COUNT];
-    uint64_t gpu_bytes, host_bytes, kv_bytes;
+    uint64_t gpu_bytes, host_bytes, kv_bytes, tail_offset;
     uint32_t token_capacity, query_capacity, page_capacity;
 } uocr_metal_dash_layout;
 
@@ -12776,6 +12796,10 @@ static int metal_dash_layout(uint32_t tokens, uint32_t queries, uint32_t pages,
         layout->offsets[slot] = layout->gpu_bytes;
         layout->gpu_bytes += layout->sizes[slot];
     }
+    // Tail accumulators are retained with their layer's K/V and summaries.
+    layout->gpu_bytes = metal_dash_align(layout->gpu_bytes, 256u);
+    layout->tail_offset = layout->gpu_bytes;
+    layout->gpu_bytes += (uint64_t)UOCR_METAL_DASH_TAIL_STRIDE * UOCR_DECODER_LAYERS;
     layout->host_bytes = sizeof(uocr_metal_dash_cache) + (uint64_t)pages * 2u * sizeof(uint32_t);
     layout->kv_bytes = metal_dash_align(layout->gpu_bytes, 256u);
     layout->gpu_bytes = layout->kv_bytes;
@@ -12862,6 +12886,8 @@ int uocr_metal_context_reset_dash_cache(uocr_metal_context *ctx, uint64_t docume
     ctx->has_integrated_prefill = 0;
     // Old GPU rows remain allocated but inaccessible. First prefill rewrites all
     // live blocks and masks the partial tail before any summary can be read.
+    // query_start == 0 also prevents reading stale tail accumulators; the last
+    // prefill block initializes each layer's state before a decode can resume.
     return 1;
 }
 
@@ -12953,7 +12979,9 @@ static int metal_run_cached_dash_layer(uocr_metal_context *ctx, uocr_metal_dash_
         metal_run_page_rope_qk_buffer_f16(ctx, buffers[DASH_Q], new_k, positions, c->pending, 10u, error, error_size) &&
         (decode || metal_run_page_rope_qk_buffer_f16(ctx, buffers[DASH_ROUTER_Q], new_router_k, positions, c->pending, 1u, error, error_size)) &&
         metal_run_dash_buffer_f16(ctx, buffers,
-            (uocr_metal_dash_params){c->length + c->pending, c->length, c->pending, c->length / 32u}, error, error_size);
+            (uocr_metal_dash_params){c->length + c->pending, c->length, c->pending, c->length / 32u},
+            (uocr_metal_buffer_slice){c->arena,
+                (NSUInteger)(c->layout.tail_offset + c->next_layer * UOCR_METAL_DASH_TAIL_STRIDE)}, error, error_size);
 }
 
 int uocr_metal_context_dash_layer_f16(uocr_metal_context *ctx, uint32_t layer,
