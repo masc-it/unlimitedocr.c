@@ -4543,7 +4543,6 @@ typedef struct uocr_metal_vision_workspace {
     uocr_metal_vision_workspace_slice clip_block_residual1;
     uocr_metal_vision_workspace_slice clip_block_norm2;
     uocr_metal_vision_workspace_slice clip_block_mlp;
-    uocr_metal_vision_workspace_slice clip_mlp_fc1;
     uocr_metal_vision_workspace_slice clip_mlp_activated;
     uocr_metal_vision_workspace_slice concat;
     uocr_metal_vision_workspace_slice projected_rows;
@@ -4881,7 +4880,6 @@ static int metal_vision_workspace_init(uocr_metal_context *ctx,
     ADD_WORKSPACE_SLICE(clip_final_values, "CLIP block residual1");
     ADD_WORKSPACE_SLICE(clip_final_values, "CLIP block norm2");
     ADD_WORKSPACE_SLICE(clip_final_values, "CLIP block MLP");
-    ADD_WORKSPACE_SLICE(clip_mlp_batch_values, "CLIP MLP fc1");
     ADD_WORKSPACE_SLICE(clip_mlp_batch_values, "CLIP MLP activated");
     ADD_WORKSPACE_SLICE(concat_values, "CLIP/SAM concat");
     if (projected_values != 0u) {
@@ -4963,7 +4961,6 @@ static int metal_vision_workspace_init(uocr_metal_context *ctx,
     ASSIGN_WORKSPACE_SLICE(clip_block_residual1, clip_final_values, "CLIP block residual1");
     ASSIGN_WORKSPACE_SLICE(clip_block_norm2, clip_final_values, "CLIP block norm2");
     ASSIGN_WORKSPACE_SLICE(clip_block_mlp, clip_final_values, "CLIP block MLP");
-    ASSIGN_WORKSPACE_SLICE(clip_mlp_fc1, clip_mlp_batch_values, "CLIP MLP fc1");
     ASSIGN_WORKSPACE_SLICE(clip_mlp_activated, clip_mlp_batch_values, "CLIP MLP activated");
     ASSIGN_WORKSPACE_SLICE(concat, concat_values, "CLIP/SAM concat");
     if (projected_values != 0u) {

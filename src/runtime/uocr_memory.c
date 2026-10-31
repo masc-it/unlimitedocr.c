@@ -351,7 +351,7 @@ static int estimate_vision_memory_for_shape_internal(uint32_t max_view_size,
         !add_aligned_f16_slice_bytes(&total, clip_final_values) ||
         !add_aligned_f16_slice_bytes(&total, clip_final_values) ||
         !add_aligned_f16_slice_bytes(&total, clip_final_values) ||
-        !add_aligned_f16_slice_bytes(&total, clip_mlp_batch_values) ||
+        /* Both CLIP FC1 paths write directly into the activation slice. */
         !add_aligned_f16_slice_bytes(&total, clip_mlp_batch_values) ||
         !add_aligned_f16_slice_bytes(&total, concat_values) ||
         !add_aligned_f16_slice_bytes(&total, projected_values)) {

@@ -128,7 +128,7 @@ and broader qualification remains `todo` in phase 2.
 | Phase | Target | Main benefit | Status |
 |---|---|---|---|
 | 1 | V2 submission/encoder scheduling | Decode speed | single-token checkpoint done; GPU chunking deferred |
-| 2 | Vision scratch lifetimes and chunk sizing | Memory | lifetimes/chunk qualification done; staging accounting remains todo |
+| 2 | Vision scratch lifetimes and chunk sizing | Memory | lifetimes/chunk sizing/unused CLIP slice done; staging accounting todo |
 | 3 | Bounded SAM global attention | Memory and first-token latency | bounded MPS checkpoint done; fused online kernel deferred |
 | 4 | SAM window matrix-tiled attention | First-token latency | v2 SAM and v2 Q4 CLIP checkpoints done; other CLIP precision modes deferred |
 | 5 | DASH attention parallelism | Decode speed; prefill opportunity | decode checkpoint done; matrix-tiled sparse prefill remains todo |
@@ -348,9 +348,8 @@ chunk-size choices have measured speed/memory behavior.
   autorelease pool.
 - [x] done: Qualify four-view local chunks across representative crop counts
   on the M1 Pro and document the tradeoff. Keep the shared default unchanged.
-- [ ] todo: Revisit the unused CLIP FC1 reservation separately. Its cleanup
-  candidate matched allocator/estimator sizes but was reverted during the Q8
-  repeatability investigation. Requalify it after the fused-head race fix.
+- [x] done: Remove the unused CLIP FC1 reservation and matching estimate entry;
+  requalify allocation sizes and OCR parity after the fused-head race fix.
 - [ ] todo: Reuse/account pixel-upload and patch-extraction buffers and account
   cached position-conversion buffers. Keep MPS/driver usage separately visible;
   the native report is still not a complete device-memory cap.
@@ -531,6 +530,74 @@ Disposable instrumented libraries, allocation-failure/abort probes, samples and
 padded images lived under `data.tmp/probes/v2-q4-lifetimes/` and were removed after
 recording these results. The user notebook and persistent stress data were left
 untouched.
+
+### Unused CLIP FC1 reservation cleanup (2026-10-31)
+
+Status: `done`. Requalified against `0d99f6b`, after the Q8/FP16 fused-head race
+fix, on the same M1 Pro and pinned model files.
+
+- [x] done: Remove the unused `clip_mlp_fc1` workspace member, size reservation
+  and slice assignment. Both quantized and FP16 CLIP MLP paths already write
+  FC1 directly into `clip_mlp_activated`; no computation reads the removed slice.
+- [x] done: Remove the matching admission-estimator entry. Activation storage,
+  FC1 weights/biases, QuickGELU, dispatch policy and model caches are unchanged.
+- [x] done: Verify estimator/allocation agreement, repeated OCR parity, cleanup/
+  reuse, runtime/precompiled loading and existing suites with disposable probes.
+
+The before/after estimate probe first failed on the old duplicate reservation,
+then passed after the change. GPU-workspace estimates changed as follows;
+final-feature and host-staging estimates stayed unchanged:
+
+| Shape | Before | After | Saved bytes |
+|---|---:|---:|---:|
+| One 1024-pixel global view | 329,494,528 | 327,389,184 | 2,105,344 |
+| Two global views | 602,365,952 | 598,155,264 | 4,210,688 |
+| One 640-pixel local view | 119,363,584 | 118,536,192 | 827,392 |
+| Four local views | 424,001,536 | 420,691,968 | 3,309,568 |
+| Eight local views | 830,185,472 | 823,566,336 | 6,619,136 |
+
+The saving is exactly `clip_tokens * views * 4096 * sizeof(half)`. A native
+probe initialized the actual Metal workspace for all five shapes and confirmed
+that its allocation length equaled the complete estimate, including final
+features. The original allocation/release and high-water ownership paths remain
+in place; there is no new aliasing or per-operation buffer reuse.
+
+Correctness checks used three complete invoice requests per library/path:
+
+| Path | Result |
+|---|---|
+| V2 Q4 base / 13-view gundam | All 385 IDs matched baseline |
+| V2 Q8 base / 13-view gundam | All 385 IDs matched baseline |
+| V1 Q4 base | All 381 IDs matched baseline |
+| V1 FP16 base | All 381 IDs matched baseline |
+
+Every complete result ended naturally and passed strict parsing. Additional
+Q4 maximum-17-view and four-local-view-chunk requests matched baseline IDs.
+Q8 reused one engine across full, one-token, 65-token and full requests without
+drift. Post-CLIP-encoding failures returned tracked memory to the pre-request
+level and allowed repeated identical recovery. Metal API validation passed
+workspace/failure checks; API/GPU shader validation passed a complete Q4 base
+request. Full v2 FP16 OCR and actual GPU execution faults were not exercised.
+
+Observed Q4 tracked peaks fell **2,176,307,712 -> 2,174,202,368 bytes** base and
+**2,680,173,056 -> 2,673,553,920 bytes** gundam: exactly the expected savings.
+Separate 1 ms Metal sampling of 65-token requests changed peaks **2,205,302,784
+-> 2,203,205,632 bytes** base and **2,735,915,008 -> 2,729,295,872 bytes** gundam.
+The base driver allocation rounded to a 2,097,152-byte saving. End Metal usage
+stayed **1,862,516,736 bytes**. RSS is not the admission estimate, and no latency
+improvement is claimed for this allocation-only cleanup.
+
+Runtime-only compilation from source in an empty resource directory matched
+precompiled base/gundam Q4 output. Release build and existing suites passed:
+**105 Python checks, 7 opt-in skips**, three expected warmup warnings, and
+**13 native checks**. Profiling-OFF and exact-budget rejection probes were not
+repeated; actual workspace sizes and matching estimates were checked directly.
+
+Owned probes/private libraries under `data.tmp/probes/clip-fc1-cleanup/` were
+removed after recording evidence. No permanent tests were added. Persistent
+stress data, model caches and concurrent notebook edits were untouched and
+unstaged. Q8 CLIP attention remains on its original scalar path; this cleanup
+does not re-enable any deferred attention specialization.
 
 ## Phase 3: Bounded SAM global attention
 
@@ -881,7 +948,8 @@ A cleanup candidate removed that reservation and matched allocator/estimator
 sizes on five shapes, saving **2,105,344 bytes** for one global view and
 **6,619,136 bytes** for eight local views. **That cleanup was reverted**, along
 with its estimator change, to keep this checkpoint's storage layout unchanged.
-It remains a separate memory-accounting follow-up.
+It was subsequently requalified and removed after the fused-head race fix;
+see the unused-CLIP-FC1 cleanup checkpoint in Phase 2.
 
 Repeated Q8 sweeps showed that the saved baseline is also unstable: besides its
 usual 385-ID invoice, it produced a 382-ID result with changed block type and a
@@ -1865,9 +1933,10 @@ precision policy or an attention optimization.
   tie handling, dispatch geometry or scratch sizes.
 - [x] done: Replay real inputs, check per-token hidden vectors, and qualify
   repeated OCR, edge cases, compatibility and both shader-loading paths.
-- [ ] todo: Requalify deferred Q8 attention/scratch candidates against this
-  corrected baseline before enabling them. This fix does not establish
-  universal model/compiler or upstream numerical parity.
+- [ ] todo: Requalify deferred Q8 attention against this corrected baseline
+  before enabling it. Universal model/compiler and upstream parity remain
+  unverified.
+- [x] done: Requalify and remove the unused CLIP FC1 reservation (Phase 2).
 
 ### Cause and scope
 
@@ -1990,8 +2059,9 @@ concurrent notebook edits were untouched and unstaged.
 
 - [x] done: Trace and fix the reproduced Q8/FP16 fused-head selection race using
   fixed-input probes and per-token real-input replay (checkpoint above).
-- [ ] todo: Requalify Q8 attention and CLIP scratch cleanup against the corrected
-  baseline. No deferred candidate is re-enabled by the synchronization fix.
+- [ ] todo: Requalify Q8 attention against the corrected baseline. No deferred
+  attention candidate is re-enabled by the synchronization fix.
+- [x] done: Requalify and remove the unused CLIP FC1 workspace reservation.
 - [ ] todo: Reassess KV quantization after vision memory and continuation work.
   It changes activation precision and requires separate quality qualification.
 - [ ] todo: Reassess long-window cache allocation after the document scheduler
