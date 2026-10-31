@@ -18,8 +18,10 @@ were small relative to variation and added dispatch complexity. Phase 8's
 Q4 LM-head scheduling/reduction and paired gate/up checkpoint is implemented
 and verified. Phase 9's projection, fused router norm/RoPE, and SIMD routing
 checkpoint and incremental tail-summary checkpoint are implemented and
-verified, with the earlier Q8 caveat retained below. CLIP reuse, matrix-tiled
-sparse prefill, and remaining staging/cached-buffer accounting are not done.
+verified. CLIP matrix-tiled attention is qualified for v2 Q4 only; Q8 retains
+its original path and broader repeatability limits are recorded below.
+Matrix-tiled sparse prefill and remaining staging/cached-buffer accounting
+are not done.
 
 ## Goal and scope
 
@@ -127,7 +129,7 @@ and broader qualification remains `todo` in phase 2.
 | 1 | V2 submission/encoder scheduling | Decode speed | single-token checkpoint done; GPU chunking deferred |
 | 2 | Vision scratch lifetimes and chunk sizing | Memory | lifetimes/chunk qualification done; staging accounting remains todo |
 | 3 | Bounded SAM global attention | Memory and first-token latency | bounded MPS checkpoint done; fused online kernel deferred |
-| 4 | SAM window matrix-tiled attention | First-token latency | v2 SAM checkpoint done; CLIP reuse remains todo |
+| 4 | SAM window matrix-tiled attention | First-token latency | v2 SAM and v2 Q4 CLIP checkpoints done; other CLIP precision modes deferred |
 | 5 | DASH attention parallelism | Decode speed; prefill opportunity | decode checkpoint done; matrix-tiled sparse prefill remains todo |
 | 6 | Occupancy-aware routed-MoE prefill | Prefill speed | v2 Q4 M16 checkpoint done; mixed-width/compact dispatch not justified |
 | 7 | Q4 vision GEMM staging | Vision speed | investigated; production deferred after small whole-request gains |
@@ -345,6 +347,9 @@ chunk-size choices have measured speed/memory behavior.
   autorelease pool.
 - [x] done: Qualify four-view local chunks across representative crop counts
   on the M1 Pro and document the tradeoff. Keep the shared default unchanged.
+- [ ] todo: Revisit the unused CLIP FC1 reservation separately. Its cleanup
+  candidate matched allocator/estimator sizes but was reverted while broader
+  Q8 repeatability remains unresolved (see the CLIP checkpoint).
 - [ ] todo: Reuse/account pixel-upload and patch-extraction buffers and account
   cached position-conversion buffers. Keep MPS/driver usage separately visible;
   the native report is still not a complete device-memory cap.
@@ -681,8 +686,8 @@ is matrix-core utilization and reuse across multiple queries.
   preserving relative-position terms and existing image-padding semantics.
 - [x] done: Adapt the earlier matrix-tile prototype to short windows without
   forcing the same dispatch onto global attention. Global attention remains MPS.
-- [ ] todo: Evaluate reuse for CLIP attention only after the SAM checkpoint;
-  keep it only if the different sequence lengths benefit.
+- [x] done: Evaluate matrix-tile reuse for CLIP after the SAM checkpoint;
+  qualify 101/257-token attention for v2 Q4. Q8/FP16 and v1 remain scalar.
 
 QA checkpoint:
 
@@ -801,7 +806,140 @@ bytes**. No admission-estimate or crop-default change was needed.
   persistent stress dataset and the user's concurrent notebook edits were not
   modified or staged.
 
-CLIP specialization remains `todo`. References: [1], [2].
+### CLIP attention checkpoint evidence (2026-10-31)
+
+Baseline: `5f77e71`, Apple M1 Pro with 16 GB RAM, pinned models and Release/
+profiling build. CLIP already reused preallocated activation/workspace slices
+across its 24 layers. The accepted change reuses K/V tiles across queries and
+uses matrix instructions; it is not a new persistent activation cache.
+
+#### Profile and implementation
+
+Detail-level-3 baseline checks attributed about **69 ms** base / **189 ms**
+gundam to CLIP attention across 24 / 72 block calls. These synchronization-heavy
+checkpoint times include wait overhead and are not normal request latency.
+The gundam invoice has one global view and local batches of eight and four.
+
+- `uocr_clip_attention_mma_f16` adapts the SAM window-MMA tile schedule to CLIP:
+  **16 queries x 32 keys**, four SIMD groups / **128 threads**, head dimension
+  **64**, and **12,480 bytes** of threadgroup storage.
+- Q/K/V remain FP16. QK accumulation, online softmax, probabilities and PV
+  accumulation remain FP32. There is no probability downcast, materialized
+  attention matrix, new device buffer or persistent dequantized weight copy.
+- Attention is noncausal and includes the class token. Only tile tails beyond
+  the **101 local / 257 global tokens** are masked; views remain independent.
+  Shared K storage is reused for V, and score storage for output rescaling.
+- Dispatch requires **v2 and Q4 CLIP QKV weights**. The default v2 Q8/FP16 and
+  v1 paths retain scalar attention. Host validation checks 32-lane SIMD width,
+  128-thread support and available threadgroup memory. Missing/unsupported
+  pipelines fail explicitly; there is no silent fallback after selection.
+- Scope tracing confirmed 24 MMA calls for a base v2 Q4 request and 24 scalar
+  calls each for v2 Q8 and v1 Q4. Nondefault mixed configurations have not been
+  independently qualified.
+
+#### Kernel and numerical qualification
+
+Resident-buffer probes alternated old/new pipelines over four measured pairs
+after warmup, with 32 dependent dispatches per command buffer:
+
+| Tokens / views | Scalar attention | Matrix-tiled attention |
+|---|---:|---:|
+| 101 / 1 | 0.451 ms | 0.107 ms |
+| 101 / 4 | 1.526 ms | 0.441 ms |
+| 101 / 8 | 3.004 ms | 0.833 ms |
+| 257 / 1 | 2.628 ms | 0.700 ms |
+| 257 / 2 | 4.923 ms | 1.257 ms |
+
+This is roughly **3.5-4x** for the operation, not for OCR. Hardware instruction/
+register/occupancy counters were not collected.
+
+The FP32 reduction schedule changes, so **attention outputs are not bitwise
+identical**. Fifteen synthetic normal/zero/high-score cases covered all five
+shapes, class/last queries and edge tiles. Sampled outputs passed a separate
+FP64 softmax oracle at `1e-3` absolute / `2e-3` relative tolerance. Metal API/GPU
+shader validation passed the production kernel checks.
+
+Actual Q4 tensors from **24 base and 72 gundam CLIP blocks** were compared on
+identical Q/K/V inputs. Maximum FP16 absolute differences were **0.00048828125
+base / 0.0009765625 gundam**, and maximum per-operation RMS differences were
+**1.98e-6 / 4.21e-6**. Approximately **0.214% / 0.184%** of output values differed
+in bits. Sampled real-tensor FP64 maximum errors were **0.000122 / 0.000243** for
+both old and new paths. Diagnostic waits/readbacks were excluded from timing.
+This does not establish universal image/model/compiler equivalence.
+
+#### Q8 rejection and deferred scratch cleanup
+
+The initial all-v2 MMA prototype was **not accepted for Q8**. Qualification
+observed text changes such as word splitting and `net 30` becoming `net 300`,
+as well as coordinate changes and a malformed block-metadata output. These
+exceed the earlier one-coordinate-unit caveat.
+
+A separate audit found that `clip_mlp_fc1` is reserved but never consumed:
+both quantized and FP16 MLP paths write FC1 directly into `clip_mlp_activated`.
+A cleanup candidate removed that reservation and matched allocator/estimator
+sizes on five shapes, saving **2,105,344 bytes** for one global view and
+**6,619,136 bytes** for eight local views. **That cleanup was reverted**, along
+with its estimator change, to keep this checkpoint's storage layout unchanged.
+It remains a separate memory-accounting follow-up.
+
+Repeated Q8 sweeps showed that the saved baseline is also unstable: besides its
+usual 385-ID invoice, it produced a 382-ID result with changed block type and a
+395-ID variant. MMA and cleanup variants showed text/metadata variation too;
+the exact cause was not isolated. Even the final scalar-Q8/original-workspace
+path produced one 384-ID variant among otherwise 385-ID outputs. All final
+sweep outputs parsed, but they were not token-identical. The accepted change
+therefore makes **no Q8 optimization or determinism claim**. Q8 repeatability
+needs a separate investigation; the evidence must not be reduced to harmless
+coordinate noise or attributed solely to MMA without further tracing.
+
+#### Complete OCR and production timing
+
+Complete Q4 IDs, natural EOS and strict parsing matched baseline on base/
+13-view/17-view invoices (385), blank (19), table (448), edge text (300),
+degraded scan (385), and tiny text (1172). Four-local-view batching also matched
+all invoice IDs. V1 base/gundam invoices retained the scalar path and matched
+381 IDs. FP16 full-model OCR was not run and its dispatch remains unchanged.
+
+Final production A/B runs used the Q4-only guard and original workspace layout,
+warmed both engines and alternated order over **six complete-request pairs**,
+without diagnostic checkpoints or memory polling:
+
+| V2 Q4 invoice | Before | After | Saving |
+|---|---:|---:|---:|
+| Base, 385 IDs | 3.071 s | 3.008 s | 63 ms / 2.1% |
+| Gundam, 385 IDs | 6.649 s | 6.523 s | 126 ms / 1.9% |
+
+Every final pair improved. Vision-stage means changed **837 -> 782 ms** base
+and **3730 -> 3602 ms** gundam, consistent with the isolated attention savings.
+Earlier broader-scope/cleanup A/B runs are not used for this acceptance table.
+
+No workspace, admission estimate or allocation lifetime changed in the final
+code. Tracked peaks remained **2,176,307,712 / 2,680,173,056 bytes**. Separate
+1 ms sampling retained Metal peaks **2,205,302,784 / 2,735,915,008 bytes** and
+end usage **1,862,516,736 bytes**. RSS high-water marks were about **2.142 ->
+2.139 GB** base and **2.214 -> 2.224 GB** gundam, including non-native state.
+Encoder/wait/allocation counts remain **1039 / 386 / 14** base and
+**3496 / 388 / 18** gundam. Final allocator/estimator equality was rechecked on
+five original-layout workspace shapes after reverting the cleanup.
+
+#### Failure, builds and cleanup
+
+- Pipeline-lookup and post-dispatch failures released request allocations and
+  allowed repeated engine reuse. Complete/capped invoice and blank requests
+  also reused the engine successfully under Metal API/GPU shader validation.
+  Actual GPU execution faults were not injected.
+- Runtime-only compilation from generated source in an empty resource directory
+  matched precompiled base/gundam IDs. Regeneration was byte-identical.
+- Release build and existing suites passed: **105 Python checks, 7 opt-in
+  skips**, three expected warmup warnings, and **13 native checks**. Profiling-
+  OFF and exact-budget rejection were not repeated; the final memory layout
+  and estimator are unchanged.
+- Owned probes, private libraries and logs under
+  `data.tmp/probes/v2-clip-attention/` were removed after recording evidence.
+  No permanent tests were added. Persistent stress data and concurrent notebook
+  edits were left untouched and unstaged.
+
+References: [1], [2].
 
 ## Phase 5: Parallel DASH sparse attention
 
@@ -1713,6 +1851,9 @@ Encoders/waits/allocations remain **1039 / 386 / 14** base and
 
 ## Deferred work and guardrails
 
+- [ ] todo: Investigate Q8 repeatability using fixed intermediate tensors and
+  per-token comparisons. Observed variation now includes text/block structure,
+  not only coordinates; no new Q8 attention specialization is qualified.
 - [ ] todo: Reassess KV quantization after vision memory and continuation work.
   It changes activation precision and requires separate quality qualification.
 - [ ] todo: Reassess long-window cache allocation after the document scheduler

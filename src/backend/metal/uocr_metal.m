@@ -18045,6 +18045,7 @@ static void metal_copy_error_detail(char *detail, size_t detail_size, const char
 }
 
 static int metal_context_clip_attention_batch_f16_to_slice(uocr_metal_context *ctx,
+                                                            int mma,
                                                             uocr_metal_vision_workspace_slice q_tokens,
                                                             uocr_metal_vision_workspace_slice k_tokens,
                                                             uocr_metal_vision_workspace_slice v_tokens,
@@ -18073,12 +18074,17 @@ static int metal_context_clip_attention_batch_f16_to_slice(uocr_metal_context *c
     }
 
     @autoreleasepool {
-        id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, "uocr_sam_window_attention_flash_f16_to_f16", error, error_size);
+        id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx,
+            mma ? "uocr_clip_attention_mma_f16" : "uocr_sam_window_attention_flash_f16_to_f16", error, error_size);
         if (pipeline == nil) {
             return 0;
         }
-        NSUInteger threads_per_group = 0u;
-        if (!metal_flash_attention_threads_per_threadgroup(pipeline,
+        NSUInteger threads_per_group = 128u;
+        if (mma) {
+            if (pipeline.threadExecutionWidth != 32u || pipeline.maxTotalThreadsPerThreadgroup < threads_per_group ||
+                pipeline.staticThreadgroupMemoryLength > ctx->device.maxThreadgroupMemoryLength)
+                return metal_fail(error, error_size, "CLIP MMA requires 32-lane SIMD groups, 128 threads and sufficient shared memory");
+        } else if (!metal_flash_attention_threads_per_threadgroup(pipeline,
                                                            UOCR_METAL_FLASH_Q_PER_TG,
                                                            UOCR_CLIP_HEAD_DIM,
                                                            "Metal CLIP batch",
@@ -18107,7 +18113,8 @@ static int metal_context_clip_attention_batch_f16_to_slice(uocr_metal_context *c
         params.reserved1 = 0u;
         params.reserved2 = 0u;
 
-        const NSUInteger query_blocks = (NSUInteger)((token_count + UOCR_METAL_FLASH_Q_PER_TG - 1u) / UOCR_METAL_FLASH_Q_PER_TG);
+        const uint32_t queries_per_group = mma ? 16u : UOCR_METAL_FLASH_Q_PER_TG;
+        const NSUInteger query_blocks = (NSUInteger)((token_count + queries_per_group - 1u) / queries_per_group);
         [enc setComputePipelineState:pipeline];
         [enc setBuffer:q_tokens.buffer offset:q_tokens.offset atIndex:0u];
         [enc setBuffer:k_tokens.buffer offset:k_tokens.offset atIndex:1u];
@@ -18436,8 +18443,11 @@ static int metal_context_clip_transformer_batch_block_workspace_f16_to_slice(uoc
                                                                 error,
                                                                 error_size));
     }
+    // Matrix reduction rounding is qualified for v2 Q4. Q8/FP16 retain
+    // their scalar attention path; Q8 OCR text changed in the MMA prototype.
     RUN_CLIP_BATCH_BLOCK_STEP("attention",
                               metal_context_clip_attention_batch_f16_to_slice(ctx,
+                                                                             ctx->model_is_v2 && block->qkv_weight.qtype == UOCR_TENSOR_Q4_0,
                                                                              scratch->clip_block_q,
                                                                              scratch->clip_block_k,
                                                                              scratch->clip_block_v,
