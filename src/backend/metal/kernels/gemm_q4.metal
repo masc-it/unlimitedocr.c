@@ -405,7 +405,8 @@ static inline void uocr_gemm_q4_stage_b(device const uchar *qweight,
 }
 
 // V2 Q4 routed prefill: 16-row tiles reduce padding and shared/register pressure.
-// Keep BK=32, the 8x8 MMA reduction order, and Q4 staging identical to M64.
+// Keep BK=32, the 8x8 MMA reduction order, and FP16 dequantization unchanged.
+// Reuse packed Q4 groups and gathered-row addresses without enlarging the tiles.
 // The generic 64-row path remains unchanged for v1 and other quantizations.
 static inline void uocr_moe_q4_m16_mma_tile(threadgroup const half *sa,
                                          threadgroup const half *sb,
@@ -440,25 +441,20 @@ static inline void uocr_moe_q4_m16_stage_rows(device const uint *pair_rows,
     threadgroup_barrier(mem_flags::mem_threadgroup);
 }
 
-// Stage a gathered A tile: source row = tile_pairs[i] / row_divisor
-// (divisor top_k gathers token rows from src; divisor 1 gathers pair rows
-// from mid).  Padding rows are zero-filled.
-static inline void uocr_moe_q4_m16_stage_a(device const half *src,
-                                                 uint K,
-                                                 uint k_base,
-                                                 uint row_divisor,
-                                                 threadgroup const uint *tile_pairs,
-                                                 uint tid,
-                                                 threadgroup half *sa) {
-    for (uint i = tid; i < (16u * UOCR_GEMM_Q8_BK) / UOCR_HALF4_WIDTH; i += UOCR_GEMM_Q8_THREADS) {
-        const uint chunks_per_row = UOCR_GEMM_Q8_BK / UOCR_HALF4_WIDTH;
-        const uint mrow = i / chunks_per_row;
-        const uint kk = (i - mrow * chunks_per_row) * UOCR_HALF4_WIDTH;
-        const uint pair = tile_pairs[mrow];
-        const half4 value = pair != 0xFFFFFFFFu
-                                ? uocr_load_half4(src, (ulong)(pair / row_divisor) * K + k_base + kk)
-                                : uocr_zero_half4();
-        *reinterpret_cast<threadgroup half4 *>(sa + mrow * UOCR_GEMM_Q8_BK + kk) = value;
+// Each thread retains eight packed bytes and their scale across both halves
+// of a 64-value group. Stage only 32 K values at a time, preserving the MMA
+// order and shared-memory footprint. Packed lanes follow the Q4 byte order.
+static inline void uocr_moe_q4_m16_stage_b(uint2 packed,
+                                          float scale,
+                                          uint tid,
+                                          uint half_index,
+                                          threadgroup half *sb) {
+    const uint col = tid / 4u;
+    const uint k = (tid % 4u) * 8u;
+    for (uint j = 0u; j < 8u; ++j) {
+        const uint shift = (j % 4u) * 8u + half_index * 4u;
+        const int q = int((packed[j / 4u] >> shift) & 0xFu) - 8;
+        sb[(k + j) * UOCR_GEMM_Q8_BN + col] = half(float(q) * scale);
     }
 }
 
@@ -511,14 +507,30 @@ static inline void uocr_moe_q4_m16_stage_a(device const half *src,
     const uint sg_row = (sgitg / 2u) * 8u;
     const uint sg_col = (sgitg % 2u) * 16u;
 
-    for (uint k_base = 0u; k_base < K; k_base += UOCR_GEMM_Q8_BK) {
-        uocr_moe_q4_m16_stage_a(src, K, k_base, params.top_k, tile_pairs, tid, sa);
-        uocr_gemm_q4_stage_b(gate_qweight, gate_qscale, K, groups_per_row, col_base, k_base, tid, sb_gate);
-        uocr_gemm_q4_stage_b(up_qweight, up_qscale, K, groups_per_row, col_base, k_base, tid, sb_up);
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        uocr_moe_q4_m16_mma_tile(sa, sb_gate, sg_row, sg_col, mc_gate);
-        uocr_moe_q4_m16_mma_tile(sa, sb_up, sg_row, sg_col, mc_up);
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+    // With 128 threads, each thread stages one half4 in the 16x32 A tile.
+    // Hoist the gathered token division/address out of the K loop.
+    const uint source_pair = tile_pairs[tid / 8u];
+    const ulong source_offset = (ulong)(source_pair != 0xFFFFFFFFu ? source_pair / params.top_k : 0u) * K +
+                                (tid % 8u) * 4u;
+    const uint weight_col = col_base + tid / 4u;
+    const uint packed_offset = (tid % 4u) * 8u;
+    for (uint group = 0u; group < K / 64u; ++group) {
+        const float gate_scale = float(gate_qscale[weight_col * groups_per_row + group]);
+        const float up_scale = float(up_qscale[weight_col * groups_per_row + group]);
+        const ulong weight_offset = (ulong)weight_col * (K / 2u) + group * 32u + packed_offset;
+        const uint2 gate_packed = *reinterpret_cast<device const uint2 *>(gate_qweight + weight_offset);
+        const uint2 up_packed = *reinterpret_cast<device const uint2 *>(up_qweight + weight_offset);
+        for (uint half_index = 0u; half_index < 2u; ++half_index) {
+            const uint k_base = group * 64u + half_index * UOCR_GEMM_Q8_BK;
+            *reinterpret_cast<threadgroup half4 *>(sa + tid * 4u) = source_pair != 0xFFFFFFFFu
+                ? uocr_load_half4(src, source_offset + k_base) : uocr_zero_half4();
+            uocr_moe_q4_m16_stage_b(gate_packed, gate_scale, tid, half_index, sb_gate);
+            uocr_moe_q4_m16_stage_b(up_packed, up_scale, tid, half_index, sb_up);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            uocr_moe_q4_m16_mma_tile(sa, sb_gate, sg_row, sg_col, mc_gate);
+            uocr_moe_q4_m16_mma_tile(sa, sb_up, sg_row, sg_col, mc_up);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
     }
 
     for (uint i = 0u; i < 1u; ++i) {
@@ -585,12 +597,24 @@ static inline void uocr_moe_q4_m16_stage_a(device const half *src,
     const uint sg_row = (sgitg / 2u) * 8u;
     const uint sg_col = (sgitg % 2u) * 16u;
 
-    for (uint k_base = 0u; k_base < K; k_base += UOCR_GEMM_Q8_BK) {
-        uocr_moe_q4_m16_stage_a(mid, K, k_base, 1u, tile_pairs, tid, sa);
-        uocr_gemm_q4_stage_b(down_qweight, down_qscale, K, groups_per_row, col_base, k_base, tid, sb);
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        uocr_moe_q4_m16_mma_tile(sa, sb, sg_row, sg_col, mc);
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint source_pair = tile_pairs[tid / 8u];
+    const ulong source_offset = (ulong)(source_pair != 0xFFFFFFFFu ? source_pair : 0u) * K +
+                                (tid % 8u) * 4u;
+    const uint weight_col = col_base + tid / 4u;
+    const uint packed_offset = (tid % 4u) * 8u;
+    for (uint group = 0u; group < K / 64u; ++group) {
+        const float scale = float(down_qscale[weight_col * groups_per_row + group]);
+        const ulong weight_offset = (ulong)weight_col * (K / 2u) + group * 32u + packed_offset;
+        const uint2 packed = *reinterpret_cast<device const uint2 *>(down_qweight + weight_offset);
+        for (uint half_index = 0u; half_index < 2u; ++half_index) {
+            const uint k_base = group * 64u + half_index * UOCR_GEMM_Q8_BK;
+            *reinterpret_cast<threadgroup half4 *>(sa + tid * 4u) = source_pair != 0xFFFFFFFFu
+                ? uocr_load_half4(mid, source_offset + k_base) : uocr_zero_half4();
+            uocr_moe_q4_m16_stage_b(packed, scale, tid, half_index, sb);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            uocr_moe_q4_m16_mma_tile(sa, sb, sg_row, sg_col, mc);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
     }
 
     for (uint i = 0u; i < 1u; ++i) {

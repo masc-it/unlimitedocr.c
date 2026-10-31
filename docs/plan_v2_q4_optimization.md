@@ -12,7 +12,7 @@ M1 Pro. Phase 3's bounded-query MPS checkpoint is implemented and verified;
 custom fused global online attention is deferred after slower prototypes.
 Phase 4's v2 SAM window MMA kernel and phase 5's order-preserving DASH decode
 kernel are implemented and verified. Phase 6's v2 Q4 M16 routed-prefill
-checkpoint is also implemented and verified. Phase 7's vision-GEMM prototypes
+checkpoint and packed-group/source-address reuse are implemented and verified. Phase 7's vision-GEMM prototypes
 were measured; production rollout is deferred because complete-request gains
 were small relative to variation and added dispatch complexity. Phase 8's
 Q4 LM-head scheduling/reduction and paired gate/up checkpoint is implemented
@@ -133,7 +133,7 @@ and broader qualification remains `todo` in phase 2.
 | 3 | Bounded SAM global attention | Memory and first-token latency | bounded MPS checkpoint done; fused online kernel deferred |
 | 4 | SAM window matrix-tiled attention | First-token latency | v2 SAM and v2 Q4 CLIP checkpoints done; other CLIP precision modes deferred |
 | 5 | DASH attention parallelism | Decode speed; prefill opportunity | decode done; sparse prefill investigated, rollout deferred |
-| 6 | Occupancy-aware routed-MoE prefill | Prefill speed | v2 Q4 M16 checkpoint done; mixed-width/compact dispatch not justified |
+| 6 | Occupancy-aware routed-MoE prefill | Prefill speed | v2 Q4 M16 and group/address reuse done; mixed-width/compact dispatch deferred |
 | 7 | Q4 vision GEMM staging | Vision speed | investigated; production deferred after small whole-request gains |
 | 8 | Q4 LM-head and decode GEMVs | Decode speed | LM-head/paired gate-up checkpoint done; down GEMVs unchanged |
 | 9 | DASH router/projection specialization | Decode and future longer windows | Projection/norm/routing and incremental-tail checkpoints done |
@@ -1321,6 +1321,8 @@ Expert sorting/bucketing and fused Q4 MMA are already implemented.
 - [x] done: Evaluate empty/partial-tile overhead. Smaller tiles address padding;
   compact/indirect dispatch is deferred because measured empty-work cost is small.
   Fused gate/up and deterministic expert combination are preserved.
+- [x] done: Reuse packed Q4 groups and gathered-row addresses within M16 K loops,
+  preserving tile sizes, arithmetic order, dispatch and memory estimates.
 
 QA checkpoint:
 
@@ -1450,6 +1452,125 @@ variation was not established in this checkpoint.
 
 References: [5], [6]. External performance figures are from different
 models/hardware and are not expected speedups for this engine.
+
+### M16 packed-group and source-address reuse (2026-10-31)
+
+Status: `done`. Baseline: `e2e7779`, Apple M1 Pro / 16 GB, pinned v2 mixed-Q4
+model and Release/profiling build. Production changes are confined to the two
+M16 kernels/helpers in `gemm_q4.metal` and the regenerated shader. No host
+code, dispatch policy, model format, quantization policy or admission estimate
+changed.
+
+- [x] done: Separate bucketing, gate/up, down and combine GPU costs on real
+  base/gundam routed-layer inputs.
+- [x] done: Compare 19 private configurations and retain the small load/address
+  change; keep the existing 16x32x32 tiles and 128-thread dispatch.
+- [x] done: Check final mid/down/combined outputs bit-for-bit, complete OCR,
+  failure recovery, runtime compilation, memory and existing regression suites.
+
+#### Measurements and selected implementation
+
+Gate/up and down dominate routed prefill; bucketing and combination are small.
+The final source was replayed on the same inputs/routes/weights as the baseline.
+Each stage used one warmup plus three measured command buffers per layer;
+GPU timestamps exclude diagnostic readbacks and host waits. These are sums of
+per-layer medians over all 11 routed layers:
+
+| Stage | Base before | Base after | Gundam before | Gundam after |
+|---|---:|---:|---:|---:|
+| Bucket | 0.20 ms | 0.20 ms | 0.40 ms | 0.40 ms |
+| Gate/up | 51.79 ms | 45.34 ms | 232.02 ms | 200.55 ms |
+| Down | 28.40 ms | 26.74 ms | 125.85 ms | 118.48 ms |
+| Combine | 0.56 ms | 0.57 ms | 2.79 ms | 2.79 ms |
+| Total | 80.94 ms | 72.86 ms | 361.05 ms | 322.22 ms |
+
+The accepted change saves about **8.1 / 38.8 ms** in this isolated replay:
+
+1. Each thread calculates its gathered source-pair/token address once, before
+   the K loop. It no longer repeatedly reads the same shared pair ID and
+   divides by `top_k` for every A tile. Padding still stages zero.
+2. Each thread loads eight packed Q4 bytes and their FP16 scale once per
+   64-value group, retaining them as thread-private values. It stages the low
+   and high nibble halves separately through the existing BK=32 buffers.
+3. FP32 dequantization followed by FP16 rounding, ordered 8x8 MMA accumulation,
+   SwiGLU, FP16 mid/down stores and deterministic expert combination are
+   unchanged. There is no persistent weight cache or full dequantized copy.
+
+Rejected configurations included BK64/BK128 staging, shared gate/up A-matrix
+loads, N64/N128 output tiles, two/four/eight-SIMD-group mappings, transposed B
+staging, fixed-dimension specialization and FMA nibble conversion. Larger K
+and N tiles mostly regressed. Sharing A loads alone did not help. Source-address
+hoisting or packed-group reuse alone helped less than their combination.
+A wider down tile recovered only a further small isolated gain and did not
+justify a separate dispatch. The accepted path introduces no new pipeline.
+
+#### Complete requests
+
+An initial two-library alternating-order experiment preserved IDs and saved
+about **41 ms** on complete gundam, but base results were noisy (about 4 ms).
+A final controlled comparison kept one model/context and switched only the
+baseline/production-derived M16 entry points between requests. Both paths were
+warmed; six pairs alternated order at each output cap. This avoids the marked
+order effect observed when switching between two model mappings. No detailed
+checkpoints, comparison readbacks or polling ran during timing; image preparation
+and model loading were excluded.
+
+| Q4 request | Before mean | After mean | Saved |
+|---|---:|---:|---:|
+| Base invoice, first token | 0.91183 s | 0.90308 s | 8.75 ms |
+| Base invoice, complete 385 IDs | 2.99104 s | 2.98161 s | 9.42 ms / 0.32% |
+| Gundam invoice, first token | 4.27063 s | 4.23201 s | 38.61 ms |
+| Gundam invoice, complete 385 IDs | 6.49351 s | 6.45965 s | 33.86 ms / 0.52% |
+| Base blank, complete 19 IDs | 1.00775 s | 0.99919 s | 8.56 ms / 0.85% |
+
+Every complete paired sample improved: invoice savings ranged **2.49-12.89 ms**
+base and **29.11-39.97 ms** gundam; blank savings were **5.95-11.69 ms**. These
+are small measured prefill gains, not a decode-speed improvement or a general
+throughput claim. Separate actual Release runs matched the baseline IDs; frozen
+baseline shaders prevented the rebuilt production library from contaminating
+before/after comparisons. Cold shader compilation is not covered by the timing
+claim.
+
+#### QA and memory
+
+- Final-source replay matched **all FP16 mid, down and combined elements** on
+  **33 real layer inputs**: base/gundam invoices and base blank. This is exact
+  native-reference parity on these inputs, not universal/upstream parity.
+- Skew/empty/tail probes gave six selected experts **0, 1, 15, 16, 17, 31, 32,
+  33, 65, 128, 279 or 1519 rows each**, leaving the other experts empty.
+  Combined outputs matched bit-for-bit. Metal API and GPU shader validation
+  passed the final kernels, the skew series and real gundam comparisons.
+- Complete Q4 outputs matched on base/13-view/maximum-17-view invoices (385
+  IDs), blank (19), table (448), tiny text (1172), gundam edge text (300), and
+  degraded scan (385), with natural EOS and strict parsing. The first cold
+  blank run was slower; the warmed paired blank series above improved in every
+  pair, so no cold-start speedup is claimed.
+- V2 Q8, v1 Q4 and v1 FP16 base invoices matched baseline IDs on two requests
+  per library/path. Their prefill kernels are untouched. Full v2 FP16 and v1
+  gundam were not rerun for this checkpoint.
+- Injected pipeline-lookup and post-gate-encoding failures, repeated twice,
+  released request allocations and allowed identical complete-request reuse.
+  A 2.5 GB budget rejected gundam and subsequently accepted base. Actual GPU
+  execution faults and exact one-byte admission boundaries were not exercised.
+- Runtime-only compilation from source in an empty resource directory matched
+  precompiled base/gundam Q4 IDs on two complete requests each. Regeneration
+  was byte-identical. Profiling-OFF was not separately rebuilt.
+- Static threadgroup storage remains **5184 / 3136 bytes** gate/up versus down;
+  no device scratch or submission was added. Base/gundam counters remain
+  **1039/386/14** and **3496/388/18** encoders/waits/allocations. Tracked peaks
+  remain **2,174,202,368 / 2,673,553,920 bytes**.
+- Separate 1 ms Metal polling of warmed 65-token requests retained peaks
+  **2,203,205,632 / 2,729,295,872 bytes** and end usage **1,862,516,736 bytes**.
+  RSS high-water marks were roughly **2.128 -> 2.141 GB** base and
+  **2.214 -> 2.216 GB** gundam. RSS is not the admission estimate, and no RSS
+  reduction is claimed.
+- Release build and existing suites passed: **105 Python checks, 7 opt-in
+  skips**, three expected warmup warnings, and **13 native checks**.
+
+Owned probes/private libraries under `data.tmp/probes/moe-prefill-stage/` were
+removed after recording evidence. No permanent tests were added. Persistent
+stress data, model caches and concurrent notebook edits were untouched and
+unstaged.
 
 ## Phase 7: Q4-specific vision GEMM staging
 
