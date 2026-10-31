@@ -16,7 +16,9 @@ checkpoint is also implemented and verified. Phase 7's vision-GEMM prototypes
 were measured; production rollout is deferred because complete-request gains
 were small relative to variation and added dispatch complexity. Phase 8's
 Q4 LM-head scheduling/reduction and paired gate/up checkpoint is implemented
-and verified. CLIP reuse, matrix-tiled sparse prefill, and remaining
+and verified. Phase 9's projection, fused router norm/RoPE, and SIMD routing
+checkpoint is implemented and verified, with the Q8 caveat below. Incremental
+tail summaries, CLIP reuse, matrix-tiled sparse prefill, and remaining
 staging/cached-buffer accounting are not done.
 
 ## Goal and scope
@@ -130,7 +132,7 @@ and broader qualification remains `todo` in phase 2.
 | 6 | Occupancy-aware routed-MoE prefill | Prefill speed | v2 Q4 M16 checkpoint done; mixed-width/compact dispatch not justified |
 | 7 | Q4 vision GEMM staging | Vision speed | investigated; production deferred after small whole-request gains |
 | 8 | Q4 LM-head and decode GEMVs | Decode speed | LM-head/paired gate-up checkpoint done; down GEMVs unchanged |
-| 9 | DASH router/projection specialization | Decode and future longer windows | todo |
+| 9 | DASH router/projection specialization | Decode and future longer windows | Projection/norm/routing checkpoint done; incremental summaries todo |
 
 Files:
 
@@ -1426,27 +1428,175 @@ Reference: [5].
 Outcome: lower router overhead on decode and a qualified path for larger block
 counts, without changing the sparse routing algorithm.
 
-- [ ] todo: Specialize the two small per-layer router Q/K projections for
-  single-token decode; evaluate normalization/RoPE fusion with preserved rounding.
+- [x] done: Specialize single-token router Q/K projections and fuse router
+  normalization/RoPE with preserved rounding.
 - [ ] todo: Maintain incremental tail-summary accumulator state rather than
   recomputing the partial block, with explicit ownership/reset at boundaries.
-- [ ] todo: For larger contexts, benchmark parallel block scoring and top-k
-  merging against the current serial candidate scan and lane-zero insertion.
-- [ ] todo: Preserve top-16 entmax, finite masked sentinels, stable tie handling,
-  FP32 norm semantics, sanitization order, and page-bucket eligibility. Do not
-  substitute the upstream full-candidate routing approximation.
+- [x] done: Benchmark parallel block scoring and SIMD top-16 insertion against
+  serial scoring/lane-zero insertion; qualify bounded score tiles.
+- [x] done: Preserve top-16 entmax, finite masked sentinels, stable ties, FP32
+  norm semantics, sanitization order and page-bucket eligibility. Do not use
+  the upstream full-candidate routing approximation.
 
 QA checkpoint:
 
-- [ ] todo: Compare router projections, summaries, selected blocks, and biases
-  against the current native path and established reference calculations.
-- [ ] todo: Exercise partial/full 32-token blocks, masked candidates, ties,
-  extreme values, and reset/reuse. Keep untested multi-page behavior explicit.
-- [ ] todo: Measure current single-page benefit separately from synthetic
-  longer-context results; do not advertise unimplemented document scheduling.
+- [x] done: Compare projections, norm/RoPE, selected blocks and biases against
+  the native baseline and independent reference calculations.
+- [ ] todo: Compare incremental summary state against full tail recomputation
+  when that separate checkpoint is implemented. Summary code is unchanged here.
+- [x] done: Exercise 32-token boundaries, masked candidates, ties, extremes,
+  failure cleanup and reset/reuse; retain the Q8 caveat below.
+- [x] done: Measure single-page benefit separately from synthetic long-context
+  results. Multi-page generation/continuation remain unimplemented.
 
-QA evidence: not run. See [v2 research notes](unlimitedocr2_research.md) for the
-routing oracle and continuation distinctions.
+### Projection and routing checkpoint evidence (2026-10-31)
+
+Baseline: `7168088`, Apple M1 Pro with 16 GB RAM, pinned models and Release/
+profiling build. Saved baseline native code and metallib were used together.
+
+#### Selected implementation and scope
+
+- `uocr_dash_project_decode_f16` replaces two 1x1280x128 MPS projections with one
+  dispatch: 128 threads, four SIMD groups/output rows per group, separate Q/K
+  grid coordinates. Inputs/weights/outputs remain FP16 and accumulation FP32.
+  Multi-token prefill projections remain on MPS.
+- `uocr_dash_norm_rope_decode_f16` fuses 128-dimensional Gemma RMSNorm and
+  router page RoPE for one-token appends. Normalized values explicitly round
+  to FP16 before the existing separately rounded RoPE products. FP32
+  `1 + weight`, epsilon, frequencies, page parity and later sanitization are
+  unchanged. Main Q/K RoPE is unchanged.
+- SIMD lanes 0..15 retain ordered top-16 entries. A SIMD minimum finds insertion
+  rank and shuffles shift entries. Strict comparison inserts after equal
+  scores, preserving earlier-block ties. Shared helpers retain the original
+  FP32 top-M entmax and centered-prior schedule after gathering the ranks.
+- Prefill/small contexts use one 32-lane SIMD group per query. Single-query
+  routing with **more than 256 keys** uses eight SIMD groups / 256 threads.
+  They score eight adjacent blocks and merge them in original block order.
+  Only **32 bytes** of threadgroup score storage are added; both barriers are
+  unconditional and incomplete tiles are bounded.
+- These are **v2 DASH** paths, shared by mixed Q4/Q8 and FP16 dispatch. V1,
+  model packing/conversion, page guards, retained K/V, summary ownership,
+  sparse attention arithmetic and local-overlap rules are unchanged. No new
+  persistent buffer or estimator change is introduced. Full v2 FP16 OCR is
+  unverified.
+
+#### Benchmark decisions
+
+Small projection GPU timings varied with allocation/run order: roughly 9-20 us
+for two MPS calls versus 8-12 us for the combined projection. Complete OCR was
+the acceptance gate. A projection-only warmed base invoice changed **3.383 ->
+3.307 s**, with matching IDs. Four interleaved base pairs comparing projection-
+only against projection-plus-fused-norm/RoPE changed **3.288 -> 3.268 s**.
+Four gundam pairs adding tiled scoring to SIMD insertion changed **6.795 ->
+6.725 s**. These separate ablations are not additive speed estimates.
+
+Serial lane-zero top-16 insertion was the larger bottleneck. Parallel scoring
+alone retained much of its cost. SIMD insertion removed more; combining both
+helped further. Isolated GPU sweeps used one warmup and three measured command
+buffers, each with 128 dependent dispatches:
+
+| Keys / blocks | Original | Parallel scores only | SIMD insertion | Tiled scores + SIMD insertion |
+|---|---:|---:|---:|---:|
+| 279 / 9 | 36.9 us | 35.1 us | about 9.9 us | 8.5 us |
+| 1024 / 32 | 93.7 us | 81.0 us | about 20.8 us | 13.3 us |
+| 2048 / 64 | 161.2 us | 138.0 us | about 37.1 us | 22.1 us |
+| 8192 / 256 | 521.2 us | 433.7 us | about 126.9 us | 67.5 us |
+| 131072 / 4096 | 7.36 ms | 5.94 ms | about 2.02 ms | 1.06 ms |
+
+The table combines successive isolated sweeps. Long-context numbers do not
+qualify document scheduling. Hardware instruction/register/occupancy counters
+were not collected.
+
+Tail-summary recomputation measured **3.0 / 6.5 / 10.7 / 14.0 / 18.7 us** for
+1/8/16/24/32 entries. Incremental summaries remain **todo**: they need owned
+FP32 accumulator/max/denominator state, reset/boundary rules, estimator updates
+if storage is added, and separate failure qualification. Reconstructing state
+from normalized summaries would change rounding. This stateful work is a
+separate checkpoint.
+
+#### Numerical and edge qualification
+
+- Four synthetic projection cases matched MPS FP16 bits. Real comparisons
+  covered **768 Q/K pairs each** from Q4 base, Q4 gundam and Q8 base (64 decode
+  steps x 12 layers). Fused norm/RoPE covered the same counts. All **589,824
+  FP16 values** in each comparison category matched the baseline.
+- Production selected blocks and biases matched bit-for-bit across **27,228
+  real query/layer outputs**: prefill plus 64 decode steps on those three paths.
+  Diagnostic waits/readbacks were excluded from timing.
+- A further complete Q8 gundam diagnostic compared **4,608 projection pairs**,
+  **4,608 norm/RoPE pairs** and **22,836 query/layer routing outputs**. Every
+  compared value matched on identical inputs, and the final 385 IDs matched
+  baseline. This is not a universal/compiler-independent equivalence proof.
+- Ninety synthetic routing cases covered 15 context sizes from 1 to 131,072
+  keys, block boundaries, ties, same-page masks, no-same-page fallback,
+  all-masked/finite sentinels, extreme negative scores and NaN/infinite queries.
+  Both new paths matched baseline bits. IDs matched an independent FP64 top-M
+  entmax oracle; priors used `2e-4` absolute/relative tolerance.
+- Forty-eight norm/RoPE cases covered token positions 0/1/32/131071, page parity,
+  zero inputs, maximum finite FP16 values, and NaNs/infinities. Outputs matched
+  the separate kernels bit-for-bit.
+- Metal API/GPU shader validation passed synthetic projection, norm/RoPE and
+  routing checks and a 65-token production Q4 base request.
+
+#### Complete OCR and Q8 caveat
+
+Q4 complete baseline IDs, natural EOS and strict parsing matched for base/
+13-view/17-view invoices (385 IDs), blank (19), table (448), edge text (300),
+degraded scan (385) and tiny text (1172). V1 base/gundam invoices matched all
+381 IDs. Q8 base invoices matched all 385 IDs.
+
+**Q8 gundam is not claimed token-identical.** One initial candidate request
+changed one coordinate from **0.211 to 0.210**, with the other 384 IDs unchanged.
+Seventeen further baseline requests exhibited 385/386-ID baseline variation,
+but did not reproduce that specific coordinate. Four later candidate requests
+and the full diagnostic matched the 385-ID baseline. The isolated outlier's
+cause is unresolved; it is recorded under the existing one-coordinate-unit
+Q8 compatibility tolerance, not dismissed as proven baseline variation.
+Deterministic Q8 output and upstream numerical parity remain unverified.
+
+#### Production timing and memory
+
+Final A/B runs warmed both engines, alternated order over four complete invoice
+pairs, and disabled diagnostic checkpoints and memory polling:
+
+| V2 Q4 invoice | Before | After | Saving |
+|---|---:|---:|---:|
+| Base, 385 IDs | 3.494 s | 3.117 s | 376 ms / 10.8% |
+| Gundam, 385 IDs | 7.440 s | 6.734 s | 706 ms / 9.5% |
+
+Every pair improved. Subtracting vision time gave **2.646 -> 2.287 s** base and
+**3.701 -> 2.985 s** gundam. A separate warmed tiny-text check changed **8.670 ->
+7.513 s**, with 1172 identical IDs. The blank-page check improved rather than
+regressed.
+
+Encoders/waits/buffer allocations remained **1039 / 386 / 14** base and
+**3496 / 388 / 18** gundam. MPS NDArray/NSArray counts each fell by **9216** per
+385-ID request, consistent with two fewer MPS calls per layer/decode step.
+Tracked peaks stayed **2,176,307,712 / 2,680,173,056 bytes**. Separate 1 ms Metal
+sampling of 65-token requests retained peaks **2,205,302,784 / 2,735,915,008
+bytes** and end usage **1,862,516,736 bytes**. RSS high-water marks were about
+**2.130 -> 2.130 GB** base and **2.220 -> 2.227 GB** gundam; these include driver,
+compiler and Python state and are not the native admission estimate.
+
+#### Failure, builds and cleanup
+
+- Injected projection-pipeline lookup, post-routing dispatch and post-norm/RoPE
+  dispatch failures cleaned up request allocations and allowed repeated reuse.
+  Reuse also covered complete invoice, blank, capped invoice and complete
+  invoice requests. Actual GPU execution faults were not injected.
+- Runtime-only compilation from generated source in an empty resource directory
+  matched precompiled base/gundam IDs. Regeneration was byte-identical.
+- Release build and existing suites passed: **105 Python checks, 7 opt-in
+  skips**, three expected warmup warnings, and **13 native checks**. Profiling-
+  OFF and budget-rejection probes were not repeated; no memory estimate or
+  persistent allocation changed.
+- Owned probes, private native/shader libraries and logs under
+  `data.tmp/probes/v2-dash-router/` were removed after recording evidence. No
+  permanent tests were added. Persistent stress data and concurrent notebook
+  edits were not modified or staged by this work.
+
+See [v2 research notes](unlimitedocr2_research.md) for the routing oracle and
+continuation distinctions.
 
 ## Deferred work and guardrails
 

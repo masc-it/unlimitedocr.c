@@ -12652,7 +12652,9 @@ static int metal_run_dash_buffer_f16(uocr_metal_context *ctx,
     // Keep prefill and short queries on the scalar path. Tiling pays off for
     // single-query decode once the full 128-token local window is present.
     const int tiled_decode = params.n_queries == 1u && params.query_start >= 127u;
-    const char *names[3] = {"uocr_dash_summary_f16", "uocr_dash_route_f16",
+    const int tiled_route = params.n_queries == 1u && params.n_keys > 256u;
+    const char *names[3] = {"uocr_dash_summary_f16",
+        tiled_route ? "uocr_dash_route_decode_tiled_f16" : "uocr_dash_route_f16",
         tiled_decode ? "uocr_dash_attend_decode_tiled_f16" : "uocr_dash_attend_f16"};
     const uint32_t bindings[3][5] = {
         {DASH_ROUTER_K, DASH_HEAD_CLS, DASH_POSITIONS, DASH_SUMMARIES, DASH_PAGE_RANGES},
@@ -12671,7 +12673,7 @@ static int metal_run_dash_buffer_f16(uocr_metal_context *ctx,
         for (uint32_t stage = 0; stage < 3u; ++stage) {
             id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, names[stage], error, error_size);
             if (pipeline == nil) return 0;
-            const NSUInteger threads = stage == 2u && tiled_decode ? 512u : 32u;
+            const NSUInteger threads = stage == 1u && tiled_route ? 256u : stage == 2u && tiled_decode ? 512u : 32u;
             if (pipeline.threadExecutionWidth != 32u || pipeline.maxTotalThreadsPerThreadgroup < threads)
                 return metal_fail(error, error_size, "DASH requires 32-lane SIMD groups and %llu threads per group",
                                   (unsigned long long)threads);
@@ -12905,6 +12907,35 @@ static void metal_dash_cache_slices(uocr_metal_dash_cache *c, uint32_t layer,
     buffers[DASH_HEAD_CLS].offset += (NSUInteger)((layer*3u + 2u)*256u);
 }
 
+static int metal_run_dash_norm_rope_decode_f16(uocr_metal_context *ctx,
+    const uocr_metal_buffer_slice buffers[4], uocr_metal_buffer_slice positions,
+    char *error, size_t error_size) {
+    if (ctx == NULL || !metal_slice_valid(positions, sizeof(uocr_page_position)))
+        return metal_fail(error, error_size, "invalid DASH decode norm/RoPE positions");
+    for (uint32_t i = 0; i < 4u; ++i) {
+        if (!metal_slice_valid(buffers[i], 256u))
+            return metal_fail(error, error_size, "invalid DASH decode norm/RoPE buffer %u", i);
+    }
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, "uocr_dash_norm_rope_decode_f16", error, error_size);
+        if (pipeline == nil) return 0;
+        if (pipeline.threadExecutionWidth != 32u || pipeline.maxTotalThreadsPerThreadgroup < 32u)
+            return metal_fail(error, error_size, "DASH decode norm/RoPE requires 32-lane SIMD groups");
+        int owned = 0;
+        id<MTLCommandBuffer> cb = metal_command_buffer_for_op(ctx, &owned, "DASH decode norm/RoPE", error, error_size);
+        if (cb == nil) return 0;
+        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
+        if (enc == nil) return metal_fail(error, error_size, "failed to create DASH decode norm/RoPE encoder");
+        [enc setComputePipelineState:pipeline];
+        for (uint32_t i = 0; i < 4u; ++i) [enc setBuffer:buffers[i].buffer offset:buffers[i].offset atIndex:i];
+        [enc setBuffer:positions.buffer offset:positions.offset atIndex:4u];
+        [enc setBytes:ctx->page_rope_inv_freq length:sizeof(ctx->page_rope_inv_freq) atIndex:5u];
+        [enc dispatchThreadgroups:MTLSizeMake(2u, 1u, 1u) threadsPerThreadgroup:MTLSizeMake(32u, 1u, 1u)];
+        metal_end_compute_encoder(ctx, enc);
+        return metal_finish_command_buffer_for_op(ctx, cb, owned, "DASH decode norm/RoPE", error, error_size);
+    }
+}
+
 // Encoder-only path for decoder integration. Q and newly appended K/V/router
 // projections must already occupy their cache slices; no host readback here.
 static int metal_run_cached_dash_layer(uocr_metal_context *ctx, uocr_metal_dash_cache *c,
@@ -12916,9 +12947,11 @@ static int metal_run_cached_dash_layer(uocr_metal_context *ctx, uocr_metal_dash_
     positions.offset += (NSUInteger)c->length * sizeof(uocr_page_position);
     uocr_metal_buffer_slice norms[4] = {buffers[DASH_ROUTER_Q], new_router_k, buffers[DASH_HEAD_CLS], buffers[DASH_HEAD_CLS]};
     norms[2].offset -= 512u; norms[3].offset -= 256u;
-    return metal_run_dash_norm_buffer_f16(ctx, norms, c->pending, error, error_size) &&
+    const int decode = c->pending == 1u;
+    return (decode ? metal_run_dash_norm_rope_decode_f16(ctx, norms, positions, error, error_size)
+                   : metal_run_dash_norm_buffer_f16(ctx, norms, c->pending, error, error_size)) &&
         metal_run_page_rope_qk_buffer_f16(ctx, buffers[DASH_Q], new_k, positions, c->pending, 10u, error, error_size) &&
-        metal_run_page_rope_qk_buffer_f16(ctx, buffers[DASH_ROUTER_Q], new_router_k, positions, c->pending, 1u, error, error_size) &&
+        (decode || metal_run_page_rope_qk_buffer_f16(ctx, buffers[DASH_ROUTER_Q], new_router_k, positions, c->pending, 1u, error, error_size)) &&
         metal_run_dash_buffer_f16(ctx, buffers,
             (uocr_metal_dash_params){c->length + c->pending, c->length, c->pending, c->length / 32u}, error, error_size);
 }
@@ -15286,6 +15319,41 @@ failed:
     return 0;
 }
 
+static int metal_run_dash_projection_f16(uocr_metal_context *ctx,
+    uocr_metal_buffer_slice input, uocr_metal_buffer_slice q_weight, uocr_metal_buffer_slice k_weight,
+    uocr_metal_buffer_slice q, uocr_metal_buffer_slice k, uint32_t n_tokens,
+    char *error, size_t error_size) {
+    if (n_tokens != 1u) {
+        return metal_run_mps_matmul_nt_f16(ctx, input, q_weight, q, n_tokens, UOCR_HIDDEN_SIZE, 128u,
+                   "DASH Q projection", error, error_size) &&
+            metal_run_mps_matmul_nt_f16(ctx, input, k_weight, k, n_tokens, UOCR_HIDDEN_SIZE, 128u,
+                   "DASH K projection", error, error_size);
+    }
+    const uocr_metal_buffer_slice buffers[5] = {input, q_weight, k_weight, q, k};
+    const uint64_t bytes[5] = {UOCR_HIDDEN_SIZE * 2u, UOCR_HIDDEN_SIZE * 256u, UOCR_HIDDEN_SIZE * 256u, 256u, 256u};
+    if (ctx == NULL) return metal_fail(error, error_size, "missing DASH projection context");
+    for (uint32_t i = 0; i < 5u; ++i) {
+        if (!metal_slice_valid(buffers[i], bytes[i]))
+            return metal_fail(error, error_size, "invalid DASH decode projection buffer %u", i);
+    }
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, "uocr_dash_project_decode_f16", error, error_size);
+        if (pipeline == nil) return 0;
+        if (pipeline.threadExecutionWidth != 32u || pipeline.maxTotalThreadsPerThreadgroup < 128u)
+            return metal_fail(error, error_size, "DASH decode projection requires 32-lane SIMD groups and 128 threads");
+        int owned = 0;
+        id<MTLCommandBuffer> cb = metal_command_buffer_for_op(ctx, &owned, "DASH decode projection", error, error_size);
+        if (cb == nil) return 0;
+        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, cb);
+        if (enc == nil) return metal_fail(error, error_size, "failed to create DASH decode projection encoder");
+        [enc setComputePipelineState:pipeline];
+        for (uint32_t i = 0; i < 5u; ++i) [enc setBuffer:buffers[i].buffer offset:buffers[i].offset atIndex:i];
+        [enc dispatchThreadgroups:MTLSizeMake(32u, 2u, 1u) threadsPerThreadgroup:MTLSizeMake(128u, 1u, 1u)];
+        metal_end_compute_encoder(ctx, enc);
+        return metal_finish_command_buffer_for_op(ctx, cb, owned, "DASH decode projection", error, error_size);
+    }
+}
+
 static int metal_run_mapped_dash_attention(uocr_metal_context *ctx,
     uocr_metal_buffer_slice norm, uint32_t layer, uint32_t n_tokens, char *error, size_t error_size) {
     uocr_metal_dash_cache *c = ctx->dash_cache;
@@ -15306,10 +15374,9 @@ static int metal_run_mapped_dash_attention(uocr_metal_context *ctx,
     buffers[DASH_OUTPUT] = norm;
     return metal_run_attention_qkv_buffer_f16(ctx, norm, main->q_proj, main->k_proj, main->v_proj,
                 n_tokens, buffers[DASH_Q], k, v, error, error_size) &&
-        metal_run_mps_matmul_nt_f16(ctx, norm, (uocr_metal_buffer_slice){rq->buffer, rq->offset},
-                buffers[DASH_ROUTER_Q], n_tokens, UOCR_HIDDEN_SIZE, 128u, "DASH Q projection", error, error_size) &&
-        metal_run_mps_matmul_nt_f16(ctx, norm, (uocr_metal_buffer_slice){rk->buffer, rk->offset},
-                router_k, n_tokens, UOCR_HIDDEN_SIZE, 128u, "DASH K projection", error, error_size) &&
+        metal_run_dash_projection_f16(ctx, norm, (uocr_metal_buffer_slice){rq->buffer, rq->offset},
+                (uocr_metal_buffer_slice){rk->buffer, rk->offset}, buffers[DASH_ROUTER_Q], router_k,
+                n_tokens, error, error_size) &&
         metal_run_cached_dash_layer(ctx, c, buffers, error, error_size);
 }
 
