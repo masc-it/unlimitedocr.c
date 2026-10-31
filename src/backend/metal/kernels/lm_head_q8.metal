@@ -176,6 +176,9 @@ static inline void uocr_lm_head_q8_threadgroup_argmax_pair(thread float &best_sc
 
     float best_score = tid < tile_tokens ? partials[tid] : -INFINITY;
     uint best_id = tid < tile_tokens ? partial_ids[tid] : 0xffffffffu;
+    // Finish loading row candidates before the reduction reuses this storage
+    // for SIMD-group winners. Other groups can otherwise overwrite rows 1..7.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     uocr_lm_head_q8_threadgroup_argmax_pair(best_score, best_id, partials, partial_ids, tid, ntg, simd_width);
 
     if (tid == 0u && tile < params.partial_count) {

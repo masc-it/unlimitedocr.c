@@ -18,8 +18,9 @@ were small relative to variation and added dispatch complexity. Phase 8's
 Q4 LM-head scheduling/reduction and paired gate/up checkpoint is implemented
 and verified. Phase 9's projection, fused router norm/RoPE, and SIMD routing
 checkpoint and incremental tail-summary checkpoint are implemented and
-verified. CLIP matrix-tiled attention is qualified for v2 Q4 only; Q8 retains
-its original path and broader repeatability limits are recorded below.
+verified. CLIP matrix-tiled attention remains qualified for v2 Q4 only.
+The Q8/FP16 fused-head selection race is now fixed and repeatability checks
+pass; deferred Q8 optimizations still require requalification below.
 Matrix-tiled sparse prefill and remaining staging/cached-buffer accounting
 are not done.
 
@@ -348,8 +349,8 @@ chunk-size choices have measured speed/memory behavior.
 - [x] done: Qualify four-view local chunks across representative crop counts
   on the M1 Pro and document the tradeoff. Keep the shared default unchanged.
 - [ ] todo: Revisit the unused CLIP FC1 reservation separately. Its cleanup
-  candidate matched allocator/estimator sizes but was reverted while broader
-  Q8 repeatability remains unresolved (see the CLIP checkpoint).
+  candidate matched allocator/estimator sizes but was reverted during the Q8
+  repeatability investigation. Requalify it after the fused-head race fix.
 - [ ] todo: Reuse/account pixel-upload and patch-extraction buffers and account
   cached position-conversion buffers. Keep MPS/driver usage separately visible;
   the native report is still not a complete device-memory cap.
@@ -888,9 +889,10 @@ usual 385-ID invoice, it produced a 382-ID result with changed block type and a
 the exact cause was not isolated. Even the final scalar-Q8/original-workspace
 path produced one 384-ID variant among otherwise 385-ID outputs. All final
 sweep outputs parsed, but they were not token-identical. The accepted change
-therefore makes **no Q8 optimization or determinism claim**. Q8 repeatability
-needs a separate investigation; the evidence must not be reduced to harmless
-coordinate noise or attributed solely to MMA without further tracing.
+therefore made **no Q8 optimization or determinism claim** at that checkpoint.
+The later Q8/FP16 fused-head investigation below reproduced and fixed a
+selection race. These earlier comparisons were confounded by it and must be
+repeated before attributing text/metadata variation to MMA or scratch layout.
 
 #### Complete OCR and production timing
 
@@ -1687,9 +1689,10 @@ changed one coordinate from **0.211 to 0.210**, with the other 384 IDs unchanged
 Seventeen further baseline requests exhibited 385/386-ID baseline variation,
 but did not reproduce that specific coordinate. Four later candidate requests
 and the full diagnostic matched the 385-ID baseline. The isolated outlier's
-cause is unresolved; it is recorded under the existing one-coordinate-unit
-Q8 compatibility tolerance, not dismissed as proven baseline variation.
-Deterministic Q8 output and upstream numerical parity remain unverified.
+cause was unresolved at that checkpoint and was recorded under the existing
+one-coordinate-unit Q8 compatibility tolerance. The later fused-head race fix
+below establishes a concrete source of wrong-token selection. That historical
+outlier was not individually replayed; upstream numerical parity is unverified.
 
 #### Production timing and memory
 
@@ -1849,11 +1852,146 @@ Encoders/waits/allocations remain **1039 / 386 / 14** base and
   after recording evidence. No permanent tests were added. Persistent stress
   data and concurrent notebook edits were left untouched and unstaged.
 
+## Q8/FP16 LM-head repeatability correction
+
+Status: `done` (2026-10-31). Baseline: `5b8f618`, Apple M1 Pro with 16 GB RAM,
+pinned models and Release/profiling build. This is a correctness fix, not a new
+precision policy or an attention optimization.
+
+- [x] done: Reproduce nondeterministic selection with fixed hidden states and
+  exactly representable scores, independently of the rest of inference.
+- [x] done: Trace the shared-memory hazard and audit other reduction callers.
+- [x] done: Fix both affected fused heads without changing arithmetic, filtering,
+  tie handling, dispatch geometry or scratch sizes.
+- [x] done: Replay real inputs, check per-token hidden vectors, and qualify
+  repeated OCR, edge cases, compatibility and both shader-loading paths.
+- [ ] todo: Requalify deferred Q8 attention/scratch candidates against this
+  corrected baseline before enabling them. This fix does not establish
+  universal model/compiler or upstream numerical parity.
+
+### Cause and scope
+
+The Q8 and FP16 fused heads first write 32 vocabulary-row candidates into
+threadgroup arrays. Threads 0..31 then load these scores/IDs into registers.
+The following helper reuses the same arrays for eight SIMD-group winners.
+There was a barrier before the candidate loads, but **none between those loads
+and reuse of the arrays**.
+
+Other SIMD groups have no candidates to load and can reach the helper's stores
+first. Their lane-zero stores overwrite slots **1..7** while the first SIMD
+group may still be loading them. The result is a lost valid candidate, sometimes
+including the true global winner. The effect is not limited to close logits or
+small coordinate changes.
+
+A `threadgroup_barrier(mem_flags::mem_threadgroup)` now separates candidate
+loads from scratch reuse in:
+
+- `uocr_lm_head_argmax_q8_0_to_f16` in `lm_head_q8.metal`;
+- `uocr_lm_head_argmax_f16` in `sampling.metal`.
+
+The Q4 head does not use this scratch-reuse pattern. The generic FP32/pair
+argmax callers start from device inputs/register accumulators and do not alias
+their input candidates with the helper's threadgroup output arrays. They do
+not need the added barrier. No host/API, model file, quantization, tensor
+arithmetic, page/EOS policy or memory-admission change was made.
+
+### Reproduction and numerical evidence
+
+The disposable regression probe used hidden size 1280, vocabulary 16384,
+256 threads, 32 rows per partial and eight lanes per row. Hidden values/scales
+were one. Weight rows at a chosen local slot were one and all other rows zero,
+so every partial had a known winner with exact score **1280**. Repeated
+dispatches wrote separate output regions, avoiding overwritten test evidence.
+Pipeline constants specialized the hidden/vocabulary/tile/lane dimensions as
+in production.
+
+Across slots 0..8/15/31 and 128 repeats per slot:
+
+| Head | Baseline wrong partials | Compared partials | Fixed failures |
+|---|---:|---:|---:|
+| Q8 | 609 | 720896 | 0 |
+| FP16 | 973 | 720896 | 0 |
+
+Failures occurred only in vulnerable slots 1..7. Control slots 0/8/15/31 were
+stable. The same probe then passed **2,844,160 additional comparisons** at the
+canonical vocabulary size 129280 with the fix.
+
+Another **180 cases** covered vocabulary sizes 1/31/33/65/129, hidden sizes
+64/896/1280, ties, excluded ID 0, forced EOS, out-of-range forced IDs/all-masked
+partials and NaN inputs. Both fixed heads matched independent FP64 selection
+and score checks. Metal API/GPU shader validation passed. No scheduling delay
+was injected to manufacture the original failure.
+
+### Real-input localization
+
+A diagnostic backend kept the fixed output for generation and replayed the
+broken head four times on each identical real hidden input. Four complete Q8
+base invoices yielded **identical 985600-byte hidden-vector streams** across
+all 385 steps. Thus, in these runs, differences did not originate in vision,
+MoE prefill, cached state or decoder activations.
+
+The broken replays nevertheless discarded two global winners:
+
+| Step (zero-based) | Correct ID | Broken replay ID | FP64 score margin |
+|---|---:|---:|---:|
+| 22 | 22081 | 38915 | 13.0914825854 |
+| 242 | 47302 | 17639 | 7.33440512565 |
+
+Margins were checked from the actual FP16 hidden vector, Q8 weights and scales.
+The winning IDs occupy local slots 1 and 6 respectively. Many other replay
+partials differed without changing the global winner. Diagnostic readbacks and
+extra dispatches were excluded from ordinary request measurements.
+
+This establishes a concrete cause of the previously observed Q8 token
+variation. Earlier MMA/scratch comparisons were confounded by this selection
+race and do not isolate the effect of those candidates. They must be repeated;
+no deferred optimization is automatically re-enabled by this fix.
+
+### Whole-request and build checks
+
+A fresh baseline run produced two distinct sequences over 12 Q8 base invoice
+requests. After the fix, each of the following series had one exact ID sequence,
+natural EOS and successful strict parsing:
+
+| Path / fixture | Repeats | Output IDs |
+|---|---:|---:|
+| V2 Q8 base invoice | 24 | 385 |
+| V2 Q8 gundam invoice | 12 | 385 |
+| V2 Q8 base blank | 4 | 19 |
+| V2 Q8 base table | 4 | 445 |
+| V1 Q8 base invoice | 4 | 381 |
+| V1 FP16 base invoice | 3 | 381 |
+
+The fixed v2 Q8 invoice matched the usual baseline sequence; the fix prevents
+sporadic loss of that higher-scoring sequence. V1/v2 Q4 base output remained
+identical to saved baseline IDs, and Q4 gundam repeats were identical.
+Full v2 FP16 OCR was not run; its fused-head primitive is covered synthetically.
+
+Runtime-only compilation in an empty resource directory matched precompiled
+v2 Q8 base/gundam and v1 FP16 base output (two requests per path). Generated
+source regeneration was byte-identical. Release build and existing suites
+passed: **105 Python checks, 7 opt-in skips**, three expected warmup warnings,
+and **13 native checks**.
+
+This adds one GPU threadgroup barrier per fused-head partial, with no additional
+CPU wait, encoder, allocation or workspace. Q8 base counters remained
+**1039 encoders / 386 waits / 14 allocations** and tracked peak memory remained
+**3,798,659,584 bytes**. Sequential warmed medians were about **3.362 s before /
+3.379 s after**; these were not interleaved performance runs, so no precise
+latency-regression claim is made. Profiling-OFF, fault injection, admission
+boundaries and device/RSS polling were not repeated for this shader-only fix.
+
+Owned probes, snapshots, private libraries and logs under
+`data.tmp/probes/q8-repeatability/` were removed after recording this evidence.
+No permanent tests were added. Persistent stress data, model caches and
+concurrent notebook edits were untouched and unstaged.
+
 ## Deferred work and guardrails
 
-- [ ] todo: Investigate Q8 repeatability using fixed intermediate tensors and
-  per-token comparisons. Observed variation now includes text/block structure,
-  not only coordinates; no new Q8 attention specialization is qualified.
+- [x] done: Trace and fix the reproduced Q8/FP16 fused-head selection race using
+  fixed-input probes and per-token real-input replay (checkpoint above).
+- [ ] todo: Requalify Q8 attention and CLIP scratch cleanup against the corrected
+  baseline. No deferred candidate is re-enabled by the synchronization fix.
 - [ ] todo: Reassess KV quantization after vision memory and continuation work.
   It changes activation precision and requires separate quality qualification.
 - [ ] todo: Reassess long-window cache allocation after the document scheduler
