@@ -13,7 +13,9 @@ management, KV cache, logits processing, and GPU execution.
 uv add unlimitedocr-c
 ```
 
-> `unlimitedocr-c` is published on PyPI. Version `0.5.0` is the latest release; v2 inference is experimental and single-page only.
+> `unlimitedocr-c` is published on PyPI. Version `0.6.0` is the latest release; v2 inference is experimental and single-page only.
+>
+> [0.6.0 release notes](docs/release_0.6.0.md): faster mixed-Q4 inference, reduced vision memory, and a Q8/FP16 token-selection race fix.
 
 ## Quick start
 
