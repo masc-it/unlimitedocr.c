@@ -18,6 +18,18 @@ extern "C" {
 
 typedef struct uocr_metal_context uocr_metal_context;
 
+int uocr_metal_document_begin(uocr_metal_context *ctx, uint32_t max_page_tokens,
+    uint64_t budget, char *error, size_t error_size);
+void uocr_metal_document_end(uocr_metal_context *ctx);
+int uocr_metal_document_set_window(uocr_metal_context *ctx, uint64_t first_page,
+    uint32_t owned_pages, uint32_t lookahead, char *error, size_t error_size);
+int uocr_metal_document_validate_window(uocr_metal_context *ctx,
+    const uocr_prepared_request *request, char *error, size_t error_size);
+uint64_t uocr_metal_document_bytes(const uocr_metal_context *ctx);
+
+/* Maximum added prompt/context rows for the rewritten image and text tails. */
+#define UOCR_DOCUMENT_EXTRA_ROWS 290u
+
 typedef struct uocr_metal_tensor_binding {
     uint32_t tensor_id;
     uint32_t view_index;

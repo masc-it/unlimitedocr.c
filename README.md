@@ -85,9 +85,43 @@ with Engine(options) as engine:
 This path prepares all supplied images and retains attention state for the entire
 request. Its page count is limited by prompt/output capacity and the memory budget;
 check for EOS to distinguish completion from hitting the output-token limit.
-Multi-page gundam, `stream_pages` / `generate_pages`, and bounded-memory cross-window
-continuation are **not implemented yet**. Separate calls do not preserve document
-context.
+### Streaming documents from source builds
+
+Source builds also provide `stream_pages` and `generate_pages` for v2 base-mode
+pages. Each chunk contains the complete OCR text for one window. The next window
+reuses the preceding image/text tail and the lookahead page's attention cache.
+
+```python
+from contextlib import closing
+from unlimitedocr_c import UnlimitedOCR
+
+with UnlimitedOCR(model="v2", quant="q4") as ocr:
+    pages = (f"page{i}.png" for i in range(1, 7))
+    with closing(ocr.stream_pages(pages, window_pages=1)) as chunks:
+        for text in chunks:
+            print(text, end="", flush=True)
+    # Alternatively: text = ocr.generate_pages(page_paths, window_pages=1)
+```
+
+- `window_pages` defaults to 1; at most that many pages plus one lookahead are
+  read before yielding. Multi-page gundam and PDF rendering are not supported.
+- `max_page_tokens` defaults to 20000 (allowed: 1-20000). Like upstream, reaching
+  this per-page cap forces a page turn or EOS and can truncate page content.
+- `max_output_tokens=None` leaves total document output uncapped. A positive
+  value caps emitted tokens across windows, including page markers but excluding
+  reused text and window stop tokens. A window that exhausts this budget before
+  completion raises without yielding its partial text. Earlier chunks describe
+  an incomplete document; restart from the beginning after fixing the failure.
+- Iterate and close a stream on the same thread. It holds the instance's lock;
+  other threads wait, and reentrant generation/engine closure is rejected. Use
+  `closing` when stopping early. Closing the stream releases continuation state.
+- `generate_pages` joins the same chunks and therefore retains the full output.
+  Caller-preloaded images are also outside the streaming working-memory bound.
+
+Native mixed-Q4 behavior has passed multi-window E2E checks. Upstream SGLang
+runtime comparison and the long-document memory plateau check remain pending.
+Continuation follows upstream's approximate cache-copy approach, not full-history
+inference. Separate API calls start independent documents.
 
 To prepare only the converted model (downloads the checkpoint on first use):
 

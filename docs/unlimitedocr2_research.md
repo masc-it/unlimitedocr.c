@@ -90,7 +90,7 @@ Simply replacing `UOCR_ROPE_THETA` or increasing `UOCR_MAX_POSITIONS` is incorre
 
 Files: `src/unlimitedocr_c/api.py`, `convert.py`, `tensor_registry.py`, `frontend.py`; `src/model/uocr_format.h`, `uocr_constants.h`, `uocr_tensor_registry.h`, `uocr_model_file.c`.
 
-- Implemented: explicit `model="v1"|"v2"` selection and source resolution. Both checkpoints report `model_type=unlimited-ocr`; conversion distinguishes them by the validated sparse-attention contract. Public single-page v2 generation is enabled on Metal. Source builds also accept base-mode multi-page windows through the prepared-request API; cross-window continuation remains pending.
+- Implemented: explicit `model="v1"|"v2"` selection and source resolution. Both checkpoints report `model_type=unlimited-ocr`; conversion distinguishes them by the validated sparse-attention contract. Public single-page v2 generation is enabled on Metal. Source builds also accept base-mode multi-page windows and document streams with retained continuation state. Native mixed-Q4 E2E checks passed; upstream runtime comparison and the long-document memory proof remain pending.
 - Implemented: v2 uses `.uocr` file version 2, retaining the common version-1 subrecords and appending a 60-byte `uocr_v2_config_record` to the config section. It records variant, page token, sparse dimensions/budgets, page RoPE, crop cap, and router scale/floor/sigma. The native loader validates the supported contract. Complete v2 models map into Metal and run through public single-page image generation with model/vision/decoder admission and page-count guarding.
 - Implemented: merge both shard headers and retain per-tensor source-file/offset information. Conversion validates variant-specific counts, sizes, config, and tokenizer. V2's absent `processor_config.json` is replaced by the pinned preprocessing contract, not disabled validation.
 - Implemented: new families `DASH_ROUTER=15` and `SPARSE_INDEXER=16`, with per-layer local IDs 60-64 and 70-73. Existing IDs remain unchanged. Deterministic `position_ids` gets fixed ID 299999, outside the sorted CLIP numbering, and is omitted only after validating its I64 payload.
@@ -106,7 +106,7 @@ Files: `src/unlimitedocr_c/frontend.py`, `api.py`, `ffi.py`, `ocr.py`; `include/
 - Preserve page markers in decoded output. Match the crop limit of 16 and upstream image preparation; base multi-page input pads original images directly to 1024.
 - Implemented for v2 base-mode windows: validate one page marker and 273 image tokens per global view. V1 keeps its contiguous-image contract.
 - Implemented: gather token embeddings and copy visual rows into the ranges selected by the image mask. Keep `<PAGE>` embeddings intact and allocate page counters for all pages plus the instruction bucket. Real Q4 two-/three-page behavior is recorded in the multi-page execution plan; upstream runtime parity remains unverified.
-- Add a user-facing multi-page method; the existing low-level `prepare_pages` is not exposed through the single-image `generate` API. Start with base-mode pages. Multi-page tiling additionally needs per-page crop grids instead of the current single request-wide grid.
+- Implemented: `stream_pages` reads base-mode pages lazily and yields complete-window text; `generate_pages` joins those chunks. The single-image `generate` API is unchanged. Multi-page tiling still needs per-page crop grids and remains deferred.
 
 ### Runtime and Metal
 
@@ -168,5 +168,7 @@ Upstream explicitly describes copy-splice reuse as approximate, validated by OCR
 
 ### Native implementation boundary
 
-Use one request-owned session: window buffers plus a retained-tail record (source slots, image/router K/V, text token IDs, global next-page index, and page counters). Consume at most one window plus one lookahead from the input iterable. Skip SGLang's server queues, cross-request caches, CUDA graphs, and asynchronous prefetch; they are not needed for the native single-session path. Validate capacity for the active window and source/destination tail copies before starting, and fail cleanly if that cannot fit.
+Implemented as one engine-owned document session: active-window buffers plus a fixed retained record containing main K/V, router K, prompt/text IDs, the next global page index and the lookahead's final visual embedding. Cache rows are copied through shared memory only after GPU work completes; the GPU-private visual row is read back through the shared prompt arena. The retained record is 36,260,592 bytes for the current architecture.
+
+The Python API consumes at most one window plus one lookahead. It omits server queues, cross-request caches, CUDA graphs and asynchronous prefetch. Conservative admission includes retained state and rewritten-prompt metadata; the remaining memory/budget audit and long-document RSS proof are tracked in the execution plan. Native behavior is verified across consecutive windows, but comparison with the CUDA SGLang runtime remains blocked locally.
 

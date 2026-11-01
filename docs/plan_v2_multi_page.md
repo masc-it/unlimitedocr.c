@@ -52,7 +52,7 @@ and unrelated notebook edits.
   multi-page Q8/FP16 checks or unit-test runs were performed. Probe files were
   removed after recording these results.
 
-[ ] **document-streaming**: Stream a document across window boundaries.
+[x] **document-streaming**: Stream a document across window boundaries.
 - Add a native session that holds state for one document. Provide the Python
   APIs `stream_pages(images)` and `generate_pages(images)`; the latter collects
   the chunks into one string.
@@ -82,6 +82,32 @@ and unrelated notebook edits.
 - Upstream reuses cached states after rearranging their context, which is an
   approximation. Use its windowed implementation as the reference; Hugging Face inference retaining the full
   history can produce different results.
+
+- **Evidence (2026-11-01):** the Release build and end-of-activity E2E probe passed
+  with Metal API and GPU shader validation. Three 1024px report pages, including
+  text continuing onto the next page, crossed three one-page windows. Every
+  expected line appeared on its own page, in order; streamed and joined text
+  matched. Input consumption stayed within the current window plus one page.
+  Five pages across three two-page windows also passed, as did blank first/last
+  pages and a final window whose image was already cached.
+- Native profile events confirmed prefix restoration, text restoration and
+  lookahead reuse on both consecutive handoffs. The fixed retained state uses
+  36,260,592 bytes; active-window allocations were released between calls, and
+  ending the session returned tracked live memory to model-only usage. This is
+  not the 10x document-length/RSS proof required by the next activity.
+- Early close released both locks and allowed a waiting thread to generate.
+  Reentrant generation/closure, skipped windows, input-iterator errors and short
+  output budgets failed explicitly; the engine remained reusable. An exact
+  emitted-token budget completed; one token less failed. Ordinary single-window
+  output matched the frozen `0c49f51` baseline.
+- The first probe exposed a CPU read of GPU-private vision output. The final
+  embedding now passes through the existing shared prompt buffer before retention;
+  rerunning the complete probe passed. Temporary probes were removed after
+  recording results; no permanent tests or micro-tests were added.
+- **Blocked:** upstream runtime comparison requires the pinned CUDA SGLang
+  implementation, unavailable on this Mac. Its source was re-read, including
+  prompt rewriting, state replay, text splicing and window guards. Native E2E
+  success does not establish upstream numerical or OCR-quality parity.
 
 [ ] **memory-and-recovery**: Verify memory use, limits and recovery.
 - Before starting a window, check that memory can hold its buffers, the retained

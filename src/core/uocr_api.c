@@ -37,6 +37,7 @@ struct uocr_engine {
     uint64_t recommended_working_set_bytes;
     uint64_t model_view_bytes;
     int has_model_file;
+    int document_active;
     uocr_model_file model_file;
     uocr_memory_tracker memory_tracker;
     uocr_runtime_memory_estimate capacity_estimate;
@@ -1047,7 +1048,7 @@ int uocr_engine_profile_reset(uocr_engine *engine) {
     return UOCR_OK;
 }
 
-int uocr_generate_prepared(uocr_engine *engine,
+static int generate_prepared_impl(uocr_engine *engine,
                            const uocr_prepared_request *requests,
                            uint32_t n_requests,
                            uocr_result **out_result) {
@@ -1137,6 +1138,11 @@ int uocr_generate_prepared(uocr_engine *engine,
             const int page_status = uocr_validate_v2_page_request(&requests[i], validation_error, sizeof(validation_error));
             if (page_status != UOCR_OK)
                 return set_engine_errorf(engine, page_status, "request %u page layout invalid: %s", i, validation_error);
+#if UOCR_HAVE_METAL
+            if (engine->document_active && !uocr_metal_document_validate_window(engine->metal,
+                    &requests[i], validation_error, sizeof(validation_error)))
+                return set_engine_errorf(engine, UOCR_ERROR_INVALID_ARGUMENT, "%s", validation_error);
+#endif
         }
         uocr_vision_schedule vision_schedule;
         memset(&vision_schedule, 0, sizeof(vision_schedule));
@@ -1202,8 +1208,11 @@ int uocr_generate_prepared(uocr_engine *engine,
 #if UOCR_HAVE_METAL
     if (v2) {
         uocr_runtime_memory_estimate estimate;
-        const uint32_t tokens = max_prompt_tokens_in_batch + max_new_tokens_in_batch;
-        if (!uocr_metal_v2_decoder_estimate(tokens, max_prompt_tokens_in_batch, max_page_count_in_batch + 1u, &estimate))
+        const uint32_t extra = engine->document_active ? UOCR_DOCUMENT_EXTRA_ROWS : 0u;
+        const uint32_t tokens = max_prompt_tokens_in_batch + max_new_tokens_in_batch + extra;
+        const uint32_t queries = max_prompt_tokens_in_batch + extra;
+        if (!uocr_metal_v2_decoder_estimate(tokens, queries,
+                max_page_count_in_batch + 1u + (engine->document_active ? 1u : 0u), &estimate))
             return set_engine_errorf(engine, UOCR_ERROR_INVALID_ARGUMENT, "invalid v2 retained-window capacity");
         const uint64_t decoder_bytes = estimate.total_bytes;
         estimate.model_views_bytes = engine->model_view_bytes;
@@ -1216,8 +1225,14 @@ int uocr_generate_prepared(uocr_engine *engine,
         const uint64_t decoder_phase = saturated_add_u64(decoder_bytes, estimate.vision_final_features_bytes);
         const uint64_t phase_peak = decoder_phase > estimate.vision_scratch_bytes ? decoder_phase : estimate.vision_scratch_bytes;
         const uint64_t output_bytes = (uint64_t)max_new_tokens_in_batch * sizeof(int32_t) * 2u;
-        const uint64_t subtotal = saturated_add_u64(engine->model_view_bytes, saturated_add_u64(phase_peak, output_bytes));
-        estimate.transient_bytes += output_bytes;
+        // Retained tails coexist with vision and the next decoder cache. Prompt
+        // rewrite/vision metadata has two int32+mask arrays, bounded by queries.
+        const uint64_t doc_bytes = uocr_metal_document_bytes(engine->metal);
+        const uint64_t metadata_bytes = engine->document_active ? (uint64_t)queries * 10u : 0u;
+        const uint64_t subtotal = saturated_add_u64(engine->model_view_bytes,
+            saturated_add_u64(phase_peak, saturated_add_u64(output_bytes, doc_bytes + metadata_bytes)));
+        estimate.kv_cache_bytes += doc_bytes;
+        estimate.transient_bytes += output_bytes + metadata_bytes;
         if (subtotal == UINT64_MAX || uocr_estimate_safety_margin_bytes(subtotal, &estimate.safety_margin_bytes) != UOCR_OK)
             return set_engine_errorf(engine, UOCR_ERROR_OUT_OF_MEMORY, "v2 memory estimate overflow");
         estimate.total_bytes = saturated_add_u64(subtotal, estimate.safety_margin_bytes);
@@ -1279,4 +1294,55 @@ int uocr_generate_prepared(uocr_engine *engine,
     }
     clear_engine_error(engine);
     return UOCR_OK;
+}
+
+int uocr_generate_prepared(uocr_engine *engine, const uocr_prepared_request *requests,
+    uint32_t n_requests, uocr_result **out_result) {
+    if (out_result != NULL) *out_result = NULL;
+    if (engine != NULL && engine->document_active)
+        return set_engine_errorf(engine, UOCR_ERROR_INVALID_ARGUMENT, "close the active document before ordinary generation");
+    return generate_prepared_impl(engine, requests, n_requests, out_result);
+}
+
+int uocr_document_begin(uocr_engine *engine, uint32_t max_page_tokens) {
+    if (engine == NULL || !engine_is_v2(engine) || engine->document_active)
+        return set_engine_errorf(engine, UOCR_ERROR_INVALID_ARGUMENT, "document session requires an idle v2 engine");
+#if UOCR_HAVE_METAL
+    char error[512];
+    if (!uocr_metal_document_begin(engine->metal, max_page_tokens, engine->memory_budget_bytes, error, sizeof(error)))
+        return set_engine_errorf(engine, UOCR_ERROR_INVALID_ARGUMENT, "%s", error);
+    engine->document_active = 1;
+    clear_engine_error(engine);
+    return UOCR_OK;
+#else
+    return set_engine_errorf(engine, UOCR_ERROR_UNSUPPORTED, "documents require Metal");
+#endif
+}
+
+void uocr_document_end(uocr_engine *engine) {
+    if (engine == NULL) return;
+#if UOCR_HAVE_METAL
+    uocr_metal_document_end(engine->metal);
+#endif
+    engine->document_active = 0;
+}
+
+int uocr_document_generate_window(uocr_engine *engine,
+    const uocr_prepared_request *request, uint64_t first_page,
+    uint32_t owned_pages, uint32_t lookahead, uocr_result **out_result) {
+    if (out_result != NULL) *out_result = NULL;
+    if (engine == NULL || !engine->document_active)
+        return set_engine_errorf(engine, UOCR_ERROR_INVALID_ARGUMENT, "no active document session");
+#if UOCR_HAVE_METAL
+    char error[512];
+    if (!uocr_metal_document_set_window(engine->metal, first_page, owned_pages, lookahead, error, sizeof(error))) {
+        uocr_document_end(engine);
+        return set_engine_errorf(engine, UOCR_ERROR_INVALID_ARGUMENT, "%s", error);
+    }
+    const int status = generate_prepared_impl(engine, request, 1u, out_result);
+    if (status != UOCR_OK) uocr_document_end(engine);
+    return status;
+#else
+    return set_engine_errorf(engine, UOCR_ERROR_UNSUPPORTED, "documents require Metal");
+#endif
 }

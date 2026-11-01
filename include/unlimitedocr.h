@@ -155,8 +155,8 @@ typedef struct uocr_engine_opts {
  * Library-level functions (uocr_abi_version, uocr_status_string,
  * uocr_memory_category_name) are safe to call from multiple threads.
  *
- * Callers serialize operations that share one uocr_engine: at most one
- * uocr_generate_prepared / report / reset call runs on an engine at a time.
+ * Callers serialize all operations on one uocr_engine, including document
+ * sessions, generation, reports and resets.
  * Separate uocr_engine instances may be used from separate threads.
  *
  * The engine owner quiesces all calls on an engine before invoking
@@ -182,6 +182,24 @@ UOCR_API int uocr_generate_prepared(uocr_engine *engine,
                                     const uocr_prepared_request *requests,
                                     uint32_t n_requests,
                                     uocr_result **out_result);
+
+/* V2 base-page document session. Calls on its engine remain serialized.
+ * Each window owns consecutive pages and optionally reads one lookahead page.
+ * first_page is zero-based and must follow the preceding successful window.
+ * After the first window, the first view must be the previous lookahead page;
+ * its earlier encoding is reused. Prompts use BOS then PAGE + 273 image tokens
+ * per view, followed by the instruction. Reuse drops BOS and the instruction.
+ * A successful call returns owned-page tokens without EOS or the next-page stop
+ * marker. Exhausting request.max_new_tokens is an error, not a checkpoint.
+ * max_page_tokens (1..20000) can force a page turn/EOS and truncate page content.
+ * Failure ends the session. end is idempotent.
+ * Ordinary generate_prepared calls are rejected while a document is active.
+ */
+UOCR_API int uocr_document_begin(uocr_engine *engine, uint32_t max_page_tokens);
+UOCR_API int uocr_document_generate_window(uocr_engine *engine,
+    const uocr_prepared_request *request, uint64_t first_page,
+    uint32_t owned_pages, uint32_t lookahead, uocr_result **out_result);
+UOCR_API void uocr_document_end(uocr_engine *engine);
 
 UOCR_API uint32_t uocr_result_count(const uocr_result *result);
 UOCR_API const int32_t *uocr_result_tokens(const uocr_result *result,

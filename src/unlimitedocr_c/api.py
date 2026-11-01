@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import base64
 import binascii
+from collections.abc import Iterable, Iterator
+from contextlib import closing
 from io import BytesIO
 import os
 from pathlib import Path
@@ -29,6 +31,7 @@ from .frontend import (
     PRESETS,
     default_tokenizer_path,
     prepare_image,
+    prepare_pages,
 )
 from .ocr import decode_generated_ids, default_resource_path
 from .model_variants import ModelName, MODEL_REPOSITORIES, get_model_variant, model_cache_dir, source_model
@@ -350,9 +353,10 @@ class UnlimitedOCR:
     Thread safety: one instance may be shared by several threads.  A per-object
     lock serializes engine selection, native generation, replacement, and
     ``close()``, so shared calls execute one at a time and ``close()`` waits
-    for the active call.  Image loading and request preparation run before the
-    lock and can overlap across threads.  Applications that want several
-    inference calls in flight create one instance per execution lane.
+    for the active call. Single-image loading and preparation can overlap across
+    threads. Document streams hold the lock until closed and must be consumed
+    and closed on their starting thread. Applications that want several inference
+    calls in flight create one instance per execution lane.
     """
 
     def __init__(
@@ -391,6 +395,7 @@ class UnlimitedOCR:
         self._request_timeout = float(request_timeout)
         self._lock = threading.RLock()
         self._engine: Engine | None = None
+        self._document_active = False
         self._engine_prompt_capacity = 0
         self._engine_gen_capacity = 0
 
@@ -426,6 +431,8 @@ class UnlimitedOCR:
         if lock is None:
             return
         with lock:
+            if getattr(self, "_document_active", False):
+                raise RuntimeError("close the document stream before closing UnlimitedOCR")
             if self._engine is not None:
                 self._engine.close()
                 self._engine = None
@@ -497,6 +504,8 @@ class UnlimitedOCR:
             max_new_tokens=None,
         )
         with self._lock:
+            if self._document_active:
+                raise RuntimeError("close the active document stream before single-page generation")
             engine = self._ensure_engine(
                 prompt_capacity=max(1, request.n_tokens),
                 gen_capacity=max(1, request.max_new_tokens),
@@ -505,6 +514,87 @@ class UnlimitedOCR:
         if len(outputs) != 1:
             raise RuntimeError(f"expected one generated output, got {len(outputs)}")
         return decode_generated_ids(outputs[0], request.tokenizer_path)
+
+    def stream_pages(
+        self, images: Iterable[ImageSource], *, window_pages: int = 1,
+        max_page_tokens: int = 20000, max_output_tokens: int | None = None,
+    ) -> Iterator[str]:
+        """Yield complete window text from ordered base-mode pages (v2 Metal).
+
+        Read at most window_pages + one lookahead page. Each yield contains only
+        owned pages; later windows reuse the preceding image/text tail and the
+        lookahead cache. A failed/incomplete window raises without yielding its
+        partial text. Earlier chunks remain valid but the document is incomplete.
+
+        The stream holds this instance's lock. Iterate and close it on the same
+        thread. Use contextlib.closing when stopping early. Separate instances
+        can process documents concurrently. No PDF rendering is performed.
+        """
+        if self._model != "v2" or self._backend != "metal":
+            raise ValueError("document streaming requires model='v2' and backend='metal'")
+        if type(window_pages) is not int or window_pages < 1:
+            raise ValueError("window_pages must be a positive integer")
+        if type(max_page_tokens) is not int or not 1 <= max_page_tokens <= 20000:
+            raise ValueError("max_page_tokens must be an integer in [1, 20000]")
+        if max_output_tokens is not None and (type(max_output_tokens) is not int or max_output_tokens < 1):
+            raise ValueError("max_output_tokens must be a positive integer or None")
+        prompt_capacity = 5 + (window_pages + 1) * 274
+        output_capacity = window_pages * max_page_tokens + 256
+        if prompt_capacity + output_capacity + 290 > 131072:
+            raise ValueError("window/page limits exceed the v2 context capacity; reduce them")
+        with self._lock:
+            if self._document_active:
+                raise RuntimeError("a document stream is already active")
+            engine = self._ensure_engine(prompt_capacity=prompt_capacity, gen_capacity=output_capacity)
+            self._document_active = True
+            try:
+                with engine.document(max_page_tokens=max_page_tokens):
+                    source = iter(images)
+                    pages: list[Image.Image] = []
+                    exhausted = False
+                    first_page = total_tokens = 0
+                    while True:
+                        remaining = None if max_output_tokens is None else max_output_tokens - total_tokens
+                        if remaining is not None and remaining <= 0:
+                            raise RuntimeError("document output budget exhausted with pages remaining")
+                        while not exhausted and len(pages) < window_pages + 1:
+                            try:
+                                image = next(source)
+                            except StopIteration:
+                                exhausted = True
+                                break
+                            pages.append(load_user_image(image, timeout=self._request_timeout))
+                            del image
+                        if not pages:
+                            return
+                        owned = min(window_pages, len(pages))
+                        lookahead = len(pages) > owned
+                        limit = owned * max_page_tokens + 256
+                        if remaining is not None:
+                            limit = min(limit, remaining)
+                        request = prepare_pages(pages, model="v2", tokenizer_path=self._tokenizer_path,
+                            max_length=131072, max_new_tokens=limit)
+                        ids = engine.document_window(request, first_page=first_page,
+                            owned_pages=owned, lookahead=lookahead)
+                        text = decode_generated_ids(ids, request.tokenizer_path)
+                        total_tokens += int(ids.size)
+                        first_page += owned
+                        pages = pages[-1:] if lookahead else []
+                        del request, ids
+                        yield text
+                        if not lookahead:
+                            return
+            finally:
+                self._document_active = False
+
+    def generate_pages(
+        self, images: Iterable[ImageSource], *, window_pages: int = 1,
+        max_page_tokens: int = 20000, max_output_tokens: int | None = None,
+    ) -> str:
+        """Collect stream_pages into one string, retaining the complete output."""
+        with closing(self.stream_pages(images, window_pages=window_pages,
+                max_page_tokens=max_page_tokens, max_output_tokens=max_output_tokens)) as chunks:
+            return "".join(chunks)
 
 
 __all__ = [

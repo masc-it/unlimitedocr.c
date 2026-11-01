@@ -6,7 +6,7 @@ Status: `todo`
 
 Ship v2 OCR with bounded-memory long-document parsing, without changing v1 behavior. Reuse existing vision, MoE, projection, and quantization kernels. Single-window inference is an intermediate checkpoint, not the finished feature.
 
-Model selection is implemented: `UnlimitedOCR(model="v2", quant="q4")`; default remains v1. Mixed Q4 is the primary v2 quantization profile. Experimental single-page v2 generation works in base/gundam modes (mixed-Q4 and mixed-Q8 verified). Source builds also support base-mode multi-page windows through the prepared-request API (mixed-Q4 verified); upstream parity and cross-window continuation remain pending. Keep `generate(image)`. Add `stream_pages(images)` accepting an iterable of ordered base-mode pages and yielding text chunks; `generate_pages(images)` joins those chunks for convenience. Only the joining API intentionally retains the full output.
+Model selection is implemented: `UnlimitedOCR(model="v2", quant="q4")`; default remains v1. Mixed Q4 is the primary v2 quantization profile. Experimental single-page v2 generation works in base/gundam modes (mixed-Q4 and mixed-Q8 verified). Source builds also support base-mode multi-page windows and document streaming (mixed-Q4 E2E verified); upstream runtime parity and the long-document memory plateau check remain pending. `generate(image)` is unchanged. `stream_pages(images)` accepts an iterable of ordered base-mode pages and yields complete-window text chunks; `generate_pages(images)` joins those chunks for convenience. Only the joining API intentionally retains the full output.
 
 Remaining multi-page work follows the [activity-based execution plan](plan_v2_multi_page.md), with behavioral E2E probes only at activity boundaries.
 
@@ -117,7 +117,7 @@ Outcome: ordered base-mode pages work through the public API; existing Q8/Q4 pat
 Files: frontend/API, `src/runtime/uocr_{request_validation,sequence,vision}.*`, `src/core/uocr_api.c`, Metal prompt assembly/embedding paths; FFI/header only if necessary; `README.md`.
 
 - [done] Replace the v2 single-image-span assumption with mask-driven visual-row copies on GPU. Keep `<PAGE>` embeddings between spans, size page counters from the request, and include that capacity in memory estimates. V1 keeps contiguous-image validation; the public C ABI and attention kernels are unchanged.
-- [todo] Add `generate_pages(images)` using one 1024 global view per page, correct page transitions, and the same attention implementation from phase 2.
+- [done] Add `generate_pages(images)` using one 1024 global view per page and the phase-2 attention implementation. It joins the document stream rather than preparing the entire document at once.
 - [done] Enable existing Q8/Q4 policies for unchanged tensor families; keep DASH weights FP16. Single-page Q4 qualification and primary-profile documentation completed before multi-page work.
 
 QA checkpoint:
@@ -125,7 +125,7 @@ QA checkpoint:
 - [todo] One two-page fixture verifies prompt placement, page coordinates/transitions, output ordering, and EOS guarding against upstream. Reuse this document for FP16/Q8/Q4 smoke checks; compare OCR quality, not exact quantized token equality.
 - [done] Confirm switching v1/v2 cannot reuse the wrong tokenizer/model cache using the offline probe. No new broad benchmark matrix or tests of unchanged vision/MoE math.
 
-QA evidence: the first activity in [the execution plan](plan_v2_multi_page.md) passed real Q4 two-/three-page OCR, page reordering with a blank page, invalid-request rejection and engine reuse. Single-page v1 base and v2 base/gundam outputs matched the frozen baseline. The complete E2E probe passed Metal API validation; GPU shader validation stopped in an unchanged v1 baseline kernel after the v2 checks passed. Upstream runtime comparison and multi-page Q8/FP16 checks remain pending. The high-level joining API will be added with streaming in the next activity.
+QA evidence: the first activity in [the execution plan](plan_v2_multi_page.md) passed real Q4 two-/three-page OCR, page reordering with a blank page, invalid-request rejection and engine reuse. Single-page v1 base and v2 base/gundam outputs matched the frozen baseline. The complete E2E probe passed Metal API validation; GPU shader validation stopped in an unchanged v1 baseline kernel after the v2 checks passed. Upstream runtime comparison and multi-page Q8/FP16 checks remain pending. The high-level joining API now uses the document session described in phase 4.
 
 ## Phase 4: Long documents with bounded working memory
 
@@ -133,16 +133,17 @@ Outcome: `stream_pages` processes documents spanning many windows without retain
 
 Files: Python API/frontend/FFI; native session lifecycle, sequence state, memory planner, vision scheduling, and Metal cache handling.
 
-- [todo] Add a request-owned native document session that can prefill the next window while retaining the exact upstream continuation state. Keep the existing engine lock for the session lifetime; cancellation/error/iterator close releases session buffers and the lock.
-- [todo] Consume pages lazily: one owned-page window plus one lookahead. Reuse the lookahead encoding/KV in the next window. Size buffers from window/page-token limits and the memory budget, including tail-copy headroom. Expose a page-window setting; fail clearly if the minimum cannot fit.
-- [todo] Implement the verified copy-splice contract: retain last-page marker, aligned image tail (128-159 tokens), up to 128 text tokens, and lookahead; copy main/router K/V, rebuild summaries/page state, preserve global page parity, and force the next page marker without duplicating output. Keep window EOS separate from document completion. Fail explicitly on incomplete/noncontiguous continuation.
-- [todo] Yield output incrementally. Keep native token history and Python bookkeeping bounded too; release processed image views and output buffers. The convenience joining API may grow with output size, and caller-owned preloaded images are outside the working-memory guarantee.
-- [todo] Document supported window/token limits and cross-window context behavior. Total document length must not be limited by a single-window positional cap.
+- [done] Add a native document session and hold both Python engine/instance locks until the stream closes. Reentrant calls are rejected; completion, errors and early close release session state.
+- [done] Consume pages lazily with one lookahead and expose `window_pages`. Reuse the lookahead K/V and its final visual embedding, including a cached-only final window. Add conservative admission for the retained state and rewritten prompt; the final accounting/budget audit remains in the next activity.
+- [done] Implement the inspected copy-splice contract: retain the previous marker, aligned image tail, text tail and lookahead; copy main K/V and router K, rebuild summaries/page state, preserve global page parity, and force the next page marker without duplicate output. Incomplete or noncontiguous windows fail explicitly. Upstream runtime equivalence is not established.
+- [done] Yield complete-window text chunks and release completed input/output buffers. Only the joining API intentionally retains all output. The retained record is fixed-size; long-document native/RSS measurements remain pending.
+- [done] Document window/page/document token limits, approximate continuation, same-thread stream ownership, early closure and failure behavior in the README. Only the active window is subject to the model context cap.
 
 QA checkpoint:
 
-- [todo] Use one document spanning at least three small windows, with content continuing across a boundary. Compare with the pinned SGLang scheduler using the same settings: every page appears once, in order, with continuation and window stopping behavior preserved. Full-cache HF output is not the scheduler oracle.
+- [done] Run real Q4 documents across three windows, including text continuing onto the next page, reordered window sizes, blank pages and cached-only final windows. Verify page order, no duplicated output and streamed/joined equality.
+- [todo] Compare continuation with the pinned SGLang scheduler using the same settings. Blocked locally: its CUDA runtime is unavailable. Full-cache HF output is not the scheduler oracle.
 - [todo] Repeat the page input to increase document length by 10x, consume/discard streamed chunks, and measure live/peak native allocations and process memory. With fixed window settings, active memory must plateau rather than grow with completed pages. No broad benchmark suite.
-- [todo] Close a stream mid-document, then reuse the engine successfully. Run the existing fast C/Python suite once before finishing.
+- [done] Close a stream mid-document, then reuse the engine. The E2E probe also covered a waiting caller, input failures, skipped windows, exact/short output budgets and ordinary single-window baseline parity. Per the activity-based plan, no micro-tests or unit-test runs were added.
 
-QA evidence: source inspection complete; runtime checks not run. SGLang windowed inference is the continuation oracle, not full-cache HF. Do not mark bounded-memory support complete until the memory check passes.
+QA evidence: see the document-streaming activity in [the execution plan](plan_v2_multi_page.md). Native E2E passed with Metal API and GPU shader validation. One failed probe exposed a GPU-private vision read; copying through the shared prompt buffer fixed it, and the full probe passed afterward. Upstream runtime comparison is blocked, and the 10x document-length/native/RSS memory check remains pending. Do not mark bounded-memory support complete until that check passes.

@@ -412,6 +412,7 @@ struct uocr_metal_context {
     int v2_decoder_ready;
     uint64_t v2_runtime_accounted[UOCR_MEMORY_CATEGORY_COUNT];
     struct uocr_metal_dash_cache *dash_cache;
+    struct uocr_metal_document *document;
     uocr_metal_kv_cache_layout kv_cache_layout;
     int has_kv_cache_layout;
     int has_integrated_prefill;
@@ -2358,6 +2359,7 @@ void uocr_metal_context_unmap_model(uocr_metal_context *ctx) {
     if (ctx == NULL) {
         return;
     }
+    uocr_metal_document_end(ctx);
     uocr_metal_context_release_dash_cache(ctx);
     if (ctx->model_is_v2) uocr_metal_context_release_runtime_arenas(ctx);
     ctx->model_is_v2 = 0;
@@ -16425,6 +16427,10 @@ int uocr_metal_context_generate_f16(uocr_metal_context *ctx,
     return ok;
 }
 
+static int metal_generate_document_window(uocr_metal_context *ctx,
+    const uocr_prepared_request *request, uocr_metal_decoder_result_f16 *result,
+    char *error, size_t error_size);
+
 static int metal_context_generate_image_f16_impl(uocr_metal_context *ctx,
                                           const uocr_prepared_request *request,
                                           uint32_t max_views_per_chunk,
@@ -16438,6 +16444,8 @@ static int metal_context_generate_image_f16_impl(uocr_metal_context *ctx,
     if (ctx == NULL || request == NULL || result == NULL) {
         return metal_fail(error, error_size, "invalid Metal image generation request");
     }
+    if (ctx->document != NULL)
+        return metal_generate_document_window(ctx, request, result, error, error_size);
     if (ctx->model_is_v2 && (slot != 0u || request->n_tokens > UOCR_V2_MAX_POSITIONS ||
         request->max_new_tokens > UOCR_V2_MAX_POSITIONS - request->n_tokens))
         return metal_fail(error, error_size, "v2 image generation exceeds slot or position limits");
@@ -20497,6 +20505,8 @@ static int run_no_copy_kernel_smoke(uocr_metal_context *ctx, char *error, size_t
     (void)close(fd);
     return ok;
 }
+
+#include "uocr_metal_document.inc"
 
 int uocr_metal_smoke_test(const char *resource_path, char *error, size_t error_size) {
     metal_clear_error(error, error_size);

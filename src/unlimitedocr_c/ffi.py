@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 import ctypes as ct
@@ -332,6 +334,14 @@ def _bind_library(path: Path) -> ct.CDLL:
     lib.uocr_result_tokens.restype = ct.POINTER(ct.c_int32)
     lib.uocr_result_free.argtypes = [ct.c_void_p]
     lib.uocr_result_free.restype = None
+    if hasattr(lib, "uocr_document_begin"):
+        lib.uocr_document_begin.argtypes = [ct.c_void_p, ct.c_uint32]
+        lib.uocr_document_begin.restype = ct.c_int
+        lib.uocr_document_end.argtypes = [ct.c_void_p]
+        lib.uocr_document_end.restype = None
+        lib.uocr_document_generate_window.argtypes = [ct.c_void_p, ct.POINTER(CPreparedRequest),
+            ct.c_uint64, ct.c_uint32, ct.c_uint32, ct.POINTER(ct.c_void_p)]
+        lib.uocr_document_generate_window.restype = ct.c_int
     return lib
 
 
@@ -516,6 +526,7 @@ class Engine:
     def __init__(self, options: EngineOptions | None = None, *, library_path: str | Path | None = None) -> None:
         self._lock = threading.RLock()
         self._handle: ct.c_void_p | None = None
+        self._document_active = False
         self._lib = load_library(library_path)
         opts = options or EngineOptions()
         c_opts = CEngineOpts(
@@ -658,6 +669,8 @@ class Engine:
         if lock is None:
             return
         with lock:
+            if getattr(self, "_document_active", False):
+                raise RuntimeError("close the document stream before closing its engine")
             handle = getattr(self, "_handle", None)
             if handle:
                 self._lib.uocr_engine_close(handle)
@@ -677,6 +690,46 @@ class Engine:
             handle = None if global_error else self._handle
             raw = self._lib.uocr_last_error(handle)
             return raw.decode("utf-8") if raw else ""
+
+    @contextmanager
+    def document(self, *, max_page_tokens: int) -> Iterator[None]:
+        """Hold the engine for a document; enter/exit on the same thread."""
+        with self._lock:
+            if self._document_active:
+                raise RuntimeError("a document is already active on this engine")
+            if not hasattr(self._lib, "uocr_document_begin"):
+                raise RuntimeError("native library lacks document sessions; rebuild it")
+            if not 1 <= max_page_tokens <= 20000:
+                raise ValueError("max_page_tokens must be in [1, 20000]")
+            status = self._lib.uocr_document_begin(self._require_open(), max_page_tokens)
+            if status != UOCR_OK:
+                raise RuntimeError(f"uocr_document_begin failed ({status}): {self.last_error()}")
+            self._document_active = True
+            try:
+                yield
+            finally:
+                self._lib.uocr_document_end(self._require_open())
+                self._document_active = False
+
+    def document_window(self, request: PreparedRequest, *, first_page: int,
+                        owned_pages: int, lookahead: bool) -> NDArray[np.int32]:
+        """Return only this window's owned output; incomplete windows raise."""
+        keepalive = as_c_request(request)
+        with self._lock:
+            if not self._document_active:
+                raise RuntimeError("no active document session")
+            result = ct.c_void_p()
+            status = self._lib.uocr_document_generate_window(self._require_open(),
+                ct.byref(keepalive.c_request), first_page, owned_pages, int(lookahead), ct.byref(result))
+            if status != UOCR_OK:
+                raise RuntimeError(f"uocr_document_generate_window failed ({status}): {self.last_error()}")
+            try:
+                outputs = _copy_result_tokens(self._lib, result)
+                if len(outputs) != 1:
+                    raise RuntimeError("document window returned an invalid result count")
+                return outputs[0]
+            finally:
+                self._lib.uocr_result_free(result)
 
     def generate_prepared(self, requests: PreparedRequest | Sequence[PreparedRequest]) -> list[NDArray[np.int32]]:
         if isinstance(requests, PreparedRequest):
