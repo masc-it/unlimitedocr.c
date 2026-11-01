@@ -179,6 +179,9 @@ int uocr_plan_vision_schedule(const uocr_prepared_request *request,
 
     uocr_request_limits limits;
     memset(&limits, 0, sizeof(limits));
+    // Vision consumes views in order; model-specific prompt layout is checked
+    // by the generation boundary, not by this shared image scheduler.
+    limits.allow_separated_images = 1u;
     const int validation_status = uocr_validate_prepared_request(request, &limits, error, error_size);
     if (validation_status != UOCR_OK) {
         return validation_status;

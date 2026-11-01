@@ -21,7 +21,8 @@ typedef struct uocr_sequence_state {
     uint32_t token_history_count;
     uint32_t prompt_token_count;
     uint32_t image_span_start;
-    uint32_t image_span_length;
+    uint32_t image_span_length; /* enclosing range; may include text in masked requests */
+    uint32_t image_token_count;
     uint32_t text_prefix_length;
     uint32_t text_suffix_start;
     uint32_t text_suffix_length;
@@ -35,6 +36,14 @@ int uocr_build_sequence_state(const uocr_prepared_request *request,
                               uocr_sequence_state *out_state,
                               char *error,
                               size_t error_size);
+
+/* Build state for image tokens in multiple spans. The caller validates page
+ * layout; image_span_* describes the enclosing range, not a visual-row map.
+ */
+int uocr_build_masked_sequence_state(const uocr_prepared_request *request,
+                                     uocr_sequence_state *out_state,
+                                     char *error,
+                                     size_t error_size);
 
 /* True when the decode loop must stop for this sequence.  Generation stops
  * after EOS token id 1 has been emitted or after max_new_tokens have been

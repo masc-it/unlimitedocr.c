@@ -42,7 +42,7 @@ for image_path in ["page-1.png", "page-2.png", "page-3.png"]:
 ocr.close()
 ```
 
-## Unlimited-OCR-2 (experimental single-page support)
+## Unlimited-OCR-2 (experimental)
 
 Experimental native v2 **single-page** OCR works in `base` and `gundam` modes.
 Mixed Q4 is the primary v2 quantization profile. Both Q4 and Q8 have passed
@@ -58,9 +58,36 @@ with UnlimitedOCR(model="v2", quant="q4") as ocr:
 ```
 
 V2 requires Metal and preserves its page/block markup in output. It warms GPU
-pipelines on the first image request. Multi-page generation and bounded-memory
-cross-window continuation are **not implemented yet**; separate `generate` calls
-do not preserve document context.
+pipelines on the first image request. The published 0.6.0 wheel supports single
+pages only. Source builds also accept multiple **base-mode** pages within one
+bounded request, through `prepare_pages` and `Engine.generate_prepared`:
+
+```python
+from unlimitedocr_c import resolve_model_path
+from unlimitedocr_c.frontend import prepare_pages
+from unlimitedocr_c.ffi import Engine, EngineOptions
+from unlimitedocr_c.ocr import default_resource_path, generate_prepared
+
+request = prepare_pages(["page1.png", "page2.png"], model="v2", max_new_tokens=2048)
+options = EngineOptions(
+    model_path=str(resolve_model_path(model="v2", quant="q4")),
+    backend="metal", resource_path=default_resource_path(),
+    max_prompt_tokens=request.n_tokens, max_gen_tokens=request.max_new_tokens,
+    warmup=False,
+)
+with Engine(options) as engine:
+    result = generate_prepared(request, engine=engine)
+    if result.token_ids[-1] != 1:  # EOS
+        raise RuntimeError("OCR reached its output-token limit")
+    print(result.text)
+```
+
+This path prepares all supplied images and retains attention state for the entire
+request. Its page count is limited by prompt/output capacity and the memory budget;
+check for EOS to distinguish completion from hitting the output-token limit.
+Multi-page gundam, `stream_pages` / `generate_pages`, and bounded-memory cross-window
+continuation are **not implemented yet**. Separate calls do not preserve document
+context.
 
 To prepare only the converted model (downloads the checkpoint on first use):
 

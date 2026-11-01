@@ -11,12 +11,17 @@ typedef struct uocr_request_limits {
     uint32_t max_gen_tokens;
     uint32_t max_position_tokens;   /* 0 = no model-position limit */
     uint32_t generated_ring_window; /* 0 = no KV generated-ring capacity check */
+    uint32_t allow_separated_images; /* v2 page markers may separate image spans */
 } uocr_request_limits;
 
 int uocr_validate_prepared_request(const uocr_prepared_request *request,
                                    const uocr_request_limits *limits,
                                    char *error,
                                    size_t error_size);
+
+/* Requires a request that passed uocr_validate_prepared_request. */
+int uocr_validate_v2_page_request(const uocr_prepared_request *request,
+                                   char *error, size_t error_size);
 
 uint32_t uocr_count_image_placeholders(const uocr_prepared_request *request);
 

@@ -563,6 +563,11 @@ def prepare_pages(images: Sequence[ImageInput],
                   max_length: int = 32768,
                   max_new_tokens: int | None = None,
                   dtype: np.dtype[Any] | type[np.float16] | type[np.float32] = np.float16) -> PreparedRequest:
+    """Prepare ordered 1024px global views for one bounded document window.
+
+    V2 keeps a <PAGE> marker before each page's image tokens. This prepares all
+    supplied pages eagerly; streaming across windows is not supported here.
+    """
     get_model_variant(model)
     if not images:
         raise ValueError("prepare_pages requires at least one image")

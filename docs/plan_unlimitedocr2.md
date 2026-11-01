@@ -6,7 +6,9 @@ Status: `todo`
 
 Ship v2 OCR with bounded-memory long-document parsing, without changing v1 behavior. Reuse existing vision, MoE, projection, and quantization kernels. Single-window inference is an intermediate checkpoint, not the finished feature.
 
-Model selection is implemented: `UnlimitedOCR(model="v2", quant="q4")`; default remains v1. Mixed Q4 is the primary v2 quantization profile. Experimental single-page v2 generation works in base/gundam modes (mixed-Q4 and mixed-Q8 verified); upstream parity and multi-page/windowed generation remain pending. Keep `generate(image)`. Add `stream_pages(images)` accepting an iterable of ordered base-mode pages and yielding text chunks; `generate_pages(images)` joins those chunks for convenience. Only the joining API intentionally retains the full output.
+Model selection is implemented: `UnlimitedOCR(model="v2", quant="q4")`; default remains v1. Mixed Q4 is the primary v2 quantization profile. Experimental single-page v2 generation works in base/gundam modes (mixed-Q4 and mixed-Q8 verified). Source builds also support base-mode multi-page windows through the prepared-request API (mixed-Q4 verified); upstream parity and cross-window continuation remain pending. Keep `generate(image)`. Add `stream_pages(images)` accepting an iterable of ordered base-mode pages and yielding text chunks; `generate_pages(images)` joins those chunks for convenience. Only the joining API intentionally retains the full output.
+
+Remaining multi-page work follows the [activity-based execution plan](plan_v2_multi_page.md), with behavioral E2E probes only at activity boundaries.
 
 Detailed tensor inventory, math, source links, and pitfalls: [research notes](unlimitedocr2_research.md).
 Pinned HF revision: `c14071b549f4fcab10909f3c4acc6a2edb366947`.
@@ -114,7 +116,7 @@ Outcome: ordered base-mode pages work through the public API; existing Q8/Q4 pat
 
 Files: frontend/API, `src/runtime/uocr_{request_validation,sequence,vision}.*`, `src/core/uocr_api.c`, Metal prompt assembly/embedding paths; FFI/header only if necessary; `README.md`.
 
-- [todo] Replace the single-image-span assumption with a mask-driven visual-row mapping. Keep `<PAGE>` embeddings between image spans; reuse the existing request image mask and avoid a public ABI change unless needed.
+- [done] Replace the v2 single-image-span assumption with mask-driven visual-row copies on GPU. Keep `<PAGE>` embeddings between spans, size page counters from the request, and include that capacity in memory estimates. V1 keeps contiguous-image validation; the public C ABI and attention kernels are unchanged.
 - [todo] Add `generate_pages(images)` using one 1024 global view per page, correct page transitions, and the same attention implementation from phase 2.
 - [done] Enable existing Q8/Q4 policies for unchanged tensor families; keep DASH weights FP16. Single-page Q4 qualification and primary-profile documentation completed before multi-page work.
 
@@ -123,7 +125,7 @@ QA checkpoint:
 - [todo] One two-page fixture verifies prompt placement, page coordinates/transitions, output ordering, and EOS guarding against upstream. Reuse this document for FP16/Q8/Q4 smoke checks; compare OCR quality, not exact quantized token equality.
 - [done] Confirm switching v1/v2 cannot reuse the wrong tokenizer/model cache using the offline probe. No new broad benchmark matrix or tests of unchanged vision/MoE math.
 
-QA evidence: single-page mixed-Q4/Q8 qualification is recorded in phase 2. Multi-page checks have not run.
+QA evidence: the first activity in [the execution plan](plan_v2_multi_page.md) passed real Q4 two-/three-page OCR, page reordering with a blank page, invalid-request rejection and engine reuse. Single-page v1 base and v2 base/gundam outputs matched the frozen baseline. The complete E2E probe passed Metal API validation; GPU shader validation stopped in an unchanged v1 baseline kernel after the v2 checks passed. Upstream runtime comparison and multi-page Q8/FP16 checks remain pending. The high-level joining API will be added with streaming in the next activity.
 
 ## Phase 4: Long documents with bounded working memory
 

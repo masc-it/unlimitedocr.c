@@ -22,7 +22,7 @@ static int sequence_token_id_valid(int32_t token_id) {
     return token_id >= 0 && (uint32_t)token_id < UOCR_VOCAB_SIZE;
 }
 
-int uocr_build_sequence_state(const uocr_prepared_request *request,
+int uocr_build_masked_sequence_state(const uocr_prepared_request *request,
                               uocr_sequence_state *out_state,
                               char *error,
                               size_t error_size) {
@@ -71,21 +71,25 @@ int uocr_build_sequence_state(const uocr_prepared_request *request,
         return UOCR_OK;
     }
 
-    const uint32_t image_span_length = last_image - first_image + 1u;
-    if (image_span_length != image_count) {
-        return fail(error,
-                    error_size,
-                    "image placeholders must be one contiguous span; first=%u last=%u count=%u",
-                    first_image,
-                    last_image,
-                    image_count);
-    }
-
     state.image_span_start = first_image;
-    state.image_span_length = image_span_length;
+    state.image_span_length = last_image - first_image + 1u;
+    state.image_token_count = image_count;
     state.text_prefix_length = first_image;
     state.text_suffix_start = last_image + 1u;
     state.text_suffix_length = request->n_tokens - state.text_suffix_start;
+    *out_state = state;
+    return UOCR_OK;
+}
+
+int uocr_build_sequence_state(const uocr_prepared_request *request,
+                              uocr_sequence_state *out_state,
+                              char *error, size_t error_size) {
+    if (out_state == NULL) return fail(error, error_size, "out_state must be non-null");
+    uocr_sequence_state state;
+    const int status = uocr_build_masked_sequence_state(request, &state, error, error_size);
+    if (status != UOCR_OK) return status;
+    if (state.image_span_length != state.image_token_count)
+        return fail(error, error_size, "image placeholders must be one contiguous span");
     *out_state = state;
     return UOCR_OK;
 }

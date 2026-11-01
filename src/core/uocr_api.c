@@ -622,14 +622,16 @@ static int generate_metal_image_fp16(uocr_engine *engine,
     memset(validation_error, 0, sizeof(validation_error));
     uocr_sequence_state sequence_state;
     memset(&sequence_state, 0, sizeof(sequence_state));
-    int status = uocr_build_sequence_state(request, &sequence_state, validation_error, sizeof(validation_error));
+    int status = engine_is_v2(engine)
+        ? uocr_build_masked_sequence_state(request, &sequence_state, validation_error, sizeof(validation_error))
+        : uocr_build_sequence_state(request, &sequence_state, validation_error, sizeof(validation_error));
     if (status != UOCR_OK) {
         return set_engine_errorf(engine,
                                  status,
-                                 "Metal fp16 image generation requires one contiguous image span: %s",
+                                 "Metal image generation sequence validation failed: %s",
                                  validation_error[0] != '\0' ? validation_error : "unknown error");
     }
-    if (sequence_state.image_span_start == UOCR_SEQUENCE_NO_IMAGE_SPAN || sequence_state.image_span_length == 0u) {
+    if (sequence_state.image_token_count == 0u) {
         return set_engine_errorf(engine,
                                  UOCR_ERROR_INVALID_ARGUMENT,
                                  "Metal fp16 image generation requires at least one image placeholder");
@@ -656,11 +658,11 @@ static int generate_metal_image_fp16(uocr_engine *engine,
                                  UOCR_ERROR_INVALID_ARGUMENT,
                                  "Metal fp16 image generation requires image views that produce visual features");
     }
-    if (sequence_state.image_span_length != vision_schedule.final_visual_tokens) {
+    if (sequence_state.image_token_count != vision_schedule.final_visual_tokens) {
         return set_engine_errorf(engine,
                                  UOCR_ERROR_INVALID_ARGUMENT,
-                                 "Metal fp16 image generation image span length %u does not match formatted visual rows %u",
-                                 sequence_state.image_span_length,
+                                 "Metal image generation image token count %u does not match formatted visual rows %u",
+                                 sequence_state.image_token_count,
                                  vision_schedule.final_visual_tokens);
     }
 
@@ -1094,9 +1096,11 @@ int uocr_generate_prepared(uocr_engine *engine,
     limits.max_gen_tokens = engine->max_gen_tokens;
     const int v2 = engine_is_v2(engine);
     if (v2 && n_requests != 1u)
-        return set_engine_errorf(engine, UOCR_ERROR_UNSUPPORTED, "v2 currently supports one single-page request at a time");
+        return set_engine_errorf(engine, UOCR_ERROR_UNSUPPORTED, "v2 supports one document window per call");
     limits.max_position_tokens = v2 ? UOCR_V2_MAX_POSITIONS : UOCR_MAX_POSITIONS;
     limits.generated_ring_window = v2 ? 0u : UOCR_GENERATED_RING_WINDOW;
+    limits.allow_separated_images = (uint32_t)v2;
+    uint32_t max_page_count_in_batch = 0u;
     uint32_t max_prompt_tokens_in_batch = 0u;
     uint32_t max_new_tokens_in_batch = 0u;
     uint32_t max_visual_tokens_in_batch = 0u;
@@ -1129,23 +1133,10 @@ int uocr_generate_prepared(uocr_engine *engine,
                                      current_metal_arena_prompt_token_capacity(engine),
                                      (unsigned long long)current_metal_arena_bytes(engine));
         }
-        uocr_sequence_state sequence_state;
-        const int state_status = uocr_build_sequence_state(&requests[i], &sequence_state, validation_error, sizeof(validation_error));
-        if (state_status != UOCR_OK) {
-            return set_engine_errorf(engine, state_status, "request %u state build failed: %s", i, validation_error);
-        }
         if (v2) {
-            uint32_t markers = 0u, globals = 0u, locals = 0u;
-            for (uint32_t j = 0u; j < requests[i].n_tokens; ++j) markers += requests[i].input_ids[j] == UOCR_TOKEN_PAGE;
-            for (uint32_t j = 0u; j < requests[i].n_views; ++j) {
-                globals += requests[i].views[j].kind == UOCR_VIEW_GLOBAL;
-                locals += requests[i].views[j].kind == UOCR_VIEW_LOCAL;
-            }
-            if (markers != 1u || globals != 1u || locals > 16u || sequence_state.image_span_length == 0u ||
-                sequence_state.image_span_start == 0u ||
-                requests[i].input_ids[sequence_state.image_span_start - 1u] != UOCR_TOKEN_PAGE)
-                return set_engine_errorf(engine, UOCR_ERROR_INVALID_ARGUMENT,
-                    "v2 requires one <PAGE> immediately before its image span, one global view, and at most 16 local crops; multi-page/text-only generation is not enabled");
+            const int page_status = uocr_validate_v2_page_request(&requests[i], validation_error, sizeof(validation_error));
+            if (page_status != UOCR_OK)
+                return set_engine_errorf(engine, page_status, "request %u page layout invalid: %s", i, validation_error);
         }
         uocr_vision_schedule vision_schedule;
         memset(&vision_schedule, 0, sizeof(vision_schedule));
@@ -1160,6 +1151,8 @@ int uocr_generate_prepared(uocr_engine *engine,
         if (vision_status != UOCR_OK) {
             return set_engine_errorf(engine, vision_status, "request %u vision scheduling failed: %s", i, validation_error);
         }
+        if (vision_schedule.global_view_count > max_page_count_in_batch)
+            max_page_count_in_batch = vision_schedule.global_view_count;
         requested_views_in_batch += (uint64_t)requests[i].n_views;
         if (vision_schedule.final_visual_tokens > max_visual_tokens_in_batch) {
             max_visual_tokens_in_batch = vision_schedule.final_visual_tokens;
@@ -1210,7 +1203,7 @@ int uocr_generate_prepared(uocr_engine *engine,
     if (v2) {
         uocr_runtime_memory_estimate estimate;
         const uint32_t tokens = max_prompt_tokens_in_batch + max_new_tokens_in_batch;
-        if (!uocr_metal_v2_decoder_estimate(tokens, max_prompt_tokens_in_batch, 2u, &estimate))
+        if (!uocr_metal_v2_decoder_estimate(tokens, max_prompt_tokens_in_batch, max_page_count_in_batch + 1u, &estimate))
             return set_engine_errorf(engine, UOCR_ERROR_INVALID_ARGUMENT, "invalid v2 retained-window capacity");
         const uint64_t decoder_bytes = estimate.total_bytes;
         estimate.model_views_bytes = engine->model_view_bytes;

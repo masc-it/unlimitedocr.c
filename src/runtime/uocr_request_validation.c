@@ -147,7 +147,10 @@ static int expected_visual_tokens(const uocr_prepared_request *request,
                         request->crop_grid_w,
                         request->crop_grid_h);
         }
-        *out_expected = globals * UOCR_GLOBAL_VISUAL_TOKENS;
+        const uint64_t total = (uint64_t)globals * UOCR_GLOBAL_VISUAL_TOKENS;
+        if (total > UINT32_MAX)
+            return fail(error, error_size, "global visual token count overflow");
+        *out_expected = (uint32_t)total;
         return UOCR_OK;
     }
 
@@ -191,6 +194,37 @@ static int expected_visual_tokens(const uocr_prepared_request *request,
         return fail(error, error_size, "visual token count overflow for crop grid %ux%u", request->crop_grid_w, request->crop_grid_h);
     }
     *out_expected = (uint32_t)total;
+    return UOCR_OK;
+}
+
+int uocr_validate_v2_page_request(const uocr_prepared_request *request,
+                                   char *error, size_t error_size) {
+    uint32_t globals = 0u, locals = 0u, pages = 0u;
+    for (uint32_t i = 0u; i < request->n_views; ++i) {
+        globals += request->views[i].kind == UOCR_VIEW_GLOBAL;
+        locals += request->views[i].kind == UOCR_VIEW_LOCAL;
+    }
+    if (globals == 0u || locals > 16u || (locals != 0u && globals != 1u))
+        return fail(error, error_size,
+                    "v2 requires base-mode pages or one page with at most 16 local crops");
+
+    for (uint32_t i = 0u; i < request->n_tokens;) {
+        if (request->input_ids[i] == UOCR_TOKEN_PAGE) {
+            if (i + 1u == request->n_tokens || request->image_mask[i + 1u] == 0u)
+                return fail(error, error_size, "v2 <PAGE> at token %u must precede an image span", i);
+            ++pages;
+        }
+        if (request->image_mask[i] == 0u) { ++i; continue; }
+        const uint32_t start = i;
+        if (start == 0u || request->input_ids[start - 1u] != UOCR_TOKEN_PAGE)
+            return fail(error, error_size, "v2 image span at token %u requires a preceding <PAGE>", start);
+        while (i < request->n_tokens && request->image_mask[i] != 0u) ++i;
+        if (locals == 0u && i - start != UOCR_GLOBAL_VISUAL_TOKENS)
+            return fail(error, error_size, "v2 base page requires %u image tokens, got %u",
+                        UOCR_GLOBAL_VISUAL_TOKENS, i - start);
+    }
+    if (pages != globals)
+        return fail(error, error_size, "v2 page count %u does not match global view count %u", pages, globals);
     return UOCR_OK;
 }
 
@@ -271,7 +305,8 @@ int uocr_validate_prepared_request(const uocr_prepared_request *request,
                         UOCR_TOKEN_IMAGE);
         }
     }
-    if (image_placeholders != 0u && last_image - first_image + 1u != image_placeholders) {
+    if (!limits->allow_separated_images && image_placeholders != 0u &&
+        last_image - first_image + 1u != image_placeholders) {
         return fail(error,
                     error_size,
                     "image placeholders must be one contiguous span; first=%u last=%u count=%u",

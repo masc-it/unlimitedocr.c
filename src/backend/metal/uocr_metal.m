@@ -15858,6 +15858,36 @@ int uocr_metal_context_v2_raw_argmax(uocr_metal_context *ctx, int32_t *token_id,
     return metal_v2_argmax(ctx, 0u, token_id, score, error, error_size);
 }
 
+static int metal_assemble_v2_page_prompt(uocr_metal_context *ctx,
+    const uocr_metal_decoder_request_f16 *r, id<MTLBuffer> visual, NSUInteger visual_offset,
+    char *error, size_t error_size) {
+    // Gather token embeddings first, then replace only masked rows. PAGE and
+    // instruction embeddings between image spans must remain intact.
+    if (!metal_context_assemble_prompt_from_model_to_arena_f16(ctx, r->input_ids, r->n_tokens,
+            UINT32_MAX, 0u, NULL, nil, 0u, r->slot, error, error_size)) return 0;
+    uocr_metal_buffer_slice prompt;
+    uint64_t prompt_bytes;
+    if (!metal_prompt_arena_slice(ctx, r->slot, r->n_tokens, &prompt, &prompt_bytes))
+        return metal_fail(error, error_size, "v2 page prompt workspace is invalid");
+    const NSUInteger row_bytes = UOCR_HIDDEN_SIZE * sizeof(uint16_t);
+    uint32_t visual_row = 0u;
+    const uint64_t blit_start = uocr_profile_now_ns();
+    for (uint32_t i = 0u; i < r->n_tokens;) {
+        if (r->image_mask[i] == 0u) { ++i; continue; }
+        const uint32_t start = i;
+        while (i < r->n_tokens && r->image_mask[i] != 0u) ++i;
+        const uint32_t rows = i - start;
+        const uocr_metal_buffer_slice src = {visual, visual_offset + (NSUInteger)visual_row * row_bytes};
+        const uocr_metal_buffer_slice dst = {prompt.buffer, prompt.offset + (NSUInteger)start * row_bytes};
+        if (!metal_copy_slice(ctx, src, dst, (uint64_t)rows * row_bytes,
+                "v2 page visual rows", error, error_size)) return 0;
+        visual_row += rows;
+    }
+    metal_profile_add_event_now(ctx, "metal.prompt.image_span_blit", blit_start);
+    metal_profile_add_event_now(ctx, "metal.prefill.image_span_blit", blit_start);
+    return 1;
+}
+
 static int metal_context_generate_v2_f16(uocr_metal_context *ctx,
     const uocr_metal_decoder_request_f16 *r, id<MTLBuffer> visual, NSUInteger visual_offset,
     uocr_metal_decoder_result_f16 *result, char *error, size_t error_size) {
@@ -15870,8 +15900,7 @@ static int metal_context_generate_v2_f16(uocr_metal_context *ctx,
     // has completed. Prompt/embedding, forward and selection then share a batch.
     if (!uocr_metal_context_dash_begin(ctx, r->input_ids, r->n_tokens, 0, error, error_size) ||
         !metal_command_batch_begin(ctx, error, error_size) ||
-        !metal_context_assemble_prompt_from_model_to_arena_f16(ctx, r->input_ids, r->n_tokens,
-            r->image_span_start, r->image_span_length, NULL, visual, visual_offset, 0u, error, error_size) ||
+        !metal_assemble_v2_page_prompt(ctx, r, visual, visual_offset, error, error_size) ||
         !metal_encode_v2_arena(ctx, error, error_size)) goto failed;
     uocr_page_guard guard = {ctx->dash_cache->pages.prompt_pages, 20000u, 0u, 0u};
     for (uint32_t i = 0u; i < r->max_new_tokens; ++i) {
@@ -16424,15 +16453,17 @@ static int metal_context_generate_image_f16_impl(uocr_metal_context *ctx,
     detail[0] = '\0';
     uocr_sequence_state sequence_state;
     memset(&sequence_state, 0, sizeof(sequence_state));
-    int status = uocr_build_sequence_state(request, &sequence_state, detail, sizeof(detail));
+    int status = ctx->model_is_v2
+        ? uocr_build_masked_sequence_state(request, &sequence_state, detail, sizeof(detail))
+        : uocr_build_sequence_state(request, &sequence_state, detail, sizeof(detail));
     if (status != UOCR_OK) {
         return metal_fail(error,
                           error_size,
                           "Metal image generation sequence validation failed: %s",
                           detail[0] != '\0' ? detail : uocr_status_string(status));
     }
-    if (sequence_state.image_span_start == UOCR_SEQUENCE_NO_IMAGE_SPAN || sequence_state.image_span_length == 0u) {
-        return metal_fail(error, error_size, "Metal image generation requires one image span");
+    if (sequence_state.image_token_count == 0u) {
+        return metal_fail(error, error_size, "Metal image generation requires image tokens");
     }
 
     uocr_vision_schedule schedule;
@@ -16445,12 +16476,12 @@ static int metal_context_generate_image_f16_impl(uocr_metal_context *ctx,
                           "Metal image generation vision schedule failed: %s",
                           detail[0] != '\0' ? detail : uocr_status_string(status));
     }
-    if (schedule.final_visual_tokens == 0u || schedule.final_visual_tokens != sequence_state.image_span_length) {
+    if (schedule.final_visual_tokens == 0u || schedule.final_visual_tokens != sequence_state.image_token_count) {
         return metal_fail(error,
                           error_size,
-                          "Metal image generation visual rows %u do not match image span length %u",
+                          "Metal image generation visual rows %u do not match image token count %u",
                           schedule.final_visual_tokens,
-                          sequence_state.image_span_length);
+                          sequence_state.image_token_count);
     }
 
     uocr_metal_vision_workspace scratch;
@@ -16499,9 +16530,10 @@ static int metal_context_generate_image_f16_impl(uocr_metal_context *ctx,
 
     if (ctx->model_is_v2) {
         const uint32_t capacity = request->n_tokens + request->max_new_tokens;
-        const uint64_t required = uocr_metal_v2_decoder_required_bytes(capacity, request->n_tokens, 2u);
+        const uint32_t page_capacity = schedule.global_view_count + 1u; // includes the instruction bucket
+        const uint64_t required = uocr_metal_v2_decoder_required_bytes(capacity, request->n_tokens, page_capacity);
         if (required == 0u || !uocr_metal_context_prepare_v2_decoder(ctx, capacity, request->n_tokens,
-                2u, 0u, required, error, error_size)) return 0;
+                page_capacity, 0u, required, error, error_size)) return 0;
     } else if (prepare_runtime != NULL) {
         const uint64_t runtime_prepare_start_ns = uocr_profile_now_ns();
         char runtime_error[512];
