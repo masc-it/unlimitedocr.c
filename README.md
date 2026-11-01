@@ -128,7 +128,8 @@ one-page windows and a 768-token page cap, a 3-to-30-page run kept tracked nativ
 peak at 2.482 GB and sampled Metal peak at 2.500 GB; sampled RSS peak was
 2.259/2.269 GB. This is a measured fixed-setting plateau, not a universal memory
 cap. See the [execution plan](docs/plan_v2_multi_page.md) for evidence and limits.
-Upstream SGLang runtime comparison remains blocked locally by unavailable CUDA.
+CUDA runtime comparison is outside this project's current scope; upstream
+numerical parity is not claimed.
 Continuation follows upstream's approximate cache-copy approach, not full-history
 inference. Separate API calls start independent documents.
 

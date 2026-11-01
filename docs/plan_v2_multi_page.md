@@ -4,7 +4,8 @@
 
 Process page images supplied in document order as one document, using base mode
 and primarily mixed Q4. Preserve v1, single-page generation, model caches and
-existing quantization policy. Multi-page gundam and PDF rendering are out of scope.
+existing quantization policy. Multi-page gundam, PDF rendering and CUDA runtime
+comparison are out of scope.
 
 Follow the continuation behavior of the upstream version we inspected, described
 in [the research notes](unlimitedocr2_research.md#verified-upstream-scheduler-contract).
@@ -76,9 +77,6 @@ and unrelated notebook edits.
   consecutive transitions and that input is read no more than one page beyond
   the current window. Check that every page appears once, in order, and that
   collecting the streamed chunks produces the same text as `generate_pages()`.
-  Compare how windows end and generation resumes with the pinned upstream
-  SGLang version. If upstream cannot be run, record that comparison as blocked;
-  do not claim the behavior has been verified against it.
 - Upstream reuses cached states after rearranging their context, which is an
   approximation. Use its windowed implementation as the reference; Hugging Face inference retaining the full
   history can produce different results.
@@ -104,10 +102,9 @@ and unrelated notebook edits.
   embedding now passes through the existing shared prompt buffer before retention;
   rerunning the complete probe passed. Temporary probes were removed after
   recording results; no permanent tests or micro-tests were added.
-- **Blocked:** upstream runtime comparison requires the pinned CUDA SGLang
-  implementation, unavailable on this Mac. Its source was re-read, including
-  prompt rewriting, state replay, text splicing and window guards. Native E2E
-  success does not establish upstream numerical or OCR-quality parity.
+- Upstream source was re-read for prompt rewriting, state replay, text splicing
+  and window guards. Native E2E success does not establish upstream numerical
+  or OCR-quality parity.
 
 [x] **memory-and-recovery**: Verify memory use, limits and recovery.
 - Before starting a window, check that memory can hold its buffers, the retained
@@ -174,6 +171,6 @@ and unrelated notebook edits.
   API validation without shader instrumentation because of the previously
   recorded v1 baseline limitation. Memory sampling used neither validation layer.
 - Only the end-of-activity E2E probe was run and rerun after fixes. No permanent
-  tests or micro-tests were added. Temporary probes were removed. Upstream CUDA
-  comparison, full v2 FP16 model OCR and general OCR-quality parity remain
-  unverified; Float32 image-input support does not qualify FP16 model inference.
+  tests or micro-tests were added. Temporary probes were removed. Full v2 FP16
+  model OCR and general OCR-quality parity remain unverified; Float32 image-input
+  support does not qualify FP16 model inference.

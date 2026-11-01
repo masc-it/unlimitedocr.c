@@ -6,7 +6,7 @@ Status: `todo`
 
 Ship v2 OCR with bounded-memory long-document parsing, without changing v1 behavior. Reuse existing vision, MoE, projection, and quantization kernels. Single-window inference is an intermediate checkpoint, not the finished feature.
 
-Model selection is implemented: `UnlimitedOCR(model="v2", quant="q4")`; default remains v1. Mixed Q4 is the primary v2 quantization profile. Experimental single-page v2 generation works in base/gundam modes (mixed-Q4 and mixed-Q8 verified). Source builds also support base-mode multi-page windows and document streaming (mixed-Q4 E2E verified); the 3-to-30-page fixed-setting memory check passed, while upstream runtime parity remains pending. `generate(image)` is unchanged. `stream_pages(images)` accepts an iterable of ordered base-mode pages and yields complete-window text chunks; `generate_pages(images)` joins those chunks for convenience. Only the joining API intentionally retains the full output.
+Model selection is implemented: `UnlimitedOCR(model="v2", quant="q4")`; default remains v1. Mixed Q4 is the primary v2 quantization profile. Experimental single-page v2 generation works in base/gundam modes (mixed-Q4 and mixed-Q8 verified). Source builds also support base-mode multi-page windows and document streaming (mixed-Q4 E2E verified); the 3-to-30-page fixed-setting memory check passed. Upstream numerical parity is not claimed. `generate(image)` is unchanged. `stream_pages(images)` accepts an iterable of ordered base-mode pages and yields complete-window text chunks; `generate_pages(images)` joins those chunks for convenience. Only the joining API intentionally retains the full output.
 
 Remaining multi-page work follows the [activity-based execution plan](plan_v2_multi_page.md), with behavioral E2E probes only at activity boundaries.
 
@@ -20,7 +20,7 @@ Pinned HF revision: `c14071b549f4fcab10909f3c4acc6a2edb366947`.
 - Start with retained v2 K/V for one active page window, bounded by its token limit and the existing memory budget. Keep the v1 ring unchanged. Do not allocate for the entire document or the full 131072-token maximum by default.
 - Support standard page-marked OCR first. Reject v2 text-only/markerless requests initially instead of implementing unused 1D YaRN fallback.
 - Page-window scheduling and KV-tail reuse are required. Follow upstream continuation semantics, not independent OCR calls stitched together. Defer only multi-page tiling, router quantization, and unrelated performance tuning.
-- No new C reference backend or test framework. Use upstream inference and small Python math fixtures; add deeper instrumentation only to diagnose a mismatch.
+- CUDA runtime comparison is out of scope. Use upstream source as the implementation reference and native behavioral E2E probes for qualification. No new C reference backend or test framework.
 
 Before implementing the cache:
 
@@ -78,10 +78,9 @@ Files: `src/unlimitedocr_c/{frontend,api,ocr}.py`, `src/runtime/`, `src/core/uoc
 QA checkpoint:
 
 - [done] Check page-state coordinates against pinned SGLang pure helpers and Metal page RoPE against an FP16 numerical reference, including offsets beyond 32768 and both head counts.
-- [done] Check standalone router summaries/selections/biases and attention output across partial blocks, the 128-token boundary, and empty-candidate fallback, using a NumPy transcription of the pinned HF inference math. Full upstream/model execution remains a separate check.
-- [todo] Compare real base and gundam OCR with pinned upstream `infer`, including a page producing more than 128 tokens. Check prompt IDs, final text, and page markers; inspect intermediate logits only if results diverge. Account for BF16/FP16 rounding rather than requiring bitwise identity.
+- [done] Check standalone router summaries/selections/biases and attention output across partial blocks, the 128-token boundary, and empty-candidate fallback, using a NumPy transcription of the pinned HF inference math. Full upstream/model parity is not established.
 - [done] Confirm a too-small request memory budget rejects before workspace allocation, and real v1 image output matches a baseline build exactly.
-- [done] Read real rendered text in v2 base/gundam modes, preserve markers, reach EOS, and generate a page with more than 128 output tokens. This does not replace the pending upstream comparison.
+- [done] Read real rendered text in v2 base/gundam modes, preserve markers, reach EOS, and generate a page with more than 128 output tokens. This does not establish upstream numerical parity.
 - [done] Convert the real checkpoint to mixed Q4, verify source-byte conversions across both shards and the FP16 DASH keep-list, compare Q4/Q8 OCR on the same fixtures, and verify budget rejection, truncated-request cleanup and engine reuse.
 
 QA evidence:
@@ -122,10 +121,10 @@ Files: frontend/API, `src/runtime/uocr_{request_validation,sequence,vision}.*`, 
 
 QA checkpoint:
 
-- [todo] One two-page fixture verifies prompt placement, page coordinates/transitions, output ordering, and EOS guarding against upstream. Reuse this document for FP16/Q8/Q4 smoke checks; compare OCR quality, not exact quantized token equality.
+- [todo] Qualify multi-page FP16-model inference using the existing two-page fixture. Native Q4/Q8 page ordering and completion checks have passed; compare OCR content rather than exact token equality between quantization profiles.
 - [done] Confirm switching v1/v2 cannot reuse the wrong tokenizer/model cache using the offline probe. No new broad benchmark matrix or tests of unchanged vision/MoE math.
 
-QA evidence: the first activity in [the execution plan](plan_v2_multi_page.md) passed real Q4 two-/three-page OCR, page reordering with a blank page, invalid-request rejection and engine reuse. Single-page v1 base and v2 base/gundam outputs matched the frozen baseline. The complete E2E probe passed Metal API validation; GPU shader validation stopped in an unchanged v1 baseline kernel after the v2 checks passed. Upstream runtime comparison and multi-page FP16-model checks remain pending. Q8 document streaming passed the final activity's E2E probe. The high-level joining API now uses the document session described in phase 4.
+QA evidence: the first activity in [the execution plan](plan_v2_multi_page.md) passed real Q4 two-/three-page OCR, page reordering with a blank page, invalid-request rejection and engine reuse. Single-page v1 base and v2 base/gundam outputs matched the frozen baseline. The complete E2E probe passed Metal API validation; GPU shader validation stopped in an unchanged v1 baseline kernel after the v2 checks passed. Multi-page FP16-model checks remain pending. Q8 document streaming passed the final activity's E2E probe. The high-level joining API now uses the document session described in phase 4.
 
 ## Phase 4: Long documents with bounded working memory
 
@@ -142,8 +141,7 @@ Files: Python API/frontend/FFI; native session lifecycle, sequence state, memory
 QA checkpoint:
 
 - [done] Run real Q4 documents across three windows, including text continuing onto the next page, reordered window sizes, blank pages and cached-only final windows. Verify page order, no duplicated output and streamed/joined equality.
-- [todo] Compare continuation with the pinned SGLang scheduler using the same settings. Blocked locally: its CUDA runtime is unavailable. Full-cache HF output is not the scheduler oracle.
 - [done] Repeat the page input to increase document length 10x while discarding chunks. With fixed one-page windows and a 768-token page cap, native/Metal peaks were unchanged and process memory plateaued. Detailed measurements and scope are in the execution plan.
 - [done] Close a stream mid-document, then reuse the engine. The E2E probe also covered a waiting caller, input failures, skipped windows, exact/short output budgets and ordinary single-window baseline parity. Per the activity-based plan, no micro-tests or unit-test runs were added.
 
-QA evidence: see the document-streaming activity in [the execution plan](plan_v2_multi_page.md). Native E2E passed with Metal API and GPU shader validation. One failed probe exposed a GPU-private vision read; copying through the shared prompt buffer fixed it, and the full probe passed afterward. The final activity also passed 3-to-30-page memory measurements, memory-budget rejection/recovery, cancellation, input failures and Q8 compatibility. It fixed a Float32 image-input dispatch bug while preserving the original Float16 kernel. Upstream runtime comparison remains blocked; the memory evidence is limited to the measured settings and is not a process-memory cap.
+QA evidence: see the document-streaming activity in [the execution plan](plan_v2_multi_page.md). Native E2E passed with Metal API and GPU shader validation. One failed probe exposed a GPU-private vision read; copying through the shared prompt buffer fixed it, and the full probe passed afterward. The final activity also passed 3-to-30-page memory measurements, memory-budget rejection/recovery, cancellation, input failures and Q8 compatibility. It fixed a Float32 image-input dispatch bug while preserving the original Float16 kernel. The memory evidence is limited to the measured settings and is not a process-memory cap. Upstream numerical parity is not claimed.
