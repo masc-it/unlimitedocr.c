@@ -117,9 +117,18 @@ with UnlimitedOCR(model="v2", quant="q4") as ocr:
   `closing` when stopping early. Closing the stream releases continuation state.
 - `generate_pages` joins the same chunks and therefore retains the full output.
   Caller-preloaded images are also outside the streaming working-memory bound.
+- `memory_budget_bytes` is checked before allocating window workspaces. Document
+  admission includes retained context, image uploads/patch buffers, cached
+  positions and a safety margin. It is not a process-RSS or total-device-memory
+  cap: Python preprocessing, framework allocations and allocator behavior also
+  affect memory use. Reduce window/page-token limits when admission fails.
 
-Native mixed-Q4 behavior has passed multi-window E2E checks. Upstream SGLang
-runtime comparison and the long-document memory plateau check remain pending.
+Native mixed-Q4 behavior has passed multi-window E2E and recovery checks. With
+one-page windows and a 768-token page cap, a 3-to-30-page run kept tracked native
+peak at 2.482 GB and sampled Metal peak at 2.500 GB; sampled RSS peak was
+2.259/2.269 GB. This is a measured fixed-setting plateau, not a universal memory
+cap. See the [execution plan](docs/plan_v2_multi_page.md) for evidence and limits.
+Upstream SGLang runtime comparison remains blocked locally by unavailable CUDA.
 Continuation follows upstream's approximate cache-copy approach, not full-history
 inference. Separate API calls start independent documents.
 

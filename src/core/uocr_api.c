@@ -1220,9 +1220,16 @@ static int generate_prepared_impl(uocr_engine *engine,
         estimate.vision_gpu_workspace_bytes = request_estimate.vision_gpu_workspace_bytes;
         estimate.vision_final_features_bytes = request_estimate.vision_final_features_bytes;
         estimate.vision_host_staging_bytes = request_estimate.vision_host_staging_bytes;
-        // Vision scratch is released before decoder allocation. Final visual
-        // rows overlap decoder setup; retain that overlap in admission.
-        const uint64_t decoder_phase = saturated_add_u64(decoder_bytes, estimate.vision_final_features_bytes);
+        const uint64_t cached_positions = engine->document_active
+            ? uocr_metal_vision_cached_position_bytes(engine->metal) : 0u;
+        const uint64_t vision_staging = engine->document_active
+            ? uocr_metal_document_vision_staging_bytes(&requests[0]) : 0u;
+        estimate.vision_gpu_workspace_bytes += cached_positions + vision_staging;
+        estimate.vision_scratch_bytes += cached_positions + vision_staging;
+        // Upload/patch staging is temporary; cached positions and final visual
+        // rows survive into decoder setup. Count the retained document below.
+        const uint64_t decoder_phase = saturated_add_u64(decoder_bytes,
+            estimate.vision_final_features_bytes + cached_positions);
         const uint64_t phase_peak = decoder_phase > estimate.vision_scratch_bytes ? decoder_phase : estimate.vision_scratch_bytes;
         const uint64_t output_bytes = (uint64_t)max_new_tokens_in_batch * sizeof(int32_t) * 2u;
         // Retained tails coexist with vision and the next decoder cache. Prompt
@@ -1309,8 +1316,9 @@ int uocr_document_begin(uocr_engine *engine, uint32_t max_page_tokens) {
         return set_engine_errorf(engine, UOCR_ERROR_INVALID_ARGUMENT, "document session requires an idle v2 engine");
 #if UOCR_HAVE_METAL
     char error[512];
-    if (!uocr_metal_document_begin(engine->metal, max_page_tokens, engine->memory_budget_bytes, error, sizeof(error)))
-        return set_engine_errorf(engine, UOCR_ERROR_INVALID_ARGUMENT, "%s", error);
+    const int status = uocr_metal_document_begin(engine->metal, max_page_tokens,
+        engine->memory_budget_bytes, error, sizeof(error));
+    if (status != UOCR_OK) return set_engine_errorf(engine, status, "%s", error);
     engine->document_active = 1;
     clear_engine_error(engine);
     return UOCR_OK;

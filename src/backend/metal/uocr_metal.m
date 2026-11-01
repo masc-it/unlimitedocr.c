@@ -6657,7 +6657,9 @@ static int metal_context_sam_patch_embed_batch_f16_to_slice(uocr_metal_vision_pr
 
         /* Step 1: extract patches */
         {
-            id<MTLComputePipelineState> extract_pipeline = metal_get_pipeline(project->ctx, "uocr_sam_extract_patches_f16", error, error_size);
+            const char *extract_kernel = first->format == UOCR_PIXEL_F32_NCHW
+                ? "uocr_sam_extract_patches_f32" : "uocr_sam_extract_patches_f16";
+            id<MTLComputePipelineState> extract_pipeline = metal_get_pipeline(project->ctx, extract_kernel, error, error_size);
             if (extract_pipeline == nil) {
                 [patch_buffer release];
                 [pixel_buffer release];

@@ -28,7 +28,7 @@ kernel void uocr_bhwc_to_nchw_f16(device const half *bhwc [[buffer(0)]],
  * row-major [B*grid_h*grid_w, 768] layout for MPS matmul with the SAM patch
  * weight [768, 3*16*16].
  *
- * pixels  — NCHW fp16 [batch, 3, height, width]
+ * pixels: NCHW fp16 or fp32 [batch, 3, height, width]
  * patches_out — row-major fp16 [batch * grid_h * grid_w, 768], contiguous.
  * inner = channel * 256 + ky * 16 + kx  (0..767).
  *
@@ -69,6 +69,36 @@ kernel void uocr_sam_extract_patches_f16(device const half *pixels [[buffer(0)]]
                                 ulong(py) * ulong(dims.width) + ulong(px));
     const ulong patch_offset = ulong(patch) * 768ul + ulong(inner);
     patches_out[patch_offset] = pixels[pixel_offset];
+}
+
+kernel void uocr_sam_extract_patches_f32(device const float *pixels [[buffer(0)]],
+                                         device half *patches_out [[buffer(1)]],
+                                         constant UocrExtractPatchesDims &dims [[buffer(2)]],
+                                         uint2 gid [[thread_position_in_grid]]) {
+    const uint inner = gid.x;
+    const uint patch = gid.y;
+    const uint patches_per_view = dims.grid_h * dims.grid_w;
+    if (inner >= 768u || patches_per_view == 0u) {
+        return;
+    }
+    const uint batch = patch / patches_per_view;
+    const uint patch_in_view = patch - batch * patches_per_view;
+    const uint patch_y = patch_in_view / dims.grid_w;
+    const uint patch_x = patch_in_view - patch_y * dims.grid_w;
+    const uint c = inner / 256u;
+    const uint rem = inner - c * 256u;
+    const uint ky = rem / 16u;
+    const uint kx = rem - ky * 16u;
+    const uint py = patch_y * 16u + ky;
+    const uint px = patch_x * 16u + kx;
+    if (py >= dims.height || px >= dims.width) {
+        return;
+    }
+    const ulong pixel_offset = (ulong(batch) * 3ul * ulong(dims.height) * ulong(dims.width) +
+                                ulong(c) * ulong(dims.height) * ulong(dims.width) +
+                                ulong(py) * ulong(dims.width) + ulong(px));
+    const ulong patch_offset = ulong(patch) * 768ul + ulong(inner);
+    patches_out[patch_offset] = half(pixels[pixel_offset]);
 }
 
 struct UocrConv3x3Im2ColParams {

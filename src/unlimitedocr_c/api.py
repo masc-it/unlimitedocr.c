@@ -540,6 +540,8 @@ class UnlimitedOCR:
             raise ValueError("max_output_tokens must be a positive integer or None")
         prompt_capacity = 5 + (window_pages + 1) * 274
         output_capacity = window_pages * max_page_tokens + 256
+        if max_output_tokens is not None:
+            output_capacity = min(output_capacity, max_output_tokens)
         if prompt_capacity + output_capacity + 290 > 131072:
             raise ValueError("window/page limits exceed the v2 context capacity; reduce them")
         with self._lock:

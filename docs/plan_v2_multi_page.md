@@ -109,7 +109,7 @@ and unrelated notebook edits.
   prompt rewriting, state replay, text splicing and window guards. Native E2E
   success does not establish upstream numerical or OCR-quality parity.
 
-[ ] **memory-and-recovery**: Verify memory use, limits and recovery.
+[x] **memory-and-recovery**: Verify memory use, limits and recovery.
 - Before starting a window, check that memory can hold its buffers, the retained
   context, image processing, and both copies of data being moved. Let callers
   configure pages per window, output tokens per page and total document output
@@ -129,3 +129,51 @@ and unrelated notebook edits.
   allows; after each case, check that the engine can process another document.
   Include checks that v1 and single-page generation still work, plus a v2 Q8
   multi-page run.
+
+- **Evidence (2026-11-01):** Release build on M1 Pro / macOS 26.0.1; cached mixed
+  Q4, `window_pages=1`, `max_page_tokens=768`. After six warmup pages, the probe
+  processed three 1024px report pages and then the same sequence repeated to 30
+  pages. It checked every page's content and order, discarded each output chunk,
+  and sampled process/Metal memory every 20 ms. No forced garbage collection was
+  used. Native counters were read at every window boundary.
+
+  | Peak measurement | 3 pages | 30 pages |
+  |---|---:|---:|
+  | Tracked native allocations | 2.482 GB | 2.482 GB |
+  | Sampled Metal allocations | 2.500 GB | 2.500 GB |
+  | Sampled process RSS | 2.259 GB | 2.269 GB |
+  | Sampled process physical footprint | 2.852 GB | 2.762 GB |
+
+  GB is decimal. Within the 30-page run, early/late steady-window medians differed
+  by +0.27 MiB RSS and +0.20 MiB physical footprint; Metal usage was unchanged.
+  Native live memory between windows was 1,882,372,848 bytes, including retained
+  context, and returned to 1,846,112,256 bytes when the session ended. This
+  verifies a plateau for the measured configuration, not an absolute RSS cap or
+  every possible image resolution/window setting.
+- The frozen `9943dbf` baseline also plateaued. The local autorelease pool around
+  summary refresh is lifetime hardening, not a demonstrated leak fix. Document
+  admission now explicitly includes pixel uploads, patch extraction and cached
+  position tables, in addition to retained state and rewrite/copy headroom.
+  Session allocation failures report `UOCR_ERROR_OUT_OF_MEMORY` with required
+  bytes and the configured budget.
+- With a 2.5 GB budget, a two-view window was rejected before its workspaces were
+  allocated (estimate 2,635,346,345 bytes); a smaller document then succeeded on
+  the same engine. A 1.86 GB budget rejected continuation-state allocation without
+  leaking. Early close, input failure, cancellation, short output budgets and
+  invalid limits all left the engine reusable. Default page-token limits passed
+  a real page; a cumulative cap also allowed a window setting whose uncapped
+  output allowance would exceed the model context.
+- The probe exposed a pre-existing Float32 image-input bug: the uploaded pixels
+  were read by a Float16 patch-extraction kernel. A separate Float32 entry point
+  now converts them correctly. A shared-template variant failed a v1 baseline
+  comparison, so the final Float16 kernel was left unchanged. Float16/Float32
+  inputs matched on the tested document and base-mode compatibility cases.
+- Final compatibility checks matched frozen-baseline token IDs for v1 Q4/FP16
+  base and v2 Q4 base/gundam. V2 Q8 passed three-window and single-page OCR.
+  Recovery checks passed Metal API and GPU shader validation; compatibility used
+  API validation without shader instrumentation because of the previously
+  recorded v1 baseline limitation. Memory sampling used neither validation layer.
+- Only the end-of-activity E2E probe was run and rerun after fixes. No permanent
+  tests or micro-tests were added. Temporary probes were removed. Upstream CUDA
+  comparison, full v2 FP16 model OCR and general OCR-quality parity remain
+  unverified; Float32 image-input support does not qualify FP16 model inference.

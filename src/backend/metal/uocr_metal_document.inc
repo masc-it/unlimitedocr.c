@@ -19,23 +19,57 @@ uint64_t uocr_metal_document_bytes(const uocr_metal_context *ctx) {
     return ctx != NULL && ctx->document != NULL ? sizeof(uocr_metal_document) : 0u;
 }
 
+uint64_t uocr_metal_vision_cached_position_bytes(const uocr_metal_context *ctx) {
+    if (ctx == NULL) return 0u;
+    return (uint64_t)[ctx->sam_abs_pos_local_buffer length] +
+        (uint64_t)[ctx->sam_rel_pos_local_buffer length] +
+        (uint64_t)[ctx->clip_abs_pos_local_buffer length];
+}
+
+uint64_t uocr_metal_document_vision_staging_bytes(const uocr_prepared_request *request) {
+    uint64_t bytes = 0u;
+    // Validated base views are uploaded together. The non-overlapping patch
+    // extraction buffer holds the same pixels in FP16, alongside the upload.
+    // Including the reused lookahead view is conservative on later windows.
+    for (uint32_t i = 0u; i < request->n_views; ++i) {
+        const uocr_image_view *v = &request->views[i];
+        const uint64_t element_bytes = v->format == UOCR_PIXEL_F16_NCHW ? 2u : 4u;
+        bytes += (uint64_t)3u * v->width * v->height * (element_bytes + sizeof(uint16_t));
+    }
+    return bytes;
+}
+
 int uocr_metal_document_begin(uocr_metal_context *ctx, uint32_t max_page_tokens,
     uint64_t budget, char *error, size_t error_size) {
     if (ctx == NULL || !ctx->model_is_v2 || ctx->document != NULL ||
-        max_page_tokens == 0u || max_page_tokens > 20000u)
-        return metal_fail(error, error_size, "document session requires idle v2 Metal and a page limit in [1,20000]");
+        max_page_tokens == 0u || max_page_tokens > 20000u) {
+        (void)metal_fail(error, error_size, "document session requires idle v2 Metal and a page limit in [1,20000]");
+        return UOCR_ERROR_INVALID_ARGUMENT;
+    }
     uocr_metal_context_release_v2_request(ctx);
     const uint64_t live = ctx->memory_tracker != NULL ? ctx->memory_tracker->total_live_bytes : 0u;
-    if (budget != 0u && (live > budget || sizeof(uocr_metal_document) > budget - live))
-        return metal_fail(error, error_size, "document continuation state exceeds memory budget");
+    uint64_t required;
+    if (!checked_add_u64(live, uocr_metal_vision_cached_position_bytes(ctx), &required) ||
+        !checked_add_u64(required, sizeof(uocr_metal_document), &required)) {
+        (void)metal_fail(error, error_size, "document continuation memory requirement overflow");
+        return UOCR_ERROR_OUT_OF_MEMORY;
+    }
+    if (budget != 0u && required > budget) {
+        (void)metal_fail(error, error_size, "document continuation requires %llu bytes including model and cached positions; budget is %llu",
+                        (unsigned long long)required, (unsigned long long)budget);
+        return UOCR_ERROR_OUT_OF_MEMORY;
+    }
     uocr_metal_document *d = calloc(1u, sizeof(*d));
-    if (d == NULL) return metal_fail(error, error_size, "failed to allocate document continuation state");
+    if (d == NULL) {
+        (void)metal_fail(error, error_size, "failed to allocate document continuation state");
+        return UOCR_ERROR_OUT_OF_MEMORY;
+    }
     if (!metal_memory_reserve(ctx, UOCR_MEMORY_KV_CACHE, sizeof(*d), "document continuation state", error, error_size)) {
-        free(d); return 0;
+        free(d); return UOCR_ERROR_OUT_OF_MEMORY;
     }
     d->max_page_tokens = max_page_tokens;
     ctx->document = d;
-    return 1;
+    return UOCR_OK;
 }
 
 void uocr_metal_document_end(uocr_metal_context *ctx) {
@@ -104,29 +138,31 @@ static void metal_document_copy(uocr_metal_context *ctx, uint32_t cached_row,
 }
 
 static int metal_document_refresh(uocr_metal_context *ctx, char *error, size_t error_size) {
-    uocr_metal_dash_cache *c = ctx->dash_cache;
-    const uint32_t slots[5] = {DASH_ROUTER_K, DASH_HEAD_CLS, DASH_POSITIONS, DASH_SUMMARIES, DASH_PAGE_RANGES};
-    const uocr_metal_dash_params params = {c->length, 0u, c->length, 0u};
-    if (!metal_command_batch_begin(ctx, error, error_size)) return 0;
-    id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, "uocr_dash_summary_cached_f16", error, error_size);
-    if (pipeline == nil) goto failed;
-    for (uint32_t layer = 0u; layer < UOCR_DECODER_LAYERS; ++layer) {
-        uocr_metal_buffer_slice slices[DASH_BUFFER_COUNT];
-        metal_dash_cache_slices(c, layer, slices);
-        id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, ctx->active_command_buffer);
-        if (enc == nil) { (void)metal_fail(error, error_size, "failed to encode restored DASH summaries"); goto failed; }
-        [enc setComputePipelineState:pipeline];
-        for (uint32_t i = 0; i < 5u; ++i)
-            [enc setBuffer:slices[slots[i]].buffer offset:slices[slots[i]].offset atIndex:i];
-        [enc setBytes:&params length:sizeof(params) atIndex:5u];
-        [enc setBuffer:c->arena offset:(NSUInteger)(c->layout.tail_offset + layer * UOCR_METAL_DASH_TAIL_STRIDE) atIndex:6u];
-        [enc dispatchThreadgroups:MTLSizeMake((c->length + 31u) / 32u, 1u, 1u)
-            threadsPerThreadgroup:MTLSizeMake(32u, 1u, 1u)];
-        metal_end_compute_encoder(ctx, enc);
+    @autoreleasepool {
+        uocr_metal_dash_cache *c = ctx->dash_cache;
+        const uint32_t slots[5] = {DASH_ROUTER_K, DASH_HEAD_CLS, DASH_POSITIONS, DASH_SUMMARIES, DASH_PAGE_RANGES};
+        const uocr_metal_dash_params params = {c->length, 0u, c->length, 0u};
+        if (!metal_command_batch_begin(ctx, error, error_size)) return 0;
+        id<MTLComputePipelineState> pipeline = metal_get_pipeline(ctx, "uocr_dash_summary_cached_f16", error, error_size);
+        if (pipeline == nil) goto failed;
+        for (uint32_t layer = 0u; layer < UOCR_DECODER_LAYERS; ++layer) {
+            uocr_metal_buffer_slice slices[DASH_BUFFER_COUNT];
+            metal_dash_cache_slices(c, layer, slices);
+            id<MTLComputeCommandEncoder> enc = metal_compute_command_encoder(ctx, ctx->active_command_buffer);
+            if (enc == nil) { (void)metal_fail(error, error_size, "failed to encode restored DASH summaries"); goto failed; }
+            [enc setComputePipelineState:pipeline];
+            for (uint32_t i = 0; i < 5u; ++i)
+                [enc setBuffer:slices[slots[i]].buffer offset:slices[slots[i]].offset atIndex:i];
+            [enc setBytes:&params length:sizeof(params) atIndex:5u];
+            [enc setBuffer:c->arena offset:(NSUInteger)(c->layout.tail_offset + layer * UOCR_METAL_DASH_TAIL_STRIDE) atIndex:6u];
+            [enc dispatchThreadgroups:MTLSizeMake((c->length + 31u) / 32u, 1u, 1u)
+                threadsPerThreadgroup:MTLSizeMake(32u, 1u, 1u)];
+            metal_end_compute_encoder(ctx, enc);
+        }
+        return metal_command_batch_commit_and_wait(ctx, "document restored summaries", error, error_size);
+    failed:
+        metal_command_batch_abort(ctx); return 0;
     }
-    return metal_command_batch_commit_and_wait(ctx, "document restored summaries", error, error_size);
-failed:
-    metal_command_batch_abort(ctx); return 0;
 }
 
 static int metal_document_retain(uocr_metal_context *ctx, const int32_t *prompt,
