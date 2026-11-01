@@ -13,9 +13,9 @@ management, KV cache, logits processing, and GPU execution.
 uv add unlimitedocr-c
 ```
 
-> `unlimitedocr-c` is published on PyPI. Version `0.6.0` is the latest release; v2 inference is experimental and single-page only.
+> `unlimitedocr-c` is published on PyPI. Version `0.7.0` adds experimental v2 multi-page OCR and document streaming.
 >
-> [0.6.0 release notes](docs/release_0.6.0.md): faster mixed-Q4 inference, reduced vision memory, and a Q8/FP16 token-selection race fix.
+> [0.7.0 release notes](docs/release_0.7.0.md): bounded-window continuation, memory-budget recovery, and corrected Float32 image inputs.
 
 ## Quick start
 
@@ -58,9 +58,9 @@ with UnlimitedOCR(model="v2", quant="q4") as ocr:
 ```
 
 V2 requires Metal and preserves its page/block markup in output. It warms GPU
-pipelines on the first image request. The published 0.6.0 wheel supports single
-pages only. Source builds also accept multiple **base-mode** pages within one
-bounded request, through `prepare_pages` and `Engine.generate_prepared`:
+pipelines on the first image request. Version 0.7.0 also accepts multiple
+**base-mode** pages within one bounded request, through `prepare_pages` and
+`Engine.generate_prepared`:
 
 ```python
 from unlimitedocr_c import resolve_model_path
@@ -85,9 +85,9 @@ with Engine(options) as engine:
 This path prepares all supplied images and retains attention state for the entire
 request. Its page count is limited by prompt/output capacity and the memory budget;
 check for EOS to distinguish completion from hitting the output-token limit.
-### Streaming documents from source builds
+### Streaming documents
 
-Source builds also provide `stream_pages` and `generate_pages` for v2 base-mode
+Version 0.7.0 provides `stream_pages` and `generate_pages` for v2 base-mode
 pages. Each chunk contains the complete OCR text for one window. The next window
 reuses the preceding image/text tail and the lookahead page's attention cache.
 
