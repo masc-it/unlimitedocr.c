@@ -78,3 +78,29 @@ one-page windows and a 768-token page cap kept tracked native peak at 2.482 GB
 and sampled Metal peak at 2.500 GB. Sampled RSS peaks were 2.259/2.269 GB. This is
 fixed-setting source-build evidence, not a universal memory bound or a fresh
 release-wheel memory measurement.
+
+## Release-wheel verification
+
+- Installed the exact wheel into a fresh Python 3.12.10 environment and ran from
+  `/tmp` on macOS 26.0.1. Both native artifacts target macOS 15.0 / arm64; a
+  physical macOS 15 host was not tested.
+- Verified the platform tag, all 22 RECORD entries, packaged dylib/metallib
+  resolution and bundled quantization policy. Installed resources matched the
+  wheel byte-for-byte; the policy matched the source file.
+- Ten prepared-request cases covered v1 Q4/Q8/FP16 and v2 Q4/Q8 in base/gundam.
+  All token IDs matched the source build and outputs parsed into the expected
+  15 invoice blocks. Four Q8 repeats and five base-mode Float32 input checks
+  also matched, for 19 installed-wheel prepared requests in total.
+- Three high-level v1 calls passed: Q4 base/gundam and FP16 base. The remaining
+  broad high-level checks were stopped to avoid unnecessary memory pressure.
+- A smaller Q4-only check used one engine, one-page windows, a 256-token page
+  cap, a 768-token document cap and a 2.7 GB native budget. Three distinct pages
+  crossed two consecutive handoffs with correct content/order; streamed and
+  joined output matched. The native budget is not a process-memory cap.
+- No long-document memory measurement or broad test-suite rerun was performed
+  for the release wheel. Earlier implementation evidence is listed separately
+  above. Model caches were reused without reconversion.
+
+Artifact: `unlimitedocr_c-0.7.0-py3-none-macosx_15_0_arm64.whl`
+
+SHA256: `fc69919117ee563dacd669d55ba4a10476d9fd48bc744a6d9c0fd2163ca67bd7`
